@@ -335,4 +335,5 @@ work:
 - **Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`), and
   the exact trailing-continuation operator set. The *lexing* mechanics are settled by adopting
   `IndentationLexical` (see `front-end.md`); these remaining pieces are grammar decisions.
-- **Final scalar-type table and operator-precedence table** as their own settled specs.
+- ~~Final scalar-type table and operator-precedence table~~ — **done**, see
+  `01-scalar-types-and-operators.md`.
