@@ -195,6 +195,63 @@ it says "a real number" (floating-point), making no size claim, so it cannot mis
 a less-preferred spelling.) The narrower and wider widths carry no alias: reach for `f32`,
 `f16`, or `f128` by their systematic names when you specifically want them.
 
+## 7. Pointer-width integers: `isize` / `usize`
+
+`isize` and `usize` are the **pointer-width** signed and unsigned integers — the canonical
+types for sizes, counts, indices, and pointer differences. On the sole target (aarch64,
+LP64) that width is 64 bits, so they are **aliases**: `isize` = `i64`, `usize` = `u64`.
+
+They are aliases rather than distinct types on purpose. A distinct pointer-width type (as in
+Rust) earns its keep only across targets of differing width, and forces frequent casts
+between `usize` and `u64` — one of Rust's most-cited frictions. sysl is committed to a single
+64-bit target, so that portability is not being paid for now, and avoiding the cast ceremony
+is squarely in the "easier than Rust" goal. As aliases they also match C's `size_t` and
+`ptrdiff_t`/`ssize_t` on the LP64 ABI, so they are FFI-safe and satisfy the §4 invariant.
+
+Using `u64`/`i64` directly for a size or index is allowed; `usize`/`isize` exist to document
+intent and to match the C size/offset names at FFI boundaries.
+
+**Revisit trigger.** If a target of non-64-bit pointer width is ever added, `isize`/`usize`
+must be promoted to *distinct target-width types*. Because size/index/offset code will
+already spell them `usize`/`isize`, that is a one-line redefinition rather than a sweep —
+which is the practical reason to use these names at those call sites even while they are
+aliases.
+
+## 8. Integer and numeric literals
+
+**Bases.** Decimal (`42`), hex (`0xFF`), binary (`0b1010`), octal (`0o17`). Prefixes are
+lowercase; hex digits are case-insensitive (`0xff` = `0xFF`). There is **no C-style
+leading-zero octal** — `010` is decimal 10, not 8. Octal is always `0o`.
+
+**Digit separators.** A single `_` may appear between digits (and immediately after a base
+prefix): `1_000_000`, `0xFF_FF`, `0b1010_0101`. It may not lead or trail the digit run.
+
+**Type suffixes.** A canonical `iN` / `uN` / `fN` type name may be appended with no space:
+`42u8`, `7i5`, `100u12`, `0xFFu16`, `3.0f32`. The suffix is restricted to the systematic
+forms so the lexer stays unambiguous; the aliases (`int`, `byte`, `real`, `usize`, …) are
+**not** valid suffixes — give a literal an alias type via a type context or a cast
+(`byte(0xFF)`).
+
+**Default type.** An unsuffixed literal with no type context is `int` (i32). If its value
+does not fit `int`, that is a **compile error** requesting an explicit suffix — the default
+is never magnitude-dependent. (`5_000_000_000` alone is an error; `5_000_000_000i64` is
+fine.)
+
+**Type context wins.** An unsuffixed literal adopts the expected type from its context —
+assignment target, parameter, etc. — provided the value fits: `var x: u8 = 42` makes `42` a
+`u8`. Out of range is a compile error (`var x: u8 = 300`). This is not implicit integer
+promotion: the literal simply *is* that type. The no-promotion rule (§Integer Overflow)
+governs runtime *values*, not literal typing.
+
+**Signed-minimum literals.** A decimal literal immediately following a unary minus may reach
+the signed type's minimum magnitude, so `-128i8` and `-2_147_483_648` are legal even though
+`128` and `2147483648` overflow the corresponding positive range. The type-checker treats
+`-<literal>` as a unit for the range check.
+
+**Float literals.** A numeric literal containing a `.` or an exponent is a floating-point
+literal: `3.14`, `2.5e10`, `1e-9`. Its default type is `real` (f64); suffixes select another
+IEEE width (`1.0f32`, `1.5f16`, `3.0f128`).
+
 ## Open at the basics level (not yet decided)
 
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
@@ -205,11 +262,6 @@ work:
   the maximum permitted `N`; whether `i1`/`u1` are allowed and how they relate to `bool`;
   and whether packed structs lay out an `i5` field in exactly 5 bits (the bitfield / hardware
   register payoff).
-- **Add `isize`/`usize`** (pointer-width integers) as core types for indexing and the
-  aarch64 ABI. Distinct from the `iN`/`uN` family because their width is target-defined
-  (64-bit on aarch64), not a literal in the name.
-- **Integer-literal default type and suffix grammar** (`42u8`, `100i64`, hex/binary,
-  underscore digit separators).
 - **Indentation mechanics:** INDENT/DEDENT tokenization, block openers (`then` / `do` / `=`),
   and line-continuation rules.
 - **Final scalar-type table and operator-precedence table** as their own settled specs.
