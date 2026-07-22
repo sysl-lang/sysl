@@ -301,6 +301,27 @@ the signed type's minimum magnitude, so `-128i8` and `-2_147_483_648` are legal 
 literal: `3.14`, `2.5e10`, `1e-9`. Its default type is `real` (f64); suffixes select another
 IEEE width (`1.0f32`, `1.5f16`, `3.0f128`).
 
+## 9. Operators are a fixed set — no custom operator symbols
+
+sysl has a **fixed, closed** set of operators (the precedence table). Users **cannot define
+new operator symbols** — there is no Nim/Swift/Scala-style custom-operator facility (`|>`,
+`<~>`, `>>>`, …). The built-in operators **are** overloadable for user types via trait
+`impl`s (Rust-style — `+`, `-`, `*`, `[]`, the comparisons, …), but the *token set itself* is
+closed.
+
+**Why.** This is the bare-metal consensus. Rust, C++, D, and Ada allow overloading only of
+the fixed set; Zig and C allow no operator overloading at all; **none** permit new operator
+tokens. Custom operators appear only in outliers with different priorities (Nim, Swift).
+Low-level code is read while reasoning about hardware, and a mystery operator that is secretly
+a user function fights that — the same "visible cost" value the memory model rests on. A
+closed set is also more teachable and yields sharper error messages and simpler tooling.
+
+**Consequence for the front end.** Because the operator set is finite and known, operators
+tokenize by **longest-match against a fixed list** — no greedy operator "muncher", no
+context-sensitive stop rules, no separate parser-vocabulary registration. The old lexer's
+operator-munching complexity (and its double-registration) existed *solely* to support custom
+operators; with those gone, operator lexing is trivial, and even a library lexer stays clean.
+
 ## Open at the basics level (not yet decided)
 
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
