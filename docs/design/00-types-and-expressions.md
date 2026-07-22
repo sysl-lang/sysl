@@ -15,6 +15,26 @@ directly from this principle.
 
 ---
 
+## Target scope (governs every decision in this document)
+
+The **implementation** targets aarch64 only for now — a single LLVM target keeps the restart
+small and the test story disciplined. But the **language is designed for 32-bit ARM
+Cortex-M embedded as an explicit intended use** — Raspberry Pi Pico (RP2040/RP2350) and
+STM32. That imposes hard constraints on the basics:
+
+- **No design decision may assume 64-bit pointers or 64-bit sizes.** Pointer width, size and
+  index width, and fat-pointer layout must be expressed in target-relative terms
+  (`isize`/`usize`), never hard-coded to `i64`/`u64`. Fat-pointer length fields, `sizeof`,
+  and `.len` are `usize`-width.
+- **Embedded ARM is a future target *triple*, not a new backend.** Same LLVM IR and codegen,
+  a different `-target` (`thumbv7em-none-eabi`, `thumbv6m-none-eabi`, …), a no-std runtime,
+  and a 32-bit data layout. This is why single-backend and multi-target do not conflict: the
+  backend is LLVM; the targets are triples.
+- **FPU reality feeds back into the type defaults.** RP2040 (Cortex-M0+) has no FPU — even
+  `f32` is soft-float; Cortex-M4F is single-precision only, so `f64` is soft-float there.
+  `real` (f64) stays a fine host default, but embedded code should prefer `f32` or
+  fixed-point (see the deferred fixed-point note).
+
 ## 1. `char` is a distinct Unicode-scalar-value type
 
 `char` is a first-class built-in type, **not** an alias for `u32`. It represents a single
@@ -128,12 +148,17 @@ The full set of kept aliases:
 Each passes the test: the name is an unambiguous common-case spelling with no promise the
 underlying type does not keep. C's "how wide is `long`?" ambiguity — the usual reason to
 distrust these names — **does not apply**, because sysl pins each width *by definition*
-(`long` is exactly `i64`, always, on every target). A useful invariant falls out: **every
-kept integer alias matches its C namesake's width on the aarch64 LP64 ABI** (`byte`=1,
-`short`=2, `int`=4, `long`=8), which is what keeps them safe in `extern` and struct-layout
-code. `i8` has no alias (there is no settled C-style name for a signed byte worth adopting).
-Floating-point keeps a single alias — `real` = `f64` — chosen specifically to preserve that
-FFI-safety property; see §6.
+(`long` is exactly `i64`, always, on every target). On the aarch64 LP64 ABI every kept
+integer alias also matches its C namesake's width (`byte`=1, `short`=2, `int`=4, `long`=8),
+which keeps them safe in `extern` and struct-layout code on the host.
+
+**This C-match is LP64-specific, not a universal guarantee.** On a 32-bit ILP32 target
+(Cortex-M) C's `long` is 32-bit, so sysl's `long` = `i64` would *diverge* from C `long`
+there — sysl fixes each alias width by definition regardless of target, which is the
+anti-ambiguity feature, not an ABI promise. **Precise FFI should therefore use the
+explicit-width names** (`i32`/`i64`, …): those match C's `stdint` types (`int32_t`,
+`int64_t`) on *every* target. `i8` has no alias (there is no settled C-style name for a
+signed byte worth adopting). Floating-point keeps a single alias — `real` = `f64`; see §6.
 
 ## 5. Integer types are an arbitrary-width family (`iN` / `uN`)
 
@@ -198,24 +223,25 @@ a less-preferred spelling.) The narrower and wider widths carry no alias: reach 
 ## 7. Pointer-width integers: `isize` / `usize`
 
 `isize` and `usize` are the **pointer-width** signed and unsigned integers — the canonical
-types for sizes, counts, indices, and pointer differences. On the sole target (aarch64,
-LP64) that width is 64 bits, so they are **aliases**: `isize` = `i64`, `usize` = `u64`.
+types for sizes, counts, indices, and pointer differences. They are **distinct types whose
+width is the target's pointer width**: 64-bit on aarch64, 32-bit on the intended Cortex-M
+targets. They are **not** aliases for `i64`/`u64`.
 
-They are aliases rather than distinct types on purpose. A distinct pointer-width type (as in
-Rust) earns its keep only across targets of differing width, and forces frequent casts
-between `usize` and `u64` — one of Rust's most-cited frictions. sysl is committed to a single
-64-bit target, so that portability is not being paid for now, and avoiding the cast ceremony
-is squarely in the "easier than Rust" goal. As aliases they also match C's `size_t` and
-`ptrdiff_t`/`ssize_t` on the LP64 ABI, so they are FFI-safe and satisfy the §4 invariant.
+This is required by the target scope. Aliasing `usize` = `u64` would be safe only if 64-bit
+were the sole target forever; but 32-bit ARM embedded is an explicit intended use, and an
+alias would silently bake 64-bit sizes into every index and pointer difference — the exact
+bug that breaks on a Cortex-M. Distinctness is the correct discipline: it keeps size/index
+code target-agnostic, and the cast friction that makes distinct `usize` annoying in desktop
+Rust is minimal on embedded, where `usize` dominates and `u64` is rarely mixed in.
 
-Using `u64`/`i64` directly for a size or index is allowed; `usize`/`isize` exist to document
-intent and to match the C size/offset names at FFI boundaries.
-
-**Revisit trigger.** If a target of non-64-bit pointer width is ever added, `isize`/`usize`
-must be promoted to *distinct target-width types*. Because size/index/offset code will
-already spell them `usize`/`isize`, that is a one-line redefinition rather than a sweep —
-which is the practical reason to use these names at those call sites even while they are
-aliases.
+- **No implicit conversion** to/from the fixed-width integers — an explicit cast is required
+  (`u64(n)`, `usize(k)`), consistent with the no-implicit-promotion rule. On aarch64 that
+  cast is representationally a no-op; on a 32-bit target it is a genuine narrowing/widening,
+  which is exactly why it must be written.
+- They match C's `size_t` and `ptrdiff_t`/`ssize_t` **on every target** (both are
+  pointer-width by definition), so they stay FFI-safe across the 64-bit host and the 32-bit
+  MCUs — unlike a fixed `i64` alias, which would match `size_t` only on LP64.
+- `sizeof` yields `usize`, and `.len` on a slice or string is `usize`.
 
 ## 8. Integer and numeric literals
 
@@ -226,11 +252,12 @@ leading-zero octal** — `010` is decimal 10, not 8. Octal is always `0o`.
 **Digit separators.** A single `_` may appear between digits (and immediately after a base
 prefix): `1_000_000`, `0xFF_FF`, `0b1010_0101`. It may not lead or trail the digit run.
 
-**Type suffixes.** A canonical `iN` / `uN` / `fN` type name may be appended with no space:
-`42u8`, `7i5`, `100u12`, `0xFFu16`, `3.0f32`. The suffix is restricted to the systematic
-forms so the lexer stays unambiguous; the aliases (`int`, `byte`, `real`, `usize`, …) are
-**not** valid suffixes — give a literal an alias type via a type context or a cast
-(`byte(0xFF)`).
+**Type suffixes.** A canonical primitive type name may be appended with no space: the
+systematic `iN` / `uN` / `fN` forms plus the two pointer-width primitives `usize` / `isize`
+— `42u8`, `7i5`, `100u12`, `0xFFu16`, `3.0f32`, `10usize`. The suffix is restricted to these
+canonical primitives so the lexer stays unambiguous; the friendly *aliases* (`int`, `byte`,
+`real`, `long`, …) are **not** valid suffixes — give a literal an alias type via a type
+context or a cast (`byte(0xFF)`).
 
 **Default type.** An unsuffixed literal with no type context is `int` (i32). If its value
 does not fit `int`, that is a **compile error** requesting an explicit suffix — the default
