@@ -56,6 +56,34 @@ here. **It is the only unsafe primitive** — the only way to produce a dangling
 — and it needs no runtime. It is how a kernel, a driver, or the allocator's own internals are
 written.
 
+## Per-declaration, and why value is the default
+
+Which mode a value uses is chosen **per declaration**, as in C — at each site you write the
+value, a pointer, or (new in sysl) a reference. This is deliberately *not* the Swift / Scala /
+Kotlin per-*type* split (`struct` value type vs `class` reference type): the per-declaration
+form keeps C's per-site flexibility — the same struct type can be held by value in one place,
+by reference in another, and by raw pointer in a third — which systems code relies on.
+
+Within that model, **value (`T`) is the unmarked default, and the kernel is why.** In a
+no-alloc module references do not exist, so if the *reference* were the bare default, the
+unmarked form would be the one spelling that is *illegal* exactly where value semantics are
+needed most — every kernel struct would need a mark and hit "references need an allocator" on
+its most natural spelling. Value-as-default keeps the kernel's common case unmarked (`T`),
+`*T` covers pointers, and `&T` simply never appears in kernel code. It is the only assignment
+of the three where the unmarked default is usable in *both* worlds.
+
+**Ergonomics of `&` in application code.** With type inference (Scala-style), `&` appears only
+in explicit type positions — function signatures and struct fields — not on locals:
+
+```
+val p = spawn(parent)                  // inferred: no annotation, no &
+spawn(parent: &Process) -> &Process    // & only at the boundary
+```
+
+So references are not scattered through the code; `&` lives at API boundaries, where
+`&Process` usefully documents "shared reference, not a copy" — the same place Scala puts its
+type annotations. Clean bodies, honest boundaries.
+
 ## `weak T` — breaking cycles
 
 ARC cannot reclaim a reference cycle (A holds B, B holds A). The tool for back-references is
