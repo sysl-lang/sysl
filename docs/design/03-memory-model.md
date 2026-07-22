@@ -138,14 +138,17 @@ The boundary is not a convention — it is compiler-enforced through the allocat
 ## Capabilities (the allocator, and orthogonal environment facts)
 
 The presence of a **managed allocator** is a first-class capability that gates `&T`, `weak`,
-and growable arrays. A context declared **no-alloc** makes those a compile error, leaving `T`,
+and growable arrays. A module declared **`no alloc`** makes those a compile error, leaving `T`,
 `*T`, fixed arrays, and slice-views — the allocator-free subset.
 
 This is **orthogonal** to whether an OS or POSIX layer is present (which gate the
 standard-library / syscall surface). Unlike Rust's `no_std` — which bundles "no allocator," "no
 OS," and "no conveniences" together and forces embedded-with-a-heap to claw `alloc` back — sysl
-keeps them independent switches: bare-metal-with-a-heap is "alloc yes, os no." The exact
-declaration mechanism is a separate design task (see open questions).
+keeps them independent switches: bare-metal-with-a-heap is "alloc yes, os no."
+
+The full mechanism — `alloc` as a type-checker-enforced *language* capability vs `os`/`posix`
+as import-gated *environment* capabilities, the target-provides / module-narrows two-level
+model, and propagation through imports — is specified in **`capabilities.md`**.
 
 ## Hazard summary
 
@@ -160,8 +163,9 @@ Only `*T` opts out — visibly.
 
 ## Open sub-questions
 
-- **Capability mechanism** — how `alloc` / `os` / `posix` are declared and checked (per-module
-  attribute, per-target default, or both) and the exact syntax. Its own design pass.
+- ~~Capability mechanism~~ — **done**, see `capabilities.md` (`alloc` type-checker-enforced,
+  `os`/`posix` import-gated; target provides + module `no alloc` narrows; propagated through
+  imports).
 - **Concurrency** — atomic refcounts for cross-thread `&T`, and the data-race story. Not yet
   designed.
 - **Unchecked-index escape hatch** — an opt-out of bounds checking for hot loops (default
