@@ -332,6 +332,7 @@ work:
   the maximum permitted `N`; whether `i1`/`u1` are allowed and how they relate to `bool`;
   and whether packed structs lay out an `i5` field in exactly 5 bits (the bitfield / hardware
   register payoff).
-- **Indentation mechanics:** INDENT/DEDENT tokenization, block openers (`then` / `do` / `=`),
-  and line-continuation rules.
+- **Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`), and
+  the exact trailing-continuation operator set. The *lexing* mechanics are settled by adopting
+  `IndentationLexical` (see `front-end.md`); these remaining pieces are grammar decisions.
 - **Final scalar-type table and operator-precedence table** as their own settled specs.
