@@ -108,13 +108,29 @@ defined.
 
 ---
 
+## 4. Type aliases — kept only when the name over-promises nothing
+
+An alias for a built-in scalar is kept **only when the alias name promises nothing the
+underlying type does not already deliver.** This is the same test that rejected `char = u32`
+in §1 (that name implied codepoint validity `u32` does not enforce). It is a positive test,
+not a blanket ban: a name that is simply a clearer spelling of the exact same guarantees is
+good ergonomics, not accretion.
+
+- **`byte` = `u8`** — **kept.** A byte is exactly an unsigned 8-bit unit of memory, which is
+  precisely `u8`; the name adds no false guarantee and reads naturally in buffer and I/O
+  code.
+
+The remaining candidate aliases (`short`/`int`/`long`/`ushort`/`uint`/`ulong`/`float`/
+`double`) are still open — see below.
+
 ## Open at the basics level (not yet decided)
 
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
 work:
 
-- **Trim the integer/float type-alias set** (`short`/`int`/`long`/`byte`/`ushort`/…). One
-  obvious name per type vs. C-familiarity aliases.
+- **Decide the remaining integer/float type aliases** (`short`/`int`/`long`/`ushort`/`uint`/
+  `ulong`/`float`/`double`), each against the §4 test. (`byte` = `u8` is already decided —
+  kept.)
 - **Add `isize`/`usize`** (pointer-width integers) as core types for indexing and the
   aarch64 ABI.
 - **Integer-literal default type and suffix grammar** (`42u8`, `100i64`, hex/binary,
