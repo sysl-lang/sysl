@@ -123,15 +123,17 @@ The full set of kept aliases:
 | `byte` | `u8` | | `short` | `i16` |
 | `ushort` | `u16` | | `int` | `i32` |
 | `uint` | `u32` | | `long` | `i64` |
-| `ulong` | `u64` | | `float` | `f32` |
-| `double` | `f64` | | | |
+| `ulong` | `u64` | | `real` | `f64` |
 
 Each passes the test: the name is an unambiguous common-case spelling with no promise the
 underlying type does not keep. C's "how wide is `long`?" ambiguity — the usual reason to
 distrust these names — **does not apply**, because sysl pins each width *by definition*
-(`long` is exactly `i64`, always, on every target). The ambiguity was a C portability
-artifact, not a property of the name once the language fixes the width. `i8` has no alias
-(there is no settled C-style name for a signed byte worth adopting).
+(`long` is exactly `i64`, always, on every target). A useful invariant falls out: **every
+kept integer alias matches its C namesake's width on the aarch64 LP64 ABI** (`byte`=1,
+`short`=2, `int`=4, `long`=8), which is what keeps them safe in `extern` and struct-layout
+code. `i8` has no alias (there is no settled C-style name for a signed byte worth adopting).
+Floating-point keeps a single alias — `real` = `f64` — chosen specifically to preserve that
+FFI-safety property; see §6.
 
 ## 5. Integer types are an arbitrary-width family (`iN` / `uN`)
 
@@ -157,6 +159,41 @@ Semantics generalize the existing integer rules with no special cases:
   arithmetic wraps at the declared type width" already in force for `i8`…`i64`.
 
 Several details that arbitrary width raises are not yet settled — see below.
+
+## 6. Floating-point types are a closed IEEE set (`fN`)
+
+Unlike integers, floats are **not** an arbitrary-width family. LLVM offers only a fixed
+enumerated set of floating-point types, so `fN` names only the IEEE widths that actually
+exist — there is no `f48` or `f96`. sysl exposes the four IEEE binary formats:
+
+| Type | IEEE format | Bits | Alias |
+|------|-------------|------|-------|
+| `f16` | binary16 | 16 | — |
+| `f32` | binary32 | 32 | — |
+| `f64` | binary64 | 64 | `real` |
+| `f128` | binary128 (quad) | 128 | — |
+
+Brain-float (`bfloat`) is **deliberately excluded** — it is not an IEEE type. It can be
+added later if a machine-learning use case calls for it.
+
+**aarch64 caveats.** `f128` is the standard `long double` on the aarch64 ABI and is fully
+supported, but there is essentially no hardware quad-precision arithmetic — LLVM lowers
+`f128` add/mul/div to **software routines** (compiler-rt soft-float). It is correct but far
+slower than `f64` and pulls in a runtime dependency, so it should not be reached for
+expecting `f64`-class speed. `f16` sits at the other end, with only partial hardware support
+(the FP16 extension).
+
+**Note on the sole `real` alias.** Only the default width, `f64`, gets a friendly alias, and
+it is deliberately named `real` — not `float`. `float` means 32-bit to the C / C++ / Rust /
+Go / Java / Swift world as an *ABI fact* (`sizeof(float) == 4`), so `float` = `f64` would be
+the one alias in the language that *disagrees* with its C namesake's width — breaking the
+§4 invariant that every integer alias matches its C twin on the aarch64 LP64 ABI, and doing
+so at exactly the FFI/struct-layout boundary where it corrupts silently. `real` sidesteps
+this completely: it has **no C namesake to contradict**, and the name is **width-neutral** —
+it says "a real number" (floating-point), making no size claim, so it cannot mislead the way
+`float` = f64 would. (`double` = f64 would also be safe and unambiguous, but was set aside as
+a less-preferred spelling.) The narrower and wider widths carry no alias: reach for `f32`,
+`f16`, or `f128` by their systematic names when you specifically want them.
 
 ## Open at the basics level (not yet decided)
 
