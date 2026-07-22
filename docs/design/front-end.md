@@ -50,6 +50,11 @@ existed solely to support custom operators, which are gone.
 The parser is a `PackratParsers` grammar with `type Elem = Token`, fed the `List[Token]` from
 `IndentationLexical.scan`. Rationale:
 
+- **Fast to build and change — the deciding reason.** A combinator grammar is *declarative*:
+  adding a construct or reshaping the syntax is editing grammar productions, not restructuring
+  a hand-written parser. During language design, when the grammar is still in flux, that
+  iteration speed is the priority — it keeps effort on the language itself. This is the primary
+  reason for the choice; the properties below are what make it safe to rely on.
 - **Linear-time parsing.** Packrat memoizes each `(rule, position)`, eliminating the
   backtracking blow-up that makes plain combinator parsers slow. The residual cost is constant
   factors plus an `O(input × rules)` memo table — acceptable.
