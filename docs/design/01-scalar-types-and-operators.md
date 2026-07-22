@@ -70,36 +70,40 @@ user types via traits, but no new symbols are introduced.
 | 6 | `\|` | bitwise or | left |
 | 7 | `^` | bitwise xor | left |
 | 8 | `&` | bitwise and | left |
-| 9 | `<<` `>>` | shift | left |
-| 10 | `+` `-` | add / subtract | left |
-| 11 | `*` `/` `%` | multiply / divide / remainder | left |
-| 12 | `-` `!` `~` `*` `&` `++` `--` | prefix unary — negate, not, complement, deref, addr-of, pre-inc/dec | right |
-| 13 | `[]` `.` `()` `?` `++` `--` | postfix — index, member, call, try, post-inc/dec | left |
+| 9 | `+` `-` | add / subtract | left |
+| 10 | `*` `/` `%` `<<` `>>` | multiply / divide / remainder / shift | left |
+| 11 | `-` `!` `~` `*` `&` `++` `--` | prefix unary — negate, not, complement, deref, addr-of, pre-inc/dec | right |
+| 12 | `[]` `.` `()` `?` `++` `--` | postfix — index, member, call, try, post-inc/dec | left |
 
 Key points:
 
-- **Bitwise binds tighter than comparison** (levels 6–8 vs 5) — the corrected-C fix, so
-  `x & mask == 0` means `(x & mask) == 0`.
+- **Two corrections to C's precedence** — the cases C is now widely held to have gotten wrong:
+  - **Bitwise binds tighter than comparison** (levels 6–8 vs 5), so `x & mask == 0` means
+    `(x & mask) == 0`. This is the universally-acknowledged C precedence bug.
+  - **Shift binds like multiplication** (level 10, alongside `* / %`), not looser than
+    addition as in C. A shift *is* multiply/divide by a power of two, so it groups with
+    `*` / `/`. This makes the common systems-code readings parenthesis-free:
+    `base + index << shift` = `base + (index << shift)`, and `a << 8 + b` = `(a << 8) + b`
+    — both of which C (and Rust and Zig) force you to parenthesize. This follows Go, which
+    made exactly this fix; it is a deliberate divergence from Rust/Zig toward Go.
+
+  Every other level matches C, so C muscle memory stays valid.
 - **Chained comparisons** (level 5): `a < b < c` means `a < b && b < c`, short-circuiting;
   comparisons do not associate as plain left/right.
 - **Assignment is an expression** (`00` §2): lowest precedence, right-associative
   (`a = b = c` = `a = (b = c)`).
-- `*` and `&` appear both as **prefix unary** (deref / addr-of, level 12) and as **binary**
-  (multiply level 11 / bitwise-and level 8); position disambiguates.
-- **Postfix binds tighter than prefix** (13 vs 12), which gives the intended C idioms:
+- `*` and `&` appear both as **prefix unary** (deref / addr-of, level 11) and as **binary**
+  (multiply level 10 / bitwise-and level 8); position disambiguates.
+- **Postfix binds tighter than prefix** (12 vs 11), which gives the intended C idioms:
   `*p++` = `*(p++)` (deref the post-incremented pointer), `-a.b` = `-(a.b)`.
 - **Casts/conversions are call-syntax** (`u32(c)`, `byte(0xFF)`), so they parse as postfix
-  calls (level 13), not a distinct operator.
-- **Shift binds looser than additive** (level 9 vs 10) — kept C-consistent, so
-  `1 << 2 + 3` = `1 << 5` = 32, not `(1 << 2) + 3`. This is the one mildly-surprising C
-  precedence left unchanged: sysl fixes only the genuinely bug-causing case (bitwise vs
-  comparison) and leaves the rest matching C, so C muscle memory stays valid. Parenthesize
-  when mixing shift with `+`/`-`.
+  calls (level 12), not a distinct operator.
 
 ### Firm vs provisional
 
-- **Firm:** level 1 (assignment) and levels 3–13 (the logical / comparison / bitwise / shift /
-  arithmetic / unary / postfix core) — all follow directly from decided items.
+- **Firm:** level 1 (assignment) and levels 3–12 (logical / comparison / bitwise /
+  arithmetic-with-shift / unary / postfix). The shift-at-multiplicative-level placement — a
+  deliberate fix of C's shift-vs-additive ordering — is firm.
 - **Provisional placement:** the range operators (`..` / `..<`, level 2) and try (`?`, level
-  13) are placed sensibly but their exact precedence has not been separately ratified —
+  12) are placed sensibly but their exact precedence has not been separately ratified —
   revisit when the range and error-propagation grammar is specified.
