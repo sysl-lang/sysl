@@ -112,5 +112,10 @@ allocator-free everywhere.
   with `no alloc`? Probably yes; secondary to `alloc`.
 - **Config / module-resolution details** — the HOCON `sysl.conf` schema, the target registry,
   and filename-axis platform selection are a separate design doc, still to be written.
+  **Expect the project config to be revisited repeatedly** as the language grows, and
+  especially once external libraries and dependency management arrive. Design only the minimum
+  that unblocks the work at hand (root, active target, capabilities, build flags, platform-file
+  selection); let real needs drive versioning, dependency resolution, workspaces, and
+  publishing rather than guessing at them upfront.
 - **`requires` granularity** — module-level only, or also finer? Module-level is the unit for
   now.
