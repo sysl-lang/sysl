@@ -52,3 +52,20 @@ Guidance:
   followed Go over Rust/Zig because the merits agreed; the inclusive-range spelling took
   Kotlin's `..` over Swift's `...`.
 - Where only one has made the decision (e.g. Go has no range operator), that one is the model.
+
+## 3. The three memory modes stay C-ergonomic
+
+Each of the three modes must be as easy to use as its C equivalent (or easier), and **no
+feature may add ceremony that breaks that ease**:
+
+- **Value (`T`)** — moving/passing a struct by value is as easy as in C: plain assignment and
+  argument passing, no wrapper.
+- **Raw pointer (`*T`)** — using pointers is as easy as in C.
+- **Refcounted (`&T`)** — refcounting is easy: you just use `&T` and the compiler emits the
+  retain/release. No manual retain/release, no `Rc::new` / `.clone()` ceremony.
+
+When a mechanism would otherwise put a keyword or wrapper in front of one of the modes, express
+it *through* the sigils instead. Worked example: trait objects carry **no `dyn` keyword** — a
+raw trait object is `*Trait`, a refcounted one is `&Trait`; the sigil already says it (see
+`02-traits.md`). By-value polymorphism needs no trait object at all — it is a generic bounded
+by the trait, monomorphized, moved by value.

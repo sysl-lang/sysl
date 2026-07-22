@@ -17,15 +17,23 @@ This replaces the old design's split into compile-time `trait`s and structural r
     indirection (`f[T: Trait](x: T)`).
   - **Dynamic dispatch** — a **boxed trait object** is a fat pointer `{ vtable, data }`; calls
     go through the vtable. For heterogeneous collections, drivers, plugin-style designs.
-- **Trait-object ownership is expressed through the three memory modes — not inferred.** The
-  old structural interface had an invisible `owns` flag: escape analysis silently chose
-  share-vs-heap-copy. That violated the "costs are visible" rule and is **removed**. Instead:
-  - `dyn Trait` (by value / borrowed) → a **non-owning** view of an existing value;
-  - `&Trait` → an **ARC-owned** boxed trait object (a heap box, refcounted like any `&T`);
-  - `*Trait` → a raw trait object, for kernel / no-allocator contexts.
+- **Trait-object ownership is expressed through the three memory modes — no `dyn` keyword.**
+  The old structural interface had an invisible `owns` flag (escape analysis silently chose
+  share-vs-heap-copy); that violated the "costs are visible" rule and is **removed**. A trait
+  object is inherently a fat pointer `{ vtable, data }` (an erased value has unknown size), so
+  it is spelled with a memory-mode sigil — the sigil already says everything a `dyn` keyword
+  would:
+  - `*Trait` → a **raw** fat pointer: a non-owning / unmanaged trait object, used as easily as
+    any C pointer (borrowing; kernel / no-allocator contexts);
+  - `&Trait` → an **ARC-owned** trait object (refcounted heap box, like any `&T`).
 
-  Whether a trait object owns or borrows its data is now visible in the type, reusing the
-  memory model rather than a bespoke analysis.
+  `*T` / `&T` on a *concrete* type is a thin pointer; on a *trait* it is a fat
+  (vtable-carrying) pointer — the trait-ness makes it fat. There is no `dyn`.
+- **By-value polymorphism is generics, not a trait object.** When the concrete type is known,
+  bound a generic by the trait (`f[T: Trait](x: T)`): the struct moves by value, monomorphized,
+  zero indirection — as easy as C. A trait object is only for *type-erased* polymorphism, and
+  because an erased value has unknown size it always lives behind `*Trait` / `&Trait`, never by
+  value.
 - **Retrofitting is preserved** — you can `impl` your trait for a type you don't own; you just
   do it explicitly rather than by implicit structural match.
 
@@ -51,10 +59,6 @@ This replaces the old design's split into compile-time `trait`s and structural r
 
 ## Details still to settle
 
-- **Trait-object type spelling.** The working forms are `dyn Trait` / `&Trait` / `*Trait`
-  above; confirm whether the borrowed form needs an explicit `dyn` keyword (Rust) or is just
-  the bare trait name used as a type. The memory-mode sigil already marks ownership, so a `dyn`
-  marker may be redundant — to decide.
 - **Default methods.** Whether a trait may supply default method bodies (as Swift / Kotlin /
   Scala do). Likely yes; specify with the trait-declaration grammar.
 - **Laws / invariants on traits.** The old `trait` could assert invariants ("`Ord` is a total
