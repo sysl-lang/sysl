@@ -116,23 +116,61 @@ in §1 (that name implied codepoint validity `u32` does not enforce). It is a po
 not a blanket ban: a name that is simply a clearer spelling of the exact same guarantees is
 good ergonomics, not accretion.
 
-- **`byte` = `u8`** — **kept.** A byte is exactly an unsigned 8-bit unit of memory, which is
-  precisely `u8`; the name adds no false guarantee and reads naturally in buffer and I/O
-  code.
+The full set of kept aliases:
 
-The remaining candidate aliases (`short`/`int`/`long`/`ushort`/`uint`/`ulong`/`float`/
-`double`) are still open — see below.
+| Alias | Type | | Alias | Type |
+|-------|------|---|-------|------|
+| `byte` | `u8` | | `short` | `i16` |
+| `ushort` | `u16` | | `int` | `i32` |
+| `uint` | `u32` | | `long` | `i64` |
+| `ulong` | `u64` | | `float` | `f32` |
+| `double` | `f64` | | | |
+
+Each passes the test: the name is an unambiguous common-case spelling with no promise the
+underlying type does not keep. C's "how wide is `long`?" ambiguity — the usual reason to
+distrust these names — **does not apply**, because sysl pins each width *by definition*
+(`long` is exactly `i64`, always, on every target). The ambiguity was a C portability
+artifact, not a property of the name once the language fixes the width. `i8` has no alias
+(there is no settled C-style name for a signed byte worth adopting).
+
+## 5. Integer types are an arbitrary-width family (`iN` / `uN`)
+
+`iN` and `uN` are not a fixed set of four sizes — they are an **open family parameterized by
+an arbitrary positive bit width `N`**: `i5`, `u3`, `i128`, `u12`, and so on. LLVM supports
+integer types of any width (up to `2^23 − 1` bits) natively, so this is a capability of the
+target, not something sysl emulates.
+
+**This is the whole reason the `iN`/`uN` spelling exists, and the reason the aliases in §4
+are not redundant.** If the integer types were only `{i8, i16, i32, i64}` and their unsigned
+counterparts, then carrying *both* `iN` names and C-style aliases would be two names for
+every number type with no benefit — pointless duplication. The arbitrary-width family
+resolves that: `iN`/`uN` is the **general mechanism** (any width you need, including odd
+ones for registers, bitfields, and packed formats), and the aliases (`byte`, `int`, `long`,
+…) are **friendly names for the handful of common widths**. Two layers, each earning its
+place.
+
+Semantics generalize the existing integer rules with no special cases:
+
+- **Signedness** is a sysl-level distinction (`iN` vs `uN`) that selects signed vs unsigned
+  operations; both map to LLVM's width-`N` integer, exactly as the fixed sizes already do.
+- **Wrapping** is at the declared width: `i5` arithmetic wraps mod `2^5`, matching "integer
+  arithmetic wraps at the declared type width" already in force for `i8`…`i64`.
+
+Several details that arbitrary width raises are not yet settled — see below.
 
 ## Open at the basics level (not yet decided)
 
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
 work:
 
-- **Decide the remaining integer/float type aliases** (`short`/`int`/`long`/`ushort`/`uint`/
-  `ulong`/`float`/`double`), each against the §4 test. (`byte` = `u8` is already decided —
-  kept.)
+- **Arbitrary-width integer details** (§5): storage size and alignment of a standalone
+  odd-width value (e.g. does an `i5` variable round up to a byte? to the next power of two?);
+  the maximum permitted `N`; whether `i1`/`u1` are allowed and how they relate to `bool`;
+  and whether packed structs lay out an `i5` field in exactly 5 bits (the bitfield / hardware
+  register payoff).
 - **Add `isize`/`usize`** (pointer-width integers) as core types for indexing and the
-  aarch64 ABI.
+  aarch64 ABI. Distinct from the `iN`/`uN` family because their width is target-defined
+  (64-bit on aarch64), not a literal in the name.
 - **Integer-literal default type and suffix grammar** (`42u8`, `100i64`, hex/binary,
   underscore digit separators).
 - **Indentation mechanics:** INDENT/DEDENT tokenization, block openers (`then` / `do` / `=`),
