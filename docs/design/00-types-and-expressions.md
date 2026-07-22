@@ -17,23 +17,33 @@ directly from this principle.
 
 ## Target scope (governs every decision in this document)
 
-The **implementation** targets aarch64 only for now — a single LLVM target keeps the restart
-small and the test story disciplined. But the **language is designed for 32-bit ARM
-Cortex-M embedded as an explicit intended use** — Raspberry Pi Pico (RP2040/RP2350) and
-STM32. That imposes hard constraints on the basics:
+aarch64 is the **main target and the first one wired up**, but sysl is designed to be **fully
+multi-target** — a serious systems language for the desktop host *and* the microcontrollers
+real projects use (the intended audio project targets an audio-class STM32, a Cortex-M part).
 
-- **No design decision may assume 64-bit pointers or 64-bit sizes.** Pointer width, size and
-  index width, and fat-pointer layout must be expressed in target-relative terms
-  (`isize`/`usize`), never hard-coded to `i64`/`u64`. Fat-pointer length fields, `sizeof`,
-  and `.len` are `usize`-width.
-- **Embedded ARM is a future target *triple*, not a new backend.** Same LLVM IR and codegen,
-  a different `-target` (`thumbv7em-none-eabi`, `thumbv6m-none-eabi`, …), a no-std runtime,
-  and a 32-bit data layout. This is why single-backend and multi-target do not conflict: the
-  backend is LLVM; the targets are triples.
-- **FPU reality feeds back into the type defaults.** RP2040 (Cortex-M0+) has no FPU — even
-  `f32` is soft-float; Cortex-M4F is single-precision only, so `f64` is soft-float there.
-  `real` (f64) stays a fine host default, but embedded code should prefer `f32` or
-  fixed-point (see the deferred fixed-point note).
+- **Multi-target and single-backend are not in tension.** There is exactly one code
+  generator: sysl emits LLVM IR, and a target is just a different LLVM *triple* + data layout
+  + calling convention + runtime — aarch64, ARM Cortex-M (`thumbv6m`/`thumbv7em`/`thumbv8m`,
+  for STM32 and Pico), `riscv32` (the RP2350's RISC-V cores), `x86_64`, `wasm32`. Adding a
+  target extends a table; it does not add a backend. This is the crucial distinction: the old
+  sysl's cost came from multiple *backends* — a tree-walking interpreter, a hand-rolled TRISC
+  codegen, an SVM bytecode emitter — that each re-implemented the language's semantics and
+  drifted. One LLVM backend over many triples carries none of that tax. Multi-target is the
+  *reward* for choosing LLVM, not a cost.
+- **A `Target` descriptor is threaded through the compiler from day one.** Pointer width,
+  alignment, endianness, ABI, and FPU presence are properties *read from the target*, never
+  constants baked into codegen or the type system. Only aarch64 is filled in initially — the
+  point is that adding `thumbv7em` becomes populating a descriptor, not a retrofit.
+- **No decision may assume a specific pointer width, size width, or endianness.** Pointer and
+  size/index widths use `isize`/`usize` (§7); fat-pointer length fields, `sizeof`, and `.len`
+  are `usize`-width; multi-byte memory access routes byte order through the target rather than
+  assuming little-endian (every current intended target is little-endian, but the design does
+  not hard-code it).
+- **FPU support is per-chip, so float defaults are guidance, not law.** RP2040 (Cortex-M0+)
+  has no FPU — even `f32` is soft-float; Cortex-M4F is single-precision only; but audio-class
+  STM32 parts (Cortex-M7) have a hardware FPU, double-precision included, so `real` (f64) can
+  be hardware there. `real` stays the host default; the embedded float choice follows the
+  chip's FPU, with fixed-point attractive for DSP throughput regardless (deferred note).
 
 ## 1. `char` is a distinct Unicode-scalar-value type
 
