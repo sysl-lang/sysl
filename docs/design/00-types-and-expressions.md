@@ -30,10 +30,22 @@ real projects use (the intended audio project targets an audio-class STM32, a Co
   codegen, an SVM bytecode emitter — that each re-implemented the language's semantics and
   drifted. One LLVM backend over many triples carries none of that tax. Multi-target is the
   *reward* for choosing LLVM, not a cost.
-- **A `Target` descriptor is threaded through the compiler from day one.** Pointer width,
-  alignment, endianness, ABI, and FPU presence are properties *read from the target*, never
-  constants baked into codegen or the type system. Only aarch64 is filled in initially — the
-  point is that adding `thumbv7em` becomes populating a descriptor, not a retrofit.
+- **Develop fully against aarch64 first; branch out only once the design is wart-free.** Two
+  different things hide in "single target first," and only one belongs at day one:
+  - **Portable language *semantics* — required from day one, and cheap.** A width or
+    endianness assumption baked into *language-observable* behavior becomes an unremovable
+    wart, because programs would come to depend on it. This is why `int` = i32 (not i64),
+    `.len`/`sizeof` = `usize`, `isize`/`usize` are distinct, and endianness is not assumed.
+  - **Multi-target *machinery* (a `Target` descriptor threaded through codegen) — deliberately
+    deferred.** A good target abstraction is designed against a real *second* target, not
+    speculatively against one; building it now would risk the wrong seams. RISC-V (`riscv32`,
+    rising fast in embedded — the RP2350 ships RISC-V cores) is the natural early second
+    target, and different enough from both aarch64 and ARM to flush out the real seams.
+
+  The line: **the first implementation may assume aarch64; the language spec may not.**
+  Implementation shortcuts (codegen emitting 64-bit pointer math directly, hardcoded backend
+  layout) are fine and retrofittable — they are not observable. Only the spec must stay
+  width/endian-neutral.
 - **No decision may assume a specific pointer width, size width, or endianness.** Pointer and
   size/index widths use `isize`/`usize` (§7); fat-pointer length fields, `sizeof`, and `.len`
   are `usize`-width; multi-byte memory access routes byte order through the target rather than
