@@ -66,7 +66,7 @@ user types via traits, but no new symbols are introduced.
 | 2 | `\|\|` | logical or | left |
 | 3 | `&&` | logical and | left |
 | 4 | `==` `!=` `<` `>` `<=` `>=` | comparison | chained |
-| 5 | `...` `..<` | range (inclusive / half-open) | non-assoc |
+| 5 | `..` `..<` | range (inclusive / half-open) | non-assoc |
 | 6 | `\|` | bitwise or | left |
 | 7 | `^` | bitwise xor | left |
 | 8 | `&` | bitwise and | left |
@@ -88,10 +88,14 @@ Key points:
     made exactly this fix; it is a deliberate divergence from Rust/Zig toward Go.
 
   Every other level matches C, so C muscle memory stays valid.
-- **Ranges** (level 5) follow Swift: `a...b` is inclusive (closed), `a..<b` is half-open
-  (exclusive end), with one-sided forms (`a...`, `...b`, `..<b`). Non-associative. Placed
-  below arithmetic (so `0..<n+1` = `0..<(n+1)`) and above comparison, matching Swift. The
-  spelling avoids `..`'s cross-language ambiguity (exclusive in Rust, inclusive in Kotlin).
+- **Ranges** (level 5): `a..b` inclusive (closed), `a..<b` half-open (exclusive end),
+  one-sided forms (`a..`, `..b`, `..<b`), non-associative. **Precedence and semantics follow
+  Swift** — below arithmetic (so `0..<n+1` = `0..<(n+1)`) and above comparison. The
+  **spelling deviates from Swift** (`...`) toward the Kotlin convention `..` / `..<` — a
+  merit-based deviation (principles §2): the two forms are visually parallel and read as
+  "through" / "up to, less than." (`..` is exclusive in Rust but inclusive here, as in
+  Kotlin.) Lexes unambiguously: a float literal requires digits after the `.`, so `1..2`
+  tokenizes as `1 .. 2`.
 - **Chained comparisons** (level 4): `a < b < c` means `a < b && b < c`, short-circuiting;
   comparisons do not associate as plain left/right.
 - **Assignment is an expression** (`00` §2): lowest precedence, right-associative
@@ -107,6 +111,6 @@ Key points:
 
 - **Firm:** level 1 (assignment) and levels 2–12 (logical / comparison / range / bitwise /
   arithmetic-with-shift / unary / postfix). The shift-at-multiplicative-level placement (fix
-  of C's shift-vs-additive ordering) and the Swift-style ranges (level 5) are both firm.
+  of C's shift-vs-additive ordering) and the ranges (level 5) are both firm.
 - **Provisional placement:** only try (`?`, level 12) — placed sensibly but not separately
   ratified; revisit when the error-propagation grammar is specified.
