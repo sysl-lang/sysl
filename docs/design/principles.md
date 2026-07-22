@@ -24,3 +24,22 @@ enthusiasm**. The default is to write each piece fresh against the current desig
 This does not forbid reuse — it forbids *reflexive* reuse. When an old piece is genuinely,
 exactly what the new design wants, reuse it consciously and say why. The rule is that the
 burden of proof is on reuse, not on rewriting.
+
+## 2. Default to Swift/Go precedent
+
+For design decisions where **Swift and/or Go** have made a considered choice, follow their
+lead by default rather than reinventing or inheriting C/C++ legacy. They are modern,
+well-designed, pragmatic languages, and leaning on their decisions kills a large amount of
+bikeshedding.
+
+- **When they conflict, weigh by fit with sysl's nature.** sysl's DNA aligns more with
+  **Swift**: ARC (Swift), not GC (Go); operator overloading and traits (Swift has both, Go
+  has neither); embedded-capable (Embedded Swift exists). So for type-system and semantics
+  questions, lean Swift. **Go is the reference for minimalism and systems-pragmatism** — reach
+  for it on "is this simple enough?" questions.
+- **This is a default, not a mandate.** It is always sanity-checked on the merits. Sometimes
+  the merits point elsewhere — e.g. shift-precedence followed Go over Rust/Zig *because* the
+  merits agreed (and Swift happened to concur). The principle removes the need to argue every
+  small choice from first principles; it does not override a clear better answer.
+- Where only one of the two has made the decision (e.g. Go has no range operator), the one
+  that has is the model.

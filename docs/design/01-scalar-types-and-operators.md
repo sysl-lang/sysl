@@ -63,10 +63,10 @@ user types via traits, but no new symbols are introduced.
 | Prec | Operators | Role | Assoc |
 |---|---|---|---|
 | 1 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | assignment (expression) | right |
-| 2 | `..` `..<` | range | non-assoc |
-| 3 | `\|\|` | logical or | left |
-| 4 | `&&` | logical and | left |
-| 5 | `==` `!=` `<` `>` `<=` `>=` | comparison | chained |
+| 2 | `\|\|` | logical or | left |
+| 3 | `&&` | logical and | left |
+| 4 | `==` `!=` `<` `>` `<=` `>=` | comparison | chained |
+| 5 | `...` `..<` | range (inclusive / half-open) | non-assoc |
 | 6 | `\|` | bitwise or | left |
 | 7 | `^` | bitwise xor | left |
 | 8 | `&` | bitwise and | left |
@@ -78,7 +78,7 @@ user types via traits, but no new symbols are introduced.
 Key points:
 
 - **Two corrections to C's precedence** — the cases C is now widely held to have gotten wrong:
-  - **Bitwise binds tighter than comparison** (levels 6–8 vs 5), so `x & mask == 0` means
+  - **Bitwise binds tighter than comparison** (levels 6–8 vs 4), so `x & mask == 0` means
     `(x & mask) == 0`. This is the universally-acknowledged C precedence bug.
   - **Shift binds like multiplication** (level 10, alongside `* / %`), not looser than
     addition as in C. A shift *is* multiply/divide by a power of two, so it groups with
@@ -88,7 +88,11 @@ Key points:
     made exactly this fix; it is a deliberate divergence from Rust/Zig toward Go.
 
   Every other level matches C, so C muscle memory stays valid.
-- **Chained comparisons** (level 5): `a < b < c` means `a < b && b < c`, short-circuiting;
+- **Ranges** (level 5) follow Swift: `a...b` is inclusive (closed), `a..<b` is half-open
+  (exclusive end), with one-sided forms (`a...`, `...b`, `..<b`). Non-associative. Placed
+  below arithmetic (so `0..<n+1` = `0..<(n+1)`) and above comparison, matching Swift. The
+  spelling avoids `..`'s cross-language ambiguity (exclusive in Rust, inclusive in Kotlin).
+- **Chained comparisons** (level 4): `a < b < c` means `a < b && b < c`, short-circuiting;
   comparisons do not associate as plain left/right.
 - **Assignment is an expression** (`00` §2): lowest precedence, right-associative
   (`a = b = c` = `a = (b = c)`).
@@ -101,9 +105,8 @@ Key points:
 
 ### Firm vs provisional
 
-- **Firm:** level 1 (assignment) and levels 3–12 (logical / comparison / bitwise /
-  arithmetic-with-shift / unary / postfix). The shift-at-multiplicative-level placement — a
-  deliberate fix of C's shift-vs-additive ordering — is firm.
-- **Provisional placement:** the range operators (`..` / `..<`, level 2) and try (`?`, level
-  12) are placed sensibly but their exact precedence has not been separately ratified —
-  revisit when the range and error-propagation grammar is specified.
+- **Firm:** level 1 (assignment) and levels 2–12 (logical / comparison / range / bitwise /
+  arithmetic-with-shift / unary / postfix). The shift-at-multiplicative-level placement (fix
+  of C's shift-vs-additive ordering) and the Swift-style ranges (level 5) are both firm.
+- **Provisional placement:** only try (`?`, level 12) — placed sensibly but not separately
+  ratified; revisit when the error-propagation grammar is specified.
