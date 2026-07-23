@@ -3,20 +3,21 @@ package io.github.edadma.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** Parsing of control flow: `if`/`elif`/`else` and `while`, block and inline (Scala-style
- * `then`/`do`) bodies, and correct dedenting of nested blocks.
+ * `then`/`do`) bodies, and correct dedenting of nested blocks. `if` is an expression, so in
+ * statement position it appears as an `IfExpr` inside an `ExprStmt` (the `ifStmt` helper).
  */
 class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
 
   "blocks" - {
     "an if with an else block" in {
       prog("if x\n    print(1)\nelse\n    print(2)") shouldBe List(
-        If(Ident("x"), List(printStmt(i(1))), List(printStmt(i(2))))
+        ifStmt(Ident("x"), List(printStmt(i(1))), Some(List(printStmt(i(2)))))
       )
     }
 
-    "an if with no else has an empty else body" in {
+    "an if with no else has no else body" in {
       prog("if x\n    print(1)") shouldBe List(
-        If(Ident("x"), List(printStmt(i(1))), Nil)
+        ifStmt(Ident("x"), List(printStmt(i(1))))
       )
     }
 
@@ -34,7 +35,7 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
         While(
           Ident("a"),
           List(
-            If(Ident("b"), List(printStmt(i(1))), Nil),
+            ifStmt(Ident("b"), List(printStmt(i(1)))),
             printStmt(i(2)),
           ),
         )
@@ -80,25 +81,25 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
   "inline if/then/else" - {
     "an inline if/then/else" in {
       prog("if x then print(1) else print(2)") shouldBe List(
-        If(Ident("x"), List(printStmt(i(1))), List(printStmt(i(2))))
+        ifStmt(Ident("x"), List(printStmt(i(1))), Some(List(printStmt(i(2)))))
       )
     }
 
     "an inline if with no else" in {
       prog("if x then print(1)") shouldBe List(
-        If(Ident("x"), List(printStmt(i(1))), Nil)
+        ifStmt(Ident("x"), List(printStmt(i(1))))
       )
     }
 
     "a block `then` with an inline `else`" in {
       prog("if x then\n    print(1)\nelse print(2)") shouldBe List(
-        If(Ident("x"), List(printStmt(i(1))), List(printStmt(i(2))))
+        ifStmt(Ident("x"), List(printStmt(i(1))), Some(List(printStmt(i(2)))))
       )
     }
 
     "an inline then with else on its own line" in {
       prog("if cond then true_part()\nelse false_part()") shouldBe List(
-        If(Ident("cond"), List(callStmt("true_part")), List(callStmt("false_part")))
+        ifStmt(Ident("cond"), List(callStmt("true_part")), Some(List(callStmt("false_part"))))
       )
     }
   }
@@ -106,19 +107,31 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
   "elif chains" - {
     "an elif chain nests into the else branch" in {
       prog("if a then\n    print(1)\nelif b then\n    print(2)\nelse\n    print(3)") shouldBe List(
-        If(Ident("a"), List(printStmt(i(1))), List(If(Ident("b"), List(printStmt(i(2))), List(printStmt(i(3))))))
+        ifStmt(
+          Ident("a"),
+          List(printStmt(i(1))),
+          Some(List(ifStmt(Ident("b"), List(printStmt(i(2))), Some(List(printStmt(i(3))))))),
+        )
       )
     }
 
     "an inline elif chain" in {
       prog("if a then x()\nelif b then y()\nelse z()") shouldBe List(
-        If(Ident("a"), List(callStmt("x")), List(If(Ident("b"), List(callStmt("y")), List(callStmt("z")))))
+        ifStmt(
+          Ident("a"),
+          List(callStmt("x")),
+          Some(List(ifStmt(Ident("b"), List(callStmt("y")), Some(List(callStmt("z")))))),
+        )
       )
     }
 
     "an elif with no else leaves the innermost else empty" in {
       prog("if a then x()\nelif b then y()") shouldBe List(
-        If(Ident("a"), List(callStmt("x")), List(If(Ident("b"), List(callStmt("y")), Nil)))
+        ifStmt(
+          Ident("a"),
+          List(callStmt("x")),
+          Some(List(ifStmt(Ident("b"), List(callStmt("y"))))),
+        )
       )
     }
   }

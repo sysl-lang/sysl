@@ -8,5 +8,5 @@ package io.github.edadma.sysl
 object Compiler {
 
   def compileToLlvm(source: String): Either[String, String] =
-    SyslParser.parse(source).flatMap(Codegen.generate)
+    SyslParser.parse(source).flatMap(Analyzer.analyze).map(Codegen.generate)
 }

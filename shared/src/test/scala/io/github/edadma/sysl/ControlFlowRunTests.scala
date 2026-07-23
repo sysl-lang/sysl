@@ -102,4 +102,54 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "5! = 120\n"
   }
+
+  "an inclusive for range sums its bounds" in {
+    val src =
+      """var total = 0
+        |for i in 1..5
+        |    total = total + i
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "15\n"
+  }
+
+  "an exclusive for range stops before its upper bound" in {
+    val src =
+      """var total = 0
+        |for i in 0..<5 do total = total + i
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "10\n"
+  }
+
+  "nested for loops accumulate" in {
+    val src =
+      """var grid = 0
+        |for i in 0..<3
+        |    for j in 0..<3
+        |        grid = grid + i * j
+        |print(grid)""".stripMargin
+
+    run(src) shouldBe "9\n"
+  }
+
+  "if used as a value binds the taken branch" in {
+    val src =
+      """var n = 7
+        |var label = if n % 2 == 0 then "even" else "odd"
+        |print(label)""".stripMargin
+
+    run(src) shouldBe "odd\n"
+  }
+
+  "a for loop variable shadows an outer variable" in {
+    val src =
+      """var i = 100
+        |var sum = 0
+        |for i in 1..3
+        |    sum = sum + i
+        |print(i, sum)""".stripMargin
+
+    run(src) shouldBe "100 6\n"
+  }
 }

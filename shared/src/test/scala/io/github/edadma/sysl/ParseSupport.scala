@@ -32,4 +32,8 @@ trait ParseSupport extends Matchers { this: Assertions =>
 
   /** A no-argument call `name()` as a statement. */
   protected def callStmt(name: String): Stmt = ExprStmt(Call(Ident(name), Nil))
+
+  /** `if cond …` in statement position — an `IfExpr` wrapped in an `ExprStmt`. */
+  protected def ifStmt(cond: Expr, thenBody: List[Stmt], elseBody: Option[List[Stmt]] = None): Stmt =
+    ExprStmt(IfExpr(cond, thenBody, elseBody))
 }

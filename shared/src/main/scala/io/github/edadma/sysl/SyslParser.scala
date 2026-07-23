@@ -52,7 +52,10 @@ class SyslParser extends PackratParsers {
 
   // --- expressions ---------------------------------------------------------------------
 
-  lazy val expression: PackratParser[Expr] = assignment
+  /** `if` and `match` are expressions (they yield the taken branch's value), so they sit at
+   * the top of the grammar — an ordinary operand everywhere an expression is expected.
+   */
+  lazy val expression: PackratParser[Expr] = ifExpr | matchExpr | assignment
 
   private def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))
@@ -149,7 +152,8 @@ class SyslParser extends PackratParsers {
 
   // --- statements ----------------------------------------------------------------------
 
-  lazy val statement: PackratParser[Stmt] = varDecl | ifStmt | whileStmt | exprStmt
+  lazy val statement: PackratParser[Stmt] =
+    structDecl | funcDecl | varDecl | forStmt | whileStmt | returnStmt | exprStmt
 
   private lazy val typeRef: Parser[TypeRef] = ident ^^ NamedType.apply
 
@@ -159,6 +163,34 @@ class SyslParser extends PackratParsers {
     }
 
   private lazy val exprStmt: PackratParser[Stmt] = expression ^^ ExprStmt.apply
+
+  private lazy val returnStmt: PackratParser[Stmt] =
+    op("return") ~> opt(expression) ^^ Return.apply
+
+  /** One `name: type` binding — a function parameter or a struct field. */
+  private lazy val param: Parser[Param] =
+    ident ~ (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) }
+
+  /** A function declaration, Scala-style but keyword-less: `name(params) -> ret = expr` or a
+   * block body, `-> ret` optional (absent ⇒ `unit`). It is tried before an expression
+   * statement; a bare call `foo(1)` fails here (its arguments are not `name: type` bindings,
+   * and nothing follows to open a body) and falls through to `exprStmt`.
+   */
+  private lazy val funcDecl: PackratParser[Stmt] =
+    ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody ^^ {
+      case name ~ params ~ ret ~ body => FuncDecl(name, params, ret, body)
+    }
+
+  /** A function body is either an `= expr` short form (whose value is the return value) or an
+   * indented block (whose trailing expression is the return value).
+   */
+  private lazy val funcBody: PackratParser[List[Stmt]] =
+    op("=") ~> (suite | expression ^^ (e => List(ExprStmt(e)))) | suite
+
+  private lazy val structDecl: PackratParser[Stmt] =
+    op("struct") ~> ident ~ (newline ~> indent ~> opt(newlines) ~> repsep(param, newlines) <~ opt(newlines) <~ dedent) ^^ {
+      case name ~ fields => StructDecl(name, fields)
+    }
 
   /** An indented block: a leading `Newline`+`Indent` (the lexer's off-side signal) wraps a
    * statement sequence closed by `Dedent`.
@@ -176,16 +208,21 @@ class SyslParser extends PackratParsers {
   private def body(keyword: String): Parser[List[Stmt]] =
     op(keyword) ~> (suite | inlineBody) | suite
 
-  private lazy val ifStmt: PackratParser[Stmt] =
+  /** `if cond then a else b` — an expression. Its branches are statement lists whose trailing
+   * expression is the branch value; `elif` nests into the else branch, and the `else` is
+   * optional (a missing one gives an open branch that only the analyzer's unit rule allows).
+   */
+  private lazy val ifExpr: PackratParser[Expr] =
     op("if") ~> expression ~ body("then") ~ rep(elifClause) ~ opt(elseClause) ~ opt(endMarker("if")) ^^ {
       case c ~ t ~ elifs ~ e ~ _ =>
-        val chained = elifs.foldRight(e.getOrElse(Nil)) { case ((ec, eb), acc) => List(If(ec, eb, acc)) }
-        If(c, t, chained)
+        val elseChain = elifs.foldRight(e) { case ((ec, eb), acc) => Some(List(ExprStmt(IfExpr(ec, eb, acc)))) }
+        IfExpr(c, t, elseChain)
     }
 
   /** `end` is a soft keyword — an ordinary identifier everywhere except immediately before a
-   * construct keyword, where `end if` / `end while` close the preceding block Scala-style. It
-   * is optional; matching it here (rather than reserving `end`) keeps `end` usable as a name.
+   * construct keyword, where `end if` / `end while` / `end for` close the preceding block
+   * Scala-style. It is optional; matching it here (rather than reserving `end`) keeps `end`
+   * usable as a name.
    */
   private lazy val softEnd: Parser[Unit] =
     accept("'end'", { case t: lexical.Identifier if t.chars == "end" => () })
@@ -207,6 +244,43 @@ class SyslParser extends PackratParsers {
 
   private lazy val whileStmt: PackratParser[Stmt] =
     op("while") ~> expression ~ body("do") ~ opt(endMarker("while")) ^^ { case c ~ b ~ _ => While(c, b) }
+
+  private lazy val forStmt: PackratParser[Stmt] =
+    op("for") ~> ident ~ (op("in") ~> expression) ~ body("do") ~ opt(endMarker("for")) ^^ {
+      case n ~ it ~ b ~ _ => For(n, it, b)
+    }
+
+  // --- match ---------------------------------------------------------------------------
+
+  /** `match scrutinee` followed by an indented list of `pattern[, pattern…] [if guard] -> body`
+   * arms — an expression yielding the taken arm's value.
+   */
+  private lazy val matchExpr: PackratParser[Expr] =
+    op("match") ~> expression ~ (newline ~> indent ~> opt(newlines) ~> repsep(matchArm, newlines) <~ opt(newlines) <~ dedent) ^^ {
+      case scrut ~ arms => MatchExpr(scrut, arms)
+    }
+
+  private lazy val matchArm: Parser[MatchArm] =
+    op("else") ~> (op("->") ~> (suite | inlineBody)) ^^ (b => MatchArm(List(WildcardPattern), None, b)) |
+      repsep(pattern, op(",")) ~ opt(op("if") ~> expression) ~ (op("->") ~> (suite | inlineBody)) ^^ {
+        case pats ~ guard ~ b => MatchArm(pats, guard, b)
+      }
+
+  /** Patterns are literals, literal ranges, or the `_` wildcard for now — enough for scalar
+   * `match`; binding and destructuring patterns arrive with enums.
+   */
+  private lazy val pattern: Parser[Pattern] =
+    patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
+      wildcard ^^^ WildcardPattern |
+      patternLit ^^ LitPattern.apply
+
+  private lazy val wildcard: Parser[Unit] =
+    accept("'_'", { case t: lexical.Identifier if t.chars == "_" => () })
+
+  /** A pattern literal: any scalar literal, or a negated numeric literal. */
+  private lazy val patternLit: Parser[Expr] =
+    op("-") ~> (floatLit | intLit) ^^ (e => Unary("-", e)) |
+      floatLit | intLit | charLit | strLit | boolLit
 
   private lazy val statements: PackratParser[List[Stmt]] =
     opt(newlines) ~> repsep(statement, newlines) <~ opt(newlines)
