@@ -250,22 +250,10 @@ class Codegen private (program: TProgram) {
       acc
 
     case TEnumNew(en, variant, args) =>
-      if en.simple then variant.tag.toString
-      else
-        val tagged = freshTemp()
-        emit(s"$tagged = insertvalue ${en.llvm} undef, i32 ${variant.tag}, 0")
-        variant.payloadSlot match
-          case None => tagged
-          case Some(slot) =>
-            val vals    = args.map(genExpr)
-            var payload = "undef"
-            for (v, i) <- vals.zipWithIndex do
-              val r = freshTemp()
-              emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, ${variant.fields(i)._2.llvm} $v, $i")
-              payload = r
-            val r = freshTemp()
-            emit(s"$r = insertvalue ${en.llvm} $tagged, ${en.payloadLlvm(variant)} $payload, $slot")
-            r
+      enumValue(en, variant, args.map(genExpr))
+
+    case TTry(operand, ok, fail, retEnum, retFail, _) =>
+      genTry(operand, ok, fail, retEnum, retFail)
 
     case TField(receiver, index, ty) =>
       val rv = genExpr(receiver); val r = freshTemp()
@@ -282,6 +270,67 @@ class Codegen private (program: TProgram) {
 
     case TMatch(scrutinee, arms, ty) =>
       genMatch(scrutinee, arms, ty)
+
+  /** Builds an enum value from already-lowered payload values: the tag, then the variant's
+   * payload aggregate dropped into its slot.
+   */
+  private def enumValue(en: Type.Enum, variant: Type.EnumVariant, vals: List[String]): String =
+    if en.simple then variant.tag.toString
+    else
+      val tagged = freshTemp()
+      emit(s"$tagged = insertvalue ${en.llvm} undef, i32 ${variant.tag}, 0")
+      variant.payloadSlot match
+        case None => tagged
+        case Some(slot) =>
+          var payload = "undef"
+          for (v, i) <- vals.zipWithIndex do
+            val r = freshTemp()
+            emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, ${variant.fields(i)._2.llvm} $v, $i")
+            payload = r
+          val r = freshTemp()
+          emit(s"$r = insertvalue ${en.llvm} $tagged, ${en.payloadLlvm(variant)} $payload, $slot")
+          r
+
+  /** Reads every field of a variant's payload out of an enum value. */
+  private def payloadFields(en: Type.Enum, variant: Type.EnumVariant, value: String): List[String] =
+    variant.payloadSlot match
+      case None => Nil
+      case Some(slot) =>
+        val p = freshTemp()
+        emit(s"$p = extractvalue ${en.llvm} $value, $slot")
+        variant.fields.indices.map { i =>
+          val f = freshTemp()
+          emit(s"$f = extractvalue ${en.payloadLlvm(variant)} $p, $i")
+          f
+        }.toList
+
+  /** `expr?` — on success the payload becomes the expression's value; on failure the function
+   * returns immediately with the failure re-wrapped in its own return type, carrying the error
+   * payload across unchanged.
+   */
+  private def genTry(
+      operand: TExpr,
+      ok: Type.EnumVariant,
+      fail: Type.EnumVariant,
+      retEnum: Type.Enum,
+      retFail: Type.EnumVariant,
+  ): String = {
+    val en = operand.ty.asInstanceOf[Type.Enum]
+    val v  = genExpr(operand)
+
+    val tag  = freshTemp(); emit(s"$tag = extractvalue ${en.llvm} $v, 0")
+    val isOk = freshTemp(); emit(s"$isOk = icmp eq i32 $tag, ${ok.tag}")
+
+    val okL   = freshLabel("try.ok")
+    val failL = freshLabel("try.fail")
+    emitTerm(s"br i1 $isOk, label %$okL, label %$failL")
+
+    emitLabel(failL)
+    emitTerm(s"ret ${retEnum.llvm} ${enumValue(retEnum, retFail, payloadFields(en, fail, v))}")
+
+    emitLabel(okL)
+    payloadFields(en, ok, v).head
+  }
 
   private def genIf(cond: TExpr, thenBlock: TBlock, elseBlock: Option[TBlock], ty: Type): String = {
     val c      = genExpr(cond)

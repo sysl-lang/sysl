@@ -22,6 +22,7 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
       prog("enum Color\n    Red\n    Green\n    Blue = 10\n    Yellow") shouldBe List(
         EnumDecl(
           "Color",
+          Nil,
           List(
             EnumVariantDecl("Red", None, Nil),
             EnumVariantDecl("Green", None, Nil),
@@ -36,6 +37,7 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
       prog("enum Shape\n    Circle(radius: int)\n    Rect(w: int, h: int)\n    Empty") shouldBe List(
         EnumDecl(
           "Shape",
+          Nil,
           List(
             EnumVariantDecl("Circle", None, List(Param("radius", NamedType("int")))),
             EnumVariantDecl("Rect", None, List(Param("w", NamedType("int")), Param("h", NamedType("int")))),
@@ -65,15 +67,15 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
   "end markers" - {
     "a matching end name closes a struct" in {
       prog("struct Point\n    x: int\nend Point") shouldBe List(
-        StructDecl("Point", List(Param("x", NamedType("int"))))
+        StructDecl("Point", Nil, List(Param("x", NamedType("int"))))
       )
     }
 
     "a matching end name closes an enum and a function" in {
       val src = "enum E\n    A\n    B\nend E\nf() -> int\n    1\nend f"
       prog(src) shouldBe List(
-        EnumDecl("E", List(EnumVariantDecl("A", None, Nil), EnumVariantDecl("B", None, Nil))),
-        FuncDecl("f", Nil, Some(NamedType("int")), List(ExprStmt(i(1)))),
+        EnumDecl("E", Nil, List(EnumVariantDecl("A", None, Nil), EnumVariantDecl("B", None, Nil))),
+        FuncDecl("f", Nil, Nil, Some(NamedType("int")), List(ExprStmt(i(1)))),
       )
     }
 

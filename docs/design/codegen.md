@@ -11,13 +11,16 @@ be unwound deliberately rather than discovered later.
 - **Parser** (`SyslParser`) — a packrat grammar over the lexer's token list, producing the
   untyped `ast.scala` tree.
 - **Analyzer** (`Analyzer`) — the semantic pass. It hoists declarations, resolves names and
-  types, checks every rule that can fail, and emits the *typed* tree (`tast.scala`). Every
-  diagnostic lives here; codegen trusts the tree it is handed.
+  types, checks every rule that can fail, monomorphizes generics, and emits the *typed* tree
+  (`tast.scala`). Every diagnostic lives here; codegen trusts the tree it is handed.
 - **Codegen** (`Codegen`) — a straight lowering of the typed tree to textual LLVM IR. It
   selects instructions from the types the tree carries and lays out basic blocks; it makes no
   semantic decision of its own.
 
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
+
+A short **prelude** (`Prelude`) of ordinary sysl source — the `Option` and `Result` enums — is
+parsed once and hoisted ahead of the user's own declarations.
 
 ## What runs today
 
@@ -51,6 +54,18 @@ before they appear and may be mutually recursive).
 - **`end` markers.** A `struct`, `enum`, or function block may optionally be closed by
   `end Name`, whose name the parser checks against the declaration's own. `end` is a soft
   keyword, so it remains usable as an identifier.
+- **Generics, monomorphized.** Functions, structs, and enums may take type parameters
+  (`id[T](x: T) -> T`, `struct Box[T]`, `enum Option[T]`), and a named type may be applied to
+  type arguments (`Box[int]`, `Result[int, string]`). Each distinct set of type arguments is
+  instantiated into its own function or aggregate under a mangled name, so codegen never sees
+  a type parameter. Type arguments are **inferred** from the argument types, and from the type
+  the surrounding context expects when the arguments alone do not determine them — which is
+  what lets `var o: Option[int] = None` and `f() -> Result[int, string] = Ok(5)` work. There is
+  no syntax for applying type arguments explicitly at a call site.
+- **`Option[T]` / `Result[T, E]` and `?`.** Both come from the prelude as ordinary generic
+  enums. The postfix `?` unwraps the success payload of one, or returns from the enclosing
+  function early with the failure re-wrapped in *that* function's return type — so `?` needs
+  the caller to return the same one, and to propagate the same error type.
 - **Expressions:** the full settled precedence grammar (`01`), over `int` (i32), `real` (f64),
   `bool`, and string literals. `++`/`--`, unary `-`/`!`/`~`, chained comparison.
 - **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed space-separated
@@ -69,7 +84,10 @@ lowers to a value aggregate `%enum.Name = type { i32 tag, payload₁, … }` wit
 per data-carrying variant (each payload a named `%Name.Variant` aggregate). A pattern test is a
 tag `icmp` plus `extractvalue` reads of the payload fields (pure, so nested fields are read
 unconditionally and a failed outer tag simply ANDs a `false` through); bindings are stored into
-fresh slots only once the arm — and its guard — is taken.
+fresh slots only once the arm — and its guard — is taken. An instantiated generic name is
+flattened into its LLVM name — `Result[int, string]` becomes `%enum.Result.int.string` and
+`id[T]` at `int` becomes `@id.int` — which stays unambiguous because every name has a fixed
+arity.
 
 ## Deliberate shortcuts (unwind these as the language grows)
 
@@ -81,15 +99,15 @@ fresh slots only once the arm — and its guard — is taken.
    unique register within its function), but there is no SSA/`phi` construction — `if`/`match`
    values route through a stack slot.
 3. **Functions are keyword-less with mandatory `(params)`.** Parameterless functions
-   (`name -> T`), inner `def`, default arguments, generics, and the pure/effect (`def` vs
-   plain) distinction are all deferred. The keyword-less form is disambiguated from a call by
-   the typed parameter list and a following body.
+   (`name -> T`), inner `def`, default arguments, and the pure/effect (`def` vs plain)
+   distinction are all deferred. The keyword-less form is disambiguated from a call by the
+   typed parameter list and a following body.
 4. **Value structs and enums only.** No `new`/heap allocation, no refs (`&T`) or the
-   ref-counted path, no recursive types, no nested-lvalue field assignment (`a.b.c = v`), no
-   methods, no generics — so `Option[T]` / `Result[T, E]` and the `?` operator wait on
-   generics. A data enum reserves storage for *every* variant's payload at once (a value
-   aggregate, no size arithmetic), which is wasteful but needs no heap; recursive enums (a
-   variant referencing its own enum) would be an infinite type and are rejected once refs land.
+   ref-counted path, no recursive types, no nested-lvalue field assignment (`a.b.c = v`), and
+   no methods. A data enum reserves storage for *every* variant's payload at once (a value
+   aggregate, no size arithmetic), which is wasteful but needs no heap; a type that contains
+   itself has no finite size and is rejected outright, which is what makes recursive enums
+   (`Add(Expr, Expr)`) wait on references.
 5. **Enum-match exhaustiveness ignores nested coverage.** An unguarded arm covers its variant
    only when every sub-pattern is irrefutable (a binding or `_`); an arm with a nested variant
    or literal sub-pattern does not count, so `Wrap(A) | Wrap(B)` covering `Wrap(Inner)` still
@@ -102,6 +120,12 @@ fresh slots only once the arm — and its guard — is taken.
    it should. Bind operands to a temp and short-circuit once that matters.
 8. **`for` iterates an integer range only.** Array/slice iteration, `downTo`, `step`, and
    `reverse` are not yet lowered.
+9. **Generics are monomorphized with local inference only.** Type arguments come from the
+   argument types and the expected type of the expression; there is no unification across a
+   whole function body, no explicit type application at a call site, and no bounds or
+   constraints on a type parameter. A parameter nothing determines is an error rather than a
+   default. `?` is wired to the prelude's `Option` and `Result` **by name**, standing in for
+   the eventual trait that will describe "can be short-circuited".
 
 None of these are load-bearing design decisions — they are the smallest lowering that runs a
 real program, chosen so the pieces above them (wider types, enums, methods) can be added

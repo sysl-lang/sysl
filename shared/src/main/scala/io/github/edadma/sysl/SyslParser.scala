@@ -155,7 +155,15 @@ class SyslParser extends PackratParsers {
   lazy val statement: PackratParser[Stmt] =
     structDecl | enumDecl | funcDecl | varDecl | forStmt | whileStmt | returnStmt | exprStmt
 
-  private lazy val typeRef: Parser[TypeRef] = ident ^^ NamedType.apply
+  /** A type: a name, optionally applied to type arguments (`Box[int]`, `Result[T, string]`). */
+  private lazy val typeRef: Parser[TypeRef] =
+    ident ~ opt(op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")) ^^ {
+      case n ~ args => NamedType(n, args.getOrElse(Nil))
+    }
+
+  /** The `[T, U]` type-parameter list of a generic declaration. */
+  private lazy val typeParams: Parser[List[String]] =
+    op("[") ~> rep1sep(ident, op(",")) <~ op("]")
 
   private lazy val varDecl: PackratParser[Stmt] =
     op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
@@ -171,15 +179,15 @@ class SyslParser extends PackratParsers {
   private lazy val param: Parser[Param] =
     ident ~ (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) }
 
-  /** A function declaration, Scala-style but keyword-less: `name(params) -> ret = expr` or a
-   * block body, `-> ret` optional (absent ⇒ `unit`). It is tried before an expression
+  /** A function declaration, Scala-style but keyword-less: `name[T…](params) -> ret = expr` or
+   * a block body, `-> ret` optional (absent ⇒ `unit`). It is tried before an expression
    * statement; a bare call `foo(1)` fails here (its arguments are not `name: type` bindings,
    * and nothing follows to open a body) and falls through to `exprStmt`.
    */
   private lazy val funcDecl: PackratParser[Stmt] =
-    ident >> { name =>
+    ident ~ opt(typeParams) >> { case name ~ tps =>
       (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
-        case params ~ ret ~ body => FuncDecl(name, params, ret, body)
+        case params ~ ret ~ body => FuncDecl(name, tps.getOrElse(Nil), params, ret, body)
       }
     }
 
@@ -190,19 +198,19 @@ class SyslParser extends PackratParsers {
     op("=") ~> (suite | expression ^^ (e => List(ExprStmt(e)))) | suite
 
   private lazy val structDecl: PackratParser[Stmt] =
-    op("struct") ~> ident >> { name =>
+    op("struct") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
       (newline ~> indent ~> opt(newlines) ~> repsep(param, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
-        fields => StructDecl(name, fields)
+        fields => StructDecl(name, tps.getOrElse(Nil), fields)
       }
     }
 
-  /** `enum Name` with indented variants. A variant is a bare name (`Empty`), a name with an
+  /** `enum Name[T…]` with indented variants. A variant is a bare name (`Empty`), a name with an
    * explicit integer value (`Blue = 10`), or a name with a payload (`Circle(radius: int)`).
    */
   private lazy val enumDecl: PackratParser[Stmt] =
-    op("enum") ~> ident >> { name =>
+    op("enum") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
       (newline ~> indent ~> opt(newlines) ~> repsep(enumVariant, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
-        variants => EnumDecl(name, variants)
+        variants => EnumDecl(name, tps.getOrElse(Nil), variants)
       }
     }
 

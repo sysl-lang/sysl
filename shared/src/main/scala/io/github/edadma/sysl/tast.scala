@@ -56,6 +56,23 @@ case class TEnumNew(enumTy: Type.Enum, variant: Type.EnumVariant, args: List[TEx
   def ty: Type = enumTy
 }
 
+/** The postfix `?` on an `Option`/`Result` value: yields the success payload, or returns the
+ * enclosing function early with the failure re-wrapped in *its* return type.
+ *
+ *   - `okVariant` / `failVariant` are the operand's two variants.
+ *   - `retEnum` / `retFail` are the enclosing function's return enum and *its* failing
+ *     variant, which the early return constructs (carrying the operand's error payload, if
+ *     the variant has one).
+ */
+case class TTry(
+    operand: TExpr,
+    okVariant: Type.EnumVariant,
+    failVariant: Type.EnumVariant,
+    retEnum: Type.Enum,
+    retFail: Type.EnumVariant,
+    ty: Type,
+) extends TExpr
+
 /** Read field `index` of a struct value. */
 case class TField(receiver: TExpr, index: Int, ty: Type) extends TExpr
 

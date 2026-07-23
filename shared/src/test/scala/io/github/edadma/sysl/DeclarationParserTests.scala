@@ -12,6 +12,7 @@ class DeclarationParserTests extends AnyFreeSpec with ParseSupport {
       prog("add(a: int, b: int) -> int = a + b") shouldBe List(
         FuncDecl(
           "add",
+          Nil,
           List(Param("a", NamedType("int")), Param("b", NamedType("int"))),
           Some(NamedType("int")),
           List(ExprStmt(Binary("+", Ident("a"), Ident("b")))),
@@ -23,6 +24,7 @@ class DeclarationParserTests extends AnyFreeSpec with ParseSupport {
       prog("f(n: int) -> int\n    n + 1") shouldBe List(
         FuncDecl(
           "f",
+          Nil,
           List(Param("n", NamedType("int"))),
           Some(NamedType("int")),
           List(ExprStmt(Binary("+", Ident("n"), i(1)))),
@@ -34,6 +36,7 @@ class DeclarationParserTests extends AnyFreeSpec with ParseSupport {
       prog("greet(name: string)\n    print(name)") shouldBe List(
         FuncDecl(
           "greet",
+          Nil,
           List(Param("name", NamedType("string"))),
           None,
           List(printStmt(Ident("name"))),
@@ -49,7 +52,7 @@ class DeclarationParserTests extends AnyFreeSpec with ParseSupport {
   "structs" - {
     "a struct with two fields" in {
       prog("struct Point\n    x: int\n    y: int") shouldBe List(
-        StructDecl("Point", List(Param("x", NamedType("int")), Param("y", NamedType("int"))))
+        StructDecl("Point", Nil, List(Param("x", NamedType("int")), Param("y", NamedType("int"))))
       )
     }
   }

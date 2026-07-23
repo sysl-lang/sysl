@@ -95,7 +95,12 @@ case class MatchArm(patterns: List[Pattern], guard: Option[Expr], body: List[Stm
 case class MatchExpr(scrutinee: Expr, arms: List[MatchArm]) extends Expr
 
 sealed trait TypeRef
-case class NamedType(name: String) extends TypeRef
+
+/** A named type, optionally applied to type arguments: `int`, `Box[int]`,
+ * `Result[int, string]`. A bare name may also be a type *parameter* of the enclosing
+ * declaration; the analyzer decides which from the substitution in scope.
+ */
+case class NamedType(name: String, args: List[TypeRef] = Nil) extends TypeRef
 
 /** One `name: type` binding, shared by function parameters and struct fields. */
 case class Param(name: String, typ: TypeRef)
@@ -114,22 +119,29 @@ case class Return(value: Option[Expr]) extends Stmt
 
 /** A function declaration. The body is a statement list whose trailing expression is the
  * implicit return value; an `= expr` short body is stored as a single-element list. A
- * missing `retType` means the function returns `unit`.
+ * missing `retType` means the function returns `unit`. `tparams` names the type parameters of
+ * a generic function, which is instantiated afresh for each set of type arguments.
  */
-case class FuncDecl(name: String, params: List[Param], retType: Option[TypeRef], body: List[Stmt]) extends Stmt
+case class FuncDecl(
+    name: String,
+    tparams: List[String],
+    params: List[Param],
+    retType: Option[TypeRef],
+    body: List[Stmt],
+) extends Stmt
 
-/** `struct Name` with `name: type` fields; positional construction is `Name(a, b, …)`. */
-case class StructDecl(name: String, fields: List[Param]) extends Stmt
+/** `struct Name[T…]` with `name: type` fields; positional construction is `Name(a, b, …)`. */
+case class StructDecl(name: String, tparams: List[String], fields: List[Param]) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
  * variant; a variant with an optional `value` and no fields is a simple integer constant.
  */
 case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param])
 
-/** `enum Name` with indented variants. All-dataless variants make a *simple* enum (integer
+/** `enum Name[T…]` with indented variants. All-dataless variants make a *simple* enum (integer
  * constants, auto-incrementing, with optional explicit `= value`); any data-carrying variant
  * makes a *data* enum (a tagged union whose variants are constructed and destructured).
  */
-case class EnumDecl(name: String, variants: List[EnumVariantDecl]) extends Stmt
+case class EnumDecl(name: String, tparams: List[String], variants: List[EnumVariantDecl]) extends Stmt
 
 case class Program(body: List[Stmt])

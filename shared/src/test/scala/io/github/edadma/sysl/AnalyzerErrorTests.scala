@@ -67,4 +67,54 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
       err("enum Color\n    Red\n    Green\nprint(Red)") should include("cannot print")
     }
   }
+
+  "generics" - {
+    "the wrong number of type arguments" in {
+      err("struct Box[T]\n    value: T\nf(b: Box[int, real])\n    print(1)") should
+        include("takes 1 type arguments")
+    }
+
+    "type arguments on a type that takes none" in {
+      err("var x: int[real] = 1") should include("does not take type arguments")
+    }
+
+    "a type argument that nothing determines" in {
+      err("var x = None") should include("cannot infer the type argument")
+    }
+
+    "an argument that does not match the instantiated parameter" in {
+      err("""pair[T](a: T, b: T) -> T = a
+            |var x = pair(1, "two")
+            |""".stripMargin) should include("is int, but string was given")
+    }
+
+    "a type that contains itself has no finite size" in {
+      err("struct Node\n    next: Node\nvar n = Node(n)") should include("contains itself")
+    }
+  }
+
+  "the ? operator" - {
+    "needs an Option or Result value" in {
+      err("f(n: int) -> Option[int]\n    var x = n?\n    None") should
+        include("'?' needs an Option or Result value")
+    }
+
+    "may not be used in a function returning something else" in {
+      err("""g() -> Option[int] = None
+            |f() -> int
+            |    var x = g()?
+            |    x
+            |end f
+            |""".stripMargin) should include("may only be used in a function returning Option")
+    }
+
+    "may not propagate an error the function does not return" in {
+      err("""g() -> Result[int, string] = Ok(1)
+            |f() -> Result[int, bool]
+            |    var x = g()?
+            |    Ok(x)
+            |end f
+            |""".stripMargin) should include("propagates a string error")
+    }
+  }
 }
