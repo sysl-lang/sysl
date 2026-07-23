@@ -147,6 +147,55 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "eval\ntwo\n"
   }
 
+  // A match in a `&T` context reaches each arm, so an arm returning the bound `&Point` payload
+  // and an arm yielding a fresh value `Point` meet at `&Point` (the value arm is boxed). Boxing
+  // the whole match instead would type it `unit` — one arm is already `&Point` and could not
+  // become plain `Point`. The extracted payload must outlive the enum it was bound from.
+  "a match in a &T context extracts a reference payload alongside a value arm" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |enum Box
+        |    Full(p: &Point)
+        |    Empty
+        |extract(b: Box) -> &Point
+        |    match b
+        |        Full(p) -> p
+        |        Empty -> Point(0, 0)
+        |var got = extract(Full(Point(11, 22)))
+        |var zero = extract(Empty)
+        |print(got.x, got.y, zero.x)""".stripMargin
+
+    run(src) shouldBe "11 22 0\n"
+  }
+
+  // The `Full(p) -> p` arm hands the bound payload out of the frame, so it must be retained on
+  // bind to outlive the enum, then freed exactly once. A long loop catches a double-free (crash)
+  // or a wrong count (wrong total); peak RSS was separately confirmed flat, so no leak either.
+  "an extracted reference payload is retained on bind and freed exactly once" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |enum Box
+        |    Full(p: &Point)
+        |    Empty
+        |extract(b: Box) -> &Point
+        |    match b
+        |        Full(p) -> p
+        |        Empty -> Point(0, 0)
+        |var i = 0
+        |var total = 0
+        |while i < 20000
+        |    var got = extract(Full(Point(3, 0)))
+        |    total += got.x
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "60000\n"
+  }
+
   // The guard-fallthrough path binds a refcounted payload and must release it exactly once when
   // the guard fails. A long loop catches a double-free (a crash) or a wrong count (a wrong total);
   // peak RSS was separately confirmed flat across a 10x loop, so there is no leak either.

@@ -168,6 +168,24 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "odd\n"
   }
 
+  // A `&T` context reaches each branch, so a value branch is boxed to `&T` and meets an
+  // already-`&T` branch there — the whole `if` is `&Point`. This is the design's documented
+  // conditional-boxing example; boxing the aggregate instead would reject the mismatch.
+  "an if in a &T context unifies a value branch with a reference branch" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |origin() -> &Point = Point(9, 9)
+        |pick(c: bool) -> int
+        |    var q: &Point = origin()
+        |    var p: &Point = if c then Point(1, 2) else q
+        |    p.x
+        |print(pick(true), pick(false))""".stripMargin
+
+    run(src) shouldBe "1 9\n"
+  }
+
   "a for loop variable shadows an outer variable" in {
     val src =
       """var i = 100

@@ -287,7 +287,12 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case Some(r: Type.Ref) =>
       expr match
         case NullLit() => err(s"a ${show(r)} always points at a live object — an absent one is Option[${show(r)}]")
-        case _         => box(analyzeValue(expr, Some(r.inner)), r)
+        // An `if`/`match` yields its value through its branches, so the `&T` context belongs to
+        // each branch, not to the aggregate: every branch boxes to `&T` on its own, letting a
+        // `&T` branch and a value branch meet at `&T`. Boxing the whole expression instead would
+        // ask the branches for a plain `T`, and a branch already holding a `&T` could not comply.
+        case _: IfExpr | _: MatchExpr => analyzeValue(expr, Some(r))
+        case _                        => box(analyzeValue(expr, Some(r.inner)), r)
     case _ => analyzeValue(expr, expected)
 
   /** Boxes a value the context wanted by reference. Nothing else coerces: a mismatch that is
