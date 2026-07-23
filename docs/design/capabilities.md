@@ -36,9 +36,16 @@ two-level machinery but act at the import boundary.
 | `alloc` | language | `&T`, `weak T`, growable arrays, `&Trait`, escaping closures, allocating string ops | — |
 | `os` | environment | OS / syscall standard-library surface | — |
 | `posix` | environment | POSIX compatibility layer | `os` |
+| `threads` | environment | thread creation and the growable channel | — |
 
 `posix` implies `os` (POSIX needs an OS); config validation enforces the implication. The set
-is extensible (e.g. a future `threads` capability), but these three are the core.
+is extensible, but these four are the core.
+
+`threads` gates *spawning*, not soundness: what may cross a domain boundary is a structural
+rule the type checker applies regardless (`06`). A target with no scheduler simply does not
+offer it, and a module may narrow it away to declare itself single-threaded. Note that a
+**fixed-capacity** channel needs neither `alloc` nor `threads` to exist — allocator-free code
+can still receive on one.
 
 ## Two levels: target provides, module narrows
 

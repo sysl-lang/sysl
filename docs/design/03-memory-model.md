@@ -1,9 +1,8 @@
 # The Memory Model — Three Modes
 
-**Status:** core model decided, including slice ownership and what the allocator-free boundary
-gates. This is the heart of the language; the type, trait, and standard-library docs all rest
-on it. A few sub-mechanisms (escape analysis, concurrency/atomic refcounts) are flagged open at
-the end.
+**Status:** core model decided, including slice ownership, what the allocator-free boundary
+gates, escape analysis (`05`), and concurrency (`06`). This is the heart of the language; the
+type, trait, and standard-library docs all rest on it.
 
 ## The guarantee
 
@@ -172,9 +171,14 @@ escapes are detected, how the answer crosses a call boundary, and how a promotio
 ## Shared mutability and concurrency
 
 `&T` permits aliasing and mutation through any reference — the deliberate simplification over
-Rust's exclusive-mutability rule. This is safe under a single-threaded assumption. Cross-thread
-sharing (atomic refcounts, data-race prevention) is a **later topic**: shared `&T` across
-threads will need atomic retain/release, and the concurrency model is not yet designed.
+Rust's exclusive-mutability rule. It is therefore safe **within one concurrency domain**, and a
+`&T` may not leave one: its refcount is non-atomic, and two threads touching it would race.
+
+Crossing a domain **copies** by default, which is what process IPC does anyway and what keeps
+the ordinary path free of atomics. The exception is `&sync T`, whose refcount is atomic and
+which may be shared — a distinct type from `&T`, with no conversion either way, chosen when the
+object is allocated. `&sync T` makes the *reference* safe to share, not the object safe to
+mutate; that still wants a `Mutex`. **`06-concurrency.md`** has the model.
 
 ## The two worlds, one language
 
@@ -218,9 +222,16 @@ model, and propagation through imports — is specified in **`capabilities.md`**
 | null dereference | non-null references; nullable is `Option` |
 | out-of-bounds | length-carrying arrays/slices, checked everywhere |
 | slice outliving its buffer | the slice's `owner` word retains it; escaping locals are promoted |
+| refcount race across threads | `&T` cannot cross a domain; `&sync T` is atomic (`06`) |
 | dangling / wild pointer | impossible without `*T` |
 
 Only `*T` opts out — visibly.
+
+One hazard on this list is **not** eliminated: racing on the *fields* of an object two threads
+deliberately share. Preventing that needs proof of exclusive access, which is the thing this
+language trades away, so it is answered by a `Mutex` and by convention rather than by the type
+checker (`06`). It takes `&sync` or `*T` to reach the situation at all, so it is at least as
+greppable as everything else here.
 
 ## Open sub-questions
 
@@ -233,8 +244,9 @@ Only `*T` opts out — visibly.
 - ~~Escape analysis~~ — **done**, see `05-escape-analysis.md` (inferred, never annotated; a
   two-fact summary carries the answer across calls; promotion where an allocator exists, a
   diagnostic under `no alloc`, and `--explain-escapes` to make a promotion discoverable).
-- **Concurrency** — atomic refcounts for cross-thread `&T`, and the data-race story. Not yet
-  designed.
+- ~~Concurrency~~ — **done**, see `06-concurrency.md` (domains are threads, crossing copies,
+  `&sync T` is the atomic-refcount exception, no async runtime in the language; shared *mutable*
+  state is discipline plus `Mutex`, since without a borrow checker it cannot be checked).
 - **Unchecked-index escape hatch** — an opt-out of bounds checking for hot loops (default
   checked). Likely yes, deferred.
 - **`weak` runtime** — the exact weak-tracking representation (side table vs in-box header).
