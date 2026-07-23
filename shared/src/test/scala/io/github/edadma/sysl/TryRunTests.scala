@@ -91,4 +91,126 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |""".stripMargin) shouldBe "bad input\n"
     }
   }
+
+  "the ? operator on reference payloads" - {
+    // `?` on a `Result[&Point, string]` unwraps the ok arm to a `&Point` that outlives the
+    // wrapper enum, while the err arm returns early. Both outcomes are exercised.
+    "unwraps a &T ok-payload and propagates the err arm" in {
+      run("""struct Point
+            |    x: int
+            |    y: int
+            |mk(ok: bool) -> Result[&Point, string]
+            |    if ok then Ok(Point(11, 22)) else Err("no")
+            |use(ok: bool) -> Result[int, string]
+            |    var p = mk(ok)?
+            |    Ok(p.x + p.y)
+            |show(r: Result[int, string]) -> int
+            |    match r
+            |        Ok(v) -> v
+            |        Err(e) -> -1
+            |print(show(use(true)), show(use(false)))
+            |""".stripMargin) shouldBe "33 -1\n"
+    }
+
+    // The failure carries a `&Fail`, which `?` moves through the early return into the caller's
+    // own `Result[int, &Fail]` — the ok arm reads a code of 7, the err arm carries 404 across.
+    "moves a &T error payload through the early return" in {
+      run("""struct Fail
+            |    code: int
+            |mk(ok: bool) -> Result[int, &Fail]
+            |    if ok then Ok(7) else Err(Fail(404))
+            |use(ok: bool) -> Result[int, &Fail]
+            |    var n = mk(ok)?
+            |    Ok(n * 10)
+            |show(r: Result[int, &Fail]) -> int
+            |    match r
+            |        Ok(v) -> v
+            |        Err(e) -> e.code
+            |print(show(use(true)), show(use(false)))
+            |""".stripMargin) shouldBe "70 404\n"
+    }
+
+    // Chained `?` on `Option[&Node]`: the first hop unwraps the head, the second unwraps its
+    // `next`, and either missing link short-circuits to None. Three inputs cover a two-hop
+    // success, a one-hop-then-None, and an empty head.
+    "chains through an Option[&Node] traversal" in {
+      run("""struct Node
+            |    value: int
+            |    next: Option[&Node]
+            |second(head: Option[&Node]) -> Option[int]
+            |    var h = head?
+            |    var nx = h.next?
+            |    Some(nx.value)
+            |unwrap(o: Option[int]) -> int
+            |    match o
+            |        Some(v) -> v
+            |        None -> -1
+            |var a: &Node = Node(3, None)
+            |var b: &Node = Node(2, Some(a))
+            |print(unwrap(second(Some(b))), unwrap(second(Some(a))), unwrap(second(None)))
+            |""".stripMargin) shouldBe "3 -1 -1\n"
+    }
+
+    // The `&Point` that `?` yields flows straight into `Ok(...)`, which the enclosing
+    // `Result[&Point, string]` boxes — the ? result and the &T-ok construction compose.
+    "flows a ? result straight into an Ok in a &T-ok-returning function" in {
+      run("""struct Point
+            |    x: int
+            |    y: int
+            |mk(ok: bool) -> Result[&Point, string]
+            |    if ok then Ok(Point(5, 6)) else Err("no")
+            |relay(ok: bool) -> Result[&Point, string]
+            |    Ok(mk(ok)?)
+            |show(r: Result[&Point, string]) -> int
+            |    match r
+            |        Ok(p) -> p.x + p.y
+            |        Err(e) -> -1
+            |print(show(relay(true)), show(relay(false)))
+            |""".stripMargin) shouldBe "11 -1\n"
+    }
+
+    // Extracting a freshly-allocated &Point through `?` many times must retain it past the
+    // wrapper enum's drop and free it once — a leak grows RSS, a double-free crashes. Peak RSS
+    // was separately confirmed flat. Ok arm only: p.x + p.y = 5 each, 20000 times.
+    "extracting a &T ok-payload in a long loop neither leaks nor double-frees" in {
+      run("""struct Point
+            |    x: int
+            |    y: int
+            |mk() -> Result[&Point, string]
+            |    Ok(Point(2, 3))
+            |use() -> Result[int, string]
+            |    var p = mk()?
+            |    Ok(p.x + p.y)
+            |var i = 0
+            |var total = 0
+            |while i < 20000
+            |    match use()
+            |        Ok(v) -> total += v
+            |        Err(e) -> total += 0
+            |    i++
+            |print(total)
+            |""".stripMargin) shouldBe "100000\n"
+    }
+
+    // The err arm allocates a fresh &Fail each time and `?` re-wraps it into the caller's return;
+    // over a long loop this must free every failure exactly once. Err arm only: e.code = 7.
+    "re-wrapping a &T error payload in a long loop neither leaks nor double-frees" in {
+      run("""struct Fail
+            |    code: int
+            |mk() -> Result[int, &Fail]
+            |    Err(Fail(7))
+            |use() -> Result[int, &Fail]
+            |    var n = mk()?
+            |    Ok(n + 1)
+            |var i = 0
+            |var total = 0
+            |while i < 20000
+            |    match use()
+            |        Ok(v) -> total += 0
+            |        Err(e) -> total += e.code
+            |    i++
+            |print(total)
+            |""".stripMargin) shouldBe "140000\n"
+    }
+  }
 }
