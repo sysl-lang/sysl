@@ -50,15 +50,27 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
   }
 
   "an inline while body with `do`" in {
-    run("var i = 0\nwhile i < 3 do i++\nprint(i)") shouldBe "3\n"
+    val src =
+      """var i = 0
+        |while i < 3 do i++
+        |print(i)""".stripMargin
+
+    run(src) shouldBe "3\n"
   }
 
   "an inline if/then/else" in {
-    run("if 1 < 2 then print(\"yes\") else print(\"no\")") shouldBe "yes\n"
+    val src =
+      """if 1 < 2 then print("yes") else print("no")""".stripMargin
+
+    run(src) shouldBe "yes\n"
   }
 
   "an inline then with else on the next line" in {
-    run("if 1 < 2 then print(\"t\")\nelse print(\"f\")") shouldBe "t\n"
+    val src =
+      """if 1 < 2 then print("t")
+        |else print("f")""".stripMargin
+
+    run(src) shouldBe "t\n"
   }
 
   "a program using end markers runs correctly" in {

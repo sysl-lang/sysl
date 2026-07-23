@@ -6,26 +6,45 @@ import org.scalatest.freespec.AnyFreeSpec
 class ExpressionRunTests extends AnyFreeSpec with RunSupport {
 
   "hello world prints a string" in {
-    run("print(\"Hello, sysl!\")") shouldBe "Hello, sysl!\n"
+    val src =
+      """print("Hello, sysl!")""".stripMargin
+
+    run(src) shouldBe "Hello, sysl!\n"
   }
 
   "arithmetic evaluates correctly" in {
-    run("print(6 * 7)") shouldBe "42\n"
+    val src =
+      """print(6 * 7)""".stripMargin
+
+    run(src) shouldBe "42\n"
   }
 
   "arguments are space-separated" in {
-    run("print(\"answer\", 42)") shouldBe "answer 42\n"
+    val src =
+      """print("answer", 42)""".stripMargin
+
+    run(src) shouldBe "answer 42\n"
   }
 
   "floats print and compute" in {
-    run("print(1.5 + 2.5)") shouldBe "4\n"
+    val src =
+      """print(1.5 + 2.5)""".stripMargin
+
+    run(src) shouldBe "4\n"
   }
 
   "booleans print as words" in {
-    run("print(1 < 2 && 2 < 3)") shouldBe "true\n"
+    val src =
+      """print(1 < 2 && 2 < 3)""".stripMargin
+
+    run(src) shouldBe "true\n"
   }
 
   "a chained comparison a < b < c" in {
-    run("var x = 5\nprint(1 < x < 10, 1 < x < 3, 1 <= x < 10)") shouldBe "true false true\n"
+    val src =
+      """var x = 5
+        |print(1 < x < 10, 1 < x < 3, 1 <= x < 10)""".stripMargin
+
+    run(src) shouldBe "true false true\n"
   }
 }
