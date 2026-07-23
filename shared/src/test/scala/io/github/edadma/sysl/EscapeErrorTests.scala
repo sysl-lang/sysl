@@ -50,6 +50,16 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
             |""".stripMargin) should include("is returned")
     }
 
+    "is a slice of a slice of a frame-local array" in {
+      err("""view() -> []int
+            |    var buf: [8]int
+            |    var s = buf[..]
+            |    s[1..<4]
+            |end view
+            |print(view().len)
+            |""".stripMargin) should include("is returned")
+    }
+
     "reaches a local that is returned" in {
       err("""leak() -> []int
             |    var buf: [4]int

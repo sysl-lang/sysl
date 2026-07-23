@@ -147,6 +147,68 @@ class SliceRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "12\n"
   }
 
+  // buf[2..<7] = [3,4,5,6,7]; s[1..<4] = [4,5,6]; writing t[1] must reach the one byte four in
+  // from the original buffer's start, through two layers of view arithmetic.
+  "a write through a slice of a slice reaches the original buffer" in {
+    val src =
+      buf +
+        """var s = buf[2..<7]
+          |var t = s[1..<4]
+          |t[1] = 99
+          |print(t[0], t[1], t[2], s[2], buf[4])
+          |""".stripMargin
+
+    run(src) shouldBe "4 99 6 99 99\n"
+  }
+
+  // A view is a fat pointer that retains its heap buffer, so reassigning the only named owner does
+  // not free what the view sees. The discriminating part is that the view keeps reading the OLD
+  // values (1 2 3 4), not the reassigned buffer's (5 6 7 8) — a dangling view would read the new
+  // buffer or garbage.
+  "a view keeps its heap buffer alive after the owner is reassigned" in {
+    val src =
+      """var b: &[4]int = [1, 2, 3, 4]
+        |var s = b[..]
+        |b = [5, 6, 7, 8]
+        |print(s[0], s[1], s[2], s[3])
+        |""".stripMargin
+
+    run(src) shouldBe "1 2 3 4\n"
+  }
+
+  // The re-slice carries the original buffer as its owner and retains it, so the returned sub-view
+  // outlives both the heap array and the intermediate view that made it. b[1..<5] = [20,30,40,50];
+  // its [1..<3] = [30,40].
+  "a returned slice of a slice keeps the buffer alive past the frame" in {
+    val src =
+      """keep() -> []int
+        |    var b: &[6]int = [10, 20, 30, 40, 50, 60]
+        |    var s = b[1..<5]
+        |    s[1..<3]
+        |end keep
+        |var t = keep()
+        |print(t.len, t[0], t[1])
+        |""".stripMargin
+
+    run(src) shouldBe "2 30 40\n"
+  }
+
+  // Storing a fresh reference through a view aliases the buffer's slot: the old Cell is released
+  // and the new one takes its place, seen through both the view and the owning array.
+  "storing a reference through a view replaces that element in the buffer" in {
+    val src =
+      """struct Cell
+        |    n: int
+        |end Cell
+        |var cells: &[3]&Cell = [Cell(10), Cell(20), Cell(30)]
+        |var v = cells[0..<3]
+        |v[1] = Cell(99)
+        |print(cells[0].n, cells[1].n, cells[2].n, v[1].n)
+        |""".stripMargin
+
+    run(src) shouldBe "10 99 30 99\n"
+  }
+
   "a bound past the end stops the program" in {
     exits(buf + "var n = 9\nvar s = buf[0..<n]\nprint(s.len)")
   }
