@@ -1,6 +1,9 @@
 # Traits (Polymorphism)
 
-**Status:** decided (core model). Some surface-syntax details are flagged open at the end.
+**Status:** decided (core model). Some surface-syntax details are flagged open at the end. How a
+plain method and its receiver are spelled — the hole this doc used to leave open — is settled in
+`08-methods.md`; a trait's methods are declared and called the same way, with the receiver an
+`impl`'s type instead of a concrete one.
 
 sysl has **one** polymorphism mechanism: the **`trait`**. It is nominal, and it supports both
 static dispatch (generic bounds, monomorphized) and dynamic dispatch (a boxed trait object).

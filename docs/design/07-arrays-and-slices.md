@@ -109,9 +109,10 @@ requires that its named high element exist. An empty slice is legal, including a
 `a.len` is the number of elements, as a `usize`. On a `[N]T` it is the constant `N` and costs
 nothing; on a `[]T` it is the third word.
 
-It is spelled as a field rather than a method because methods are not designed yet (gap #2),
-and because a length is a property rather than a computation. When methods land, `len` may
-become one without any source changing.
+It is a **property** (`08-methods.md`) — a member read without parentheses — because a length is
+a projection of what is already there rather than a computation over it. On the built-in array
+and slice types it is compiler-provided, so `a.len` reads the same whether `a` is a fixed array
+whose length is a constant or a slice whose length is its third word.
 
 ## Iterating
 
