@@ -53,4 +53,123 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "two\n"
   }
+
+  // A failed guard must fall through to a *later overlapping* arm, and the earlier arm wins when
+  // its guard holds — the first-match-plus-guard rule, not just guards among distinct wildcards.
+  "a failed guard falls through to a later overlapping arm" in {
+    val src =
+      """classify(n: int) -> string
+        |    match n
+        |        1..10 if n > 5 -> "high"
+        |        1..10 -> "low"
+        |        else -> "other"
+        |print(classify(3), classify(7), classify(50))""".stripMargin
+
+    run(src) shouldBe "low high other\n"
+  }
+
+  // An inclusive range includes both ends, tested exactly at each boundary and just outside.
+  "an inclusive range pattern includes both bounds" in {
+    val src =
+      """band(n: int) -> string
+        |    match n
+        |        3..7 -> "in"
+        |        else -> "out"
+        |print(band(2), band(3), band(7), band(8))""".stripMargin
+
+    run(src) shouldBe "out in in out\n"
+  }
+
+  "a guarded arm on a data variant falls through while keeping the binding" in {
+    val src =
+      """enum Tree
+        |    Leaf(v: int)
+        |    Node(l: int, r: int)
+        |sum(t: Tree) -> int
+        |    match t
+        |        Leaf(v) if v < 0 -> 0
+        |        Leaf(v) -> v
+        |        Node(a, b) -> a + b
+        |print(sum(Leaf(5)), sum(Leaf(-3)), sum(Node(10, 20)))""".stripMargin
+
+    run(src) shouldBe "5 0 30\n"
+  }
+
+  "a nested variant pattern destructures through a layer" in {
+    val src =
+      """enum Inner
+        |    Val(n: int)
+        |    Nought
+        |enum Outer
+        |    Wrap(i: Inner)
+        |    Bare
+        |peek(o: Outer) -> int
+        |    match o
+        |        Wrap(Val(n)) -> n
+        |        Wrap(Nought) -> -1
+        |        else -> -2
+        |print(peek(Wrap(Val(42))), peek(Wrap(Nought)), peek(Bare))""".stripMargin
+
+    run(src) shouldBe "42 -1 -2\n"
+  }
+
+  // A guard is evaluated only after its arm's pattern matches, never for an arm that was ruled
+  // out — check(3) never runs the guard, so "guard" prints only for check(5).
+  "a guard is evaluated only when its arm's pattern matches" in {
+    val src =
+      """noisy() -> bool
+        |    print("guard")
+        |    true
+        |end noisy
+        |check(n: int) -> int
+        |    match n
+        |        5 if noisy() -> 1
+        |        else -> 0
+        |print(check(3))
+        |print(check(5))""".stripMargin
+
+    run(src) shouldBe "0\nguard\n1\n"
+  }
+
+  // The scrutinee is evaluated once, not re-evaluated per arm — a side-effecting scrutinee prints
+  // exactly once.
+  "the scrutinee is evaluated exactly once" in {
+    val src =
+      """src() -> int
+        |    print("eval")
+        |    2
+        |end src
+        |match src()
+        |    1 -> print("one")
+        |    2 -> print("two")
+        |    else -> print("other")""".stripMargin
+
+    run(src) shouldBe "eval\ntwo\n"
+  }
+
+  // The guard-fallthrough path binds a refcounted payload and must release it exactly once when
+  // the guard fails. A long loop catches a double-free (a crash) or a wrong count (a wrong total);
+  // peak RSS was separately confirmed flat across a 10x loop, so there is no leak either.
+  "a refcounted binding under a failed guard is released exactly once" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |enum Cell
+        |    Full(p: &Point)
+        |    Empty
+        |score(c: Cell) -> int
+        |    match c
+        |        Full(p) if p.x > 100 -> 1
+        |        Full(p) -> p.x
+        |        Empty -> 0
+        |var total = 0
+        |var i = 0
+        |while i < 20000
+        |    total += score(Full(Point(i % 200, 0)))
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "514900\n"
+  }
 }
