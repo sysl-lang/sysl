@@ -124,6 +124,32 @@ case class ArrayType(length: Option[Expr], elem: TypeRef) extends TypeRef
 /** One `name: type` binding, shared by function parameters and struct fields. */
 case class Param(name: String, typ: TypeRef)
 
+/** How an instance member takes its receiver — the memory-mode sigil written before `self`.
+ * A property receiver is implicit and not spelled, so it is absent here (a property carries no
+ * `RecvMode`); an associated function has no receiver at all.
+ */
+enum RecvMode:
+  case ByValue                 // self
+  case ByPtr                   // *self
+  case ByRef(sync: Boolean)    // &self, &sync self
+
+/** A member declared in a type's body. Exactly one of three kinds, told apart by shape:
+ *
+ *   - an **instance method** has a `receiver` (the `self` sigil form) and a parameter list;
+ *   - an **associated function** has no `receiver` and a parameter list, called `Type.name(…)`;
+ *   - a **computed property** has `isProperty` set, no parameter list at all, and an implicit
+ *     borrow receiver, read as `value.name` with no parentheses.
+ */
+case class MethodDecl(
+    name: String,
+    receiver: Option[RecvMode],
+    isProperty: Boolean,
+    tparams: List[String],
+    params: List[Param],
+    retType: Option[TypeRef],
+    body: List[Stmt],
+)
+
 sealed trait Stmt
 
 /** `var name [: type] [= init]`. A declaration with a type and no initializer starts at that
@@ -153,8 +179,11 @@ case class FuncDecl(
     body: List[Stmt],
 ) extends Stmt
 
-/** `struct Name[T…]` with `name: type` fields; positional construction is `Name(a, b, …)`. */
-case class StructDecl(name: String, tparams: List[String], fields: List[Param]) extends Stmt
+/** `struct Name[T…]` with `name: type` fields and, intermixed, member declarations (methods,
+ * properties, associated functions). Positional construction is `Name(a, b, …)`.
+ */
+case class StructDecl(name: String, tparams: List[String], fields: List[Param], members: List[MethodDecl] = Nil)
+    extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
  * variant; a variant with an optional `value` and no fields is a simple integer constant.

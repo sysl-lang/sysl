@@ -30,6 +30,12 @@ class Analyzer private (program: Program) {
   private val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   private val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
+  /** A type's inherent members, keyed by (type name, member name). Methods, properties, and
+   * associated functions all live here; each is also lowered to an ordinary function under the
+   * mangled name `Type.member`, so calling one is a call and codegen needs no method concept.
+   */
+  private val memberDecls = mutable.LinkedHashMap.empty[(String, String), MethodDecl]
+
   /** Instantiated types, keyed by their display name (`Point`, `Option[int]`) and held in
    * dependency order — a type is inserted only after the types it contains.
    */
@@ -298,9 +304,17 @@ class Analyzer private (program: Program) {
                f.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit))
         case _ =>
 
+    // A type's members lower to ordinary functions under mangled names, registered here so a
+    // method call and an associated-function call resolve exactly as a free call does.
+    val members = mutable.ListBuffer.empty[FuncDecl]
+    for (tname, sdecl) <- structDecls do hoistMembers(tname, sdecl, members)
+
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 
     for f <- body.collect { case f: FuncDecl if f.tparams.isEmpty => f } do
+      tfuncs += analyzeFuncBody(f.name, f, Map.empty)
+
+    for f <- members do
       tfuncs += analyzeFuncBody(f.name, f, Map.empty)
 
     val mainStmts = program.body.filter {
@@ -326,6 +340,44 @@ class Analyzer private (program: Program) {
    */
   private def typeNameTaken(name: String): Boolean =
     structDecls.contains(name) || enumDecls.contains(name) || scalarType(name).isDefined
+
+  /** Records a type's members and lowers each to a function declaration under the mangled name
+   * `Type.member`, whose signature is registered so calls resolve like ordinary ones. Members on
+   * generic types and members that introduce their own type parameters wait on the generics work
+   * and are rejected with a clear diagnostic rather than silently mishandled.
+   */
+  private def hoistMembers(tname: String, sdecl: StructDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
+    if sdecl.members.nonEmpty && sdecl.tparams.nonEmpty then
+      err(s"members of a generic type are not supported yet — '$tname' has type parameters")
+
+    for m <- sdecl.members do
+      if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '$tname.${m.name}'")
+      if memberDecls.contains((tname, m.name)) then err(s"type '$tname' already has a member named '${m.name}'")
+      if sdecl.fields.exists(_.name == m.name) then
+        err(s"type '$tname' has both a field and a member named '${m.name}'")
+
+      memberDecls((tname, m.name)) = m
+      val fd = synthesize(tname, m)
+      out += fd
+      funcInsts(fd.name) =
+        (fd.params.map(p => (p.name, resolveType(p.typ, Map.empty))),
+         fd.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit))
+  }
+
+  /** Builds the function a member lowers to: the receiver becomes an ordinary first parameter
+   * named `self`, carrying the memory mode its sigil asked for. A property's receiver is an
+   * implicit by-value read; an associated function has no receiver.
+   */
+  private def synthesize(tname: String, m: MethodDecl): FuncDecl = {
+    val selfRef = NamedType(tname, Nil)
+    val selfParam = m.receiver match
+      case Some(RecvMode.ByValue)     => Some(Param("self", selfRef))
+      case Some(RecvMode.ByPtr)       => Some(Param("self", PtrType(selfRef)))
+      case Some(RecvMode.ByRef(sync)) => Some(Param("self", RefType(selfRef, sync)))
+      case None if m.isProperty       => Some(Param("self", selfRef))
+      case None                       => None
+    FuncDecl(s"$tname.${m.name}", Nil, selfParam.toList ::: m.params, m.retType, m.body)
+  }
 
   private def analyzeFuncBody(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
     val (params, rtype) = funcInsts(name)
@@ -669,6 +721,21 @@ class Analyzer private (program: Program) {
     case Call(Ident(name), _) =>
       err(s"undefined function '$name'")
 
+    // A data-carrying variant reached through its enum: `Shape.Circle(5)`, the qualified form of
+    // the bare `Circle(5)`.
+    case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && enumDecls.contains(tname) =>
+      enumDecls(tname).variants.find(_.name == mname) match
+        case Some(_) => constructVariant(mname, args, expected)
+        case None    => err(s"enum '$tname' has no variant '$mname'")
+
+    // `Type.name(…)` — an associated function, told from the positional constructor `Type(…)` by
+    // the member selected from the type name rather than the bare name applied.
+    case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && structDecls.contains(tname) =>
+      callAssociated(tname, mname, args, expected)
+
+    case Call(Field(recv, mname), args) =>
+      callMethod(recv, mname, args)
+
     case Call(_, _) =>
       err("the thing being called must be a name")
 
@@ -682,11 +749,19 @@ class Analyzer private (program: Program) {
       tr.ty match
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
-          if idx < 0 then err(s"struct '${s.name}' has no field '$f'")
-          TField(tr, idx, s.fields(idx)._2)
-        // A length is a property of the value rather than a computation over it, so it reads as
-        // a field. It becomes an ordinary method the day methods exist, and so does `bytes` —
-        // a string's bytes are the same three words the string is, with the guarantee dropped.
+          if idx >= 0 then TField(tr, idx, s.fields(idx)._2)
+          else
+            memberDecls.get((s.base, f)) match
+              // A property reads with no parentheses, so it looks exactly like a field; its
+              // receiver is an implicit by-value read of the instance.
+              case Some(m) if m.isProperty =>
+                val (_, rtype) = funcInsts(s"${s.base}.$f")
+                TCall(s"${s.base}.$f", List(tr), rtype)
+              case Some(_) => err(s"'$f' is a method of '${s.name}' — call it with '$f(…)'")
+              case None    => err(s"'${s.name}' has no field or property '$f'")
+        // `len` and `bytes` are the first compiler-provided members: `len` a property on every
+        // array, slice, and string, and `bytes` the reinterpretation of a string's three words
+        // as a `[]u8`, dropping only the validity guarantee.
         case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
         case Type.Str if f == "bytes"                   => TBytes(tr)
         case other =>
@@ -962,6 +1037,84 @@ class Analyzer private (program: Program) {
     val (params, rtype) = funcInsts(name)
     TCall(name, checkArgs(f.name, params, args, pre), rtype)
   }
+
+  /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
+   * calls the function it lowered to, passing the receiver as the first argument in whatever
+   * memory mode the method's `self` asked for.
+   */
+  private def callMethod(recv: Expr, mname: String, args: List[Expr]): TExpr = {
+    val tr = analyzeExpr(recv)
+
+    structBase(tr.ty) match
+      case Some((base, s)) =>
+        memberDecls.get((base, mname)) match
+          case Some(m) if m.receiver.isDefined =>
+            val fname           = s"$base.$mname"
+            val (params, rtype) = funcInsts(fname)
+            if args.length != params.length - 1 then
+              err(s"method '$fname' takes ${params.length - 1} arguments, but ${args.length} were given")
+            val recvArg  = buildReceiver(m.receiver.get, tr, s)
+            val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+            TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
+          case Some(_) => err(s"'$mname' is a property of '${s.name}' — read it as 'value.$mname', without '()'")
+          case None    => err(s"type '${s.name}' has no method '$mname'")
+      case None =>
+        err(s"cannot call method '$mname' on ${show(tr.ty)}")
+  }
+
+  /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
+   * The positional constructor `Type(…)` is a different form and is handled elsewhere.
+   */
+  private def callAssociated(tname: String, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
+    memberDecls.get((tname, mname)) match
+      case Some(m) if m.receiver.isEmpty && !m.isProperty =>
+        val fname           = s"$tname.$mname"
+        val (params, rtype) = funcInsts(fname)
+        if args.length != params.length then
+          err(s"associated function '$fname' takes ${params.length} arguments, but ${args.length} were given")
+        val ts = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+        TCall(fname, checkArgs(fname, params, args, Some(ts)), rtype)
+      case Some(m) if m.isProperty =>
+        err(s"'$mname' is a property of '$tname' — read it on a value, as 'value.$mname'")
+      case Some(_) => err(s"'$mname' is an instance method of '$tname' — call it on a value, not the type")
+      case None    => err(s"type '$tname' has no associated function '$mname'")
+
+  /** The struct a receiver denotes, seeing through one level of `*T` / `&T`, so a method may be
+   * called on a value, a pointer to it, or a reference to it alike.
+   */
+  private def structBase(t: Type): Option[(String, Type.Struct)] = t match
+    case s: Type.Struct              => Some((s.base, s))
+    case Type.Ptr(s: Type.Struct)    => Some((s.base, s))
+    case Type.Ref(s: Type.Struct, _) => Some((s.base, s))
+    case _                           => None
+
+  /** Passes the receiver in the mode the method's `self` declared, inserting the same conversion
+   * a matching argument would: a value is copied, `*self` takes the instance's address, `&self`
+   * needs the reference itself.
+   */
+  private def buildReceiver(mode: RecvMode, tr: TExpr, s: Type.Struct): TExpr = mode match
+    case RecvMode.ByValue =>
+      tr.ty match
+        case _: Type.Struct => tr
+        case _              => autoDeref(tr)
+
+    case RecvMode.ByPtr =>
+      tr.ty match
+        case _: Type.Ptr => tr
+        case _ =>
+          val place = tr.ty match
+            case _: Type.Ref => autoDeref(tr)
+            case _           => tr
+          if !isPlace(place) then
+            err("'*self' needs a variable, field, or dereference to point at — this receiver has no address")
+          TAddrOf(place, Type.Ptr(place.ty))
+
+    case RecvMode.ByRef(_) =>
+      tr.ty match
+        case _: Type.Ref => tr
+        case _ =>
+          err(s"'&self' needs a reference; a ${show(tr.ty)} on the stack has none — take '*self' instead, " +
+            "or put the object behind a '&'")
 
   private def constructStruct(name: String, args: List[Expr], expected: Option[Type]): TExpr = {
     val decl = structDecls(name)

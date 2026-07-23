@@ -124,8 +124,13 @@ class SyslParser extends PackratParsers {
       op("--") ^^^ ((e: Expr) => PostIncDec("--", e))
 
   lazy val primary: PackratParser[Expr] =
-    floatLit | intLit | charLit | strLit | boolLit | nullLit | identExpr | arrayLit |
+    floatLit | intLit | charLit | strLit | boolLit | nullLit | selfExpr | identExpr | arrayLit |
       op("(") ~> parenTail
+
+  /** `self` is reserved, so it never lexes as an identifier; inside a method body it reads as an
+   * ordinary name that the analyzer resolves to the receiver binding, and is undefined elsewhere.
+   */
+  private lazy val selfExpr: Parser[Expr] = op("self") ^^^ Ident("self")
 
   /** `[a, b, c]` — an array literal. A leading `[` is unambiguous in operand position, since a
    * subscript is a postfix tail on something already parsed.
@@ -220,10 +225,54 @@ class SyslParser extends PackratParsers {
 
   private lazy val structDecl: PackratParser[Stmt] =
     op("struct") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
-      (newline ~> indent ~> opt(newlines) ~> repsep(param, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
-        fields => StructDecl(name, tps.getOrElse(Nil), fields)
+      (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
+        items =>
+          val fields  = items.collect { case Left(f)  => f }
+          val members = items.collect { case Right(m) => m }
+          StructDecl(name, tps.getOrElse(Nil), fields, members)
       }
     }
+
+  /** A line inside a struct body is either a `name: type` field or a member declaration. A member
+   * is tried first: it needs a `(` (a method or associated function) or a `->` (a property) after
+   * the name, so a bare field falls through to `param`.
+   */
+  private lazy val structItem: Parser[Either[Param, MethodDecl]] =
+    member ^^ (Right(_)) | param ^^ (Left(_))
+
+  /** A member of a type's body. What follows the name decides the kind: `(params)` is a method
+   * (or, with no `self`, an associated function), and `-> type = body` with no parameter list is
+   * a computed property.
+   */
+  private lazy val member: PackratParser[MethodDecl] =
+    ident ~ opt(typeParams) >> { case name ~ tps =>
+      methodTail(name, tps.getOrElse(Nil)) |
+        (if tps.isEmpty then propertyTail(name) else failure("a property takes no type parameters"))
+    }
+
+  private def methodTail(name: String, tparams: List[String]): Parser[MethodDecl] =
+    (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
+      case (recv, params) ~ ret ~ body => MethodDecl(name, recv, isProperty = false, tparams, params, ret, body)
+    }
+
+  private def propertyTail(name: String): Parser[MethodDecl] =
+    (op("->") ~> typeRef) ~ (op("=") ~> expression) <~ endName(name) ^^ {
+      case ret ~ e => MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), List(ExprStmt(e)))
+    }
+
+  /** The parenthesised part of a method: an optional receiver shorthand (`self`, `*self`,
+   * `&self`, `&sync self`) followed by ordinary `name: type` parameters. With no receiver the
+   * member is an associated function.
+   */
+  private lazy val methodParams: Parser[(Option[RecvMode], List[Param])] =
+    receiver ~ rep(op(",") ~> param) ^^ { case r ~ ps => (Some(r), ps) } |
+      repsep(param, op(",")) ^^ (ps => (None, ps))
+
+  private lazy val receiver: Parser[RecvMode] =
+    op("*") ~> op("self") ^^^ RecvMode.ByPtr |
+      op("&") ~> softSync ~> op("self") ^^^ RecvMode.ByRef(sync = true) |
+      op("&") ~> op("self") ^^^ RecvMode.ByRef(sync = false) |
+      op("self") ^^^ RecvMode.ByValue
 
   /** `enum Name[T…]` with indented variants. A variant is a bare name (`Empty`), a name with an
    * explicit integer value (`Blue = 10`), or a name with a payload (`Circle(radius: int)`).

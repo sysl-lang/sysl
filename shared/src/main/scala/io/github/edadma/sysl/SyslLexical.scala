@@ -77,6 +77,7 @@ class SyslLexical
     "struct",
     "enum",
     "return",
+    "self",
     "weak",
     "no",
     "alloc",
