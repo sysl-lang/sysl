@@ -59,7 +59,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       "io.github.edadma"         %%% "indentation"              % "0.0.3",
       // Cross-platform I/O boundary (see docs/design/cross-platform.md).
       "io.github.edadma"         %%% "path"                     % "0.0.6",
-      "io.github.edadma"         %%% "cross_platform"           % "0.1.7",
+      "io.github.edadma"         %%% "cross_platform"           % "0.1.8",
 //      "com.lihaoyi" %%% "pprint" % "0.9.6" % "test",
     ),
     publishMavenStyle      := true,

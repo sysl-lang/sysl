@@ -1,13 +1,13 @@
 package io.github.edadma.sysl
 
-import java.nio.file.{Files, Path, Paths}
-
-import scala.sys.process.*
+import io.github.edadma.cross_platform.*
 
 import scopt.OParser
 
-/** The sysl command-line driver (JVM only — it touches the filesystem and drives an LLVM
- * toolchain). The pure front end and codegen live in the shared module.
+/** The sysl command-line driver. It reads a source file, runs the pure front end and codegen
+ * from the shared module, and drives an LLVM toolchain to link and run the result. Filesystem
+ * and process access go through `cross_platform`, so the same driver ships as a native binary
+ * and as a Node CLI (the JVM build is for a fast development loop).
  *
  * Subcommands:
  *   - `sysl run <file>`        compile and execute
@@ -45,27 +45,27 @@ case class Config(
     )
   }
 
-  OParser.parse(parser, args, Config()) match
-    case Some(cfg) => sys.exit(execute(cfg))
-    case None      => sys.exit(2)
+  OParser.parse(parser, processArgs(args), Config()) match
+    case Some(cfg) => processExit(execute(cfg))
+    case None      => processExit(2)
 }
 
 private def execute(cfg: Config): Int = {
   val source =
-    try new String(Files.readAllBytes(Paths.get(cfg.file)), "UTF-8")
+    try readFile(cfg.file)
     catch case e: Exception => return fail(s"cannot read ${cfg.file}: ${e.getMessage}")
 
   cfg.command match
     case "emit-llvm" =>
       Compiler.compileToLlvm(source) match
         case Left(err) => fail(err)
-        case Right(ir) => print(ir); 0
+        case Right(ir) => stdout(ir); 0
 
     case "build" =>
       Compiler.compileToLlvm(source) match
         case Left(err) => fail(err)
         case Right(ir) =>
-          val exe = Paths.get(cfg.output.getOrElse(defaultOutputName(cfg.file)))
+          val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
           Toolchain.build(ir, exe) match
             case Left(err) => fail(err)
             case Right(_)  => Console.err.println(s"wrote $exe"); 0
@@ -74,22 +74,25 @@ private def execute(cfg: Config): Int = {
       Compiler.compileToLlvm(source) match
         case Left(err) => fail(err)
         case Right(ir) =>
-          val exe = Files.createTempFile("sysl-", "")
-          Files.deleteIfExists(exe)
+          val exe = createTempFile("sysl-", "")
           Toolchain.build(ir, exe) match
-            case Left(err) => fail(err)
+            case Left(err) => deleteFile(exe); fail(err)
             case Right(_) =>
-              val code = Seq(exe.toString).!
-              Files.deleteIfExists(exe)
-              code
+              val result = exec(Seq(exe))
+              deleteFile(exe)
+              stdout(result.stdout)
+              if result.stderr.nonEmpty then Console.err.print(result.stderr)
+              result.exitCode
 
     case other =>
       fail(s"unknown command '$other'")
 }
 
 private def defaultOutputName(file: String): String = {
-  val name = Paths.get(file).getFileName.toString
-  val base = if name.contains('.') then name.substring(0, name.lastIndexOf('.')) else name
+  val slash = math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))
+  val name  = if slash >= 0 then file.substring(slash + 1) else file
+  val dot   = name.lastIndexOf('.')
+  val base  = if dot > 0 then name.substring(0, dot) else name
   if base.isEmpty then "a.out" else base
 }
 
