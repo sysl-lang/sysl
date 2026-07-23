@@ -177,11 +177,21 @@ class SyslParser extends PackratParsers {
     op(keyword) ~> (suite | inlineBody) | suite
 
   private lazy val ifStmt: PackratParser[Stmt] =
-    op("if") ~> expression ~ body("then") ~ rep(elifClause) ~ opt(elseClause) ^^ {
-      case c ~ t ~ elifs ~ e =>
+    op("if") ~> expression ~ body("then") ~ rep(elifClause) ~ opt(elseClause) ~ opt(endMarker("if")) ^^ {
+      case c ~ t ~ elifs ~ e ~ _ =>
         val chained = elifs.foldRight(e.getOrElse(Nil)) { case ((ec, eb), acc) => List(If(ec, eb, acc)) }
         If(c, t, chained)
     }
+
+  /** `end` is a soft keyword — an ordinary identifier everywhere except immediately before a
+   * construct keyword, where `end if` / `end while` close the preceding block Scala-style. It
+   * is optional; matching it here (rather than reserving `end`) keeps `end` usable as a name.
+   */
+  private lazy val softEnd: Parser[Unit] =
+    accept("'end'", { case t: lexical.Identifier if t.chars == "end" => () })
+
+  private def endMarker(construct: String): Parser[Unit] =
+    opt(newlines) ~> softEnd ~> op(construct) ^^^ (())
 
   /** `elif cond then …` is sugar for `else if cond then …` — each one nests into the else
    * branch of the previous, so no distinct AST node is needed.
@@ -196,7 +206,7 @@ class SyslParser extends PackratParsers {
     opt(newlines) ~> op("else") ~> (suite | inlineBody)
 
   private lazy val whileStmt: PackratParser[Stmt] =
-    op("while") ~> expression ~ body("do") ^^ { case c ~ b => While(c, b) }
+    op("while") ~> expression ~ body("do") ~ opt(endMarker("while")) ^^ { case c ~ b ~ _ => While(c, b) }
 
   private lazy val statements: PackratParser[List[Stmt]] =
     opt(newlines) ~> repsep(statement, newlines) <~ opt(newlines)

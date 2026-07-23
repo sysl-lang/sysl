@@ -61,6 +61,23 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
     run("if 1 < 2 then print(\"t\")\nelse print(\"f\")") shouldBe "t\n"
   }
 
+  "a program using end markers runs correctly" in {
+    val src =
+      """var i = 0
+        |var sum = 0
+        |while i < 5
+        |    sum = sum + i
+        |    i++
+        |end while
+        |if sum == 10 then
+        |    print("ten")
+        |else
+        |    print("other")
+        |end if""".stripMargin
+
+    run(src) shouldBe "ten\n"
+  }
+
   "a factorial loop" in {
     val src =
       """var n = 5

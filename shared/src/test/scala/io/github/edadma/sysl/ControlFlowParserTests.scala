@@ -122,4 +122,29 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
       )
     }
   }
+
+  "optional end markers" - {
+    "`end while` closes a while and parses the same as without it" in {
+      prog("while c\n    print(1)\nend while") shouldBe prog("while c\n    print(1)")
+    }
+
+    "`end if` closes an if/elif/else chain" in {
+      prog("if a then\n    print(1)\nelif b then\n    print(2)\nelse\n    print(3)\nend if") shouldBe
+        prog("if a then\n    print(1)\nelif b then\n    print(2)\nelse\n    print(3)")
+    }
+
+    "a statement after an end marker still parses" in {
+      prog("while c\n    print(1)\nend while\nprint(2)") shouldBe List(
+        While(Ident("c"), List(printStmt(i(1)))),
+        printStmt(i(2)),
+      )
+    }
+
+    "`end` stays usable as an ordinary identifier" in {
+      prog("var end = 5\nprint(end)") shouldBe List(
+        VarDecl("end", None, i(5)),
+        printStmt(Ident("end")),
+      )
+    }
+  }
 }

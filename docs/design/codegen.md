@@ -15,6 +15,11 @@ A program is a sequence of statements that becomes the body of `main`. Supported
   already marks the block). `else` likewise takes an inline statement or an indented block.
   `elif cond then …` is parsed as sugar for `else if cond then …`, nesting into the else
   branch — no distinct AST node.
+- **Optional `end` markers (Scala-style):** `end if` and `end while` may close the
+  corresponding block. `end` is a *soft* keyword — an ordinary identifier everywhere except
+  immediately before a construct keyword — so it is not reserved. The marker is accepted but
+  carries no AST; it is purely a readability aid. `end for` and `end match` will follow when
+  `for` and `match` exist.
 - **Expressions:** the full settled precedence grammar (`01`), over `int` (i32), `real` (f64),
   `bool`, and string literals. `++`/`--`, unary `-`/`!`/`~`, chained comparison.
 - **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed
