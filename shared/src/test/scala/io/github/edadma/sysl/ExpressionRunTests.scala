@@ -47,4 +47,27 @@ class ExpressionRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "true false true\n"
   }
+
+  "compound assignment operators update in place" in {
+    val src =
+      """var x = 10
+        |x += 5
+        |x -= 2
+        |x *= 3
+        |x /= 2
+        |print(x)""".stripMargin
+
+    run(src) shouldBe "19\n"
+  }
+
+  "bitwise compound assignment" in {
+    val src =
+      """var b = 12
+        |b &= 10
+        |b |= 1
+        |b <<= 2
+        |print(b)""".stripMargin
+
+    run(src) shouldBe "36\n"
+  }
 }

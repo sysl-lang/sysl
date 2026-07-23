@@ -17,5 +17,13 @@ class CodegenStatementTests extends AnyFreeSpec with CodegenSupport {
     "reassignment stores again" in {
       ir("var x = 1\nx = 2") should include("store i32 2, ptr %x.addr")
     }
+
+    "a compound assignment loads, operates, and stores back" in {
+      val out = ir("var x = 10\nx += 5")
+
+      out should include("load i32, ptr %x.addr")
+      out should include("add i32")
+      out should include("store i32")
+    }
   }
 }
