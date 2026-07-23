@@ -67,12 +67,19 @@ class MethodParserTests extends AnyFreeSpec with ParseSupport {
         |    a(&self) = self.n
         |    b(&sync self) = self.n""".stripMargin
 
-    val members = prog(src) match {
-      case List(s: StructDecl) => s.members
-      case other               => fail(other.toString)
-    }
-
-    members.map(_.receiver) shouldBe List(Some(RecvMode.ByRef(sync = false)), Some(RecvMode.ByRef(sync = true)))
+    prog(src) shouldBe List(
+      StructDecl(
+        "C",
+        Nil,
+        List(Param("n", NamedType("int"))),
+        List(
+          MethodDecl("a", Some(RecvMode.ByRef(sync = false)), isProperty = false, Nil, Nil, None,
+            List(ExprStmt(Field(Ident("self"), "n")))),
+          MethodDecl("b", Some(RecvMode.ByRef(sync = true)), isProperty = false, Nil, Nil, None,
+            List(ExprStmt(Field(Ident("self"), "n")))),
+        ),
+      )
+    )
   }
 
   "a computed property" in {
@@ -134,12 +141,16 @@ class MethodParserTests extends AnyFreeSpec with ParseSupport {
         |    sum(self) -> int = self.x
         |    y: int""".stripMargin
 
-    val s = prog(src) match {
-      case List(s: StructDecl) => s
-      case other               => fail(other.toString)
-    }
-
-    s.fields shouldBe List(Param("x", NamedType("int")), Param("y", NamedType("int")))
-    s.members.map(_.name) shouldBe List("sum")
+    prog(src) shouldBe List(
+      StructDecl(
+        "P",
+        Nil,
+        List(Param("x", NamedType("int")), Param("y", NamedType("int"))),
+        List(
+          MethodDecl("sum", Some(RecvMode.ByValue), isProperty = false, Nil, Nil, Some(NamedType("int")),
+            List(ExprStmt(Field(Ident("self"), "x")))),
+        ),
+      )
+    )
   }
 }

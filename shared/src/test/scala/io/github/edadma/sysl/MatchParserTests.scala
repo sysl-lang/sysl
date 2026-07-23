@@ -13,21 +13,36 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
       case other                        => fail(s"expected a single match statement, got $other")
 
   "a literal, alternative, range, and else arm" in {
-    val m = matchExpr("match n\n    0 -> print(1)\n    1 | 2 -> print(2)\n    3..5 -> print(3)\n    else -> print(4)")
+    val src =
+      """match n
+        |    0 -> print(1)
+        |    1 | 2 -> print(2)
+        |    3..5 -> print(3)
+        |    else -> print(4)""".stripMargin
 
-    m.scrutinee shouldBe Ident("n")
-    m.arms.map(_.patterns) shouldBe List(
-      List(LitPattern(i(0))),
-      List(LitPattern(i(1)), LitPattern(i(2))),
-      List(RangePattern(i(3), i(5), inclusive = true)),
-      List(WildcardPattern),
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("n"),
+      List(
+        MatchArm(List(LitPattern(i(0))), None, List(printStmt(i(1)))),
+        MatchArm(List(LitPattern(i(1)), LitPattern(i(2))), None, List(printStmt(i(2)))),
+        MatchArm(List(RangePattern(i(3), i(5), inclusive = true)), None, List(printStmt(i(3)))),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(4)))),
+      ),
     )
   }
 
   "a guarded wildcard arm" in {
-    val m = matchExpr("match x\n    _ if x > 0 -> print(1)\n    else -> print(2)")
+    val src =
+      """match x
+        |    _ if x > 0 -> print(1)
+        |    else -> print(2)""".stripMargin
 
-    m.arms.head.patterns shouldBe List(WildcardPattern)
-    m.arms.head.guard shouldBe Some(Compare(List(Ident("x"), i(0)), List(">")))
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("x"),
+      List(
+        MatchArm(List(WildcardPattern), Some(Compare(List(Ident("x"), i(0)), List(">"))), List(printStmt(i(1)))),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(2)))),
+      ),
+    )
   }
 }
