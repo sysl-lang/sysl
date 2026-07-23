@@ -117,6 +117,14 @@ The practical consequence: even low-level, allocator-free code stays bounds-safe
 slices; `*T` is reserved for genuine address work, not merely for having an indexable buffer.
 Growable (appendable) arrays need an allocator; fixed arrays and slice-views do not.
 
+**Open: who keeps a slice's bytes alive.** A bare `{ptr, len}` view into an ARC'd buffer can
+outlive the last `&T` to that buffer, so "a slice is only a view" and "the safe subset has no
+dangling pointers" cannot both hold as written. `04-strings.md` resolves this for `string` by
+carrying the owning reference in the value itself — `{owner, ptr, len}` — which retains its
+buffer and costs one extra word. The consistent resolution here is the same shape for `[]T`,
+which would additionally make `string` exactly an immutable, validated `[]u8`. That change is
+not yet made.
+
 ## Shared mutability and concurrency
 
 `&T` permits aliasing and mutation through any reference — the deliberate simplification over

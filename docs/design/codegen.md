@@ -109,10 +109,12 @@ arity.
    through `printf`). `usize` / `isize` are fixed at 64 bits by a constant rather than by a
    target description. A narrower float constant is emitted as the `double` constant rounded
    down to it, which is correctly rounded except in the rare double-rounding case.
-2. **`string` is a bare pointer, not the fat pointer it is specified as.** A literal interns
-   as NUL-terminated bytes and passes to `printf` as a `ptr`, so an embedded `\0` truncates
-   it — the one place the implementation contradicts `01` rather than merely lagging it.
-   There is no `.len`, no runtime string value, and no concatenation.
+2. **`string` is a bare pointer, not the three-word owning view it is specified as.** A
+   literal interns as NUL-terminated bytes and passes to `printf` as a `ptr`, so an embedded
+   `\0` truncates it — the one place the implementation contradicts the design (`04`) rather
+   than merely lagging it. There is no owner word, no `.len`, no slicing, no runtime string
+   value, and no concatenation. The real representation waits on ARC, since it *is* an ARC
+   reference with a view attached.
 3. **All locals are `alloca`.** Every `var`, parameter, and loop variable gets a stack slot;
    reads `load`, writes `store`. Slots are hoisted into the entry block (names are unique per
    function, so one inside a loop does not grow the stack per iteration), but there is no

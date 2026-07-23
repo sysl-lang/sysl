@@ -154,9 +154,9 @@ class StringLiteralTests extends AnyFreeSpec with Matchers with CodegenSupport w
       run("print('☃', \"☃\")") shouldBe "☃ ☃\n"
     }
 
-    // A `string` is specified as a fat pointer carrying its own length, so a NUL is an
-    // ordinary byte in it. The bring-up lowering passes a bare pointer to `printf`, which
-    // stops there — the assertion below is what the specified representation gives.
+    // A `string` carries its own length, so a NUL is an ordinary byte in it. The bring-up
+    // lowering passes a bare pointer to `printf`, which stops there — the assertion below is
+    // what the specified representation gives.
     "a NUL inside a string is an ordinary byte" ignore {
       run("""print("a\0b", "end")""") shouldBe "a" + 0.toChar + "b end\n"
     }

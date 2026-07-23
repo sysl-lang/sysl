@@ -49,11 +49,14 @@ Not an arbitrary-width family — only these four (`00` §6). `bfloat` deliberat
 | `bool` | — | 1 | `true` / `false`; no int↔bool coercion |
 | `char` | — | 4 | Unicode scalar value `0..=0x10FFFF` minus surrogates; no arithmetic (`00` §1) |
 | `unit` | — | 0 | sole value `()` |
-| `string` | — | 16 | fat pointer `{ ptr: *u8, len: usize }` — UTF-8 bytes |
+| `string` | — | 24 | `{ owner, ptr: *u8, len: usize }` — an owning view of validated UTF-8 (`04`) |
 
-`string`'s `len` is `usize`, so the fat pointer is 16 bytes on aarch64 and 8 bytes on a
-32-bit target — never hard-coded to 64-bit. Because the length is carried, a NUL is an
-ordinary byte inside a `string`; nothing about the type is NUL-terminated.
+`string` is the one primitive that is not self-contained: it carries a reference to the
+buffer holding its bytes, so substrings share and ARC keeps them alive. Its size is three
+pointer-width words, so 24 bytes on a 64-bit target and 12 on a 32-bit one — never hard-coded.
+Because the length is carried, a NUL is an ordinary byte inside a `string`; nothing about the
+type is NUL-terminated. `04-strings.md` has the representation, the validity guarantee, and
+the operations.
 
 ## Literals
 
@@ -115,7 +118,8 @@ error. A character literal may not span a line break.
 Double-quoted, UTF-8, the escape table above: `"héllo ☃"`. The value is a sequence of bytes
 with a known length, so an embedded `\0` is an ordinary byte rather than a terminator. A
 string literal may not span a line break, and `//` or `/*` inside one is ordinary text.
-Concatenation, interpolation, and raw/multi-line forms are not yet specified.
+Concatenation, interpolation, and raw/multi-line forms are not yet specified. A literal's
+bytes are immortal, which is what lets allocator-free code use one (`04`).
 
 ## Conversions between scalar types
 
