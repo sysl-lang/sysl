@@ -382,5 +382,25 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
           |    get(self) -> T = self.value""".stripMargin
       ) should include("members of a generic type are not supported yet")
     }
+
+    // The deferral is about the type carrying parameters, not the receiver mode — a &self
+    // receiver on a generic type is rejected by the same guard, not silently lowered.
+    "a &self member on a generic type is rejected too" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    get(&self) -> T = self.value""".stripMargin
+      ) should include("members of a generic type are not supported yet")
+    }
+
+    // A method that introduces its own type parameter, even on a non-generic type, is a separate
+    // deferral with its own diagnostic.
+    "a generic method on a non-generic type waits on the generics work" in {
+      err(
+        """struct Registry
+          |    n: int
+          |    store[T](&self, item: T) -> int = self.n""".stripMargin
+      ) should include("generic methods are not supported yet")
+    }
   }
 }

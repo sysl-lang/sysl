@@ -103,6 +103,74 @@ class MethodRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "103\n"
   }
 
+  // A &self method that returns a &T field hands out the reference the receiver holds; the
+  // returned &Inner is retained so it outlives the receiver being dropped when extract returns.
+  // Over a long loop this must free each Inner exactly once — a leak grows RSS, a double-free
+  // crashes. Peak RSS was separately confirmed flat. total = sum of i%4 over 500000 = 750000.
+  "a &self method returns a &T field that outlives the dropped receiver" in {
+    val src =
+      """struct Inner
+        |    v: int
+        |struct Outer
+        |    inner: &Inner
+        |    peek(&self) -> &Inner = self.inner
+        |extract(seed: int) -> &Inner
+        |    var o: &Outer = Outer(Inner(seed))
+        |    o.peek()
+        |var i = 0
+        |var total = 0
+        |while i < 500000
+        |    var got = extract(i % 4)
+        |    total += got.v
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "750000\n"
+  }
+
+  // A &self method that overwrites a &T field must release the old reference and retain the new
+  // one. Building a fresh Outer, replacing its inner, and reading it back, over a long loop, must
+  // free every Inner once. total = sum of (i%3 + 1) over 500000 = 999999.
+  "a &self method that swaps a &T field releases the old and retains the new" in {
+    val src =
+      """struct Inner
+        |    v: int
+        |struct Outer
+        |    inner: &Inner
+        |    replace(&self, x: &Inner)
+        |        self.inner = x
+        |    val(&self) -> int = self.inner.v
+        |mk(seed: int) -> int
+        |    var o: &Outer = Outer(Inner(seed))
+        |    o.replace(Inner(seed + 1))
+        |    o.val()
+        |var i = 0
+        |var total = 0
+        |while i < 500000
+        |    total += mk(i % 3)
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "999999\n"
+  }
+
+  // A &self method may return the receiver itself as a &Outer, so calls chain. Each bump mutates
+  // the one shared heap object and returns it; after three, both the original alias and the chain
+  // result read 3 — every link points at the same object, retained and released without a leak.
+  "a fluent &self method returns the receiver so calls chain on one object" in {
+    val src =
+      """struct Outer
+        |    n: int
+        |    bump(&self) -> &Outer
+        |        self.n += 1
+        |        self
+        |var o: &Outer = Outer(0)
+        |var p = o.bump().bump().bump()
+        |print(o.n, p.n)""".stripMargin
+
+    run(src) shouldBe "3 3\n"
+  }
+
   "the built-in len property is unchanged by user members" in {
     val src =
       """var a = [10, 20, 30]
