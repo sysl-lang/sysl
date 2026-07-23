@@ -1,0 +1,193 @@
+package io.github.edadma.sysl
+
+/** Calls and construction: free functions, methods, associated functions, struct and enum
+ * construction, and the `?` operator. A member call resolves exactly as a free call does —
+ * the analyzer lowered every member to a function under the mangled name `Type.member` — so the
+ * only method-specific work here is passing the receiver in the mode its `self` sigil declared.
+ */
+trait CallAnalysis extends TypeResolution {
+
+  /** Type-checks positional arguments against a resolved parameter list. `pre` holds arguments
+   * already analyzed during type-argument inference, so they are not analyzed twice.
+   */
+  protected def checkArgs(
+      what: String,
+      params: List[(String, Type)],
+      args: List[Expr],
+      pre: Option[List[TExpr]],
+  ): List[TExpr] = {
+    // An argument analyzed during inference was analyzed without an expected type, so a value
+    // headed for a `&T` parameter is boxed here instead of at its own analysis.
+    val ts = pre match
+      case Some(provisional) => provisional.zip(params).map { case (t, (_, pty)) => box(t, pty) }
+      case None              => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+
+    for (t, (pname, pty)) <- ts.zip(params) do
+      if t.ty != pty then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")
+
+    ts
+  }
+
+  protected def callFunction(f: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
+    if args.length != f.params.length then
+      err(s"function '${f.name}' takes ${f.params.length} arguments, but ${args.length} were given")
+
+    val (name, pre) =
+      if f.tparams.isEmpty then (f.name, None)
+      else
+        val provisional = args.map(analyzeExpr(_))
+        val targs =
+          solve(f.name, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected)
+        (instantiateFunc(f, targs), Some(provisional))
+
+    val (params, rtype) = funcInsts(name)
+    TCall(name, checkArgs(f.name, params, args, pre), rtype)
+  }
+
+  /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
+   * calls the function it lowered to, passing the receiver as the first argument in whatever
+   * memory mode the method's `self` asked for.
+   */
+  protected def callMethod(recv: Expr, mname: String, args: List[Expr]): TExpr = {
+    val tr = analyzeExpr(recv)
+
+    structBase(tr.ty) match
+      case Some((base, s)) =>
+        memberDecls.get((base, mname)) match
+          case Some(m) if m.receiver.isDefined =>
+            val fname           = s"$base.$mname"
+            val (params, rtype) = funcInsts(fname)
+            if args.length != params.length - 1 then
+              err(s"method '$fname' takes ${params.length - 1} arguments, but ${args.length} were given")
+            val recvArg  = buildReceiver(m.receiver.get, tr, s)
+            val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+            TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
+          case Some(_) => err(s"'$mname' is a property of '${s.name}' — read it as 'value.$mname', without '()'")
+          case None    => err(s"type '${s.name}' has no method '$mname'")
+      case None =>
+        err(s"cannot call method '$mname' on ${show(tr.ty)}")
+  }
+
+  /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
+   * The positional constructor `Type(…)` is a different form and is handled elsewhere.
+   */
+  protected def callAssociated(tname: String, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
+    memberDecls.get((tname, mname)) match
+      case Some(m) if m.receiver.isEmpty && !m.isProperty =>
+        val fname           = s"$tname.$mname"
+        val (params, rtype) = funcInsts(fname)
+        if args.length != params.length then
+          err(s"associated function '$fname' takes ${params.length} arguments, but ${args.length} were given")
+        val ts = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+        TCall(fname, checkArgs(fname, params, args, Some(ts)), rtype)
+      case Some(m) if m.isProperty =>
+        err(s"'$mname' is a property of '$tname' — read it on a value, as 'value.$mname'")
+      case Some(_) => err(s"'$mname' is an instance method of '$tname' — call it on a value, not the type")
+      case None    => err(s"type '$tname' has no associated function '$mname'")
+
+  /** The struct a receiver denotes, seeing through one level of `*T` / `&T`, so a method may be
+   * called on a value, a pointer to it, or a reference to it alike.
+   */
+  protected def structBase(t: Type): Option[(String, Type.Struct)] = t match
+    case s: Type.Struct              => Some((s.base, s))
+    case Type.Ptr(s: Type.Struct)    => Some((s.base, s))
+    case Type.Ref(s: Type.Struct, _) => Some((s.base, s))
+    case _                           => None
+
+  /** Passes the receiver in the mode the method's `self` declared, inserting the same conversion
+   * a matching argument would: a value is copied, `*self` takes the instance's address, `&self`
+   * needs the reference itself.
+   */
+  protected def buildReceiver(mode: RecvMode, tr: TExpr, s: Type.Struct): TExpr = mode match
+    case RecvMode.ByValue =>
+      tr.ty match
+        case _: Type.Struct => tr
+        case _              => autoDeref(tr)
+
+    case RecvMode.ByPtr =>
+      tr.ty match
+        case _: Type.Ptr => tr
+        case _ =>
+          val place = tr.ty match
+            case _: Type.Ref => autoDeref(tr)
+            case _           => tr
+          if !isPlace(place) then
+            err("'*self' needs a variable, field, or dereference to point at — this receiver has no address")
+          TAddrOf(place, Type.Ptr(place.ty))
+
+    case RecvMode.ByRef(_) =>
+      tr.ty match
+        case _: Type.Ref => tr
+        case _ =>
+          err(s"'&self' needs a reference; a ${show(tr.ty)} on the stack has none — take '*self' instead, " +
+            "or put the object behind a '&'")
+
+  protected def constructStruct(name: String, args: List[Expr], expected: Option[Type]): TExpr = {
+    val decl = structDecls(name)
+
+    if args.length != decl.fields.length then
+      err(s"struct '$name' has ${decl.fields.length} fields, but ${args.length} were given")
+
+    val (targs, pre) =
+      if decl.tparams.isEmpty then (Nil, None)
+      else
+        expected match
+          case Some(s: Type.Struct) if s.base == name => (s.targs, None)
+          case _ =>
+            val provisional = args.map(analyzeExpr(_))
+            val targs =
+              solve(name, decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected)
+            (targs, Some(provisional))
+
+    val s = instantiateStruct(name, targs)
+    TStructNew(s, checkArgs(s.name, s.fields, args, pre))
+  }
+
+  protected def constructVariant(name: String, args: List[Expr], expected: Option[Type]): TExpr = {
+    val ename = variantOwner(name)
+    val decl  = enumDecls(ename)
+    val vdecl = decl.variants.find(_.name == name).get
+
+    if vdecl.fields.isEmpty && args.nonEmpty then
+      err(s"variant '$name' takes no arguments — write it as '$name'")
+    if vdecl.fields.nonEmpty && args.isEmpty then
+      err(s"variant '$name' carries data — construct it with '$name(…)'")
+    if args.length != vdecl.fields.length then
+      err(s"variant '$name' has ${vdecl.fields.length} fields, but ${args.length} were given")
+
+    val (targs, pre) =
+      if decl.tparams.isEmpty then (Nil, None)
+      else
+        expected match
+          case Some(e: Type.Enum) if e.base == ename => (e.targs, None)
+          case _ =>
+            val provisional = args.map(analyzeExpr(_))
+            val targs =
+              solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected)
+            (targs, Some(provisional))
+
+    val en = instantiateEnum(ename, targs)
+    val v  = en.variant(name).get
+    TEnumNew(en, v, checkArgs(name, v.fields, args, pre))
+  }
+
+  /** `expr?` — unwraps an `Option`/`Result`, or returns the enclosing function early with the
+   * failure re-wrapped in *its* return type. The two enums must agree, and a propagated error
+   * must be the one the function returns.
+   */
+  protected def analyzeTry(t: TExpr): TExpr = {
+    val en = t.ty match
+      case e: Type.Enum if Prelude.tryVariants(e.base).isDefined => e
+      case other => err(s"'?' needs an Option or Result value, not ${show(other)}")
+
+    val (okName, failName) = Prelude.tryVariants(en.base).get
+
+    retTy match
+      case ret: Type.Enum if ret.base == en.base =>
+        if en.base == "Result" && ret.targs(1) != en.targs(1) then
+          err(s"'?' propagates a ${show(en.targs(1))} error, but this function returns ${show(ret.targs(1))}")
+        TTry(t, en.variant(okName).get, en.variant(failName).get, ret, ret.variant(failName).get, en.targs.head)
+      case other =>
+        err(s"'?' may only be used in a function returning ${en.base}, not ${show(other)}")
+  }
+}

@@ -2,14 +2,16 @@ package io.github.edadma.sysl
 
 import scala.collection.mutable
 
-/** An error raised by the analyzer: an unknown name, a type mismatch, a wrong arity — any
- * rule that the structural parse cannot catch.
- */
-case class AnalyzerError(message: String) extends RuntimeException(message)
-
 /** The semantic pass: it resolves names, checks types, and turns the untyped `Program` into
  * a typed `TProgram` that codegen lowers directly. All diagnostics live here; codegen trusts
  * the tree it is handed.
+ *
+ * The work is split across traits mixed into this class, the way codegen is split across
+ * `Emitter` and friends: `AnalyzerBase` holds the shared tables and name scopes, `TypeResolution`
+ * resolves and instantiates types, `Literals` handles the scalar leaves, `CallAnalysis` handles
+ * calls and construction, and `PatternAnalysis` handles `match`. What stays here is the spine —
+ * the declaration-hoisting driver, statements, the expression dispatch, and places — plus the
+ * recursive entry points the traits call back into through `AnalyzerBase`'s hooks.
  *
  * Declarations are hoisted, so functions, structs, and enums may be used before they appear
  * and may be mutually recursive. Each function (and the synthetic `main` around the top-level
@@ -24,250 +26,7 @@ case class AnalyzerError(message: String) extends RuntimeException(message)
  * *expected* type when the arguments alone do not determine them — which is what lets `None`
  * and `Ok(5)` take their type from the context they appear in.
  */
-class Analyzer private (program: Program) {
-
-  private val structDecls = mutable.LinkedHashMap.empty[String, StructDecl]
-  private val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
-  private val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
-
-  /** A type's inherent members, keyed by (type name, member name). Methods, properties, and
-   * associated functions all live here; each is also lowered to an ordinary function under the
-   * mangled name `Type.member`, so calling one is a call and codegen needs no method concept.
-   */
-  private val memberDecls = mutable.LinkedHashMap.empty[(String, String), MethodDecl]
-
-  /** Instantiated types, keyed by their display name (`Point`, `Option[int]`) and held in
-   * dependency order — a type is inserted only after the types it contains.
-   */
-  private val structInsts = mutable.LinkedHashMap.empty[String, Type.Struct]
-  private val enumInsts   = mutable.LinkedHashMap.empty[String, Type.Enum]
-
-  /** Instantiations whose fields are still being resolved, each recorded with the indirection
-   * depth at which it was entered. A type that reaches itself finds its own entry here; the
-   * depth is what decides whether that is a legal cycle (see `cycleCheck`).
-   */
-  private val resolving = mutable.LinkedHashMap.empty[String, Int]
-
-  /** The same instantiations, by display name, so a recursive occurrence resolves to the object
-   * whose fields are still being filled in rather than starting a second one.
-   */
-  private val inProgress = mutable.LinkedHashMap.empty[String, Type]
-
-  /** How many `*T` / `&T` wrappers the resolver is currently inside. */
-  private var indirection = 0
-
-  /** Instantiated function signatures, keyed by the name codegen will emit. */
-  private val funcInsts = mutable.LinkedHashMap.empty[String, (List[(String, Type)], Type)]
-
-  /** Instantiations whose body has not been analyzed yet. Queued rather than analyzed inline
-   * so an instantiation discovered mid-function does not disturb the enclosing context.
-   */
-  private val pending = mutable.Queue.empty[(String, FuncDecl, Map[String, Type])]
-
-  /** Every enum variant name maps to its declaring enum, so a bare `Circle(5)` or `Empty`
-   * resolves without qualification. Variant names are therefore unique across all enums.
-   */
-  private val variantOwner = mutable.LinkedHashMap.empty[String, String]
-
-  // Per-function state, reset at each function boundary.
-  private var scopes: List[mutable.LinkedHashMap[String, (String, Type)]] = Nil
-  private val used                                                        = mutable.HashSet.empty[String]
-  private var retTy: Type                                                 = Type.Unit
-  private var tsubst: Map[String, Type]                                   = Map.empty
-
-  private def err(msg: String): Nothing = throw AnalyzerError(msg)
-
-  private def show(t: Type): String = Type.show(t)
-
-  // --- scopes and unique naming --------------------------------------------------------
-
-  private def pushScope(): Unit = scopes = mutable.LinkedHashMap.empty[String, (String, Type)] :: scopes
-  private def popScope(): Unit  = scopes = scopes.tail
-
-  private def resetFunction(): Unit = {
-    used.clear()
-    scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
-  }
-
-  private def freshName(base: String): String =
-    if !used(base) then { used += base; base }
-    else {
-      var k = 1
-      while used(s"$base.$k") do k += 1
-      val n = s"$base.$k"
-      used += n
-      n
-    }
-
-  private def declare(name: String, ty: Type): String = {
-    val unique = freshName(name)
-    scopes.head(name) = (unique, ty)
-    unique
-  }
-
-  private def lookupOpt(name: String): Option[(String, Type)] =
-    scopes.collectFirst { case s if s.contains(name) => s(name) }
-
-  private def lookup(name: String): (String, Type) =
-    lookupOpt(name).getOrElse(err(s"undefined name '$name'"))
-
-  // --- type resolution -----------------------------------------------------------------
-
-  /** Resolves a type in the current function's substitution — the identity map outside a
-   * generic instantiation.
-   */
-  private def rt(t: TypeRef): Type = resolveType(t, tsubst)
-
-  /** Resolves a type reference under `subst`, which maps the enclosing declaration's type
-   * parameters to the arguments it was instantiated with.
-   */
-  private def resolveType(t: TypeRef, subst: Map[String, Type]): Type = t match
-    case PtrType(inner)       => Type.Ptr(underIndirection(resolveType(inner, subst)))
-    case RefType(inner, sync) => Type.Ref(underIndirection(resolveType(inner, subst)), sync)
-
-    // An array holds its elements, so it is no indirection at all and a type cannot contain an
-    // array of itself. A slice only points at them, so it breaks a cycle exactly as `*T` does.
-    case ArrayType(None, elem) => Type.Slice(underIndirection(resolveType(elem, subst)))
-    case ArrayType(Some(len), elem) =>
-      val n = len match
-        case IntLit(v, _) if v >= 0 && v.isValidInt => v.toInt
-        case IntLit(v, _)                           => err(s"an array cannot have $v elements")
-        case _ => err("an array length must be an integer literal")
-      Type.Array(n, resolveType(elem, subst))
-
-    case NamedType(n, argRefs) =>
-      if argRefs.isEmpty && subst.contains(n) then subst(n)
-      else
-        val targs = argRefs.map(resolveType(_, subst))
-        scalarType(n) match
-          case Some(s)                        => plain(n, targs, s)
-          case None if structDecls.contains(n) => instantiateStruct(n, targs)
-          case None if enumDecls.contains(n)   => instantiateEnum(n, targs)
-          case None                            => err(s"unknown type '$n'")
-
-  /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
-   * whatever type is currently being laid out.
-   */
-  private def underIndirection(resolve: => Type): Type = {
-    indirection += 1
-    try resolve
-    finally indirection -= 1
-  }
-
-  /** Whether reaching an in-progress instantiation again is a legal cycle. It is exactly when
-   * at least one indirection was crossed on the way back to it: a `Node` holding a `*Node` is
-   * pointer-sized, while a `Node` holding a `Node` by value has no finite size.
-   */
-  private def cycleCheck(key: String): Unit =
-    if indirection <= resolving(key) then err(s"type '$key' contains itself, so it has no finite size")
-
-  /** Resolves a scalar type name: the named primitives and friendly aliases, or one of the
-   * systematic `iN` / `uN` / `fN` width spellings.
-   */
-  private def scalarType(name: String): Option[Type] =
-    Type.scalars.get(name).orElse(widthType(name))
-
-  /** `i5`, `u12`, `f32` — a family letter followed by a width. The integer family is open,
-   * so it is recognised by shape rather than listed; a width the back end cannot lower is a
-   * diagnostic, not an unknown name.
-   */
-  private def widthType(name: String): Option[Type] = {
-    val digits = name.drop(1)
-
-    if name.length < 2 || !"iuf".contains(name.head) then None
-    else if digits.head == '0' || !digits.forall(c => c >= '0' && c <= '9') then None
-    else
-      val bits = digits.toIntOption.getOrElse(err(s"'$name' is far wider than anything can hold"))
-
-      if name.head == 'f' then
-        if bits == 16 || bits == 32 || bits == 64 then Some(Type.Floating(bits))
-        else if bits == 128 then err("'f128' is not lowered yet — the widest float is 'f64'")
-        else err(s"'$name' is not an IEEE floating-point width; they are f16, f32, and f64")
-      else if bits >= 1 && bits <= 64 then Some(Type.Integer(bits, signed = name.head == 'i'))
-      else err(s"'$name' is wider than the 64 bits the back end lowers")
-  }
-
-  private def plain(name: String, targs: List[Type], ty: Type): Type =
-    if targs.nonEmpty then err(s"type '$name' does not take type arguments") else ty
-
-  private def checkArity(name: String, tparams: List[String], targs: List[Type]): Unit =
-    if tparams.length != targs.length then
-      if tparams.isEmpty then err(s"type '$name' does not take type arguments")
-      else err(s"type '$name' takes ${tparams.length} type arguments, but ${targs.length} were given")
-
-  /** Instantiates a struct for one set of type arguments, memoized on the display name. The
-   * instantiation is registered *before* its fields are resolved, so a field that points back
-   * at the struct finds it and the recursion terminates; `cycleCheck` is what rejects the cycle
-   * that has no indirection to break it.
-   */
-  private def instantiateStruct(name: String, targs: List[Type]): Type.Struct = {
-    val decl = structDecls(name)
-    checkArity(name, decl.tparams, targs)
-    val key = Type.qualified(name, targs)
-
-    structInsts.get(key) match
-      case Some(s) => s
-      case None if inProgress.contains(key) =>
-        cycleCheck(key)
-        inProgress(key).asInstanceOf[Type.Struct]
-      case None =>
-        val s = new Type.Struct(name, targs)
-        inProgress(key) = s
-        resolving(key) = indirection
-        val subst = decl.tparams.zip(targs).toMap
-        s.fields = decl.fields.map(f => (f.name, resolveType(f.typ, subst)))
-        resolving -= key
-        inProgress -= key
-        structInsts(key) = s
-        s
-  }
-
-  /** Instantiates an enum for one set of type arguments. All-dataless variants make a *simple*
-   * enum (integer constants, auto-incrementing from an optional explicit `= value`); any
-   * data-carrying variant makes a *data* enum, whose variants take sequential tags and whose
-   * payload-bearing variants each claim a slot in the aggregate.
-   */
-  private def instantiateEnum(name: String, targs: List[Type]): Type.Enum = {
-    val decl = enumDecls(name)
-    checkArity(name, decl.tparams, targs)
-    val key = Type.qualified(name, targs)
-
-    enumInsts.get(key) match
-      case Some(en) => en
-      case None if inProgress.contains(key) =>
-        cycleCheck(key)
-        inProgress(key).asInstanceOf[Type.Enum]
-      case None =>
-        val en = new Type.Enum(name, targs)
-        en.simple = decl.variants.forall(_.fields.isEmpty)
-        inProgress(key) = en
-        resolving(key) = indirection
-
-        val subst    = decl.tparams.zip(targs).toMap
-        var nextTag  = 0
-        var nextSlot = 1
-        en.variants = decl.variants.map { v =>
-          if en.simple then
-            val tag = v.value match
-              case Some(IntLit(n, _)) => n.toInt
-              case Some(_)            => err(s"the value of variant '${v.name}' must be an integer literal")
-              case None               => nextTag
-            nextTag = tag + 1
-            Type.EnumVariant(v.name, tag, Nil, None)
-          else
-            if v.value.isDefined then
-              err(s"variant '${v.name}' carries data, so it cannot also have an explicit value")
-            val tag    = nextTag; nextTag += 1
-            val fields = v.fields.map(f => (f.name, resolveType(f.typ, subst)))
-            val slot   = if fields.nonEmpty then { val s = nextSlot; nextSlot += 1; Some(s) } else None
-            Type.EnumVariant(v.name, tag, fields, slot)
-        }
-
-        resolving -= key
-        inProgress -= key
-        enumInsts(key) = en
-        en
-  }
+class Analyzer private (program: Program) extends CallAnalysis with PatternAnalysis with Literals {
 
   // --- program -------------------------------------------------------------------------
 
@@ -397,7 +156,7 @@ class Analyzer private (program: Program) {
    * The signature is recorded before the body is queued, so a recursive generic function
    * resolves its own call.
    */
-  private def instantiateFunc(f: FuncDecl, targs: List[Type]): String = {
+  protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String = {
     val name = Type.mangled(f.name, targs)
 
     if !funcInsts.contains(name) then
@@ -408,69 +167,6 @@ class Analyzer private (program: Program) {
       pending.enqueue((name, f, subst))
 
     name
-  }
-
-  /** Matches a declaration's type reference against an actual type, binding whatever type
-   * parameters it determines. Deliberately lenient: a structural mismatch simply leaves the
-   * parameter unbound, and the argument is type-checked properly against the instantiated
-   * signature afterwards, where the message can name both types.
-   */
-  private def unify(
-      ref: TypeRef,
-      actual: Type,
-      tparams: Set[String],
-      sub: mutable.Map[String, Type],
-  ): Unit = ref match
-    case PtrType(inner) =>
-      actual match
-        case Type.Ptr(t) => unify(inner, t, tparams, sub)
-        case _           => ()
-    // A `&T` parameter also accepts a bare `T`, which the call boxes, so the payload type is
-    // matched against either shape.
-    case RefType(inner, sync) =>
-      actual match
-        case Type.Ref(t, s) if s == sync => unify(inner, t, tparams, sub)
-        case _: Type.Ref                 => ()
-        case t                           => unify(inner, t, tparams, sub)
-    case ArrayType(None, elem) =>
-      actual match
-        case Type.Slice(e) => unify(elem, e, tparams, sub)
-        case _             => ()
-    case ArrayType(Some(_), elem) =>
-      actual match
-        case Type.Array(_, e) => unify(elem, e, tparams, sub)
-        case _                => ()
-    case NamedType(n, Nil) if tparams(n) =>
-      if !sub.contains(n) then sub(n) = actual
-    case NamedType(n, argRefs) =>
-      actual match
-        case s: Type.Struct if s.base == n && s.targs.length == argRefs.length =>
-          argRefs.zip(s.targs).foreach { case (r, t) => unify(r, t, tparams, sub) }
-        case e: Type.Enum if e.base == n && e.targs.length == argRefs.length =>
-          argRefs.zip(e.targs).foreach { case (r, t) => unify(r, t, tparams, sub) }
-        case _ => ()
-
-  /** Solves a generic declaration's type arguments from the argument types, falling back to
-   * the expected type of the whole expression for parameters the arguments do not determine.
-   */
-  private def solve(
-      what: String,
-      tparams: List[String],
-      paramRefs: List[TypeRef],
-      argTys: List[Type],
-      resultRef: Option[TypeRef],
-      expected: Option[Type],
-  ): List[Type] = {
-    val sub = mutable.LinkedHashMap.empty[String, Type]
-    val tps = tparams.toSet
-
-    for (r, t) <- paramRefs.zip(argTys) do unify(r, t, tps, sub)
-    if sub.size < tparams.length then
-      for r <- resultRef; e <- expected do unify(r, e, tps, sub)
-
-    tparams.map(tp =>
-      sub.getOrElse(tp, err(s"cannot infer the type argument '$tp' of '$what' here — annotate the expected type")),
-    )
   }
 
   // --- statements ----------------------------------------------------------------------
@@ -488,7 +184,7 @@ class Analyzer private (program: Program) {
   /** The body of a value block, using whatever scope the caller has established — a match arm
    * runs this after declaring its pattern bindings, so they are visible to the body.
    */
-  private def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock =
+  protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock =
     stmts.reverse match
       case ExprStmt(e) :: initRev =>
         val init = initRev.reverse.map(analyzeStmt(_))
@@ -572,7 +268,7 @@ class Analyzer private (program: Program) {
 
   // --- expressions ---------------------------------------------------------------------
 
-  private def analyzeBool(e: Expr): TExpr = {
+  protected def analyzeBool(e: Expr): TExpr = {
     val t = analyzeExpr(e, Some(Type.Bool))
     if t.ty != Type.Bool then err(s"condition must be bool, got ${show(t.ty)}")
     t
@@ -587,7 +283,7 @@ class Analyzer private (program: Program) {
    * writing the ordinary construction is the whole spelling of an allocation. An expression
    * that is already a `&T` passes through untouched.
    */
-  private def analyzeExpr(expr: Expr, expected: Option[Type] = None): TExpr = expected match
+  protected def analyzeExpr(expr: Expr, expected: Option[Type]): TExpr = expected match
     case Some(r: Type.Ref) =>
       expr match
         case NullLit() => err(s"a ${show(r)} always points at a live object — an absent one is Option[${show(r)}]")
@@ -597,7 +293,7 @@ class Analyzer private (program: Program) {
   /** Boxes a value the context wanted by reference. Nothing else coerces: a mismatch that is
    * not exactly "a `T` where `&T` was expected" is left for the caller to diagnose.
    */
-  private def box(t: TExpr, expected: Type): TExpr = expected match
+  protected def box(t: TExpr, expected: Type): TExpr = expected match
     case r: Type.Ref if t.ty == r.inner => TBox(t, r)
     case _                              => t
 
@@ -836,19 +532,6 @@ class Analyzer private (program: Program) {
 
     case _: Tuple => err("tuples are not supported yet")
 
-  /** Whether a type has a zero value, which is what a declaration with no initializer starts
-   * at. A reference has none — it always points at a live object — and neither does an enum,
-   * whose zeroed tag names no variant in particular.
-   */
-  private def hasZero(t: Type): Boolean = t match
-    case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool | _: Type.Ptr => true
-    // A zeroed view owns nothing and names no elements, which is exactly the empty slice — and,
-    // for a string, the empty string, which is well-formed UTF-8 the way anything empty is.
-    case _: Type.View        => true
-    case Type.Array(_, elem) => hasZero(elem)
-    case s: Type.Struct      => s.fields.forall(f => hasZero(f._2))
-    case _                   => false
-
   /** One end of a slice range: an index like any other, so any integer will do. */
   private def bound(e: Expr): TExpr = {
     val t = analyzeExpr(e, Some(Type.Usize))
@@ -872,7 +555,7 @@ class Analyzer private (program: Program) {
    * assigned through and pointed at. A local, a dereference, and a field of either are places;
    * anything computed (a call result, an arithmetic result, a freshly built struct) is not.
    */
-  private def isPlace(t: TExpr): Boolean = t match
+  protected def isPlace(t: TExpr): Boolean = t match
     case _: TLoad           => true
     case _: TDeref          => true
     case TField(recv, _, _) => isPlace(recv)
@@ -903,7 +586,7 @@ class Analyzer private (program: Program) {
   /** One level of automatic dereference, so a field is selected through a `*T` or a `&T`
    * exactly as it is on the value itself. One level only: reaching through a `**T` is written.
    */
-  private def autoDeref(t: TExpr): TExpr =
+  protected def autoDeref(t: TExpr): TExpr =
     Type.pointee(t.ty) match
       case Some(inner) => TDeref(t, inner)
       case None        => t
@@ -915,391 +598,6 @@ class Analyzer private (program: Program) {
     case Unary("*", _) => "the place it points at"
     case Index(_, _)   => "this element"
     case _             => "this place"
-
-  // --- literals ------------------------------------------------------------------------
-
-  /** An integer literal takes its type from its suffix, else from the type the context
-   * expects, else `int`. The default is never magnitude-dependent: a value too large for the
-   * type it landed in is an error asking for a suffix, not a silent widening.
-   */
-  private def intLiteral(value: BigInt, suffix: Option[String], expected: Option[Type]): TExpr = {
-    val ty = suffix match
-      case Some(s) =>
-        scalarType(s) match
-          case Some(i: Type.Integer) => i
-          case _                     => err(s"'$s' is not an integer type")
-      case None =>
-        expected match
-          case Some(i: Type.Integer) => i
-          case _                     => Type.Int
-
-    if !Type.fits(value, ty) then err(s"the literal $value does not fit ${show(ty)}")
-
-    TIntLit(value, ty)
-  }
-
-  /** A float literal takes its type from its suffix, else from the expected type when that is
-   * a float, else `real`. An integer literal never becomes a float on its own — writing `1`
-   * where a `real` is wanted is a type error, not a silent conversion.
-   */
-  private def floatLiteral(text: String, suffix: Option[String], expected: Option[Type]): TExpr = {
-    val ty = suffix match
-      case Some(s) =>
-        scalarType(s) match
-          case Some(f: Type.Floating) => f
-          case _                      => err(s"'$s' is not a floating-point type")
-      case None =>
-        expected match
-          case Some(f: Type.Floating) => f
-          case _                      => Type.Real
-
-    TFloatLit(hexDouble(text), ty)
-  }
-
-  /** Analyzes operands that must share one type. A bare literal has no type of its own, so it
-   * takes the type of a non-literal neighbour — which is what lets `n + 1` work for an `n` of
-   * any width without the literal needing a suffix, and `p == null` work for any `*T`. The
-   * non-literals are analyzed first precisely so their type is available to the literals.
-   */
-  private def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
-    val fixed = operands.map(e => Option.when(!isLiteral(e))(analyzeExpr(e, expected)))
-    val ty    = fixed.flatten.headOption.map(_.ty).orElse(expected)
-
-    operands.zip(fixed).map {
-      case (_, Some(t)) => t
-      case (e, None)    => analyzeExpr(e, ty)
-    }
-  }
-
-  /** Whether an expression is a literal with no type of its own. A suffixed numeric literal
-   * has already said what it is, so it counts as fixed rather than adaptable.
-   */
-  private def isLiteral(e: Expr): Boolean = e match
-    case IntLit(_, None) | FloatLit(_, None) => true
-    case NullLit()                           => true
-    case Unary("-", operand)                 => isLiteral(operand)
-    case _                                   => false
-
-  /** An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens,
-   * narrows, or changes representation without being written.
-   */
-  private def convert(t: TExpr, to: Type): TExpr = {
-    val allowed = (t.ty, to) match
-      case (_: Type.Integer, _: Type.Integer)   => true
-      case (_: Type.Integer, _: Type.Floating)  => true
-      case (_: Type.Floating, _: Type.Integer)  => true
-      case (_: Type.Floating, _: Type.Floating) => true
-      case (Type.Char, _: Type.Integer)         => true // total: every char is an integer
-      case (_: Type.Integer, Type.Char)         => true // partial: traps on a non-scalar value
-      case (Type.Char, Type.Char)               => true
-      case _                                    => false
-
-    if !allowed then err(s"cannot convert ${show(t.ty)} to ${show(to)}")
-
-    TCast(t, to)
-  }
-
-  // --- calls and construction ----------------------------------------------------------
-
-  /** Type-checks positional arguments against a resolved parameter list. `pre` holds arguments
-   * already analyzed during type-argument inference, so they are not analyzed twice.
-   */
-  private def checkArgs(
-      what: String,
-      params: List[(String, Type)],
-      args: List[Expr],
-      pre: Option[List[TExpr]],
-  ): List[TExpr] = {
-    // An argument analyzed during inference was analyzed without an expected type, so a value
-    // headed for a `&T` parameter is boxed here instead of at its own analysis.
-    val ts = pre match
-      case Some(provisional) => provisional.zip(params).map { case (t, (_, pty)) => box(t, pty) }
-      case None              => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
-
-    for (t, (pname, pty)) <- ts.zip(params) do
-      if t.ty != pty then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")
-
-    ts
-  }
-
-  private def callFunction(f: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
-    if args.length != f.params.length then
-      err(s"function '${f.name}' takes ${f.params.length} arguments, but ${args.length} were given")
-
-    val (name, pre) =
-      if f.tparams.isEmpty then (f.name, None)
-      else
-        val provisional = args.map(analyzeExpr(_))
-        val targs =
-          solve(f.name, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected)
-        (instantiateFunc(f, targs), Some(provisional))
-
-    val (params, rtype) = funcInsts(name)
-    TCall(name, checkArgs(f.name, params, args, pre), rtype)
-  }
-
-  /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
-   * calls the function it lowered to, passing the receiver as the first argument in whatever
-   * memory mode the method's `self` asked for.
-   */
-  private def callMethod(recv: Expr, mname: String, args: List[Expr]): TExpr = {
-    val tr = analyzeExpr(recv)
-
-    structBase(tr.ty) match
-      case Some((base, s)) =>
-        memberDecls.get((base, mname)) match
-          case Some(m) if m.receiver.isDefined =>
-            val fname           = s"$base.$mname"
-            val (params, rtype) = funcInsts(fname)
-            if args.length != params.length - 1 then
-              err(s"method '$fname' takes ${params.length - 1} arguments, but ${args.length} were given")
-            val recvArg  = buildReceiver(m.receiver.get, tr, s)
-            val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
-            TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
-          case Some(_) => err(s"'$mname' is a property of '${s.name}' — read it as 'value.$mname', without '()'")
-          case None    => err(s"type '${s.name}' has no method '$mname'")
-      case None =>
-        err(s"cannot call method '$mname' on ${show(tr.ty)}")
-  }
-
-  /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
-   * The positional constructor `Type(…)` is a different form and is handled elsewhere.
-   */
-  private def callAssociated(tname: String, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
-    memberDecls.get((tname, mname)) match
-      case Some(m) if m.receiver.isEmpty && !m.isProperty =>
-        val fname           = s"$tname.$mname"
-        val (params, rtype) = funcInsts(fname)
-        if args.length != params.length then
-          err(s"associated function '$fname' takes ${params.length} arguments, but ${args.length} were given")
-        val ts = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
-        TCall(fname, checkArgs(fname, params, args, Some(ts)), rtype)
-      case Some(m) if m.isProperty =>
-        err(s"'$mname' is a property of '$tname' — read it on a value, as 'value.$mname'")
-      case Some(_) => err(s"'$mname' is an instance method of '$tname' — call it on a value, not the type")
-      case None    => err(s"type '$tname' has no associated function '$mname'")
-
-  /** The struct a receiver denotes, seeing through one level of `*T` / `&T`, so a method may be
-   * called on a value, a pointer to it, or a reference to it alike.
-   */
-  private def structBase(t: Type): Option[(String, Type.Struct)] = t match
-    case s: Type.Struct              => Some((s.base, s))
-    case Type.Ptr(s: Type.Struct)    => Some((s.base, s))
-    case Type.Ref(s: Type.Struct, _) => Some((s.base, s))
-    case _                           => None
-
-  /** Passes the receiver in the mode the method's `self` declared, inserting the same conversion
-   * a matching argument would: a value is copied, `*self` takes the instance's address, `&self`
-   * needs the reference itself.
-   */
-  private def buildReceiver(mode: RecvMode, tr: TExpr, s: Type.Struct): TExpr = mode match
-    case RecvMode.ByValue =>
-      tr.ty match
-        case _: Type.Struct => tr
-        case _              => autoDeref(tr)
-
-    case RecvMode.ByPtr =>
-      tr.ty match
-        case _: Type.Ptr => tr
-        case _ =>
-          val place = tr.ty match
-            case _: Type.Ref => autoDeref(tr)
-            case _           => tr
-          if !isPlace(place) then
-            err("'*self' needs a variable, field, or dereference to point at — this receiver has no address")
-          TAddrOf(place, Type.Ptr(place.ty))
-
-    case RecvMode.ByRef(_) =>
-      tr.ty match
-        case _: Type.Ref => tr
-        case _ =>
-          err(s"'&self' needs a reference; a ${show(tr.ty)} on the stack has none — take '*self' instead, " +
-            "or put the object behind a '&'")
-
-  private def constructStruct(name: String, args: List[Expr], expected: Option[Type]): TExpr = {
-    val decl = structDecls(name)
-
-    if args.length != decl.fields.length then
-      err(s"struct '$name' has ${decl.fields.length} fields, but ${args.length} were given")
-
-    val (targs, pre) =
-      if decl.tparams.isEmpty then (Nil, None)
-      else
-        expected match
-          case Some(s: Type.Struct) if s.base == name => (s.targs, None)
-          case _ =>
-            val provisional = args.map(analyzeExpr(_))
-            val targs =
-              solve(name, decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected)
-            (targs, Some(provisional))
-
-    val s = instantiateStruct(name, targs)
-    TStructNew(s, checkArgs(s.name, s.fields, args, pre))
-  }
-
-  private def constructVariant(name: String, args: List[Expr], expected: Option[Type]): TExpr = {
-    val ename = variantOwner(name)
-    val decl  = enumDecls(ename)
-    val vdecl = decl.variants.find(_.name == name).get
-
-    if vdecl.fields.isEmpty && args.nonEmpty then
-      err(s"variant '$name' takes no arguments — write it as '$name'")
-    if vdecl.fields.nonEmpty && args.isEmpty then
-      err(s"variant '$name' carries data — construct it with '$name(…)'")
-    if args.length != vdecl.fields.length then
-      err(s"variant '$name' has ${vdecl.fields.length} fields, but ${args.length} were given")
-
-    val (targs, pre) =
-      if decl.tparams.isEmpty then (Nil, None)
-      else
-        expected match
-          case Some(e: Type.Enum) if e.base == ename => (e.targs, None)
-          case _ =>
-            val provisional = args.map(analyzeExpr(_))
-            val targs =
-              solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected)
-            (targs, Some(provisional))
-
-    val en = instantiateEnum(ename, targs)
-    val v  = en.variant(name).get
-    TEnumNew(en, v, checkArgs(name, v.fields, args, pre))
-  }
-
-  /** `expr?` — unwraps an `Option`/`Result`, or returns the enclosing function early with the
-   * failure re-wrapped in *its* return type. The two enums must agree, and a propagated error
-   * must be the one the function returns.
-   */
-  private def analyzeTry(t: TExpr): TExpr = {
-    val en = t.ty match
-      case e: Type.Enum if Prelude.tryVariants(e.base).isDefined => e
-      case other => err(s"'?' needs an Option or Result value, not ${show(other)}")
-
-    val (okName, failName) = Prelude.tryVariants(en.base).get
-
-    retTy match
-      case ret: Type.Enum if ret.base == en.base =>
-        if en.base == "Result" && ret.targs(1) != en.targs(1) then
-          err(s"'?' propagates a ${show(en.targs(1))} error, but this function returns ${show(ret.targs(1))}")
-        TTry(t, en.variant(okName).get, en.variant(failName).get, ret, ret.variant(failName).get, en.targs.head)
-      case other =>
-        err(s"'?' may only be used in a function returning ${en.base}, not ${show(other)}")
-  }
-
-  // --- match arms and patterns ---------------------------------------------------------
-
-  /** Analyzes one arm in its own scope so pattern bindings are visible to the guard and body.
-   * Alternatives (`a | b`) may not bind, since the body cannot know which alternative matched.
-   */
-  private def analyzeArm(scrutTy: Type, arm: MatchArm, expected: Option[Type]): TArm = {
-    pushScope()
-    val tpats = arm.patterns.map(analyzePattern(_, scrutTy))
-    if tpats.length > 1 && tpats.exists(binds) then
-      err("alternative patterns joined by '|' cannot bind a name")
-    val tguard = arm.guard.map(analyzeBool)
-    val tbody  = analyzeBlockBody(arm.body, expected)
-    popScope()
-    TArm(tpats, tguard, tbody)
-  }
-
-  /** Turns one pattern into its typed form, declaring any bindings into the current scope. A
-   * bare name is a nullary-variant pattern when it names a variant of the scrutinee's enum, and
-   * a binding otherwise.
-   */
-  private def analyzePattern(p: Pattern, ty: Type): TPattern = p match
-    case WildcardPattern => TWildPattern(ty)
-
-    case LitPattern(v) =>
-      val t = analyzeExpr(v, Some(ty))
-      if t.ty != ty then err(s"pattern is ${show(t.ty)} but the value is ${show(ty)}")
-      if !Type.isOrdered(ty) then err(s"a ${show(ty)} value cannot be matched against a literal yet")
-      TLitPattern(t)
-
-    case RangePattern(lo, hi, inclusive) =>
-      if !Type.isOrdered(ty) then err(s"a range pattern needs an ordered value, not ${show(ty)}")
-      val tl = analyzeExpr(lo, Some(ty))
-      val th = analyzeExpr(hi, Some(ty))
-      if tl.ty != ty || th.ty != ty then err(s"range pattern must match the ${show(ty)} value")
-      TRangePattern(tl, th, inclusive)
-
-    case IdentPattern(name) =>
-      ty match
-        case en: Type.Enum if en.variant(name).exists(_.fields.isEmpty) =>
-          TVariantPattern(en, en.variant(name).get, Nil)
-        case en: Type.Enum if en.variant(name).isDefined =>
-          err(s"variant '$name' carries data — match it as '$name(…)'")
-        case _ =>
-          TBindPattern(declare(name, ty), ty)
-
-    case VariantPattern(name, args) =>
-      ty match
-        case en: Type.Enum =>
-          en.variant(name) match
-            case Some(v) if v.fields.isEmpty =>
-              err(s"variant '$name' takes no arguments — match it as '$name'")
-            case Some(v) =>
-              if args.length != v.fields.length then
-                err(s"variant '$name' has ${v.fields.length} fields, but ${args.length} sub-patterns were given")
-              TVariantPattern(en, v, args.zip(v.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
-            case None =>
-              err(s"enum '${en.name}' has no variant '$name'")
-        case other =>
-          err(s"'$name(…)' matches an enum variant, but the value is ${show(other)}")
-
-  /** Whether a pattern binds any name (directly or inside a variant's sub-patterns). */
-  private def binds(p: TPattern): Boolean = p match
-    case _: TBindPattern    => true
-    case v: TVariantPattern => v.args.exists(binds)
-    case _                  => false
-
-  /** A pattern that always matches, so an unguarded arm carrying it is a catch-all. */
-  private def irrefutable(p: TPattern): Boolean = p match
-    case _: TWildPattern | _: TBindPattern => true
-    case _                                 => false
-
-  /** Checks exhaustiveness and returns the value type of a match (`unit` unless every arm
-   * yields the same non-unit type). An enum match must cover every variant or carry a
-   * catch-all; a scalar match need only be exhaustive when it is used for a value.
-   */
-  private def matchResultType(scrutTy: Type, arms: List[TArm]): Type = {
-    val bodyTys = arms.map(_.body.ty).distinct
-    val valueTy = if bodyTys.size == 1 && bodyTys.head != Type.Unit then bodyTys.head else Type.Unit
-
-    val hasCatchAll = arms.exists(a => a.guard.isEmpty && a.patterns.exists(irrefutable))
-
-    scrutTy match
-      case en: Type.Enum =>
-        val covered = arms
-          .filter(_.guard.isEmpty)
-          .flatMap(_.patterns)
-          .collect { case v: TVariantPattern if v.args.forall(irrefutable) => v.variant.tag }
-          .toSet
-        if !hasCatchAll && !en.variants.map(_.tag).toSet.subsetOf(covered) then
-          val missing = en.variants.filterNot(v => covered(v.tag)).map(_.name)
-          err(s"match on '${en.name}' is not exhaustive; missing ${missing.mkString(", ")} (add an 'else' arm)")
-      case _ =>
-        if valueTy != Type.Unit && !hasCatchAll then
-          err("a 'match' that yields a value must be exhaustive — add an 'else' arm")
-
-    valueTy
-  }
-
-  /** The result type of an arithmetic or bitwise binary operator. Operands must already have
-   * the same type — there is no implicit promotion, so a mixed-width expression is an error
-   * asking for a conversion rather than a silent widening.
-   */
-  private def arithType(op: String, a: Type, b: Type): Type = {
-    if a != b then err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}")
-    (a, op) match
-      case (_: Type.Integer, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^") => a
-      case (_: Type.Floating, "+" | "-" | "*" | "/")                                      => a
-      case _ => err(s"operator '$op' is not defined for ${show(a)}")
-  }
-
-  /** Renders a decimal float literal as an LLVM hex double — the textual form that survives
-   * the round-trip without losing bits.
-   */
-  private def hexDouble(text: String): String =
-    f"0x${java.lang.Double.doubleToLongBits(text.toDouble)}%016X"
 }
 
 object Analyzer {
