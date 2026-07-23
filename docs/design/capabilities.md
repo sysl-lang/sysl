@@ -17,9 +17,11 @@ parts of the compiler:
   the heap-backed features are legal: `&T`, `weak T`, growable arrays, boxed trait objects
   (`&Trait`), escaping closures, and allocating string operations. Without it, only the
   **no-alloc subset** compiles: value types `T`, raw pointers `*T`, fixed arrays `[N]T`,
-  slice-views `[]T`, static data, string literals, and bounds-checked indexing. The
-  **type-checker** enforces this — it is what makes "no `&T` in the kernel" a checked
-  guarantee rather than a convention.
+  slices `[]T`, static data, string literals, and bounds-checked indexing. What is gated is
+  *creating* heap storage, not *holding* it — allocator-free code may keep and release a `&T`
+  or heap-backed slice it was handed, because every ARC object carries its own deallocation
+  hook (`03`). The **type-checker** enforces this — it is what makes "the kernel allocates
+  nothing" a checked guarantee rather than a convention.
 - **`os` / `posix` — *environment* capabilities.** They do not change the language; they gate
   which **standard-library modules exist**. `import std.fs` requires `os`; the POSIX
   compatibility layer requires `posix`. Enforced by **module resolution**, not the type-checker.
@@ -91,10 +93,16 @@ fit within the target's capabilities.
 
 **Available without `alloc`** (the no-alloc subset):
 
-- value types `T`, fixed arrays `[N]T`, slice-views `[]T`, `*T` raw pointers, static data;
+- value types `T`, fixed arrays `[N]T`, slices `[]T`, `*T` raw pointers, static data;
 - bounds-checked indexing on arrays and slices;
 - string **literals** (static) and **non-escaping** closures (inlined, no box);
+- **holding, passing, and releasing** references and heap-backed slices created elsewhere —
+  retain and release need no allocator, and the free path goes through the object's own hook;
 - manual `malloc` / `free` you provide yourself via `*T` — the allocator's own building blocks.
+
+What remains a compile error is *making* heap storage: `&T`, `weak T`, growable arrays, boxed
+trait objects, escaping closures, and the allocating string operations. A slice of a local
+array that escapes its frame is also an error here, since promoting it would allocate (`03`).
 
 ## The payoff
 

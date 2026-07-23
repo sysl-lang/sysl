@@ -1,17 +1,17 @@
 # Strings
 
-**Status:** representation and semantics decided; the API surface is sketched and the two
-items at the end are open. This rests on the memory model (`03`) — a `string` is the first
-place ownership, ARC, and the allocator-free subset all meet, so read that one first.
+**Status:** representation and semantics decided; the API surface is sketched. This rests on
+the memory model (`03`) — a `string` is an immutable, validated `[]u8` and inherits its
+ownership rules from slices, so read that one first.
 
 ## The decision in one paragraph
 
-A `string` is a **three-word owning view of validated UTF-8 bytes**: an owner reference for
-ARC, an interior pointer, and a byte length. Substrings share the bytes and cost a retain.
-Literals are immortal, so allocator-free code can hold and slice them. Every `string` is
-well-formed UTF-8, guaranteed at construction. The element granularity is the byte and the
-Unicode scalar value; grapheme clusters are a library. Nothing about the type is
-NUL-terminated.
+A `string` is a **three-word owning view of validated UTF-8 bytes** — the same shape every
+slice has: an owner reference for ARC, an interior pointer, and a byte length. Substrings
+share the bytes and cost a retain. Literals are immortal, so allocator-free code can hold and
+slice them. Every `string` is well-formed UTF-8, guaranteed at construction. The element
+granularity is the byte and the Unicode scalar value; grapheme clusters are a library. Nothing
+about the type is NUL-terminated.
 
 ## Representation
 
@@ -31,8 +31,9 @@ buffer while still keeping that parent alive. Two words cannot do both jobs: wit
 lifetime goes unchecked. The third word buys O(1) substring sharing — the property that makes
 a string library worth using — for 8 bytes.
 
-`StrBuf` is an ordinary ARC heap object: a refcount header followed by the bytes. Nothing in
-the layout is special-cased; a `string` is a normal ARC reference with a view attached.
+`StrBuf` is an ordinary ARC heap object: a header — refcount plus the deallocation hook every
+ARC object carries (`03`) — followed by the bytes. Nothing in the layout is special-cased; a
+`string` is a normal ARC reference with a view attached, which is precisely what a slice is.
 
 ### Why not the alternatives
 
@@ -164,32 +165,35 @@ contains a NUL is diagnosed rather than silently made unpassable.
 
 Following `03`: the *type* is not gated, the *allocating operations* are.
 
-Legal with `no alloc`: holding, passing, comparing, indexing, slicing, and iterating a
-string; string literals and anything sliced from one.
+Legal with `no alloc`: holding, passing, comparing, indexing, slicing, iterating, and
+releasing any string — including a heap-backed one handed in from outside, which frees itself
+through its own deallocation hook.
 
 Requires `alloc`: `from_utf8`, `copy()`, concatenation, `str.builder`, `cstring` — every
 operation that produces new bytes.
 
-Because a `no alloc` module can only obtain strings from literals, every string it sees is
-immortal and its retain/release compile away.
+A module that only ever uses literals sees only immortal strings, so its retain and release
+compile away entirely; one that is handed a heap-backed string pays ordinary refcount traffic
+and still links no allocator.
 
-## Two open items
+## Relationship to slices
 
-**1. Ownership across a `no alloc` boundary.** If an allocator-ful module hands a heap-backed
-string to an allocator-free one, that module is on the hook for the final release — which
-needs a deallocator it does not have. This is not a string problem: it is the same question as
-passing `&T` across the boundary, which `03` currently answers by making `&T` illegal there
-rather than by describing the boundary. Candidate answers are a per-buffer deallocation hook
-in the header (the microkernel move — the allocating server's free function travels with the
-buffer), or a signature-level rule that the boundary only carries immortal strings. Decide
-this once, for `&T` and `string` together.
+Both questions this doc originally left open are now decided in `03`, and they resolve the
+same way:
 
-**2. Slices have the same hole.** `03` describes `[]T` as "only a view" needing no allocator,
-and separately promises the safe subset has no dangling pointers. A two-word view into an
-ARC'd buffer cannot deliver both. The consistent resolution is the one taken here — `[]T`
-becomes `{owner, ptr, len}`, retaining its buffer — which would make `string` precisely an
-immutable, validated `[]u8` and let the two share one implementation. That is a change to `03`
-and has not been made yet.
+- **`[]T` is three words too** — `{owner, ptr, len}`, retaining its buffer, with a null owner
+  for views of static or otherwise-outliving storage. A `string` is therefore exactly an
+  **immutable, validated `[]u8`**: the same representation, the same retain-on-slice, one
+  implementation underneath. Everything this doc says about sharing and immortality is the
+  general slice rule, not a string special case.
+- **Ownership crosses a `no alloc` boundary freely.** Every ARC object carries a pointer to
+  the function that frees it, so allocator-free code can hold and release a heap-backed string
+  it was handed without linking an allocator. `no alloc` gates *making* strings, not *having*
+  them.
+
+The one string-specific addition is the validity invariant: a `[]u8` may hold any bytes, and a
+`string` is the subset that is well-formed UTF-8, which is why converting between them is
+checked in one direction and free in the other.
 
 ## Summary against the languages this came from
 
@@ -203,4 +207,4 @@ and has not been made yet.
 | Element | byte / `rune` | grapheme cluster | byte / `char` | byte / `char` |
 | Comparison | bytes | canonical equivalence | bytes | bytes |
 | NUL-terminated | no | privately | no | no |
-| Usable without an allocator | no | no | `&str` yes | literals yes |
+| Usable without an allocator | no | no | `&str` yes | yes (literals free; heap-backed ones held and released) |

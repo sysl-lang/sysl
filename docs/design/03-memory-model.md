@@ -1,8 +1,9 @@
 # The Memory Model — Three Modes
 
-**Status:** core model decided. This is the heart of the language; the type, trait, and
-standard-library docs all rest on it. A few sub-mechanisms (the capability system,
-concurrency/atomic refcounts) are flagged open at the end.
+**Status:** core model decided, including slice ownership and what the allocator-free boundary
+gates. This is the heart of the language; the type, trait, and standard-library docs all rest
+on it. A few sub-mechanisms (escape analysis, concurrency/atomic refcounts) are flagged open at
+the end.
 
 ## The guarantee
 
@@ -45,8 +46,30 @@ always safe.
 - **automatically managed** — the compiler emits retain/release; the object is freed the moment
   the last strong reference goes away.
 
-`&T` needs a managed allocator (see Capabilities). This is the pleasant default for
-application, server, and utility code.
+**Creating** a `&T` needs a managed allocator (see Capabilities); **holding** one does not.
+This is the pleasant default for application, server, and utility code, and — because of the
+rule below — it is also what lets a driver hold a reference the bus manager created for it.
+
+### Who frees it — the deallocation hook
+
+Every ARC heap object carries, alongside its refcount, a **pointer to the function that frees
+it**, installed by whoever allocated it. Release decrements; at zero it runs the destructor
+(which the compiler emits inline, since every release site knows the static type) and then
+calls through the hook.
+
+One word per heap object buys three things:
+
+- **ARC works the same everywhere.** A module that never allocates can still retain and
+  release, because the free path calls back into the heap the object came from. Refcount
+  operations are a few instructions and depend on no runtime.
+- **Several heaps coexist.** A microkernel wants exactly this: the kernel heap, each server's
+  heap, and an arena are different allocators, and an object frees itself into the one that
+  made it, wherever it is dropped.
+- **No boundary rule to learn.** Ownership crosses a `no alloc` edge like any other value.
+
+The cost lands only where the feature is used. Value types, fixed arrays, and `*T` buffers
+have no header at all, so kernel code written in the allocator-free subset pays nothing for a
+mechanism it never touches.
 
 ### `*T` — raw pointer
 
@@ -64,13 +87,13 @@ Kotlin per-*type* split (`struct` value type vs `class` reference type): the per
 form keeps C's per-site flexibility — the same struct type can be held by value in one place,
 by reference in another, and by raw pointer in a third — which systems code relies on.
 
-Within that model, **value (`T`) is the unmarked default, and the kernel is why.** In a
-no-alloc module references do not exist, so if the *reference* were the bare default, the
-unmarked form would be the one spelling that is *illegal* exactly where value semantics are
-needed most — every kernel struct would need a mark and hit "references need an allocator" on
-its most natural spelling. Value-as-default keeps the kernel's common case unmarked (`T`),
-`*T` covers pointers, and `&T` simply never appears in kernel code. It is the only assignment
-of the three where the unmarked default is usable in *both* worlds.
+Within that model, **value (`T`) is the unmarked default, and the kernel is why.** A no-alloc
+module cannot *make* a reference, so if the *reference* were the bare default, the unmarked
+form would be the one spelling that is illegal exactly where value semantics are needed most —
+every kernel struct would need a mark and hit "references need an allocator" on its most
+natural spelling. Value-as-default keeps the kernel's common case unmarked (`T`), `*T` covers
+pointers, and `&T` appears in kernel code only where something else handed it one. It is the
+only assignment of the three where the unmarked default is usable in *both* worlds.
 
 **Ergonomics of `&` in application code.** With type inference (Scala-style), `&` appears only
 in explicit type positions — function signatures and struct fields — not on locals:
@@ -108,22 +131,43 @@ may be null like any C pointer — part of its unsafety.)
 The out-of-bounds hazard is governed by whether a value **carries its length**, independent of
 allocation or "pointer-ness":
 
-- **Arrays (`[N]T`) and slices (`[]T`, a `{ptr, len}` view)** carry their length, so indexing
-  is **bounds-checked in every context** — hosted or allocator-free kernel, over static, stack,
-  or heap memory. A slice is only a view; creating one needs no allocator.
+- **Arrays (`[N]T`) and slices** carry their length, so indexing is **bounds-checked in every
+  context** — hosted or allocator-free kernel, over static, stack, or heap memory.
 - **`*T` carries no length**, so it is the one unchecked primitive.
 
 The practical consequence: even low-level, allocator-free code stays bounds-safe by using
 slices; `*T` is reserved for genuine address work, not merely for having an indexable buffer.
-Growable (appendable) arrays need an allocator; fixed arrays and slice-views do not.
+Growable (appendable) arrays need an allocator; fixed arrays and slices do not.
 
-**Open: who keeps a slice's bytes alive.** A bare `{ptr, len}` view into an ARC'd buffer can
-outlive the last `&T` to that buffer, so "a slice is only a view" and "the safe subset has no
-dangling pointers" cannot both hold as written. `04-strings.md` resolves this for `string` by
-carrying the owning reference in the value itself — `{owner, ptr, len}` — which retains its
-buffer and costs one extra word. The consistent resolution here is the same shape for `[]T`,
-which would additionally make `string` exactly an immutable, validated `[]u8`. That change is
-not yet made.
+## Slices keep their backing alive
+
+A slice is **three words**, not two:
+
+```
+[]T = { owner: *Buf, ptr: *T, len: usize }        // 24 bytes on a 64-bit target
+```
+
+A bare `{ptr, len}` view can outlive the buffer it views — Go gets away with it because its
+collector finds the object from an interior pointer, and sysl has no collector. So a slice
+carries the owning reference itself: `ptr` and `len` name the range, `owner` keeps the bytes
+alive. Taking a slice retains; dropping one releases. Slicing stays O(1) and allocation-free,
+and "a slice never dangles" becomes true rather than aspirational.
+
+`owner` is **null when there is nothing to keep alive** — a slice of static data, of a `*T`
+buffer, or of a fixed array whose storage outlives every view of it. Retain and release on
+such a slice are no-ops, so allocator-free code slicing a static or stack buffer pays nothing
+at all. This is the same immortality rule string literals use (`04`), generalized.
+
+A `string` is then exactly an **immutable, validated `[]u8`**, and the two share one
+representation and one implementation.
+
+**Slicing something that would not outlive the slice.** If a local fixed array is sliced and
+the slice escapes the frame, the array is promoted to an ARC buffer so the slice's `owner` has
+something to hold — the same escape analysis Go performs, done by the compiler with no
+annotation in the source. That is the ordinary case. Under `no alloc` there is nothing to
+promote it into, so the escape is a compile error naming the array and the slice that outlives
+it; the fix there is to make the storage static or to pass the slice down rather than out.
+This analysis is a compiler-internal one, not a lifetime system the programmer writes.
 
 ## Shared mutability and concurrency
 
@@ -136,18 +180,26 @@ threads will need atomic retain/release, and the concurrency model is not yet de
 
 - **App / server / utility:** `T` + `&T` (+ `weak`, slices, arrays). Safe, pleasant,
   ARC-managed. The bulk of an OS.
-- **Kernel / driver / allocator-free:** `T` + `*T` + fixed arrays + slice-views + manual
-  `malloc` / `free`. No ARC runtime — a module that never uses `&T` compiles with no refcount
-  and no allocator dependency, exactly like C, and stays bounds-checked wherever it uses
-  arrays/slices.
+- **Kernel / driver / allocator-free:** `T` + `*T` + fixed arrays + slices + manual `malloc` /
+  `free`. A module that never *creates* a `&T` emits no allocation and no allocator
+  dependency, exactly like C, and stays bounds-checked wherever it uses arrays and slices.
 
 The boundary is not a convention — it is compiler-enforced through the allocator capability.
 
+**What the boundary gates is allocation, not ownership.** Allocator-free code may hold, pass,
+copy, and drop a `&T` or a heap-backed slice that something else created: retain and release
+are a few instructions, and the free path goes through the object's own deallocation hook.
+What it may not do is *make* one. This is what allows a driver to keep the `&Device` its bus
+manager handed it, and a `no alloc` parser to be handed a heap-backed slice and read it —
+neither of which is expressible if ownership stops at the boundary.
+
 ## Capabilities (the allocator, and orthogonal environment facts)
 
-The presence of a **managed allocator** is a first-class capability that gates `&T`, `weak`,
-and growable arrays. A module declared **`no alloc`** makes those a compile error, leaving `T`,
-`*T`, fixed arrays, and slice-views — the allocator-free subset.
+The presence of a **managed allocator** is a first-class capability that gates the operations
+that *allocate*: creating a `&T`, growing an array, and anything in the library that returns
+newly-made storage. A module declared **`no alloc`** makes those a compile error, leaving `T`,
+`*T`, fixed arrays, slices, and whatever references it was given — the allocator-free subset.
+Holding and releasing an already-allocated object stays legal there (see "The two worlds").
 
 This is **orthogonal** to whether an OS or POSIX layer is present (which gate the
 standard-library / syscall surface). Unlike Rust's `no_std` — which bundles "no allocator," "no
@@ -165,6 +217,7 @@ model, and propagation through imports — is specified in **`capabilities.md`**
 | use-after-free / double-free | ARC on `&T`; `weak` degrades to `Option`, never dangles |
 | null dereference | non-null references; nullable is `Option` |
 | out-of-bounds | length-carrying arrays/slices, checked everywhere |
+| slice outliving its buffer | the slice's `owner` word retains it; escaping locals are promoted |
 | dangling / wild pointer | impossible without `*T` |
 
 Only `*T` opts out — visibly.
@@ -174,6 +227,12 @@ Only `*T` opts out — visibly.
 - ~~Capability mechanism~~ — **done**, see `capabilities.md` (`alloc` type-checker-enforced,
   `os`/`posix` import-gated; target provides + module `no alloc` narrows; propagated through
   imports).
+- ~~Slice ownership and the allocator-free boundary~~ — **done**, above: slices carry an
+  `owner` word, ARC objects carry a deallocation hook, and `no alloc` gates allocation rather
+  than ownership.
+- **Escape analysis** — the promotion rule above is stated but not specified: exactly which
+  escapes are detected, what the `no alloc` diagnostic says, and whether promotion is ever
+  silent enough to be surprising. Needs its own pass.
 - **Concurrency** — atomic refcounts for cross-thread `&T`, and the data-race story. Not yet
   designed.
 - **Unchecked-index escape hatch** — an opt-out of bounds checking for hot loops (default
