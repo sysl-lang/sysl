@@ -1,7 +1,8 @@
 package io.github.edadma.sysl
 
+import scala.collection.mutable.ListBuffer
 import scala.util.parsing.input.CharArrayReader.EofCh
-import scala.util.parsing.input.Reader
+import scala.util.parsing.input.{CharSequenceReader, Position, Reader}
 
 import io.github.edadma.indentation.IndentationLexical
 
@@ -62,6 +63,10 @@ class SyslLexical
   reserved ++= List(
     "true",
     "false",
+    "var",
+    "if",
+    "else",
+    "while",
     "weak",
     "no",
     "alloc",
@@ -83,6 +88,22 @@ class SyslLexical
     "(", ")", "[", "]", "{", "}", ".", "?",
     ",", ":", "->",
   )
+
+  /** Materializes the token stream with each token's source position, so the parser can
+   * memoize over a fixed `List` (not the stateful scanner — see docs/design/front-end.md)
+   * yet still report where a parse error occurred.
+   */
+  def scanPositioned(s: String): List[(Token, Position)] = {
+    val buf = ListBuffer.empty[(Token, Position)]
+    var t   = read(new CharSequenceReader(s))
+
+    while (!t.atEnd) {
+      buf += ((t.first, t.pos))
+      t = t.rest
+    }
+
+    buf.toList
+  }
 
   override def token: Parser[Token] =
     identifier | number | character | string | (elem(EofCh) ^^^ EOF) | delim | failure("illegal character")
