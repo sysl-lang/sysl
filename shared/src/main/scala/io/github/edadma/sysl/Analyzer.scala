@@ -698,6 +698,27 @@ class Analyzer private (program: Program) {
       )
       TArrayLit(ts, Type.Array(ts.length, elemTy))
 
+    // A range subscript takes a view. The receiver is left *undereferenced* on purpose: for a
+    // heap array the reference is both where the elements are and what keeps them alive, and
+    // evaluating it once is what makes those the same object.
+    case Index(receiver, RangeExpr(lo, hi, inclusive)) =>
+      if !inclusive && hi.isEmpty then err("an open-ended slice is written 'a[lo..]'")
+
+      val tr = analyzeExpr(receiver)
+      val elem = tr.ty match
+        case Type.Ref(Type.Array(_, e), false) => e
+        case Type.Ref(Type.Array(_, _), true) =>
+          err("a slice does not record whether its owner's count is atomic, so a '&sync' array cannot be sliced")
+        case Type.Slice(e) => e
+        case _: Type.Array | Type.Ptr(_: Type.Array) =>
+          err(
+            "a slice of an array this frame owns cannot yet be shown to outlive it — " +
+              "put the storage on the heap as '&[N]T', or index the array directly",
+          )
+        case other => err(s"cannot slice ${show(other)}")
+
+      TSlice(tr, lo.map(bound), hi.map(bound), inclusive, Type.Slice(elem))
+
     case Index(receiver, index) =>
       val tr   = autoDeref(analyzeExpr(receiver))
       val elem = Type.element(tr.ty).getOrElse(err(s"cannot index ${show(tr.ty)}"))
@@ -737,9 +758,20 @@ class Analyzer private (program: Program) {
    */
   private def hasZero(t: Type): Boolean = t match
     case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool | _: Type.Ptr => true
-    case Type.Array(_, elem)                                                      => hasZero(elem)
-    case s: Type.Struct                                                           => s.fields.forall(f => hasZero(f._2))
-    case _                                                                        => false
+    // A zeroed slice owns nothing and names no elements, which is exactly the empty slice.
+    case _: Type.Slice       => true
+    case Type.Array(_, elem) => hasZero(elem)
+    case s: Type.Struct      => s.fields.forall(f => hasZero(f._2))
+    case _                   => false
+
+  /** One end of a slice range: an index like any other, so any integer will do. */
+  private def bound(e: Expr): TExpr = {
+    val t = analyzeExpr(e, Some(Type.Usize))
+
+    t.ty match
+      case _: Type.Integer => t
+      case other           => err(s"a slice bound must be an integer, not ${show(other)}")
+  }
 
   private def incDec(op: String, target: Expr, pre: Boolean): TExpr = {
     val place = analyzePlace(target, s"'$op'")

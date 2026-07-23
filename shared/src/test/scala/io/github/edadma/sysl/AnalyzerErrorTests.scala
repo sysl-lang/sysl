@@ -264,4 +264,34 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
       err("var a") should include("needs either a type or an initial value")
     }
   }
+
+  "slices" - {
+    "of an array this frame owns are not allowed yet" in {
+      err("var a = [1, 2, 3]\nvar s = a[..]") should include("put the storage on the heap")
+    }
+
+    "of a raw pointer are not allowed either" in {
+      err("var a = [1, 2, 3]\nvar p = &a\nvar s = p[..]") should include("put the storage on the heap")
+    }
+
+    "cannot carry an owner whose count is atomic" in {
+      err("var b: &sync [4]int = [1, 2, 3, 4]\nvar s = b[..]") should include("'&sync' array cannot be sliced")
+    }
+
+    "are written with '..' when the high end is left off" in {
+      err("var b: &[4]int = [1, 2, 3, 4]\nvar s = b[1..<]") should include("written 'a[lo..]'")
+    }
+
+    "have integer bounds" in {
+      err("var b: &[4]int = [1, 2, 3, 4]\nvar s = b[true..<2]") should include("bound must be an integer")
+    }
+
+    "are taken of something with elements" in {
+      err("var n = 1\nvar s = n[..]") should include("cannot slice int")
+    }
+
+    "do not accept an array where a view was asked for" in {
+      err("f(s: []int) -> usize = s.len\nvar a = [1, 2]\nprint(f(a))") should include("is []int, but [2]int was given")
+    }
+  }
 }

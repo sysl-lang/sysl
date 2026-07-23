@@ -1,0 +1,139 @@
+package io.github.edadma.sysl
+
+import org.scalatest.freespec.AnyFreeSpec
+
+/** Tier-2: slices as programs actually behave. A slice views elements it does not own, so most
+ * of what is worth checking is that the view and its buffer agree — and that the buffer
+ * outlives every view of it.
+ */
+class SliceRunTests extends AnyFreeSpec with RunSupport {
+
+  private val buf = "var buf: &[8]u8 = [1, 2, 3, 4, 5, 6, 7, 8]\n"
+
+  "the whole thing" in {
+    run(buf + "var s = buf[..]\nprint(s.len, s[0], s[7])") shouldBe "8 1 8\n"
+  }
+
+  "an exclusive range stops before its high end" in {
+    run(buf + "var s = buf[2..<5]\nprint(s.len, s[0], s[2])") shouldBe "3 3 5\n"
+  }
+
+  "an inclusive range takes its high end too" in {
+    run(buf + "var s = buf[2..5]\nprint(s.len, s[0], s[3])") shouldBe "4 3 6\n"
+  }
+
+  "an open high end runs to the last element" in {
+    run(buf + "var s = buf[6..]\nprint(s.len, s[0], s[1])") shouldBe "2 7 8\n"
+  }
+
+  "an open low end starts at the first" in {
+    run(buf + "var s = buf[..<3]\nprint(s.len, s[0], s[2])") shouldBe "3 1 3\n"
+  }
+
+  "a slice of a slice is relative to the slice" in {
+    run(buf + "var s = buf[2..<6]\nvar t = s[1..<3]\nprint(t.len, t[0], t[1])") shouldBe "2 4 5\n"
+  }
+
+  "an empty slice is legal, at the end and in the middle" in {
+    run(buf + "print(buf[8..].len, buf[3..<3].len, buf[..<0].len)") shouldBe "0 0 0\n"
+  }
+
+  "a zero-valued slice owns nothing and names nothing" in {
+    run("var s: []int\nprint(s.len)") shouldBe "0\n"
+  }
+
+  "a view writes through to the buffer" in {
+    run(buf + "var s = buf[2..<5]\ns[0] = 99\nprint(buf[2], s[0])") shouldBe "99 99\n"
+  }
+
+  "a function takes a view without caring where the elements live" in {
+    val src =
+      buf +
+        """total(s: []u8) -> int
+          |    var t = 0
+          |    for b in s do t += int(b)
+          |    t
+          |end total
+          |print(total(buf[..]), total(buf[2..<5]), total(buf[8..]))
+          |""".stripMargin
+
+    run(src) shouldBe "36 12 0\n"
+  }
+
+  "a callee filling a view is seen by the caller" in {
+    val src =
+      """fill(s: []int, v: int)
+        |    for i in 0..<s.len do s[i] = v
+        |end fill
+        |var buf: &[4]int = [0, 0, 0, 0]
+        |fill(buf[1..<3], 7)
+        |print(buf[0], buf[1], buf[2], buf[3])
+        |""".stripMargin
+
+    run(src) shouldBe "0 7 7 0\n"
+  }
+
+  "the buffer outlives every view of it, even when the reference is gone" in {
+    val src =
+      """view() -> []int
+        |    var owned: &[3]int = [4, 5, 6]
+        |    owned[..]
+        |end view
+        |var s = view()
+        |print(s.len, s[0], s[2])
+        |""".stripMargin
+
+    run(src) shouldBe "3 4 6\n"
+  }
+
+  "a slice of references reaches the objects, which stay alive" in {
+    val src =
+      """struct Cell
+        |    n: int
+        |end Cell
+        |var cells: &[3]&Cell = [Cell(1), Cell(2), Cell(3)]
+        |var view = cells[1..]
+        |print(view.len, view[0].n, view[1].n)
+        |""".stripMargin
+
+    run(src) shouldBe "2 2 3\n"
+  }
+
+  "slicing in a loop neither leaks nor frees twice" in {
+    val src =
+      """var total = 0
+        |for i in 1..20000 do
+        |    var b: &[4]int = [i, i, i, i]
+        |    var s = b[1..<3]
+        |    total += s[0]
+        |print(total)
+        |""".stripMargin
+
+    run(src) shouldBe "200010000\n"
+  }
+
+  "a bound past the end stops the program" in {
+    exits(buf + "var n = 9\nvar s = buf[0..<n]\nprint(s.len)")
+  }
+
+  "an inclusive high end must name an element that exists" in {
+    exits(buf + "var n = 8\nvar s = buf[0..n]\nprint(s.len)")
+  }
+
+  "a low end past the high end stops the program" in {
+    exits(buf + "var a = 5\nvar b = 2\nvar s = buf[a..<b]\nprint(s.len)")
+  }
+
+  "indexing past a view's end stops the program, even though the buffer is longer" in {
+    exits(buf + "var s = buf[0..<2]\nvar i = 2\nprint(s[i])")
+  }
+
+  private def exits(src: String): Unit = {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    Toolchain.compileAndRun(src) match {
+      case Right((code, _)) => code should not be 0
+      case Left(e)          => fail(e)
+    }
+  }
+}

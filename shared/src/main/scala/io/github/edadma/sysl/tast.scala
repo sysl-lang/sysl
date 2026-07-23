@@ -50,6 +50,15 @@ case class TIndex(receiver: TExpr, index: TExpr, ty: Type) extends TExpr
  */
 case class TLen(receiver: TExpr) extends TExpr { def ty: Type = Type.Usize }
 
+/** `a[lo..hi]` — a view of some of `base`'s elements. `base` is either the reference that owns
+ * a heap array or another slice, so that one expression yields both where the elements are and
+ * what keeps them alive. An absent bound is the start or the end.
+ */
+case class TSlice(base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: Boolean, sliceTy: Type.Slice)
+    extends TExpr {
+  def ty: Type = sliceTy
+}
+
 /** An explicit scalar conversion, written with call syntax: `u32(c)`, `byte(n)`, `char(u)`.
  * Every conversion between scalar types is written, never inferred.
  */

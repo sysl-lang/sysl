@@ -91,6 +91,17 @@ before they appear and may be mutually recursive).
   something names it, and frees it through its own deallocation hook at zero. A reference is
   never null, so an absent one is `Option[&T]`. `&sync T` counts atomically — a relaxed
   increment, a releasing decrement, and an acquire fence before the destructor.
+- **Arrays and slices.** `[N]T` is a value type with no header: a literal (`[1, 2, 3]`) fixes
+  its length from how many elements were written, and a declaration with a type and no
+  initializer (`var buf: [64]u8`) starts at the type's zero value — the general rule, legal for
+  any type that has one, which excludes anything containing a `&T`. `[]T` is a view of elements
+  someone else owns. Every subscript is checked: an index may be any integer, is widened to 64
+  bits, and is compared unsigned, so a negative one fails the same test. `a[lo..hi]` takes a
+  view, keeping the inclusive/exclusive meanings the range operators have everywhere else, with
+  either end omittable; `a.len` reads as a field; `for x in a` binds a copy of each element.
+  Taking a view retains the buffer, so a slice cannot outlive what it views. What cannot be
+  sliced *yet* is an array this frame owns — that needs the escape analysis of `05`, so the
+  diagnostic asks for `&[N]T` instead (`07`).
 - **Recursive types.** A cycle through a `*T` or a `&T` is legal and pointer-sized; a cycle
   every edge of which is by value is rejected as having no finite size. An instantiation is
   registered before its fields are resolved, so a field that points back at it finds it.
@@ -113,12 +124,18 @@ place's address — a local's own slot, a loaded pointer value, or a `getelement
 either — and `store`s through it, which is one mechanism for `x = v`, `s.f = v`, `*p = v`, and
 `p.f = v` alike. `*T` and `&T` are both the opaque `ptr`; inside a mangled name a memory mode
 is spelled as a word (`ptr.` / `ref.` / `sync.`), since a sigil is not an LLVM name character.
-A `&T` addresses a **box** `%arc.T = type { i64, ptr, T }` — the count, the function that frees
-it, then the payload — so reading through one is a `getelementptr` past the header. Taking a
-share is type-independent (`@arc.retain`); giving one back is per payload type, because
-reaching zero runs that type's destructor, which releases whatever the payload itself held and
-then calls through the hook. Walking an aggregate's reference-carrying fields is a helper
-emitted once per type rather than inlined, since a data enum needs a tag test per variant.
+A `&T` addresses a **box** `%arc.T = type { i64, ptr, T }` — the count, the function that
+destroys it, then the payload — so reading through one is a `getelementptr` past the header.
+Both taking a share and giving one back are **type-independent** (`@arc.retain` /
+`@arc.release`): reaching zero calls through the hook, which is the per-payload-type function
+that releases whatever the payload held and then returns the storage. That indirection is what
+lets a slice release its owner, whose payload type its own type does not name. Walking an
+aggregate's reference-carrying fields is a helper emitted once per type rather than inlined,
+since a data enum needs a tag test per variant, and an array is walked with a loop rather than
+an unrolled chain. A **slice** is `{ ptr owner, ptr first, i64 len }` by value; its owner is
+null when there is nothing to keep alive, so it counts through a null-tolerant pair while the
+reference path stays branch-free. The atomic pair and the null-tolerant pair are each emitted
+only into a module that turns out to need them.
 A simple enum is plain `i32`; a data enum
 lowers to a value aggregate `%enum.Name = type { i32 tag, payload₁, … }` with one payload slot
 per data-carrying variant (each payload a named `%Name.Variant` aggregate). A pattern test is a
@@ -141,8 +158,8 @@ arity.
    literal interns as NUL-terminated bytes and passes to `printf` as a `ptr`, so an embedded
    `\0` truncates it — the one place the implementation contradicts the design (`04`) rather
    than merely lagging it. There is no owner word, no `.len`, no slicing, no runtime string
-   value, and no concatenation. The real representation waits on ARC, since it *is* an ARC
-   reference with a view attached.
+   value, and no concatenation. The real representation waits on slices, since a `string` *is*
+   an immutable validated `[]u8`.
 3. **All locals are `alloca`.** Every `var`, parameter, and loop variable gets a stack slot;
    reads `load`, writes `store`. Slots are hoisted into the entry block (names are unique per
    function, so one inside a loop does not grow the stack per iteration), but there is no
@@ -171,9 +188,15 @@ arity.
 8. **Chained comparisons `and` their pairs eagerly.** `a < b < c` lowers to `(a<b) and (b<c)`,
    evaluating the shared middle operand once per pair and not short-circuiting, which `01` says
    it should. Bind operands to a temp and short-circuit once that matters.
-9. **`for` iterates an integer range only.** Array/slice iteration, `downTo`, `step`, and
-   `reverse` are not yet lowered.
-10. **Generics are monomorphized with local inference only.** Type arguments come from the
+9. **`for` iterates a range, an array, or a slice.** `downTo`, `step`, and `reverse` are not
+   yet lowered, and nothing else is iterable — there is no iterator protocol.
+10. **A slice cannot view an array this frame owns.** `05`'s escape analysis is not
+   implemented, so rather than let a view dangle, the compiler refuses the case it cannot check
+   and asks for `&[N]T` — `05`'s `no alloc` behaviour applied everywhere. Promotion, the
+   two-fact call summary, and `--explain-escapes` all come with it. There is also no growable
+   array: no `append`, no capacity, no `[]T` that owns rather than views. A bounds failure
+   traps with no message, exactly as `char(u)` does.
+11. **Generics are monomorphized with local inference only.** Type arguments come from the
     argument types and the expected type of the expression; there is no unification across a
     whole function body, no explicit type application at a call site, and no bounds or
     constraints on a type parameter. A parameter nothing determines is an error rather than a
@@ -181,5 +204,5 @@ arity.
     the eventual trait that will describe "can be short-circuited".
 
 None of these are load-bearing design decisions — they are the smallest lowering that runs a
-real program, chosen so the pieces above them (references, arrays, methods) can be added
+real program, chosen so the pieces above them (strings, methods, escape analysis) can be added
 without reworking the pipeline shape.

@@ -261,6 +261,9 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       val p = elementAddr(receiver, index)
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
 
+    case TSlice(base, lo, hi, inclusive, sliceTy) =>
+      genSlice(base, lo, hi, inclusive, sliceTy)
+
     case TLen(receiver) =>
       receiver.ty match
         case Type.Array(n, _) => genExpr(receiver); n.toString
@@ -415,6 +418,69 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     val i = widen64(index)
     boundsCheck(i, len)
     val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, i64 $i"); r
+  }
+
+  /** Takes a view of some of an array's or a slice's elements. The base is evaluated once and
+   * gives up three things — what keeps the elements alive, where the first of them is, and how
+   * many there are — and the view is built by narrowing the last two and taking a share of the
+   * first.
+   */
+  private def genSlice(
+      base: TExpr,
+      lo: Option[TExpr],
+      hi: Option[TExpr],
+      inclusive: Boolean,
+      sliceTy: Type.Slice,
+  ): String = {
+    val elem = sliceTy.elem
+
+    val (ownerV, first, len) = base.ty match
+      case Type.Ref(array @ Type.Array(n, _), _) =>
+        val r = genExpr(base)
+        val p = freshTemp(); emit(s"$p = getelementptr ${boxName(array)}, ptr $r, i32 0, i32 2")
+        (r, p, n.toString)
+      case s: Type.Slice =>
+        val v = genExpr(base)
+        val o = freshTemp(); emit(s"$o = extractvalue ${s.llvm} $v, 0")
+        val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
+        val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
+        (o, p, l)
+      case other => sys.error(s"unreachable slice of ${other.llvm}")
+
+    val start = lo.map(widen64).getOrElse("0")
+
+    // The check is on the half-open interval the view ends up naming. An inclusive high end
+    // additionally has to name an element that exists, which is also what stops `hi + 1` from
+    // wrapping past the end.
+    val end = hi match
+      case None => len
+      case Some(h) =>
+        val v = widen64(h)
+        if !inclusive then v
+        else
+          val within = freshTemp(); emit(s"$within = icmp ult i64 $v, $len")
+          trapUnless(within, "bounds")
+          val e = freshTemp(); emit(s"$e = add i64 $v, 1"); e
+
+    if hi.isDefined && !inclusive then
+      val fits = freshTemp(); emit(s"$fits = icmp ule i64 $end, $len")
+      trapUnless(fits, "bounds")
+
+    val ordered = freshTemp(); emit(s"$ordered = icmp ule i64 $start, $end")
+    trapUnless(ordered, "bounds")
+
+    val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, i64 $start")
+    val n = freshTemp(); emit(s"$n = sub i64 $end, $start")
+
+    emit(s"call void @arc.retain_maybe(ptr $ownerV)")
+    maybeHeap = true
+    heap = true
+
+    val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $ownerV, 0")
+    val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $p, 1")
+    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, i64 $n, 2")
+
+    ownTemp(whole, sliceTy)
   }
 
   /** An index at 64 bits, keeping its signedness so a negative one stays negative through the
