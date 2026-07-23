@@ -17,6 +17,28 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "55\n"
   }
 
+  // An empty range runs the body zero times, both when the exclusive bound coincides with the
+  // start and when an inclusive low bound is already past its high — the off-by-one corner.
+  "an empty for range runs its body zero times" in {
+    val src =
+      """var s = 0
+        |for i in 5..<5 do s += 1
+        |for i in 5..4 do s += 100
+        |print(s)""".stripMargin
+
+    run(src) shouldBe "0\n"
+  }
+
+  // A single-iteration range still enters the body exactly once (inclusive a..a).
+  "an inclusive range of one element runs the body once" in {
+    val src =
+      """var s = 0
+        |for i in 7..7 do s += i
+        |print(s)""".stripMargin
+
+    run(src) shouldBe "7\n"
+  }
+
   // Called with both an even and an odd input, so an "always take one branch" miscompile can't
   // pass by coincidence the way a single input would.
   "if/else picks the right branch" in {

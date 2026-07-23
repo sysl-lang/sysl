@@ -17,6 +17,16 @@ class ArrayRunTests extends AnyFreeSpec with RunSupport {
     run("var a: [4]int\nprint(a[0], a[3], a.len)") shouldBe "0 0 4\n"
   }
 
+  // A zero-length array is a legal degenerate case: it holds nothing, so its length is 0 and any
+  // index would trap, but declaring one and asking its length must still work.
+  "a zero-length array has length zero" in {
+    val src =
+      """var empty: [0]int
+        |print(empty.len)""".stripMargin
+
+    run(src) shouldBe "0\n"
+  }
+
   "an element is a place, so every assignment form works on it" in {
     val src =
       """var a: [3]int

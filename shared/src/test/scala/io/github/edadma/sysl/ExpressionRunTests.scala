@@ -89,6 +89,17 @@ class ExpressionRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "true false\n"
   }
 
+  // The short-circuit lowering must compose: && binds tighter than ||, and each nests as the
+  // right side of another, so the branch structure has to be right at every level.
+  "logical operators compose under precedence and nesting" in {
+    val src =
+      """print(false || true && false)
+        |print(true && false || true)
+        |print(true && true && false)""".stripMargin
+
+    run(src) shouldBe "false\ntrue\nfalse\n"
+  }
+
   "a chained comparison a < b < c" in {
     val src =
       """var x = 5
