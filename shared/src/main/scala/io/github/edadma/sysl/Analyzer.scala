@@ -709,13 +709,10 @@ class Analyzer private (program: Program) {
         case Type.Ref(Type.Array(_, e), false) => e
         case Type.Ref(Type.Array(_, _), true) =>
           err("a slice does not record whether its owner's count is atomic, so a '&sync' array cannot be sliced")
-        case Type.Slice(e) => e
-        case _: Type.Array | Type.Ptr(_: Type.Array) =>
-          err(
-            "a slice of an array this frame owns cannot yet be shown to outlive it — " +
-              "put the storage on the heap as '&[N]T', or index the array directly",
-          )
-        case other => err(s"cannot slice ${show(other)}")
+        case Type.Slice(e)                  => e
+        case Type.Array(_, e)               => e
+        case Type.Ptr(Type.Array(_, e))     => e
+        case other                          => err(s"cannot slice ${show(other)}")
 
       TSlice(tr, lo.map(bound), hi.map(bound), inclusive, Type.Slice(elem))
 

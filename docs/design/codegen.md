@@ -99,9 +99,11 @@ before they appear and may be mutually recursive).
   bits, and is compared unsigned, so a negative one fails the same test. `a[lo..hi]` takes a
   view, keeping the inclusive/exclusive meanings the range operators have everywhere else, with
   either end omittable; `a.len` reads as a field; `for x in a` binds a copy of each element.
-  Taking a view retains the buffer, so a slice cannot outlive what it views. What cannot be
-  sliced *yet* is an array this frame owns — that needs the escape analysis of `05`, so the
-  diagnostic asks for `&[N]T` instead (`07`).
+  Taking a view retains the buffer, so a slice cannot outlive what it views — and where there
+  is no buffer to retain, because the array is one this frame owns, the **escape analysis** of
+  `05` is what makes the view safe: it is inferred with nothing written in the source, carried
+  across calls by one bit per parameter, and iterated to a fixpoint so recursion converges
+  (`07`).
 - **Recursive types.** A cycle through a `*T` or a `&T` is legal and pointer-sized; a cycle
   every edge of which is by value is rejected as having no finite size. An instantiation is
   registered before its fields are resolved, so a field that points back at it finds it.
@@ -190,12 +192,15 @@ arity.
    it should. Bind operands to a temp and short-circuit once that matters.
 9. **`for` iterates a range, an array, or a slice.** `downTo`, `step`, and `reverse` are not
    yet lowered, and nothing else is iterable — there is no iterator protocol.
-10. **A slice cannot view an array this frame owns.** `05`'s escape analysis is not
-   implemented, so rather than let a view dangle, the compiler refuses the case it cannot check
-   and asks for `&[N]T` — `05`'s `no alloc` behaviour applied everywhere. Promotion, the
-   two-fact call summary, and `--explain-escapes` all come with it. There is also no growable
-   array: no `append`, no capacity, no `[]T` that owns rather than views. A bounds failure
-   traps with no message, exactly as `char(u)` does.
+10. **Escape analysis rejects rather than promotes.** An array whose view escapes is
+   diagnosed where `05` says an allocator should silently promote it to the heap, so a program
+   that means to return a view writes `&[N]T` itself. That is `05`'s `no alloc` behaviour
+   applied everywhere — the safe direction to be wrong in — and `--explain-escapes` arrives
+   with promotion. Two more approximations `05` allows: a call's result is treated as viewing
+   *every* slice argument rather than the ones it really views, and a value's provenance is
+   tracked per local rather than per field, so a struct that holds one confined view is
+   confined entirely. There is also no growable array: no `append`, no capacity, no `[]T` that
+   owns rather than views. A bounds failure traps with no message, exactly as `char(u)` does.
 11. **Generics are monomorphized with local inference only.** Type arguments come from the
     argument types and the expected type of the expression; there is no unification across a
     whole function body, no explicit type application at a call site, and no bounds or

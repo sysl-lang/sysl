@@ -140,10 +140,11 @@ implementation:
 
 - **Growable arrays** — `append`, capacity, a `[]T` that owns rather than views. Needs an
   allocator and a decision about whether growth is a library type or a language one.
-- **Promotion of an escaping local array** (`05`). Until it exists, a slice that must outlive
-  its frame is written by putting the storage on the heap in the first place — `&[64]u8` — and
-  a slice of a *local* array is confined to the frame by a diagnostic. That is `05`'s
-  `no alloc` behaviour applied everywhere, which is the safe direction to be wrong in.
+- **Promotion of an escaping local array** (`05`). The analysis that *finds* the escape is
+  implemented; what happens next is not. A view that would outlive its array is a diagnostic
+  rather than a silent heap promotion, so a program that means to return one writes `&[64]u8`
+  itself. That is `05`'s `no alloc` behaviour applied everywhere, which is the safe direction
+  to be wrong in, and `--explain-escapes` only becomes meaningful once promotion exists.
 - **Slicing a `&sync` buffer.** A `[]T` does not record whether its owner's count is atomic, so
   it cannot carry an owner that needs the atomic path. Rejected with a diagnostic until slices
   distinguish the two.

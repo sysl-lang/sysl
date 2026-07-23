@@ -1,8 +1,12 @@
 # Escape Analysis
 
-**Status:** decided. This specifies the analysis `03` calls for when it gives slices an owner
-word: which escapes are detected, how the answer crosses a call boundary, and what happens
-when something escapes that has nothing to keep it alive.
+**Status:** decided, and implemented except for promotion. This specifies the analysis `03`
+calls for when it gives slices an owner word: which escapes are detected, how the answer
+crosses a call boundary, and what happens when something escapes that has nothing to keep it
+alive. What runs today finds the escapes and reports them; the heap promotion described below
+does not exist yet, so every escape is a diagnostic, which is the `no alloc` behaviour applied
+everywhere. The approximations it takes are the ones the *Deferred* section at the end
+permits.
 
 ## What it is for
 

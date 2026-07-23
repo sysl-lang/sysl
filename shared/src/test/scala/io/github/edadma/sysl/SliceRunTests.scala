@@ -112,6 +112,41 @@ class SliceRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "200010000\n"
   }
 
+  "a view of an array this frame owns reaches the same elements" in {
+    val src =
+      """var xs = [1, 2, 3, 4, 5]
+        |var mid = xs[1..<4]
+        |mid[0] = 9
+        |print(mid.len, mid[0], xs[1], xs[0])
+        |""".stripMargin
+
+    run(src) shouldBe "3 9 9 1\n"
+  }
+
+  "a scratch buffer is filled by a callee and read back, with nothing allocated" in {
+    val src =
+      """fill(s: []u8, v: u8) -> usize
+        |    for i in 0..<s.len do s[i] = v
+        |    s.len
+        |end fill
+        |
+        |total(s: []u8) -> int
+        |    var t = 0
+        |    for b in s do t += int(b)
+        |    t
+        |end total
+        |
+        |format(v: u8) -> int
+        |    var buf: [8]u8
+        |    var n = fill(buf[0..<4], v)
+        |    total(buf[0..<n])
+        |end format
+        |print(format(3))
+        |""".stripMargin
+
+    run(src) shouldBe "12\n"
+  }
+
   "a bound past the end stops the program" in {
     exits(buf + "var n = 9\nvar s = buf[0..<n]\nprint(s.len)")
   }

@@ -8,5 +8,9 @@ package io.github.edadma.sysl
 object Compiler {
 
   def compileToLlvm(source: String): Either[String, String] =
-    SyslParser.parse(source).flatMap(Analyzer.analyze).map(Codegen.generate)
+    for
+      tree    <- SyslParser.parse(source)
+      typed   <- Analyzer.analyze(tree)
+      checked <- Escape.check(typed).toLeft(typed)
+    yield Codegen.generate(checked)
 }

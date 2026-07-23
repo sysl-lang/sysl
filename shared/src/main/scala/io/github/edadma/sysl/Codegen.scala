@@ -445,7 +445,12 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
         val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
         val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
         (o, p, l)
-      case other => sys.error(s"unreachable slice of ${other.llvm}")
+      // Storage this frame owns, or a `*T` region: there is nothing to keep alive, so the
+      // owner is null and counting it is a no-op. The escape analysis is what makes the first
+      // of those safe, and nothing makes the second safe — that is what `*T` is.
+      case Type.Array(n, _)             => ("null", address(base), n.toString)
+      case Type.Ptr(Type.Array(n, _))   => ("null", genExpr(base), n.toString)
+      case other                        => sys.error(s"unreachable slice of ${other.llvm}")
 
     val start = lo.map(widen64).getOrElse("0")
 
