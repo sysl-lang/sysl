@@ -155,7 +155,7 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
 
     "`end` stays usable as an ordinary identifier" in {
       prog("var end = 5\nprint(end)") shouldBe List(
-        VarDecl("end", None, i(5)),
+        VarDecl("end", None, Some(i(5))),
         printStmt(Ident("end")),
       )
     }

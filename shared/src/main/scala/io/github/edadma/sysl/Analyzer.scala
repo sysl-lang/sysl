@@ -119,6 +119,16 @@ class Analyzer private (program: Program) {
     case PtrType(inner)       => Type.Ptr(underIndirection(resolveType(inner, subst)))
     case RefType(inner, sync) => Type.Ref(underIndirection(resolveType(inner, subst)), sync)
 
+    // An array holds its elements, so it is no indirection at all and a type cannot contain an
+    // array of itself. A slice only points at them, so it breaks a cycle exactly as `*T` does.
+    case ArrayType(None, elem) => Type.Slice(underIndirection(resolveType(elem, subst)))
+    case ArrayType(Some(len), elem) =>
+      val n = len match
+        case IntLit(v, _) if v >= 0 && v.isValidInt => v.toInt
+        case IntLit(v, _)                           => err(s"an array cannot have $v elements")
+        case _ => err("an array length must be an integer literal")
+      Type.Array(n, resolveType(elem, subst))
+
     case NamedType(n, argRefs) =>
       if argRefs.isEmpty && subst.contains(n) then subst(n)
       else
@@ -370,6 +380,14 @@ class Analyzer private (program: Program) {
         case Type.Ref(t, s) if s == sync => unify(inner, t, tparams, sub)
         case _: Type.Ref                 => ()
         case t                           => unify(inner, t, tparams, sub)
+    case ArrayType(None, elem) =>
+      actual match
+        case Type.Slice(e) => unify(elem, e, tparams, sub)
+        case _             => ()
+    case ArrayType(Some(_), elem) =>
+      actual match
+        case Type.Array(_, e) => unify(elem, e, tparams, sub)
+        case _                => ()
     case NamedType(n, Nil) if tparams(n) =>
       if !sub.contains(n) then sub(n) = actual
     case NamedType(n, argRefs) =>
@@ -436,7 +454,7 @@ class Analyzer private (program: Program) {
   }
 
   private def analyzeStmt(stmt: Stmt): TStmt = stmt match
-    case VarDecl(name, typOpt, init) =>
+    case VarDecl(name, typOpt, Some(init)) =>
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
       if ti.ty == Type.Unit then err(s"cannot bind '$name' to a unit value")
@@ -444,6 +462,11 @@ class Analyzer private (program: Program) {
       if declared.isDefined && declTy != ti.ty then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
       TVarDecl(declare(name, declTy), declTy, ti)
+
+    case VarDecl(name, typOpt, None) =>
+      val ty = typOpt.map(rt).getOrElse(err(s"'$name' needs either a type or an initial value"))
+      if !hasZero(ty) then err(s"${show(ty)} has no zero value, so '$name' needs an initial value")
+      TVarDecl(declare(name, ty), ty, TZero(ty))
 
     case ExprStmt(e) =>
       TExprStmt(analyzeExpr(e))
@@ -465,8 +488,17 @@ class Analyzer private (program: Program) {
           val tb = body.map(analyzeStmt(_))
           popScope()
           TFor(u, ty, tlo, thi, inclusive, tb)
+
         case _ =>
-          err("'for' iterates an integer range 'a..b' or 'a..<b'")
+          val seq = autoDeref(analyzeExpr(iter))
+          val elem = Type.element(seq.ty).getOrElse(
+            err(s"'for' iterates an integer range, an array, or a slice, not ${show(seq.ty)}"),
+          )
+          pushScope()
+          val u  = declare(name, elem)
+          val tb = body.map(analyzeStmt(_))
+          popScope()
+          TForEach(u, elem, seq, tb)
 
     case Return(opt) =>
       val tv = opt.map(analyzeExpr(_, Some(retTy)))
@@ -607,8 +639,9 @@ class Analyzer private (program: Program) {
       TPrint(args.map { a =>
         val t = analyzeExpr(a)
         t.ty match
-          case Type.Unit                                             => err("cannot print a unit value")
-          case _: Type.Struct | _: Type.Enum | _: Type.Ptr | _: Type.Ref =>
+          case Type.Unit => err("cannot print a unit value")
+          case _: Type.Struct | _: Type.Enum | _: Type.Ptr | _: Type.Ref | _: Type.Array |
+              _: Type.Slice =>
             err(s"cannot print a ${show(t.ty)} value")
           case _ => t
       })
@@ -645,8 +678,34 @@ class Analyzer private (program: Program) {
           val idx = s.fieldIndex(f)
           if idx < 0 then err(s"struct '${s.name}' has no field '$f'")
           TField(tr, idx, s.fields(idx)._2)
+        // A length is a property of the value rather than a computation over it, so it reads as
+        // a field. It becomes an ordinary method the day methods exist.
+        case _: Type.Array | _: Type.Slice if f == "len" => TLen(tr)
         case other =>
           err(s"cannot read field '$f' of ${show(other)}")
+
+    case ArrayLit(elems) =>
+      val elemExp = expected.collect { case Type.Array(_, e) => e }
+      val ts      = elems.map(analyzeExpr(_, elemExp))
+
+      for t <- ts do
+        if t.ty == Type.Unit then err("an array cannot hold unit values")
+        if t.ty != ts.head.ty then
+          err(s"an array literal needs one element type, got ${show(ts.head.ty)} and ${show(t.ty)}")
+
+      val elemTy = ts.headOption.map(_.ty).orElse(elemExp).getOrElse(
+        err("an empty array literal takes its element type from its context, and there is none here"),
+      )
+      TArrayLit(ts, Type.Array(ts.length, elemTy))
+
+    case Index(receiver, index) =>
+      val tr   = autoDeref(analyzeExpr(receiver))
+      val elem = Type.element(tr.ty).getOrElse(err(s"cannot index ${show(tr.ty)}"))
+      val ti   = analyzeExpr(index, Some(Type.Usize))
+
+      ti.ty match
+        case _: Type.Integer => TIndex(tr, ti, elem)
+        case other           => err(s"an index must be an integer, not ${show(other)}")
 
     case IfExpr(cond, thenBody, elseOpt) =>
       val tc    = analyzeBool(cond)
@@ -670,8 +729,17 @@ class Analyzer private (program: Program) {
     case _: RangeExpr =>
       err("a range is only allowed in a 'for' loop or a 'match' pattern")
 
-    case _: Index => err("indexing is not supported yet")
     case _: Tuple => err("tuples are not supported yet")
+
+  /** Whether a type has a zero value, which is what a declaration with no initializer starts
+   * at. A reference has none — it always points at a live object — and neither does an enum,
+   * whose zeroed tag names no variant in particular.
+   */
+  private def hasZero(t: Type): Boolean = t match
+    case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool | _: Type.Ptr => true
+    case Type.Array(_, elem)                                                      => hasZero(elem)
+    case s: Type.Struct                                                           => s.fields.forall(f => hasZero(f._2))
+    case _                                                                        => false
 
   private def incDec(op: String, target: Expr, pre: Boolean): TExpr = {
     val place = analyzePlace(target, s"'$op'")
@@ -691,6 +759,9 @@ class Analyzer private (program: Program) {
     case _: TLoad           => true
     case _: TDeref          => true
     case TField(recv, _, _) => isPlace(recv)
+    // A slice's elements live wherever its owner keeps them, so they have an address even when
+    // the slice itself is a temporary. An array's elements are the array, so they do not.
+    case TIndex(recv, _, _) => recv.ty.isInstanceOf[Type.Slice] || isPlace(recv)
     case _                  => false
 
   /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
@@ -713,6 +784,7 @@ class Analyzer private (program: Program) {
     case Ident(n)      => s"'$n'"
     case Field(_, f)   => s"field '$f'"
     case Unary("*", _) => "the place it points at"
+    case Index(_, _)   => "this element"
     case _             => "this place"
 
   // --- literals ------------------------------------------------------------------------

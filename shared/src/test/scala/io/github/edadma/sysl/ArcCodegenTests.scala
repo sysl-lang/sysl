@@ -23,7 +23,7 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     out should include regex raw"%t\d+ = call ptr @malloc\(i64 %t\d+\)"
     out should include regex raw"store i64 1, ptr %t\d+"
-    out should include("store ptr @arc.free, ptr")
+    out should include("store ptr @arc.free, ptr")   // a payload holding nothing needs no destructor
   }
 
   "the same construction with no expectation stays a value" in {
@@ -37,14 +37,14 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
     val out = ir(point + "var p: &Point = Point(1, 2)\nprint(p.x)")
 
     out should include regex raw"call void @arc\.retain\(ptr %t\d+\)\n  store ptr %t\d+, ptr %p\.addr"
-    out should include regex raw"load ptr, ptr %p\.addr\n  call void @arc\.release\.Point\(ptr %t\d+\)\n  ret i32 0"
+    out should include regex raw"load ptr, ptr %p\.addr\n  call void @arc\.release\(ptr %t\d+\)\n  ret i32 0"
   }
 
   "assignment retains the new reference before releasing the old one" in {
     val out = ir(point + "var p: &Point = Point(1, 2)\np = Point(3, 4)")
     val store =
       raw"load ptr, ptr %p\.addr\n  call void @arc\.retain\(ptr %t\d+\)\n" +
-        raw"  store ptr %t\d+, ptr %p\.addr\n  call void @arc\.release\.Point"
+        raw"  store ptr %t\d+, ptr %p\.addr\n  call void @arc\.release\("
 
     out should include regex store
   }
@@ -53,7 +53,7 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
     val out = ir(point + "keep(p: &Point) -> &Point = p\nvar q: &Point = Point(1, 2)\nvar r = keep(q)")
 
     out should include("call void @arc.retain(ptr %p.param)")
-    out should include regex raw"call void @arc\.release\.Point\(ptr %t\d+\)\n  ret ptr %t\d+"
+    out should include regex raw"call void @arc\.release\(ptr %t\d+\)\n  ret ptr %t\d+"
   }
 
   "a destructor lets go of what the payload held, then calls through the hook" in {
@@ -62,7 +62,8 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     out should include("define private void @arc.drop.Node(ptr %p) {")
     out should include("call void @arc.dispose.Node(%struct.Node %t2)")
-    out should include regex raw"%t4 = load ptr, ptr %t3\n  call void %t4\(ptr %p\)"
+    out should include regex raw"call void @arc\.dispose\.Node[^\n]*\n  call void @free\(ptr %p\)"
+    out should include("store ptr @arc.drop.Node, ptr")
   }
 
   "copying an aggregate takes a share of every reference inside it" in {
@@ -79,13 +80,13 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     out should include("define private void @arc.dispose.Option.ref.Node(%enum.Option.ref.Node %v) {")
     out should include regex raw"extractvalue %enum\.Option\.ref\.Node %v, 0\n  %t\d+ = icmp eq i32 %t\d+, 0"
-    out should include("call void @arc.release.Node(ptr %t4)")
+    out should include("call void @arc.release(ptr %t4)")
   }
 
   "an ordinary reference counts with a plain load and store" in {
     val out = ir(point + "var p: &Point = Point(1, 2)")
 
-    out should include("define private void @arc.release.Point(ptr %p) {")
+    out should include("define private void @arc.release(ptr %p) {")
     out should not include "atomicrmw sub"
   }
 
@@ -94,7 +95,7 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     out should include("%o = atomicrmw add ptr %p, i64 1 monotonic")
     out should include("atomicrmw sub ptr %p, i64 1 release")
-    out should include regex raw"arc\.drop\d+:\n  fence acquire"
+    out should include regex raw"drop:\n  fence acquire"
   }
 
   "the two reference modes share one box layout, since atomicity belongs to the reference" in {
@@ -102,8 +103,8 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
     val out = ir(src)
 
     out.linesIterator.count(_.startsWith("%arc.Point = type")) shouldBe 1
-    out should include("define private void @arc.release.Point(ptr %p) {")
-    out should include("define private void @arc.release_sync.Point(ptr %p) {")
+    out should include("define private void @arc.release(ptr %p) {")
+    out should include("define private void @arc.release_sync(ptr %p) {")
   }
 
   "a field through a reference reaches past the header" in {

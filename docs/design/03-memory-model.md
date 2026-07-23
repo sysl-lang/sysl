@@ -84,10 +84,14 @@ value looking for a home.
 
 ### Who frees it — the deallocation hook
 
-Every ARC heap object carries, alongside its refcount, a **pointer to the function that frees
-it**, installed by whoever allocated it. Release decrements; at zero it runs the destructor
-(which the compiler emits inline, since every release site knows the static type) and then
-calls through the hook.
+Every ARC heap object carries, alongside its refcount, a **pointer to the function that
+destroys it**, installed by whoever allocated it. Release decrements; at zero it calls through
+the hook, which releases whatever the payload holds and then returns the storage to the heap
+the object came from.
+
+Putting the destructor *behind* the hook rather than inline at each release site is what makes
+letting go of a reference **type-erased**: one instruction sequence, no static type. Slices
+need exactly that, since a `[]T` gives no clue what type of object its owner points at (`07`).
 
 One word per heap object buys three things:
 
@@ -197,7 +201,7 @@ parent, the back-link of an intrusive doubly-linked list, a process's pointer to
 process. `weak T` expresses those safely; reach for it only when you have a genuine
 back-reference. Needs an allocator.
 
-## Null
+## References are never null
 
 References are **non-null**. There is no null pointer in the safe subset, so there is no null
 dereference. A maybe-absent reference is `Option[&T]`, matched or unwrapped explicitly. (`*T`
@@ -215,6 +219,9 @@ allocation or "pointer-ness":
 The practical consequence: even low-level, allocator-free code stays bounds-safe by using
 slices; `*T` is reserved for genuine address work, not merely for having an indexable buffer.
 Growable (appendable) arrays need an allocator; fixed arrays and slices do not.
+
+How the two are written, indexed, and sliced — the literal, the zero-valued declaration, the
+range subscript, `.len` — is **`07-arrays-and-slices.md`**.
 
 ## Slices keep their backing alive
 
@@ -325,6 +332,9 @@ greppable as everything else here.
 - ~~Concurrency~~ — **done**, see `06-concurrency.md` (domains are threads, crossing copies,
   `&sync T` is the atomic-refcount exception, no async runtime in the language; shared *mutable*
   state is discipline plus `Mutex`, since without a borrow checker it cannot be checked).
+- ~~Array and slice expression syntax~~ — **done**, see `07-arrays-and-slices.md` (literals and
+  zero-valued declarations, any-integer checked indexing, range subscripts keeping the
+  language's inclusive/exclusive meanings, `.len` as a field until methods exist).
 - **Unchecked-index escape hatch** — an opt-out of bounds checking for hot loops (default
   checked). Likely yes, deferred.
 - **`weak` runtime** — the exact weak-tracking representation (side table vs in-box header).

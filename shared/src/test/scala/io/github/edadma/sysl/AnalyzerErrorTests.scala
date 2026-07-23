@@ -222,4 +222,46 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
             |""".stripMargin) should include("propagates a string error")
     }
   }
+
+  "arrays" - {
+    "have a length that is written down, not computed" in {
+      err("var n = 4\nvar a: [n]int\nprint(a[0])") should include("must be an integer literal")
+    }
+
+    "hold one element type" in {
+      err("var a = [1, 2.5]") should include("needs one element type")
+    }
+
+    "cannot be empty without a context to take an element type from" in {
+      err("var a = []") should include("takes its element type from its context")
+    }
+
+    "cannot hold themselves by value" in {
+      err("struct Tree\n    kids: [4]Tree\nvar t: Tree\n") should include("contains itself")
+    }
+
+    "index with an integer" in {
+      err("var a = [1, 2]\nprint(a[true])") should include("index must be an integer")
+    }
+
+    "are not indexable when they are not sequences" in {
+      err("var n = 1\nprint(n[0])") should include("cannot index int")
+    }
+
+    "have no field but their length" in {
+      err("var a = [1, 2]\nprint(a.size)") should include("cannot read field 'size'")
+    }
+
+    "are not printable, since printing is scalars only" in {
+      err("var a = [1, 2]\nprint(a)") should include("cannot print a [2]int value")
+    }
+
+    "have no zero value when their elements have none" in {
+      err("struct P\n    x: int\nvar a: [2]&P") should include("has no zero value")
+    }
+
+    "need one or the other — a type, or something to infer it from" in {
+      err("var a") should include("needs either a type or an initial value")
+    }
+  }
 }

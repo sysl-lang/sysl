@@ -92,7 +92,8 @@ class SyslParser extends PackratParsers {
       case lo ~ None                => lo
       case lo ~ Some(inc ~ hiOpt)   => RangeExpr(Some(lo), hiOpt, inc)
     } |
-      rangeOp ~ bitOr ^^ { case inc ~ hi => RangeExpr(None, Some(hi), inc) }
+      rangeOp ~ bitOr ^^ { case inc ~ hi => RangeExpr(None, Some(hi), inc) } |
+      rangeOp ^^ (inc => RangeExpr(None, None, inc))
 
   lazy val bitOr: PackratParser[Expr]  = chainl1(bitXor, binOp("|"))
   lazy val bitXor: PackratParser[Expr] = chainl1(bitAnd, binOp("^"))
@@ -123,7 +124,14 @@ class SyslParser extends PackratParsers {
       op("--") ^^^ ((e: Expr) => PostIncDec("--", e))
 
   lazy val primary: PackratParser[Expr] =
-    floatLit | intLit | charLit | strLit | boolLit | nullLit | identExpr | op("(") ~> parenTail
+    floatLit | intLit | charLit | strLit | boolLit | nullLit | identExpr | arrayLit |
+      op("(") ~> parenTail
+
+  /** `[a, b, c]` — an array literal. A leading `[` is unambiguous in operand position, since a
+   * subscript is a postfix tail on something already parsed.
+   */
+  private lazy val arrayLit: PackratParser[Expr] =
+    op("[") ~> repsep(expression, op(",")) <~ op("]") ^^ ArrayLit.apply
 
   /** After `(`: `)` is unit, one expression is a grouping, more are a tuple. */
   private lazy val parenTail: PackratParser[Expr] =
@@ -166,6 +174,7 @@ class SyslParser extends PackratParsers {
     op("*") ~> typeRef ^^ PtrType.apply |
       op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
       op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
+      (op("[") ~> opt(expression) <~ op("]")) ~ typeRef ^^ { case n ~ t => ArrayType(n, t) } |
       ident ~ opt(op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")) ^^ {
         case n ~ args => NamedType(n, args.getOrElse(Nil))
       }
@@ -178,7 +187,7 @@ class SyslParser extends PackratParsers {
     op("[") ~> rep1sep(ident, op(",")) <~ op("]")
 
   private lazy val varDecl: PackratParser[Stmt] =
-    op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
+    op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
       case n ~ t ~ e => VarDecl(n, t, e)
     }
 

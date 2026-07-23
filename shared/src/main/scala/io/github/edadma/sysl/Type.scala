@@ -61,6 +61,28 @@ object Type {
    */
   case class Ref(inner: Type, sync: Boolean) extends Type { def llvm = "ptr" }
 
+  /** `[N]T` — N elements of `T`, laid out end to end with no header. An array *is* its
+   * elements: copying one copies all of them, and its length is part of its type, which is what
+   * lets every index be checked against a constant.
+   */
+  case class Array(length: Int, elem: Type) extends Type {
+    def llvm: String = s"[$length x ${elem.llvm}]"
+  }
+
+  /** `[]T` — a view of elements someone else owns: the reference that keeps the storage alive,
+   * the first element, and how many there are. Every slice has the same layout, so the element
+   * type shows up only in the instructions that reach through it.
+   */
+  case class Slice(elem: Type) extends Type {
+    def llvm: String = "{ ptr, ptr, i64 }"
+  }
+
+  /** The element type of whatever a subscript may be applied to. */
+  def element(t: Type): Option[Type] = t match
+    case Array(_, e) => Some(e)
+    case Slice(e)    => Some(e)
+    case _           => None
+
   /** The type a `*T` or `&T` points at, for the one level of automatic dereference that field
    * selection performs.
    */
@@ -113,6 +135,8 @@ object Type {
     case Unit                     => "unit"
     case Ptr(inner)               => s"*${show(inner)}"
     case Ref(inner, sync)         => s"&${if sync then "sync " else ""}${show(inner)}"
+    case Array(n, elem)           => s"[$n]${show(elem)}"
+    case Slice(elem)              => s"[]${show(elem)}"
     case other                    => other.llvm
 
   def isNumeric(t: Type): Boolean = t match
@@ -225,6 +249,8 @@ object Type {
     case Ptr(inner)       => s"ptr.${mangleOne(inner)}"
     case Ref(inner, false) => s"ref.${mangleOne(inner)}"
     case Ref(inner, true)  => s"sync.${mangleOne(inner)}"
+    case Array(n, elem)    => s"arr$n.${mangleOne(elem)}"
+    case Slice(elem)       => s"slice.${mangleOne(elem)}"
     case other            => show(other)
 
   /** How a type is written in a diagnostic: the friendly alias where one exists (`int`,

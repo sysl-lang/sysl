@@ -58,6 +58,11 @@ case class TryExpr(expr: Expr) extends Expr
 
 case class Tuple(elements: List[Expr]) extends Expr
 
+/** `[a, b, c]` — an array literal, whose length is how many elements were written. An empty
+ * one has no element type of its own and takes it from the context.
+ */
+case class ArrayLit(elements: List[Expr]) extends Expr
+
 /** `if cond then a else b` as an **expression**: it yields the value of the taken branch.
  * In statement position the `else` may be omitted and the whole thing has type `unit`.
  * Each branch is a statement list whose trailing expression is the branch's value.
@@ -113,12 +118,19 @@ case class PtrType(inner: TypeRef) extends TypeRef
 /** `&T`, or `&sync T` when the refcount is atomic. */
 case class RefType(inner: TypeRef, sync: Boolean) extends TypeRef
 
+/** `[N]T` — a fixed array — or `[]T`, a slice, when no length is written. */
+case class ArrayType(length: Option[Expr], elem: TypeRef) extends TypeRef
+
 /** One `name: type` binding, shared by function parameters and struct fields. */
 case class Param(name: String, typ: TypeRef)
 
 sealed trait Stmt
 
-case class VarDecl(name: String, typ: Option[TypeRef], init: Expr) extends Stmt
+/** `var name [: type] [= init]`. A declaration with a type and no initializer starts at that
+ * type's zero value, which is how a scratch buffer is written; a type that has no zero value
+ * (one containing a `&T`, which always points at a live object) must be initialized.
+ */
+case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr]) extends Stmt
 case class ExprStmt(expr: Expr)                                    extends Stmt
 case class While(cond: Expr, body: List[Stmt])                    extends Stmt
 

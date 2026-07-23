@@ -97,8 +97,8 @@ learn.
 
 ```
 tty.sysl:31: the slice returned here outlives 'buf', the array it views
-   31 |     return buf[0..n]
-      |            ^^^^^^^^^
+   31 |     return buf[0..<n]
+      |            ^^^^^^^^^^
    28 |     var buf: [64]u8
       |         --- 'buf' is a local array; its storage ends when this function returns
    this module is 'no alloc', so 'buf' cannot be promoted to the heap.
@@ -135,7 +135,7 @@ stack:
 format_status(code: int) -> unit
     var buf: [64]u8
     var n = render(buf[0..], code)
-    write(buf[0..n])
+    write(buf[0..<n])
 ```
 
 **Zero-copy parsing — no allocation, and the constraint is real.** `parse` returns a `Header`
@@ -146,7 +146,7 @@ outliving the bytes it points into:
 ```
 var packet: [1500]u8
 var n = recv(packet[0..])
-var h = parse(packet[0..n])       // h views 'packet' — fine, both live here
+var h = parse(packet[0..<n])      // h views 'packet' — fine, both live here
 ```
 
 **Returning a view — promotion.** Here the slice does leave, so `line` is promoted and the
@@ -156,7 +156,7 @@ returned slice owns it:
 read_line(f: &File) -> []u8
     var line: [512]u8             // promoted: the result views it
     var n = f.read_into(line[0..])
-    line[0..n]
+    line[0..<n]
 ```
 
 Under `no alloc` that third one is the diagnostic above, and the fix is to take the buffer as

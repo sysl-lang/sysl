@@ -34,6 +34,22 @@ case class TNullLit(ty: Type) extends TExpr
  */
 case class TBox(value: TExpr, refTy: Type.Ref) extends TExpr { def ty: Type = refTy }
 
+/** The zero value of a type: what a declaration with no initializer starts at. */
+case class TZero(ty: Type) extends TExpr
+
+/** `[a, b, c]` — an array value built from its elements. */
+case class TArrayLit(elems: List[TExpr], arrayTy: Type.Array) extends TExpr { def ty: Type = arrayTy }
+
+/** `a[i]` — one element of an array or slice, checked against the length. It is a *place* when
+ * its receiver is one, which is what makes `a[i] = v` and `&a[i]` ordinary.
+ */
+case class TIndex(receiver: TExpr, index: TExpr, ty: Type) extends TExpr
+
+/** `a.len` — how many elements, as a `usize`. Constant for an array, a word of the header for
+ * a slice.
+ */
+case class TLen(receiver: TExpr) extends TExpr { def ty: Type = Type.Usize }
+
 /** An explicit scalar conversion, written with call syntax: `u32(c)`, `byte(n)`, `char(u)`.
  * Every conversion between scalar types is written, never inferred.
  */
@@ -153,6 +169,11 @@ case class TExprStmt(expr: TExpr)                         extends TStmt
 case class TWhile(cond: TExpr, body: List[TStmt])         extends TStmt
 /** `for name in lo..hi` — the loop variable has the integer type of its bounds. */
 case class TFor(name: String, ty: Type, lo: TExpr, hi: TExpr, inclusive: Boolean, body: List[TStmt]) extends TStmt
+
+/** `for name in seq` over an array or a slice. The loop variable is a *copy* of each element,
+ * and the sequence is evaluated once.
+ */
+case class TForEach(name: String, elemTy: Type, seq: TExpr, body: List[TStmt]) extends TStmt
 case class TReturn(value: Option[TExpr])                  extends TStmt
 
 /** A user function. Parameters carry their unique names (the codegen allocates a slot for

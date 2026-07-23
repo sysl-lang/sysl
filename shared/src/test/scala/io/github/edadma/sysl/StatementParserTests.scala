@@ -7,13 +7,13 @@ class StatementParserTests extends AnyFreeSpec with ParseSupport {
 
   "a sequence of statements" in {
     prog("var x = 1\nprint(x)") shouldBe List(
-      VarDecl("x", None, i(1)),
+      VarDecl("x", None, Some(i(1))),
       printStmt(Ident("x")),
     )
   }
 
   "a var with a type annotation" in {
-    prog("var n: int = 0") shouldBe List(VarDecl("n", Some(NamedType("int")), i(0)))
+    prog("var n: int = 0") shouldBe List(VarDecl("n", Some(NamedType("int")), Some(i(0))))
   }
 
   "a parse error reports a location" in {

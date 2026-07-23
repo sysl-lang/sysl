@@ -9,27 +9,27 @@ class MemoryModeParserTests extends AnyFreeSpec with ParseSupport {
 
   "type sigils" - {
     "a raw pointer" in {
-      prog("var x: *int = p") shouldBe List(VarDecl("x", Some(PtrType(NamedType("int"))), Ident("p")))
+      prog("var x: *int = p") shouldBe List(VarDecl("x", Some(PtrType(NamedType("int"))), Some(Ident("p"))))
     }
 
     "a reference, plain and atomic" in {
       prog("var x: &Point = p") shouldBe
-        List(VarDecl("x", Some(RefType(NamedType("Point"), sync = false)), Ident("p")))
+        List(VarDecl("x", Some(RefType(NamedType("Point"), sync = false)), Some(Ident("p"))))
 
       prog("var x: &sync Point = p") shouldBe
-        List(VarDecl("x", Some(RefType(NamedType("Point"), sync = true)), Ident("p")))
+        List(VarDecl("x", Some(RefType(NamedType("Point"), sync = true)), Some(Ident("p"))))
     }
 
     "sigils stack, right to left" in {
-      prog("var x: **int = p") shouldBe List(VarDecl("x", Some(PtrType(PtrType(NamedType("int")))), Ident("p")))
+      prog("var x: **int = p") shouldBe List(VarDecl("x", Some(PtrType(PtrType(NamedType("int")))), Some(Ident("p"))))
 
       prog("var x: *&int = p") shouldBe
-        List(VarDecl("x", Some(PtrType(RefType(NamedType("int"), sync = false))), Ident("p")))
+        List(VarDecl("x", Some(PtrType(RefType(NamedType("int"), sync = false))), Some(Ident("p"))))
     }
 
     "a sigil applies to a type argument as readily as to a name" in {
       prog("var x: Box[*int] = p") shouldBe
-        List(VarDecl("x", Some(NamedType("Box", List(PtrType(NamedType("int"))))), Ident("p")))
+        List(VarDecl("x", Some(NamedType("Box", List(PtrType(NamedType("int"))))), Some(Ident("p"))))
     }
 
     "in a signature, on a parameter and a result" in {
@@ -52,7 +52,7 @@ class MemoryModeParserTests extends AnyFreeSpec with ParseSupport {
 
     "'sync' stays an ordinary name, so a type may be called it" in {
       prog("var x: &sync = p") shouldBe
-        List(VarDecl("x", Some(RefType(NamedType("sync"), sync = false)), Ident("p")))
+        List(VarDecl("x", Some(RefType(NamedType("sync"), sync = false)), Some(Ident("p"))))
     }
   }
 

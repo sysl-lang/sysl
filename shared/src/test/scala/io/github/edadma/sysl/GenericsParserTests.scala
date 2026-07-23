@@ -55,7 +55,7 @@ class GenericsParserTests extends AnyFreeSpec with ParseSupport {
         VarDecl(
           "x",
           Some(NamedType("Result", List(NamedType("Box", List(NamedType("int"))), NamedType("string")))),
-          Ident("y"),
+          Some(Ident("y")),
         )
       )
     }
