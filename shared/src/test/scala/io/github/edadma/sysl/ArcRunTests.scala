@@ -206,6 +206,32 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "6 7\n"
   }
 
+  // A deep field-path store a.b.c through two levels of &T indirection must reach the innermost
+  // reference and release the C it replaced — not the wrong hop, and not nothing. Over a long
+  // loop a missed release grows RSS; peak RSS was separately confirmed flat. seed = i%7, new =
+  // seed + 100, so residues 0..5 occur 57143 times and residue 6 occurs 57142 across 400000.
+  "a deep field-path store through nested references releases the innermost old one" in {
+    val src =
+      """struct C
+        |    v: int
+        |struct B
+        |    c: &C
+        |struct A
+        |    b: &B
+        |run(seed: int) -> int
+        |    var a: &A = A(B(C(seed)))
+        |    a.b.c = C(seed + 100)
+        |    a.b.c.v
+        |var i = 0
+        |var total = 0
+        |while i < 400000
+        |    total += run(i % 7)
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "41199997\n"
+  }
+
   // An early return must release exactly the &T locals live at that point — the ones already
   // allocated, not the ones a later line would have made. Three cut points leave different sets
   // live (x; x and the nested Pair; then y as well), and a nested Pair of &Inner exercises a

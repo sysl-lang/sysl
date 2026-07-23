@@ -121,6 +121,66 @@ class ExpressionRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "tick\ntrue\n"
   }
 
+  // Arguments are evaluated left to right, each exactly once — a side-effecting argument prints
+  // in call order and the packed result confirms each value landed in its own slot.
+  "call arguments are evaluated left to right, once each" in {
+    val src =
+      """tick(label: int) -> int
+        |    print(label)
+        |    label
+        |end tick
+        |take(a: int, b: int, c: int) -> int = a * 100 + b * 10 + c
+        |print(take(tick(1), tick(2), tick(3)))""".stripMargin
+
+    run(src) shouldBe "1\n2\n3\n123\n"
+  }
+
+  // The operands of a binary operator are evaluated left first, each once — the left side prints
+  // before the right, and the asymmetric subtraction pins which value went where.
+  "binary operands are evaluated left first, once each" in {
+    val src =
+      """tick(label: int, v: int) -> int
+        |    print(label)
+        |    v
+        |end tick
+        |print(tick(1, 20) - tick(2, 5))""".stripMargin
+
+    run(src) shouldBe "1\n2\n15\n"
+  }
+
+  // A compound assignment to an indexed element must evaluate the place once, not once for the
+  // load and again for the store. A side-effecting index prints a single time, and the element
+  // holds the read-modify-write result.
+  "a compound assignment evaluates a side-effecting index exactly once" in {
+    val src =
+      """next() -> int
+        |    print(99)
+        |    2
+        |end next
+        |var a = [10, 20, 30, 40]
+        |a[next()] += 5
+        |print(a[2])""".stripMargin
+
+    run(src) shouldBe "99\n35\n"
+  }
+
+  // The same once-only rule for a compound assignment through a side-effecting receiver: the
+  // receiver expression is evaluated a single time and the field is updated in place.
+  "a compound assignment evaluates a side-effecting receiver exactly once" in {
+    val src =
+      """struct Box
+        |    n: int
+        |get(b: &Box) -> &Box
+        |    print(99)
+        |    b
+        |end get
+        |var box: &Box = Box(100)
+        |get(box).n += 7
+        |print(box.n)""".stripMargin
+
+    run(src) shouldBe "99\n107\n"
+  }
+
   "compound assignment operators update in place" in {
     val src =
       """var x = 10
