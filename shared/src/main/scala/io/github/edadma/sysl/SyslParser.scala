@@ -123,7 +123,7 @@ class SyslParser extends PackratParsers {
       op("--") ^^^ ((e: Expr) => PostIncDec("--", e))
 
   lazy val primary: PackratParser[Expr] =
-    floatLit | intLit | charLit | strLit | boolLit | identExpr | op("(") ~> parenTail
+    floatLit | intLit | charLit | strLit | boolLit | nullLit | identExpr | op("(") ~> parenTail
 
   /** After `(`: `)` is unit, one expression is a grouping, more are a tuple. */
   private lazy val parenTail: PackratParser[Expr] =
@@ -148,6 +148,8 @@ class SyslParser extends PackratParsers {
   private lazy val boolLit: Parser[Expr] =
     op("true") ^^^ BoolLit(true) | op("false") ^^^ BoolLit(false)
 
+  private lazy val nullLit: Parser[Expr] = op("null") ^^^ NullLit()
+
   private lazy val identExpr: Parser[Expr] = ident ^^ Ident.apply
 
   // --- statements ----------------------------------------------------------------------
@@ -155,11 +157,21 @@ class SyslParser extends PackratParsers {
   lazy val statement: PackratParser[Stmt] =
     structDecl | enumDecl | funcDecl | varDecl | forStmt | whileStmt | returnStmt | exprStmt
 
-  /** A type: a name, optionally applied to type arguments (`Box[int]`, `Result[T, string]`). */
+  /** A type: a memory-mode sigil applied to a type, or a name optionally applied to type
+   * arguments (`Box[int]`, `Result[T, string]`). `sync` stays a soft keyword — it is only
+   * special immediately after `&`, and the `&sync T` alternative is tried first so that a
+   * reference to a type actually named `sync` still parses.
+   */
   private lazy val typeRef: Parser[TypeRef] =
-    ident ~ opt(op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")) ^^ {
-      case n ~ args => NamedType(n, args.getOrElse(Nil))
-    }
+    op("*") ~> typeRef ^^ PtrType.apply |
+      op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
+      op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
+      ident ~ opt(op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")) ^^ {
+        case n ~ args => NamedType(n, args.getOrElse(Nil))
+      }
+
+  private lazy val softSync: Parser[Unit] =
+    accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
 
   /** The `[T, U]` type-parameter list of a generic declaration. */
   private lazy val typeParams: Parser[List[String]] =

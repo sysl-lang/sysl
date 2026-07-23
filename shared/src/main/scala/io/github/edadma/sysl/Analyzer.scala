@@ -35,7 +35,20 @@ class Analyzer private (program: Program) {
    */
   private val structInsts = mutable.LinkedHashMap.empty[String, Type.Struct]
   private val enumInsts   = mutable.LinkedHashMap.empty[String, Type.Enum]
-  private val resolving   = mutable.LinkedHashSet.empty[String]
+
+  /** Instantiations whose fields are still being resolved, each recorded with the indirection
+   * depth at which it was entered. A type that reaches itself finds its own entry here; the
+   * depth is what decides whether that is a legal cycle (see `cycleCheck`).
+   */
+  private val resolving = mutable.LinkedHashMap.empty[String, Int]
+
+  /** The same instantiations, by display name, so a recursive occurrence resolves to the object
+   * whose fields are still being filled in rather than starting a second one.
+   */
+  private val inProgress = mutable.LinkedHashMap.empty[String, Type]
+
+  /** How many `*T` / `&T` wrappers the resolver is currently inside. */
+  private var indirection = 0
 
   /** Instantiated function signatures, keyed by the name codegen will emit. */
   private val funcInsts = mutable.LinkedHashMap.empty[String, (List[(String, Type)], Type)]
@@ -103,6 +116,9 @@ class Analyzer private (program: Program) {
    * parameters to the arguments it was instantiated with.
    */
   private def resolveType(t: TypeRef, subst: Map[String, Type]): Type = t match
+    case PtrType(inner)       => Type.Ptr(underIndirection(resolveType(inner, subst)))
+    case RefType(inner, sync) => Type.Ref(underIndirection(resolveType(inner, subst)), sync)
+
     case NamedType(n, argRefs) =>
       if argRefs.isEmpty && subst.contains(n) then subst(n)
       else
@@ -112,6 +128,22 @@ class Analyzer private (program: Program) {
           case None if structDecls.contains(n) => instantiateStruct(n, targs)
           case None if enumDecls.contains(n)   => instantiateEnum(n, targs)
           case None                            => err(s"unknown type '$n'")
+
+  /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
+   * whatever type is currently being laid out.
+   */
+  private def underIndirection(resolve: => Type): Type = {
+    indirection += 1
+    try resolve
+    finally indirection -= 1
+  }
+
+  /** Whether reaching an in-progress instantiation again is a legal cycle. It is exactly when
+   * at least one indirection was crossed on the way back to it: a `Node` holding a `*Node` is
+   * pointer-sized, while a `Node` holding a `Node` by value has no finite size.
+   */
+  private def cycleCheck(key: String): Unit =
+    if indirection <= resolving(key) then err(s"type '$key' contains itself, so it has no finite size")
 
   /** Resolves a scalar type name: the named primitives and friendly aliases, or one of the
    * systematic `iN` / `uN` / `fN` width spellings.
@@ -147,24 +179,31 @@ class Analyzer private (program: Program) {
       if tparams.isEmpty then err(s"type '$name' does not take type arguments")
       else err(s"type '$name' takes ${tparams.length} type arguments, but ${targs.length} were given")
 
-  /** Instantiates a struct for one set of type arguments, memoized on the display name. */
+  /** Instantiates a struct for one set of type arguments, memoized on the display name. The
+   * instantiation is registered *before* its fields are resolved, so a field that points back
+   * at the struct finds it and the recursion terminates; `cycleCheck` is what rejects the cycle
+   * that has no indirection to break it.
+   */
   private def instantiateStruct(name: String, targs: List[Type]): Type.Struct = {
     val decl = structDecls(name)
     checkArity(name, decl.tparams, targs)
     val key = Type.qualified(name, targs)
 
-    structInsts.getOrElse(
-      key, {
-        if resolving(key) then err(s"type '$key' contains itself, so it has no finite size")
-        resolving += key
-        val subst  = decl.tparams.zip(targs).toMap
-        val fields = decl.fields.map(f => (f.name, resolveType(f.typ, subst)))
+    structInsts.get(key) match
+      case Some(s) => s
+      case None if inProgress.contains(key) =>
+        cycleCheck(key)
+        inProgress(key).asInstanceOf[Type.Struct]
+      case None =>
+        val s = new Type.Struct(name, targs)
+        inProgress(key) = s
+        resolving(key) = indirection
+        val subst = decl.tparams.zip(targs).toMap
+        s.fields = decl.fields.map(f => (f.name, resolveType(f.typ, subst)))
         resolving -= key
-        val s = Type.Struct(name, targs, fields)
+        inProgress -= key
         structInsts(key) = s
         s
-      },
-    )
   }
 
   /** Instantiates an enum for one set of type arguments. All-dataless variants make a *simple*
@@ -177,16 +216,22 @@ class Analyzer private (program: Program) {
     checkArity(name, decl.tparams, targs)
     val key = Type.qualified(name, targs)
 
-    enumInsts.getOrElse(
-      key, {
-        if resolving(key) then err(s"type '$key' contains itself, so it has no finite size")
-        resolving += key
+    enumInsts.get(key) match
+      case Some(en) => en
+      case None if inProgress.contains(key) =>
+        cycleCheck(key)
+        inProgress(key).asInstanceOf[Type.Enum]
+      case None =>
+        val en = new Type.Enum(name, targs)
+        en.simple = decl.variants.forall(_.fields.isEmpty)
+        inProgress(key) = en
+        resolving(key) = indirection
+
         val subst    = decl.tparams.zip(targs).toMap
-        val simple   = decl.variants.forall(_.fields.isEmpty)
         var nextTag  = 0
         var nextSlot = 1
-        val variants = decl.variants.map { v =>
-          if simple then
+        en.variants = decl.variants.map { v =>
+          if en.simple then
             val tag = v.value match
               case Some(IntLit(n, _)) => n.toInt
               case Some(_)            => err(s"the value of variant '${v.name}' must be an integer literal")
@@ -201,12 +246,11 @@ class Analyzer private (program: Program) {
             val slot   = if fields.nonEmpty then { val s = nextSlot; nextSlot += 1; Some(s) } else None
             Type.EnumVariant(v.name, tag, fields, slot)
         }
+
         resolving -= key
-        val en = Type.Enum(name, targs, simple, variants)
+        inProgress -= key
         enumInsts(key) = en
         en
-      },
-    )
   }
 
   // --- program -------------------------------------------------------------------------
@@ -315,6 +359,14 @@ class Analyzer private (program: Program) {
       tparams: Set[String],
       sub: mutable.Map[String, Type],
   ): Unit = ref match
+    case PtrType(inner) =>
+      actual match
+        case Type.Ptr(t) => unify(inner, t, tparams, sub)
+        case _           => ()
+    case RefType(inner, sync) =>
+      actual match
+        case Type.Ref(t, s) if s == sync => unify(inner, t, tparams, sub)
+        case _                           => ()
     case NamedType(n, Nil) if tparams(n) =>
       if !sub.contains(n) then sub(n) = actual
     case NamedType(n, argRefs) =>
@@ -445,6 +497,12 @@ class Analyzer private (program: Program) {
     case BoolLit(b)          => TBoolLit(b)
     case UnitLit()           => TUnitLit()
 
+    case NullLit() =>
+      expected match
+        case Some(p: Type.Ptr) => TNullLit(p)
+        case Some(other)       => err(s"'null' is a raw pointer, and ${show(other)} was expected here")
+        case None              => err("'null' takes its type from its context, and there is none here")
+
     // A minus and the literal it precedes are one unit for the range check, so a signed type's
     // minimum is writable even though its magnitude overflows the positive range.
     case Unary("-", IntLit(v, suffix))   => intLiteral(-v, suffix, expected)
@@ -480,59 +538,57 @@ class Analyzer private (program: Program) {
         case i: Type.Integer => TUnary("~", t, i)
         case other           => err(s"unary '~' is not defined for ${show(other)}")
 
+    // Address-of yields a *raw* pointer: a place lives in a frame or inside another object, so
+    // there is no refcount to take a share of. Reaching a `&T` means being handed one.
+    case Unary("&", e) =>
+      val place = analyzePlace(e, "'&'")
+      TAddrOf(place, Type.Ptr(place.ty))
+
+    case Unary("*", e) =>
+      val t = analyzeExpr(e)
+      Type.pointee(t.ty) match
+        case Some(inner) => TDeref(t, inner)
+        case None        => err(s"'*' needs a pointer or a reference, not ${show(t.ty)}")
+
     case Unary(op, _) =>
       err(s"unary '$op' is not supported yet")
 
-    case PreIncDec(op, Ident(n))  => incDec(op, n, pre = true)
-    case PostIncDec(op, Ident(n)) => incDec(op, n, pre = false)
-    case PreIncDec(op, _)         => err(s"'$op' needs a variable")
-    case PostIncDec(op, _)        => err(s"'$op' needs a variable")
+    case PreIncDec(op, target)  => incDec(op, target, pre = true)
+    case PostIncDec(op, target) => incDec(op, target, pre = false)
 
     case Compare(operands, ops) =>
       val ts = analyzeOperands(operands, None)
       for i <- ops.indices do
-        val (a, b) = (ts(i), ts(i + 1))
+        val (a, b)  = (ts(i), ts(i + 1))
+        val equality = ops(i) == "==" || ops(i) == "!="
         if a.ty != b.ty then err(s"cannot compare ${show(a.ty)} with ${show(b.ty)}")
-        if !Type.isOrdered(a.ty) then err(s"'${ops(i)}' is not defined for ${show(a.ty)}")
+        if !(if equality then Type.isEquatable(a.ty) else Type.isOrdered(a.ty)) then
+          err(s"'${ops(i)}' is not defined for ${show(a.ty)}")
       TCompare(ts, ops)
 
-    case Assign("=", Ident(n), value) =>
-      val (u, ty) = lookup(n)
-      val tv      = analyzeExpr(value, Some(ty))
-      if tv.ty != ty then err(s"cannot assign ${show(tv.ty)} to '$n' of type ${show(ty)}")
-      TStore(u, tv, ty)
+    case Assign("=", target, value) =>
+      val place = analyzePlace(target, "assignment")
+      val tv    = analyzeExpr(value, Some(place.ty))
+      if tv.ty != place.ty then
+        err(s"cannot assign ${show(tv.ty)} to ${describe(target)} of type ${show(place.ty)}")
+      TStore(place, tv, place.ty)
 
-    case Assign("=", Field(Ident(n), f), value) =>
-      val (u, ty) = lookup(n)
-      ty match
-        case s: Type.Struct =>
-          val idx = s.fieldIndex(f)
-          if idx < 0 then err(s"struct '${s.name}' has no field '$f'")
-          val fty = s.fields(idx)._2
-          val tv  = analyzeExpr(value, Some(fty))
-          if tv.ty != fty then err(s"cannot assign ${show(tv.ty)} to field '$f' of type ${show(fty)}")
-          TSetField(u, s, idx, tv, fty)
-        case other =>
-          err(s"cannot assign to field '$f' of ${show(other)}")
-
-    case Assign(op, Ident(n), value) =>
-      val (u, ty) = lookup(n)
-      val binSym  = op.dropRight(1)
-      val tv      = analyzeExpr(value, Some(ty))
-      val rty     = arithType(binSym, ty, tv.ty)
-      if rty != ty then err(s"'$op' would change the type of '$n'")
-      TUpdate(u, op, tv, ty)
-
-    case Assign(_, _, _) =>
-      err("assignment target must be a variable or a field of one")
+    case Assign(op, target, value) =>
+      val place  = analyzePlace(target, s"'$op'")
+      val binSym = op.dropRight(1)
+      val tv     = analyzeExpr(value, Some(place.ty))
+      if arithType(binSym, place.ty, tv.ty) != place.ty then
+        err(s"'$op' would change the type of ${describe(target)}")
+      TUpdate(place, op, tv, place.ty)
 
     case Call(Ident("print"), args) =>
       TPrint(args.map { a =>
         val t = analyzeExpr(a)
         t.ty match
-          case Type.Unit                     => err("cannot print a unit value")
-          case _: Type.Struct | _: Type.Enum => err(s"cannot print a ${show(t.ty)} value")
-          case _                             => t
+          case Type.Unit                                             => err("cannot print a unit value")
+          case _: Type.Struct | _: Type.Enum | _: Type.Ptr | _: Type.Ref =>
+            err(s"cannot print a ${show(t.ty)} value")
+          case _ => t
       })
 
     // A conversion is written with call syntax, so a scalar type name in call position is one.
@@ -561,7 +617,7 @@ class Analyzer private (program: Program) {
         case None    => err(s"enum '$n' has no variant '$f'")
 
     case Field(receiver, f) =>
-      val tr = analyzeExpr(receiver)
+      val tr = autoDeref(analyzeExpr(receiver))
       tr.ty match
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
@@ -595,13 +651,47 @@ class Analyzer private (program: Program) {
     case _: Index => err("indexing is not supported yet")
     case _: Tuple => err("tuples are not supported yet")
 
-  private def incDec(op: String, name: String, pre: Boolean): TExpr = {
-    val (u, ty) = lookup(name)
+  private def incDec(op: String, target: Expr, pre: Boolean): TExpr = {
+    val place = analyzePlace(target, s"'$op'")
 
-    ty match
-      case i: Type.Integer => TIncDec(u, op, pre, i)
+    place.ty match
+      case i: Type.Integer => TIncDec(place, op, pre, i)
       case other           => err(s"'$op' is not defined for ${show(other)}")
   }
+
+  // --- places --------------------------------------------------------------------------
+
+  /** Whether a typed expression denotes a **place** — something with an address, which can be
+   * assigned through and pointed at. A local, a dereference, and a field of either are places;
+   * anything computed (a call result, an arithmetic result, a freshly built struct) is not.
+   */
+  private def isPlace(t: TExpr): Boolean = t match
+    case _: TLoad           => true
+    case _: TDeref          => true
+    case TField(recv, _, _) => isPlace(recv)
+    case _                  => false
+
+  /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
+  private def analyzePlace(target: Expr, what: String): TExpr = {
+    val t = analyzeExpr(target)
+    if !isPlace(t) then err(s"$what needs a variable, a field, or a dereference — something with an address")
+    t
+  }
+
+  /** One level of automatic dereference, so a field is selected through a `*T` or a `&T`
+   * exactly as it is on the value itself. One level only: reaching through a `**T` is written.
+   */
+  private def autoDeref(t: TExpr): TExpr =
+    Type.pointee(t.ty) match
+      case Some(inner) => TDeref(t, inner)
+      case None        => t
+
+  /** How a diagnostic names an assignment target. */
+  private def describe(target: Expr): String = target match
+    case Ident(n)      => s"'$n'"
+    case Field(_, f)   => s"field '$f'"
+    case Unary("*", _) => "the place it points at"
+    case _             => "this place"
 
   // --- literals ------------------------------------------------------------------------
 
@@ -643,27 +733,27 @@ class Analyzer private (program: Program) {
     TFloatLit(hexDouble(text), ty)
   }
 
-  /** Analyzes operands that must share one type. A bare numeric literal has no type of its
-   * own, so it takes the type of a non-literal neighbour — which is what lets `n + 1` work
-   * for an `n` of any width without the literal needing a suffix.
+  /** Analyzes operands that must share one type. A bare literal has no type of its own, so it
+   * takes the type of a non-literal neighbour — which is what lets `n + 1` work for an `n` of
+   * any width without the literal needing a suffix, and `p == null` work for any `*T`. The
+   * non-literals are analyzed first precisely so their type is available to the literals.
    */
   private def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
-    val first = operands.map(analyzeExpr(_, expected))
+    val fixed = operands.map(e => Option.when(!isLiteral(e))(analyzeExpr(e, expected)))
+    val ty    = fixed.flatten.headOption.map(_.ty).orElse(expected)
 
-    operands.zip(first).collectFirst { case (e, t) if !isLiteral(e) => t.ty } match
-      case Some(ty) =>
-        operands.zip(first).map {
-          case (e, t) if isLiteral(e) && t.ty != ty => analyzeExpr(e, Some(ty))
-          case (_, t)                              => t
-        }
-      case None => first
+    operands.zip(fixed).map {
+      case (_, Some(t)) => t
+      case (e, None)    => analyzeExpr(e, ty)
+    }
   }
 
-  /** Whether an expression is a numeric literal with no type of its own. A suffixed literal
+  /** Whether an expression is a literal with no type of its own. A suffixed numeric literal
    * has already said what it is, so it counts as fixed rather than adaptable.
    */
   private def isLiteral(e: Expr): Boolean = e match
     case IntLit(_, None) | FloatLit(_, None) => true
+    case NullLit()                           => true
     case Unary("-", operand)                 => isLiteral(operand)
     case _                                   => false
 

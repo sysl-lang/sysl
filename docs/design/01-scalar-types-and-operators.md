@@ -87,6 +87,11 @@ nothing else to go on both take the default, so `1 << 2` is `int`.
 This is not implicit promotion — the literal *is* that type from the start, and a value that
 does not fit it is an error asking for a wider one, never a silent wrap or widening.
 
+**`null` follows the same table.** It is the absent raw pointer and has no type of its own, so
+it takes the `*T` its position expects — including the operand rule, which is what makes
+`walk != null` work without naming the pointee. Where nothing expects a pointer, `null` is an
+error asking for the type. There is no null in the safe subset (`03`).
+
 ### Escape sequences
 
 The same table serves character and string literals.
@@ -188,16 +193,21 @@ Key points:
   amount**: `x << 2` takes its `2` from `x`'s type by the literal rule above, and shifting by
   a value of a different type is written `x << u8(k)`.
 - **Arithmetic is defined on the numeric types only.** `char` has equality and ordering and
-  no arithmetic at all (`00` §1); `bool` has neither ordering nor arithmetic. Unary `-` needs
-  a type that has a sign, so it is defined on the signed integers and the floats — negating
-  an unsigned value is written as the subtraction it actually is. Unary `~` is defined on
-  every integer type, signed or not.
+  no arithmetic at all (`00` §1); `bool` has equality but no ordering and no arithmetic. Unary
+  `-` needs a type that has a sign, so it is defined on the signed integers and the floats —
+  negating an unsigned value is written as the subtraction it actually is. Unary `~` is defined
+  on every integer type, signed or not.
+- **Equality reaches further than ordering.** `==` and `!=` are defined wherever `<` is, and
+  additionally on `bool` and on the two pointer-shaped modes `*T` and `&T`, which compare by
+  address. Ordering on an address is not defined — a bare address has no meaningful one.
 - **Chained comparisons** (level 4): `a < b < c` means `a < b && b < c`, short-circuiting;
   comparisons do not associate as plain left/right.
 - **Assignment is an expression** (`00` §2): lowest precedence, right-associative
   (`a = b = c` = `a = (b = c)`).
 - `*` and `&` appear both as **prefix unary** (deref / addr-of, level 11) and as **binary**
-  (multiply level 10 / bitwise-and level 8); position disambiguates.
+  (multiply level 10 / bitwise-and level 8); position disambiguates. Their operands and results
+  are in `03`: `&` takes a place and yields a `*T`, `*` reads through a `*T` or a `&T` and is
+  itself a place.
 - **Postfix binds tighter than prefix** (12 vs 11), which gives the intended C idioms:
   `*p++` = `*(p++)` (deref the post-incremented pointer), `-a.b` = `-(a.b)`.
 - **Casts/conversions are call-syntax** (`u32(c)`, `byte(0xFF)`), so they parse as postfix

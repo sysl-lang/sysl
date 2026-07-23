@@ -93,6 +93,48 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "memory modes" - {
+    "a cycle through a value field still has no finite size" in {
+      err("struct A\n    b: B\nstruct B\n    a: A\nvar x = A(B(x))") should include("contains itself")
+    }
+
+    "a cycle is fine as soon as one edge is an indirection" in {
+      ir("struct A\n    b: B\nstruct B\n    a: *A\nvar b = B(null)\nvar a = A(b)") should
+        include("%struct.A = type { %struct.B }")
+    }
+
+    "'&' needs something with an address" in {
+      err("print(*(&(1 + 2)))") should include("needs a variable, a field, or a dereference")
+      err("f() -> int = 1\nvar p = &f()") should include("needs a variable, a field, or a dereference")
+    }
+
+    "'*' needs a pointer or a reference" in {
+      err("var n = 1\nprint(*n)") should include("'*' needs a pointer or a reference, not int")
+    }
+
+    "assigning through a pointer checks the pointee type" in {
+      err("var n = 1\nvar p = &n\n*p = 1.5") should include("cannot assign real")
+    }
+
+    "a pointer cannot be printed" in {
+      err("var n = 1\nprint(&n)") should include("cannot print a *int value")
+    }
+
+    "null must know which pointer it is" in {
+      err("var p = null") should include("takes its type from its context")
+      err("var n: int = null") should include("'null' is a raw pointer")
+    }
+
+    "a pointer has equality but no ordering" in {
+      err("var n = 1\nvar p = &n\nprint(p < p)") should include("'<' is not defined for *int")
+    }
+
+    "the two reference modes are distinct types" in {
+      err("f(p: &int) -> &int = p\ng(p: &sync int) -> &int = f(p)") should
+        include("is &int, but &sync int was given")
+    }
+  }
+
   "scalar types" - {
     "a literal too large for the width it landed in" in {
       err("var x: byte = 300") should include("does not fit byte")

@@ -1,8 +1,9 @@
 # The Memory Model — Three Modes
 
-**Status:** core model decided, including slice ownership, what the allocator-free boundary
-gates, escape analysis (`05`), and concurrency (`06`). This is the heart of the language; the
-type, trait, and standard-library docs all rest on it.
+**Status:** core model decided, including how a reference is created, places and automatic
+dereference, recursive types, `null`, slice ownership, what the allocator-free boundary gates,
+escape analysis (`05`), and concurrency (`06`). This is the heart of the language; the type,
+trait, and standard-library docs all rest on it.
 
 ## The guarantee
 
@@ -49,6 +50,31 @@ always safe.
 This is the pleasant default for application, server, and utility code, and — because of the
 rule below — it is also what lets a driver hold a reference the bus manager created for it.
 
+### Creating one is ordinary construction
+
+There is **no allocation keyword**. A reference is made by writing the ordinary construction
+where a `&T` is expected, and the expected type is what puts the object on the heap:
+
+```
+spawn(parent: &Process) -> &Process
+    Process(parent, 0)                 // the return type says &Process, so this allocates
+
+var p: &Point = Point(1, 2)            // the annotation says so here
+var q = Point(1, 2)                    // no expectation: an ordinary value, on the stack
+```
+
+This is Swift, Kotlin, and Scala 3, where `Point(1, 2)` is the whole spelling and the
+declaration decides whether the result is a value or an object. sysl chooses per declaration
+rather than per type, so the *declaration site* is what carries the choice — but the
+construction reads the same either way, which is what principle 3 asks for: no `Rc::new`, no
+`.clone()`, no wrapper.
+
+The positions that fix the expectation are the ones that already do so for generic inference:
+a declared local type, a parameter, a return type, a struct field, and an enum variant's
+payload. Somewhere with no expectation at all, a construction is a value — annotate to say
+otherwise. A prefix `&` on a construction was considered as an explicit mark and not taken:
+it would collide with address-of, which is a different operation with a different result type.
+
 ### Who frees it — the deallocation hook
 
 Every ARC heap object carries, alongside its refcount, a **pointer to the function that frees
@@ -77,6 +103,49 @@ lifetime. Pointer arithmetic, `malloc` / `free`, MMIO addresses, and structure-w
 here. **It is the only unsafe primitive** — the only way to produce a dangling or wild pointer
 — and it needs no runtime. It is how a kernel, a driver, or the allocator's own internals are
 written.
+
+## Places: `&`, `*`, and selection
+
+A **place** is something with an address: a local or parameter, a dereference, and a field of
+either. Everything else — a call result, an arithmetic result, a freshly built struct — is a
+value with no address to take.
+
+- **`&place` yields a `*T`.** A place lives in a frame or inside another object, so there is
+  no refcount to take a share of; address-of is C's operator with C's result. Reaching a `&T`
+  means being handed one, or constructing one (above). Taking the address of a local is
+  therefore inherently in the unsafe tier, which is right: it can dangle, and nothing promotes
+  it (`05`).
+- **`*p` reads through a `*T` or a `&T`**, and is itself a place, so `*p = v`, `*p += 1`, and
+  `(*p)++` all mean what they do in C.
+- **Field selection dereferences one level automatically**, on both `*T` and `&T`:
+  `p.x` is `(*p).x`, and `p.x = 9` writes through the pointer. This is Go's rule. There is no
+  `->`, and reaching through a `**T` is written, since the shorthand stops at one level.
+
+Assignment, compound assignment, and `++`/`--` all take a place, so the same three forms work
+on a variable, on a field, and through a pointer with nothing special said about any of them.
+
+## Recursive types
+
+A type may reach itself **through an indirection**, and only through one. `struct Node { value:
+int; next: *Node }` is pointer-sized and legal; a struct holding itself by value has no finite
+size and is rejected, naming the type. The rule is per cycle rather than per field: a cycle is
+legal as soon as one edge on it is a `*T` or a `&T`, so mutually recursive types work as long
+as the loop passes through a pointer or a reference somewhere.
+
+## Null
+
+`null` is the absent raw pointer, and it exists **only for `*T`** — there is no null in the
+safe subset, where an absent reference is `Option[&T]`. It has no type of its own and takes the
+`*T` its context expects, the way a bare `None` takes its type argument:
+
+```
+var p: *int = null
+var c = Node(3, null)              // the field's type says which pointer
+while walk != null do …            // the comparison's other operand says
+```
+
+Pointers and references compare with `==` and `!=` — by address, since that is the only
+question a bare address can answer — and have no ordering.
 
 ## Per-declaration, and why value is the default
 

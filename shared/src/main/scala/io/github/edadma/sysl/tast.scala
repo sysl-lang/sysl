@@ -25,6 +25,9 @@ case class TStrLit(value: String)   extends TExpr { def ty: Type = Type.Str  }
 case class TBoolLit(value: Boolean) extends TExpr { def ty: Type = Type.Bool }
 case class TUnitLit()               extends TExpr { def ty: Type = Type.Unit }
 
+/** `null` at the pointer type its context fixed. */
+case class TNullLit(ty: Type) extends TExpr
+
 /** An explicit scalar conversion, written with call syntax: `u32(c)`, `byte(n)`, `char(u)`.
  * Every conversion between scalar types is written, never inferred.
  */
@@ -33,14 +36,22 @@ case class TCast(operand: TExpr, ty: Type) extends TExpr
 /** Reads a local variable (or parameter) by its unique name. */
 case class TLoad(name: String, ty: Type) extends TExpr
 
-/** `name = value` — stores and yields the assigned value. */
-case class TStore(name: String, value: TExpr, ty: Type) extends TExpr
+/** `*p` — reads through a pointer or reference. */
+case class TDeref(operand: TExpr, ty: Type) extends TExpr
 
-/** A compound assignment `name op= value`, yielding the updated value. */
-case class TUpdate(name: String, op: String, value: TExpr, ty: Type) extends TExpr
+/** `&place` — the address of a place, as a raw pointer. */
+case class TAddrOf(place: TExpr, ty: Type) extends TExpr
+
+/** `place = value` — stores and yields the assigned value. The place is a `TLoad`, a `TDeref`,
+ * or a `TField` chain over one of those; codegen computes its address rather than its value.
+ */
+case class TStore(place: TExpr, value: TExpr, ty: Type) extends TExpr
+
+/** A compound assignment `place op= value`, yielding the updated value. */
+case class TUpdate(place: TExpr, op: String, value: TExpr, ty: Type) extends TExpr
 
 /** `++`/`--`, prefix (new value) or postfix (old value). */
-case class TIncDec(name: String, op: String, pre: Boolean, ty: Type) extends TExpr
+case class TIncDec(place: TExpr, op: String, pre: Boolean, ty: Type) extends TExpr
 
 case class TBinary(op: String, left: TExpr, right: TExpr, ty: Type) extends TExpr
 case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExpr
@@ -84,11 +95,10 @@ case class TTry(
     ty: Type,
 ) extends TExpr
 
-/** Read field `index` of a struct value. */
+/** Read field `index` of a struct value. It is also a *place* when its receiver is one, which
+ * is what makes `s.f = v` and `p.f = v` (through a pointer) ordinary assignments.
+ */
 case class TField(receiver: TExpr, index: Int, ty: Type) extends TExpr
-
-/** `receiver.field = value` on a local struct variable, yielding the assigned value. */
-case class TSetField(name: String, struct: Type.Struct, index: Int, value: TExpr, ty: Type) extends TExpr
 
 /** `if cond then … else …` as a value (or unit when there is no else). */
 case class TIf(cond: TExpr, thenBlock: TBlock, elseBlock: Option[TBlock], ty: Type) extends TExpr

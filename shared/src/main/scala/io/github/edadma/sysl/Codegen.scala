@@ -142,6 +142,8 @@ class Codegen private (program: TProgram) {
     case Type.Char        => "0"
     case Type.Bool        => "0"
     case Type.Str         => "null"
+    case _: Type.Ptr      => "null"
+    case _: Type.Ref      => "null"
     case _: Type.Struct   => "zeroinitializer"
     case e: Type.Enum     => if e.simple then "0" else "zeroinitializer"
     case Type.Unit        => ""
@@ -205,6 +207,7 @@ class Codegen private (program: TProgram) {
     case TIntLit(v, _) => v.toString
     case TStrLit(s)    => stringGlobal(s)
     case TBoolLit(b)   => if b then "1" else "0"
+    case TNullLit(_)   => "null"
     case TUnitLit()    => ""
 
     // A narrower float is the `double` constant rounded to it, which folds away entirely.
@@ -218,21 +221,30 @@ class Codegen private (program: TProgram) {
     case TLoad(name, ty) =>
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %$name.addr"); r
 
-    case TStore(name, value, ty) =>
-      val v = genExpr(value); emit(s"store ${ty.llvm} $v, ptr %$name.addr"); v
+    case TDeref(operand, ty) =>
+      val p = genExpr(operand)
+      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
 
-    case TUpdate(name, op, value, ty) =>
-      val cur     = freshTemp(); emit(s"$cur = load ${ty.llvm}, ptr %$name.addr")
+    case TAddrOf(place, _) =>
+      address(place)
+
+    case TStore(place, value, ty) =>
+      val v = genExpr(value); emit(s"store ${ty.llvm} $v, ptr ${address(place)}"); v
+
+    case TUpdate(place, op, value, ty) =>
+      val p       = address(place)
+      val cur     = freshTemp(); emit(s"$cur = load ${ty.llvm}, ptr $p")
       val v       = genExpr(value)
       val updated = arith(op.dropRight(1), ty, cur, v)
-      emit(s"store ${ty.llvm} $updated, ptr %$name.addr")
+      emit(s"store ${ty.llvm} $updated, ptr $p")
       updated
 
-    case TIncDec(name, op, pre, ty) =>
+    case TIncDec(place, op, pre, ty) =>
       val w   = ty.llvm
-      val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
+      val p   = address(place)
+      val cur = freshTemp(); emit(s"$cur = load $w, ptr $p")
       val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} $w $cur, 1")
-      emit(s"store $w $nv, ptr %$name.addr")
+      emit(s"store $w $nv, ptr $p")
       if pre then nv else cur
 
     case TBinary(op, l, r, _) =>
@@ -286,17 +298,25 @@ class Codegen private (program: TProgram) {
       val rv = genExpr(receiver); val r = freshTemp()
       emit(s"$r = extractvalue ${receiver.ty.llvm} $rv, $index"); r
 
-    case TSetField(name, struct, index, value, ty) =>
-      val v = genExpr(value); val p = freshTemp()
-      emit(s"$p = getelementptr ${struct.llvm}, ptr %$name.addr, i32 0, i32 $index")
-      emit(s"store ${ty.llvm} $v, ptr $p")
-      v
-
     case TIf(cond, thenBlock, elseBlock, ty) =>
       genIf(cond, thenBlock, elseBlock, ty)
 
     case TMatch(scrutinee, arms, ty) =>
       genMatch(scrutinee, arms, ty)
+
+  /** The address of a place, as a `ptr` register or an existing slot name. Every place bottoms
+   * out either in a local's stack slot or in a pointer the program already holds, so this walks
+   * the field chain with `getelementptr` rather than reading values out with `extractvalue`.
+   */
+  private def address(place: TExpr): String = place match
+    case TLoad(name, _) => s"%$name.addr"
+    case TDeref(operand, _) => genExpr(operand)
+    case TField(receiver, index, _) =>
+      val base = address(receiver)
+      val r    = freshTemp()
+      emit(s"$r = getelementptr ${receiver.ty.llvm}, ptr $base, i32 0, i32 $index")
+      r
+    case other => sys.error(s"unreachable address of ${other.getClass.getSimpleName}")
 
   /** Builds an enum value from already-lowered payload values: the tag, then the variant's
    * payload aggregate dropped into its slot.
@@ -541,6 +561,11 @@ class Codegen private (program: TProgram) {
    * value, so it uses the unsigned predicates over its `i32` representation.
    */
   private def predicate(op: String, ty: Type): String = ty match
+    // Equality only: a bool and an address have no ordering, so no signed/unsigned choice.
+    case Type.Bool | _: Type.Ptr | _: Type.Ref =>
+      op match
+        case "==" => "eq"; case "!=" => "ne"
+        case _    => sys.error(s"unreachable compare '$op'")
     case Type.Char | Type.Integer(_, false, _) =>
       op match
         case "==" => "eq"; case "!=" => "ne"

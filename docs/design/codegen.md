@@ -76,8 +76,22 @@ before they appear and may be mutually recursive).
 - **Conversions** are written with call syntax — `u32(c)`, `byte(n)`, `real(n)`, `int(x)` —
   and lower to one LLVM cast each. The single partial one, `char(u)`, tests the value at 64
   bits and traps when it is not a Unicode scalar value.
+- **Raw pointers.** `*T` in any type position, `&place` to take an address, `*p` to read
+  through one, and `null` — which takes its `*T` from context the way a numeric literal takes
+  its width. A **place** (a local, a dereference, a field of either) is what `&` takes, what
+  assignment writes to, and what `++`/`--` and compound assignment update, so all three forms
+  work uniformly on a variable, a field, and through a pointer. Field selection dereferences
+  one level automatically, on `*T` and `&T` alike, so there is no `->`. Pointers and
+  references compare with `==` / `!=` by address and have no ordering; `bool` gained equality
+  at the same time.
+- **References in the type system.** `&T` and `&sync T` parse, resolve, mangle, and pass
+  through generic inference as distinct types, and a field of either kind makes a type legally
+  recursive. Nothing *creates* one yet: that is ARC, and it is the next stage.
+- **Recursive types.** A cycle through a `*T` or a `&T` is legal and pointer-sized; a cycle
+  every edge of which is by value is rejected as having no finite size. An instantiation is
+  registered before its fields are resolved, so a field that points back at it finds it.
 - **Expressions:** the full settled precedence grammar (`01`) over the scalar types and
-  string literals. `++`/`--`, unary `-`/`!`/`~`, chained comparison.
+  string literals. `++`/`--`, unary `-`/`!`/`~`/`*`/`&`, chained comparison.
 - **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed space-separated
   followed by a newline, lowered to a single `printf`. Integers widen to what varargs promote
   to and print as `%d` / `%u` / `%lld` / `%llu`; floats widen to `double` and print as `%g`; a
@@ -90,8 +104,12 @@ Textual LLVM IR with **opaque pointers** (`ptr`, never `i32*`), verified against
 on arm64. Floats are emitted as **hex doubles** (`0x…`) so the textual round-trip loses no
 bits. `printf` is declared varargs; each `print` interns one format-string constant. Value
 structs lower to named aggregates (`%struct.Name = type { … }`); construction is an
-`insertvalue` chain, a field read is `extractvalue`, and a field assignment is a
-`getelementptr` + `store` into the variable's slot. A simple enum is plain `i32`; a data enum
+`insertvalue` chain, and a field read is `extractvalue`. A **write** instead computes the
+place's address — a local's own slot, a loaded pointer value, or a `getelementptr` chain over
+either — and `store`s through it, which is one mechanism for `x = v`, `s.f = v`, `*p = v`, and
+`p.f = v` alike. `*T` and `&T` are both the opaque `ptr`; inside a mangled name a memory mode
+is spelled as a word (`ptr.` / `ref.` / `sync.`), since a sigil is not an LLVM name character.
+A simple enum is plain `i32`; a data enum
 lowers to a value aggregate `%enum.Name = type { i32 tag, payload₁, … }` with one payload slot
 per data-carrying variant (each payload a named `%Name.Variant` aggregate). A pattern test is a
 tag `icmp` plus `extractvalue` reads of the payload fields (pure, so nested fields are read
@@ -123,12 +141,11 @@ arity.
    (`name -> T`), inner `def`, default arguments, and the pure/effect (`def` vs plain)
    distinction are all deferred. The keyword-less form is disambiguated from a call by the
    typed parameter list and a following body.
-5. **Value structs and enums only.** No `new`/heap allocation, no refs (`&T`) or the
-   ref-counted path, no recursive types, no nested-lvalue field assignment (`a.b.c = v`), and
-   no methods. A data enum reserves storage for *every* variant's payload at once (a value
-   aggregate, no size arithmetic), which is wasteful but needs no heap; a type that contains
-   itself has no finite size and is rejected outright, which is what makes recursive enums
-   (`Add(Expr, Expr)`) wait on references.
+5. **No heap.** `&T` exists as a type but nothing allocates one, so ARC — retain/release,
+   destructors, the deallocation hook, `weak` — is entirely absent, and a recursive structure
+   is built out of `*T` and stack storage. There are no methods. A data enum reserves storage
+   for *every* variant's payload at once (a value aggregate, no size arithmetic), which is
+   wasteful but needs no heap.
 6. **Enum-match exhaustiveness ignores nested coverage.** An unguarded arm covers its variant
    only when every sub-pattern is irrefutable (a binding or `_`); an arm with a nested variant
    or literal sub-pattern does not count, so `Wrap(A) | Wrap(B)` covering `Wrap(Inner)` still

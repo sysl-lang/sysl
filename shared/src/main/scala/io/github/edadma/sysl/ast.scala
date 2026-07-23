@@ -23,6 +23,11 @@ case class BoolLit(value: Boolean)                        extends Expr
 /** `()` — the sole value of `unit`. */
 case class UnitLit() extends Expr
 
+/** `null` — the absent raw pointer. It has no type of its own and takes the `*T` its context
+ * expects; there is no null in the safe subset, where an absent reference is `Option[&T]`.
+ */
+case class NullLit() extends Expr
+
 case class Ident(name: String) extends Expr
 
 /** A prefix operator: `-x`, `!b`, `~n`, `*p`, `&x`. */
@@ -101,6 +106,12 @@ sealed trait TypeRef
  * declaration; the analyzer decides which from the substitution in scope.
  */
 case class NamedType(name: String, args: List[TypeRef] = Nil) extends TypeRef
+
+/** `*T` — a raw pointer to `T`. */
+case class PtrType(inner: TypeRef) extends TypeRef
+
+/** `&T`, or `&sync T` when the refcount is atomic. */
+case class RefType(inner: TypeRef, sync: Boolean) extends TypeRef
 
 /** One `name: type` binding, shared by function parameters and struct fields. */
 case class Param(name: String, typ: TypeRef)

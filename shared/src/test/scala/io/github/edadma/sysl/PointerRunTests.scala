@@ -1,0 +1,165 @@
+package io.github.edadma.sysl
+
+import org.scalatest.freespec.AnyFreeSpec
+
+/** Tier-2 runtime behavior of the raw-pointer mode: taking an address, reading and writing
+ * through it, the one level of automatic dereference on a field, and the recursive types that
+ * a pointer field makes possible.
+ */
+class PointerRunTests extends AnyFreeSpec with RunSupport {
+
+  "a pointer reads and writes the variable it points at" in {
+    val src =
+      """var n = 10
+        |var p = &n
+        |print(*p)
+        |*p = 42
+        |print(n)""".stripMargin
+
+    run(src) shouldBe "10\n42\n"
+  }
+
+  "a pointer follows its target rather than copying it" in {
+    val src =
+      """var n = 1
+        |var p = &n
+        |n = 2
+        |print(*p)
+        |*p = 3
+        |print(n)""".stripMargin
+
+    run(src) shouldBe "2\n3\n"
+  }
+
+  "a pointer to a pointer reaches through both levels" in {
+    val src =
+      """var n = 1
+        |var p = &n
+        |var pp = &p
+        |**pp = 5
+        |print(n, **pp)""".stripMargin
+
+    run(src) shouldBe "5 5\n"
+  }
+
+  "a function mutates its caller's variable through a pointer" in {
+    val src =
+      """bump(p: *int)
+        |    *p += 1
+        |var n = 41
+        |bump(&n)
+        |print(n)""".stripMargin
+
+    run(src) shouldBe "42\n"
+  }
+
+  "increment and compound assignment work through a dereference" in {
+    val src =
+      """var n = 10
+        |var p = &n
+        |*p += 5
+        |print(*p)
+        |print((*p)++)
+        |print(n)""".stripMargin
+
+    run(src) shouldBe "15\n15\n16\n"
+  }
+
+  "a field is selected through a pointer without writing the dereference" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |var pt = Point(3, 4)
+        |var p = &pt
+        |print(p.x, p.y)
+        |p.x = 30
+        |print(pt.x)""".stripMargin
+
+    run(src) shouldBe "3 4\n30\n"
+  }
+
+  "a pointer to a field addresses that field alone" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |var pt = Point(3, 4)
+        |var py = &pt.y
+        |*py = 40
+        |print(pt.x, pt.y)""".stripMargin
+
+    run(src) shouldBe "3 40\n"
+  }
+
+  "a struct may point at its own type" in {
+    val src =
+      """struct Node
+        |    value: int
+        |    next: *Node
+        |var c = Node(3, null)
+        |var b = Node(2, &c)
+        |var a = Node(1, &b)
+        |var walk = &a
+        |var sum = 0
+        |while walk != null do
+        |    sum += walk.value
+        |    walk = walk.next
+        |print(sum)""".stripMargin
+
+    run(src) shouldBe "6\n"
+  }
+
+  "a write reaches through two links of a list" in {
+    val src =
+      """struct Node
+        |    value: int
+        |    next: *Node
+        |var b = Node(2, null)
+        |var a = Node(1, &b)
+        |a.next.value = 20
+        |print(b.value)""".stripMargin
+
+    run(src) shouldBe "20\n"
+  }
+
+  "null compares equal to null and unequal to an address" in {
+    val src =
+      """var n = 1
+        |var p = &n
+        |var q: *int = null
+        |print(p == null, q == null, p != null)""".stripMargin
+
+    run(src) shouldBe "false true true\n"
+  }
+
+  "two pointers to the same variable compare equal" in {
+    val src =
+      """var n = 1
+        |var m = 1
+        |var p = &n
+        |var q = &n
+        |print(p == q, p == &m)""".stripMargin
+
+    run(src) shouldBe "true false\n"
+  }
+
+  "a pointer parameter of a generic function takes its argument's type" in {
+    val src =
+      """peek[T](p: *T) -> T = *p
+        |var n = 7
+        |var r = 1.5
+        |print(peek(&n), peek(&r))""".stripMargin
+
+    run(src) shouldBe "7 1.5\n"
+  }
+
+  "booleans compare for equality" in {
+    val src =
+      """var a = true
+        |var b = false
+        |print(a == a, a == b, a != b)""".stripMargin
+
+    run(src) shouldBe "true false true\n"
+  }
+}

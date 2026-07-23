@@ -91,7 +91,9 @@ fit within the target's capabilities.
 
 **Requires `alloc`** (heap-backed):
 
-- `&T` and `weak T` (ARC boxes, weak-tracking);
+- **creating** a `&T` or a `weak T` (ARC boxes, weak-tracking) — which is an ordinary
+  construction in a position expecting one (`03`), so this is the construction the type checker
+  rejects, not the type;
 - growable arrays (append / realloc);
 - boxed trait objects `&Trait`;
 - **escaping** closures (a closure that outlives its scope is heap-boxed, as in Swift — but

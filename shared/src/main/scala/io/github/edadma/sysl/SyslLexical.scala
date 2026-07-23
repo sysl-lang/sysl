@@ -63,6 +63,7 @@ class SyslLexical
   reserved ++= List(
     "true",
     "false",
+    "null",
     "var",
     "if",
     "then",
