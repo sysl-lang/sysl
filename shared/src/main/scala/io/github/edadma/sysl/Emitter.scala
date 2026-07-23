@@ -17,6 +17,11 @@ trait Emitter {
   protected var charBuf  = false
   protected var traps    = false
 
+  /** LLVM intrinsic `declare` lines the module turned out to need — the saturating
+   * float-to-integer casts, each declared once under its overload-mangled name.
+   */
+  protected val satDecls = mutable.LinkedHashSet.empty[String]
+
   /** Box layouts to declare, keyed by their LLVM name and held in the order they were first
    * needed — a box's payload type is always declared before it.
    */

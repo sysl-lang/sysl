@@ -76,8 +76,14 @@ before they appear and may be mutually recursive).
   suffix or from the context it appears in (`01` §Literals), and a value that does not fit
   is rejected.
 - **Conversions** are written with call syntax — `u32(c)`, `byte(n)`, `real(n)`, `int(x)` —
-  and lower to one LLVM cast each. The single partial one, `char(u)`, tests the value at 64
-  bits and traps when it is not a Unicode scalar value.
+  and lower to one LLVM cast each, with two conversions that need more than a bare instruction.
+  Float-to-integer (`int(f)`, `u32(f)`, …) goes through the saturating intrinsics
+  `llvm.fptosi.sat` / `llvm.fptoui.sat`: a plain `fptosi`/`fptoui` is poison when the source is
+  out of the target's range or is NaN, and what the hardware then does differs by target, so the
+  same program would print different numbers on different machines. Saturation pins it down
+  everywhere — out of range clamps to the type's minimum or maximum, NaN becomes zero — which
+  keeps `int()` total (it never traps) and matches Rust's `as`. The one *trapping* conversion is
+  `char(u)`, which tests the value at 64 bits and traps when it is not a Unicode scalar value.
 - **Raw pointers.** `*T` in any type position, `&place` to take an address, `*p` to read
   through one, and `null` — which takes its `*T` from context the way a numeric literal takes
   its width. A **place** (a local, a dereference, a field of either) is what `&` takes, what

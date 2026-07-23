@@ -99,7 +99,7 @@ trait ScalarEmitter extends StringEmitter {
       else castOp(if a.signed then "sext" else "zext", a, b, v)
 
     case (a: Type.Integer, b: Type.Floating)  => castOp(if a.signed then "sitofp" else "uitofp", a, b, v)
-    case (a: Type.Floating, b: Type.Integer)  => castOp(if b.signed then "fptosi" else "fptoui", a, b, v)
+    case (a: Type.Floating, b: Type.Integer)  => saturatingCast(a, b, v)
     case (a: Type.Floating, b: Type.Floating) => castOp(if b.bits > a.bits then "fpext" else "fptrunc", a, b, v)
 
     case (Type.Char, b: Type.Integer) => convert(Type.Integer(32, signed = false), b, v)
@@ -109,6 +109,21 @@ trait ScalarEmitter extends StringEmitter {
 
   private def castOp(instr: String, from: Type, to: Type, v: String): String = {
     val r = freshTemp(); emit(s"$r = $instr ${from.llvm} $v to ${to.llvm}"); r
+  }
+
+  /** Float-to-integer, saturating. A plain `fptosi`/`fptoui` is poison when the source is out of
+   * the target's range or is NaN, and what the hardware then does differs by target — so the same
+   * program would print different numbers on different machines. The `llvm.fpto{s,u}i.sat`
+   * intrinsics pin it down everywhere: out of range clamps to the type's minimum or maximum, and
+   * NaN becomes zero. `int()` stays total; `char()` remains the one conversion that traps.
+   */
+  private def saturatingCast(from: Type.Floating, to: Type.Integer, v: String): String = {
+    val op   = if to.signed then "fptosi.sat" else "fptoui.sat"
+    val name = s"llvm.$op.${to.llvm}.f${from.bits}"
+    satDecls += s"declare ${to.llvm} @$name(${from.llvm})"
+    val r = freshTemp()
+    emit(s"$r = call ${to.llvm} @$name(${from.llvm} $v)")
+    r
   }
 
   /** `char(u)` — a checked conversion. A Unicode scalar value is at most `0x10FFFF` and never

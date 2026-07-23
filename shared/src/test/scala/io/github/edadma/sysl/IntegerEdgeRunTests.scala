@@ -63,4 +63,40 @@ class IntegerEdgeRunTests extends AnyFreeSpec with RunSupport {
         |print(s < 0, s > 0, u > 128, u < 128)""".stripMargin
     ) shouldBe "true false true false\n"
   }
+
+  // Float-to-int saturates: a value past the target's range clamps to its maximum or minimum
+  // rather than wrapping or giving a target-dependent poison value. Tested just over i32's ends
+  // and well past them.
+  "a float past an integer's range saturates to its maximum or minimum" in {
+    run(
+      """var hi = 1.0e30
+        |var lo = -1.0e30
+        |var edge = 2147483648.0
+        |print(int(hi), int(lo), int(edge))""".stripMargin
+    ) shouldBe "2147483647 -2147483648 2147483647\n"
+  }
+
+  // A negative float converted to an unsigned type saturates to zero, at every unsigned width,
+  // rather than wrapping to a huge value.
+  "a negative float saturates to zero when the target is unsigned" in {
+    run(
+      """var neg = -5.0
+        |print(u8(neg), u16(neg), u32(neg))""".stripMargin
+    ) shouldBe "0 0 0\n"
+  }
+
+  // NaN has no integer value, so the saturating conversion defines it as zero — for both a signed
+  // and an unsigned target.
+  "NaN converts to zero" in {
+    run(
+      """var z = 0.0
+        |var nan = z / z
+        |print(int(nan), u32(nan))""".stripMargin
+    ) shouldBe "0 0\n"
+  }
+
+  // In-range float-to-int is unaffected: it still truncates toward zero for both signs.
+  "an in-range float still truncates toward zero" in {
+    run("print(int(2.9), int(-2.9), int(0.9), int(-0.9))") shouldBe "2 -2 0 0\n"
+  }
 }

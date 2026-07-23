@@ -38,7 +38,20 @@ class ScalarCodegenTests extends AnyFreeSpec with CodegenSupport {
     "between integer and float" in {
       ir("var n: int = 9\nprint(real(n))") should include("sitofp i32")
       ir("var n: uint = 9\nprint(real(n))") should include("uitofp i32")
-      ir("print(int(1.5))") should include("fptosi double")
+    }
+
+    // Float-to-integer saturates through the LLVM intrinsic (defined on every target), rather
+    // than a bare fptosi/fptoui whose out-of-range result is poison. Each is declared once and
+    // called; the target's signedness picks fptosi.sat vs fptoui.sat.
+    "float to integer uses the saturating intrinsic, not a bare cast" in {
+      val signed = ir("print(int(1.5))")
+      signed should include("declare i32 @llvm.fptosi.sat.i32.f64(double)")
+      signed should include("call i32 @llvm.fptosi.sat.i32.f64(double")
+      signed should not include "fptosi double"
+
+      val unsigned = ir("print(u8(1.5))")
+      unsigned should include("declare i8 @llvm.fptoui.sat.i8.f64(double)")
+      unsigned should include("call i8 @llvm.fptoui.sat.i8.f64(double")
     }
 
     "a checked char conversion traps on a value that is not a scalar value" in {

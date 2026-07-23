@@ -28,6 +28,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     if heap then
       out ++= "declare ptr @malloc(i64)\n"
       out ++= "declare void @free(ptr)\n"
+    for d <- satDecls do out ++= d + "\n"
     out ++= "\n"
 
     for s <- program.structs do
