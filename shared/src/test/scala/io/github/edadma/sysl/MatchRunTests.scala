@@ -2,17 +2,17 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Tier-2 runtime behavior of `match`: literal, comma-alternative, range, and wildcard
+/** Tier-2 runtime behavior of `match`: literal, `|`-alternative, range, and wildcard
  * patterns; guards; and use both as a value and as a statement.
  */
 class MatchRunTests extends AnyFreeSpec with RunSupport {
 
-  "literal, comma, range, and else arms" in {
+  "literal, alternative, range, and else arms" in {
     val src =
       """classify(n: int) -> string
         |    match n
         |        0 -> "zero"
-        |        1, 2, 3 -> "small"
+        |        1 | 2 | 3 -> "small"
         |        4..10 -> "medium"
         |        else -> "large"
         |print(classify(0), classify(2), classify(7), classify(99))""".stripMargin

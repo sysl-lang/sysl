@@ -33,8 +33,9 @@ appear and may be mutually recursive).
 - **`if` and `match` are expressions.** They yield the value of the taken branch/arm, so
   `var label = if c then a else b` and `f() -> T = match x …` both work; in statement position
   the value is simply unused and no `else`/catch-all is required. A `match` *used as a value*
-  must be exhaustive (have an `else`). Patterns are literals, comma-alternatives, literal
-  ranges (`1..10`, `0..<10`), and the `_` wildcard, with optional `if` guards.
+  must be exhaustive (have an `else`). Patterns are literals, `|`-alternatives (Scala-style —
+  `1 | 2 | 3`), literal ranges (`1..10`, `0..<10`), and the `_` wildcard, with optional `if`
+  guards.
 - **Functions** are keyword-less, Scala-style: `name(params) -> ret = expr` or an indented
   block whose trailing expression is the implicit return value. A missing `-> ret` means
   `unit`. A block-bodied function may also `return` early.

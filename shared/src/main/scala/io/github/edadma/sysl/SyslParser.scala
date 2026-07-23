@@ -262,7 +262,7 @@ class SyslParser extends PackratParsers {
 
   private lazy val matchArm: Parser[MatchArm] =
     op("else") ~> (op("->") ~> (suite | inlineBody)) ^^ (b => MatchArm(List(WildcardPattern), None, b)) |
-      repsep(pattern, op(",")) ~ opt(op("if") ~> expression) ~ (op("->") ~> (suite | inlineBody)) ^^ {
+      rep1sep(pattern, op("|")) ~ opt(op("if") ~> expression) ~ (op("->") ~> (suite | inlineBody)) ^^ {
         case pats ~ guard ~ b => MatchArm(pats, guard, b)
       }
 
