@@ -345,7 +345,10 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       emit(s"$res = ${if op == "&&" then "and" else "or"} i1 $lv, $rv"); res
 
     case TCompare(operands, ops) =>
-      val cmps = ops.indices.map(i => compareOne(ops(i), operands(i), operands(i + 1))).toList
+      // Each operand is evaluated exactly once — a chained comparison such as `1 < f() < 10` must
+      // not run its middle operand twice — then adjacent values are compared and the results ANDed.
+      val vals = operands.map(o => (o.ty, genExpr(o)))
+      val cmps = ops.indices.map(i => compareValue(ops(i), vals(i)._1, vals(i)._2, vals(i + 1)._2)).toList
       cmps.reduce { (a, b) => val r = freshTemp(); emit(s"$r = and i1 $a, $b"); r }
 
     case TPrint(args) =>

@@ -45,9 +45,6 @@ trait ScalarEmitter extends StringEmitter {
     val r = freshTemp(); emit(s"$r = $instr ${ty.llvm} $lv, $rv"); r
   }
 
-  protected def compareOne(op: String, a: TExpr, b: TExpr): String =
-    compareValue(op, a.ty, genExpr(a), genExpr(b))
-
   /** The `icmp` / `fcmp` predicate for an operator at a type. `char` compares by scalar
    * value, so it uses the unsigned predicates over its `i32` representation.
    */

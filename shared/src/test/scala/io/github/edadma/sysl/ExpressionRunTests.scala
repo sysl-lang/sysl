@@ -70,6 +70,19 @@ class ExpressionRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "true false true\n"
   }
 
+  // Regression: the middle operand of a chain used to be emitted for both the left and the right
+  // comparison, so a side-effecting one ran twice. It must be evaluated exactly once.
+  "a chained comparison evaluates each operand exactly once" in {
+    val src =
+      """tick(n: int) -> int
+        |    print("tick")
+        |    n
+        |end tick
+        |print(1 < tick(5) < 10)""".stripMargin
+
+    run(src) shouldBe "tick\ntrue\n"
+  }
+
   "compound assignment operators update in place" in {
     val src =
       """var x = 10
