@@ -1,34 +1,9 @@
 package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
-import org.scalatest.matchers.should.Matchers
 
-/** Tier-2: compile a program all the way to a native binary, run it, and check its output.
- * These need an LLVM toolchain, so each test cancels cleanly when `clang` is absent.
- */
-class RunTests extends AnyFreeSpec with Matchers {
-
-  private def run(src: String): String = {
-    assume(Toolchain.clangAvailable, "clang not available")
-
-    Toolchain.compileAndRun(src) match {
-      case Right((0, out)) => out
-      case Right((code, out)) => fail(s"program exited with $code:\n$out")
-      case Left(err)          => fail(err)
-    }
-  }
-
-  "hello world prints a string" in {
-    run("print(\"Hello, sysl!\")") shouldBe "Hello, sysl!\n"
-  }
-
-  "arithmetic evaluates correctly" in {
-    run("print(6 * 7)") shouldBe "42\n"
-  }
-
-  "arguments are space-separated" in {
-    run("print(\"answer\", 42)") shouldBe "answer 42\n"
-  }
+/** Tier-2 runtime behavior of control flow: loops, branches, elif chains, inline forms. */
+class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
 
   "a while loop sums 1..10" in {
     val src =
@@ -51,18 +26,6 @@ class RunTests extends AnyFreeSpec with Matchers {
         |    print("odd")""".stripMargin
 
     run(src) shouldBe "odd\n"
-  }
-
-  "floats print and compute" in {
-    run("print(1.5 + 2.5)") shouldBe "4\n"
-  }
-
-  "booleans print as words" in {
-    run("print(1 < 2 && 2 < 3)") shouldBe "true\n"
-  }
-
-  "a chained comparison a < b < c" in {
-    run("var x = 5\nprint(1 < x < 10, 1 < x < 3, 1 <= x < 10)") shouldBe "true false true\n"
   }
 
   "an elif chain picks the matching branch" in {
