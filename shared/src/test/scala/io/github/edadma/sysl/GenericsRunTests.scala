@@ -51,6 +51,37 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport {
           |""".stripMargin) shouldBe "9\n"
   }
 
+  "a generic struct nested three deep" in {
+    run("""struct Box[T]
+          |    value: T
+          |end Box
+          |var d = Box(Box(Box(7)))
+          |print(d.value.value.value)
+          |""".stripMargin) shouldBe "7\n"
+  }
+
+  "nested generic enums destructure through both layers" in {
+    run("""var x: Option[Result[int, string]] = Some(Ok(99))
+          |var y: Result[Option[int], string] = Ok(Some(5))
+          |var a = match x
+          |    Some(Ok(n)) -> n
+          |    else -> -1
+          |var b = match y
+          |    Ok(Some(n)) -> n
+          |    else -> -1
+          |print(a, b)
+          |""".stripMargin) shouldBe "99 5\n"
+  }
+
+  "a generic function inferred through a generic construction" in {
+    run("""id[T](x: T) -> T = x
+          |struct Box[T]
+          |    value: T
+          |end Box
+          |print(id(Box(id(5))).value)
+          |""".stripMargin) shouldBe "5\n"
+  }
+
   "a generic enum destructured in a match" in {
     run("""enum Maybe[T]
           |    Just(value: T)

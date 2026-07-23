@@ -49,6 +49,27 @@ class RecursiveTeardownRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "199999\n"
   }
 
+  // A monomorphized generic recursive type tears down through the same iterative reaper — its
+  // drop hook is generated per instantiation, so this checks Stack[int]'s hook releases the
+  // `rest: Option[&Stack[int]]` field iteratively too.
+  "a generic recursive type tears down without overflowing the stack" in {
+    val src =
+      """struct Stack[T]
+        |    top: T
+        |    rest: Option[&Stack[T]]
+        |build(n: int) -> &Stack[int]
+        |    var s: &Stack[int] = Stack(0, None)
+        |    var i = 1
+        |    while i < n
+        |        s = Stack(i, Some(s))
+        |        i++
+        |    s
+        |var list = build(200000)
+        |print(list.top)""".stripMargin
+
+    run(src) shouldBe "199999\n"
+  }
+
   // A shared node (a diamond) must be freed exactly once. Dropped 100_000 times, a double-free
   // would crash and a leak would grow memory; the total confirms every build ran.
   "a shared node in a diamond is freed exactly once" in {
