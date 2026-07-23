@@ -17,15 +17,19 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "55\n"
   }
 
+  // Called with both an even and an odd input, so an "always take one branch" miscompile can't
+  // pass by coincidence the way a single input would.
   "if/else picks the right branch" in {
     val src =
-      """var n = 7
-        |if n % 2 == 0
-        |    print("even")
-        |else
-        |    print("odd")""".stripMargin
+      """parity(n: int) -> string
+        |    if n % 2 == 0
+        |        "even"
+        |    else
+        |        "odd"
+        |end parity
+        |print(parity(4), parity(7))""".stripMargin
 
-    run(src) shouldBe "odd\n"
+    run(src) shouldBe "even odd\n"
   }
 
   "an elif chain picks the matching branch" in {

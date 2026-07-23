@@ -19,6 +19,28 @@ class ExpressionRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "42\n"
   }
 
+  // Asymmetric operands so an operand-order or wrong-instruction bug shows: a - b and b - a
+  // differ, a / b is not b / a, and each shift and bitwise op has a distinct result.
+  "every binary operator, with order-sensitive operands" in {
+    val src =
+      """var a = 20
+        |var b = 6
+        |print(a + b, a - b, b - a, a * b, a / b, a % b, a << 1, a >> 1, a & b, a | b, a ^ b)""".stripMargin
+
+    run(src) shouldBe "26 14 -14 120 3 2 40 10 4 22 18\n"
+  }
+
+  // Each comparison must yield both outcomes across the row, so an always-true or always-false
+  // miscompile of any one of them changes the printed string.
+  "every comparison operator, both outcomes" in {
+    val src =
+      """var a = 3
+        |var b = 7
+        |print(a < b, a > b, a <= b, a >= b, a == b, a != b, b >= b, b == b)""".stripMargin
+
+    run(src) shouldBe "true false true false false true true true\n"
+  }
+
   "arguments are space-separated" in {
     val src =
       """print("answer", 42)""".stripMargin
