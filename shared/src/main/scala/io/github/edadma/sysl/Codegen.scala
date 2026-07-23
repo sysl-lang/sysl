@@ -340,9 +340,27 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     case TUnary(op, _, _) =>
       sys.error(s"unreachable unary '$op'")
 
+    // Short-circuit: `&&` evaluates its right side only when the left is true, `||` only when the
+    // left is false — so a guard like `p != null && *p > 0` never runs the unsafe right side. The
+    // result defaults to the left value and is overwritten by the right only when it is reached.
     case TLogical(op, l, r) =>
-      val lv = genExpr(l); val rv = genExpr(r); val res = freshTemp()
-      emit(s"$res = ${if op == "&&" then "and" else "or"} i1 $lv, $rv"); res
+      val lv   = genExpr(l)
+      val slot = emitAlloca(freshTemp(), "i1")
+      emit(s"store i1 $lv, ptr $slot")
+      val rhsL = freshLabel("sc.rhs")
+      val endL = freshLabel("sc.end")
+      if op == "&&" then emitTerm(s"br i1 $lv, label %$rhsL, label %$endL")
+      else emitTerm(s"br i1 $lv, label %$endL, label %$rhsL")
+      emitLabel(rhsL)
+      // The right side gets its own temp region: anything it allocates is released before the
+      // merge, and if the branch is skipped that code never runs at all.
+      pushTemps()
+      val rv = genExpr(r)
+      emit(s"store i1 $rv, ptr $slot")
+      popTemps()
+      emitTerm(s"br label %$endL")
+      emitLabel(endL)
+      val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
 
     case TCompare(operands, ops) =>
       // Each operand is evaluated exactly once — a chained comparison such as `1 < f() < 10` must

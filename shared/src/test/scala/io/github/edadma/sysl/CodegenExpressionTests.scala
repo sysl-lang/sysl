@@ -25,11 +25,15 @@ class CodegenExpressionTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "comparison chains" - {
-    "an explicit && of comparisons lowers to two anded icmps" in {
+    "an explicit && short-circuits its right side behind a branch" in {
       val out = ir("print(1 < 2 && 2 < 3)")
 
+      // Still two comparisons, but the right one sits in a conditionally-entered block rather than
+      // being eagerly `and`ed with the left.
       (out.split("icmp").length - 1) shouldBe 2
-      out should include("and i1")
+      out should include("sc.rhs")
+      out should include("sc.end")
+      out should not include "and i1"
     }
 
     "a chained comparison a < b < c becomes two anded icmps" in {

@@ -209,8 +209,12 @@ arity.
 7. **`print` is a printf shim** — the stand-in for the eventual `std` I/O surface, not a
    committed language builtin.
 8. **Chained comparisons `and` their pairs eagerly.** `a < b < c` lowers to `(a<b) and (b<c)`,
-   evaluating the shared middle operand once per pair and not short-circuiting, which `01` says
-   it should. Bind operands to a temp and short-circuit once that matters.
+   evaluating each operand exactly once but ANDing the pairs without short-circuiting the *chain* —
+   so a side-effecting later operand still runs when an earlier pair is already false, which `01`'s
+   "short-circuiting" does not intend. `&&` and `||` themselves now short-circuit (the right side is
+   a conditionally-entered block), so a guard like `p != null && *p > 0` never runs its unsafe side;
+   carrying that into the chain means evaluating its operands lazily, which the owned-operand
+   (string) case makes fiddly, so it waits.
 9. **`for` iterates a range, an array, or a slice.** `downTo`, `step`, and `reverse` are not
    yet lowered, and nothing else is iterable — there is no iterator protocol, which is also why
    a string is iterated as `s.bytes` and has no `s.chars` yet.

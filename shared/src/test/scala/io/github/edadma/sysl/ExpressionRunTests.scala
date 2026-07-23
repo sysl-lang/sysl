@@ -62,6 +62,33 @@ class ExpressionRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "true\n"
   }
 
+  // && evaluates the right side only when the left is true, || only when the left is false, so a
+  // side-effecting right side runs exactly when it should — never on the decided-left path.
+  "&& and || short-circuit their right side" in {
+    val src =
+      """loud(b: bool) -> bool
+        |    print("run")
+        |    b
+        |end loud
+        |print(false && loud(true))
+        |print(true || loud(false))
+        |print(true && loud(false))
+        |print(false || loud(true))""".stripMargin
+
+    run(src) shouldBe "false\ntrue\nrun\nfalse\nrun\ntrue\n"
+  }
+
+  // The point of short-circuit: the left side is a guard that keeps the right side from running an
+  // unsafe operation. Without it, guarded(null) would dereference a null pointer.
+  "a short-circuited guard protects the unsafe right side" in {
+    val src =
+      """guarded(p: *int) -> bool = p != null && *p > 0
+        |var n = 5
+        |print(guarded(&n), guarded(null))""".stripMargin
+
+    run(src) shouldBe "true false\n"
+  }
+
   "a chained comparison a < b < c" in {
     val src =
       """var x = 5
