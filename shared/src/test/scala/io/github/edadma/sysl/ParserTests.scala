@@ -158,6 +158,67 @@ class ParserTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "control-flow bodies (Scala-style then/do)" - {
+    "a while with `do` before an indented block" in {
+      prog("while i <= 10 do\n    i++") shouldBe List(
+        While(
+          Compare(List(Ident("i"), i(10)), List("<=")),
+          List(ExprStmt(PostIncDec("++", Ident("i")))),
+        )
+      )
+    }
+
+    "`do` is optional before an indented block" in {
+      prog("while c\n    print(1)") shouldBe prog("while c do\n    print(1)")
+    }
+
+    "a one-line while body needs `do`" in {
+      prog("while i < 3 do i++") shouldBe List(
+        While(
+          Compare(List(Ident("i"), i(3)), List("<")),
+          List(ExprStmt(PostIncDec("++", Ident("i")))),
+        )
+      )
+    }
+
+    "an inline if/then/else" in {
+      prog("if x then print(1) else print(2)") shouldBe List(
+        If(
+          Ident("x"),
+          List(ExprStmt(Call(Ident("print"), List(i(1))))),
+          List(ExprStmt(Call(Ident("print"), List(i(2))))),
+        )
+      )
+    }
+
+    "an inline if with no else" in {
+      prog("if x then print(1)") shouldBe List(
+        If(Ident("x"), List(ExprStmt(Call(Ident("print"), List(i(1))))), Nil)
+      )
+    }
+
+    "`then` is optional before an indented block" in {
+      prog("if x\n    print(1)") shouldBe prog("if x then\n    print(1)")
+    }
+
+    "a block `then` with an inline `else`, and vice versa, both parse" in {
+      prog("if x then\n    print(1)\nelse print(2)") shouldBe List(
+        If(
+          Ident("x"),
+          List(ExprStmt(Call(Ident("print"), List(i(1))))),
+          List(ExprStmt(Call(Ident("print"), List(i(2))))),
+        )
+      )
+    }
+
+    "an inline body still ends at a following statement" in {
+      prog("while c do print(1)\nprint(2)") shouldBe List(
+        While(Ident("c"), List(ExprStmt(Call(Ident("print"), List(i(1)))))),
+        ExprStmt(Call(Ident("print"), List(i(2)))),
+      )
+    }
+  }
+
   "a parse error reports a location" in {
     SyslParser.parse("var = 5") match {
       case Left(msg) => msg should include("parse error")

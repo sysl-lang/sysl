@@ -61,6 +61,14 @@ class RunTests extends AnyFreeSpec with Matchers {
     run("print(1 < 2 && 2 < 3)") shouldBe "true\n"
   }
 
+  "an inline while body with `do`" in {
+    run("var i = 0\nwhile i < 3 do i++\nprint(i)") shouldBe "3\n"
+  }
+
+  "an inline if/then/else" in {
+    run("if 1 < 2 then print(\"yes\") else print(\"no\")") shouldBe "yes\n"
+  }
+
   "a factorial loop" in {
     val src =
       """var n = 5

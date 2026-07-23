@@ -166,13 +166,29 @@ class SyslParser extends PackratParsers {
   private lazy val suite: PackratParser[List[Stmt]] =
     newline ~> indent ~> statements <~ dedent
 
+  /** A single statement written on the same line as its control-flow keyword. */
+  private lazy val inlineBody: PackratParser[List[Stmt]] = statement ^^ (s => List(s))
+
+  /** The body of a control-flow construct, Scala-style: the introducer keyword (`then` /
+   * `do`) is required for a one-line body but optional before an indented block, since a
+   * following `Newline`+`Indent` already marks the block unambiguously.
+   */
+  private def body(keyword: String): Parser[List[Stmt]] =
+    op(keyword) ~> (suite | inlineBody) | suite
+
   private lazy val ifStmt: PackratParser[Stmt] =
-    op("if") ~> expression ~ suite ~ opt(newlines ~> op("else") ~> suite) ^^ {
+    op("if") ~> expression ~ body("then") ~ opt(elseClause) ^^ {
       case c ~ t ~ e => If(c, t, e.getOrElse(Nil))
     }
 
+  /** `else` sits on a fresh line after a block body, or on the same line after an inline
+   * one — so any intervening `Newline` is optional.
+   */
+  private lazy val elseClause: Parser[List[Stmt]] =
+    opt(newlines) ~> op("else") ~> (suite | inlineBody)
+
   private lazy val whileStmt: PackratParser[Stmt] =
-    op("while") ~> expression ~ suite ^^ { case c ~ b => While(c, b) }
+    op("while") ~> expression ~ body("do") ^^ { case c ~ b => While(c, b) }
 
   private lazy val statements: PackratParser[List[Stmt]] =
     opt(newlines) ~> repsep(statement, newlines) <~ opt(newlines)

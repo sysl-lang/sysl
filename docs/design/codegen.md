@@ -9,9 +9,10 @@ be unwound deliberately rather than discovered later.
 A program is a sequence of statements that becomes the body of `main`. Supported:
 
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
-  compound assignment), `if`/`else`, `while`. Blocks are indentation-delimited — the condition
-  line is followed by an indented suite; there is no `then`/`do` keyword yet (that block-opener
-  decision is still open in `00 §Open`).
+  compound assignment), `if`/`else`, `while`. Bodies follow Scala-3 style: `if cond then …`
+  and `while cond do …`, where the introducer keyword (`then`/`do`) is **required for a
+  one-line body** and **optional before an indented block** (a following `Newline`+`Indent`
+  already marks the block). `else` likewise takes an inline statement or an indented block.
 - **Expressions:** the full settled precedence grammar (`01`), over `int` (i32), `real` (f64),
   `bool`, and string literals. `++`/`--`, unary `-`/`!`/`~`, chained comparison.
 - **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed
