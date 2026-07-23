@@ -95,7 +95,10 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     out should include("%o = atomicrmw add ptr %p, i64 1 monotonic")
     out should include("atomicrmw sub ptr %p, i64 1 release")
-    out should include regex raw"drop:\n  fence acquire"
+    // On the zero transition the atomic path fences, then hands the object to the iterative reaper
+    // rather than recursing into its destructor.
+    out should include regex raw"reap:\n  fence acquire"
+    out should include("call void @arc.reap(ptr %p)")
   }
 
   "the two reference modes share one box layout, since atomicity belongs to the reference" in {

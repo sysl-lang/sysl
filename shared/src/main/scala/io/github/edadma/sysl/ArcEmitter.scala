@@ -251,9 +251,21 @@ object ArcEmitter {
    * The `_maybe` pair is for views — slices and strings — whose owner is null when the elements
    * are static, on a frame, or reached through a `*T`; the plain pair stays branch-free, since a
    * reference is non-null by construction.
+   *
+   * **Teardown is iterative, not recursive.** A destructor releases the references its payload
+   * holds, so a chain of `&T` — a linked list, a degenerate tree — would otherwise recurse one C
+   * stack frame per node and overflow the stack on a long one. Instead, when a count reaches zero
+   * the object is pushed onto a worklist (reusing its now-dead count slot as the link) and the
+   * *first* release to hit zero drains the list in a loop: each destructor it runs pushes more
+   * work rather than recursing, so teardown depth is O(1) regardless of structure depth. The
+   * worklist is a plain global, which is correct while drops are single-threaded; concurrent drops
+   * of `&sync` structures across threads will need it thread-local.
    */
   val core: String =
     """%arc.header = type { i64, ptr }
+      |
+      |@arc.worklist = internal global ptr null
+      |@arc.draining = internal global i1 false
       |
       |define private void @arc.retain(ptr %p) {
       |entry:
@@ -271,15 +283,41 @@ object ArcEmitter {
       |  ret void
       |}
       |
+      |define private void @arc.reap(ptr %p) {
+      |entry:
+      |  %w = load ptr, ptr @arc.worklist
+      |  store ptr %w, ptr %p
+      |  store ptr %p, ptr @arc.worklist
+      |  %d = load i1, ptr @arc.draining
+      |  br i1 %d, label %done, label %drain
+      |drain:
+      |  store i1 true, ptr @arc.draining
+      |  br label %loop
+      |loop:
+      |  %q = load ptr, ptr @arc.worklist
+      |  %e = icmp eq ptr %q, null
+      |  br i1 %e, label %finish, label %step
+      |step:
+      |  %next = load ptr, ptr %q
+      |  store ptr %next, ptr @arc.worklist
+      |  call void @arc.destroy(ptr %q)
+      |  br label %loop
+      |finish:
+      |  store i1 false, ptr @arc.draining
+      |  ret void
+      |done:
+      |  ret void
+      |}
+      |
       |define private void @arc.release(ptr %p) {
       |entry:
       |  %c = load i64, ptr %p
       |  %n = sub i64 %c, 1
       |  store i64 %n, ptr %p
       |  %z = icmp eq i64 %n, 0
-      |  br i1 %z, label %drop, label %live
-      |drop:
-      |  call void @arc.destroy(ptr %p)
+      |  br i1 %z, label %reap, label %live
+      |reap:
+      |  call void @arc.reap(ptr %p)
       |  ret void
       |live:
       |  ret void
@@ -305,10 +343,10 @@ object ArcEmitter {
       |entry:
       |  %o = atomicrmw sub ptr %p, i64 1 release
       |  %z = icmp eq i64 %o, 1
-      |  br i1 %z, label %drop, label %live
-      |drop:
+      |  br i1 %z, label %reap, label %live
+      |reap:
       |  fence acquire
-      |  call void @arc.destroy(ptr %p)
+      |  call void @arc.reap(ptr %p)
       |  ret void
       |live:
       |  ret void

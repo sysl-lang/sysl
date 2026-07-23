@@ -89,6 +89,14 @@ destroys it**, installed by whoever allocated it. Release decrements; at zero it
 the hook, which releases whatever the payload holds and then returns the storage to the heap
 the object came from.
 
+**Teardown is iterative, so depth is bounded.** A destructor releases the references its payload
+holds, so destroying the head of a long `&T` chain — a linked list, a degenerate tree — would
+recurse one stack frame per node and overflow the stack. It does not: when a count reaches zero
+the object is pushed onto a worklist, reusing its now-dead refcount slot as the link, and the
+*first* release to hit zero drains the worklist in a loop. Each destructor it runs pushes more
+work rather than recursing, so a structure of any depth comes apart in O(1) stack. The worklist
+is per-thread in principle; while drops are single-threaded a plain global suffices.
+
 Putting the destructor *behind* the hook rather than inline at each release site is what makes
 letting go of a reference **type-erased**: one instruction sequence, no static type. Slices
 need exactly that, since a `[]T` gives no clue what type of object its owner points at (`07`).
