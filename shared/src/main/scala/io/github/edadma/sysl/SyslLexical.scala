@@ -274,6 +274,8 @@ class SyslLexical
           case Left((msg, rest)) => Success(errorToken(msg), rest)
           case Right((cp, rest)) =>
             if (!rest.atEnd && rest.first == '\'') Success(CharLit(cp), rest.rest)
+            else if (rest.atEnd || rest.first == '\n')
+              Success(errorToken("unterminated character literal"), rest)
             else Success(errorToken("character literal must hold exactly one character"), rest)
         }
     }

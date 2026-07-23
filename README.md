@@ -40,6 +40,15 @@ sbt syslJVM/test        # run the test suite
 sbt syslJVM/run         # run the CLI
 ```
 
+To see the language run end to end — source, through the compiler, to a native binary:
+
+```bash
+./run-example.sh                     # examples/hello.sysl
+./run-example.sh examples/hello.sysl # or name one
+```
+
+That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with clang.
+
 The JS and Native cross-targets exist in the build but the JVM target is the working one during
 development.
 

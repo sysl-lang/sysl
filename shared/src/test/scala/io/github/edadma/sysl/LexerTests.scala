@@ -113,50 +113,13 @@ class LexerTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  "character literals" - {
-    "a plain character" in withLexer { l =>
-      l.bare("'a'") shouldBe List(l.CharLit('a'.toInt))
-    }
-
-    "escape sequences" in withLexer { l =>
-      l.bare("'\\n'") shouldBe List(l.CharLit('\n'.toInt))
-      l.bare("'\\t'") shouldBe List(l.CharLit('\t'.toInt))
-      l.bare("'\\\\'") shouldBe List(l.CharLit('\\'.toInt))
-      l.bare("'\\''") shouldBe List(l.CharLit('\''.toInt))
-    }
-
-    "a braced supplementary codepoint" in withLexer { l =>
-      l.bare("'\\u{1F600}'") shouldBe List(l.CharLit(0x1f600))
-    }
-
-    "a literal surrogate pair reads as one scalar value" in withLexer { l =>
-      val emoji = "'" + new String(Array('\uD83D', '\uDE00')) + "'"
-
-      l.bare(emoji) shouldBe List(l.CharLit(0x1f600))
-    }
-
-    "an empty character literal is an error" in withLexer { l =>
-      l.bare("''").head.toString should include("empty")
-    }
-
-    "a surrogate codepoint is not a scalar value" in withLexer { l =>
-      l.bare("'\\u{D800}'").head.toString should include("scalar value")
-    }
-  }
-
-  "string literals" - {
-    "a plain string" in withLexer { l =>
-      l.bare("\"hello\"") shouldBe List(l.StrLit("hello"))
-    }
-
-    "escapes inside a string" in withLexer { l =>
-      l.bare("\"a\\nb\"") shouldBe List(l.StrLit("a\nb"))
-      l.bare("\"\\u{1F600}\"") shouldBe List(l.StrLit(new String(Array('\uD83D', '\uDE00'))))
-    }
-
-    "an unterminated string is an error" in withLexer { l =>
-      l.bare("\"oops").head.toString should include("unterminated")
-    }
+  /** Character and string literals have their own suite — `StringLiteralTests` — because
+   * their edge cases (the escape table, `\u{…}`, surrogates, termination) outnumber the rest
+   * of the token grammar put together.
+   */
+  "quoted literals lex to their decoded value" in withLexer { l =>
+    l.bare("'a'") shouldBe List(l.CharLit('a'.toInt))
+    l.bare("\"hello\"") shouldBe List(l.StrLit("hello"))
   }
 
   "identifiers and reserved words" - {

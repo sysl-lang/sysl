@@ -52,7 +52,90 @@ Not an arbitrary-width family — only these four (`00` §6). `bfloat` deliberat
 | `string` | — | 16 | fat pointer `{ ptr: *u8, len: usize }` — UTF-8 bytes |
 
 `string`'s `len` is `usize`, so the fat pointer is 16 bytes on aarch64 and 8 bytes on a
-32-bit target — never hard-coded to 64-bit.
+32-bit target — never hard-coded to 64-bit. Because the length is carried, a NUL is an
+ordinary byte inside a `string`; nothing about the type is NUL-terminated.
+
+## Literals
+
+`00` §8 has the numeric literal rules (bases, separators, suffixes, defaults) and their
+rationale. The tables below complete them.
+
+### Which types a literal can take
+
+An unsuffixed numeric literal has no type of its own — it takes one from where it appears,
+and falls back to `int` (integer literal) or `real` (float literal) when nothing says
+otherwise. The positions that fix a literal's type are:
+
+| Position | Example | Literal becomes |
+|---|---|---|
+| declared type of a `var` | `var x: u8 = 42` | `u8` |
+| parameter type at a call | `f(42)` where `f(n: i16)` | `i16` |
+| field type at construction | `P(42)` where `x: byte` | `byte` |
+| the function's return type | `f() -> u16 = 42` | `u16` |
+| assignment target's type | `x = 42` | type of `x` |
+| the other operand of a binary operator | `n + 1` | type of `n` |
+| the scrutinee's type in a pattern | `match b` … `1..9 ->` | type of `b` |
+
+The operand rule is what keeps `n + 1` working for an `n` of any width without the literal
+needing a suffix. It applies only to a literal with no suffix of its own: `1u8 << 2` fixes
+both operands from the suffix, and a **suffixed literal never adapts**. Two literals with
+nothing else to go on both take the default, so `1 << 2` is `int`.
+
+This is not implicit promotion — the literal *is* that type from the start, and a value that
+does not fit it is an error asking for a wider one, never a silent wrap or widening.
+
+### Escape sequences
+
+The same table serves character and string literals.
+
+| Escape | Meaning |
+|---|---|
+| `\n` | line feed, U+000A |
+| `\t` | tab, U+0009 |
+| `\r` | carriage return, U+000D |
+| `\0` | NUL, U+0000 |
+| `\\` | backslash |
+| `\'` | single quote |
+| `\"` | double quote |
+| `\u{H…}` | one to six hex digits, any Unicode scalar value |
+
+`\u{…}` is braced rather than fixed-width because a codepoint needs up to six hex digits.
+Its value must be a Unicode scalar value: at most `0x10FFFF` and not a surrogate. Any other
+escape letter is an error — there is no "unknown escapes pass through" rule.
+
+### Character literals
+
+Single-quoted, exactly one Unicode scalar value: `'a'`, `'\n'`, `'é'`, `'\u{1F600}'`. Source
+text is decoded before the literal is formed, so a supplementary character written literally
+is one `char` however the host stores it, and an unpaired surrogate in the source is an
+error. A character literal may not span a line break.
+
+### String literals
+
+Double-quoted, UTF-8, the escape table above: `"héllo ☃"`. The value is a sequence of bytes
+with a known length, so an embedded `\0` is an ordinary byte rather than a terminator. A
+string literal may not span a line break, and `//` or `/*` inside one is ordinary text.
+Concatenation, interpolation, and raw/multi-line forms are not yet specified.
+
+## Conversions between scalar types
+
+Every conversion is written, with call syntax (`u32(c)`, `byte(0xFF)`, `real(n)`). None is
+inferred, and none is a no-op the reader cannot see — the visible-cost rule the memory model
+rests on applies to representation changes too.
+
+| From → to | Written | Behaviour |
+|---|---|---|
+| integer → integer | `u16(n)`, `byte(n)` | truncates or extends; sign-extends only when the *source* is signed |
+| integer → float | `real(n)`, `f32(n)` | rounds to nearest; signed and unsigned sources differ |
+| float → integer | `int(x)` | truncates toward zero |
+| float → float | `f32(x)`, `real(x)` | rounds to nearest |
+| `char` → integer | `u32(c)` | total — every `char` is an integer |
+| integer → `char` | `char(u)` | **partial** — traps on a value that is not a Unicode scalar value (`00` §1) |
+
+Everything else is rejected: there is no conversion to or from `bool` (`int(true)` is an
+error, and so is `bool(0)`), and none between a scalar and `string`. `usize` / `isize` are
+distinct types, so moving between them and a fixed-width integer of the same size is still
+written — on a target where the widths differ it is a real narrowing, which is exactly why.
 
 ## Operator precedence
 
@@ -96,6 +179,15 @@ Key points:
   "through" / "up to, less than." (`..` is exclusive in Rust but inclusive here, as in
   Kotlin.) Lexes unambiguously: a float literal requires digits after the `.`, so `1..2`
   tokenizes as `1 .. 2`.
+- **Both operands of a binary operator have the same type.** There is no implicit promotion,
+  so a mixed-width expression is an error asking for a conversion. This includes the **shift
+  amount**: `x << 2` takes its `2` from `x`'s type by the literal rule above, and shifting by
+  a value of a different type is written `x << u8(k)`.
+- **Arithmetic is defined on the numeric types only.** `char` has equality and ordering and
+  no arithmetic at all (`00` §1); `bool` has neither ordering nor arithmetic. Unary `-` needs
+  a type that has a sign, so it is defined on the signed integers and the floats — negating
+  an unsigned value is written as the subtraction it actually is. Unary `~` is defined on
+  every integer type, signed or not.
 - **Chained comparisons** (level 4): `a < b < c` means `a < b && b < c`, short-circuiting;
   comparisons do not associate as plain left/right.
 - **Assignment is an expression** (`00` §2): lowest precedence, right-associative

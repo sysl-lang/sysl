@@ -13,11 +13,22 @@ sealed trait TExpr {
   def ty: Type
 }
 
-case class TIntLit(value: BigInt, ty: Type)          extends TExpr
-case class TFloatLit(bits: String)                   extends TExpr { def ty: Type = Type.Real }
-case class TStrLit(value: String)                    extends TExpr { def ty: Type = Type.Str }
-case class TBoolLit(value: Boolean)                  extends TExpr { def ty: Type = Type.Bool }
-case class TUnitLit()                                extends TExpr { def ty: Type = Type.Unit }
+/** An integer, `char`, or simple-enum constant — anything whose value is one whole number. */
+case class TIntLit(value: BigInt, ty: Type) extends TExpr
+
+/** A floating-point constant, held as the bits of its `double` value. A narrower type is
+ * reached by rounding that constant down to it, which costs nothing at run time.
+ */
+case class TFloatLit(bits: String, ty: Type) extends TExpr
+
+case class TStrLit(value: String)   extends TExpr { def ty: Type = Type.Str  }
+case class TBoolLit(value: Boolean) extends TExpr { def ty: Type = Type.Bool }
+case class TUnitLit()               extends TExpr { def ty: Type = Type.Unit }
+
+/** An explicit scalar conversion, written with call syntax: `u32(c)`, `byte(n)`, `char(u)`.
+ * Every conversion between scalar types is written, never inferred.
+ */
+case class TCast(operand: TExpr, ty: Type) extends TExpr
 
 /** Reads a local variable (or parameter) by its unique name. */
 case class TLoad(name: String, ty: Type) extends TExpr
@@ -29,7 +40,7 @@ case class TStore(name: String, value: TExpr, ty: Type) extends TExpr
 case class TUpdate(name: String, op: String, value: TExpr, ty: Type) extends TExpr
 
 /** `++`/`--`, prefix (new value) or postfix (old value). */
-case class TIncDec(name: String, op: String, pre: Boolean) extends TExpr { def ty: Type = Type.Int }
+case class TIncDec(name: String, op: String, pre: Boolean, ty: Type) extends TExpr
 
 case class TBinary(op: String, left: TExpr, right: TExpr, ty: Type) extends TExpr
 case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExpr
@@ -124,7 +135,8 @@ sealed trait TStmt
 case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
 case class TWhile(cond: TExpr, body: List[TStmt])         extends TStmt
-case class TFor(name: String, lo: TExpr, hi: TExpr, inclusive: Boolean, body: List[TStmt]) extends TStmt
+/** `for name in lo..hi` — the loop variable has the integer type of its bounds. */
+case class TFor(name: String, ty: Type, lo: TExpr, hi: TExpr, inclusive: Boolean, body: List[TStmt]) extends TStmt
 case class TReturn(value: Option[TExpr])                  extends TStmt
 
 /** A user function. Parameters carry their unique names (the codegen allocates a slot for

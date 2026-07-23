@@ -100,7 +100,8 @@ right rather than something that falls out of a general `within`-constraint.
 
 ### Literals
 
-- Single-quoted, exactly one scalar value: `'a'`, `'\n'`, `'\t'`, `'\\'`, `'\''`.
+- Single-quoted, exactly one scalar value: `'a'`, `'\n'`, `'\t'`, `'\\'`, `'\''`. The
+  complete escape table is in `01`.
 - Braced hex escape for arbitrary codepoints: `'\u{1F600}'`. Braced (not fixed-width
   `\uXXXX`) because codepoints exceed four hex digits — `0x1F600` needs five.
 - A `char` literal has type `char` and does **not** implicitly coerce to `u32`. Otherwise

@@ -66,11 +66,23 @@ before they appear and may be mutually recursive).
   enums. The postfix `?` unwraps the success payload of one, or returns from the enclosing
   function early with the failure re-wrapped in *that* function's return type — so `?` needs
   the caller to return the same one, and to propagate the same error type.
-- **Expressions:** the full settled precedence grammar (`01`), over `int` (i32), `real` (f64),
-  `bool`, and string literals. `++`/`--`, unary `-`/`!`/`~`, chained comparison.
+- **Scalar types.** The integer family `iN` / `uN` for any width up to 64 bits, the
+  pointer-width `usize` / `isize`, the floats `f16` / `f32` / `f64`, `char`, `bool`, and the
+  friendly aliases (`int`, `byte`, `long`, `real`, …). Arithmetic wraps at the declared width
+  and never promotes; signedness selects between the division, remainder, and right-shift
+  instruction pairs, and between the comparison predicates. A literal takes its type from its
+  suffix or from the context it appears in (`01` §Literals), and a value that does not fit
+  is rejected.
+- **Conversions** are written with call syntax — `u32(c)`, `byte(n)`, `real(n)`, `int(x)` —
+  and lower to one LLVM cast each. The single partial one, `char(u)`, tests the value at 64
+  bits and traps when it is not a Unicode scalar value.
+- **Expressions:** the full settled precedence grammar (`01`) over the scalar types and
+  string literals. `++`/`--`, unary `-`/`!`/`~`, chained comparison.
 - **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed space-separated
-  followed by a newline, lowered to a single `printf`. `int`→`%d`, `real`→`%g`, string→`%s`,
-  `bool`→`%s` over `"true"`/`"false"`.
+  followed by a newline, lowered to a single `printf`. Integers widen to what varargs promote
+  to and print as `%d` / `%u` / `%lld` / `%llu`; floats widen to `double` and print as `%g`; a
+  `char` is encoded to UTF-8 in a stack buffer and printed as `%s`; strings are `%s`; `bool`
+  is `%s` over `"true"` / `"false"`.
 
 ## IR dialect (locked against the dev toolchain)
 
@@ -91,42 +103,49 @@ arity.
 
 ## Deliberate shortcuts (unwind these as the language grows)
 
-1. **`int` is hard-lowered to i32 and `real` to f64.** Literal suffixes are parsed but not yet
-   honoured; the arbitrary-width `iN`/`uN` family, the floats other than `f64`, and
-   `usize`/`isize` are not lowered. `char` and byte-level types are not yet present.
-2. **All locals are `alloca`.** Every `var`, parameter, and loop variable gets a stack slot;
-   reads `load`, writes `store`. Lexical scopes are real (a shadowing name is renamed to a
-   unique register within its function), but there is no SSA/`phi` construction — `if`/`match`
-   values route through a stack slot.
-3. **Functions are keyword-less with mandatory `(params)`.** Parameterless functions
+1. **The scalar table stops short of its widest members.** An integer wider than 64 bits and
+   `f128` are diagnosed rather than lowered: printing them portably needs a runtime this
+   stage does not have (`long double` is 64-bit on the arm64 Apple ABI, so `fp128` cannot go
+   through `printf`). `usize` / `isize` are fixed at 64 bits by a constant rather than by a
+   target description. A narrower float constant is emitted as the `double` constant rounded
+   down to it, which is correctly rounded except in the rare double-rounding case.
+2. **`string` is a bare pointer, not the fat pointer it is specified as.** A literal interns
+   as NUL-terminated bytes and passes to `printf` as a `ptr`, so an embedded `\0` truncates
+   it — the one place the implementation contradicts `01` rather than merely lagging it.
+   There is no `.len`, no runtime string value, and no concatenation.
+3. **All locals are `alloca`.** Every `var`, parameter, and loop variable gets a stack slot;
+   reads `load`, writes `store`. Slots are hoisted into the entry block (names are unique per
+   function, so one inside a loop does not grow the stack per iteration), but there is no
+   SSA/`phi` construction — `if`/`match` values route through a stack slot.
+4. **Functions are keyword-less with mandatory `(params)`.** Parameterless functions
    (`name -> T`), inner `def`, default arguments, and the pure/effect (`def` vs plain)
    distinction are all deferred. The keyword-less form is disambiguated from a call by the
    typed parameter list and a following body.
-4. **Value structs and enums only.** No `new`/heap allocation, no refs (`&T`) or the
+5. **Value structs and enums only.** No `new`/heap allocation, no refs (`&T`) or the
    ref-counted path, no recursive types, no nested-lvalue field assignment (`a.b.c = v`), and
    no methods. A data enum reserves storage for *every* variant's payload at once (a value
    aggregate, no size arithmetic), which is wasteful but needs no heap; a type that contains
    itself has no finite size and is rejected outright, which is what makes recursive enums
    (`Add(Expr, Expr)`) wait on references.
-5. **Enum-match exhaustiveness ignores nested coverage.** An unguarded arm covers its variant
+6. **Enum-match exhaustiveness ignores nested coverage.** An unguarded arm covers its variant
    only when every sub-pattern is irrefutable (a binding or `_`); an arm with a nested variant
    or literal sub-pattern does not count, so `Wrap(A) | Wrap(B)` covering `Wrap(Inner)` still
    needs an `else`. Guard expressions are evaluated after the pattern matches and its bindings
    are in scope.
-6. **`print` is a printf shim** — the stand-in for the eventual `std` I/O surface, not a
+7. **`print` is a printf shim** — the stand-in for the eventual `std` I/O surface, not a
    committed language builtin.
-7. **Chained comparisons `and` their pairs eagerly.** `a < b < c` lowers to `(a<b) and (b<c)`,
+8. **Chained comparisons `and` their pairs eagerly.** `a < b < c` lowers to `(a<b) and (b<c)`,
    evaluating the shared middle operand once per pair and not short-circuiting, which `01` says
    it should. Bind operands to a temp and short-circuit once that matters.
-8. **`for` iterates an integer range only.** Array/slice iteration, `downTo`, `step`, and
+9. **`for` iterates an integer range only.** Array/slice iteration, `downTo`, `step`, and
    `reverse` are not yet lowered.
-9. **Generics are monomorphized with local inference only.** Type arguments come from the
-   argument types and the expected type of the expression; there is no unification across a
-   whole function body, no explicit type application at a call site, and no bounds or
-   constraints on a type parameter. A parameter nothing determines is an error rather than a
-   default. `?` is wired to the prelude's `Option` and `Result` **by name**, standing in for
-   the eventual trait that will describe "can be short-circuited".
+10. **Generics are monomorphized with local inference only.** Type arguments come from the
+    argument types and the expected type of the expression; there is no unification across a
+    whole function body, no explicit type application at a call site, and no bounds or
+    constraints on a type parameter. A parameter nothing determines is an error rather than a
+    default. `?` is wired to the prelude's `Option` and `Result` **by name**, standing in for
+    the eventual trait that will describe "can be short-circuited".
 
 None of these are load-bearing design decisions — they are the smallest lowering that runs a
-real program, chosen so the pieces above them (wider types, enums, methods) can be added
+real program, chosen so the pieces above them (references, arrays, methods) can be added
 without reworking the pipeline shape.

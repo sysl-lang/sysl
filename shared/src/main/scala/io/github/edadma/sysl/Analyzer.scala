@@ -107,15 +107,37 @@ class Analyzer private (program: Program) {
       if argRefs.isEmpty && subst.contains(n) then subst(n)
       else
         val targs = argRefs.map(resolveType(_, subst))
-        n match
-          case "int" | "i32"  => plain(n, targs, Type.Int)
-          case "real" | "f64" => plain(n, targs, Type.Real)
-          case "bool"         => plain(n, targs, Type.Bool)
-          case "string"       => plain(n, targs, Type.Str)
-          case "unit"         => plain(n, targs, Type.Unit)
-          case _ if structDecls.contains(n) => instantiateStruct(n, targs)
-          case _ if enumDecls.contains(n)   => instantiateEnum(n, targs)
-          case _                            => err(s"unknown type '$n'")
+        scalarType(n) match
+          case Some(s)                        => plain(n, targs, s)
+          case None if structDecls.contains(n) => instantiateStruct(n, targs)
+          case None if enumDecls.contains(n)   => instantiateEnum(n, targs)
+          case None                            => err(s"unknown type '$n'")
+
+  /** Resolves a scalar type name: the named primitives and friendly aliases, or one of the
+   * systematic `iN` / `uN` / `fN` width spellings.
+   */
+  private def scalarType(name: String): Option[Type] =
+    Type.scalars.get(name).orElse(widthType(name))
+
+  /** `i5`, `u12`, `f32` — a family letter followed by a width. The integer family is open,
+   * so it is recognised by shape rather than listed; a width the back end cannot lower is a
+   * diagnostic, not an unknown name.
+   */
+  private def widthType(name: String): Option[Type] = {
+    val digits = name.drop(1)
+
+    if name.length < 2 || !"iuf".contains(name.head) then None
+    else if digits.head == '0' || !digits.forall(c => c >= '0' && c <= '9') then None
+    else
+      val bits = digits.toIntOption.getOrElse(err(s"'$name' is far wider than anything can hold"))
+
+      if name.head == 'f' then
+        if bits == 16 || bits == 32 || bits == 64 then Some(Type.Floating(bits))
+        else if bits == 128 then err("'f128' is not lowered yet — the widest float is 'f64'")
+        else err(s"'$name' is not an IEEE floating-point width; they are f16, f32, and f64")
+      else if bits >= 1 && bits <= 64 then Some(Type.Integer(bits, signed = name.head == 'i'))
+      else err(s"'$name' is wider than the 64 bits the back end lowers")
+  }
 
   private def plain(name: String, targs: List[Type], ty: Type): Type =
     if targs.nonEmpty then err(s"type '$name' does not take type arguments") else ty
@@ -245,8 +267,11 @@ class Analyzer private (program: Program) {
     TProgram(structInsts.values.toList, enumInsts.values.filterNot(_.simple).toList, tfuncs.toList, tmain)
   }
 
-  /** A struct and an enum share one type namespace, so a name may name at most one of them. */
-  private def typeNameTaken(name: String): Boolean = structDecls.contains(name) || enumDecls.contains(name)
+  /** Structs, enums, and the built-in scalars share one type namespace, so a name may name at
+   * most one of them.
+   */
+  private def typeNameTaken(name: String): Boolean =
+    structDecls.contains(name) || enumDecls.contains(name) || scalarType(name).isDefined
 
   private def analyzeFuncBody(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
     val (params, rtype) = funcInsts(name)
@@ -374,14 +399,17 @@ class Analyzer private (program: Program) {
     case For(name, iter, body) =>
       iter match
         case RangeExpr(Some(lo), Some(hi), inclusive) =>
-          val tlo = analyzeExpr(lo)
-          val thi = analyzeExpr(hi)
-          if tlo.ty != Type.Int || thi.ty != Type.Int then err("a 'for' range iterates 'int' bounds")
+          val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
+          if tlo.ty != thi.ty then
+            err(s"a 'for' range needs matching bounds, got ${show(tlo.ty)} and ${show(thi.ty)}")
+          val ty = tlo.ty match
+            case i: Type.Integer => i
+            case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
           pushScope()
-          val u  = declare(name, Type.Int)
+          val u  = declare(name, ty)
           val tb = body.map(analyzeStmt(_))
           popScope()
-          TFor(u, tlo, thi, inclusive, tb)
+          TFor(u, ty, tlo, thi, inclusive, tb)
         case _ =>
           err("'for' iterates an integer range 'a..b' or 'a..<b'")
 
@@ -410,11 +438,17 @@ class Analyzer private (program: Program) {
    * type is not mentioned by its argument, a generic call whose result alone is generic.
    */
   private def analyzeExpr(expr: Expr, expected: Option[Type] = None): TExpr = expr match
-    case IntLit(v, _)   => TIntLit(v, Type.Int)
-    case FloatLit(t, _) => TFloatLit(hexDouble(t))
-    case StrLit(s)      => TStrLit(s)
-    case BoolLit(b)     => TBoolLit(b)
-    case UnitLit()      => TUnitLit()
+    case IntLit(v, suffix)   => intLiteral(v, suffix, expected)
+    case FloatLit(t, suffix) => floatLiteral(t, suffix, expected)
+    case CharLit(cp)         => TIntLit(cp, Type.Char)
+    case StrLit(s)           => TStrLit(s)
+    case BoolLit(b)          => TBoolLit(b)
+    case UnitLit()           => TUnitLit()
+
+    // A minus and the literal it precedes are one unit for the range check, so a signed type's
+    // minimum is writable even though its magnitude overflows the positive range.
+    case Unary("-", IntLit(v, suffix))   => intLiteral(-v, suffix, expected)
+    case Unary("-", FloatLit(t, suffix)) => floatLiteral("-" + t, suffix, expected)
 
     case Ident(name) =>
       lookupOpt(name) match
@@ -426,22 +460,25 @@ class Analyzer private (program: Program) {
       TLogical(op, analyzeBool(l), analyzeBool(r))
 
     case Binary(op, l, r) =>
-      val tl = analyzeExpr(l)
-      val tr = analyzeExpr(r)
+      val List(tl, tr) = analyzeOperands(List(l, r), expected.filter(Type.isNumeric))
       TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty))
 
     case Unary("-", e) =>
-      val t = analyzeExpr(e)
-      if t.ty == Type.Int || t.ty == Type.Real then TUnary("-", t, t.ty)
-      else err(s"unary '-' is not defined for ${show(t.ty)}")
+      val t = analyzeExpr(e, expected.filter(Type.isNumeric))
+      t.ty match
+        case i: Type.Integer if i.signed => TUnary("-", t, i)
+        case f: Type.Floating            => TUnary("-", t, f)
+        case i: Type.Integer             => err(s"unary '-' is not defined for the unsigned type ${show(i)}")
+        case other                       => err(s"unary '-' is not defined for ${show(other)}")
 
     case Unary("!", e) =>
       TUnary("!", analyzeBool(e), Type.Bool)
 
     case Unary("~", e) =>
-      val t = analyzeExpr(e)
-      if t.ty == Type.Int then TUnary("~", t, Type.Int)
-      else err(s"unary '~' is not defined for ${show(t.ty)}")
+      val t = analyzeExpr(e, expected.filter(Type.isNumeric))
+      t.ty match
+        case i: Type.Integer => TUnary("~", t, i)
+        case other           => err(s"unary '~' is not defined for ${show(other)}")
 
     case Unary(op, _) =>
       err(s"unary '$op' is not supported yet")
@@ -452,11 +489,11 @@ class Analyzer private (program: Program) {
     case PostIncDec(op, _)        => err(s"'$op' needs a variable")
 
     case Compare(operands, ops) =>
-      val ts = operands.map(analyzeExpr(_))
+      val ts = analyzeOperands(operands, None)
       for i <- ops.indices do
         val (a, b) = (ts(i), ts(i + 1))
         if a.ty != b.ty then err(s"cannot compare ${show(a.ty)} with ${show(b.ty)}")
-        if a.ty != Type.Int && a.ty != Type.Real then err(s"'${ops(i)}' is not defined for ${show(a.ty)}")
+        if !Type.isOrdered(a.ty) then err(s"'${ops(i)}' is not defined for ${show(a.ty)}")
       TCompare(ts, ops)
 
     case Assign("=", Ident(n), value) =>
@@ -481,7 +518,7 @@ class Analyzer private (program: Program) {
     case Assign(op, Ident(n), value) =>
       val (u, ty) = lookup(n)
       val binSym  = op.dropRight(1)
-      val tv      = analyzeExpr(value)
+      val tv      = analyzeExpr(value, Some(ty))
       val rty     = arithType(binSym, ty, tv.ty)
       if rty != ty then err(s"'$op' would change the type of '$n'")
       TUpdate(u, op, tv, ty)
@@ -497,6 +534,11 @@ class Analyzer private (program: Program) {
           case _: Type.Struct | _: Type.Enum => err(s"cannot print a ${show(t.ty)} value")
           case _                             => t
       })
+
+    // A conversion is written with call syntax, so a scalar type name in call position is one.
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty && scalarType(name).isDefined =>
+      if args.length != 1 then err(s"a '$name' conversion takes exactly one value")
+      convert(analyzeExpr(args.head), scalarType(name).get)
 
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && variantOwner.contains(name) =>
       constructVariant(name, args, expected)
@@ -550,14 +592,98 @@ class Analyzer private (program: Program) {
     case _: RangeExpr =>
       err("a range is only allowed in a 'for' loop or a 'match' pattern")
 
-    case CharLit(_) => err("character literals are not supported yet")
-    case _: Index   => err("indexing is not supported yet")
-    case _: Tuple   => err("tuples are not supported yet")
+    case _: Index => err("indexing is not supported yet")
+    case _: Tuple => err("tuples are not supported yet")
 
   private def incDec(op: String, name: String, pre: Boolean): TExpr = {
     val (u, ty) = lookup(name)
-    if ty != Type.Int then err(s"'$op' is only defined for int")
-    TIncDec(u, op, pre)
+
+    ty match
+      case i: Type.Integer => TIncDec(u, op, pre, i)
+      case other           => err(s"'$op' is not defined for ${show(other)}")
+  }
+
+  // --- literals ------------------------------------------------------------------------
+
+  /** An integer literal takes its type from its suffix, else from the type the context
+   * expects, else `int`. The default is never magnitude-dependent: a value too large for the
+   * type it landed in is an error asking for a suffix, not a silent widening.
+   */
+  private def intLiteral(value: BigInt, suffix: Option[String], expected: Option[Type]): TExpr = {
+    val ty = suffix match
+      case Some(s) =>
+        scalarType(s) match
+          case Some(i: Type.Integer) => i
+          case _                     => err(s"'$s' is not an integer type")
+      case None =>
+        expected match
+          case Some(i: Type.Integer) => i
+          case _                     => Type.Int
+
+    if !Type.fits(value, ty) then err(s"the literal $value does not fit ${show(ty)}")
+
+    TIntLit(value, ty)
+  }
+
+  /** A float literal takes its type from its suffix, else from the expected type when that is
+   * a float, else `real`. An integer literal never becomes a float on its own — writing `1`
+   * where a `real` is wanted is a type error, not a silent conversion.
+   */
+  private def floatLiteral(text: String, suffix: Option[String], expected: Option[Type]): TExpr = {
+    val ty = suffix match
+      case Some(s) =>
+        scalarType(s) match
+          case Some(f: Type.Floating) => f
+          case _                      => err(s"'$s' is not a floating-point type")
+      case None =>
+        expected match
+          case Some(f: Type.Floating) => f
+          case _                      => Type.Real
+
+    TFloatLit(hexDouble(text), ty)
+  }
+
+  /** Analyzes operands that must share one type. A bare numeric literal has no type of its
+   * own, so it takes the type of a non-literal neighbour — which is what lets `n + 1` work
+   * for an `n` of any width without the literal needing a suffix.
+   */
+  private def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
+    val first = operands.map(analyzeExpr(_, expected))
+
+    operands.zip(first).collectFirst { case (e, t) if !isLiteral(e) => t.ty } match
+      case Some(ty) =>
+        operands.zip(first).map {
+          case (e, t) if isLiteral(e) && t.ty != ty => analyzeExpr(e, Some(ty))
+          case (_, t)                              => t
+        }
+      case None => first
+  }
+
+  /** Whether an expression is a numeric literal with no type of its own. A suffixed literal
+   * has already said what it is, so it counts as fixed rather than adaptable.
+   */
+  private def isLiteral(e: Expr): Boolean = e match
+    case IntLit(_, None) | FloatLit(_, None) => true
+    case Unary("-", operand)                 => isLiteral(operand)
+    case _                                   => false
+
+  /** An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens,
+   * narrows, or changes representation without being written.
+   */
+  private def convert(t: TExpr, to: Type): TExpr = {
+    val allowed = (t.ty, to) match
+      case (_: Type.Integer, _: Type.Integer)   => true
+      case (_: Type.Integer, _: Type.Floating)  => true
+      case (_: Type.Floating, _: Type.Integer)  => true
+      case (_: Type.Floating, _: Type.Floating) => true
+      case (Type.Char, _: Type.Integer)         => true // total: every char is an integer
+      case (_: Type.Integer, Type.Char)         => true // partial: traps on a non-scalar value
+      case (Type.Char, Type.Char)               => true
+      case _                                    => false
+
+    if !allowed then err(s"cannot convert ${show(t.ty)} to ${show(to)}")
+
+    TCast(t, to)
   }
 
   // --- calls and construction ----------------------------------------------------------
@@ -688,14 +814,15 @@ class Analyzer private (program: Program) {
     case WildcardPattern => TWildPattern(ty)
 
     case LitPattern(v) =>
-      val t = analyzeExpr(v)
+      val t = analyzeExpr(v, Some(ty))
       if t.ty != ty then err(s"pattern is ${show(t.ty)} but the value is ${show(ty)}")
+      if !Type.isOrdered(ty) then err(s"a ${show(ty)} value cannot be matched against a literal yet")
       TLitPattern(t)
 
     case RangePattern(lo, hi, inclusive) =>
-      if ty != Type.Int && ty != Type.Real then err(s"a range pattern needs a numeric value, not ${show(ty)}")
-      val tl = analyzeExpr(lo)
-      val th = analyzeExpr(hi)
+      if !Type.isOrdered(ty) then err(s"a range pattern needs an ordered value, not ${show(ty)}")
+      val tl = analyzeExpr(lo, Some(ty))
+      val th = analyzeExpr(hi, Some(ty))
       if tl.ty != ty || th.ty != ty then err(s"range pattern must match the ${show(ty)} value")
       TRangePattern(tl, th, inclusive)
 
@@ -761,12 +888,15 @@ class Analyzer private (program: Program) {
     valueTy
   }
 
-  /** The result type of an arithmetic or bitwise binary operator on matching operands. */
+  /** The result type of an arithmetic or bitwise binary operator. Operands must already have
+   * the same type — there is no implicit promotion, so a mixed-width expression is an error
+   * asking for a conversion rather than a silent widening.
+   */
   private def arithType(op: String, a: Type, b: Type): Type = {
     if a != b then err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}")
     (a, op) match
-      case (Type.Int, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^") => Type.Int
-      case (Type.Real, "+" | "-" | "*" | "/")                                      => Type.Real
+      case (_: Type.Integer, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^") => a
+      case (_: Type.Floating, "+" | "-" | "*" | "/")                                      => a
       case _ => err(s"operator '$op' is not defined for ${show(a)}")
   }
 

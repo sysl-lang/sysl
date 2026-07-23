@@ -93,6 +93,45 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "scalar types" - {
+    "a literal too large for the width it landed in" in {
+      err("var x: byte = 300") should include("does not fit byte")
+      err("print(5000000000)") should include("does not fit int")
+    }
+
+    "an integer literal does not quietly become a float" in {
+      err("var x: real = 1") should include("declared real but the value is int")
+    }
+
+    "mixed widths need a conversion rather than promoting" in {
+      err("var a: byte = 1\nvar b: int = 2\nprint(a + b)") should
+        include("'+' needs matching types, got byte and int")
+    }
+
+    "an unsupported width is named as such" in {
+      err("var x: i128 = 1") should include("wider than the 64 bits")
+      err("var x: f128 = 1.0") should include("'f128' is not lowered yet")
+    }
+
+    "char has no arithmetic" in {
+      err("print('a' + 'b')") should include("'+' is not defined for char")
+      err("print('a' + 1)") should include("needs matching types, got char and int")
+    }
+
+    "a conversion that has no meaning" in {
+      err("print(int(true))") should include("cannot convert bool to int")
+      err("print(char('a'), char(1, 2))") should include("takes exactly one value")
+    }
+
+    "unary minus needs a type that has a sign" in {
+      err("var b: byte = 1\nprint(-b)") should include("unsigned type byte")
+    }
+
+    "a built-in type name may not be redeclared" in {
+      err("struct byte\n    x: int") should include("already declared")
+    }
+  }
+
   "the ? operator" - {
     "needs an Option or Result value" in {
       err("f(n: int) -> Option[int]\n    var x = n?\n    None") should

@@ -14,14 +14,18 @@ class Codegen private (program: TProgram) {
   private val globals  = new mutable.StringBuilder
   private var strId    = 0
   private var boolStrs = false
+  private var charBuf  = false
+  private var traps    = false
 
   // Per-function emission state, reset at each function boundary.
+  private var prologue   = new mutable.StringBuilder
   private var body       = new mutable.StringBuilder
   private var temp       = 0
   private var label      = 0
   private var terminated = false
 
   private def startFunction(): Unit = {
+    prologue = new mutable.StringBuilder
     body = new mutable.StringBuilder
     temp = 0
     label = 0
@@ -34,6 +38,15 @@ class Codegen private (program: TProgram) {
   /** Emits a plain instruction, unless the current block is already terminated. */
   private def emit(line: String): Unit =
     if !terminated then { body ++= "  "; body ++= line; body ++= "\n" }
+
+  /** Emits a stack slot into the function's entry block rather than where it is needed.
+   * Every name is unique within a function, so hoisting is safe — and it keeps a slot inside
+   * a loop from growing the stack on every iteration.
+   */
+  private def emitAlloca(name: String, ty: String): String = {
+    prologue ++= s"  $name = alloca $ty\n"
+    name
+  }
 
   /** Emits a block terminator (`br` / `ret` / `unreachable`) and marks the block closed. */
   private def emitTerm(line: String): Unit =
@@ -69,7 +82,9 @@ class Codegen private (program: TProgram) {
     val mainText  = genMain(program.main)
 
     val out = new mutable.StringBuilder
-    out ++= "declare i32 @printf(ptr, ...)\n\n"
+    out ++= "declare i32 @printf(ptr, ...)\n"
+    if traps then out ++= "declare void @llvm.trap()\n"
+    out ++= "\n"
 
     for s <- program.structs do
       out ++= s"${s.llvm} = type { ${s.fields.map(_._2.llvm).mkString(", ")} }\n"
@@ -88,6 +103,8 @@ class Codegen private (program: TProgram) {
     out ++= globals.toString
     if globals.nonEmpty || boolStrs then out ++= "\n"
 
+    if charBuf then out ++= Codegen.utf8Encoder
+
     for t <- funcTexts do out ++= t; out ++= "\n"
     out ++= mainText
     out.toString
@@ -97,14 +114,14 @@ class Codegen private (program: TProgram) {
     startFunction()
     stmts.foreach(genStmt)
     emitTerm("ret i32 0")
-    s"define i32 @main() {\nentry:\n$body}\n"
+    s"define i32 @main() {\nentry:\n$prologue$body}\n"
   }
 
   private def genFunction(f: TFunc): String = {
     startFunction()
 
     for (name, ty) <- f.params do
-      emit(s"%$name.addr = alloca ${ty.llvm}")
+      emitAlloca(s"%$name.addr", ty.llvm)
       emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
 
     f.body.stmts.foreach(genStmt)
@@ -116,24 +133,25 @@ class Codegen private (program: TProgram) {
       case None                            => emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
     val params = f.params.map { case (name, ty) => s"${ty.llvm} %$name.param" }.mkString(", ")
-    s"define ${f.retTy.llvm} @${f.name}($params) {\nentry:\n$body}\n"
+    s"define ${f.retTy.llvm} @${f.name}($params) {\nentry:\n$prologue$body}\n"
   }
 
   private def zero(ty: Type): String = ty match
-    case Type.Int       => "0"
-    case Type.Bool      => "0"
-    case Type.Real      => "0x0000000000000000"
-    case Type.Str       => "null"
-    case _: Type.Struct => "zeroinitializer"
-    case e: Type.Enum   => if e.simple then "0" else "zeroinitializer"
-    case Type.Unit      => ""
+    case _: Type.Integer  => "0"
+    case _: Type.Floating => "0.0"
+    case Type.Char        => "0"
+    case Type.Bool        => "0"
+    case Type.Str         => "null"
+    case _: Type.Struct   => "zeroinitializer"
+    case e: Type.Enum     => if e.simple then "0" else "zeroinitializer"
+    case Type.Unit        => ""
 
   // --- statements ----------------------------------------------------------------------
 
   private def genStmt(stmt: TStmt): Unit = stmt match
     case TVarDecl(name, ty, init) =>
       val v = genExpr(init)
-      emit(s"%$name.addr = alloca ${ty.llvm}")
+      emitAlloca(s"%$name.addr", ty.llvm)
       emit(s"store ${ty.llvm} $v, ptr %$name.addr")
 
     case TExprStmt(expr) =>
@@ -151,24 +169,25 @@ class Codegen private (program: TProgram) {
       emitTerm(s"br label %$condL")
       emitLabel(endL)
 
-    case TFor(name, lo, hi, inclusive, forBody) =>
+    case TFor(name, ty, lo, hi, inclusive, forBody) =>
+      val w     = ty.llvm
       val loV   = genExpr(lo)
       val hiV   = genExpr(hi)
       val condL = freshLabel("for.cond")
       val bodyL = freshLabel("for.body")
       val endL  = freshLabel("for.end")
-      emit(s"%$name.addr = alloca i32")
-      emit(s"store i32 $loV, ptr %$name.addr")
+      emitAlloca(s"%$name.addr", w)
+      emit(s"store $w $loV, ptr %$name.addr")
       emitTerm(s"br label %$condL")
       emitLabel(condL)
-      val iv   = freshTemp(); emit(s"$iv = load i32, ptr %$name.addr")
-      val cmp  = freshTemp(); emit(s"$cmp = icmp ${if inclusive then "sle" else "slt"} i32 $iv, $hiV")
+      val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
+      val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", ty)} $w $iv, $hiV")
       emitTerm(s"br i1 $cmp, label %$bodyL, label %$endL")
       emitLabel(bodyL)
       forBody.foreach(genStmt)
-      val cur = freshTemp(); emit(s"$cur = load i32, ptr %$name.addr")
-      val nxt = freshTemp(); emit(s"$nxt = add i32 $cur, 1")
-      emit(s"store i32 $nxt, ptr %$name.addr")
+      val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
+      val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
+      emit(s"store $w $nxt, ptr %$name.addr")
       emitTerm(s"br label %$condL")
       emitLabel(endL)
 
@@ -184,10 +203,17 @@ class Codegen private (program: TProgram) {
    */
   private def genExpr(expr: TExpr): String = expr match
     case TIntLit(v, _) => v.toString
-    case TFloatLit(b)  => b
     case TStrLit(s)    => stringGlobal(s)
     case TBoolLit(b)   => if b then "1" else "0"
     case TUnitLit()    => ""
+
+    // A narrower float is the `double` constant rounded to it, which folds away entirely.
+    case TFloatLit(bits, ty) =>
+      if ty == Type.Real then bits
+      else { val r = freshTemp(); emit(s"$r = fptrunc double $bits to ${ty.llvm}"); r }
+
+    case TCast(operand, ty) =>
+      convert(operand.ty, ty, genExpr(operand))
 
     case TLoad(name, ty) =>
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %$name.addr"); r
@@ -202,23 +228,24 @@ class Codegen private (program: TProgram) {
       emit(s"store ${ty.llvm} $updated, ptr %$name.addr")
       updated
 
-    case TIncDec(name, op, pre) =>
-      val cur = freshTemp(); emit(s"$cur = load i32, ptr %$name.addr")
-      val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} i32 $cur, 1")
-      emit(s"store i32 $nv, ptr %$name.addr")
+    case TIncDec(name, op, pre, ty) =>
+      val w   = ty.llvm
+      val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
+      val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} $w $cur, 1")
+      emit(s"store $w $nv, ptr %$name.addr")
       if pre then nv else cur
 
     case TBinary(op, l, r, _) =>
       arith(op, l.ty, genExpr(l), genExpr(r))
 
-    case TUnary("-", operand, Type.Int) =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub i32 0, $v"); r
-    case TUnary("-", operand, Type.Real) =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = fneg double $v"); r
+    case TUnary("-", operand, ty: Type.Integer) =>
+      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} 0, $v"); r
+    case TUnary("-", operand, ty: Type.Floating) =>
+      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = fneg ${ty.llvm} $v"); r
     case TUnary("!", operand, _) =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor i1 $v, true"); r
-    case TUnary("~", operand, _) =>
-      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor i32 $v, -1"); r
+    case TUnary("~", operand, ty) =>
+      val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor ${ty.llvm} $v, -1"); r
     case TUnary(op, _, _) =>
       sys.error(s"unreachable unary '$op'")
 
@@ -352,7 +379,7 @@ class Codegen private (program: TProgram) {
       emitLabel(endL)
       ""
     else
-      val slot = freshTemp(); emit(s"$slot = alloca ${ty.llvm}")
+      val slot = emitAlloca(freshTemp(), ty.llvm)
       emitTerm(s"br i1 $c, label %$thenL, label %$elseL")
       emitLabel(thenL)
       emit(s"store ${ty.llvm} ${genBlockValue(thenBlock)}, ptr $slot")
@@ -368,7 +395,7 @@ class Codegen private (program: TProgram) {
     val sv   = genExpr(scrutinee)
     val sty  = scrutinee.ty
     val endL = freshLabel("match.end")
-    val slot = if ty == Type.Unit then "" else { val s = freshTemp(); emit(s"$s = alloca ${ty.llvm}"); s }
+    val slot = if ty == Type.Unit then "" else emitAlloca(freshTemp(), ty.llvm)
 
     for arm <- arms do
       val bodyL = freshLabel("match.arm")
@@ -437,7 +464,7 @@ class Codegen private (program: TProgram) {
    */
   private def patternBind(p: TPattern, ty: Type, value: String): Unit = p match
     case TBindPattern(name, bty) =>
-      emit(s"%$name.addr = alloca ${bty.llvm}")
+      emitAlloca(s"%$name.addr", bty.llvm)
       emit(s"store ${bty.llvm} $value, ptr %$name.addr")
     case TVariantPattern(en, variant, args) if args.exists(bindsAny) =>
       val payload = freshTemp()
@@ -476,35 +503,118 @@ class Codegen private (program: TProgram) {
 
   // --- arithmetic and comparison -------------------------------------------------------
 
+  /** Arithmetic wraps at the operand's declared width, which plain LLVM integer instructions
+   * already do — the width is in the type, so no masking is needed even for an odd one.
+   * Signedness picks between the division, remainder, and right-shift pairs.
+   */
   private def arith(op: String, ty: Type, lv: String, rv: String): String = {
-    val (kind, instr) = ty match
-      case Type.Int =>
-        ("i32", op match
-          case "+" => "add"; case "-" => "sub"; case "*" => "mul"; case "/" => "sdiv"; case "%" => "srem"
-          case "<<" => "shl"; case ">>" => "ashr"; case "&" => "and"; case "|" => "or"; case "^" => "xor")
-      case Type.Real =>
-        ("double", op match
-          case "+" => "fadd"; case "-" => "fsub"; case "*" => "fmul"; case "/" => "fdiv")
+    val instr = ty match
+      case i: Type.Integer =>
+        op match
+          case "+"  => "add"
+          case "-"  => "sub"
+          case "*"  => "mul"
+          case "/"  => if i.signed then "sdiv" else "udiv"
+          case "%"  => if i.signed then "srem" else "urem"
+          case "<<" => "shl"
+          case ">>" => if i.signed then "ashr" else "lshr"
+          case "&"  => "and"
+          case "|"  => "or"
+          case "^"  => "xor"
+          case _    => sys.error(s"unreachable arith '$op'")
+      case _: Type.Floating =>
+        op match
+          case "+" => "fadd"
+          case "-" => "fsub"
+          case "*" => "fmul"
+          case "/" => "fdiv"
+          case _   => sys.error(s"unreachable arith '$op'")
       case other => sys.error(s"unreachable arith on ${other.llvm}")
-    val r = freshTemp(); emit(s"$r = $instr $kind $lv, $rv"); r
+
+    val r = freshTemp(); emit(s"$r = $instr ${ty.llvm} $lv, $rv"); r
   }
 
   private def compareOne(op: String, a: TExpr, b: TExpr): String =
     compareValue(op, a.ty, genExpr(a), genExpr(b))
 
+  /** The `icmp` / `fcmp` predicate for an operator at a type. `char` compares by scalar
+   * value, so it uses the unsigned predicates over its `i32` representation.
+   */
+  private def predicate(op: String, ty: Type): String = ty match
+    case Type.Char | Type.Integer(_, false, _) =>
+      op match
+        case "==" => "eq"; case "!=" => "ne"
+        case "<"  => "ult"; case ">" => "ugt"; case "<=" => "ule"; case ">=" => "uge"
+        case _    => sys.error(s"unreachable compare '$op'")
+    case _: Type.Integer =>
+      op match
+        case "==" => "eq"; case "!=" => "ne"
+        case "<"  => "slt"; case ">" => "sgt"; case "<=" => "sle"; case ">=" => "sge"
+        case _    => sys.error(s"unreachable compare '$op'")
+    case _: Type.Floating =>
+      op match
+        case "==" => "oeq"; case "!=" => "one"
+        case "<"  => "olt"; case ">" => "ogt"; case "<=" => "ole"; case ">=" => "oge"
+        case _    => sys.error(s"unreachable compare '$op'")
+    case other => sys.error(s"unreachable compare on ${other.llvm}")
+
   private def compareValue(op: String, ty: Type, av: String, bv: String): String = {
-    val r = freshTemp()
-    ty match
-      case Type.Int =>
-        val pred = op match
-          case "==" => "eq"; case "!=" => "ne"; case "<" => "slt"; case ">" => "sgt"; case "<=" => "sle"; case ">=" => "sge"
-        emit(s"$r = icmp $pred i32 $av, $bv")
-      case Type.Real =>
-        val pred = op match
-          case "==" => "oeq"; case "!=" => "one"; case "<" => "olt"; case ">" => "ogt"; case "<=" => "ole"; case ">=" => "oge"
-        emit(s"$r = fcmp $pred double $av, $bv")
-      case other => sys.error(s"unreachable compare on ${other.llvm}")
+    val instr = if ty.isInstanceOf[Type.Floating] then "fcmp" else "icmp"
+    val r     = freshTemp()
+
+    emit(s"$r = $instr ${predicate(op, ty)} ${ty.llvm} $av, $bv")
     r
+  }
+
+  // --- conversions ---------------------------------------------------------------------
+
+  /** Lowers an explicit scalar conversion. Every case is a single LLVM cast, except the
+   * partial `char(u)` — the one conversion that can fail, and so the one that checks.
+   */
+  private def convert(from: Type, to: Type, v: String): String = (from, to) match
+    case _ if from == to => v
+
+    case (a: Type.Integer, b: Type.Integer) =>
+      if b.bits == a.bits then v
+      else if b.bits < a.bits then castOp("trunc", a, b, v)
+      else castOp(if a.signed then "sext" else "zext", a, b, v)
+
+    case (a: Type.Integer, b: Type.Floating)  => castOp(if a.signed then "sitofp" else "uitofp", a, b, v)
+    case (a: Type.Floating, b: Type.Integer)  => castOp(if b.signed then "fptosi" else "fptoui", a, b, v)
+    case (a: Type.Floating, b: Type.Floating) => castOp(if b.bits > a.bits then "fpext" else "fptrunc", a, b, v)
+
+    case (Type.Char, b: Type.Integer) => convert(Type.Integer(32, signed = false), b, v)
+    case (a: Type.Integer, Type.Char) => checkedChar(a, v)
+
+    case _ => sys.error(s"unreachable conversion from ${from.llvm} to ${to.llvm}")
+
+  private def castOp(instr: String, from: Type, to: Type, v: String): String = {
+    val r = freshTemp(); emit(s"$r = $instr ${from.llvm} $v to ${to.llvm}"); r
+  }
+
+  /** `char(u)` — a checked conversion. A Unicode scalar value is at most `0x10FFFF` and never
+   * a surrogate; anything else traps, in the same runtime-safety category as a bounds check.
+   * The test runs at 64 bits so a wide source cannot smuggle a value past it.
+   */
+  private def checkedChar(from: Type.Integer, v: String): String = {
+    traps = true
+
+    val wide     = convert(from, Type.Integer(64, from.signed), v)
+    val inRange  = freshTemp(); emit(s"$inRange = icmp ule i64 $wide, 1114111")
+    val belowLow = freshTemp(); emit(s"$belowLow = icmp ult i64 $wide, 55296")
+    val aboveTop = freshTemp(); emit(s"$aboveTop = icmp ugt i64 $wide, 57343")
+    val scalar   = freshTemp(); emit(s"$scalar = or i1 $belowLow, $aboveTop")
+    val ok       = freshTemp(); emit(s"$ok = and i1 $inRange, $scalar")
+
+    val okL   = freshLabel("char.ok")
+    val badL  = freshLabel("char.bad")
+    emitTerm(s"br i1 $ok, label %$okL, label %$badL")
+    emitLabel(badL)
+    emit("call void @llvm.trap()")
+    emitTerm("unreachable")
+    emitLabel(okL)
+
+    castOp("trunc", Type.Integer(64, from.signed), Type.Char, wide)
   }
 
   // --- print ---------------------------------------------------------------------------
@@ -515,15 +625,36 @@ class Codegen private (program: TProgram) {
 
     for arg <- args do
       arg.ty match
-        case Type.Int  => specs += "%d"; callArgs += s"i32 ${genExpr(arg)}"
-        case Type.Real => specs += "%g"; callArgs += s"double ${genExpr(arg)}"
-        case Type.Str  => specs += "%s"; callArgs += s"ptr ${genExpr(arg)}"
+        // Varargs promote, so a narrow value is widened here rather than left to the ABI.
+        case i: Type.Integer =>
+          val wide = if i.bits <= 32 then Type.Integer(32, i.signed) else Type.Integer(64, i.signed)
+          val v    = convert(i, wide, genExpr(arg))
+          specs += (if i.signed then (if wide.bits == 32 then "%d" else "%lld")
+                    else if wide.bits == 32 then "%u"
+                    else "%llu")
+          callArgs += s"${wide.llvm} $v"
+
+        case f: Type.Floating =>
+          val v = convert(f, Type.Real, genExpr(arg))
+          specs += "%g"; callArgs += s"double $v"
+
+        case Type.Char =>
+          charBuf = true
+          val cp  = genExpr(arg)
+          val buf = emitAlloca(freshTemp(), "[5 x i8]")
+          val enc = freshTemp()
+          emit(s"$enc = call ptr @sysl.utf8(i32 $cp, ptr $buf)")
+          specs += "%s"; callArgs += s"ptr $enc"
+
+        case Type.Str => specs += "%s"; callArgs += s"ptr ${genExpr(arg)}"
+
         case Type.Bool =>
           boolStrs = true
           val v   = genExpr(arg)
           val sel = freshTemp()
           emit(s"$sel = select i1 $v, ptr @.true, ptr @.false")
           specs += "%s"; callArgs += s"ptr $sel"
+
         case other => sys.error(s"unreachable print of ${other.llvm}")
 
     val fmt = stringGlobal(specs.mkString(" ") + "\n")
@@ -536,4 +667,86 @@ object Codegen {
 
   /** Lowers a typed program to an LLVM IR module. */
   def generate(program: TProgram): String = new Codegen(program).gen()
+
+  /** Encodes one Unicode scalar value as NUL-terminated UTF-8 into a caller-supplied
+   * five-byte buffer, so printing a `char` is an ordinary `%s` argument alongside the rest.
+   * Emitted only into modules that print one.
+   */
+  private val utf8Encoder: String =
+    """define private ptr @sysl.utf8(i32 %cp, ptr %buf) {
+      |entry:
+      |  %ascii = icmp ult i32 %cp, 128
+      |  br i1 %ascii, label %one, label %wide
+      |one:
+      |  %a0 = trunc i32 %cp to i8
+      |  store i8 %a0, ptr %buf
+      |  %a1 = getelementptr i8, ptr %buf, i32 1
+      |  store i8 0, ptr %a1
+      |  ret ptr %buf
+      |wide:
+      |  %short = icmp ult i32 %cp, 2048
+      |  br i1 %short, label %two, label %wider
+      |two:
+      |  %b0 = lshr i32 %cp, 6
+      |  %b1 = or i32 %b0, 192
+      |  %b2 = trunc i32 %b1 to i8
+      |  store i8 %b2, ptr %buf
+      |  %b3 = and i32 %cp, 63
+      |  %b4 = or i32 %b3, 128
+      |  %b5 = trunc i32 %b4 to i8
+      |  %b6 = getelementptr i8, ptr %buf, i32 1
+      |  store i8 %b5, ptr %b6
+      |  %b7 = getelementptr i8, ptr %buf, i32 2
+      |  store i8 0, ptr %b7
+      |  ret ptr %buf
+      |wider:
+      |  %bmp = icmp ult i32 %cp, 65536
+      |  br i1 %bmp, label %three, label %four
+      |three:
+      |  %c0 = lshr i32 %cp, 12
+      |  %c1 = or i32 %c0, 224
+      |  %c2 = trunc i32 %c1 to i8
+      |  store i8 %c2, ptr %buf
+      |  %c3 = lshr i32 %cp, 6
+      |  %c4 = and i32 %c3, 63
+      |  %c5 = or i32 %c4, 128
+      |  %c6 = trunc i32 %c5 to i8
+      |  %c7 = getelementptr i8, ptr %buf, i32 1
+      |  store i8 %c6, ptr %c7
+      |  %c8 = and i32 %cp, 63
+      |  %c9 = or i32 %c8, 128
+      |  %c10 = trunc i32 %c9 to i8
+      |  %c11 = getelementptr i8, ptr %buf, i32 2
+      |  store i8 %c10, ptr %c11
+      |  %c12 = getelementptr i8, ptr %buf, i32 3
+      |  store i8 0, ptr %c12
+      |  ret ptr %buf
+      |four:
+      |  %d0 = lshr i32 %cp, 18
+      |  %d1 = or i32 %d0, 240
+      |  %d2 = trunc i32 %d1 to i8
+      |  store i8 %d2, ptr %buf
+      |  %d3 = lshr i32 %cp, 12
+      |  %d4 = and i32 %d3, 63
+      |  %d5 = or i32 %d4, 128
+      |  %d6 = trunc i32 %d5 to i8
+      |  %d7 = getelementptr i8, ptr %buf, i32 1
+      |  store i8 %d6, ptr %d7
+      |  %d8 = lshr i32 %cp, 6
+      |  %d9 = and i32 %d8, 63
+      |  %d10 = or i32 %d9, 128
+      |  %d11 = trunc i32 %d10 to i8
+      |  %d12 = getelementptr i8, ptr %buf, i32 2
+      |  store i8 %d11, ptr %d12
+      |  %d13 = and i32 %cp, 63
+      |  %d14 = or i32 %d13, 128
+      |  %d15 = trunc i32 %d14 to i8
+      |  %d16 = getelementptr i8, ptr %buf, i32 3
+      |  store i8 %d15, ptr %d16
+      |  %d17 = getelementptr i8, ptr %buf, i32 4
+      |  store i8 0, ptr %d17
+      |  ret ptr %buf
+      |}
+      |
+      |""".stripMargin
 }
