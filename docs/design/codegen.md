@@ -6,16 +6,18 @@ be unwound deliberately rather than discovered later.
 
 ## The pipeline
 
-`Compiler.compileToLlvm` = **parse → analyze → codegen**:
+`Compiler.compileToLlvm` = **parse → analyze → escape-check → codegen**:
 
 - **Parser** (`SyslParser`) — a packrat grammar over the lexer's token list, producing the
   untyped `ast.scala` tree.
 - **Analyzer** (`Analyzer`) — the semantic pass. It hoists declarations, resolves names and
   types, checks every rule that can fail, monomorphizes generics, and emits the *typed* tree
   (`tast.scala`). Every diagnostic lives here; codegen trusts the tree it is handed.
-- **Codegen** (`Codegen`) — a straight lowering of the typed tree to textual LLVM IR. It
-  selects instructions from the types the tree carries and lays out basic blocks; it makes no
-  semantic decision of its own.
+- **Escape analysis** (`Escape`) — the one check that needs the whole call graph rather than one
+  expression at a time, so it runs over the typed tree once the analyzer is finished (`05`).
+- **Codegen** (`Codegen`, with `Emitter` / `ArcEmitter` / `ScalarEmitter` / `StringEmitter`) — a
+  straight lowering of the typed tree to textual LLVM IR. It selects instructions from the types
+  the tree carries and lays out basic blocks; it makes no semantic decision of its own.
 
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
 
@@ -104,16 +106,29 @@ before they appear and may be mutually recursive).
   `05` is what makes the view safe: it is inferred with nothing written in the source, carried
   across calls by one bit per parameter, and iterated to a fixpoint so recursion converges
   (`07`).
+- **Strings.** A `string` is an immutable validated `[]u8` and is exactly the same three words
+  (`04`), so it inherits the view machinery whole: `s.len` in bytes, `s[i]` yielding one checked
+  `u8`, `s[a..b]` sharing rather than copying, and `s.bytes` handing the same value to anything
+  that takes a `[]u8`. What it adds is the validity invariant — a substring must land between
+  characters, and a mid-codepoint cut traps like any other failed check — and immutability, so
+  `s[i] = v` and `&s[i]` are rejected outright. Comparison is by bytes, which for well-formed
+  UTF-8 is codepoint order, so `==` and `<` work and a literal can be a `match` pattern. A
+  literal's owner is **null**, which is how `04`'s "immortal" is spelled: no allocation, and
+  retain and release are run-time no-ops. Iterating is written `for b in s.bytes`, since a
+  string has two granularities and choosing one silently would be a guess.
 - **Recursive types.** A cycle through a `*T` or a `&T` is legal and pointer-sized; a cycle
   every edge of which is by value is rejected as having no finite size. An instantiation is
   registered before its fields are resolved, so a field that points back at it finds it.
 - **Expressions:** the full settled precedence grammar (`01`) over the scalar types and
   string literals. `++`/`--`, unary `-`/`!`/`~`/`*`/`&`, chained comparison.
 - **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed space-separated
-  followed by a newline, lowered to a single `printf`. Integers widen to what varargs promote
-  to and print as `%d` / `%u` / `%lld` / `%llu`; floats widen to `double` and print as `%g`; a
-  `char` is encoded to UTF-8 in a stack buffer and printed as `%s`; strings are `%s`; `bool`
-  is `%s` over `"true"` / `"false"`.
+  followed by a newline, lowered to one `printf` per run of arguments `printf` can carry.
+  Integers widen to what varargs promote to and print as `%d` / `%u` / `%lld` / `%llu`; floats
+  widen to `double` and print as `%g`; a `char` is encoded to UTF-8 in a stack buffer and
+  printed as `%s`; `bool` is `%s` over `"true"` / `"false"`. A **string breaks the run**: it
+  carries its own length and may hold a NUL, and every `%s` conversion — including `%.*s`, whose
+  precision is a maximum rather than a count — stops at one, so its bytes are written by length
+  through `putchar` instead.
 
 ## IR dialect (locked against the dev toolchain)
 
@@ -134,10 +149,15 @@ that releases whatever the payload held and then returns the storage. That indir
 lets a slice release its owner, whose payload type its own type does not name. Walking an
 aggregate's reference-carrying fields is a helper emitted once per type rather than inlined,
 since a data enum needs a tag test per variant, and an array is walked with a loop rather than
-an unrolled chain. A **slice** is `{ ptr owner, ptr first, i64 len }` by value; its owner is
-null when there is nothing to keep alive, so it counts through a null-tolerant pair while the
-reference path stays branch-free. The atomic pair and the null-tolerant pair are each emitted
-only into a module that turns out to need them.
+an unrolled chain. A **view** — a slice or a string, which differ in the type
+system and not at all in the machine — is `{ ptr owner, ptr first, i64 len }` by value; its owner
+is null when there is nothing to keep alive, so it counts through a null-tolerant pair while the
+reference path stays branch-free. A string literal is a **constant** view of interned bytes with
+a null owner, so it needs no instruction to build and no count to hold; the bytes carry a
+trailing NUL that the length leaves out, for the C interop `04` wants. The atomic pair and the
+null-tolerant pair are each emitted only into a module that turns out to need them, as are the
+three string helpers — writing bytes by length, comparing two byte runs, and testing that an
+offset is not inside a character.
 A simple enum is plain `i32`; a data enum
 lowers to a value aggregate `%enum.Name = type { i32 tag, payload₁, … }` with one payload slot
 per data-carrying variant (each payload a named `%Name.Variant` aggregate). A pattern test is a
@@ -156,12 +176,13 @@ arity.
    through `printf`). `usize` / `isize` are fixed at 64 bits by a constant rather than by a
    target description. A narrower float constant is emitted as the `double` constant rounded
    down to it, which is correctly rounded except in the rare double-rounding case.
-2. **`string` is a bare pointer, not the three-word owning view it is specified as.** A
-   literal interns as NUL-terminated bytes and passes to `printf` as a `ptr`, so an embedded
-   `\0` truncates it — the one place the implementation contradicts the design (`04`) rather
-   than merely lagging it. There is no owner word, no `.len`, no slicing, no runtime string
-   value, and no concatenation. The real representation waits on slices, since a `string` *is*
-   an immutable validated `[]u8`.
+2. **Every string is a literal or part of one.** The representation is the specified three
+   words and the operations over it are real, but nothing yet *makes* bytes: `from_utf8`,
+   `copy()`, concatenation, `str.builder`, `cstring`, and `string(c)` all need either an
+   allocator surface or methods, and none of them exists. So every string a program can hold
+   traces back to a literal, every owner word is null, and the validation `04` requires at
+   construction is done by the lexer rather than at run time. `s.chars` waits on the iterator
+   protocol; ordering is by byte with no collation, which is what `04` specifies.
 3. **All locals are `alloca`.** Every `var`, parameter, and loop variable gets a stack slot;
    reads `load`, writes `store`. Slots are hoisted into the entry block (names are unique per
    function, so one inside a loop does not grow the stack per iteration), but there is no
@@ -191,7 +212,8 @@ arity.
    evaluating the shared middle operand once per pair and not short-circuiting, which `01` says
    it should. Bind operands to a temp and short-circuit once that matters.
 9. **`for` iterates a range, an array, or a slice.** `downTo`, `step`, and `reverse` are not
-   yet lowered, and nothing else is iterable — there is no iterator protocol.
+   yet lowered, and nothing else is iterable — there is no iterator protocol, which is also why
+   a string is iterated as `s.bytes` and has no `s.chars` yet.
 10. **Escape analysis rejects rather than promotes.** An array whose view escapes is
    diagnosed where `05` says an allocator should silently promote it to the heap, so a program
    that means to return a view writes `&[N]T` itself. That is `05`'s `no alloc` behaviour

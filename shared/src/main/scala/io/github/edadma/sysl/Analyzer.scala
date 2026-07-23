@@ -491,9 +491,15 @@ class Analyzer private (program: Program) {
 
         case _ =>
           val seq = autoDeref(analyzeExpr(iter))
-          val elem = Type.element(seq.ty).getOrElse(
-            err(s"'for' iterates an integer range, an array, or a slice, not ${show(seq.ty)}"),
-          )
+          val elem = seq.ty match
+            case Type.Array(_, e) => e
+            case Type.Slice(e)    => e
+            // A string has two granularities and no reason to prefer one silently, so which one
+            // is wanted is written: `s.bytes` today, `s.chars` when there are characters.
+            case Type.Str =>
+              err("a string is iterated as 's.bytes', since a string has bytes and characters both")
+            case other =>
+              err(s"'for' iterates an integer range, an array, or a slice, not ${show(other)}")
           pushScope()
           val u  = declare(name, elem)
           val tb = body.map(analyzeStmt(_))
@@ -679,8 +685,10 @@ class Analyzer private (program: Program) {
           if idx < 0 then err(s"struct '${s.name}' has no field '$f'")
           TField(tr, idx, s.fields(idx)._2)
         // A length is a property of the value rather than a computation over it, so it reads as
-        // a field. It becomes an ordinary method the day methods exist.
-        case _: Type.Array | _: Type.Slice if f == "len" => TLen(tr)
+        // a field. It becomes an ordinary method the day methods exist, and so does `bytes` —
+        // a string's bytes are the same three words the string is, with the guarantee dropped.
+        case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
+        case Type.Str if f == "bytes"                   => TBytes(tr)
         case other =>
           err(s"cannot read field '$f' of ${show(other)}")
 
@@ -709,12 +717,16 @@ class Analyzer private (program: Program) {
         case Type.Ref(Type.Array(_, e), false) => e
         case Type.Ref(Type.Array(_, _), true) =>
           err("a slice does not record whether its owner's count is atomic, so a '&sync' array cannot be sliced")
-        case Type.Slice(e)                  => e
-        case Type.Array(_, e)               => e
-        case Type.Ptr(Type.Array(_, e))     => e
-        case other                          => err(s"cannot slice ${show(other)}")
+        case w: Type.View               => w.elem
+        case Type.Array(_, e)           => e
+        case Type.Ptr(Type.Array(_, e)) => e
+        case other                      => err(s"cannot slice ${show(other)}")
 
-      TSlice(tr, lo.map(bound), hi.map(bound), inclusive, Type.Slice(elem))
+      // Part of a string is a string, not a `[]u8` — the bytes between two character boundaries
+      // are still well-formed UTF-8, which is what the check at those boundaries is for.
+      val viewTy = if tr.ty == Type.Str then Type.Str else Type.Slice(elem)
+
+      TSlice(tr, lo.map(bound), hi.map(bound), inclusive, viewTy)
 
     case Index(receiver, index) =>
       val tr   = autoDeref(analyzeExpr(receiver))
@@ -755,8 +767,9 @@ class Analyzer private (program: Program) {
    */
   private def hasZero(t: Type): Boolean = t match
     case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool | _: Type.Ptr => true
-    // A zeroed slice owns nothing and names no elements, which is exactly the empty slice.
-    case _: Type.Slice       => true
+    // A zeroed view owns nothing and names no elements, which is exactly the empty slice — and,
+    // for a string, the empty string, which is well-formed UTF-8 the way anything empty is.
+    case _: Type.View        => true
     case Type.Array(_, elem) => hasZero(elem)
     case s: Type.Struct      => s.fields.forall(f => hasZero(f._2))
     case _                   => false
@@ -790,13 +803,25 @@ class Analyzer private (program: Program) {
     case TField(recv, _, _) => isPlace(recv)
     // A slice's elements live wherever its owner keeps them, so they have an address even when
     // the slice itself is a temporary. An array's elements are the array, so they do not.
-    case TIndex(recv, _, _) => recv.ty.isInstanceOf[Type.Slice] || isPlace(recv)
-    case _                  => false
+    case TIndex(recv, _, _) =>
+      recv.ty match
+        case _: Type.Slice => true
+        case Type.Str      => false
+        case _             => isPlace(recv)
+    case _ => false
 
   /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
   private def analyzePlace(target: Expr, what: String): TExpr = {
     val t = analyzeExpr(target)
-    if !isPlace(t) then err(s"$what needs a variable, a field, or a dereference — something with an address")
+
+    t match
+      // A string is immutable, and it is worth saying so rather than reporting the absence of an
+      // address: writing one byte of UTF-8 is how a string stops being UTF-8.
+      case TIndex(recv, _, _) if recv.ty == Type.Str =>
+        err("a string is immutable, so its bytes have no address to write through")
+      case _ =>
+        if !isPlace(t) then err(s"$what needs a variable, a field, or a dereference — something with an address")
+
     t
   }
 

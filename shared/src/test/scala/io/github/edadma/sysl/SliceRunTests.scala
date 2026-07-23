@@ -162,13 +162,4 @@ class SliceRunTests extends AnyFreeSpec with RunSupport {
   "indexing past a view's end stops the program, even though the buffer is longer" in {
     exits(buf + "var s = buf[0..<2]\nvar i = 2\nprint(s[i])")
   }
-
-  private def exits(src: String): Unit = {
-    assume(Toolchain.clangAvailable, "clang not available")
-
-    Toolchain.compileAndRun(src) match {
-      case Right((code, _)) => code should not be 0
-      case Left(e)          => fail(e)
-    }
-  }
 }

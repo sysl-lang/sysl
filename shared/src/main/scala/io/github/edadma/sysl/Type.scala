@@ -46,7 +46,6 @@ object Type {
   case object Char extends Type { def llvm = "i32" }
 
   case object Bool extends Type { def llvm = "i1"  }
-  case object Str  extends Type { def llvm = "ptr" } // ptr to UTF-8 bytes
   case object Unit extends Type { def llvm = "void" }
 
   /** `*T` — a bare machine address: no length, no refcount, no checks, and a lifetime the
@@ -69,18 +68,30 @@ object Type {
     def llvm: String = s"[$length x ${elem.llvm}]"
   }
 
-  /** `[]T` — a view of elements someone else owns: the reference that keeps the storage alive,
-   * the first element, and how many there are. Every slice has the same layout, so the element
-   * type shows up only in the instructions that reach through it.
+  /** A view of elements someone else owns: the reference that keeps the storage alive, the first
+   * element, and how many there are. Every view has that same layout, so the element type shows
+   * up only in the instructions that reach through it — which is what lets a slice and a string
+   * share one implementation.
    */
-  case class Slice(elem: Type) extends Type {
+  sealed trait View extends Type {
+    def elem: Type
+
     def llvm: String = "{ ptr, ptr, i64 }"
   }
+
+  /** `[]T` — a view of any elements at all. */
+  case class Slice(elem: Type) extends View
+
+  /** A view of bytes that are well-formed UTF-8 and stay that way: the same three words a slice
+   * is, minus the ability to write through it. The validity invariant is what separates the two
+   * types, so converting a `[]u8` to a `string` is checked and the other direction is free.
+   */
+  case object Str extends View { def elem: Type = Byte }
 
   /** The element type of whatever a subscript may be applied to. */
   def element(t: Type): Option[Type] = t match
     case Array(_, e) => Some(e)
-    case Slice(e)    => Some(e)
+    case v: View     => Some(v.elem)
     case _           => None
 
   /** The type a `*T` or `&T` points at, for the one level of automatic dereference that field
@@ -95,6 +106,7 @@ object Type {
   val Int: Integer   = Integer(32, signed = true)
   val Real: Floating = Floating(64)
 
+  val Byte:  Integer = Integer(8, signed = false)
   val Usize: Integer = Integer(pointerBits, signed = false, pointerWidth = true)
   val Isize: Integer = Integer(pointerBits, signed = true, pointerWidth = true)
 
@@ -143,8 +155,10 @@ object Type {
     case _: Integer | _: Floating => true
     case _                        => false
 
-  /** Whether `<`, `<=`, `>`, `>=` are defined — the numeric types and `char`. */
-  def isOrdered(t: Type): Boolean = isNumeric(t) || t == Char
+  /** Whether `<`, `<=`, `>`, `>=` are defined — the numeric types, `char`, and `string`, which
+   * orders by its bytes and so, being well-formed UTF-8, by codepoint.
+   */
+  def isOrdered(t: Type): Boolean = isNumeric(t) || t == Char || t == Str
 
   /** Whether `==` and `!=` are defined. Everything ordered, plus the types that have equality
    * without an ordering: `bool`, and the two pointer-shaped modes, which compare by address.

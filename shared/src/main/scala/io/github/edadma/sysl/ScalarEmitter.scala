@@ -7,8 +7,12 @@ import scala.collection.mutable
  * Everything here follows from `01-scalar-types-and-operators.md` — arithmetic wraps at the
  * operand's declared width and never promotes, ordering distinguishes signed from unsigned,
  * and every conversion between types is one the programmer wrote.
+ *
+ * The two operations that are not scalar at all — comparing and printing a `string` — are
+ * dispatched from here because that is where an operator and a `print` argument arrive, but
+ * what they do with the bytes belongs to `StringEmitter`.
  */
-trait ScalarEmitter extends Emitter {
+trait ScalarEmitter extends StringEmitter {
 
   /** Arithmetic wraps at the operand's declared width, which plain LLVM integer instructions
    * already do — the width is in the type, so no masking is needed even for an odd one.
@@ -70,13 +74,19 @@ trait ScalarEmitter extends Emitter {
         case _    => sys.error(s"unreachable compare '$op'")
     case other => sys.error(s"unreachable compare on ${other.llvm}")
 
-  protected def compareValue(op: String, ty: Type, av: String, bv: String): String = {
-    val instr = if ty.isInstanceOf[Type.Floating] then "fcmp" else "icmp"
-    val r     = freshTemp()
-
-    emit(s"$r = $instr ${predicate(op, ty)} ${ty.llvm} $av, $bv")
-    r
-  }
+  protected def compareValue(op: String, ty: Type, av: String, bv: String): String =
+    // Two strings are ordered by their bytes, which is a call rather than an instruction; every
+    // operator then reads the same -1 / 0 / 1 the way it would read a subtraction.
+    if ty == Type.Str then
+      val c = strCmp(av, bv)
+      val r = freshTemp()
+      emit(s"$r = icmp ${predicate(op, Type.Int)} i32 $c, 0")
+      r
+    else
+      val instr = if ty.isInstanceOf[Type.Floating] then "fcmp" else "icmp"
+      val r     = freshTemp()
+      emit(s"$r = $instr ${predicate(op, ty)} ${ty.llvm} $av, $bv")
+      r
 
   // --- conversions ---------------------------------------------------------------------
 
@@ -138,24 +148,42 @@ trait ScalarEmitter extends Emitter {
 
   // --- print ---------------------------------------------------------------------------
 
+  /** `print` is one `printf` per run of arguments that `printf` can carry. A string breaks the
+   * run, because it is written by length rather than up to a terminator, so the format built so
+   * far is flushed — with the separator that would have preceded the string tacked on — and a
+   * new one starts after it.
+   */
   protected def genPrint(args: List[TExpr]): Unit = {
     val specs    = mutable.ListBuffer.empty[String]
     val callArgs = mutable.ListBuffer.empty[String]
 
-    for arg <- args do
+    def flush(tail: String): Unit =
+      if specs.nonEmpty || tail.nonEmpty then
+        val fmt = stringGlobal(specs.mkString + tail)
+        val r   = freshTemp()
+        emit(s"$r = call i32 (ptr, ...) @printf(${(s"ptr $fmt" :: callArgs.toList).mkString(", ")})")
+        specs.clear()
+        callArgs.clear()
+
+    for (arg, argIndex) <- args.zipWithIndex do
+      val sep = if argIndex == 0 then "" else " "
+
+      def spec(s: String, callArg: String): Unit = { specs += sep + s; callArgs += callArg }
+
       arg.ty match
         // Varargs promote, so a narrow value is widened here rather than left to the ABI.
         case i: Type.Integer =>
           val wide = if i.bits <= 32 then Type.Integer(32, i.signed) else Type.Integer(64, i.signed)
           val v    = convert(i, wide, genExpr(arg))
-          specs += (if i.signed then (if wide.bits == 32 then "%d" else "%lld")
-                    else if wide.bits == 32 then "%u"
-                    else "%llu")
-          callArgs += s"${wide.llvm} $v"
+          spec(
+            if i.signed then (if wide.bits == 32 then "%d" else "%lld")
+            else if wide.bits == 32 then "%u"
+            else "%llu",
+            s"${wide.llvm} $v",
+          )
 
         case f: Type.Floating =>
-          val v = convert(f, Type.Real, genExpr(arg))
-          specs += "%g"; callArgs += s"double $v"
+          spec("%g", s"double ${convert(f, Type.Real, genExpr(arg))}")
 
         case Type.Char =>
           charBuf = true
@@ -163,22 +191,22 @@ trait ScalarEmitter extends Emitter {
           val buf = emitAlloca(freshTemp(), "[5 x i8]")
           val enc = freshTemp()
           emit(s"$enc = call ptr @sysl.utf8(i32 $cp, ptr $buf)")
-          specs += "%s"; callArgs += s"ptr $enc"
+          spec("%s", s"ptr $enc")
 
-        case Type.Str => specs += "%s"; callArgs += s"ptr ${genExpr(arg)}"
+        case Type.Str =>
+          flush(sep)
+          printStr(genExpr(arg))
 
         case Type.Bool =>
           boolStrs = true
           val v   = genExpr(arg)
           val sel = freshTemp()
           emit(s"$sel = select i1 $v, ptr @.true, ptr @.false")
-          specs += "%s"; callArgs += s"ptr $sel"
+          spec("%s", s"ptr $sel")
 
         case other => sys.error(s"unreachable print of ${other.llvm}")
 
-    val fmt = stringGlobal(specs.mkString(" ") + "\n")
-    val r   = freshTemp()
-    emit(s"$r = call i32 (ptr, ...) @printf(${(s"ptr $fmt" :: callArgs.toList).mkString(", ")})")
+    flush("\n")
   }
 }
 

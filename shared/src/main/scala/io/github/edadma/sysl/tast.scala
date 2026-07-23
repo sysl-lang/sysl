@@ -40,21 +40,26 @@ case class TZero(ty: Type) extends TExpr
 /** `[a, b, c]` — an array value built from its elements. */
 case class TArrayLit(elems: List[TExpr], arrayTy: Type.Array) extends TExpr { def ty: Type = arrayTy }
 
-/** `a[i]` — one element of an array or slice, checked against the length. It is a *place* when
- * its receiver is one, which is what makes `a[i] = v` and `&a[i]` ordinary.
+/** `a[i]` — one element of an array, slice, or string, checked against the length. It is a
+ * *place* when its receiver is one, which is what makes `a[i] = v` and `&a[i]` ordinary.
  */
 case class TIndex(receiver: TExpr, index: TExpr, ty: Type) extends TExpr
 
-/** `a.len` — how many elements, as a `usize`. Constant for an array, a word of the header for
- * a slice.
+/** `a.len` — how many elements, as a `usize`. Constant for an array, a word of the view for a
+ * slice or a string, where it counts bytes.
  */
 case class TLen(receiver: TExpr) extends TExpr { def ty: Type = Type.Usize }
 
+/** `s.bytes` — a string's bytes, as a `[]u8`. The same three words the string already is, so
+ * this reinterprets rather than converts; only the validity guarantee is given up.
+ */
+case class TBytes(receiver: TExpr) extends TExpr { def ty: Type = Type.Slice(Type.Byte) }
+
 /** `a[lo..hi]` — a view of some of `base`'s elements. `base` is either the reference that owns
- * a heap array or another slice, so that one expression yields both where the elements are and
+ * a heap array or another view, so that one expression yields both where the elements are and
  * what keeps them alive. An absent bound is the start or the end.
  */
-case class TSlice(base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: Boolean, sliceTy: Type.Slice)
+case class TSlice(base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: Boolean, sliceTy: Type.View)
     extends TExpr {
   def ty: Type = sliceTy
 }

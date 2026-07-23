@@ -113,12 +113,11 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     case _: Type.Floating => "0.0"
     case Type.Char        => "0"
     case Type.Bool        => "0"
-    case Type.Str         => "null"
     case _: Type.Ptr      => "null"
     case _: Type.Ref      => "null"
     case _: Type.Struct   => "zeroinitializer"
     case _: Type.Array    => "zeroinitializer"
-    case _: Type.Slice    => "zeroinitializer"
+    case _: Type.View     => "zeroinitializer"
     case e: Type.Enum     => if e.simple then "0" else "zeroinitializer"
     case Type.Unit        => ""
 
@@ -242,7 +241,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
    */
   protected def genExpr(expr: TExpr): String = expr match
     case TIntLit(v, _) => v.toString
-    case TStrLit(s)    => stringGlobal(s)
+    case TStrLit(s)    => stringValue(s)
     case TBoolLit(b)   => if b then "1" else "0"
     case TNullLit(_)   => "null"
     case TUnitLit()    => ""
@@ -267,10 +266,15 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     case TLen(receiver) =>
       receiver.ty match
         case Type.Array(n, _) => genExpr(receiver); n.toString
-        case s: Type.Slice =>
+        case w: Type.View =>
           val v = genExpr(receiver)
-          val r = freshTemp(); emit(s"$r = extractvalue ${s.llvm} $v, 2"); r
+          val r = freshTemp(); emit(s"$r = extractvalue ${w.llvm} $v, 2"); r
         case other => sys.error(s"unreachable length of ${other.llvm}")
+
+    // A string and a `[]u8` are the same three words, so looking at one as the other is nothing
+    // at all — the guarantee that was given up is the analyzer's business, not the machine's.
+    case TBytes(receiver) =>
+      genExpr(receiver)
 
     // A narrower float is the `double` constant rounded to it, which folds away entirely.
     case TFloatLit(bits, ty) =>
@@ -408,11 +412,11 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
   private def elementAddr(receiver: TExpr, index: TExpr): String = {
     val (base, len, elem) = receiver.ty match
       case Type.Array(n, e) => (address(receiver), n.toString, e)
-      case s @ Type.Slice(e) =>
+      case w: Type.View =>
         val v = genExpr(receiver)
-        val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
-        val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
-        (p, l, e)
+        val p = freshTemp(); emit(s"$p = extractvalue ${w.llvm} $v, 1")
+        val l = freshTemp(); emit(s"$l = extractvalue ${w.llvm} $v, 2")
+        (p, l, w.elem)
       case other => sys.error(s"unreachable index into ${other.llvm}")
 
     val i = widen64(index)
@@ -420,17 +424,17 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, i64 $i"); r
   }
 
-  /** Takes a view of some of an array's or a slice's elements. The base is evaluated once and
-   * gives up three things — what keeps the elements alive, where the first of them is, and how
-   * many there are — and the view is built by narrowing the last two and taking a share of the
-   * first.
+  /** Takes a view of some of an array's, a slice's, or a string's elements. The base is evaluated
+   * once and gives up three things — what keeps the elements alive, where the first of them is,
+   * and how many there are — and the view is built by narrowing the last two and taking a share
+   * of the first.
    */
   private def genSlice(
       base: TExpr,
       lo: Option[TExpr],
       hi: Option[TExpr],
       inclusive: Boolean,
-      sliceTy: Type.Slice,
+      sliceTy: Type.View,
   ): String = {
     val elem = sliceTy.elem
 
@@ -439,7 +443,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
         val r = genExpr(base)
         val p = freshTemp(); emit(s"$p = getelementptr ${boxName(array)}, ptr $r, i32 0, i32 2")
         (r, p, n.toString)
-      case s: Type.Slice =>
+      case s: Type.View =>
         val v = genExpr(base)
         val o = freshTemp(); emit(s"$o = extractvalue ${s.llvm} $v, 0")
         val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
@@ -473,6 +477,12 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
 
     val ordered = freshTemp(); emit(s"$ordered = icmp ule i64 $start, $end")
     trapUnless(ordered, "bounds")
+
+    // A substring has to be a string, so both ends must fall between characters. This runs after
+    // the bounds checks, which is what makes reading the byte at either end safe.
+    if sliceTy == Type.Str then
+      trapUnless(strBoundary(first, len, start), "boundary")
+      trapUnless(strBoundary(first, len, end), "boundary")
 
     val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, i64 $start")
     val n = freshTemp(); emit(s"$n = sub i64 $end, $start")

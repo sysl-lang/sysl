@@ -18,4 +18,16 @@ trait RunSupport extends Matchers { this: Assertions =>
       case Left(err)          => fail(err)
     }
   }
+
+  /** Asserts that a program stops itself rather than running past a failed check. Every runtime
+   * check traps, so what is observable is the exit status, not the output.
+   */
+  protected def exits(src: String): Unit = {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    Toolchain.compileAndRun(src) match {
+      case Right((code, _)) => code should not be 0
+      case Left(err)        => fail(err)
+    }
+  }
 }

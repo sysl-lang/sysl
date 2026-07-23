@@ -63,7 +63,7 @@ private class Escape(program: TProgram) {
 
   /** Whether a value of this type could carry a view of somebody's elements. */
   private def carriesView(t: Type): Boolean = t match
-    case _: Type.Slice       => true
+    case _: Type.View        => true
     case Type.Array(_, elem) => carriesView(elem)
     case s: Type.Struct      => s.fields.exists(f => carriesView(f._2))
     case e: Type.Enum        => e.variants.exists(_.fields.exists(f => carriesView(f._2)))
@@ -108,6 +108,7 @@ private class Escape(program: TProgram) {
       case TArrayLit(elems, _)  => elems.exists(viewsFrame)
       case TField(r, _, _)      => viewsFrame(r)
       case TIndex(r, _, _)      => viewsFrame(r)
+      case TBytes(r)            => viewsFrame(r)
       case TStore(_, v, _)      => viewsFrame(v)
       case TIf(_, t, e, _)      => blockValue(t) || e.exists(blockValue)
       case TMatch(_, arms, _)   => arms.exists(a => blockValue(a.body))
@@ -224,6 +225,7 @@ private class Escape(program: TProgram) {
     case TArrayLit(elems, _)        => elems
     case TIndex(r, i, _)            => List(r, i)
     case TLen(r)                    => List(r)
+    case TBytes(r)                  => List(r)
     case TSlice(b, lo, hi, _, _)    => b :: lo.toList ::: hi.toList
     case TTry(v, _, _, _, _, _)     => List(v)
     case TField(r, _, _)            => List(r)

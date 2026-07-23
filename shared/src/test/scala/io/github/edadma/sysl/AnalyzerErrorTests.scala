@@ -286,4 +286,34 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
       err("f(s: []int) -> usize = s.len\nvar a = [1, 2]\nprint(f(a))") should include("is []int, but [2]int was given")
     }
   }
+
+  "strings" - {
+    "cannot be written through, since a string is immutable" in {
+      err("""var s = "ab"
+            |s[0] = 65""".stripMargin) should include("a string is immutable")
+    }
+
+    "cannot have their bytes pointed at either" in {
+      err("""var s = "ab"
+            |var p = &s[0]""".stripMargin) should include("a string is immutable")
+    }
+
+    "say which granularity a loop wants rather than choosing one" in {
+      err("""var s = "ab"
+            |for c in s do print(c)""".stripMargin) should include("iterated as 's.bytes'")
+    }
+
+    "have a length and their bytes, and no other field yet" in {
+      err("""print("ab".chars)""") should include("cannot read field 'chars'")
+    }
+
+    "are not a []u8 where one was asked for" in {
+      err("""f(b: []u8) -> usize = b.len
+            |print(f("ab"))""".stripMargin) should include("is []byte, but string was given")
+    }
+
+    "do not concatenate yet, since that would allocate" in {
+      err("""print("a" + "b")""") should include("'+' is not defined for string")
+    }
+  }
 }

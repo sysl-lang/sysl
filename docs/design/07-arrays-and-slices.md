@@ -21,6 +21,12 @@ never has to care where the bytes live.
 Both carry a length, so **every index is checked** — that is the whole point of preferring
 them to `*T` in allocator-free code (`03`).
 
+A `string` is the second of these with one thing added and one taken away: its bytes are
+guaranteed well-formed UTF-8, and nothing may write through it (`04`). Everything below about
+indexing, slicing, length, and ownership is therefore true of a string as well, and the places
+it is not are exactly the two the guarantee accounts for — a substring is checked for landing
+between characters, and `s[i] = v` does not exist.
+
 ## Writing one down
 
 **A literal** lists its elements and fixes the length from how many there are:

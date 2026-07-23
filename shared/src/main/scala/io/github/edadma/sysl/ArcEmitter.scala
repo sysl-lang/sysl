@@ -18,7 +18,7 @@ trait ArcEmitter extends Emitter {
    */
   protected def containsRef(t: Type): Boolean = t match
     case _: Type.Ref         => true
-    case _: Type.Slice       => true // the owner word, which may or may not be there
+    case _: Type.View        => true // the owner word, which may or may not be there
     case Type.Array(_, elem) => containsRef(elem)
     case s: Type.Struct      => s.fields.exists(f => containsRef(f._2))
     case e: Type.Enum        => e.variants.exists(_.fields.exists(f => containsRef(f._2)))
@@ -42,7 +42,7 @@ trait ArcEmitter extends Emitter {
       heap = true
       syncHeap ||= sync
       emit(s"call void @arc.retain${if sync then "_sync" else ""}(ptr $v)")
-    case s: Type.Slice       => emit(s"call void @arc.retain_maybe(ptr ${owner(s, v)})")
+    case w: Type.View        => emit(s"call void @arc.retain_maybe(ptr ${owner(w, v)})")
     case t if containsRef(t) => emit(s"call void @${valueHelper(t, retain = true)}(${t.llvm} $v)")
     case _                   => ()
 
@@ -52,14 +52,14 @@ trait ArcEmitter extends Emitter {
       heap = true
       syncHeap ||= sync
       emit(s"call void @arc.release${if sync then "_sync" else ""}(ptr $v)")
-    case s: Type.Slice       => emit(s"call void @arc.release_maybe(ptr ${owner(s, v)})")
+    case w: Type.View        => emit(s"call void @arc.release_maybe(ptr ${owner(w, v)})")
     case t if containsRef(t) => emit(s"call void @${valueHelper(t, retain = false)}(${t.llvm} $v)")
     case _                   => ()
 
-  /** The owner word of a slice value — the reference that keeps its elements alive, or null
-   * when they are static, on a frame, or reached through a `*T`.
+  /** The owner word of a view — the reference that keeps its elements alive, or null when they
+   * are static (every string literal), on a frame, or reached through a `*T`.
    */
-  protected def owner(ty: Type.Slice, v: String): String = {
+  protected def owner(ty: Type.View, v: String): String = {
     heap = true
     maybeHeap = true
     val o = freshTemp(); emit(s"$o = extractvalue ${ty.llvm} $v, 0"); o
@@ -248,9 +248,9 @@ object ArcEmitter {
    * Taking a share needs no ordering: a count you already hold cannot reach zero underneath you,
    * so the atomic form is a relaxed increment. Giving one back publishes with release ordering
    * and acquires before destroying, so the thread that frees sees every other domain's writes.
-   * The `_maybe` pair is for slices, whose owner is null when the elements are static, on a
-   * frame, or reached through a `*T`; the plain pair stays branch-free, since a reference is
-   * non-null by construction.
+   * The `_maybe` pair is for views — slices and strings — whose owner is null when the elements
+   * are static, on a frame, or reached through a `*T`; the plain pair stays branch-free, since a
+   * reference is non-null by construction.
    */
   val core: String =
     """%arc.header = type { i64, ptr }
@@ -316,7 +316,7 @@ object ArcEmitter {
       |
       |""".stripMargin
 
-  /** The null-tolerant pair, emitted only into a module that slices something. */
+  /** The null-tolerant pair, emitted only into a module that holds a view of something. */
   val maybe: String =
     """define private void @arc.retain_maybe(ptr %p) {
       |entry:

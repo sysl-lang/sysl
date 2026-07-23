@@ -1,8 +1,15 @@
 # Strings
 
-**Status:** representation and semantics decided; the API surface is sketched. This rests on
-the memory model (`03`) — a `string` is an immutable, validated `[]u8` and inherits its
-ownership rules from slices, so read that one first.
+**Status:** representation and semantics decided and implemented; the API surface is sketched,
+and the part of it that makes new bytes is not built. This rests on the memory model (`03`) — a
+`string` is an immutable, validated `[]u8` and inherits its ownership rules from slices, so read
+that one first, and `07` for the view machinery it shares.
+
+What exists: the three-word representation, literals, `s.len`, `s[i]`, `s[a..b]` with both the
+bounds and the boundary checked, `s.bytes`, comparison by bytes, and string literals as `match`
+patterns. What does not: every operation that produces new bytes — `from_utf8`, `copy()`,
+concatenation, `str.builder`, `cstring`, `string(c)` — since each needs either an allocator
+surface or methods. So every string a program can hold today traces back to a literal.
 
 ## The decision in one paragraph
 
@@ -65,17 +72,18 @@ named (`s.copy()`), and the hazard is documented rather than encoded.
 
 ### Immortal bytes
 
-A string literal is bytes in read-only data behind a header whose refcount holds a **sentinel
-value meaning "never freed."** Retain and release both test for it and do nothing. The
-practical consequences:
+A string literal is bytes in read-only data with **no owner at all** — the owner word is null,
+and retain and release both test for that and do nothing. The practical consequences:
 
-- A literal costs no allocation and no refcount traffic.
+- A literal costs no allocation and no refcount traffic. It is a *constant*, so it needs no
+  instruction to build either.
 - Allocator-free code can hold, pass, compare, and slice string literals — panic messages,
   device node names, format fragments — all of which a kernel needs constantly.
-- Any string derived from a literal by slicing is also immortal, because it shares the header.
+- Any string derived from a literal by slicing is also immortal, because it shares the owner.
 
-An implementation may instead spell "immortal" as a null `owner` and branch on it. Either way
-the observable rule is the same, and it is the rule the language documents.
+A sentinel refcount in a header would say the same thing, and was the first plan here. The null
+owner is better because it is not string-specific: it is already how a slice of static storage
+or of a `*T` region says "nothing to keep alive," so immortality needs no mechanism of its own.
 
 ## Validity
 
@@ -158,8 +166,12 @@ contain a NUL as an ordinary byte, so the conversion can fail or truncate and mu
 **One optimization is worth building in.** The compiler emits a NUL byte after every string
 literal in read-only data. It costs one byte, it is not counted in `len`, and it means passing
 a *literal* to a C function needs no allocation and no copy — which is what kernel and driver
-code actually does with strings. Swift does the same thing internally. A literal that itself
-contains a NUL is diagnosed rather than silently made unpassable.
+code actually does with strings. Swift does the same thing internally.
+
+A NUL *inside* a literal stays an ordinary byte — that is what carrying a length means, and
+`"a\0b"` has three bytes and prints as three. What such a literal loses is only the free ride to
+C, so that is where the diagnostic belongs: at the conversion, which can see that the bytes it
+was asked to hand over would be cut short. Passing one to C is an error, not a truncation.
 
 ## The allocator-free subset
 
