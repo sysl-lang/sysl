@@ -8,7 +8,12 @@ import org.scalatest.freespec.AnyFreeSpec
 class MethodParserTests extends AnyFreeSpec with ParseSupport {
 
   "a value-receiver method" in {
-    prog("struct Point\n    x: int\n    sum(self) -> int = self.x") shouldBe List(
+    val src =
+      """struct Point
+        |    x: int
+        |    sum(self) -> int = self.x""".stripMargin
+
+    prog(src) shouldBe List(
       StructDecl(
         "Point",
         Nil,
@@ -29,7 +34,13 @@ class MethodParserTests extends AnyFreeSpec with ParseSupport {
   }
 
   "a pointer-receiver method with parameters" in {
-    prog("struct P\n    x: int\n    shift(*self, dx: int)\n        self.x += dx") shouldBe List(
+    val src =
+      """struct P
+        |    x: int
+        |    shift(*self, dx: int)
+        |        self.x += dx""".stripMargin
+
+    prog(src) shouldBe List(
       StructDecl(
         "P",
         Nil,
@@ -50,7 +61,13 @@ class MethodParserTests extends AnyFreeSpec with ParseSupport {
   }
 
   "a reference receiver, plain and sync" in {
-    val members = prog("struct C\n    n: int\n    a(&self) = self.n\n    b(&sync self) = self.n") match {
+    val src =
+      """struct C
+        |    n: int
+        |    a(&self) = self.n
+        |    b(&sync self) = self.n""".stripMargin
+
+    val members = prog(src) match {
       case List(s: StructDecl) => s.members
       case other               => fail(other.toString)
     }
@@ -59,7 +76,12 @@ class MethodParserTests extends AnyFreeSpec with ParseSupport {
   }
 
   "a computed property" in {
-    prog("struct P\n    x: int\n    doubled -> int = self.x * 2") shouldBe List(
+    val src =
+      """struct P
+        |    x: int
+        |    doubled -> int = self.x * 2""".stripMargin
+
+    prog(src) shouldBe List(
       StructDecl(
         "P",
         Nil,
@@ -80,7 +102,12 @@ class MethodParserTests extends AnyFreeSpec with ParseSupport {
   }
 
   "an associated function has no receiver" in {
-    prog("struct P\n    x: int\n    origin() -> P = P(0)") shouldBe List(
+    val src =
+      """struct P
+        |    x: int
+        |    origin() -> P = P(0)""".stripMargin
+
+    prog(src) shouldBe List(
       StructDecl(
         "P",
         Nil,
@@ -101,7 +128,13 @@ class MethodParserTests extends AnyFreeSpec with ParseSupport {
   }
 
   "fields and members intermix, and a field still parses after a member" in {
-    val s = prog("struct P\n    x: int\n    sum(self) -> int = self.x\n    y: int") match {
+    val src =
+      """struct P
+        |    x: int
+        |    sum(self) -> int = self.x
+        |    y: int""".stripMargin
+
+    val s = prog(src) match {
       case List(s: StructDecl) => s
       case other               => fail(other.toString)
     }

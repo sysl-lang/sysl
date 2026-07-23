@@ -319,36 +319,68 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "methods" - {
     "a '&self' method rejects a bare stack value" in {
-      err("struct C\n    n: int\n    bump(&self)\n        self.n += 1\nvar c = C(0)\nc.bump()") should
-        include("'&self' needs a reference")
+      err(
+        """struct C
+          |    n: int
+          |    bump(&self)
+          |        self.n += 1
+          |var c = C(0)
+          |c.bump()""".stripMargin
+      ) should include("'&self' needs a reference")
     }
 
     "a property is read without parentheses" in {
-      err("struct P\n    x: int\n    twice -> int = self.x * 2\nvar p = P(1)\nprint(p.twice())") should
-        include("is a property")
+      err(
+        """struct P
+          |    x: int
+          |    twice -> int = self.x * 2
+          |var p = P(1)
+          |print(p.twice())""".stripMargin
+      ) should include("is a property")
     }
 
     "a method is called with parentheses" in {
-      err("struct P\n    x: int\n    twice(self) -> int = self.x * 2\nvar p = P(1)\nprint(p.twice)") should
-        include("is a method")
+      err(
+        """struct P
+          |    x: int
+          |    twice(self) -> int = self.x * 2
+          |var p = P(1)
+          |print(p.twice)""".stripMargin
+      ) should include("is a method")
     }
 
     "an unknown method is reported against its type" in {
-      err("struct P\n    x: int\nvar p = P(1)\nprint(p.area())") should include("no method 'area'")
+      err(
+        """struct P
+          |    x: int
+          |var p = P(1)
+          |print(p.area())""".stripMargin
+      ) should include("no method 'area'")
     }
 
     "an unknown associated function is reported against its type" in {
-      err("struct P\n    x: int\n    id(self) -> int = self.x\nvar p = P.make()") should
-        include("no associated function 'make'")
+      err(
+        """struct P
+          |    x: int
+          |    id(self) -> int = self.x
+          |var p = P.make()""".stripMargin
+      ) should include("no associated function 'make'")
     }
 
     "a member may not share a name with a field" in {
-      err("struct P\n    x: int\n    x(self) -> int = 1") should include("both a field and a member")
+      err(
+        """struct P
+          |    x: int
+          |    x(self) -> int = 1""".stripMargin
+      ) should include("both a field and a member")
     }
 
     "a member on a generic type waits on the generics work" in {
-      err("struct Box[T]\n    value: T\n    get(self) -> T = self.value") should
-        include("members of a generic type are not supported yet")
+      err(
+        """struct Box[T]
+          |    value: T
+          |    get(self) -> T = self.value""".stripMargin
+      ) should include("members of a generic type are not supported yet")
     }
   }
 }
