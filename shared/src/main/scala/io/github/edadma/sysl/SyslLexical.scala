@@ -74,6 +74,7 @@ class SyslLexical
     "in",
     "match",
     "struct",
+    "enum",
     "return",
     "weak",
     "no",

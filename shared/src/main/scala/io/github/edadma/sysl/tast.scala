@@ -49,6 +49,13 @@ case class TCall(name: String, args: List[TExpr], ty: Type) extends TExpr
 /** Positional construction of a value struct. */
 case class TStructNew(struct: Type.Struct, args: List[TExpr]) extends TExpr { def ty: Type = struct }
 
+/** Construction of an enum value: a simple enum's integer constant, or a data enum's variant
+ * (with `args` for a data-carrying variant, empty for a nullary one).
+ */
+case class TEnumNew(enumTy: Type.Enum, variant: Type.EnumVariant, args: List[TExpr]) extends TExpr {
+  def ty: Type = enumTy
+}
+
 /** Read field `index` of a struct value. */
 case class TField(receiver: TExpr, index: Int, ty: Type) extends TExpr
 
@@ -61,13 +68,34 @@ case class TIf(cond: TExpr, thenBlock: TBlock, elseBlock: Option[TBlock], ty: Ty
 /** `match scrutinee` — arms are tried in order; `ty` is the common arm type (or unit). */
 case class TMatch(scrutinee: TExpr, arms: List[TArm], ty: Type) extends TExpr
 
-/** One arm: the scrutinee matches if any test holds and the guard (if any) is true. */
-case class TArm(tests: List[TArmTest], guard: Option[TExpr], body: TBlock)
+/** One arm: the scrutinee matches if any alternative pattern holds and the guard (if any) is
+ * true. Only non-binding patterns may share an arm as alternatives.
+ */
+case class TArm(patterns: List[TPattern], guard: Option[TExpr], body: TBlock)
 
-sealed trait TArmTest
-case class TEqTest(value: TExpr)                                extends TArmTest
-case class TRangeTest(lo: TExpr, hi: TExpr, inclusive: Boolean) extends TArmTest
-case object TWildTest                                          extends TArmTest
+/** A typed pattern, matched against a value of type `ty`. Patterns are recursive: a variant
+ * pattern's sub-patterns match the payload fields, which may themselves be variants.
+ */
+sealed trait TPattern { def ty: Type }
+
+/** `_` — matches anything, binds nothing. */
+case class TWildPattern(ty: Type) extends TPattern
+
+/** A binding: matches anything and stores the value in a fresh local. */
+case class TBindPattern(name: String, ty: Type) extends TPattern
+
+/** A scalar literal: matches a value equal to it. */
+case class TLitPattern(value: TExpr) extends TPattern { def ty: Type = value.ty }
+
+/** A scalar range `lo..hi` / `lo..<hi`. */
+case class TRangePattern(lo: TExpr, hi: TExpr, inclusive: Boolean) extends TPattern { def ty: Type = lo.ty }
+
+/** A data-enum variant `V(sub…)`: matches when the tag is the variant's, then recurses into
+ * each payload field with the corresponding sub-pattern.
+ */
+case class TVariantPattern(enumTy: Type.Enum, variant: Type.EnumVariant, args: List[TPattern]) extends TPattern {
+  def ty: Type = enumTy
+}
 
 /** A block: a sequence of statements optionally ending in a value expression. When `result`
  * is `None` the block's type is `unit`.
@@ -87,7 +115,13 @@ case class TReturn(value: Option[TExpr])                  extends TStmt
  */
 case class TFunc(name: String, params: List[(String, Type)], retTy: Type, body: TBlock)
 
-/** A whole program: hoisted struct and function declarations, plus the top-level statements
- * that make up `main`.
+/** A whole program: hoisted struct, enum, and function declarations, plus the top-level
+ * statements that make up `main`. Only data enums appear in `enums` — a simple enum lowers to
+ * `i32` and needs no type declaration.
  */
-case class TProgram(structs: List[Type.Struct], funcs: List[TFunc], main: List[TStmt])
+case class TProgram(
+    structs: List[Type.Struct],
+    enums: List[Type.Enum],
+    funcs: List[TFunc],
+    main: List[TStmt],
+)

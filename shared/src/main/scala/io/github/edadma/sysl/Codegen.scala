@@ -75,6 +75,13 @@ class Codegen private (program: TProgram) {
       out ++= s"${s.llvm} = type { ${s.fields.map(_._2.llvm).mkString(", ")} }\n"
     if program.structs.nonEmpty then out ++= "\n"
 
+    for e <- program.enums do
+      for v <- e.variants if v.payloadSlot.isDefined do
+        out ++= s"${e.payloadLlvm(v)} = type { ${v.fields.map(_._2.llvm).mkString(", ")} }\n"
+      val slots = "i32" :: e.variants.collect { case v if v.payloadSlot.isDefined => e.payloadLlvm(v) }
+      out ++= s"${e.llvm} = type { ${slots.mkString(", ")} }\n"
+    if program.enums.nonEmpty then out ++= "\n"
+
     if boolStrs then
       out ++= "@.true = private constant [5 x i8] c\"true\\00\"\n"
       out ++= "@.false = private constant [6 x i8] c\"false\\00\"\n"
@@ -118,6 +125,7 @@ class Codegen private (program: TProgram) {
     case Type.Real      => "0x0000000000000000"
     case Type.Str       => "null"
     case _: Type.Struct => "zeroinitializer"
+    case e: Type.Enum   => if e.simple then "0" else "zeroinitializer"
     case Type.Unit      => ""
 
   // --- statements ----------------------------------------------------------------------
@@ -241,6 +249,24 @@ class Codegen private (program: TProgram) {
         acc = r
       acc
 
+    case TEnumNew(en, variant, args) =>
+      if en.simple then variant.tag.toString
+      else
+        val tagged = freshTemp()
+        emit(s"$tagged = insertvalue ${en.llvm} undef, i32 ${variant.tag}, 0")
+        variant.payloadSlot match
+          case None => tagged
+          case Some(slot) =>
+            val vals    = args.map(genExpr)
+            var payload = "undef"
+            for (v, i) <- vals.zipWithIndex do
+              val r = freshTemp()
+              emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, ${variant.fields(i)._2.llvm} $v, $i")
+              payload = r
+            val r = freshTemp()
+            emit(s"$r = insertvalue ${en.llvm} $tagged, ${en.payloadLlvm(variant)} $payload, $slot")
+            r
+
     case TField(receiver, index, ty) =>
       val rv = genExpr(receiver); val r = freshTemp()
       emit(s"$r = extractvalue ${receiver.ty.llvm} $rv, $index"); r
@@ -299,32 +325,95 @@ class Codegen private (program: TProgram) {
       val bodyL = freshLabel("match.arm")
       val nextL = freshLabel("match.next")
       val patCond =
-        arm.tests.map(armTest(_, sty, sv)).reduce { (a, b) => val r = freshTemp(); emit(s"$r = or i1 $a, $b"); r }
-      val cond = arm.guard match
-        case Some(g) => val gv = genExpr(g); val r = freshTemp(); emit(s"$r = and i1 $patCond, $gv"); r
-        case None    => patCond
-      emitTerm(s"br i1 $cond, label %$bodyL, label %$nextL")
-      emitLabel(bodyL)
+        arm.patterns.map(patternTest(_, sty, sv)).reduce(orI1)
+
+      // Bindings are established only after the pattern matches, and a guard may reference them,
+      // so a guarded arm branches first on the pattern, then binds, then tests the guard.
+      // Only a single (non-alternative) pattern may bind.
+      def bind(): Unit = if arm.patterns.length == 1 then patternBind(arm.patterns.head, sty, sv)
+
+      arm.guard match
+        case None =>
+          emitTerm(s"br i1 $patCond, label %$bodyL, label %$nextL")
+          emitLabel(bodyL)
+          bind()
+        case Some(g) =>
+          val guardL = freshLabel("match.guard")
+          emitTerm(s"br i1 $patCond, label %$guardL, label %$nextL")
+          emitLabel(guardL)
+          bind()
+          emitTerm(s"br i1 ${genExpr(g)}, label %$bodyL, label %$nextL")
+          emitLabel(bodyL)
+
       if ty == Type.Unit then genBlockVoid(arm.body)
       else emit(s"store ${ty.llvm} ${genBlockValue(arm.body)}, ptr $slot")
       emitTerm(s"br label %$endL")
       emitLabel(nextL)
 
-    // Fallthrough with no matching arm: a value match is exhaustive (the analyzer required a
-    // catch-all), so this point is unreachable; a statement match simply proceeds.
+    // Fallthrough with no matching arm: a value or enum match is exhaustive (the analyzer
+    // required full coverage or a catch-all), so this point is unreachable; a plain scalar
+    // statement match simply proceeds.
     if ty == Type.Unit then emitTerm(s"br label %$endL") else emitTerm("unreachable")
     emitLabel(endL)
     if ty == Type.Unit then "" else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); r }
   }
 
-  /** The i1 result of one pattern test against the scrutinee value. */
-  private def armTest(test: TArmTest, sty: Type, sv: String): String = test match
-    case TWildTest      => "true"
-    case TEqTest(value) => compareValue("==", sty, sv, genExpr(value))
-    case TRangeTest(lo, hi, inclusive) =>
-      val loOk = compareValue(">=", sty, sv, genExpr(lo))
-      val hiOk = compareValue(if inclusive then "<=" else "<", sty, sv, genExpr(hi))
-      val r = freshTemp(); emit(s"$r = and i1 $loOk, $hiOk"); r
+  /** The i1 result of testing a pattern against a value of type `ty`. Pattern tests are pure
+   * value reads (`extractvalue`, comparisons), so nested variant fields are extracted and
+   * tested unconditionally — a failed outer tag simply ANDs a `false` through.
+   */
+  private def patternTest(p: TPattern, ty: Type, value: String): String = p match
+    case _: TWildPattern | _: TBindPattern => "true"
+    case TLitPattern(v)                    => compareValue("==", v.ty, value, genExpr(v))
+    case TRangePattern(lo, hi, inclusive) =>
+      val loOk = compareValue(">=", lo.ty, value, genExpr(lo))
+      val hiOk = compareValue(if inclusive then "<=" else "<", hi.ty, value, genExpr(hi))
+      andI1(loOk, hiOk)
+    case TVariantPattern(en, variant, args) =>
+      val tagVal =
+        if en.simple then value
+        else { val t = freshTemp(); emit(s"$t = extractvalue ${en.llvm} $value, 0"); t }
+      val tagOk = freshTemp(); emit(s"$tagOk = icmp eq i32 $tagVal, ${variant.tag}")
+      if args.isEmpty then tagOk
+      else
+        val payload = freshTemp()
+        emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
+        args.zipWithIndex.foldLeft(tagOk) { case (acc, (arg, i)) =>
+          val fv = freshTemp(); emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, $i")
+          andI1(acc, patternTest(arg, variant.fields(i)._2, fv))
+        }
+
+  /** Establishes the bindings a pattern introduces, once its arm has been taken. Only binding
+   * and (nested) variant patterns carry bindings; the rest are no-ops.
+   */
+  private def patternBind(p: TPattern, ty: Type, value: String): Unit = p match
+    case TBindPattern(name, bty) =>
+      emit(s"%$name.addr = alloca ${bty.llvm}")
+      emit(s"store ${bty.llvm} $value, ptr %$name.addr")
+    case TVariantPattern(en, variant, args) if args.exists(bindsAny) =>
+      val payload = freshTemp()
+      emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
+      for (arg, i) <- args.zipWithIndex do
+        val fv = freshTemp(); emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, $i")
+        patternBind(arg, variant.fields(i)._2, fv)
+    case _ => ()
+
+  private def bindsAny(p: TPattern): Boolean = p match
+    case _: TBindPattern    => true
+    case v: TVariantPattern => v.args.exists(bindsAny)
+    case _                  => false
+
+  /** ANDs / ORs two i1 values, folding away the `"true"` immediate a trivially-true pattern
+   * produces so the emitted condition stays readable.
+   */
+  private def andI1(a: String, b: String): String =
+    if a == "true" then b
+    else if b == "true" then a
+    else { val r = freshTemp(); emit(s"$r = and i1 $a, $b"); r }
+
+  private def orI1(a: String, b: String): String =
+    if a == "true" || b == "true" then "true"
+    else { val r = freshTemp(); emit(s"$r = or i1 $a, $b"); r }
 
   private def genBlockVoid(b: TBlock): Unit = {
     b.stmts.foreach(genStmt)

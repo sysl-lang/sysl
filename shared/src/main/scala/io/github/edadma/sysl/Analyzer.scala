@@ -21,7 +21,14 @@ class Analyzer private (program: Program) {
 
   private val structDecls = mutable.LinkedHashMap.empty[String, StructDecl]
   private val structCache = mutable.LinkedHashMap.empty[String, Type.Struct]
+  private val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
+  private val enumCache   = mutable.LinkedHashMap.empty[String, Type.Enum]
   private val funcSigs    = mutable.LinkedHashMap.empty[String, (List[(String, Type)], Type)]
+
+  /** Every enum variant name maps to its enum, so a bare `Circle(5)` or `Empty` resolves
+   * without qualification. Variant names are therefore unique across all enums.
+   */
+  private val variantOf = mutable.HashMap.empty[String, Type.Enum]
 
   // Per-function state, reset at each function boundary.
   private var scopes: List[mutable.LinkedHashMap[String, (String, Type)]] = Nil
@@ -32,6 +39,7 @@ class Analyzer private (program: Program) {
 
   private def show(t: Type): String = t match
     case s: Type.Struct => s.name
+    case e: Type.Enum   => e.name
     case Type.Int       => "int"
     case Type.Real      => "real"
     case Type.Bool      => "bool"
@@ -64,8 +72,11 @@ class Analyzer private (program: Program) {
     unique
   }
 
+  private def lookupOpt(name: String): Option[(String, Type)] =
+    scopes.collectFirst { case s if s.contains(name) => s(name) }
+
   private def lookup(name: String): (String, Type) =
-    scopes.collectFirst { case s if s.contains(name) => s(name) }.getOrElse(err(s"undefined name '$name'"))
+    lookupOpt(name).getOrElse(err(s"undefined name '$name'"))
 
   // --- type resolution -----------------------------------------------------------------
 
@@ -78,6 +89,7 @@ class Analyzer private (program: Program) {
         case "string"       => Type.Str
         case "unit"         => Type.Unit
         case other if structDecls.contains(other) => resolveStruct(other)
+        case other if enumDecls.contains(other)   => resolveEnum(other)
         case other                                => err(s"unknown type '$other'")
 
   private def resolveStruct(name: String): Type.Struct =
@@ -88,16 +100,57 @@ class Analyzer private (program: Program) {
       },
     )
 
+  /** Builds an enum type from its declaration. All-dataless variants make a *simple* enum
+   * (integer constants, auto-incrementing from an optional explicit `= value`); any
+   * data-carrying variant makes a *data* enum, whose variants take sequential tags and whose
+   * payload-bearing variants each claim a slot in the aggregate.
+   */
+  private def resolveEnum(name: String): Type.Enum =
+    enumCache.getOrElseUpdate(
+      name, {
+        val decl   = enumDecls(name)
+        val simple = decl.variants.forall(_.fields.isEmpty)
+        var nextTag  = 0
+        var nextSlot = 1
+        val variants = decl.variants.map { v =>
+          if simple then
+            val tag = v.value match
+              case Some(IntLit(n, _)) => n.toInt
+              case Some(_)            => err(s"the value of variant '${v.name}' must be an integer literal")
+              case None               => nextTag
+            nextTag = tag + 1
+            Type.EnumVariant(v.name, tag, Nil, None)
+          else
+            if v.value.isDefined then
+              err(s"variant '${v.name}' carries data, so it cannot also have an explicit value")
+            val tag    = nextTag; nextTag += 1
+            val fields = v.fields.map(f => (f.name, resolveType(f.typ)))
+            val slot   = if fields.nonEmpty then { val s = nextSlot; nextSlot += 1; Some(s) } else None
+            Type.EnumVariant(v.name, tag, fields, slot)
+        }
+        val en = Type.Enum(name, simple, variants)
+        for v <- variants do
+          if variantOf.contains(v.name) then
+            err(s"variant name '${v.name}' is already used by enum '${variantOf(v.name).name}'")
+          variantOf(v.name) = en
+        en
+      },
+    )
+
   // --- program -------------------------------------------------------------------------
 
   private def analyze(): TProgram = {
     for stmt <- program.body do
       stmt match
         case s: StructDecl =>
-          if structDecls.contains(s.name) then err(s"struct '${s.name}' is already declared")
+          if typeNameTaken(s.name) then err(s"type '${s.name}' is already declared")
           structDecls(s.name) = s
+        case e: EnumDecl =>
+          if typeNameTaken(e.name) then err(s"type '${e.name}' is already declared")
+          enumDecls(e.name) = e
         case _ =>
 
+    enumDecls.keys.foreach(resolveEnum)
     structDecls.keys.foreach(resolveStruct)
 
     for stmt <- program.body do
@@ -112,16 +165,21 @@ class Analyzer private (program: Program) {
     val tfuncs = program.body.collect { case f: FuncDecl => analyzeFunc(f) }
 
     val mainStmts = program.body.filter {
-      case _: FuncDecl | _: StructDecl => false
-      case _                           => true
+      case _: FuncDecl | _: StructDecl | _: EnumDecl => false
+      case _                                         => true
     }
 
     resetFunction()
     retTy = Type.Int
     val tmain = mainStmts.map(analyzeStmt)
 
-    TProgram(structDecls.values.map(d => resolveStruct(d.name)).toList, tfuncs, tmain)
+    val tstructs = structDecls.keys.map(resolveStruct).toList
+    val tenums   = enumDecls.keys.map(resolveEnum).filterNot(_.simple).toList
+    TProgram(tstructs, tenums, tfuncs, tmain)
   }
+
+  /** A struct and an enum share one type namespace, so a name may name at most one of them. */
+  private def typeNameTaken(name: String): Boolean = structDecls.contains(name) || enumDecls.contains(name)
 
   private def analyzeFunc(f: FuncDecl): TFunc = {
     val (params, rt) = funcSigs(f.name)
@@ -143,17 +201,22 @@ class Analyzer private (program: Program) {
    */
   private def analyzeValueBlock(stmts: List[Stmt]): TBlock = {
     pushScope()
-    val tb =
-      stmts.reverse match
-        case ExprStmt(e) :: initRev =>
-          val init = initRev.reverse.map(analyzeStmt)
-          val tr   = analyzeExpr(e)
-          TBlock(init, Some(tr), tr.ty)
-        case _ =>
-          TBlock(stmts.map(analyzeStmt), None, Type.Unit)
+    val tb = analyzeBlockBody(stmts)
     popScope()
     tb
   }
+
+  /** The body of a value block, using whatever scope the caller has established — a match arm
+   * runs this after declaring its pattern bindings, so they are visible to the body.
+   */
+  private def analyzeBlockBody(stmts: List[Stmt]): TBlock =
+    stmts.reverse match
+      case ExprStmt(e) :: initRev =>
+        val init = initRev.reverse.map(analyzeStmt)
+        val tr   = analyzeExpr(e)
+        TBlock(init, Some(tr), tr.ty)
+      case _ =>
+        TBlock(stmts.map(analyzeStmt), None, Type.Unit)
 
   /** A statement sequence used only for its effects (a loop body): a fresh scope, no value. */
   private def analyzeStmts(stmts: List[Stmt]): List[TStmt] = {
@@ -203,8 +266,8 @@ class Analyzer private (program: Program) {
         case _                             =>
       TReturn(tv)
 
-    case _: FuncDecl | _: StructDecl =>
-      err("functions and structs may only be declared at the top level")
+    case _: FuncDecl | _: StructDecl | _: EnumDecl =>
+      err("functions, structs, and enums may only be declared at the top level")
 
   // --- expressions ---------------------------------------------------------------------
 
@@ -222,8 +285,15 @@ class Analyzer private (program: Program) {
     case UnitLit()      => TUnitLit()
 
     case Ident(name) =>
-      val (u, ty) = lookup(name)
-      TLoad(u, ty)
+      lookupOpt(name) match
+        case Some((u, ty)) => TLoad(u, ty)
+        case None =>
+          variantOf.get(name) match
+            case Some(en) =>
+              val v = en.variant(name).get
+              if v.fields.nonEmpty then err(s"variant '$name' carries data — construct it with '$name(…)'")
+              TEnumNew(en, v, Nil)
+            case None => err(s"undefined name '$name'")
 
     case Binary(op @ ("&&" | "||"), l, r) =>
       TLogical(op, analyzeBool(l), analyzeBool(r))
@@ -296,10 +366,23 @@ class Analyzer private (program: Program) {
       TPrint(args.map { a =>
         val t = analyzeExpr(a)
         t.ty match
-          case Type.Unit      => err("cannot print a unit value")
-          case _: Type.Struct => err(s"cannot print a ${show(t.ty)} value")
-          case _              => t
+          case Type.Unit                     => err("cannot print a unit value")
+          case _: Type.Struct | _: Type.Enum => err(s"cannot print a ${show(t.ty)} value")
+          case _                             => t
       })
+
+    case Call(Ident(name), args) if variantOf.contains(name) =>
+      val en = variantOf(name)
+      val v  = en.variant(name).get
+      if v.fields.isEmpty then err(s"variant '$name' takes no arguments — write it as '$name'")
+      if args.length != v.fields.length then
+        err(s"variant '$name' has ${v.fields.length} fields, but ${args.length} were given")
+      val targs = args.zip(v.fields).map { case (a, (fname, fty)) =>
+        val t = analyzeExpr(a)
+        if t.ty != fty then err(s"field '$fname' of '$name' is ${show(fty)}, but ${show(t.ty)} was given")
+        t
+      }
+      TEnumNew(en, v, targs)
 
     case Call(Ident(name), args) if structDecls.contains(name) =>
       val s = resolveStruct(name)
@@ -329,6 +412,13 @@ class Analyzer private (program: Program) {
     case Call(_, _) =>
       err("the thing being called must be a name")
 
+    case Field(Ident(n), f) if lookupOpt(n).isEmpty && enumDecls.contains(n) =>
+      val en = resolveEnum(n)
+      en.variant(f) match
+        case Some(v) if v.fields.isEmpty => TEnumNew(en, v, Nil)
+        case Some(_)                     => err(s"variant '$n.$f' carries data — construct it with '$f(…)'")
+        case None                        => err(s"enum '$n' has no variant '$f'")
+
     case Field(receiver, f) =>
       val tr = analyzeExpr(receiver)
       tr.ty match
@@ -351,31 +441,9 @@ class Analyzer private (program: Program) {
       TIf(tc, tThen, tElse, ty)
 
     case MatchExpr(scrut, arms) =>
-      val ts = analyzeExpr(scrut)
-      val tarms = arms.map { arm =>
-        val tests = arm.patterns.map {
-          case LitPattern(v) =>
-            val t = analyzeExpr(v)
-            if t.ty != ts.ty then err(s"pattern is ${show(t.ty)} but the value is ${show(ts.ty)}")
-            TEqTest(t)
-          case RangePattern(lo, hi, inclusive) =>
-            val tl = analyzeExpr(lo)
-            val th = analyzeExpr(hi)
-            if tl.ty != ts.ty || th.ty != ts.ty then err(s"range pattern must match the ${show(ts.ty)} value")
-            TRangeTest(tl, th, inclusive)
-          case WildcardPattern =>
-            TWildTest
-        }
-        TArm(tests, arm.guard.map(analyzeBool), analyzeValueBlock(arm.body))
-      }
-      val hasCatchAll = tarms.exists(a => a.guard.isEmpty && a.tests.contains(TWildTest))
-      val bodyTys     = tarms.map(_.body.ty).distinct
-      val ty =
-        if bodyTys.size == 1 && bodyTys.head != Type.Unit then
-          if !hasCatchAll then err("a 'match' that yields a value must be exhaustive — add an 'else' arm")
-          bodyTys.head
-        else Type.Unit
-      TMatch(ts, tarms, ty)
+      val ts    = analyzeExpr(scrut)
+      val tarms = arms.map(analyzeArm(ts.ty, _))
+      TMatch(ts, tarms, matchResultType(ts.ty, tarms))
 
     case _: RangeExpr =>
       err("a range is only allowed in a 'for' loop or a 'match' pattern")
@@ -389,6 +457,101 @@ class Analyzer private (program: Program) {
     val (u, ty) = lookup(name)
     if ty != Type.Int then err(s"'$op' is only defined for int")
     TIncDec(u, op, pre)
+  }
+
+  // --- match arms and patterns ---------------------------------------------------------
+
+  /** Analyzes one arm in its own scope so pattern bindings are visible to the guard and body.
+   * Alternatives (`a | b`) may not bind, since the body cannot know which alternative matched.
+   */
+  private def analyzeArm(scrutTy: Type, arm: MatchArm): TArm = {
+    pushScope()
+    val tpats = arm.patterns.map(analyzePattern(_, scrutTy))
+    if tpats.length > 1 && tpats.exists(binds) then
+      err("alternative patterns joined by '|' cannot bind a name")
+    val tguard = arm.guard.map(analyzeBool)
+    val tbody  = analyzeBlockBody(arm.body)
+    popScope()
+    TArm(tpats, tguard, tbody)
+  }
+
+  /** Turns one pattern into its typed form, declaring any bindings into the current scope. A
+   * bare name is a nullary-variant pattern when it names a variant of the scrutinee's enum, and
+   * a binding otherwise.
+   */
+  private def analyzePattern(p: Pattern, ty: Type): TPattern = p match
+    case WildcardPattern => TWildPattern(ty)
+
+    case LitPattern(v) =>
+      val t = analyzeExpr(v)
+      if t.ty != ty then err(s"pattern is ${show(t.ty)} but the value is ${show(ty)}")
+      TLitPattern(t)
+
+    case RangePattern(lo, hi, inclusive) =>
+      if ty != Type.Int && ty != Type.Real then err(s"a range pattern needs a numeric value, not ${show(ty)}")
+      val tl = analyzeExpr(lo)
+      val th = analyzeExpr(hi)
+      if tl.ty != ty || th.ty != ty then err(s"range pattern must match the ${show(ty)} value")
+      TRangePattern(tl, th, inclusive)
+
+    case IdentPattern(name) =>
+      ty match
+        case en: Type.Enum if en.variant(name).exists(_.fields.isEmpty) =>
+          TVariantPattern(en, en.variant(name).get, Nil)
+        case en: Type.Enum if en.variant(name).isDefined =>
+          err(s"variant '$name' carries data — match it as '$name(…)'")
+        case _ =>
+          TBindPattern(declare(name, ty), ty)
+
+    case VariantPattern(name, args) =>
+      ty match
+        case en: Type.Enum =>
+          en.variant(name) match
+            case Some(v) if v.fields.isEmpty =>
+              err(s"variant '$name' takes no arguments — match it as '$name'")
+            case Some(v) =>
+              if args.length != v.fields.length then
+                err(s"variant '$name' has ${v.fields.length} fields, but ${args.length} sub-patterns were given")
+              TVariantPattern(en, v, args.zip(v.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
+            case None =>
+              err(s"enum '${en.name}' has no variant '$name'")
+        case other =>
+          err(s"'$name(…)' matches an enum variant, but the value is ${show(other)}")
+
+  /** Whether a pattern binds any name (directly or inside a variant's sub-patterns). */
+  private def binds(p: TPattern): Boolean = p match
+    case _: TBindPattern         => true
+    case v: TVariantPattern      => v.args.exists(binds)
+    case _                       => false
+
+  /** A pattern that always matches, so an unguarded arm carrying it is a catch-all. */
+  private def irrefutable(p: TPattern): Boolean = p match
+    case _: TWildPattern | _: TBindPattern => true
+    case _                                 => false
+
+  /** Checks exhaustiveness and returns the value type of a match (`unit` unless every arm
+   * yields the same non-unit type). An enum match must cover every variant or carry a
+   * catch-all; a scalar match need only be exhaustive when it is used for a value.
+   */
+  private def matchResultType(scrutTy: Type, arms: List[TArm]): Type = {
+    val bodyTys = arms.map(_.body.ty).distinct
+    val valueTy = if bodyTys.size == 1 && bodyTys.head != Type.Unit then bodyTys.head else Type.Unit
+
+    val hasCatchAll = arms.exists(a => a.guard.isEmpty && a.patterns.exists(irrefutable))
+
+    scrutTy match
+      case en: Type.Enum =>
+        val covered = arms.filter(_.guard.isEmpty).flatMap(_.patterns).collect {
+          case v: TVariantPattern if v.args.forall(irrefutable) => v.variant.tag
+        }.toSet
+        if !hasCatchAll && !en.variants.map(_.tag).toSet.subsetOf(covered) then
+          val missing = en.variants.filterNot(v => covered(v.tag)).map(_.name)
+          err(s"match on '${en.name}' is not exhaustive; missing ${missing.mkString(", ")} (add an 'else' arm)")
+      case _ =>
+        if valueTy != Type.Unit && !hasCatchAll then
+          err("a 'match' that yields a value must be exhaustive — add an 'else' arm")
+
+    valueTy
   }
 
   /** The result type of an arithmetic or bitwise binary operator on matching operands. */

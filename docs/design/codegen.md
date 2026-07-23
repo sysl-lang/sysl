@@ -22,8 +22,8 @@ The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with
 ## What runs today
 
 A program is a sequence of statements and declarations. Non-declaration statements become the
-body of `main`; function and struct declarations are hoisted (so they may be used before they
-appear and may be mutually recursive).
+body of `main`; function, struct, and enum declarations are hoisted (so they may be used
+before they appear and may be mutually recursive).
 
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
   compound assignment), `while`, `for name in a..b` / `a..<b`, and `return [expr]`. Loop and
@@ -32,16 +32,25 @@ appear and may be mutually recursive).
   may close a block (`end` is a *soft* keyword, not reserved).
 - **`if` and `match` are expressions.** They yield the value of the taken branch/arm, so
   `var label = if c then a else b` and `f() -> T = match x …` both work; in statement position
-  the value is simply unused and no `else`/catch-all is required. A `match` *used as a value*
-  must be exhaustive (have an `else`). Patterns are literals, `|`-alternatives (Scala-style —
+  the value is simply unused. Scalar patterns are literals, `|`-alternatives (Scala-style —
   `1 | 2 | 3`), literal ranges (`1..10`, `0..<10`), and the `_` wildcard, with optional `if`
-  guards.
+  guards; a bare name binds the value. A scalar `match` used as a value must be exhaustive
+  (have a catch-all); an enum `match` must always cover every variant or carry a catch-all.
 - **Functions** are keyword-less, Scala-style: `name(params) -> ret = expr` or an indented
   block whose trailing expression is the implicit return value. A missing `-> ret` means
   `unit`. A block-bodied function may also `return` early.
 - **Value structs:** `struct Name` with indented `field: type` lines; positional construction
   `Name(a, b)`, field read `p.x`, and in-place field assignment `p.x = v`. Structs pass to and
   from functions by value.
+- **Enums.** A `simple` enum (`enum Color` with dataless variants) is a set of integer
+  constants, auto-incrementing from an optional explicit `Blue = 10`; variants are named
+  `Color.Blue` or bare `Blue`. A **data enum** (any variant carries a payload, `Circle(radius:
+  int)`) is a tagged union: construct a variant with `Circle(5)` or a nullary one as `Empty`,
+  and destructure it in a `match` — `Circle(r) -> …` binds the payload, sub-patterns may nest
+  (`Wrap(Val(v))`), and guards may read the bindings. Enums pass by value.
+- **`end` markers.** A `struct`, `enum`, or function block may optionally be closed by
+  `end Name`, whose name the parser checks against the declaration's own. `end` is a soft
+  keyword, so it remains usable as an identifier.
 - **Expressions:** the full settled precedence grammar (`01`), over `int` (i32), `real` (f64),
   `bool`, and string literals. `++`/`--`, unary `-`/`!`/`~`, chained comparison.
 - **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed space-separated
@@ -55,7 +64,12 @@ on arm64. Floats are emitted as **hex doubles** (`0x…`) so the textual round-t
 bits. `printf` is declared varargs; each `print` interns one format-string constant. Value
 structs lower to named aggregates (`%struct.Name = type { … }`); construction is an
 `insertvalue` chain, a field read is `extractvalue`, and a field assignment is a
-`getelementptr` + `store` into the variable's slot.
+`getelementptr` + `store` into the variable's slot. A simple enum is plain `i32`; a data enum
+lowers to a value aggregate `%enum.Name = type { i32 tag, payload₁, … }` with one payload slot
+per data-carrying variant (each payload a named `%Name.Variant` aggregate). A pattern test is a
+tag `icmp` plus `extractvalue` reads of the payload fields (pure, so nested fields are read
+unconditionally and a failed outer tag simply ANDs a `false` through); bindings are stored into
+fresh slots only once the arm — and its guard — is taken.
 
 ## Deliberate shortcuts (unwind these as the language grows)
 
@@ -70,12 +84,17 @@ structs lower to named aggregates (`%struct.Name = type { … }`); construction 
    (`name -> T`), inner `def`, default arguments, generics, and the pure/effect (`def` vs
    plain) distinction are all deferred. The keyword-less form is disambiguated from a call by
    the typed parameter list and a following body.
-4. **Value structs only.** No `new`/heap allocation, no refs (`&T`) or the ref-counted path,
-   no nested-lvalue field assignment (`a.b.c = v`), no methods, no generics. Field assignment
-   targets a local variable's field directly.
-5. **`match` is scalar-only.** Literal / range / wildcard patterns with guards; no binding
-   patterns, no enum/struct destructuring (those arrive with enums). A value match must be
-   exhaustive; guard expressions are evaluated as part of the arm test.
+4. **Value structs and enums only.** No `new`/heap allocation, no refs (`&T`) or the
+   ref-counted path, no recursive types, no nested-lvalue field assignment (`a.b.c = v`), no
+   methods, no generics — so `Option[T]` / `Result[T, E]` and the `?` operator wait on
+   generics. A data enum reserves storage for *every* variant's payload at once (a value
+   aggregate, no size arithmetic), which is wasteful but needs no heap; recursive enums (a
+   variant referencing its own enum) would be an infinite type and are rejected once refs land.
+5. **Enum-match exhaustiveness ignores nested coverage.** An unguarded arm covers its variant
+   only when every sub-pattern is irrefutable (a binding or `_`); an arm with a nested variant
+   or literal sub-pattern does not count, so `Wrap(A) | Wrap(B)` covering `Wrap(Inner)` still
+   needs an `else`. Guard expressions are evaluated after the pattern matches and its bindings
+   are in scope.
 6. **`print` is a printf shim** — the stand-in for the eventual `std` I/O surface, not a
    committed language builtin.
 7. **Chained comparisons `and` their pairs eagerly.** `a < b < c` lowers to `(a<b) and (b<c)`,

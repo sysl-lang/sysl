@@ -153,7 +153,7 @@ class SyslParser extends PackratParsers {
   // --- statements ----------------------------------------------------------------------
 
   lazy val statement: PackratParser[Stmt] =
-    structDecl | funcDecl | varDecl | forStmt | whileStmt | returnStmt | exprStmt
+    structDecl | enumDecl | funcDecl | varDecl | forStmt | whileStmt | returnStmt | exprStmt
 
   private lazy val typeRef: Parser[TypeRef] = ident ^^ NamedType.apply
 
@@ -177,8 +177,10 @@ class SyslParser extends PackratParsers {
    * and nothing follows to open a body) and falls through to `exprStmt`.
    */
   private lazy val funcDecl: PackratParser[Stmt] =
-    ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody ^^ {
-      case name ~ params ~ ret ~ body => FuncDecl(name, params, ret, body)
+    ident >> { name =>
+      (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
+        case params ~ ret ~ body => FuncDecl(name, params, ret, body)
+      }
     }
 
   /** A function body is either an `= expr` short form (whose value is the return value) or an
@@ -188,8 +190,36 @@ class SyslParser extends PackratParsers {
     op("=") ~> (suite | expression ^^ (e => List(ExprStmt(e)))) | suite
 
   private lazy val structDecl: PackratParser[Stmt] =
-    op("struct") ~> ident ~ (newline ~> indent ~> opt(newlines) ~> repsep(param, newlines) <~ opt(newlines) <~ dedent) ^^ {
-      case name ~ fields => StructDecl(name, fields)
+    op("struct") ~> ident >> { name =>
+      (newline ~> indent ~> opt(newlines) ~> repsep(param, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
+        fields => StructDecl(name, fields)
+      }
+    }
+
+  /** `enum Name` with indented variants. A variant is a bare name (`Empty`), a name with an
+   * explicit integer value (`Blue = 10`), or a name with a payload (`Circle(radius: int)`).
+   */
+  private lazy val enumDecl: PackratParser[Stmt] =
+    op("enum") ~> ident >> { name =>
+      (newline ~> indent ~> opt(newlines) ~> repsep(enumVariant, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
+        variants => EnumDecl(name, variants)
+      }
+    }
+
+  private lazy val enumVariant: Parser[EnumVariantDecl] =
+    ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ^^ { case n ~ fs => EnumVariantDecl(n, None, fs) } |
+      ident ~ (op("=") ~> expression) ^^ { case n ~ v => EnumVariantDecl(n, Some(v), Nil) } |
+      ident ^^ (n => EnumVariantDecl(n, None, Nil))
+
+  /** An optional `end Name` marker closing a declaration block, Scala-style. `end` is a soft
+   * keyword; the trailing name must equal the declaration's own name, or it is a parse error.
+   */
+  private def endName(name: String): Parser[Unit] =
+    opt(opt(newlines) ~> softEnd ~> checkedEndName(name)) ^^^ (())
+
+  private def checkedEndName(expected: String): Parser[Unit] =
+    ident >> { n =>
+      if n == expected then success(()) else err(s"'end $n' does not match '$expected'")
     }
 
   /** An indented block: a leading `Newline`+`Indent` (the lexer's off-side signal) wraps a
@@ -266,13 +296,19 @@ class SyslParser extends PackratParsers {
         case pats ~ guard ~ b => MatchArm(pats, guard, b)
       }
 
-  /** Patterns are literals, literal ranges, or the `_` wildcard for now — enough for scalar
-   * `match`; binding and destructuring patterns arrive with enums.
+  /** Patterns: scalar literals and ranges, the `_` wildcard, a variant destructuring
+   * `V(sub…)`, or a bare name — which the analyzer reads as a nullary-variant pattern when it
+   * names a variant of the scrutinee's enum, and as a binding otherwise.
    */
   private lazy val pattern: Parser[Pattern] =
     patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
+      variantPattern |
       wildcard ^^^ WildcardPattern |
+      ident ^^ IdentPattern.apply |
       patternLit ^^ LitPattern.apply
+
+  private lazy val variantPattern: Parser[Pattern] =
+    ident ~ (op("(") ~> repsep(pattern, op(",")) <~ op(")")) ^^ { case n ~ ps => VariantPattern(n, ps) }
 
   private lazy val wildcard: Parser[Unit] =
     accept("'_'", { case t: lexical.Identifier if t.chars == "_" => () })

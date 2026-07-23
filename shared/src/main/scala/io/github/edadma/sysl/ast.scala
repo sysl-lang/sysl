@@ -71,6 +71,18 @@ case class RangePattern(lo: Expr, hi: Expr, inclusive: Boolean) extends Pattern
 /** `_` (and `else`, which desugars to the same) — matches anything. */
 case object WildcardPattern extends Pattern
 
+/** A bare name. The analyzer resolves it to a *nullary variant* pattern when the name is a
+ * variant of the scrutinee's enum, and to a *binding* (which matches anything and names the
+ * value) otherwise.
+ */
+case class IdentPattern(name: String) extends Pattern
+
+/** `Circle(r)`, `Wrap(Val(v))` — matches a data-enum variant and recurses into its fields.
+ * Each sub-pattern matches the field at that position (a binding, a nested variant, `_`, or a
+ * literal).
+ */
+case class VariantPattern(name: String, args: List[Pattern]) extends Pattern
+
 /** `pat, pat, … [if guard] -> body`. Alternatives share one body; the optional guard is a
  * boolean the scrutinee value must additionally satisfy. Each body is a statement list whose
  * trailing expression is the arm's value.
@@ -108,5 +120,16 @@ case class FuncDecl(name: String, params: List[Param], retType: Option[TypeRef],
 
 /** `struct Name` with `name: type` fields; positional construction is `Name(a, b, …)`. */
 case class StructDecl(name: String, fields: List[Param]) extends Stmt
+
+/** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
+ * variant; a variant with an optional `value` and no fields is a simple integer constant.
+ */
+case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param])
+
+/** `enum Name` with indented variants. All-dataless variants make a *simple* enum (integer
+ * constants, auto-incrementing, with optional explicit `= value`); any data-carrying variant
+ * makes a *data* enum (a tagged union whose variants are constructed and destructured).
+ */
+case class EnumDecl(name: String, variants: List[EnumVariantDecl]) extends Stmt
 
 case class Program(body: List[Stmt])
