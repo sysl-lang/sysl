@@ -84,9 +84,13 @@ before they appear and may be mutually recursive).
   one level automatically, on `*T` and `&T` alike, so there is no `->`. Pointers and
   references compare with `==` / `!=` by address and have no ordering; `bool` gained equality
   at the same time.
-- **References in the type system.** `&T` and `&sync T` parse, resolve, mangle, and pass
-  through generic inference as distinct types, and a field of either kind makes a type legally
-  recursive. Nothing *creates* one yet: that is ARC, and it is the next stage.
+- **References, counted automatically.** `&T` and `&sync T` are distinct types that pass
+  through generic inference, and a field of either kind makes a type legally recursive. A value
+  written where a reference is expected is put on the heap, so there is no allocation keyword;
+  the compiler emits the retain and release that keep the object alive exactly as long as
+  something names it, and frees it through its own deallocation hook at zero. A reference is
+  never null, so an absent one is `Option[&T]`. `&sync T` counts atomically — a relaxed
+  increment, a releasing decrement, and an acquire fence before the destructor.
 - **Recursive types.** A cycle through a `*T` or a `&T` is legal and pointer-sized; a cycle
   every edge of which is by value is rejected as having no finite size. An instantiation is
   registered before its fields are resolved, so a field that points back at it finds it.
@@ -109,6 +113,12 @@ place's address — a local's own slot, a loaded pointer value, or a `getelement
 either — and `store`s through it, which is one mechanism for `x = v`, `s.f = v`, `*p = v`, and
 `p.f = v` alike. `*T` and `&T` are both the opaque `ptr`; inside a mangled name a memory mode
 is spelled as a word (`ptr.` / `ref.` / `sync.`), since a sigil is not an LLVM name character.
+A `&T` addresses a **box** `%arc.T = type { i64, ptr, T }` — the count, the function that frees
+it, then the payload — so reading through one is a `getelementptr` past the header. Taking a
+share is type-independent (`@arc.retain`); giving one back is per payload type, because
+reaching zero runs that type's destructor, which releases whatever the payload itself held and
+then calls through the hook. Walking an aggregate's reference-carrying fields is a helper
+emitted once per type rather than inlined, since a data enum needs a tag test per variant.
 A simple enum is plain `i32`; a data enum
 lowers to a value aggregate `%enum.Name = type { i32 tag, payload₁, … }` with one payload slot
 per data-carrying variant (each payload a named `%Name.Variant` aggregate). A pattern test is a
@@ -141,11 +151,16 @@ arity.
    (`name -> T`), inner `def`, default arguments, and the pure/effect (`def` vs plain)
    distinction are all deferred. The keyword-less form is disambiguated from a call by the
    typed parameter list and a following body.
-5. **No heap.** `&T` exists as a type but nothing allocates one, so ARC — retain/release,
-   destructors, the deallocation hook, `weak` — is entirely absent, and a recursive structure
-   is built out of `*T` and stack storage. There are no methods. A data enum reserves storage
-   for *every* variant's payload at once (a value aggregate, no size arithmetic), which is
-   wasteful but needs no heap.
+5. **Reference counting is emitted where it is obviously needed, and nowhere elided.** Every
+   named slot takes a count and gives it back; every temporary is released when its statement
+   or branch ends; every function retains its parameters and returns a count already taken.
+   That is correct but not minimal — a retain/release pair that provably cancels is still
+   emitted, and a reference borrowed for the length of a call is still counted twice. Eliding
+   them is a later pass over the same placement, not a change to it. `weak` does not exist yet,
+   so a reference cycle is a leak; there are no methods; the deallocation hook is always the
+   built-in one, since there is no way yet to write an allocator; and a data enum still
+   reserves storage for *every* variant's payload at once (a value aggregate, no size
+   arithmetic) rather than sizing the box to the variant it holds.
 6. **Enum-match exhaustiveness ignores nested coverage.** An unguarded arm covers its variant
    only when every sub-pattern is irrefutable (a binding or `_`); an arm with a nested variant
    or literal sub-pattern does not count, so `Wrap(A) | Wrap(B)` covering `Wrap(Inner)` still

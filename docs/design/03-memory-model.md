@@ -75,6 +75,13 @@ payload. Somewhere with no expectation at all, a construction is a value — ann
 otherwise. A prefix `&` on a construction was considered as an explicit mark and not taken:
 it would collide with address-of, which is a different operation with a different result type.
 
+The rule is about the *types*, not about the syntax: a `T` written where a `&T` is expected
+goes on the heap, whatever produced it. That is what makes the branches of a conditional box
+once at the end rather than once each (`var p: &Point = if c then Point(1, 2) else q.origin`),
+and what lets a scalar be referenced (`var n: &int = 0`) without `int` needing a constructor of
+its own. Something that is *already* a `&T` passes through untouched — it is a reference, not a
+value looking for a home.
+
 ### Who frees it — the deallocation hook
 
 Every ARC heap object carries, alongside its refcount, a **pointer to the function that frees
@@ -120,6 +127,8 @@ value with no address to take.
 - **Field selection dereferences one level automatically**, on both `*T` and `&T`:
   `p.x` is `(*p).x`, and `p.x = 9` writes through the pointer. This is Go's rule. There is no
   `->`, and reaching through a `**T` is written, since the shorthand stops at one level.
+  Selection is the *only* implicit dereference: matching a reference to an enum against its
+  variants is `match *e`, the same way Go asks for one on a type switch.
 
 Assignment, compound assignment, and `++`/`--` all take a place, so the same three forms work
 on a variable, on a field, and through a pointer with nothing special said about any of them.

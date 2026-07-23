@@ -17,6 +17,18 @@ class Codegen private (program: TProgram) {
   private var charBuf  = false
   private var traps    = false
 
+  /** Box layouts to declare, keyed by their LLVM name and held in the order they were first
+   * needed — a box's payload type is always declared before it.
+   */
+  private val boxes = mutable.LinkedHashMap.empty[String, Type]
+
+  /** Runtime helpers (retain, release, destructors) to emit, generated on demand. Generating one
+   * may ask for another, so they are queued rather than emitted inline.
+   */
+  private val requested    = mutable.HashSet.empty[String]
+  private val runtimeQueue = mutable.Queue.empty[() => String]
+  private var heap         = false
+
   // Per-function emission state, reset at each function boundary.
   private var prologue   = new mutable.StringBuilder
   private var body       = new mutable.StringBuilder
@@ -24,12 +36,26 @@ class Codegen private (program: TProgram) {
   private var label      = 0
   private var terminated = false
 
+  /** References this expression owns and must let go of. The stack mirrors the regions a value
+   * may not escape: a statement, and each branch of an `if` or arm of a `match`, release their
+   * own before control leaves them, so every release site dominates what it releases.
+   */
+  private var tempStack: List[mutable.ListBuffer[(String, Type)]] = Nil
+
+  /** Named slots — parameters, locals, pattern bindings — that hold a reference of their own,
+   * innermost scope first. Each holds one count, taken when the slot is written and given back
+   * when the scope ends or the function returns.
+   */
+  private var owned: List[mutable.ListBuffer[(String, Type)]] = Nil
+
   private def startFunction(): Unit = {
     prologue = new mutable.StringBuilder
     body = new mutable.StringBuilder
     temp = 0
     label = 0
     terminated = false
+    tempStack = Nil
+    owned = Nil
   }
 
   private def freshTemp(): String            = { temp += 1; s"%t$temp" }
@@ -53,6 +79,207 @@ class Codegen private (program: TProgram) {
     if !terminated then { body ++= "  "; body ++= line; body ++= "\n"; terminated = true }
 
   private def emitLabel(l: String): Unit = { body ++= l; body ++= ":\n"; terminated = false }
+
+  /** Generates one whole function while another is in progress, which is how a runtime helper
+   * gets written at the moment it is first asked for.
+   */
+  private def inFunction(header: String)(gen: => Unit): String = {
+    val saved =
+      (prologue, body, temp, label, terminated, tempStack, owned)
+
+    startFunction()
+    gen
+    val text = s"$header {\nentry:\n$prologue$body}\n"
+
+    prologue = saved._1; body = saved._2; temp = saved._3; label = saved._4
+    terminated = saved._5; tempStack = saved._6; owned = saved._7
+    text
+  }
+
+  /** Queues a runtime helper for emission, once per name. */
+  private def request(name: String)(gen: => String): String = {
+    if requested.add(name) then runtimeQueue.enqueue(() => gen)
+    name
+  }
+
+  // --- reference counting ----------------------------------------------------------------
+
+  /** Whether copying a value of this type has to touch a refcount. A raw pointer never does —
+   * it is the mode that opts out of management — and a `&T` is a leaf, so a recursive type
+   * cannot make this recur forever.
+   */
+  private def containsRef(t: Type): Boolean = t match
+    case _: Type.Ref    => true
+    case s: Type.Struct => s.fields.exists(f => containsRef(f._2))
+    case e: Type.Enum   => e.variants.exists(_.fields.exists(f => containsRef(f._2)))
+    case _              => false
+
+  /** The LLVM name of the box that holds a `T` on the heap: the refcount, the deallocation
+   * hook, and the payload.
+   */
+  private def boxName(payload: Type): String = {
+    heap = true
+    val n = s"%arc.${Type.mangle(payload)}"
+    boxes.getOrElseUpdate(n, payload)
+    n
+  }
+
+  /** Takes a share of everything a value refers to. A bare reference is one refcount; an
+   * aggregate delegates to a per-type helper that walks its reference-carrying fields.
+   */
+  private def retainValue(ty: Type, v: String): Unit = ty match
+    case Type.Ref(_, sync) =>
+      heap = true
+      emit(s"call void @arc.retain${if sync then "_sync" else ""}(ptr $v)")
+    case t if containsRef(t) => emit(s"call void @${valueHelper(t, retain = true)}(${t.llvm} $v)")
+    case _                   => ()
+
+  /** Gives back a share of everything a value refers to. */
+  private def releaseValue(ty: Type, v: String): Unit = ty match
+    case Type.Ref(inner, sync) => emit(s"call void @${releaseFn(inner, sync)}(ptr $v)")
+    case t if containsRef(t)   => emit(s"call void @${valueHelper(t, retain = false)}(${t.llvm} $v)")
+    case _                     => ()
+
+  /** The release function for a box, which is per payload type because reaching zero has to run
+   * that type's destructor. Atomicity is a property of the *reference*, not of the object, so
+   * the two orderings are two functions over one layout.
+   */
+  private def releaseFn(payload: Type, sync: Boolean): String = {
+    val m  = Type.mangle(payload)
+    val bn = boxName(payload)
+
+    request(s"arc.drop.$m") {
+      inFunction(s"define private void @arc.drop.$m(ptr %p)") {
+        if containsRef(payload) then
+          val pa = freshTemp(); emit(s"$pa = getelementptr $bn, ptr %p, i32 0, i32 2")
+          val v  = freshTemp(); emit(s"$v = load ${payload.llvm}, ptr $pa")
+          releaseValue(payload, v)
+        val h = freshTemp(); emit(s"$h = getelementptr $bn, ptr %p, i32 0, i32 1")
+        val f = freshTemp(); emit(s"$f = load ptr, ptr $h")
+        emit(s"call void $f(ptr %p)")
+        emitTerm("ret void")
+      }
+    }
+
+    val name = if sync then s"arc.release_sync.$m" else s"arc.release.$m"
+
+    request(name) {
+      inFunction(s"define private void @$name(ptr %p)") {
+        val dropL  = freshLabel("arc.drop")
+        val doneL  = freshLabel("arc.live")
+        val atZero = freshTemp()
+
+        if sync then
+          // Release ordering publishes every write this domain made before letting go.
+          val old = freshTemp(); emit(s"$old = atomicrmw sub ptr %p, i64 1 release")
+          emit(s"$atZero = icmp eq i64 $old, 1")
+        else
+          val cur = freshTemp(); emit(s"$cur = load i64, ptr %p")
+          val nxt = freshTemp(); emit(s"$nxt = sub i64 $cur, 1")
+          emit(s"store i64 $nxt, ptr %p")
+          emit(s"$atZero = icmp eq i64 $nxt, 0")
+
+        emitTerm(s"br i1 $atZero, label %$dropL, label %$doneL")
+        emitLabel(dropL)
+        // The acquire fence makes every other domain's writes visible to the thread that frees.
+        if sync then emit("fence acquire")
+        emit(s"call void @arc.drop.$m(ptr %p)")
+        emitTerm("ret void")
+        emitLabel(doneL)
+        emitTerm("ret void")
+      }
+    }
+  }
+
+  /** The retain / release helper for an aggregate type, which walks the fields that carry
+   * references. Emitted once per type rather than inlined, since a data enum needs a tag test
+   * per reference-carrying variant.
+   */
+  private def valueHelper(ty: Type, retain: Boolean): String = {
+    val name = s"arc.${if retain then "copy" else "dispose"}.${Type.mangle(ty)}"
+
+    request(name) {
+      inFunction(s"define private void @$name(${ty.llvm} %v)") {
+        walkValue(ty, "%v", retain)
+        emitTerm("ret void")
+      }
+    }
+  }
+
+  private def walkValue(ty: Type, v: String, retain: Boolean): Unit = {
+    def each(fields: List[(String, Type)], aggregate: String, value: String): Unit =
+      for ((_, fty), i) <- fields.zipWithIndex if containsRef(fty) do
+        val f = freshTemp()
+        emit(s"$f = extractvalue $aggregate $value, $i")
+        if retain then retainValue(fty, f) else releaseValue(fty, f)
+
+    ty match
+      case s: Type.Struct => each(s.fields, s.llvm, v)
+
+      case e: Type.Enum =>
+        val tag  = freshTemp(); emit(s"$tag = extractvalue ${e.llvm} $v, 0")
+        val endL = freshLabel("arc.done")
+        for variant <- e.variants if variant.fields.exists(f => containsRef(f._2)) do
+          val hitL  = freshLabel("arc.variant")
+          val nextL = freshLabel("arc.next")
+          val is    = freshTemp(); emit(s"$is = icmp eq i32 $tag, ${variant.tag}")
+          emitTerm(s"br i1 $is, label %$hitL, label %$nextL")
+          emitLabel(hitL)
+          val payload = freshTemp()
+          emit(s"$payload = extractvalue ${e.llvm} $v, ${variant.payloadSlot.get}")
+          each(variant.fields, e.payloadLlvm(variant), payload)
+          emitTerm(s"br label %$endL")
+          emitLabel(nextL)
+        emitTerm(s"br label %$endL")
+        emitLabel(endL)
+
+      case _ => ()
+  }
+
+  // --- ownership regions -----------------------------------------------------------------
+
+  private def pushTemps(): Unit = tempStack = mutable.ListBuffer.empty[(String, Type)] :: tempStack
+
+  /** Records a value the expression owns outright — a fresh box, or a call result, which every
+   * function returns with a count already taken.
+   */
+  private def ownTemp(v: String, ty: Type): String = {
+    if containsRef(ty) then tempStack.head += ((v, ty))
+    v
+  }
+
+  /** Releases the innermost region's temporaries and pops it. */
+  private def popTemps(): Unit = {
+    for (v, ty) <- tempStack.head.reverse do releaseValue(ty, v)
+    tempStack = tempStack.tail
+  }
+
+  private def pushOwned(): Unit = owned = mutable.ListBuffer.empty[(String, Type)] :: owned
+
+  /** Records a slot that holds a count of its own, after it has been written. */
+  private def ownSlot(name: String, ty: Type): Unit =
+    if containsRef(ty) then owned.head += ((s"%$name.addr", ty))
+
+  /** Emits the releases for the innermost scope without popping it — the guard-failure path out
+   * of a match arm, where the bindings have been made but the arm is not taken.
+   */
+  private def releaseOwned(): Unit =
+    for (slot, ty) <- owned.head.reverse do
+      val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
+      releaseValue(ty, v)
+
+  private def popOwned(): Unit = { releaseOwned(); owned = owned.tail }
+
+  /** Lets go of everything the function holds, for a `return` that leaves from the middle of
+   * it. Nothing is popped: the block is terminated straight afterwards, so the scopes that
+   * follow this one lexically emit their own releases into unreachable code and are dropped.
+   */
+  private def releaseAll(): Unit = {
+    for frame <- tempStack; (v, ty) <- frame.reverse do releaseValue(ty, v)
+    for scope <- owned; (slot, ty) <- scope.reverse do
+      val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
+      releaseValue(ty, v)
+  }
 
   // --- string interning ----------------------------------------------------------------
 
@@ -81,9 +308,17 @@ class Codegen private (program: TProgram) {
     val funcTexts = program.funcs.map(genFunction)
     val mainText  = genMain(program.main)
 
+    // Emitting a runtime helper may ask for another (a destructor releases the references its
+    // payload holds), so this runs until nothing new is requested.
+    val runtimeTexts = mutable.ListBuffer.empty[String]
+    while runtimeQueue.nonEmpty do runtimeTexts += runtimeQueue.dequeue()()
+
     val out = new mutable.StringBuilder
     out ++= "declare i32 @printf(ptr, ...)\n"
     if traps then out ++= "declare void @llvm.trap()\n"
+    if heap then
+      out ++= "declare ptr @malloc(i64)\n"
+      out ++= "declare void @free(ptr)\n"
     out ++= "\n"
 
     for s <- program.structs do
@@ -97,6 +332,12 @@ class Codegen private (program: TProgram) {
       out ++= s"${e.llvm} = type { ${slots.mkString(", ")} }\n"
     if program.enums.nonEmpty then out ++= "\n"
 
+    // A box is the refcount, the function that frees it, and the payload — so ARC works the
+    // same everywhere, and an object frees itself into whichever heap made it.
+    for (name, payload) <- boxes do
+      out ++= s"$name = type { i64, ptr, ${payload.llvm} }\n"
+    if boxes.nonEmpty then out ++= "\n"
+
     if boolStrs then
       out ++= "@.true = private constant [5 x i8] c\"true\\00\"\n"
       out ++= "@.false = private constant [6 x i8] c\"false\\00\"\n"
@@ -104,6 +345,8 @@ class Codegen private (program: TProgram) {
     if globals.nonEmpty || boolStrs then out ++= "\n"
 
     if charBuf then out ++= Codegen.utf8Encoder
+    if heap then out ++= Codegen.arcRuntime
+    for t <- runtimeTexts do out ++= t; out ++= "\n"
 
     for t <- funcTexts do out ++= t; out ++= "\n"
     out ++= mainText
@@ -112,25 +355,43 @@ class Codegen private (program: TProgram) {
 
   private def genMain(stmts: List[TStmt]): String = {
     startFunction()
+    pushTemps()
+    pushOwned()
     stmts.foreach(genStmt)
+    releaseAll()
     emitTerm("ret i32 0")
     s"define i32 @main() {\nentry:\n$prologue$body}\n"
   }
 
+  /** A function owns its parameters and returns its result with a count already taken, so a
+   * caller can hand over a temporary and a callee can store one without either having to know
+   * what the other did with it.
+   */
   private def genFunction(f: TFunc): String = {
     startFunction()
+    pushTemps()
+    pushOwned()
 
     for (name, ty) <- f.params do
       emitAlloca(s"%$name.addr", ty.llvm)
       emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
+      retainValue(ty, s"%$name.param")
+      ownSlot(name, ty)
 
     f.body.stmts.foreach(genStmt)
 
     f.body.result match
-      case Some(r) if f.retTy != Type.Unit => emitTerm(s"ret ${f.retTy.llvm} ${genExpr(r)}")
-      case Some(r)                         => genExpr(r); emitTerm("ret void")
-      case None if f.retTy == Type.Unit    => emitTerm("ret void")
-      case None                            => emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
+      case Some(r) if f.retTy != Type.Unit =>
+        val v = genExpr(r)
+        retainValue(f.retTy, v)
+        releaseAll()
+        emitTerm(s"ret ${f.retTy.llvm} $v")
+      case Some(r) =>
+        genExpr(r); releaseAll(); emitTerm("ret void")
+      case None if f.retTy == Type.Unit =>
+        releaseAll(); emitTerm("ret void")
+      case None =>
+        releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
     val params = f.params.map { case (name, ty) => s"${ty.llvm} %$name.param" }.mkString(", ")
     s"define ${f.retTy.llvm} @${f.name}($params) {\nentry:\n$prologue$body}\n"
@@ -150,11 +411,22 @@ class Codegen private (program: TProgram) {
 
   // --- statements ----------------------------------------------------------------------
 
-  private def genStmt(stmt: TStmt): Unit = stmt match
+  /** A statement is the region a temporary lives in: whatever it allocated or was handed is
+   * released once the statement is over, leaving only what a slot has taken a count of.
+   */
+  private def genStmt(stmt: TStmt): Unit = {
+    pushTemps()
+    genStmtBody(stmt)
+    popTemps()
+  }
+
+  private def genStmtBody(stmt: TStmt): Unit = stmt match
     case TVarDecl(name, ty, init) =>
       val v = genExpr(init)
       emitAlloca(s"%$name.addr", ty.llvm)
+      retainValue(ty, v)
       emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+      ownSlot(name, ty)
 
     case TExprStmt(expr) =>
       genExpr(expr)
@@ -165,9 +437,16 @@ class Codegen private (program: TProgram) {
       val endL  = freshLabel("while.end")
       emitTerm(s"br label %$condL")
       emitLabel(condL)
-      emitTerm(s"br i1 ${genExpr(cond)}, label %$bodyL, label %$endL")
+      // The condition is re-evaluated every iteration, so whatever it borrows is let go before
+      // the branch rather than accumulating in the enclosing statement's region.
+      pushTemps()
+      val c = genExpr(cond)
+      popTemps()
+      emitTerm(s"br i1 $c, label %$bodyL, label %$endL")
       emitLabel(bodyL)
+      pushOwned()
       whileBody.foreach(genStmt)
+      popOwned()
       emitTerm(s"br label %$condL")
       emitLabel(endL)
 
@@ -186,7 +465,9 @@ class Codegen private (program: TProgram) {
       val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", ty)} $w $iv, $hiV")
       emitTerm(s"br i1 $cmp, label %$bodyL, label %$endL")
       emitLabel(bodyL)
+      pushOwned()
       forBody.foreach(genStmt)
+      popOwned()
       val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
       val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
       emit(s"store $w $nxt, ptr %$name.addr")
@@ -195,8 +476,14 @@ class Codegen private (program: TProgram) {
 
     case TReturn(opt) =>
       opt match
-        case Some(t) => emitTerm(s"ret ${t.ty.llvm} ${genExpr(t)}")
-        case None    => emitTerm("ret void")
+        case Some(t) =>
+          val v = genExpr(t)
+          retainValue(t.ty, v)
+          releaseAll()
+          emitTerm(s"ret ${t.ty.llvm} $v")
+        case None =>
+          releaseAll()
+          emitTerm("ret void")
 
   // --- expressions ---------------------------------------------------------------------
 
@@ -222,14 +509,27 @@ class Codegen private (program: TProgram) {
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %$name.addr"); r
 
     case TDeref(operand, ty) =>
-      val p = genExpr(operand)
+      val p = payloadAddr(operand)
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
 
     case TAddrOf(place, _) =>
       address(place)
 
+    case TBox(value, refTy) =>
+      genBox(value, refTy)
+
     case TStore(place, value, ty) =>
-      val v = genExpr(value); emit(s"store ${ty.llvm} $v, ptr ${address(place)}"); v
+      val v = genExpr(value)
+      val p = address(place)
+      if containsRef(ty) then
+        // The new value is retained before the old is released, so assigning something to
+        // itself does not briefly drop the last count.
+        val old = freshTemp(); emit(s"$old = load ${ty.llvm}, ptr $p")
+        retainValue(ty, v)
+        emit(s"store ${ty.llvm} $v, ptr $p")
+        releaseValue(ty, old)
+      else emit(s"store ${ty.llvm} $v, ptr $p")
+      v
 
     case TUpdate(place, op, value, ty) =>
       val p       = address(place)
@@ -277,7 +577,8 @@ class Codegen private (program: TProgram) {
       if ty == Type.Unit then
         emit(s"call void @$name(${argVals.mkString(", ")})"); ""
       else
-        val r = freshTemp(); emit(s"$r = call ${ty.llvm} @$name(${argVals.mkString(", ")})"); r
+        val r = freshTemp(); emit(s"$r = call ${ty.llvm} @$name(${argVals.mkString(", ")})")
+        ownTemp(r, ty)
 
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)
@@ -309,14 +610,51 @@ class Codegen private (program: TProgram) {
    * the field chain with `getelementptr` rather than reading values out with `extractvalue`.
    */
   private def address(place: TExpr): String = place match
-    case TLoad(name, _) => s"%$name.addr"
-    case TDeref(operand, _) => genExpr(operand)
+    case TLoad(name, _)     => s"%$name.addr"
+    case TDeref(operand, _) => payloadAddr(operand)
     case TField(receiver, index, _) =>
       val base = address(receiver)
       val r    = freshTemp()
       emit(s"$r = getelementptr ${receiver.ty.llvm}, ptr $base, i32 0, i32 $index")
       r
     case other => sys.error(s"unreachable address of ${other.getClass.getSimpleName}")
+
+  /** Where a pointer's pointee actually lives. A `*T` addresses its value directly; a `&T`
+   * addresses the box, whose payload sits after the refcount and the deallocation hook.
+   */
+  private def payloadAddr(operand: TExpr): String = {
+    val p = genExpr(operand)
+
+    operand.ty match
+      case Type.Ref(inner, _) =>
+        val r = freshTemp()
+        emit(s"$r = getelementptr ${boxName(inner)}, ptr $p, i32 0, i32 2")
+        r
+      case _ => p
+  }
+
+  /** Puts a value on the heap: one count for the reference this yields, the default hook, and
+   * a copy of the payload — whose own references the box now holds a share of.
+   */
+  private def genBox(value: TExpr, refTy: Type.Ref): String = {
+    val inner = refTy.inner
+    val bn    = boxName(inner)
+    val v     = genExpr(value)
+
+    val end  = freshTemp(); emit(s"$end = getelementptr $bn, ptr null, i32 1")
+    val size = freshTemp(); emit(s"$size = ptrtoint ptr $end to i64")
+    val p    = freshTemp(); emit(s"$p = call ptr @malloc(i64 $size)")
+
+    emit(s"store i64 1, ptr $p")
+    val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
+    emit(s"store ptr @arc.free, ptr $hook")
+
+    val slot = freshTemp(); emit(s"$slot = getelementptr $bn, ptr $p, i32 0, i32 2")
+    retainValue(inner, v)
+    emit(s"store ${inner.llvm} $v, ptr $slot")
+
+    ownTemp(p, refTy)
+  }
 
   /** Builds an enum value from already-lowered payload values: the tag, then the variant's
    * payload aggregate dropped into its slot.
@@ -373,7 +711,10 @@ class Codegen private (program: TProgram) {
     emitTerm(s"br i1 $isOk, label %$okL, label %$failL")
 
     emitLabel(failL)
-    emitTerm(s"ret ${retEnum.llvm} ${enumValue(retEnum, retFail, payloadFields(en, fail, v))}")
+    val failed = enumValue(retEnum, retFail, payloadFields(en, fail, v))
+    retainValue(retEnum, failed)
+    releaseAll()
+    emitTerm(s"ret ${retEnum.llvm} $failed")
 
     emitLabel(okL)
     payloadFields(en, ok, v).head
@@ -408,7 +749,9 @@ class Codegen private (program: TProgram) {
       emit(s"store ${ty.llvm} ${genBlockValue(elseBlock.get)}, ptr $slot")
       emitTerm(s"br label %$endL")
       emitLabel(endL)
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); r
+      // Each branch handed its value over with a count taken, so what the merge loads is the
+      // one temporary the enclosing region has to let go of.
+      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty)
   }
 
   private def genMatch(scrutinee: TExpr, arms: List[TArm], ty: Type): String = {
@@ -432,17 +775,29 @@ class Codegen private (program: TProgram) {
         case None =>
           emitTerm(s"br i1 $patCond, label %$bodyL, label %$nextL")
           emitLabel(bodyL)
+          pushOwned()
           bind()
         case Some(g) =>
           val guardL = freshLabel("match.guard")
           emitTerm(s"br i1 $patCond, label %$guardL, label %$nextL")
           emitLabel(guardL)
+          pushOwned()
           bind()
-          emitTerm(s"br i1 ${genExpr(g)}, label %$bodyL, label %$nextL")
+          pushTemps()
+          val gv = genExpr(g)
+          popTemps()
+          // A guard that fails leaves an arm whose bindings were already made, so they are
+          // given back before falling through to the next one.
+          val unbindL = freshLabel("match.unbind")
+          emitTerm(s"br i1 $gv, label %$bodyL, label %$unbindL")
+          emitLabel(unbindL)
+          releaseOwned()
+          emitTerm(s"br label %$nextL")
           emitLabel(bodyL)
 
       if ty == Type.Unit then genBlockVoid(arm.body)
       else emit(s"store ${ty.llvm} ${genBlockValue(arm.body)}, ptr $slot")
+      popOwned()
       emitTerm(s"br label %$endL")
       emitLabel(nextL)
 
@@ -451,7 +806,8 @@ class Codegen private (program: TProgram) {
     // statement match simply proceeds.
     if ty == Type.Unit then emitTerm(s"br label %$endL") else emitTerm("unreachable")
     emitLabel(endL)
-    if ty == Type.Unit then "" else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); r }
+    if ty == Type.Unit then ""
+    else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
   }
 
   /** The i1 result of testing a pattern against a value of type `ty`. Pattern tests are pure
@@ -485,7 +841,9 @@ class Codegen private (program: TProgram) {
   private def patternBind(p: TPattern, ty: Type, value: String): Unit = p match
     case TBindPattern(name, bty) =>
       emitAlloca(s"%$name.addr", bty.llvm)
+      retainValue(bty, value)
       emit(s"store ${bty.llvm} $value, ptr %$name.addr")
+      ownSlot(name, bty)
     case TVariantPattern(en, variant, args) if args.exists(bindsAny) =>
       val payload = freshTemp()
       emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
@@ -512,13 +870,27 @@ class Codegen private (program: TProgram) {
     else { val r = freshTemp(); emit(s"$r = or i1 $a, $b"); r }
 
   private def genBlockVoid(b: TBlock): Unit = {
+    pushTemps()
+    pushOwned()
     b.stmts.foreach(genStmt)
     b.result.foreach(genExpr)
+    popOwned()
+    popTemps()
   }
 
+  /** A branch's value, handed out with a count of its own. The block's locals and temporaries
+   * are released before control leaves it — that is what keeps every release site dominating
+   * the value it releases — so the result is retained first and becomes the caller's to let go.
+   */
   private def genBlockValue(b: TBlock): String = {
+    pushTemps()
+    pushOwned()
     b.stmts.foreach(genStmt)
-    genExpr(b.result.get)
+    val v = genExpr(b.result.get)
+    retainValue(b.result.get.ty, v)
+    popOwned()
+    popTemps()
+    v
   }
 
   // --- arithmetic and comparison -------------------------------------------------------
@@ -692,6 +1064,34 @@ object Codegen {
 
   /** Lowers a typed program to an LLVM IR module. */
   def generate(program: TProgram): String = new Codegen(program).gen()
+
+  /** The part of ARC that is the same for every type: taking a share of a box, and the default
+   * deallocation hook. Taking a share needs no ordering — a count you already hold cannot reach
+   * zero underneath you — so the atomic form is a relaxed increment. Giving one back *is*
+   * per-type, since reaching zero runs that type's destructor.
+   */
+  private val arcRuntime: String =
+    """define private void @arc.retain(ptr %p) {
+      |entry:
+      |  %c = load i64, ptr %p
+      |  %n = add i64 %c, 1
+      |  store i64 %n, ptr %p
+      |  ret void
+      |}
+      |
+      |define private void @arc.retain_sync(ptr %p) {
+      |entry:
+      |  %o = atomicrmw add ptr %p, i64 1 monotonic
+      |  ret void
+      |}
+      |
+      |define private void @arc.free(ptr %p) {
+      |entry:
+      |  call void @free(ptr %p)
+      |  ret void
+      |}
+      |
+      |""".stripMargin
 
   /** Encodes one Unicode scalar value as NUL-terminated UTF-8 into a caller-supplied
    * five-byte buffer, so printing a `char` is an ordinary `%s` argument alongside the rest.

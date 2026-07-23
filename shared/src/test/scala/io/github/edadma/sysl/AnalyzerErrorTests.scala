@@ -135,6 +135,30 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "references" - {
+    "a reference is never null, so an absent one is an Option" in {
+      err("var p: &int = null") should include("Option[&int]")
+    }
+
+    "a value of an unrelated type is still a mismatch, not a box" in {
+      err("struct P\n    x: int\nvar p: &P = 5") should include("declared &P but the value is int")
+    }
+
+    "a reference cannot be printed" in {
+      err("struct P\n    x: int\nvar p: &P = P(1)\nprint(p)") should include("cannot print a &P value")
+    }
+
+    "references have equality but no ordering" in {
+      val src = "struct P\n    x: int\nvar a: &P = P(1)\nvar b: &P = P(2)\nprint(a < b)"
+
+      err(src) should include("'<' is not defined for &P")
+    }
+
+    "a reference is not a raw pointer" in {
+      err("f(p: *int)\n    print(1)\ng(r: &int)\n    f(r)") should include("is *int, but &int was given")
+    }
+  }
+
   "scalar types" - {
     "a literal too large for the width it landed in" in {
       err("var x: byte = 300") should include("does not fit byte")

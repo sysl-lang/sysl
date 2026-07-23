@@ -211,6 +211,11 @@ object Type {
   def mangled(base: String, targs: List[Type]): String =
     if targs.isEmpty then base else s"$base.${targs.map(mangleOne).mkString(".")}"
 
+  /** One type's contribution to a mangled name, which is also how a runtime helper for a type
+   * is named (`@arc.release.Node`, `%arc.Option.int`).
+   */
+  def mangle(t: Type): String = mangleOne(t)
+
   /** A memory mode is mangled as a word rather than its sigil, since `*` and `&` are not
    * LLVM-name characters.
    */

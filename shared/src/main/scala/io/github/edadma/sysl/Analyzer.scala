@@ -363,10 +363,13 @@ class Analyzer private (program: Program) {
       actual match
         case Type.Ptr(t) => unify(inner, t, tparams, sub)
         case _           => ()
+    // A `&T` parameter also accepts a bare `T`, which the call boxes, so the payload type is
+    // matched against either shape.
     case RefType(inner, sync) =>
       actual match
         case Type.Ref(t, s) if s == sync => unify(inner, t, tparams, sub)
-        case _                           => ()
+        case _: Type.Ref                 => ()
+        case t                           => unify(inner, t, tparams, sub)
     case NamedType(n, Nil) if tparams(n) =>
       if !sub.contains(n) then sub(n) = actual
     case NamedType(n, argRefs) =>
@@ -485,11 +488,30 @@ class Analyzer private (program: Program) {
     t
   }
 
-  /** Analyzes an expression. `expected` is the type the context wants, used only where the
+  /** Analyzes an expression. `expected` is the type the context wants, used where the
    * expression cannot determine its own type arguments — a bare `None`, an `Ok(v)` whose error
-   * type is not mentioned by its argument, a generic call whose result alone is generic.
+   * type is not mentioned by its argument, a generic call whose result alone is generic — and
+   * where it decides that a value belongs on the heap.
+   *
+   * A context expecting `&T` asks the expression for a `T` and boxes what comes back, so
+   * writing the ordinary construction is the whole spelling of an allocation. An expression
+   * that is already a `&T` passes through untouched.
    */
-  private def analyzeExpr(expr: Expr, expected: Option[Type] = None): TExpr = expr match
+  private def analyzeExpr(expr: Expr, expected: Option[Type] = None): TExpr = expected match
+    case Some(r: Type.Ref) =>
+      expr match
+        case NullLit() => err(s"a ${show(r)} always points at a live object — an absent one is Option[${show(r)}]")
+        case _         => box(analyzeValue(expr, Some(r.inner)), r)
+    case _ => analyzeValue(expr, expected)
+
+  /** Boxes a value the context wanted by reference. Nothing else coerces: a mismatch that is
+   * not exactly "a `T` where `&T` was expected" is left for the caller to diagnose.
+   */
+  private def box(t: TExpr, expected: Type): TExpr = expected match
+    case r: Type.Ref if t.ty == r.inner => TBox(t, r)
+    case _                              => t
+
+  private def analyzeValue(expr: Expr, expected: Option[Type]): TExpr = expr match
     case IntLit(v, suffix)   => intLiteral(v, suffix, expected)
     case FloatLit(t, suffix) => floatLiteral(t, suffix, expected)
     case CharLit(cp)         => TIntLit(cp, Type.Char)
@@ -787,7 +809,11 @@ class Analyzer private (program: Program) {
       args: List[Expr],
       pre: Option[List[TExpr]],
   ): List[TExpr] = {
-    val ts = pre.getOrElse(args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) })
+    // An argument analyzed during inference was analyzed without an expected type, so a value
+    // headed for a `&T` parameter is boxed here instead of at its own analysis.
+    val ts = pre match
+      case Some(provisional) => provisional.zip(params).map { case (t, (_, pty)) => box(t, pty) }
+      case None              => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
 
     for (t, (pname, pty)) <- ts.zip(params) do
       if t.ty != pty then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")

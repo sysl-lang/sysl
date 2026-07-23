@@ -28,6 +28,12 @@ case class TUnitLit()               extends TExpr { def ty: Type = Type.Unit }
 /** `null` at the pointer type its context fixed. */
 case class TNullLit(ty: Type) extends TExpr
 
+/** Puts a value on the heap, because a `&T` was expected where a `T` was written. The box holds
+ * the refcount, the deallocation hook, and the payload; the expression yields a reference the
+ * caller owns.
+ */
+case class TBox(value: TExpr, refTy: Type.Ref) extends TExpr { def ty: Type = refTy }
+
 /** An explicit scalar conversion, written with call syntax: `u32(c)`, `byte(n)`, `char(u)`.
  * Every conversion between scalar types is written, never inferred.
  */
