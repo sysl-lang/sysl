@@ -205,4 +205,34 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "6 7\n"
   }
+
+  // An early return must release exactly the &T locals live at that point — the ones already
+  // allocated, not the ones a later line would have made. Three cut points leave different sets
+  // live (x; x and the nested Pair; then y as well), and a nested Pair of &Inner exercises a
+  // struct field's own references. Over a long loop a skipped release grows RSS and a stray
+  // release of an unassigned slot crashes; peak RSS was separately confirmed flat. The period is
+  // lcm(3,5)=15, summing to 105 per block, times 20000 blocks.
+  "an early return releases exactly the references live at that point" in {
+    val src =
+      """struct Inner
+        |    v: int
+        |struct Pair
+        |    a: &Inner
+        |    b: &Inner
+        |build(cut: int, seed: int) -> int
+        |    var x: &Inner = Inner(seed)
+        |    if cut == 1 then return x.v
+        |    var p: &Pair = Pair(Inner(seed + 1), Inner(seed + 2))
+        |    if cut == 2 then return x.v + p.a.v
+        |    var y: &Inner = Inner(seed + 3)
+        |    x.v + p.a.v + p.b.v + y.v
+        |var i = 0
+        |var total = 0
+        |while i < 300000
+        |    total += build(i % 3, i % 5)
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "2100000\n"
+  }
 }

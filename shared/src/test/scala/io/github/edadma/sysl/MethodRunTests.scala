@@ -171,6 +171,56 @@ class MethodRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "3 3\n"
   }
 
+  // A *self pointer-receiver reaches a &T field through a raw pointer, where the release of the
+  // old reference on overwrite is easy to skip. Building a value Outer, swapping its inner, and
+  // reading it back over a long loop must free every Inner once. seed = i%3, new = seed + 10;
+  // total = sum of (i%3 + 10) over 500000 = 5499999.
+  "a *self method overwriting a &T field releases the old reference" in {
+    val src =
+      """struct Inner
+        |    v: int
+        |struct Outer
+        |    inner: &Inner
+        |    swap(*self, x: &Inner)
+        |        self.inner = x
+        |    val(*self) -> int = self.inner.v
+        |mk(seed: int) -> int
+        |    var o = Outer(Inner(seed))
+        |    o.swap(Inner(seed + 10))
+        |    o.val()
+        |var i = 0
+        |var total = 0
+        |while i < 500000
+        |    total += mk(i % 3)
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "5499999\n"
+  }
+
+  // The raw-pointer read of a &T field must still retain it on return, so the reference outlives
+  // the value Outer being dropped when extract returns. total = sum of i%4 over 500000 = 750000.
+  "a *self method returns a &T field that outlives the dropped receiver" in {
+    val src =
+      """struct Inner
+        |    v: int
+        |struct Outer
+        |    inner: &Inner
+        |    peek(*self) -> &Inner = self.inner
+        |extract(seed: int) -> &Inner
+        |    var o = Outer(Inner(seed))
+        |    o.peek()
+        |var i = 0
+        |var total = 0
+        |while i < 500000
+        |    var got = extract(i % 4)
+        |    total += got.v
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "750000\n"
+  }
+
   "the built-in len property is unchanged by user members" in {
     val src =
       """var a = [10, 20, 30]
