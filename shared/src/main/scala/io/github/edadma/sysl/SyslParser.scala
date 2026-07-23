@@ -177,9 +177,17 @@ class SyslParser extends PackratParsers {
     op(keyword) ~> (suite | inlineBody) | suite
 
   private lazy val ifStmt: PackratParser[Stmt] =
-    op("if") ~> expression ~ body("then") ~ opt(elseClause) ^^ {
-      case c ~ t ~ e => If(c, t, e.getOrElse(Nil))
+    op("if") ~> expression ~ body("then") ~ rep(elifClause) ~ opt(elseClause) ^^ {
+      case c ~ t ~ elifs ~ e =>
+        val chained = elifs.foldRight(e.getOrElse(Nil)) { case ((ec, eb), acc) => List(If(ec, eb, acc)) }
+        If(c, t, chained)
     }
+
+  /** `elif cond then …` is sugar for `else if cond then …` — each one nests into the else
+   * branch of the previous, so no distinct AST node is needed.
+   */
+  private lazy val elifClause: Parser[(Expr, List[Stmt])] =
+    opt(newlines) ~> op("elif") ~> expression ~ body("then") ^^ { case c ~ b => (c, b) }
 
   /** `else` sits on a fresh line after a block body, or on the same line after an inline
    * one — so any intervening `Newline` is optional.

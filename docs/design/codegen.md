@@ -9,10 +9,12 @@ be unwound deliberately rather than discovered later.
 A program is a sequence of statements that becomes the body of `main`. Supported:
 
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
-  compound assignment), `if`/`else`, `while`. Bodies follow Scala-3 style: `if cond then …`
-  and `while cond do …`, where the introducer keyword (`then`/`do`) is **required for a
-  one-line body** and **optional before an indented block** (a following `Newline`+`Indent`
+  compound assignment), `if`/`elif`/`else`, `while`. Bodies follow Scala-3 style: `if cond
+  then …` and `while cond do …`, where the introducer keyword (`then`/`do`) is **required for
+  a one-line body** and **optional before an indented block** (a following `Newline`+`Indent`
   already marks the block). `else` likewise takes an inline statement or an indented block.
+  `elif cond then …` is parsed as sugar for `else if cond then …`, nesting into the else
+  branch — no distinct AST node.
 - **Expressions:** the full settled precedence grammar (`01`), over `int` (i32), `real` (f64),
   `bool`, and string literals. `++`/`--`, unary `-`/`!`/`~`, chained comparison.
 - **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed
@@ -44,6 +46,11 @@ bits. `printf` is declared varargs; each `print` interns one format-string const
    story exists.
 5. **`print` is a printf shim.** It is the stand-in for the eventual `std` I/O surface, not a
    committed language builtin.
+6. **Chained comparisons `and` their pairs eagerly.** `a < b < c` lowers to
+   `(a<b) and (b<c)` — correct for the ordinary case of side-effect-free operands, but it
+   evaluates the shared middle operand once per pair and does not short-circuit, which `01`
+   says it should. Once operands can be bound to a temp (analyzer/typed-AST), lower it to
+   evaluate each operand once and short-circuit.
 
 None of these are load-bearing design decisions — they are the smallest lowering that runs a
 real program, chosen so the pieces above them (analyzer, functions, types) can be added

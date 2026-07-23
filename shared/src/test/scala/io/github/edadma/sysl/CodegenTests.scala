@@ -111,6 +111,13 @@ class CodegenTests extends AnyFreeSpec with Matchers {
     out should include("and i1")
   }
 
+  "a chained comparison a < b < c becomes two anded icmps" in {
+    val out = ir("print(1 < 2 < 3)")
+
+    (out.split("icmp").length - 1) shouldBe 2
+    out should include("and i1")
+  }
+
   "errors" - {
     "an undefined name is rejected" in {
       err("print(nope)") should include("undefined name 'nope'")

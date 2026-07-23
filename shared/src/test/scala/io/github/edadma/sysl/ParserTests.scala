@@ -211,6 +211,40 @@ class ParserTests extends AnyFreeSpec with Matchers {
       )
     }
 
+    "an inline then with else on its own line" in {
+      prog("if cond then true_part()\nelse false_part()") shouldBe List(
+        If(
+          Ident("cond"),
+          List(ExprStmt(Call(Ident("true_part"), Nil))),
+          List(ExprStmt(Call(Ident("false_part"), Nil))),
+        )
+      )
+    }
+
+    "an elif chain nests into the else branch" in {
+      def p(n: Int) = ExprStmt(Call(Ident("print"), List(i(n))))
+
+      prog("if a then\n    print(1)\nelif b then\n    print(2)\nelse\n    print(3)") shouldBe List(
+        If(Ident("a"), List(p(1)), List(If(Ident("b"), List(p(2)), List(p(3)))))
+      )
+    }
+
+    "an inline elif chain" in {
+      def call(name: String) = ExprStmt(Call(Ident(name), Nil))
+
+      prog("if a then x()\nelif b then y()\nelse z()") shouldBe List(
+        If(Ident("a"), List(call("x")), List(If(Ident("b"), List(call("y")), List(call("z")))))
+      )
+    }
+
+    "an elif with no else leaves the innermost else empty" in {
+      def call(name: String) = ExprStmt(Call(Ident(name), Nil))
+
+      prog("if a then x()\nelif b then y()") shouldBe List(
+        If(Ident("a"), List(call("x")), List(If(Ident("b"), List(call("y")), Nil)))
+      )
+    }
+
     "an inline body still ends at a following statement" in {
       prog("while c do print(1)\nprint(2)") shouldBe List(
         While(Ident("c"), List(ExprStmt(Call(Ident("print"), List(i(1)))))),

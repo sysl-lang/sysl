@@ -61,12 +61,41 @@ class RunTests extends AnyFreeSpec with Matchers {
     run("print(1 < 2 && 2 < 3)") shouldBe "true\n"
   }
 
+  "a chained comparison a < b < c" in {
+    run("var x = 5\nprint(1 < x < 10, 1 < x < 3, 1 <= x < 10)") shouldBe "true false true\n"
+  }
+
+  "an elif chain picks the matching branch" in {
+    val src =
+      """var n = 2
+        |if n == 1 then print("one")
+        |elif n == 2 then print("two")
+        |elif n == 3 then print("three")
+        |else print("many")""".stripMargin
+
+    run(src) shouldBe "two\n"
+  }
+
+  "an elif chain falling through to else" in {
+    val src =
+      """var n = 9
+        |if n == 1 then print("one")
+        |elif n == 2 then print("two")
+        |else print("many")""".stripMargin
+
+    run(src) shouldBe "many\n"
+  }
+
   "an inline while body with `do`" in {
     run("var i = 0\nwhile i < 3 do i++\nprint(i)") shouldBe "3\n"
   }
 
   "an inline if/then/else" in {
     run("if 1 < 2 then print(\"yes\") else print(\"no\")") shouldBe "yes\n"
+  }
+
+  "an inline then with else on the next line" in {
+    run("if 1 < 2 then print(\"t\")\nelse print(\"f\")") shouldBe "t\n"
   }
 
   "a factorial loop" in {

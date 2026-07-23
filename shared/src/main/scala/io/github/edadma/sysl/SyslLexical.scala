@@ -66,6 +66,7 @@ class SyslLexical
     "var",
     "if",
     "then",
+    "elif",
     "else",
     "while",
     "do",
