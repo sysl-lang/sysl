@@ -87,8 +87,8 @@ fit within the target's capabilities.
 - `&T` and `weak T` (ARC boxes, weak-tracking);
 - growable arrays (append / realloc);
 - boxed trait objects `&Trait`;
-- **escaping** closures (a closure that outlives its scope is heap-boxed — the Swift
-  escaping / non-escaping distinction);
+- **escaping** closures (a closure that outlives its scope is heap-boxed, as in Swift — but
+  which closures escape is **inferred**, not annotated, see `05`);
 - allocating string operations (building / concatenating a new `string`).
 
 **Available without `alloc`** (the no-alloc subset):
@@ -102,7 +102,8 @@ fit within the target's capabilities.
 
 What remains a compile error is *making* heap storage: `&T`, `weak T`, growable arrays, boxed
 trait objects, escaping closures, and the allocating string operations. A slice of a local
-array that escapes its frame is also an error here, since promoting it would allocate (`03`).
+array that escapes its frame is also an error here: with an allocator the compiler would
+promote the array to the heap, and there is nothing to promote into (`05`).
 
 ## The payoff
 

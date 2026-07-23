@@ -163,11 +163,11 @@ representation and one implementation.
 
 **Slicing something that would not outlive the slice.** If a local fixed array is sliced and
 the slice escapes the frame, the array is promoted to an ARC buffer so the slice's `owner` has
-something to hold — the same escape analysis Go performs, done by the compiler with no
-annotation in the source. That is the ordinary case. Under `no alloc` there is nothing to
-promote it into, so the escape is a compile error naming the array and the slice that outlives
-it; the fix there is to make the storage static or to pass the slice down rather than out.
-This analysis is a compiler-internal one, not a lifetime system the programmer writes.
+something to hold — the same escape analysis Go performs, inferred by the compiler with no
+annotation in the source, exactly as an escaping closure is heap-boxed with no marker. Under
+`no alloc` there is nothing to promote into, so the escape is a compile error naming the array
+and the route by which the slice outlives it. **`05-escape-analysis.md`** specifies which
+escapes are detected, how the answer crosses a call boundary, and how a promotion is reported.
 
 ## Shared mutability and concurrency
 
@@ -230,9 +230,9 @@ Only `*T` opts out — visibly.
 - ~~Slice ownership and the allocator-free boundary~~ — **done**, above: slices carry an
   `owner` word, ARC objects carry a deallocation hook, and `no alloc` gates allocation rather
   than ownership.
-- **Escape analysis** — the promotion rule above is stated but not specified: exactly which
-  escapes are detected, what the `no alloc` diagnostic says, and whether promotion is ever
-  silent enough to be surprising. Needs its own pass.
+- ~~Escape analysis~~ — **done**, see `05-escape-analysis.md` (inferred, never annotated; a
+  two-fact summary carries the answer across calls; promotion where an allocator exists, a
+  diagnostic under `no alloc`, and `--explain-escapes` to make a promotion discoverable).
 - **Concurrency** — atomic refcounts for cross-thread `&T`, and the data-race story. Not yet
   designed.
 - **Unchecked-index escape hatch** — an opt-out of bounds checking for hot loops (default
