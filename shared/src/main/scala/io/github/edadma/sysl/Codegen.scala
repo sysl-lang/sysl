@@ -159,8 +159,8 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     // A `break`/`continue` leaves the body from the middle, so it unwinds the body's ownership
     // regions before jumping — the same discipline as `return`, bounded to the loop. `break v`
     // hands its value over with a count taken (so it survives the unwind) into the loop's slot.
-    case TBreak(opt) =>
-      val loop = genLoops.head
+    case TBreak(opt, depth) =>
+      val loop = genLoops(depth)
       opt.foreach { t =>
         val v = genExpr(t)
         retainValue(t.ty, v)
@@ -169,8 +169,8 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
       emitTerm(s"br label %${loop.breakL}")
 
-    case TContinue =>
-      val loop = genLoops.head
+    case TContinue(depth) =>
+      val loop = genLoops(depth)
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
       emitTerm(s"br label %${loop.continueL}")
 

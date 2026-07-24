@@ -122,6 +122,29 @@ class LexerTests extends AnyFreeSpec with Matchers {
     l.bare("\"hello\"") shouldBe List(l.StrLit("hello"))
   }
 
+  "a loop label is told from a character by its missing closing quote" - {
+    "'name with no closing quote is a label" in withLexer { l =>
+      l.bare("'outer") shouldBe List(l.Label("outer"))
+      l.bare("break 'scan") shouldBe List(l.Keyword("break"), l.Label("scan"))
+    }
+
+    "'x' with a closing quote stays a character literal" in withLexer { l =>
+      l.bare("'x'") shouldBe List(l.CharLit('x'.toInt))
+      l.bare("'_'") shouldBe List(l.CharLit('_'.toInt))
+    }
+
+    "a label may hold digits and underscores after its first letter" in withLexer { l =>
+      l.bare("'loop_2") shouldBe List(l.Label("loop_2"))
+    }
+
+    "a labeled loop keyword and a char array do not confuse the two" in withLexer { l =>
+      l.bare("'top for") shouldBe List(l.Label("top"), l.Keyword("for"))
+      l.bare("['a', 'b']") shouldBe List(
+        l.Keyword("["), l.CharLit('a'.toInt), l.Keyword(","), l.CharLit('b'.toInt), l.Keyword("]"),
+      )
+    }
+  }
+
   "interpolated strings split into literal parts and embedded source" - {
     "a hole separates the surrounding literals" in withLexer { l =>
       l.bare("""s"a${x}b"""") shouldBe List(l.StrInterp(List("a", "b"), List("x"), List(None)))

@@ -301,4 +301,104 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe "6 -1\n"
     }
   }
+
+  "labeled loops" - {
+    // `break 'outer` from the inner loop leaves both loops at once — the outer loop's `hits`
+    // counter is never bumped past the iteration where the match is found.
+    "a labeled break leaves the outer loop from inside the inner" in {
+      val src =
+        """var found = -1
+          |var hits = 0
+          |'outer for i in 0..<4
+          |    for j in 0..<4
+          |        if i * 4 + j == 7 then
+          |            found = i * 10 + j
+          |            break 'outer
+          |    hits += 1
+          |print(found, hits)""".stripMargin
+
+      // i=1, j=3 hits 7 → found = 13; hits bumped only for i=0 before the break → 1
+      run(src) shouldBe "13 1\n"
+    }
+
+    // `continue 'rows` from the inner loop skips to the next iteration of the OUTER loop, so the
+    // inner loop's remaining iterations for that row are abandoned.
+    "a labeled continue advances the outer loop" in {
+      val src =
+        """var sum = 0
+          |'rows for i in 0..<3
+          |    for j in 0..<3
+          |        if j == 1 then continue 'rows
+          |        sum += i * 10 + j
+          |print(sum)""".stripMargin
+
+      // each row adds only j=0 before continuing the outer: 0 + 10 + 20 = 30
+      run(src) shouldBe "30\n"
+    }
+
+    // A labeled `break` carries a value out of the *named* loop, which is a function's tail
+    // expression — so the value threads through the outer loop's result, not the inner's.
+    "a labeled break carries a value out of the named loop" in {
+      val src =
+        """firstSquareOver(limit: int) -> int
+          |    'scan for i in 0..<100
+          |        for j in 0..<100
+          |            if i * j > limit then break 'scan i * 1000 + j
+          |    else -1
+          |print(firstSquareOver(50), firstSquareOver(100000))""".stripMargin
+
+      // i=1: j up to 50 gives 50 (not >50), j=51 → 51>50 → break with 1*1000+51 = 1051.
+      run(src) shouldBe "1051 -1\n"
+    }
+
+    // An unlabeled break still binds to the nearest loop even when an outer loop is labeled, so
+    // the label changes nothing until it is named.
+    "an unlabeled break beside a label still leaves only the inner loop" in {
+      val src =
+        """var total = 0
+          |'outer for i in 1..3
+          |    for j in 0..<5
+          |        if j == 2 then break
+          |        total += i * 10 + j
+          |print(total)""".stripMargin
+
+      run(src) shouldBe "123\n"
+    }
+
+    // Three deep: a break to the middle label leaves the middle and innermost loops but resumes
+    // the outermost, so the outermost keeps iterating.
+    "a break to a middle label leaves two of three loops" in {
+      val src =
+        """var log = 0
+          |for a in 0..<3
+          |    'mid for b in 0..<3
+          |        for c in 0..<3
+          |            if c == 1 then break 'mid
+          |            log += a * 100 + b * 10 + c
+          |    log += 100000
+          |print(log)""".stripMargin
+
+      // For each a, the mid loop starts b=0, inner c=0 adds a*100, then c=1 breaks 'mid → mid ends.
+      // So per a: adds a*100 (b=0,c=0) then 100000. a=0,1,2: (0+100+200) + 3*100000 = 300300.
+      run(src) shouldBe "300300\n"
+    }
+
+    // A labeled loop that also owns heap values in its body must still tear them down correctly
+    // when a labeled break unwinds several loops at once.
+    "a labeled break through owning loops neither leaks nor frees twice" in {
+      val src =
+        """var total = 0
+          |for k in 1..2000
+          |    'find for i in 0..<8
+          |        for j in 0..<8
+          |            var s = "ab" + "cd"
+          |            if i == 3 then break 'find
+          |            total += int(s[0])
+          |print(total)""".stripMargin
+
+      // Per k: i=0,1,2 each run j=0..7 adding 97 (='a') = 3*8*97 = 2328; i=3 breaks. ×1999 k's
+      // (k=1..1999, i.e. 1..2000 exclusive upper? range is inclusive 1..2000 → 2000 iters).
+      run(src) shouldBe (2328 * 2000).toString + "\n"
+    }
+  }
 }

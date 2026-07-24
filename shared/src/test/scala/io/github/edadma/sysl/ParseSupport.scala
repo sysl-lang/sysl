@@ -38,10 +38,21 @@ trait ParseSupport extends Matchers { this: Assertions =>
     ExprStmt(IfExpr(cond, thenBody, elseBody))
 
   /** `while cond …` in statement position — a `While` expression wrapped in an `ExprStmt`. */
-  protected def whileStmt(cond: Expr, body: List[Stmt], elseBody: Option[List[Stmt]] = None): Stmt =
-    ExprStmt(While(cond, body, elseBody))
+  protected def whileStmt(
+      cond: Expr,
+      body: List[Stmt],
+      elseBody: Option[List[Stmt]] = None,
+      label: Option[String] = None,
+  ): Stmt =
+    ExprStmt(While(label, cond, body, elseBody))
 
   /** `for name in iter …` in statement position — a `For` expression wrapped in an `ExprStmt`. */
-  protected def forStmt(name: String, iter: Expr, body: List[Stmt], elseBody: Option[List[Stmt]] = None): Stmt =
-    ExprStmt(For(name, iter, body, elseBody))
+  protected def forStmt(
+      name: String,
+      iter: Expr,
+      body: List[Stmt],
+      elseBody: Option[List[Stmt]] = None,
+      label: Option[String] = None,
+  ): Stmt =
+    ExprStmt(For(label, name, iter, body, elseBody))
 }

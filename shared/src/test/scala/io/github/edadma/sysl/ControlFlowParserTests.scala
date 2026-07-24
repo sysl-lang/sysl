@@ -93,19 +93,36 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
 
     "a bare break and a break with a value" in {
       prog("while c\n    break\n    break 5") shouldBe List(
-        whileStmt(Ident("c"), List(Break(None), Break(Some(i(5)))))
+        whileStmt(Ident("c"), List(Break(None, None), Break(None, Some(i(5)))))
       )
     }
 
     "continue parses as its own statement" in {
       prog("while c\n    continue") shouldBe List(
-        whileStmt(Ident("c"), List(Continue))
+        whileStmt(Ident("c"), List(Continue(None)))
       )
     }
 
     "an inline break inside an inline if" in {
       prog("for x in xs do if x then break x") shouldBe List(
-        forStmt("x", Ident("xs"), List(ifStmt(Ident("x"), List(Break(Some(Ident("x")))))))
+        forStmt("x", Ident("xs"), List(ifStmt(Ident("x"), List(Break(None, Some(Ident("x")))))))
+      )
+    }
+
+    "a labeled loop and labeled break/continue" in {
+      prog("'outer for i in xs do\n    break 'outer\n    continue 'outer") shouldBe List(
+        forStmt(
+          "i",
+          Ident("xs"),
+          List(Break(Some("outer"), None), Continue(Some("outer"))),
+          label = Some("outer"),
+        )
+      )
+    }
+
+    "a labeled break carrying a value" in {
+      prog("'scan while c\n    break 'scan 5") shouldBe List(
+        whileStmt(Ident("c"), List(Break(Some("scan"), Some(i(5)))), label = Some("scan"))
       )
     }
   }

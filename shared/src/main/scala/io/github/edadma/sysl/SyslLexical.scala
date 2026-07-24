@@ -50,6 +50,13 @@ class SyslLexical
     def chars: String = codepointToString(codepoint)
   }
 
+  /** A loop label, `'name` — the apostrophe form Rust uses. It is told from a character literal by
+   * the absence of a closing quote: `'a'` is the character, `'a` is the label.
+   */
+  case class Label(name: String) extends Token {
+    def chars: String = s"'$name"
+  }
+
   /** A string literal, holding its decoded value. */
   case class StrLit(value: String) extends Token {
     def chars: String = value
@@ -131,7 +138,7 @@ class SyslLexical
   }
 
   override def token: Parser[Token] =
-    interpString | identifier | number | character | string | (elem(EofCh) ^^^ EOF) | delim | failure(
+    interpString | identifier | number | label | character | string | (elem(EofCh) ^^^ EOF) | delim | failure(
       "illegal character",
     )
 
@@ -279,6 +286,20 @@ class SyslLexical
   private def validSuffix(s: String): Boolean =
     s == "usize" || s == "isize" ||
       (s.length > 1 && "iuf".contains(s.head) && s(1) != '0' && s.tail.forall(isDigit))
+
+  /** A loop label `'name`: an apostrophe, an identifier, and — crucially — no closing apostrophe,
+   * which is what separates it from the character literal `'n'`. When a closing quote does follow,
+   * this yields so the `character` parser reads the literal instead.
+   */
+  private lazy val label: Parser[Token] = Parser { in =>
+    if (in.atEnd || in.first != '\'' || in.rest.atEnd || !isIdentStart(in.rest.first)) Failure("not a label", in)
+    else {
+      val (name, after) = takeWhile(in.rest, isIdentPart)
+
+      if (!after.atEnd && after.first == '\'') Failure("not a label", in)
+      else Success(Label(name), after)
+    }
+  }
 
   private lazy val character: Parser[Token] = Parser { in =>
     if (in.atEnd || in.first != '\'') Failure("not a character literal", in)

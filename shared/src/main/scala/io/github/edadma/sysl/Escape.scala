@@ -158,7 +158,7 @@ private class Escape(program: TProgram) {
       case TExprStmt(e)      => escaping(e)
       // A `break value` carries the value out of the loop; walk it for the escape sites it may
       // contain. Whether it then leaves the frame is decided where the loop's own value is used.
-      case TBreak(Some(v))   => escaping(v)
+      case TBreak(Some(v), _)   => escaping(v)
       case _                 =>
     }
 
@@ -209,7 +209,7 @@ private class Escape(program: TProgram) {
         case TExprStmt(e)     => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TVarDecl(_, _, e) => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TReturn(Some(e))  => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
-        case TBreak(Some(e))   => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
+        case TBreak(Some(e), _)   => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case _                 =>
 
   /** The `break` values that belong to a loop with these body statements — those in its body but
@@ -217,7 +217,7 @@ private class Escape(program: TProgram) {
    * `if`/`match`, which do not introduce a new loop.
    */
   private def ownBreakValues(stmts: List[TStmt]): List[TExpr] = stmts.flatMap {
-    case TBreak(Some(v))   => List(v)
+    case TBreak(Some(v), _)   => List(v)
     case TExprStmt(e)      => ownBreaksInExpr(e)
     case TVarDecl(_, _, e) => ownBreaksInExpr(e)
     case TReturn(Some(e))  => ownBreaksInExpr(e)

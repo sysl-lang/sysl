@@ -213,9 +213,12 @@ case class TForEach(name: String, elemTy: Type, seq: TExpr, body: List[TStmt],
                     elseBlock: Option[TBlock], ty: Type) extends TExpr
 case class TReturn(value: Option[TExpr])                  extends TStmt
 
-/** `break [expr]` and `continue`. `break` carries the loop's value when the loop yields one. */
-case class TBreak(value: Option[TExpr]) extends TStmt
-case object TContinue                   extends TStmt
+/** `break [expr]` and `continue`. `break` carries the loop's value when the loop yields one.
+ * `depth` names the target loop by its distance out from the innermost — `0` is the nearest,
+ * a larger number a loop reached through a `'label` — and indexes the codegen loop stack directly.
+ */
+case class TBreak(value: Option[TExpr], depth: Int) extends TStmt
+case class TContinue(depth: Int)                    extends TStmt
 
 /** A user function. Parameters carry their unique names (the codegen allocates a slot for
  * each so the body can read and mutate them uniformly).

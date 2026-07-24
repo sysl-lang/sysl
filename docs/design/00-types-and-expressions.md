@@ -360,6 +360,34 @@ supply the matching value when the loop finishes on its own; every `break` value
 value share one type, which becomes the loop's. A bare `break` with no `else` is the ordinary
 statement loop, of type `unit`.
 
+**A loop may be labeled, so `break` and `continue` can reach an outer one.** A `'label` written
+before the loop keyword names that loop, and `break 'label` / `continue 'label` then act on it
+rather than on the nearest enclosing loop — the one way to leave or restart an outer loop from
+inside a nested one:
+
+```
+'outer for i in 0..<rows
+    for j in 0..<cols
+        if grid[i][j] == target then break 'outer
+```
+
+A labeled `break` carries a value exactly as a bare one does: `break 'scan x` makes `x` the value
+of the loop named `scan`, meeting that loop's other breaks and its `else` at one type. `continue`
+takes a label but never a value.
+
+```
+var hit = 'scan for i in 0..<n
+    if a[i] == found then break 'scan i
+else -1
+```
+
+The sigil is a leading apostrophe, as in Rust, and deliberately not the `:`-suffix label some
+languages use: a bare `break outer` would be ambiguous with `break expr` carrying a value named
+`outer`, and the apostrophe keeps a label and a value textually distinct. It does not collide with
+a character literal — `'a'` closes its quote and is a character, while `'a` does not and is a
+label. A label is in scope only inside its own loop's body; naming a loop that does not enclose the
+`break`/`continue`, or reusing a label already in scope, is an error rather than a silent miss.
+
 **Why.** An expression-oriented core removes the statement/expression split that forces a
 temporary-and-reassign dance in C (`int label; if (…) label = …; else label = …;`). It is the
 Rust/Scala/Kotlin consensus, and it makes the last-expression-is-the-value rule uniform across

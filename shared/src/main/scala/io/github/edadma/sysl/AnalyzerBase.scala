@@ -69,9 +69,10 @@ trait AnalyzerBase {
 
   /** The enclosing loops, innermost first, so a `break`/`continue` finds the one it leaves and a
    * `break value` records its type against that loop's result. `expected` is the type the loop's
-   * context wants, pushed down so a `break`/`else` value boxes to `&T` on its own.
+   * context wants, pushed down so a `break`/`else` value boxes to `&T` on its own. `label` is the
+   * loop's `'name`, if it has one, which a labeled `break`/`continue` resolves against.
    */
-  protected class LoopCtx(val expected: Option[Type]):
+  protected class LoopCtx(val expected: Option[Type], val label: Option[String]):
     val breakTys = mutable.ListBuffer.empty[Type]
   protected var loops: List[LoopCtx] = Nil
 

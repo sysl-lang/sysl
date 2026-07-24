@@ -48,6 +48,36 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
           |else 0""".stripMargin
       ) should include("must have the same type")
     }
+
+    // A labeled break/continue must name a loop that actually encloses it.
+    "breaking or continuing to an unknown label is rejected" in {
+      err(
+        """for i in 0..<3
+          |    break 'nope""".stripMargin
+      ) should include("no enclosing loop is labeled 'nope")
+      err(
+        """for i in 0..<3
+          |    continue 'gone""".stripMargin
+      ) should include("no enclosing loop is labeled 'gone")
+    }
+
+    // A label is out of scope once its loop has ended, so naming it from outside is an error.
+    "a label used outside its loop is rejected" in {
+      err(
+        """'outer for i in 0..<3
+          |    print(i)
+          |break 'outer""".stripMargin
+      ) should include("no enclosing loop is labeled 'outer")
+    }
+
+    // Two enclosing loops may not share a label, or a labeled break would be ambiguous.
+    "reusing a label already in scope is rejected" in {
+      err(
+        """'dup for i in 0..<3
+          |    'dup for j in 0..<3
+          |        break 'dup""".stripMargin
+      ) should include("label 'dup is already in scope")
+    }
   }
 
   "an argument of the wrong type" in {

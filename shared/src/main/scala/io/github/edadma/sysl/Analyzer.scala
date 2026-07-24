@@ -205,13 +205,31 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * resolve to this loop and each `break` value is collected for the loop's result type. Returns
    * the typed body together with the context the breaks were recorded in.
    */
-  private def analyzeLoopBody(expected: Option[Type])(body: => List[TStmt]): (List[TStmt], LoopCtx) = {
-    val ctx = new LoopCtx(expected)
+  private def analyzeLoopBody(expected: Option[Type], label: Option[String])(
+      body: => List[TStmt],
+  ): (List[TStmt], LoopCtx) = {
+    label.foreach { l =>
+      if loops.exists(_.label.contains(l)) then err(s"label '$l is already in scope")
+    }
+    val ctx = new LoopCtx(expected, label)
     loops = ctx :: loops
     val tb = body
     loops = loops.tail
     (tb, ctx)
   }
+
+  /** Resolves a `break`/`continue` to the loop it targets and that loop's distance out from the
+   * innermost. An absent label is the nearest loop; a `'name` is the nearest loop carrying it.
+   */
+  private def resolveLoop(keyword: String, label: Option[String]): (LoopCtx, Int) = label match
+    case None =>
+      loops match
+        case ctx :: _ => (ctx, 0)
+        case Nil      => err(s"'$keyword' is only allowed inside a loop")
+    case Some(l) =>
+      loops.indexWhere(_.label.contains(l)) match
+        case -1 => err(s"no enclosing loop is labeled '$l")
+        case i  => (loops(i), i)
 
   /** The result type of a loop: every `break` value and the `else` value must agree on one type.
    * With no `else`, normal completion yields `unit`, so a value-carrying `break` has nothing to
@@ -255,20 +273,19 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         case _                             =>
       TReturn(tv)
 
-    // `break value` records its type against the innermost loop, which unites it with the loop's
-    // other breaks and its `else` to fix the loop's result type. The value is analyzed in the
-    // loop's expected type, so a `break &T` boxes the same way a `break` in a `&T` context asks.
-    case Break(opt) =>
-      loops match
-        case ctx :: _ =>
-          val tv = opt.map(e => analyzeExpr(e, ctx.expected))
-          ctx.breakTys += tv.map(_.ty).getOrElse(Type.Unit)
-          TBreak(tv)
-        case Nil => err("'break' is only allowed inside a loop")
+    // `break value` records its type against the loop it targets — the nearest, or the one a
+    // `'label` names — which unites it with that loop's other breaks and its `else` to fix the
+    // loop's result type. The value is analyzed in the target loop's expected type, so a `break &T`
+    // boxes the same way a `break` in a `&T` context asks.
+    case Break(label, opt) =>
+      val (ctx, depth) = resolveLoop("break", label)
+      val tv           = opt.map(e => analyzeExpr(e, ctx.expected))
+      ctx.breakTys += tv.map(_.ty).getOrElse(Type.Unit)
+      TBreak(tv, depth)
 
-    case Continue =>
-      if loops.isEmpty then err("'continue' is only allowed inside a loop")
-      TContinue
+    case Continue(label) =>
+      val (_, depth) = resolveLoop("continue", label)
+      TContinue(depth)
 
     case _: FuncDecl | _: StructDecl | _: EnumDecl =>
       err("functions, structs, and enums may only be declared at the top level")
@@ -561,13 +578,13 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val tarms = arms.map(analyzeArm(ts.ty, _, expected))
       TMatch(ts, tarms, matchResultType(ts.ty, tarms))
 
-    case While(cond, body, elseOpt) =>
+    case While(label, cond, body, elseOpt) =>
       val tc            = analyzeBool(cond)
-      val (tbody, ctx)  = analyzeLoopBody(expected)(analyzeStmts(body))
+      val (tbody, ctx)  = analyzeLoopBody(expected, label)(analyzeStmts(body))
       val telse         = elseOpt.map(analyzeValueBlock(_, expected))
       TWhile(tc, tbody, telse, loopResultType(ctx, telse))
 
-    case For(name, iter, body, elseOpt) =>
+    case For(label, name, iter, body, elseOpt) =>
       iter match
         case RangeExpr(Some(lo), Some(hi), inclusive) =>
           val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
@@ -578,7 +595,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
             case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
           pushScope()
           val u            = declare(name, vty)
-          val (tb, ctx)    = analyzeLoopBody(expected)(body.map(analyzeStmt(_)))
+          val (tb, ctx)    = analyzeLoopBody(expected, label)(body.map(analyzeStmt(_)))
           popScope()
           val telse        = elseOpt.map(analyzeValueBlock(_, expected))
           TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
@@ -596,7 +613,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
               err(s"'for' iterates an integer range, an array, or a slice, not ${show(other)}")
           pushScope()
           val u         = declare(name, elem)
-          val (tb, ctx) = analyzeLoopBody(expected)(body.map(analyzeStmt(_)))
+          val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(analyzeStmt(_)))
           popScope()
           val telse     = elseOpt.map(analyzeValueBlock(_, expected))
           TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))

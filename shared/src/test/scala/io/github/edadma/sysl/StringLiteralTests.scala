@@ -106,9 +106,12 @@ class StringLiteralTests extends AnyFreeSpec with Matchers with CodegenSupport w
       l.bad("'ab'") should include("must hold exactly one character")
     }
 
+    // A letter-started `'a` with no closing quote is now a loop label, not an unterminated
+    // character, so the unterminated-character cases use a digit-started literal, which cannot be
+    // a label.
     "neither literal may run past the end of its line" in withLexer { l =>
-      l.bad("'a") should include("unterminated character literal")
-      l.bad("'a\nb'") should include("unterminated character literal")
+      l.bad("'1") should include("unterminated character literal")
+      l.bad("'1\nb") should include("unterminated character literal")
       l.bad("\"oops") should include("unterminated string literal")
       l.bad("\"oops\nmore\"") should include("unterminated string literal")
     }

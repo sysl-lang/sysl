@@ -259,10 +259,14 @@ class SyslParser extends PackratParsers {
     op("return") ~> opt(expression) ^^ Return.apply
 
   private lazy val breakStmt: PackratParser[Stmt] =
-    op("break") ~> opt(expression) ^^ Break.apply
+    op("break") ~> opt(labelRef) ~ opt(expression) ^^ { case lbl ~ v => Break(lbl, v) }
 
   private lazy val continueStmt: PackratParser[Stmt] =
-    op("continue") ^^^ Continue
+    op("continue") ~> opt(labelRef) ^^ (lbl => Continue(lbl))
+
+  /** A `'name` label reference, as used before a loop and after `break`/`continue`. */
+  private lazy val labelRef: Parser[String] =
+    accept("label", { case t: lexical.Label => t.name })
 
   /** One `name: type` binding — a function parameter or a struct field. */
   private lazy val param: Parser[Param] =
@@ -417,13 +421,15 @@ class SyslParser extends PackratParsers {
    * `if`, sitting after the body and before any `end while`.
    */
   private lazy val whileExpr: PackratParser[Expr] =
-    op("while") ~> expression ~ body("do") ~ opt(elseClause) ~ opt(endMarker("while")) ^^ {
-      case c ~ b ~ e ~ _ => While(c, b, e)
+    opt(labelRef) ~ (op("while") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(endMarker("while")) ^^ {
+      case lbl ~ c ~ b ~ e ~ _ => While(lbl, c, b, e)
     }
 
   private lazy val forExpr: PackratParser[Expr] =
-    op("for") ~> ident ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(endMarker("for")) ^^ {
-      case n ~ it ~ b ~ e ~ _ => For(n, it, b, e)
+    opt(labelRef) ~ (op("for") ~> ident) ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(
+      endMarker("for"),
+    ) ^^ {
+      case lbl ~ n ~ it ~ b ~ e ~ _ => For(lbl, n, it, b, e)
     }
 
   // --- match ---------------------------------------------------------------------------
