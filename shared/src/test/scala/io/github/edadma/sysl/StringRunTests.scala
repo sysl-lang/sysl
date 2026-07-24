@@ -82,6 +82,128 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  "concatenation" - {
+    "two strings join into one" in {
+      run("""print("foo" + "bar")""") shouldBe "foobar\n"
+    }
+
+    "concatenation chains left to right" in {
+      run("""print("a" + "b" + "c" + "d")""") shouldBe "abcd\n"
+    }
+
+    "a literal joins with a variable, in either order" in {
+      run("""var name = "ada"
+            |print("hi " + name, name + "!")""".stripMargin) shouldBe "hi ada ada!\n"
+    }
+
+    // The empty string is the identity on both sides, and the join of two empties is empty.
+    "the empty string is the identity" in {
+      run("""var s = "xy"
+            |print(s + "" == s, "" + s == s, ("" + "").len)""".stripMargin) shouldBe "true true 0\n"
+    }
+
+    "the joined length is the sum of the byte lengths, multibyte included" in {
+      run("""var s = "é" + "☃"
+            |print(s.len, s == "é☃")""".stripMargin) shouldBe "5 true\n"
+    }
+
+    // The result is a real owning string, not a view of an operand — it can be sliced, indexed,
+    // compared, and its bytes reach through, all of which need it to hold its own buffer.
+    "the result is a fully-fledged string" in {
+      run("""var s = "abc" + "def"
+            |print(s[2..<4], s[0], s.bytes.len, s > "abc")""".stripMargin) shouldBe "cd 97 6 true\n"
+    }
+
+    "operands that share a buffer join by content" in {
+      run("""var s = "abcdef"
+            |print(s[0..<2] + s[4..])""".stripMargin) shouldBe "abef\n"
+    }
+
+    "a NUL survives concatenation as an ordinary byte" in {
+      run("""var s = "a\0" + "b"
+            |print(s.len, s[1])""".stripMargin) shouldBe "3 0\n"
+    }
+
+    "a joined string outlives the frame when it is returned" in {
+      val src =
+        """join(a: string, b: string) -> string
+          |    a + b
+          |end join
+          |print(join("out", "live"))
+          |""".stripMargin
+
+      run(src) shouldBe "outlive\n"
+    }
+
+    "a joined string survives being put on the heap" in {
+      val src =
+        """struct Label
+          |    text: string
+          |end Label
+          |tag() -> string
+          |    var l: &Label = Label("v" + "1")
+          |    l.text
+          |end tag
+          |print(tag())
+          |""".stripMargin
+
+      run(src) shouldBe "v1\n"
+    }
+
+    "joining in a loop neither leaks nor frees twice" in {
+      val src =
+        """var total = 0
+          |for i in 1..20000 do
+          |    var s = "ab" + "cd"
+          |    total += int(s[2]) - int(s[0])
+          |print(total)
+          |""".stripMargin
+
+      run(src) shouldBe "40000\n"
+    }
+  }
+
+  "in-place append" - {
+    "`+=` grows a string in place" in {
+      run("""var s = "a"
+            |s += "b"
+            |s += "cd"
+            |print(s, s.len)""".stripMargin) shouldBe "abcd 4\n"
+    }
+
+    "appending the empty string is a no-op on the contents" in {
+      run("""var s = "keep"
+            |s += ""
+            |print(s, s.len)""".stripMargin) shouldBe "keep 4\n"
+    }
+
+    // Appending a string to itself must read the old value before the slot is overwritten.
+    "a string can be appended to itself" in {
+      run("""var s = "ab"
+            |s += s
+            |print(s)""".stripMargin) shouldBe "abab\n"
+    }
+
+    "repeated append accumulates a growing string" in {
+      run("""var s = ""
+            |for i in 0..<5 do s += "-"
+            |print(s, s.len)""".stripMargin) shouldBe "----- 5\n"
+    }
+
+    "appending in a loop neither leaks nor frees twice" in {
+      val src =
+        """var t = 0
+          |for i in 1..20000 do
+          |    var s = "ab"
+          |    s += "cd"
+          |    t += int(s[2])
+          |print(t)
+          |""".stripMargin
+
+      run(src) shouldBe "1980000\n"
+    }
+  }
+
   "comparison" - {
     "equality is by bytes" in {
       run("""print("abc" == "abc", "abc" == "abd", "abc" != "ab")""") shouldBe "true false true\n"

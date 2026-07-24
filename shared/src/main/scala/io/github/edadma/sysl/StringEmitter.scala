@@ -38,6 +38,23 @@ trait StringEmitter extends Emitter {
     emit(s"call void @${request("sysl.str.write")(StringEmitter.write)}(ptr $p, i64 $n)")
   }
 
+  /** Joins two strings into a fresh one. The result owns a new `StrBuf` — an ordinary ARC box
+   * (`03`) whose payload is the two halves' bytes laid end to end — so it carries a count of its
+   * own and frees itself through `@arc.free` like every other heap object. UTF-8 is closed under
+   * concatenation, so the validity invariant needs no re-checking. Both operands are copied out,
+   * so neither is retained; the caller records the result as an owned temporary.
+   */
+  protected def strConcat(av: String, bv: String): String = {
+    heap = true
+    val (ap, an) = strBytes(av)
+    val (bp, bn) = strBytes(bv)
+    val fn       = request("sysl.str.concat")(StringEmitter.concat)
+    val r        = freshTemp()
+
+    emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $ap, i64 $an, ptr $bp, i64 $bn)")
+    r
+  }
+
   /** Compares two strings by their bytes, yielding the usual -1 / 0 / 1 so that every comparison
    * operator is one `icmp` against the result. For well-formed UTF-8 the byte order is also
    * codepoint order, which is the ordering worth having.
@@ -125,6 +142,57 @@ object StringEmitter {
       |  %t0 = select i1 %longer, i32 1, i32 0
       |  %t1 = select i1 %shorter, i32 -1, i32 %t0
       |  ret i32 %t1
+      |}
+      |""".stripMargin
+
+  /** Concatenation. A `StrBuf` sized for both halves is allocated the way every ARC box is — a
+   * refcount set to one, the deallocation hook (`@arc.free`, since raw bytes hold no references),
+   * then the payload — with the header size taken portably from `%arc.header` so a 32-bit target
+   * lays it out the same way. The two halves are copied in a byte at a time, and the returned
+   * view names the buffer as its owner, the first payload byte as its start, and the summed
+   * length.
+   */
+  val concat: String =
+    """define private { ptr, ptr, i64 } @sysl.str.concat(ptr %ap, i64 %an, ptr %bp, i64 %bn) {
+      |entry:
+      |  %total = add i64 %an, %bn
+      |  %hend = getelementptr %arc.header, ptr null, i32 1
+      |  %hsize = ptrtoint ptr %hend to i64
+      |  %size = add i64 %hsize, %total
+      |  %p = call ptr @malloc(i64 %size)
+      |  store i64 1, ptr %p
+      |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
+      |  store ptr @arc.free, ptr %hook
+      |  %bytes = getelementptr %arc.header, ptr %p, i32 1
+      |  br label %acond
+      |acond:
+      |  %i = phi i64 [ 0, %entry ], [ %inext, %abody ]
+      |  %amore = icmp ult i64 %i, %an
+      |  br i1 %amore, label %abody, label %bcond
+      |abody:
+      |  %asrc = getelementptr i8, ptr %ap, i64 %i
+      |  %abyte = load i8, ptr %asrc
+      |  %adst = getelementptr i8, ptr %bytes, i64 %i
+      |  store i8 %abyte, ptr %adst
+      |  %inext = add i64 %i, 1
+      |  br label %acond
+      |bcond:
+      |  %j = phi i64 [ 0, %acond ], [ %jnext, %bbody ]
+      |  %bmore = icmp ult i64 %j, %bn
+      |  br i1 %bmore, label %bbody, label %done
+      |bbody:
+      |  %bsrc = getelementptr i8, ptr %bp, i64 %j
+      |  %bbyte = load i8, ptr %bsrc
+      |  %off = add i64 %an, %j
+      |  %bdst = getelementptr i8, ptr %bytes, i64 %off
+      |  store i8 %bbyte, ptr %bdst
+      |  %jnext = add i64 %j, 1
+      |  br label %bcond
+      |done:
+      |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
+      |  %v1 = insertvalue { ptr, ptr, i64 } %v0, ptr %bytes, 1
+      |  %v2 = insertvalue { ptr, ptr, i64 } %v1, i64 %total, 2
+      |  ret { ptr, ptr, i64 } %v2
       |}
       |""".stripMargin
 

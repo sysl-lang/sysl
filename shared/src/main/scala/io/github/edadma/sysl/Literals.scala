@@ -90,13 +90,16 @@ trait Literals extends TypeResolution {
 
   /** The result type of an arithmetic or bitwise binary operator. Operands must already have
    * the same type — there is no implicit promotion, so a mixed-width expression is an error
-   * asking for a conversion rather than a silent widening.
+   * asking for a conversion rather than a silent widening. `+` on two strings concatenates,
+   * allocating a fresh buffer; it is deliberately strict, so `s + 5` is an error asking for
+   * interpolation rather than a silent `str(5)`.
    */
   protected def arithType(op: String, a: Type, b: Type): Type = {
     if a != b then err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}")
     (a, op) match
       case (_: Type.Integer, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^") => a
       case (_: Type.Floating, "+" | "-" | "*" | "/")                                      => a
+      case (Type.Str, "+")                                                                => a
       case _ => err(s"operator '$op' is not defined for ${show(a)}")
   }
 

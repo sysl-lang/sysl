@@ -253,9 +253,19 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       val p       = address(place)
       val cur     = freshTemp(); emit(s"$cur = load ${ty.llvm}, ptr $p")
       val v       = genExpr(value)
-      val updated = arith(op.dropRight(1), ty, cur, v)
-      emit(s"store ${ty.llvm} $updated, ptr $p")
-      updated
+      // A string slot holds a count, so `s += t` retains the fresh join for the slot and releases
+      // what was there before, exactly like a plain assignment; every other type just overwrites.
+      ty match
+        case Type.Str =>
+          val updated = ownTemp(strConcat(cur, v), Type.Str)
+          retainValue(ty, updated)
+          emit(s"store ${ty.llvm} $updated, ptr $p")
+          releaseValue(ty, cur)
+          updated
+        case _ =>
+          val updated = arith(op.dropRight(1), ty, cur, v)
+          emit(s"store ${ty.llvm} $updated, ptr $p")
+          updated
 
     case TIncDec(place, op, pre, ty) =>
       val w   = ty.llvm
@@ -264,6 +274,9 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} $w $cur, 1")
       emit(s"store $w $nv, ptr $p")
       if pre then nv else cur
+
+    case TBinary(_, l, r, Type.Str) =>
+      ownTemp(strConcat(genExpr(l), genExpr(r)), Type.Str)
 
     case TBinary(op, l, r, _) =>
       arith(op, l.ty, genExpr(l), genExpr(r))

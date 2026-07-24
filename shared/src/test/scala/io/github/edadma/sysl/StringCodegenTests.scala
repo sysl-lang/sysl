@@ -82,10 +82,23 @@ class StringCodegenTests extends AnyFreeSpec with CodegenSupport {
          |print(b.len)""".stripMargin) should not include "@sysl.str.boundary"
   }
 
-  "a module that only prints a string needs neither comparison nor boundaries" in {
-    val out = ir("""print("hi")""")
+  "concatenation is one call that returns the joined view" in {
+    val out = ir("""print("a" + "b")""")
 
-    out should not include "@sysl.str.cmp"
-    out should not include "@sysl.str.boundary"
+    out should include regex
+      raw"call \{ ptr, ptr, i64 \} @sysl\.str\.concat\(ptr %t\d+, i64 %t\d+, ptr %t\d+, i64 %t\d+\)"
+    out should include("define private { ptr, ptr, i64 } @sysl.str.concat")
+  }
+
+  "a joined string owns a heap buffer, so the module links an allocator and counts references" in {
+    val out = ir("""print("a" + "b")""")
+
+    out should include("declare ptr @malloc(i64)")
+    out should include("store ptr @arc.free")
+    out should include("define private void @arc.release_maybe(ptr %p) {")
+  }
+
+  "a module that never joins strings emits no concatenation helper" in {
+    ir("""print("hi")""") should not include "@sysl.str.concat"
   }
 }

@@ -351,8 +351,23 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
             |print(f("ab"))""".stripMargin) should include("is []byte, but string was given")
     }
 
-    "do not concatenate yet, since that would allocate" in {
-      err("""print("a" + "b")""") should include("'+' is not defined for string")
+    // `+` is the one string operator, so the others are rejected the way they are for any type
+    // that does not define them.
+    "join with '+' only, not the other arithmetic operators" in {
+      err("""print("a" - "b")""") should include("operator '-' is not defined for string")
+      err("""print("a" * "b")""") should include("operator '*' is not defined for string")
+    }
+
+    // `+` is deliberately strict: mixing a string with a number is a type error asking for
+    // interpolation, not a silent `str()` of the other operand — in either order.
+    "do not coerce a number across '+'" in {
+      err("""print("n=" + 5)""") should include("'+' needs matching types, got string and int")
+      err("""print(5 + "n")""") should include("'+' needs matching types, got int and string")
+    }
+
+    "need a string on the right of '+=' too" in {
+      err("""var s = "a"
+            |s += 5""".stripMargin) should include("'+' needs matching types, got string and int")
     }
   }
 

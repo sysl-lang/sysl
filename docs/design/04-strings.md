@@ -1,15 +1,16 @@
 # Strings
 
 **Status:** representation and semantics decided and implemented; the API surface is sketched,
-and the part of it that makes new bytes is not built. This rests on the memory model (`03`) — a
+and most of the part that makes new bytes is not built. This rests on the memory model (`03`) — a
 `string` is an immutable, validated `[]u8` and inherits its ownership rules from slices, so read
 that one first, and `07` for the view machinery it shares.
 
 What exists: the three-word representation, literals, `s.len`, `s[i]`, `s[a..b]` with both the
-bounds and the boundary checked, `s.bytes`, comparison by bytes, and string literals as `match`
-patterns. What does not: every operation that produces new bytes — `from_utf8`, `copy()`,
-concatenation, `str.builder`, `cstring`, `string(c)` — since each needs either an allocator
-surface or methods. So every string a program can hold today traces back to a literal.
+bounds and the boundary checked, `s.bytes`, comparison by bytes, string literals as `match`
+patterns, and **concatenation** — `a + b` and `s += t`, which allocate a fresh buffer. What does
+not: the rest of the operations that produce new bytes — `from_utf8`, `copy()`, `str.builder`,
+`cstring`, `string(c)` — since each needs either the raw-bytes surface or methods. A string is
+therefore no longer always traceable to a literal; a program can build one by joining.
 
 ## The decision in one paragraph
 
@@ -145,6 +146,25 @@ composed `"é"` equals a decomposed one — correct for user-facing text, surpri
 expensive in systems code, where a string is usually a path, a device name, or a protocol
 token that must compare as the bytes it is. Normalization and collation are library
 operations, applied where they are wanted and visible when they cost something.
+
+## Concatenation
+
+`a + b` joins two strings, and `s += t` appends onto a slot. Both allocate: the result is a
+fresh `StrBuf` — an ordinary ARC heap object (`03`), a refcount and a deallocation hook followed
+by the two halves' bytes laid end to end — so it owns a count of its own and frees itself like
+any other reference. UTF-8 is closed under concatenation, so the validity invariant is preserved
+for free; nothing is re-checked. The operands are copied out, not aliased, so an operand that was
+itself a substring keeps no hold on the result.
+
+`+` is **strict**: it joins a `string` to a `string` and nothing else. `"n=" + 5` is a type
+error, not a silent `str(5)` — the same no-implicit-coercion stance the numeric operators take,
+where a mixed-width sum is an error asking for a conversion. The way to build a string out of
+values of other types is interpolation, where the conversion is written where it happens. Making
+`+` polymorphic over "anything with a string form" would reintroduce exactly the invisible
+conversion the rest of the language refuses.
+
+`+` is the only arithmetic operator a string defines; `-`, `*`, and the rest are rejected the way
+they are for any type that does not define them.
 
 ## Literals
 
