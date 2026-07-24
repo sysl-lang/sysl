@@ -229,7 +229,7 @@ class SyslParser extends PackratParsers {
   // --- statements ----------------------------------------------------------------------
 
   lazy val statement: PackratParser[Stmt] =
-    structDecl | enumDecl | funcDecl | varDecl | returnStmt | breakStmt | continueStmt | exprStmt
+    structDecl | enumDecl | traitDecl | implDecl | funcDecl | varDecl | returnStmt | breakStmt | continueStmt | exprStmt
 
   /** A type: a memory-mode sigil applied to a type, or a name optionally applied to type
    * arguments (`Box[int]`, `Result[T, string]`). `sync` stays a soft keyword — it is only
@@ -360,6 +360,38 @@ class SyslParser extends PackratParsers {
     ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ^^ { case n ~ fs => EnumVariantDecl(n, None, fs) } |
       ident ~ (op("=") ~> expression) ^^ { case n ~ v => EnumVariantDecl(n, Some(v), Nil) } |
       ident ^^ (n => EnumVariantDecl(n, None, Nil))
+
+  /** `trait Name` with indented method signatures. A signature is a method header — a receiver, a
+   * parameter list, and an optional result — with no body; it parses to a `MethodDecl` whose empty
+   * body marks it as a signature rather than a definition.
+   */
+  private lazy val traitDecl: PackratParser[Stmt] =
+    op("trait") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
+      (newline ~> indent ~> opt(newlines) ~> repsep(methodSig, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
+        methods => TraitDecl(name, tps.getOrElse(Nil), methods)
+      }
+    }
+
+  /** A trait method signature: a header with no `= body`. The receiver and parameters parse
+   * exactly as a real method's do, so a signature and its implementation are compared shape for
+   * shape.
+   */
+  private lazy val methodSig: PackratParser[MethodDecl] =
+    ident ~ opt(typeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+      case name ~ tps ~ ((recv, params)) ~ ret =>
+        MethodDecl(name, recv, isProperty = false, tps.getOrElse(Nil), params, ret, Nil)
+    }
+
+  /** `impl Trait for Type` with indented method definitions — ordinary members, reusing the same
+   * grammar as a method written in a struct's own body. The block is closed by an optional
+   * `end Type`.
+   */
+  private lazy val implDecl: PackratParser[Stmt] =
+    op("impl") ~> ident ~ (op("for") ~> ident) >> { case tname ~ forType =>
+      (newline ~> indent ~> opt(newlines) ~> repsep(member, newlines) <~ opt(newlines) <~ dedent) <~ endName(forType) ^^ {
+        methods => ImplDecl(tname, forType, methods)
+      }
+    }
 
   /** An optional `end Name` marker closing a declaration block, Scala-style. `end` is a soft
    * keyword; the trailing name must equal the declaration's own name, or it is a parse error.

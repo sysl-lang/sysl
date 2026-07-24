@@ -810,4 +810,139 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("does not fit")
     }
   }
+
+  "traits" - {
+    "an impl that omits a trait method is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |    label(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> string = "p"""".stripMargin
+      ) should include("method 'label' is missing")
+    }
+
+    "an impl method the trait does not declare is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> string = "p"
+          |    extra(self) -> int = 1""".stripMargin
+      ) should include("declares no method 'extra'")
+    }
+
+    "an impl method whose parameter type differs from the trait is rejected" in {
+      err(
+        """trait Add
+          |    add(self, x: int) -> int
+          |struct P
+          |    v: int
+          |impl Add for P
+          |    add(self, x: string) -> int = self.v""".stripMargin
+      ) should include("parameter 'x'")
+    }
+
+    "an impl method whose result type differs from the trait is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> int = self.v""".stripMargin
+      ) should include("but trait 'Show' declares")
+    }
+
+    "an impl method whose receiver mode differs from the trait is rejected" in {
+      err(
+        """trait Bump
+          |    bump(*self)
+          |struct P
+          |    v: int
+          |impl Bump for P
+          |    bump(self)
+          |        self.v""".stripMargin
+      ) should include("different receiver")
+    }
+
+    "implementing an unknown trait is rejected" in {
+      err(
+        """struct P
+          |    v: int
+          |impl Nope for P
+          |    go(self) -> int = self.v""".stripMargin
+      ) should include("unknown trait 'Nope'")
+    }
+
+    "implementing a trait for an unknown type is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |impl Show for Ghost
+          |    show(self) -> string = "g"""".stripMargin
+      ) should include("'Ghost' is not one")
+    }
+
+    "two impls of the same trait for one type are rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> string = "a"
+          |impl Show for P
+          |    show(self) -> string = "b"""".stripMargin
+      ) should include("already implements 'Show'")
+    }
+
+    // Stage 1a dispatches only through members that concretely exist; a trait method on a type
+    // with no impl has nothing to resolve to, and the diagnostic is the ordinary "no method" one.
+    "calling a trait method on a type with no impl is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |var p = P(1)
+          |print(p.show())""".stripMargin
+      ) should include("has no method 'show'")
+    }
+
+    "a generic trait is rejected for now" in {
+      err(
+        """trait Into[T]
+          |    into(self) -> T""".stripMargin
+      ) should include("generic traits are not supported yet")
+    }
+
+    "implementing a trait for a generic struct is rejected for now" in {
+      err(
+        """trait Show
+          |    show(self) -> int
+          |struct Box[T]
+          |    v: T
+          |impl Show for Box
+          |    show(self) -> int = 1""".stripMargin
+      ) should include("generic type is not supported yet")
+    }
+
+    // A field and an impl method sharing a name collide the same way a field and an inherent
+    // method do, since both land in the one member table.
+    "an impl method colliding with a field is rejected" in {
+      err(
+        """trait Show
+          |    v(self) -> int
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    v(self) -> int = 1""".stripMargin
+      ) should include("both a field and a member")
+    }
+  }
 }

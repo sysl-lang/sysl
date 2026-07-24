@@ -225,4 +225,17 @@ case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param
 case class EnumDecl(name: String, tparams: List[String], underlying: Option[TypeRef],
                     variants: List[EnumVariantDecl]) extends Stmt
 
+/** `trait Name` with indented method **signatures** — a method with a receiver and a parameter
+ * list but no body (`show(self) -> string`). A trait is nominal: a type participates only through
+ * an explicit `impl`, never by coincidence of method names. Each signature is a `MethodDecl` with
+ * an empty `body`, which is what tells a signature from a real method.
+ */
+case class TraitDecl(name: String, tparams: List[String], methods: List[MethodDecl]) extends Stmt
+
+/** `impl Trait for Type` with indented method **bodies**. Every method the trait declares must be
+ * present with a matching signature, and no others; the methods then become inherent members of
+ * `forType`, callable as `value.method(…)` exactly as a method written in the type's own body.
+ */
+case class ImplDecl(traitName: String, forType: String, methods: List[MethodDecl]) extends Stmt
+
 case class Program(body: List[Stmt])

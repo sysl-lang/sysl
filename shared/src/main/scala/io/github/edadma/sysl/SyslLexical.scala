@@ -97,6 +97,8 @@ class SyslLexical
     "match",
     "struct",
     "enum",
+    "trait",
+    "impl",
     "return",
     "self",
     "weak",

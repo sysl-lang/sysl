@@ -49,6 +49,14 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
             if variantOwner.contains(v.name) then
               err(s"variant name '${v.name}' is already used by enum '${variantOwner(v.name)}'")
             variantOwner(v.name) = e.name
+        case t: TraitDecl =>
+          if typeNameTaken(t.name) then err(s"the name '${t.name}' is already declared")
+          if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
+          traitDecls(t.name) = t
+        case i: ImplDecl =>
+          if traitImpls.contains((i.traitName, i.forType)) then
+            err(s"'${i.forType}' already implements '${i.traitName}'")
+          traitImpls((i.traitName, i.forType)) = i
         case _ =>
 
     // A non-generic type is instantiated eagerly, so it is emitted whether or not it is used;
@@ -71,6 +79,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     // method call and an associated-function call resolve exactly as a free call does.
     val members = mutable.ListBuffer.empty[FuncDecl]
     for (tname, sdecl) <- structDecls do hoistMembers(tname, sdecl, members)
+    for impl <- traitImpls.values do hoistImpl(impl, members)
 
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 
@@ -81,8 +90,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       tfuncs += analyzeFuncBody(f.name, f, Map.empty)
 
     val mainStmts = program.body.filter {
-      case _: FuncDecl | _: StructDecl | _: EnumDecl => false
-      case _                                         => true
+      case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl => false
+      case _                                                                      => true
     }
 
     resetFunction()
@@ -102,7 +111,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * most one of them.
    */
   private def typeNameTaken(name: String): Boolean =
-    structDecls.contains(name) || enumDecls.contains(name) || scalarType(name).isDefined
+    structDecls.contains(name) || enumDecls.contains(name) || traitDecls.contains(name) ||
+      scalarType(name).isDefined
 
   /** Records a type's members and lowers each to a function declaration under the mangled name
    * `Type.member`, whose signature is registered so calls resolve like ordinary ones.
@@ -115,17 +125,31 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * to be inferred rather than read off a receiver — wait on later work and are rejected with a
    * clear diagnostic rather than silently mishandled.
    */
-  private def hoistMembers(tname: String, sdecl: StructDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
-    val generic = sdecl.tparams.nonEmpty
+  private def hoistMembers(tname: String, sdecl: StructDecl, out: mutable.ListBuffer[FuncDecl]): Unit =
+    hoistMemberList(tname, sdecl.tparams, sdecl.fields.map(_.name).toSet, sdecl.members, out)
 
-    for m <- sdecl.members do
+  /** Lowers a list of members of `tname` to functions, shared by a type's own body and an `impl`
+   * block. Each member is registered under (type, name) and synthesized to a `Type.member`
+   * function; a member of a concrete type is type-checked eagerly, while a member of a generic
+   * type waits for a concrete instantiation.
+   */
+  private def hoistMemberList(
+      tname: String,
+      tparams: List[String],
+      fieldNames: Set[String],
+      members: List[MethodDecl],
+      out: mutable.ListBuffer[FuncDecl],
+  ): Unit = {
+    val generic = tparams.nonEmpty
+
+    for m <- members do
       if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '$tname.${m.name}'")
       if memberDecls.contains((tname, m.name)) then err(s"type '$tname' already has a member named '${m.name}'")
-      if sdecl.fields.exists(_.name == m.name) then
+      if fieldNames.contains(m.name) then
         err(s"type '$tname' has both a field and a member named '${m.name}'")
 
       memberDecls((tname, m.name)) = m
-      val fd = synthesize(tname, sdecl.tparams, m)
+      val fd = synthesize(tname, tparams, m)
 
       if generic then
         if m.receiver.isEmpty && !m.isProperty then
@@ -136,6 +160,65 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         funcInsts(fd.name) =
           (fd.params.map(p => (p.name, resolveType(p.typ, Map.empty))),
            fd.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit))
+  }
+
+  /** Checks an `impl` conforms to its trait and lowers its methods to inherent members of the
+   * implementing type. Conformance is nominal and exact: the type must supply every trait method
+   * with a matching signature and no method the trait does not declare. The methods are then
+   * hoisted exactly as a struct's own members, so a call on a value resolves through the ordinary
+   * member path with no dispatch machinery of its own.
+   */
+  private def hoistImpl(impl: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
+    val tr = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
+    val sdecl = structDecls.getOrElse(
+      impl.forType,
+      err(s"a trait can only be implemented for a struct so far, and '${impl.forType}' is not one"),
+    )
+    if sdecl.tparams.nonEmpty then
+      err(s"implementing a trait for a generic type is not supported yet — '${impl.forType}'")
+
+    checkConformance(tr, impl)
+    hoistMemberList(impl.forType, Nil, sdecl.fields.map(_.name).toSet, impl.methods, out)
+  }
+
+  /** Verifies that `impl` supplies exactly the methods `tr` declares, each with an identical
+   * resolved signature. A missing method, an extra one, or a mismatched receiver, parameter, or
+   * result is reported against the trait it fails to satisfy.
+   */
+  private def checkConformance(tr: TraitDecl, impl: ImplDecl): Unit = {
+    val declared = tr.methods.map(_.name).toSet
+
+    for tm <- tr.methods do
+      impl.methods.find(_.name == tm.name) match
+        case None     => err(s"'${impl.forType}' does not implement '${impl.traitName}': method '${tm.name}' is missing")
+        case Some(im) => checkSignature(impl.forType, impl.traitName, tm, im)
+
+    for im <- impl.methods do
+      if !declared.contains(im.name) then
+        err(s"trait '${impl.traitName}' declares no method '${im.name}', so this 'impl' cannot define it")
+  }
+
+  /** Compares one implementing method against the trait's signature: same receiver mode, same
+   * parameter types in order, and the same result. Types are resolved with the implementing type
+   * substituted for `self`, so `self` on both sides means the same concrete type.
+   */
+  private def checkSignature(forType: String, traitName: String, tm: MethodDecl, im: MethodDecl): Unit = {
+    if tm.receiver != im.receiver then
+      err(s"method '${im.name}' of 'impl $traitName for $forType' takes a different receiver than the trait declares")
+    if tm.params.length != im.params.length then
+      err(s"method '${im.name}' of 'impl $traitName for $forType' takes ${im.params.length} " +
+        s"parameters, but the trait declares ${tm.params.length}")
+
+    for (tp, ip) <- tm.params.zip(im.params) do
+      val want = resolveType(tp.typ, Map.empty)
+      val got  = resolveType(ip.typ, Map.empty)
+      if want != got then
+        err(s"parameter '${ip.name}' of method '${im.name}' is ${show(got)}, but trait '$traitName' declares ${show(want)}")
+
+    val want = tm.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit)
+    val got  = im.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit)
+    if want != got then
+      err(s"method '${im.name}' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")
   }
 
   /** Builds the function a member lowers to: the receiver becomes an ordinary first parameter
@@ -305,8 +388,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val (_, depth) = resolveLoop("continue", label)
       TContinue(depth)
 
-    case _: FuncDecl | _: StructDecl | _: EnumDecl =>
-      err("functions, structs, and enums may only be declared at the top level")
+    case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl =>
+      err("functions, structs, enums, traits, and impls may only be declared at the top level")
 
   // --- expressions ---------------------------------------------------------------------
 

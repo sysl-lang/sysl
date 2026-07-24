@@ -22,6 +22,16 @@ trait AnalyzerBase {
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
+  /** Declared traits by name. A trait is a set of method signatures a type opts into through an
+   * explicit `impl`; nothing conforms structurally.
+   */
+  protected val traitDecls = mutable.LinkedHashMap.empty[String, TraitDecl]
+
+  /** Every `impl Trait for Type`, keyed by (trait name, type name). The key catches a duplicate
+   * implementation, and it is what a trait bound will consult to decide whether a type conforms.
+   */
+  protected val traitImpls = mutable.LinkedHashMap.empty[(String, String), ImplDecl]
+
   /** A type's inherent members, keyed by (type name, member name). Methods, properties, and
    * associated functions all live here; each is also lowered to an ordinary function under the
    * mangled name `Type.member`, so calling one is a call and codegen needs no method concept.
