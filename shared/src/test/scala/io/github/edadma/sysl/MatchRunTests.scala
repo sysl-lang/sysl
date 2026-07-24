@@ -20,6 +20,40 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "zero small medium large\n"
   }
 
+  // `bool` is a closed two-value type: covering `true` and `false` is exhaustive with no `else`.
+  "a bool matches its two literal values without an else" in {
+    val src =
+      """word(b: bool) -> string
+        |    match b
+        |        true -> "yes"
+        |        false -> "no"
+        |print(word(true), word(false))""".stripMargin
+
+    run(src) shouldBe "yes no\n"
+  }
+
+  "a bool match reads a computed condition" in {
+    val src =
+      """parity(n: int) -> string
+        |    match n % 2 == 0
+        |        true -> "even"
+        |        false -> "odd"
+        |print(parity(4), parity(7))""".stripMargin
+
+    run(src) shouldBe "even odd\n"
+  }
+
+  "a bool match may cover one value and fall through to else" in {
+    val src =
+      """flag(b: bool) -> int
+        |    match b
+        |        true -> 1
+        |        else -> 0
+        |print(flag(true), flag(false))""".stripMargin
+
+    run(src) shouldBe "1 0\n"
+  }
+
   "an exclusive range pattern excludes its upper bound" in {
     val src =
       """band(n: int) -> string

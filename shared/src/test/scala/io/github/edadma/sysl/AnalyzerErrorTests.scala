@@ -104,6 +104,33 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
     err("var x = match 1\n    1 -> 10\n    2 -> 20") should include("exhaustive")
   }
 
+  "match patterns and results" - {
+    // `bool` is exhaustive only when both values are covered; one value with no else is a gap.
+    "a value match on a bool covering only one value is rejected" in {
+      err("var x = match true\n    true -> 1") should include("must cover both 'true' and 'false'")
+    }
+
+    // A range pattern is for numbers and characters; `string` is ordered but a string range is a
+    // trap, so it is refused.
+    "a string range pattern is rejected" in {
+      err(
+        """f(s: string) -> int = match s
+          |    "a".."z" -> 1
+          |    else -> 0""".stripMargin
+      ) should include("a range pattern needs a numeric or char value, not string")
+    }
+
+    // Two arms yielding different value types have nothing to unify to — a diagnostic, not a
+    // silent collapse to unit.
+    "arms that yield different value types are rejected" in {
+      err(
+        """var x = match 3
+          |    1 -> 10
+          |    else -> "big"""".stripMargin
+      ) should include("match arms have different types: int and string")
+    }
+  }
+
   "an unknown type in a signature" in {
     err("f(x: Widget) -> int = 0") should include("unknown type 'Widget'")
   }

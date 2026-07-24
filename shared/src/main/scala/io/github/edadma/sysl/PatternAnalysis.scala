@@ -31,11 +31,18 @@ trait PatternAnalysis extends TypeResolution {
     case LitPattern(v) =>
       val t = analyzeExpr(v, Some(ty))
       if t.ty != ty then err(s"pattern is ${show(t.ty)} but the value is ${show(ty)}")
-      if !Type.isOrdered(ty) then err(s"a ${show(ty)} value cannot be matched against a literal yet")
+      // A literal pattern matches by equality, so any equatable type may carry one — the ordered
+      // scalars and `bool`. `bool`'s two literals also make it exhaustive on their own (below).
+      if !Type.isEquatable(ty) then err(s"a ${show(ty)} value cannot be matched against a literal")
       TLitPattern(t)
 
     case RangePattern(lo, hi, inclusive) =>
-      if !Type.isOrdered(ty) then err(s"a range pattern needs an ordered value, not ${show(ty)}")
+      // A range is between two endpoints of a discrete, numerically-ordered value — the integers,
+      // the floats, and `char`. `string` is ordered too, but a `"a".."z"` range reads as a
+      // character range while quietly matching every string whose bytes sort between them, so it is
+      // excluded rather than left as a surprise.
+      if !(Type.isNumeric(ty) || ty == Type.Char) then
+        err(s"a range pattern needs a numeric or char value, not ${show(ty)}")
       val tl = analyzeExpr(lo, Some(ty))
       val th = analyzeExpr(hi, Some(ty))
       if tl.ty != ty || th.ty != ty then err(s"range pattern must match the ${show(ty)} value")
@@ -82,6 +89,14 @@ trait PatternAnalysis extends TypeResolution {
    */
   protected def matchResultType(scrutTy: Type, arms: List[TArm]): Type = {
     val bodyTys = arms.map(_.body.ty).distinct
+
+    // Two arms that each yield a value cannot yield *different* value types — there is nothing to
+    // unify them to. Diagnosed like an `if` with mismatched branches rather than collapsed to a
+    // silent `unit`, which would hide the mistake. A value/unit mix is the "not every arm yields"
+    // case and stays `unit`, exactly as an `if` with no `else` does.
+    val valueTys = bodyTys.filterNot(_ == Type.Unit)
+    if valueTys.size > 1 then
+      err(s"match arms have different types: ${valueTys.map(show).mkString(" and ")}")
     val valueTy = if bodyTys.size == 1 && bodyTys.head != Type.Unit then bodyTys.head else Type.Unit
 
     val hasCatchAll = arms.exists(a => a.guard.isEmpty && a.patterns.exists(irrefutable))
@@ -96,6 +111,18 @@ trait PatternAnalysis extends TypeResolution {
         if !hasCatchAll && !en.variants.map(_.tag).toSet.subsetOf(covered) then
           val missing = en.variants.filterNot(v => covered(v.tag)).map(_.name)
           err(s"match on '${en.name}' is not exhaustive; missing ${missing.mkString(", ")} (add an 'else' arm)")
+
+      // `bool` is a closed two-value type, so covering both `true` and `false` with unguarded arms
+      // is exhaustive on its own — no `else` needed, exactly as for a two-variant enum.
+      case Type.Bool =>
+        val covered = arms
+          .filter(_.guard.isEmpty)
+          .flatMap(_.patterns)
+          .collect { case TLitPattern(TBoolLit(b)) => b }
+          .toSet
+        if valueTy != Type.Unit && !hasCatchAll && covered.size < 2 then
+          err("a 'match' on 'bool' that yields a value must cover both 'true' and 'false' — add the missing arm or an 'else'")
+
       case _ =>
         if valueTy != Type.Unit && !hasCatchAll then
           err("a 'match' that yields a value must be exhaustive — add an 'else' arm")
