@@ -180,15 +180,29 @@ sealed trait TStmt
 
 case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
-case class TWhile(cond: TExpr, body: List[TStmt])         extends TStmt
-/** `for name in lo..hi` — the loop variable has the integer type of its bounds. */
-case class TFor(name: String, ty: Type, lo: TExpr, hi: TExpr, inclusive: Boolean, body: List[TStmt]) extends TStmt
 
-/** `for name in seq` over an array or a slice. The loop variable is a *copy* of each element,
- * and the sequence is evaluated once.
+/** `while cond body [else …]` as an expression. `body` runs for effect each iteration; a `break`
+ * in it carries the loop's value, and `elseBlock` (if present) supplies the value on normal
+ * completion. `ty` is the loop's result type — `unit` when nothing carries a value.
  */
-case class TForEach(name: String, elemTy: Type, seq: TExpr, body: List[TStmt]) extends TStmt
+case class TWhile(cond: TExpr, body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
+
+/** `for name in lo..hi [else …]` — the loop variable has the integer type `varTy` of its bounds;
+ * `ty` is the loop expression's result type.
+ */
+case class TFor(name: String, varTy: Type, lo: TExpr, hi: TExpr, inclusive: Boolean,
+                body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
+
+/** `for name in seq [else …]` over an array or a slice. The loop variable is a *copy* of each
+ * element, and the sequence is evaluated once.
+ */
+case class TForEach(name: String, elemTy: Type, seq: TExpr, body: List[TStmt],
+                    elseBlock: Option[TBlock], ty: Type) extends TExpr
 case class TReturn(value: Option[TExpr])                  extends TStmt
+
+/** `break [expr]` and `continue`. `break` carries the loop's value when the loop yields one. */
+case class TBreak(value: Option[TExpr]) extends TStmt
+case object TContinue                   extends TStmt
 
 /** A user function. Parameters carry their unique names (the codegen allocates a slot for
  * each so the body can read and mutate them uniformly).

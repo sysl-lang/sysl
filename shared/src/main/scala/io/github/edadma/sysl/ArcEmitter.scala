@@ -238,6 +238,19 @@ trait ArcEmitter extends Emitter {
       val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
       releaseValue(ty, v)
   }
+
+  /** Lets go of everything accrued since a loop was entered, for a `break`/`continue` that leaves
+   * from the middle of the body — the ownership analogue of `releaseAll`, but bounded to the
+   * loop's regions (whose depths the `GenLoop` recorded) rather than the whole function. Nothing
+   * is popped: the block terminates right after, so the lexically-following pops emit into
+   * unreachable code and are dropped.
+   */
+  protected def releaseToDepth(ownedDepth: Int, tempDepth: Int): Unit = {
+    for frame <- tempStack.take(tempStack.length - tempDepth); (v, ty) <- frame.reverse do releaseValue(ty, v)
+    for scope <- owned.take(owned.length - ownedDepth); (slot, ty) <- scope.reverse do
+      val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
+      releaseValue(ty, v)
+  }
 }
 
 object ArcEmitter {

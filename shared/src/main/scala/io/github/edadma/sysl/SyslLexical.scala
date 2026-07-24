@@ -73,6 +73,8 @@ class SyslLexical
     "do",
     "for",
     "in",
+    "break",
+    "continue",
     "match",
     "struct",
     "enum",

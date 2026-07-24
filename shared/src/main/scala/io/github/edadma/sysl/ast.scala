@@ -158,13 +158,28 @@ sealed trait Stmt
  */
 case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr]) extends Stmt
 case class ExprStmt(expr: Expr)                                    extends Stmt
-case class While(cond: Expr, body: List[Stmt])                    extends Stmt
 
-/** `for name in iter body` — `iter` is a range for now (`a..b`, `a..<b`). */
-case class For(name: String, iter: Expr, body: List[Stmt]) extends Stmt
+/** `while cond body [else elseBody]` as an **expression**. A `break expr` in the body makes
+ * `expr` the loop's value; the optional `else` runs on normal completion (the condition became
+ * false with no break) and its trailing expression is the loop's value on that path. With no
+ * `else`, normal completion yields `unit`, so a value-carrying `break` needs an `else` to give a
+ * matching value when the loop finishes on its own.
+ */
+case class While(cond: Expr, body: List[Stmt], elseBody: Option[List[Stmt]]) extends Expr
+
+/** `for name in iter body [else elseBody]` — an **expression** with the same `break`/`else`
+ * value rules as `while`. `iter` is a range for now (`a..b`, `a..<b`).
+ */
+case class For(name: String, iter: Expr, body: List[Stmt], elseBody: Option[List[Stmt]]) extends Expr
 
 /** `return` / `return expr` inside a function body. */
 case class Return(value: Option[Expr]) extends Stmt
+
+/** `break` / `break expr` — leaves the nearest enclosing loop, optionally carrying the loop's
+ * value. `continue` skips to the loop's next iteration.
+ */
+case class Break(value: Option[Expr]) extends Stmt
+case object Continue extends Stmt
 
 /** A function declaration. The body is a statement list whose trailing expression is the
  * implicit return value; an `= expr` short body is stored as a single-element list. A

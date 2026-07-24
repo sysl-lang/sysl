@@ -11,6 +11,45 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
     err("add(a: int, b: int) -> int = a + b\nprint(add(1))") should include("takes 2 arguments")
   }
 
+  "loops" - {
+    "break outside a loop is rejected" in {
+      err("break 5") should include("'break' is only allowed inside a loop")
+    }
+
+    "continue outside a loop is rejected" in {
+      err("continue") should include("'continue' is only allowed inside a loop")
+    }
+
+    // A value-carrying break needs an `else` to supply the value on normal completion; without
+    // one the break path and the unit fall-through can't agree, and the message says why.
+    "a value-carrying break with no else is rejected" in {
+      err(
+        """var r = for x in [1, 2, 3]
+          |    if x == 2 then break x""".stripMargin
+      ) should include("has no 'else' to give a value when it finishes normally")
+    }
+
+    // The break value and the else value must be the same type — int and string cannot both be
+    // the loop's result.
+    "a break value and else of different types are rejected" in {
+      err(
+        """var r = for x in [1, 2, 3]
+          |    if x == 2 then break x
+          |else "no"""".stripMargin
+      ) should include("must have the same type")
+    }
+
+    // Two breaks that carry different types are equally irreconcilable, even before an else.
+    "two breaks of different types are rejected" in {
+      err(
+        """var r = while true
+          |    if true then break 1
+          |    break "two"
+          |else 0""".stripMargin
+      ) should include("must have the same type")
+    }
+  }
+
   "an argument of the wrong type" in {
     err("f(x: int) -> int = x\nprint(f(1.5))") should include("is int, but real was given")
   }

@@ -60,7 +60,7 @@ class DeclarationParserTests extends AnyFreeSpec with ParseSupport {
   "for and return" - {
     "a for over an inclusive range" in {
       prog("for i in 1..10\n    print(i)") shouldBe List(
-        For("i", RangeExpr(Some(i(1)), Some(i(10)), inclusive = true), List(printStmt(Ident("i"))))
+        forStmt("i", RangeExpr(Some(i(1)), Some(i(10)), inclusive = true), List(printStmt(Ident("i"))))
       )
     }
 

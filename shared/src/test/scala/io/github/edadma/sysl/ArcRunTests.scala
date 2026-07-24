@@ -206,6 +206,30 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "6 7\n"
   }
 
+  // `break value` hands a value out of a loop the same way a branch or a return does, so a fresh
+  // &Point broken out of a search must be retained past the loop and freed exactly once. Over a
+  // long loop a leak grows RSS and a double-free crashes; peak RSS was separately confirmed flat.
+  // find(t) breaks with Point(t, 2t), so x+y = 3t; total = sum of 3*(i%10) over 500000 = 6750000.
+  "a &T value broken out of a loop is retained and freed exactly once" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |find(target: int) -> &Point
+        |    for i in 0..<10
+        |        if i == target then break Point(i, i * 2)
+        |    else Point(-1, -1)
+        |var i = 0
+        |var total = 0
+        |while i < 500000
+        |    var p = find(i % 10)
+        |    total += p.x + p.y
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "6750000\n"
+  }
+
   // A deep field-path store a.b.c through two levels of &T indirection must reach the innermost
   // reference and release the C it replaced — not the wrong hop, and not nothing. Over a long
   // loop a missed release grows RSS; peak RSS was separately confirmed flat. seed = i%7, new =

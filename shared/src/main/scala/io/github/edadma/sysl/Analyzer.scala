@@ -201,6 +201,33 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     r
   }
 
+  /** Analyzes a loop body with a fresh loop context on the stack, so `break`/`continue` inside it
+   * resolve to this loop and each `break` value is collected for the loop's result type. Returns
+   * the typed body together with the context the breaks were recorded in.
+   */
+  private def analyzeLoopBody(expected: Option[Type])(body: => List[TStmt]): (List[TStmt], LoopCtx) = {
+    val ctx = new LoopCtx(expected)
+    loops = ctx :: loops
+    val tb = body
+    loops = loops.tail
+    (tb, ctx)
+  }
+
+  /** The result type of a loop: every `break` value and the `else` value must agree on one type.
+   * With no `else`, normal completion yields `unit`, so a value-carrying `break` has nothing to
+   * meet on that path — a clear error rather than a silent mismatch.
+   */
+  private def loopResultType(ctx: LoopCtx, elseBlock: Option[TBlock]): Type = {
+    val elseTy = elseBlock.map(_.ty).getOrElse(Type.Unit)
+    val tys    = (ctx.breakTys.toList :+ elseTy).distinct
+    if tys.size == 1 then tys.head
+    else if elseBlock.isEmpty then
+      val v = ctx.breakTys.find(_ != Type.Unit).get
+      err(s"this loop breaks with a ${show(v)} but has no 'else' to give a value when it finishes normally — add an 'else'")
+    else
+      err(s"a loop's break values and its 'else' must have the same type, but got ${tys.map(show).mkString(" and ")}")
+  }
+
   private def analyzeStmt(stmt: Stmt): TStmt = stmt match
     case VarDecl(name, typOpt, Some(init)) =>
       val declared = typOpt.map(rt)
@@ -219,41 +246,6 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case ExprStmt(e) =>
       TExprStmt(analyzeExpr(e))
 
-    case While(cond, body) =>
-      TWhile(analyzeBool(cond), analyzeStmts(body))
-
-    case For(name, iter, body) =>
-      iter match
-        case RangeExpr(Some(lo), Some(hi), inclusive) =>
-          val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
-          if tlo.ty != thi.ty then
-            err(s"a 'for' range needs matching bounds, got ${show(tlo.ty)} and ${show(thi.ty)}")
-          val ty = tlo.ty match
-            case i: Type.Integer => i
-            case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
-          pushScope()
-          val u  = declare(name, ty)
-          val tb = body.map(analyzeStmt(_))
-          popScope()
-          TFor(u, ty, tlo, thi, inclusive, tb)
-
-        case _ =>
-          val seq = autoDeref(analyzeExpr(iter))
-          val elem = seq.ty match
-            case Type.Array(_, e) => e
-            case Type.Slice(e)    => e
-            // A string has two granularities and no reason to prefer one silently, so which one
-            // is wanted is written: `s.bytes` today, `s.chars` when there are characters.
-            case Type.Str =>
-              err("a string is iterated as 's.bytes', since a string has bytes and characters both")
-            case other =>
-              err(s"'for' iterates an integer range, an array, or a slice, not ${show(other)}")
-          pushScope()
-          val u  = declare(name, elem)
-          val tb = body.map(analyzeStmt(_))
-          popScope()
-          TForEach(u, elem, seq, tb)
-
     case Return(opt) =>
       val tv = opt.map(analyzeExpr(_, Some(retTy)))
       tv match
@@ -262,6 +254,21 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         case None if retTy != Type.Unit    => err(s"this function must return a ${show(retTy)} value")
         case _                             =>
       TReturn(tv)
+
+    // `break value` records its type against the innermost loop, which unites it with the loop's
+    // other breaks and its `else` to fix the loop's result type. The value is analyzed in the
+    // loop's expected type, so a `break &T` boxes the same way a `break` in a `&T` context asks.
+    case Break(opt) =>
+      loops match
+        case ctx :: _ =>
+          val tv = opt.map(e => analyzeExpr(e, ctx.expected))
+          ctx.breakTys += tv.map(_.ty).getOrElse(Type.Unit)
+          TBreak(tv)
+        case Nil => err("'break' is only allowed inside a loop")
+
+    case Continue =>
+      if loops.isEmpty then err("'continue' is only allowed inside a loop")
+      TContinue
 
     case _: FuncDecl | _: StructDecl | _: EnumDecl =>
       err("functions, structs, and enums may only be declared at the top level")
@@ -287,11 +294,12 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case Some(r: Type.Ref) =>
       expr match
         case NullLit() => err(s"a ${show(r)} always points at a live object — an absent one is Option[${show(r)}]")
-        // An `if`/`match` yields its value through its branches, so the `&T` context belongs to
-        // each branch, not to the aggregate: every branch boxes to `&T` on its own, letting a
-        // `&T` branch and a value branch meet at `&T`. Boxing the whole expression instead would
-        // ask the branches for a plain `T`, and a branch already holding a `&T` could not comply.
-        case _: IfExpr | _: MatchExpr => analyzeValue(expr, Some(r))
+        // An `if`/`match`/loop yields its value through its branches (a loop's, through its
+        // `break`s and `else`), so the `&T` context belongs to each of those, not to the
+        // aggregate: every one boxes to `&T` on its own, letting a `&T` branch and a value branch
+        // meet at `&T`. Boxing the whole expression instead would ask the branches for a plain
+        // `T`, and a branch already holding a `&T` could not comply.
+        case _: IfExpr | _: MatchExpr | _: While | _: For => analyzeValue(expr, Some(r))
         case _                        => box(analyzeValue(expr, Some(r.inner)), r)
     case _ => analyzeValue(expr, expected)
 
@@ -528,6 +536,46 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val ts    = analyzeExpr(scrut)
       val tarms = arms.map(analyzeArm(ts.ty, _, expected))
       TMatch(ts, tarms, matchResultType(ts.ty, tarms))
+
+    case While(cond, body, elseOpt) =>
+      val tc            = analyzeBool(cond)
+      val (tbody, ctx)  = analyzeLoopBody(expected)(analyzeStmts(body))
+      val telse         = elseOpt.map(analyzeValueBlock(_, expected))
+      TWhile(tc, tbody, telse, loopResultType(ctx, telse))
+
+    case For(name, iter, body, elseOpt) =>
+      iter match
+        case RangeExpr(Some(lo), Some(hi), inclusive) =>
+          val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
+          if tlo.ty != thi.ty then
+            err(s"a 'for' range needs matching bounds, got ${show(tlo.ty)} and ${show(thi.ty)}")
+          val vty = tlo.ty match
+            case i: Type.Integer => i
+            case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
+          pushScope()
+          val u            = declare(name, vty)
+          val (tb, ctx)    = analyzeLoopBody(expected)(body.map(analyzeStmt(_)))
+          popScope()
+          val telse        = elseOpt.map(analyzeValueBlock(_, expected))
+          TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
+
+        case _ =>
+          val seq = autoDeref(analyzeExpr(iter))
+          val elem = seq.ty match
+            case Type.Array(_, e) => e
+            case Type.Slice(e)    => e
+            // A string has two granularities and no reason to prefer one silently, so which one
+            // is wanted is written: `s.bytes` today, `s.chars` when there are characters.
+            case Type.Str =>
+              err("a string is iterated as 's.bytes', since a string has bytes and characters both")
+            case other =>
+              err(s"'for' iterates an integer range, an array, or a slice, not ${show(other)}")
+          pushScope()
+          val u         = declare(name, elem)
+          val (tb, ctx) = analyzeLoopBody(expected)(body.map(analyzeStmt(_)))
+          popScope()
+          val telse     = elseOpt.map(analyzeValueBlock(_, expected))
+          TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
 
     case TryExpr(e) =>
       analyzeTry(analyzeExpr(e))

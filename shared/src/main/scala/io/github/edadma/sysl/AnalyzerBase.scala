@@ -67,6 +67,14 @@ trait AnalyzerBase {
   protected var retTy: Type                                                 = Type.Unit
   protected var tsubst: Map[String, Type]                                   = Map.empty
 
+  /** The enclosing loops, innermost first, so a `break`/`continue` finds the one it leaves and a
+   * `break value` records its type against that loop's result. `expected` is the type the loop's
+   * context wants, pushed down so a `break`/`else` value boxes to `&T` on its own.
+   */
+  protected class LoopCtx(val expected: Option[Type]):
+    val breakTys = mutable.ListBuffer.empty[Type]
+  protected var loops: List[LoopCtx] = Nil
+
   protected def err(msg: String): Nothing = throw AnalyzerError(msg)
 
   protected def show(t: Type): String = Type.show(t)
@@ -79,6 +87,7 @@ trait AnalyzerBase {
   protected def resetFunction(): Unit = {
     used.clear()
     scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
+    loops = Nil
   }
 
   protected def freshName(base: String): String =

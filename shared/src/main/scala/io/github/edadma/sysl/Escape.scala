@@ -112,9 +112,18 @@ private class Escape(program: TProgram) {
       case TStore(_, v, _)      => viewsFrame(v)
       case TIf(_, t, e, _)      => blockValue(t) || e.exists(blockValue)
       case TMatch(_, arms, _)   => arms.exists(a => blockValue(a.body))
+      // A loop's value comes from its `break`s and its `else`, so it views the frame when any of
+      // those do — a `break` of a frame-backed slice out of the loop is the same escape route as
+      // returning one.
+      case w: TWhile            => loopViewsFrame(w.body, w.elseBlock)
+      case f: TFor              => loopViewsFrame(f.body, f.elseBlock)
+      case e: TForEach          => loopViewsFrame(e.body, e.elseBlock)
       case _                    => false
 
     private def blockValue(b: TBlock): Boolean = b.result.exists(viewsFrame)
+
+    private def loopViewsFrame(body: List[TStmt], elseBlock: Option[TBlock]): Boolean =
+      ownBreakValues(body).exists(viewsFrame) || elseBlock.exists(blockValue)
 
     private def viaPointer(e: TExpr): Boolean = e match
       case TDeref(operand, _) => operand.ty.isInstanceOf[Type.Ptr]
@@ -140,13 +149,13 @@ private class Escape(program: TProgram) {
     }
 
     private def check(stmts: List[TStmt]): Unit = forEachStmt(stmts) {
-      case TReturn(Some(v))         => returned(v)
-      case TVarDecl(_, _, e)        => escaping(e)
-      case TExprStmt(e)             => escaping(e)
-      case TWhile(c, _)             => escaping(c)
-      case TFor(_, _, lo, hi, _, _) => escaping(lo); escaping(hi)
-      case TForEach(_, _, seq, _)   => escaping(seq)
-      case _                        =>
+      case TReturn(Some(v))  => returned(v)
+      case TVarDecl(_, _, e) => escaping(e)
+      case TExprStmt(e)      => escaping(e)
+      // A `break value` carries the value out of the loop; walk it for the escape sites it may
+      // contain. Whether it then leaves the frame is decided where the loop's own value is used.
+      case TBreak(Some(v))   => escaping(v)
+      case _                 =>
     }
 
     private def returned(v: TExpr): Unit =
@@ -185,25 +194,47 @@ private class Escape(program: TProgram) {
 
   // --- tree walking ----------------------------------------------------------------------
 
-  /** Applies `f` to every statement, including the ones nested in loop and branch bodies. */
+  /** Applies `f` to every statement, including the ones nested in loop and branch bodies. Loops
+   * are expressions now, so they are reached through the `blocks` an expression carries rather
+   * than as statements of their own.
+   */
   private def forEachStmt(stmts: List[TStmt])(f: PartialFunction[TStmt, Unit]): Unit =
     for s <- stmts do
       f.applyOrElse(s, (_: TStmt) => ())
       s match
-        case TWhile(_, body)             => forEachStmt(body)(f)
-        case TFor(_, _, _, _, _, body)   => forEachStmt(body)(f)
-        case TForEach(_, _, _, body)     => forEachStmt(body)(f)
-        case TExprStmt(e)                => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
-        case TVarDecl(_, _, e)           => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
-        case TReturn(Some(e))            => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
-        case _                           =>
+        case TExprStmt(e)     => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
+        case TVarDecl(_, _, e) => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
+        case TReturn(Some(e))  => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
+        case TBreak(Some(e))   => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
+        case _                 =>
 
-  /** Every block an expression contains, so a statement nested inside an `if` or a `match` used
-   * as a value is walked too.
+  /** The `break` values that belong to a loop with these body statements — those in its body but
+   * not inside a nested loop, whose `break`s are that loop's. Walks through the branch bodies of
+   * `if`/`match`, which do not introduce a new loop.
+   */
+  private def ownBreakValues(stmts: List[TStmt]): List[TExpr] = stmts.flatMap {
+    case TBreak(Some(v))   => List(v)
+    case TExprStmt(e)      => ownBreaksInExpr(e)
+    case TVarDecl(_, _, e) => ownBreaksInExpr(e)
+    case TReturn(Some(e))  => ownBreaksInExpr(e)
+    case _                 => Nil
+  }
+
+  private def ownBreaksInExpr(e: TExpr): List[TExpr] = e match
+    case _: TWhile | _: TFor | _: TForEach => Nil
+    case TIf(_, t, el, _)   => ownBreakValues(t.stmts) ::: el.toList.flatMap(b => ownBreakValues(b.stmts))
+    case TMatch(_, arms, _) => arms.flatMap(a => ownBreakValues(a.body.stmts))
+    case _                  => Nil
+
+  /** Every block an expression contains, so a statement nested inside an `if`, a `match`, or a
+   * loop used as a value is walked too. A loop's body is wrapped as a block; its `else` is one.
    */
   private def blocks(e: TExpr): List[TBlock] = e match
     case TIf(_, t, el, _)   => t :: el.toList ::: children(e).flatMap(blocks)
     case TMatch(_, arms, _) => arms.map(_.body) ::: children(e).flatMap(blocks)
+    case TWhile(_, body, el, _)           => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
+    case TFor(_, _, _, _, _, body, el, _) => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
+    case TForEach(_, _, _, body, el, _)   => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case _                  => children(e).flatMap(blocks)
 
   private def children(e: TExpr): List[TExpr] = e match
@@ -231,5 +262,10 @@ private class Escape(program: TProgram) {
     case TField(r, _, _)            => List(r)
     case TIf(c, t, el, _)           => c :: t.result.toList ::: el.flatMap(_.result).toList
     case TMatch(s, arms, _)         => s :: arms.flatMap(a => a.guard.toList ::: a.body.result.toList)
+    // A loop's own sub-expressions plus its `else` value; the `break` values reach `escaping`
+    // through the body statements, so they are not repeated here.
+    case TWhile(c, _, el, _)             => c :: el.flatMap(_.result).toList
+    case TFor(_, _, lo, hi, _, _, el, _) => lo :: hi :: el.flatMap(_.result).toList
+    case TForEach(_, _, seq, _, el, _)   => seq :: el.flatMap(_.result).toList
     case _                          => Nil
 }

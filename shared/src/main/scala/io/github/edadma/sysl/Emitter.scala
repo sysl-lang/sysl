@@ -59,6 +59,15 @@ trait Emitter {
    */
   protected var owned: List[mutable.ListBuffer[(String, Type)]] = Nil
 
+  /** The enclosing loops, innermost first, so a `break`/`continue` knows where to jump, what
+   * result slot to store into, and how far to unwind the ownership regions on the way out. The
+   * depths are the sizes of `owned`/`tempStack` at loop entry, so leaving releases exactly what
+   * the body accrued.
+   */
+  protected case class GenLoop(breakL: String, continueL: String, slot: String, resultTy: Type,
+                               ownedDepth: Int, tempDepth: Int)
+  protected var genLoops: List[GenLoop] = Nil
+
   /** Lowers an expression, returning the register or immediate holding its value. Defined by
    * the class that walks the tree; the emitting traits call back into it.
    */
@@ -72,6 +81,7 @@ trait Emitter {
     terminated = false
     tempStack = Nil
     owned = Nil
+    genLoops = Nil
   }
 
   /** The text of the function just emitted: its header, the hoisted slots, and its blocks. */

@@ -50,6 +50,19 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
             |""".stripMargin) should include("is returned")
     }
 
+    // A loop is an expression, so a `break` of a frame-backed slice out of a loop whose value is
+    // returned is the same escape as returning the slice directly — the break carries it out.
+    "is broken out of a loop that is returned" in {
+      err("""leak() -> []int
+            |    var buf: [4]int
+            |    for i in 0..<4
+            |        if i == 2 then break buf[..]
+            |    else buf[0..<0]
+            |end leak
+            |print(leak().len)
+            |""".stripMargin) should include("is returned")
+    }
+
     "is a slice of a slice of a frame-local array" in {
       err("""view() -> []int
             |    var buf: [8]int
@@ -147,6 +160,19 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
       ir("""view() -> []int
            |    var buf: &[4]int = [1, 2, 3, 4]
            |    buf[..]
+           |end view
+           |print(view().len)
+           |""".stripMargin) should include("@view")
+    }
+
+    // Breaking a slice of a heap buffer out of a loop is fine: the slice retains the buffer's
+    // owner, so it keeps its storage alive the same way a returned heap-buffer view does.
+    "is broken out of a loop but views a heap buffer" in {
+      ir("""view() -> []int
+           |    var buf: &[4]int = [1, 2, 3, 4]
+           |    for i in 0..<4
+           |        if i == 2 then break buf[..]
+           |    else buf[0..<0]
            |end view
            |print(view().len)
            |""".stripMargin) should include("@view")

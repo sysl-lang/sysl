@@ -55,7 +55,7 @@ class SyslParser extends PackratParsers {
   /** `if` and `match` are expressions (they yield the taken branch's value), so they sit at
    * the top of the grammar — an ordinary operand everywhere an expression is expected.
    */
-  lazy val expression: PackratParser[Expr] = ifExpr | matchExpr | assignment
+  lazy val expression: PackratParser[Expr] = ifExpr | matchExpr | whileExpr | forExpr | assignment
 
   private def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))
@@ -168,7 +168,7 @@ class SyslParser extends PackratParsers {
   // --- statements ----------------------------------------------------------------------
 
   lazy val statement: PackratParser[Stmt] =
-    structDecl | enumDecl | funcDecl | varDecl | forStmt | whileStmt | returnStmt | exprStmt
+    structDecl | enumDecl | funcDecl | varDecl | returnStmt | breakStmt | continueStmt | exprStmt
 
   /** A type: a memory-mode sigil applied to a type, or a name optionally applied to type
    * arguments (`Box[int]`, `Result[T, string]`). `sync` stays a soft keyword — it is only
@@ -200,6 +200,12 @@ class SyslParser extends PackratParsers {
 
   private lazy val returnStmt: PackratParser[Stmt] =
     op("return") ~> opt(expression) ^^ Return.apply
+
+  private lazy val breakStmt: PackratParser[Stmt] =
+    op("break") ~> opt(expression) ^^ Break.apply
+
+  private lazy val continueStmt: PackratParser[Stmt] =
+    op("continue") ^^^ Continue
 
   /** One `name: type` binding — a function parameter or a struct field. */
   private lazy val param: Parser[Param] =
@@ -350,12 +356,17 @@ class SyslParser extends PackratParsers {
   private lazy val elseClause: Parser[List[Stmt]] =
     opt(newlines) ~> op("else") ~> (suite | inlineBody)
 
-  private lazy val whileStmt: PackratParser[Stmt] =
-    op("while") ~> expression ~ body("do") ~ opt(endMarker("while")) ^^ { case c ~ b ~ _ => While(c, b) }
+  /** `while cond body [else …]` — an expression. The optional `else` reuses the same clause as
+   * `if`, sitting after the body and before any `end while`.
+   */
+  private lazy val whileExpr: PackratParser[Expr] =
+    op("while") ~> expression ~ body("do") ~ opt(elseClause) ~ opt(endMarker("while")) ^^ {
+      case c ~ b ~ e ~ _ => While(c, b, e)
+    }
 
-  private lazy val forStmt: PackratParser[Stmt] =
-    op("for") ~> ident ~ (op("in") ~> expression) ~ body("do") ~ opt(endMarker("for")) ^^ {
-      case n ~ it ~ b ~ _ => For(n, it, b)
+  private lazy val forExpr: PackratParser[Expr] =
+    op("for") ~> ident ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(endMarker("for")) ^^ {
+      case n ~ it ~ b ~ e ~ _ => For(n, it, b, e)
     }
 
   // --- match ---------------------------------------------------------------------------

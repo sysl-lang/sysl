@@ -196,4 +196,109 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "100 6\n"
   }
+
+  "loops as expressions" - {
+    // `break x` makes the loop yield x; the search hits the target, so the loop is 30 and the
+    // `else` never runs. The both-paths pair below runs the other way.
+    "a for that breaks with a value yields it, skipping the else" in {
+      val src =
+        """var xs = [10, 20, 30, 40]
+          |var found = for x in xs
+          |    if x == 30 then break x
+          |else -1
+          |print(found)""".stripMargin
+
+      run(src) shouldBe "30\n"
+    }
+
+    // No element matches, so the loop finishes normally and the `else` supplies the value. Same
+    // program as above with a target that is absent — the discriminating half of the pair.
+    "a for that finds nothing takes the else value" in {
+      val src =
+        """var xs = [10, 20, 30, 40]
+          |var found = for x in xs
+          |    if x == 99 then break x
+          |else -1
+          |print(found)""".stripMargin
+
+      run(src) shouldBe "-1\n"
+    }
+
+    // A `while` whose only exit is `break value` — the infinite-loop shape. The `else` is
+    // unreachable here (the condition never turns false), so the value can only be the break's.
+    "a while true yields its break value" in {
+      val src =
+        """var n = 0
+          |var r = while true
+          |    n += 1
+          |    if n == 7 then break n * 100
+          |else 0
+          |print(r)""".stripMargin
+
+      run(src) shouldBe "700\n"
+    }
+
+    // `continue` skips the rest of the iteration: the odds are summed, the evens skipped. Sum of
+    // 1,3,5,7,9 = 25 discriminates against summing everything (45) or nothing.
+    "continue skips the rest of the iteration" in {
+      val src =
+        """var sum = 0
+          |for i in 1..10
+          |    if i % 2 == 0 then continue
+          |    sum += i
+          |print(sum)""".stripMargin
+
+      run(src) shouldBe "25\n"
+    }
+
+    // `break`/`continue` bind to the nearest loop. The inner loop breaks out of itself at j==1,
+    // so each outer step adds only j==0's contribution (i*0 = 0) plus... nothing; the outer loop
+    // runs to completion. The total pins that the break left the inner loop, not the outer.
+    "break leaves only the innermost loop" in {
+      val src =
+        """var hits = 0
+          |var total = 0
+          |for i in 1..3
+          |    for j in 0..<5
+          |        if j == 2 then break
+          |        total += i * 10 + j
+          |    hits += 1
+          |print(hits, total)""".stripMargin
+
+      // inner runs j=0,1 for each i in 1..3: 10+11 + 20+21 + 30+31 = 123
+      run(src) shouldBe "3 123\n"
+    }
+
+    // The `else` runs for effect (unit loop) when the loop completes normally, and is skipped
+    // when a bare `break` cuts it short — Python's for/else, kept for the statement form.
+    "an else on a unit loop runs only on normal completion" in {
+      val src =
+        """search(hit: bool)
+          |    for i in 0..<3
+          |        if i == 1 then
+          |            if hit then break
+          |        print(i)
+          |    else print(99)
+          |search(false)
+          |print(0)
+          |search(true)""".stripMargin
+
+      // no break: prints 0,1,2 then else 99; break at i==1: prints 0 then 1 (from before the
+      // hit check)… actually the print is after the break check, so hit path prints 0 then breaks
+      run(src) shouldBe "0\n1\n2\n99\n0\n0\n"
+    }
+
+    // A loop is a function's whole body — its value is the function's return value, threaded
+    // through `break`/`else` exactly as when it initializes a `var`.
+    "a loop is a function's tail expression" in {
+      val src =
+        """firstOver(limit: int) -> int
+          |    for x in [3, 6, 9]
+          |        if x > limit then break x
+          |    else -1
+          |print(firstOver(5), firstOver(100))""".stripMargin
+
+      run(src) shouldBe "6 -1\n"
+    }
+  }
 }

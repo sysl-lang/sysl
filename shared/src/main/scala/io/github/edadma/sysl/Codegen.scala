@@ -144,86 +144,6 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     case TExprStmt(expr) =>
       genExpr(expr)
 
-    case TWhile(cond, whileBody) =>
-      val condL = freshLabel("while.cond")
-      val bodyL = freshLabel("while.body")
-      val endL  = freshLabel("while.end")
-      emitTerm(s"br label %$condL")
-      emitLabel(condL)
-      // The condition is re-evaluated every iteration, so whatever it borrows is let go before
-      // the branch rather than accumulating in the enclosing statement's region.
-      pushTemps()
-      val c = genExpr(cond)
-      popTemps()
-      emitTerm(s"br i1 $c, label %$bodyL, label %$endL")
-      emitLabel(bodyL)
-      pushOwned()
-      whileBody.foreach(genStmt)
-      popOwned()
-      emitTerm(s"br label %$condL")
-      emitLabel(endL)
-
-    case TFor(name, ty, lo, hi, inclusive, forBody) =>
-      val w     = ty.llvm
-      val loV   = genExpr(lo)
-      val hiV   = genExpr(hi)
-      val condL = freshLabel("for.cond")
-      val bodyL = freshLabel("for.body")
-      val endL  = freshLabel("for.end")
-      emitAlloca(s"%$name.addr", w)
-      emit(s"store $w $loV, ptr %$name.addr")
-      emitTerm(s"br label %$condL")
-      emitLabel(condL)
-      val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
-      val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", ty)} $w $iv, $hiV")
-      emitTerm(s"br i1 $cmp, label %$bodyL, label %$endL")
-      emitLabel(bodyL)
-      pushOwned()
-      forBody.foreach(genStmt)
-      popOwned()
-      val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
-      val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
-      emit(s"store $w $nxt, ptr %$name.addr")
-      emitTerm(s"br label %$condL")
-      emitLabel(endL)
-
-    // The sequence is evaluated once, into the statement's own region, so a slice temporary
-    // stays alive for the whole loop; the loop variable is a copy, released each iteration.
-    case TForEach(name, elemTy, seq, forBody) =>
-      val (base, len) = seq.ty match
-        case Type.Array(n, _) => (address(seq), n.toString)
-        case s: Type.Slice =>
-          val v = genExpr(seq)
-          val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
-          val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
-          (p, l)
-        case other => sys.error(s"unreachable iteration over ${other.llvm}")
-
-      val idx   = emitAlloca(freshTemp(), "i64")
-      val condL = freshLabel("each.cond")
-      val bodyL = freshLabel("each.body")
-      val endL  = freshLabel("each.end")
-      emit(s"store i64 0, ptr $idx")
-      emitTerm(s"br label %$condL")
-      emitLabel(condL)
-      val iv   = freshTemp(); emit(s"$iv = load i64, ptr $idx")
-      val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, $len")
-      emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
-      emitLabel(bodyL)
-      val ep = freshTemp(); emit(s"$ep = getelementptr ${elemTy.llvm}, ptr $base, i64 $iv")
-      val ev = freshTemp(); emit(s"$ev = load ${elemTy.llvm}, ptr $ep")
-      emitAlloca(s"%$name.addr", elemTy.llvm)
-      retainValue(elemTy, ev)
-      emit(s"store ${elemTy.llvm} $ev, ptr %$name.addr")
-      pushOwned()
-      ownSlot(name, elemTy)
-      forBody.foreach(genStmt)
-      popOwned()
-      val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
-      emit(s"store i64 $nxt, ptr $idx")
-      emitTerm(s"br label %$condL")
-      emitLabel(endL)
-
     case TReturn(opt) =>
       opt match
         case Some(t) =>
@@ -234,6 +154,24 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
         case None =>
           releaseAll()
           emitTerm("ret void")
+
+    // A `break`/`continue` leaves the body from the middle, so it unwinds the body's ownership
+    // regions before jumping — the same discipline as `return`, bounded to the loop. `break v`
+    // hands its value over with a count taken (so it survives the unwind) into the loop's slot.
+    case TBreak(opt) =>
+      val loop = genLoops.head
+      opt.foreach { t =>
+        val v = genExpr(t)
+        retainValue(t.ty, v)
+        emit(s"store ${t.ty.llvm} $v, ptr ${loop.slot}")
+      }
+      releaseToDepth(loop.ownedDepth, loop.tempDepth)
+      emitTerm(s"br label %${loop.breakL}")
+
+    case TContinue =>
+      val loop = genLoops.head
+      releaseToDepth(loop.ownedDepth, loop.tempDepth)
+      emitTerm(s"br label %${loop.continueL}")
 
   // --- expressions ---------------------------------------------------------------------
 
@@ -405,6 +343,10 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
 
     case TMatch(scrutinee, arms, ty) =>
       genMatch(scrutinee, arms, ty)
+
+    case w: TWhile   => genWhile(w)
+    case f: TFor     => genFor(f)
+    case e: TForEach => genForEach(e)
 
   /** The address of a place, as a `ptr` register or an existing slot name. Every place bottoms
    * out either in a local's stack slot or in a pointer the program already holds, so this walks
@@ -747,6 +689,141 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
   private def orI1(a: String, b: String): String =
     if a == "true" || b == "true" then "true"
     else { val r = freshTemp(); emit(s"$r = or i1 $a, $b"); r }
+
+  // --- loops ---------------------------------------------------------------------------
+  //
+  // A loop is an expression: a `break value` stores into the loop's result slot and jumps to the
+  // end, and normal completion runs the optional `else` (whose value feeds the same slot). When
+  // the loop yields nothing (`unit`), there is no slot and the end is a plain merge. The `else`
+  // target doubles as the end when there is no `else`, so a bare loop keeps its old shape.
+
+  private def genWhile(w: TWhile): String = {
+    val TWhile(cond, body, elseBlock, ty) = w
+    val condL = freshLabel("while.cond")
+    val bodyL = freshLabel("while.body")
+    val endL  = freshLabel("while.end")
+    val elseL = if elseBlock.isDefined then freshLabel("while.else") else endL
+    val slot  = if ty == Type.Unit then "" else emitAlloca(freshTemp(), ty.llvm)
+    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
+
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    // The condition is re-evaluated every iteration, so whatever it borrows is let go before the
+    // branch rather than accumulating in the enclosing statement's region.
+    pushTemps()
+    val c = genExpr(cond)
+    popTemps()
+    emitTerm(s"br i1 $c, label %$bodyL, label %$elseL")
+    emitLabel(bodyL)
+    pushOwned()
+    body.foreach(genStmt)
+    popOwned()
+    emitTerm(s"br label %$condL")
+
+    genLoops = genLoops.tail
+    genLoopResult(slot, ty, elseL, endL, elseBlock)
+  }
+
+  private def genFor(f: TFor): String = {
+    val TFor(name, varTy, lo, hi, inclusive, body, elseBlock, ty) = f
+    val w     = varTy.llvm
+    val loV   = genExpr(lo)
+    val hiV   = genExpr(hi)
+    val condL = freshLabel("for.cond")
+    val bodyL = freshLabel("for.body")
+    val stepL = freshLabel("for.step")
+    val endL  = freshLabel("for.end")
+    val elseL = if elseBlock.isDefined then freshLabel("for.else") else endL
+    val slot  = if ty == Type.Unit then "" else emitAlloca(freshTemp(), ty.llvm)
+    emitAlloca(s"%$name.addr", w)
+    emit(s"store $w $loV, ptr %$name.addr")
+    genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
+
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
+    val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
+    emitTerm(s"br i1 $cmp, label %$bodyL, label %$elseL")
+    emitLabel(bodyL)
+    pushOwned()
+    body.foreach(genStmt)
+    popOwned()
+    // `continue` lands here so the counter still advances before the next test.
+    emitTerm(s"br label %$stepL")
+    emitLabel(stepL)
+    val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
+    val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
+    emit(s"store $w $nxt, ptr %$name.addr")
+    emitTerm(s"br label %$condL")
+
+    genLoops = genLoops.tail
+    genLoopResult(slot, ty, elseL, endL, elseBlock)
+  }
+
+  // The sequence is evaluated once, into the statement's own region, so a slice temporary stays
+  // alive for the whole loop; the loop variable is a copy, released each iteration.
+  private def genForEach(e: TForEach): String = {
+    val TForEach(name, elemTy, seq, body, elseBlock, ty) = e
+    val (base, len) = seq.ty match
+      case Type.Array(n, _) => (address(seq), n.toString)
+      case s: Type.Slice =>
+        val v = genExpr(seq)
+        val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
+        val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
+        (p, l)
+      case other => sys.error(s"unreachable iteration over ${other.llvm}")
+
+    val idx   = emitAlloca(freshTemp(), "i64")
+    val condL = freshLabel("each.cond")
+    val bodyL = freshLabel("each.body")
+    val stepL = freshLabel("each.step")
+    val endL  = freshLabel("each.end")
+    val elseL = if elseBlock.isDefined then freshLabel("each.else") else endL
+    val slot  = if ty == Type.Unit then "" else emitAlloca(freshTemp(), ty.llvm)
+    emit(s"store i64 0, ptr $idx")
+    genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
+
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    val iv   = freshTemp(); emit(s"$iv = load i64, ptr $idx")
+    val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, $len")
+    emitTerm(s"br i1 $more, label %$bodyL, label %$elseL")
+    emitLabel(bodyL)
+    val ep = freshTemp(); emit(s"$ep = getelementptr ${elemTy.llvm}, ptr $base, i64 $iv")
+    val ev = freshTemp(); emit(s"$ev = load ${elemTy.llvm}, ptr $ep")
+    emitAlloca(s"%$name.addr", elemTy.llvm)
+    retainValue(elemTy, ev)
+    emit(s"store ${elemTy.llvm} $ev, ptr %$name.addr")
+    pushOwned()
+    ownSlot(name, elemTy)
+    body.foreach(genStmt)
+    popOwned()
+    emitTerm(s"br label %$stepL")
+    emitLabel(stepL)
+    val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
+    emit(s"store i64 $nxt, ptr $idx")
+    emitTerm(s"br label %$condL")
+
+    genLoops = genLoops.tail
+    genLoopResult(slot, ty, elseL, endL, elseBlock)
+  }
+
+  /** Finishes a loop expression: run the `else` (if any) on the normal-completion path into the
+   * result slot, then land at the end and hand the slot's value out as the enclosing region's to
+   * release. A `unit` loop has no slot and yields nothing.
+   */
+  private def genLoopResult(slot: String, ty: Type, elseL: String, endL: String,
+                            elseBlock: Option[TBlock]): String = {
+    elseBlock.foreach { eb =>
+      emitLabel(elseL)
+      if ty == Type.Unit then genBlockVoid(eb)
+      else emit(s"store ${ty.llvm} ${genBlockValue(eb)}, ptr $slot")
+      emitTerm(s"br label %$endL")
+    }
+    emitLabel(endL)
+    if ty == Type.Unit then ""
+    else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
+  }
 
   private def genBlockVoid(b: TBlock): Unit = {
     pushTemps()
