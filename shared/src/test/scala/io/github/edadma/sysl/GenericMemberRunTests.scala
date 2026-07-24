@@ -1,0 +1,166 @@
+package io.github.edadma.sysl
+
+import org.scalatest.freespec.AnyFreeSpec
+
+/** Tier-2 runtime behavior of members on *generic* types: a method or property on a generic
+ * struct is instantiated from the receiver's concrete type arguments, so the same member compiled
+ * against two element types becomes two independent monomorphized functions. These check that the
+ * receiver mode, the type parameter in the signature and body, and the per-instantiation choice of
+ * `T` all behave as they do for a free generic function.
+ */
+class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
+
+  "a value-receiver method returns the element type" in {
+    val src =
+      """struct Box[T]
+        |    value: T
+        |    get(self) -> T = self.value
+        |var a = Box(41)
+        |var b = Box("boxed")
+        |print(a.get(), b.get())""".stripMargin
+
+    run(src) shouldBe "41 boxed\n"
+  }
+
+  "a method takes a parameter of the element type" in {
+    val src =
+      """struct Box[T]
+        |    value: T
+        |    plus(self, other: T) -> T = self.value + other
+        |var a = Box(10)
+        |print(a.plus(5))""".stripMargin
+
+    run(src) shouldBe "15\n"
+  }
+
+  "a pointer-receiver method mutates the element in place" in {
+    val src =
+      """struct Box[T]
+        |    value: T
+        |    set(*self, x: T)
+        |        self.value = x
+        |    get(self) -> T = self.value
+        |var a = Box(1)
+        |a.set(99)
+        |print(a.get())""".stripMargin
+
+    run(src) shouldBe "99\n"
+  }
+
+  "a reference-receiver method mutates the shared heap object" in {
+    val src =
+      """struct Box[T]
+        |    value: T
+        |    bump(&self, by: T)
+        |        self.value = self.value + by
+        |    get(&self) -> T = self.value
+        |var a: &Box[int] = Box(0)
+        |a.bump(3)
+        |a.bump(4)
+        |print(a.get())""".stripMargin
+
+    run(src) shouldBe "7\n"
+  }
+
+  "a computed property on a generic struct reads with no parentheses" in {
+    val src =
+      """struct Box[T]
+        |    value: T
+        |    doubled -> T = self.value + self.value
+        |var a = Box(21)
+        |var b = Box(1.25)
+        |print(a.doubled, b.doubled)""".stripMargin
+
+    run(src) shouldBe "42 2.5\n"
+  }
+
+  "the same generic method is monomorphized once per element type" in {
+    val out = Compiler.compileToLlvm(
+      """struct Box[T]
+        |    value: T
+        |    get(self) -> T = self.value
+        |var a = Box(1)
+        |var b = Box(2.5)
+        |print(a.get(), b.get())""".stripMargin
+    )
+
+    // Box.get.int, Box.get.real, and main — the member is compiled once per element type, exactly
+    // as a free generic function is, not shared across the two instantiations.
+    out.map(_.linesIterator.count(_.startsWith("define"))) shouldBe Right(3)
+  }
+
+  "a method uses both parameters of a two-parameter generic struct" in {
+    val src =
+      """struct Pair[A, B]
+        |    first: A
+        |    second: B
+        |    show(self) -> B = self.second
+        |var p = Pair(1, "one")
+        |print(p.show())""".stripMargin
+
+    run(src) shouldBe "one\n"
+  }
+
+  "a generic method calls another method on self" in {
+    val src =
+      """struct Box[T]
+        |    value: T
+        |    raw(self) -> T = self.value
+        |    twice(self) -> T = self.raw() + self.raw()
+        |var a = Box(6)
+        |print(a.twice())""".stripMargin
+
+    run(src) shouldBe "12\n"
+  }
+
+  "a recursive generic type exposes a method that reaches through the pointer" in {
+    val src =
+      """struct Node[T]
+        |    value: T
+        |    next: *Node[T]
+        |    head(self) -> T = self.value
+        |var tail: Node[int] = Node(2, null)
+        |var list = Node(1, &tail)
+        |print(list.head(), tail.head())""".stripMargin
+
+    run(src) shouldBe "1 2\n"
+  }
+
+  // The unbounded model checks a member's body per instantiation, so a body that needs `T` to be
+  // numeric compiles fine when the receiver is a Box[int] even though it would be rejected at a
+  // Box[string]. Here only the numeric instantiation exists.
+  "a method whose body needs a numeric element compiles at a numeric instantiation" in {
+    val src =
+      """struct Box[T]
+        |    value: T
+        |    inc(self) -> T = self.value + 1
+        |var a = Box(41)
+        |print(a.inc())""".stripMargin
+
+    run(src) shouldBe "42\n"
+  }
+
+  // A &self method on a generic type that hands out a &T field: the returned reference is retained
+  // so it outlives the receiver dropped when extract returns. Over a long loop this must free each
+  // boxed value exactly once — a leak grows RSS, a double-free crashes. total = sum of i%4 = 750000.
+  "a &self generic method returns a &T field that outlives the dropped receiver" in {
+    val src =
+      """struct Inner
+        |    v: int
+        |struct Holder[T]
+        |    item: T
+        |    peek(&self) -> T = self.item
+        |extract(seed: int) -> &Inner
+        |    var h: &Holder[&Inner] = Holder(Inner(seed))
+        |    h.peek()
+        |var i = 0
+        |var total = 0
+        |while i < 500000
+        |    var got = extract(i % 4)
+        |    total += got.v
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "750000\n"
+  }
+}

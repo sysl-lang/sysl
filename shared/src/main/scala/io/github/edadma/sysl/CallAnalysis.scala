@@ -44,6 +44,15 @@ trait CallAnalysis extends TypeResolution {
     TCall(name, checkArgs(f.name, params, args, pre), rtype)
   }
 
+  /** The name codegen emits for a member call on `s`. A member of a concrete type was hoisted
+   * eagerly under `Type.member`; a member of a generic type is instantiated here, from the
+   * receiver's own type arguments, and its body queued for analysis — so both resolve to a name
+   * that `funcInsts` holds.
+   */
+  protected def memberFuncName(base: String, mname: String, s: Type.Struct): String =
+    if structDecls(base).tparams.isEmpty then s"$base.$mname"
+    else instantiateFunc(genericMembers((base, mname)), s.targs)
+
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever
    * memory mode the method's `self` asked for.
@@ -55,7 +64,7 @@ trait CallAnalysis extends TypeResolution {
       case Some((base, s)) =>
         memberDecls.get((base, mname)) match
           case Some(m) if m.receiver.isDefined =>
-            val fname           = s"$base.$mname"
+            val fname           = memberFuncName(base, mname, s)
             val (params, rtype) = funcInsts(fname)
             if args.length != params.length - 1 then
               err(s"method '$fname' takes ${params.length - 1} arguments, but ${args.length} were given")

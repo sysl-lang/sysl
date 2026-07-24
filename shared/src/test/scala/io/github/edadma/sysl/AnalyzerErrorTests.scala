@@ -604,22 +604,15 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("both a field and a member")
     }
 
-    "a member on a generic type waits on the generics work" in {
+    // An associated function on a generic type has no receiver to read the type arguments from,
+    // so it would need them inferred — a separate deferral with its own diagnostic. Methods and
+    // properties, whose type arguments come straight off the receiver, are supported.
+    "an associated function on a generic type waits on the generics work" in {
       err(
         """struct Box[T]
           |    value: T
-          |    get(self) -> T = self.value""".stripMargin
-      ) should include("members of a generic type are not supported yet")
-    }
-
-    // The deferral is about the type carrying parameters, not the receiver mode — a &self
-    // receiver on a generic type is rejected by the same guard, not silently lowered.
-    "a &self member on a generic type is rejected too" in {
-      err(
-        """struct Box[T]
-          |    value: T
-          |    get(&self) -> T = self.value""".stripMargin
-      ) should include("members of a generic type are not supported yet")
+          |    empty() -> int = 0""".stripMargin
+      ) should include("associated functions on generic types are not supported yet")
     }
 
     // A method that introduces its own type parameter, even on a non-generic type, is a separate
@@ -630,6 +623,78 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
           |    n: int
           |    store[T](&self, item: T) -> int = self.n""".stripMargin
       ) should include("generic methods are not supported yet")
+    }
+
+    // A method with its own type parameter is rejected even on a generic type — the receiver fixes
+    // the struct's parameters, but the method's own parameter still has nothing to infer it from.
+    "a generic method on a generic type waits on the generics work" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    cast[U](self, u: U) -> U = u""".stripMargin
+      ) should include("generic methods are not supported yet")
+    }
+  }
+
+  "members on generic types" - {
+    "a method call with the wrong arity is reported" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    plus(self, other: T) -> T = self.value + other
+          |var a = Box(1)
+          |print(a.plus(2, 3))""".stripMargin
+      ) should include("takes 1 arguments")
+    }
+
+    "a property on a generic type is read without parentheses" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    doubled -> T = self.value + self.value
+          |var a = Box(1)
+          |print(a.doubled())""".stripMargin
+      ) should include("is a property")
+    }
+
+    "a method on a generic type is called with parentheses" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    get(self) -> T = self.value
+          |var a = Box(1)
+          |print(a.get)""".stripMargin
+      ) should include("is a method")
+    }
+
+    "an unknown method on a generic type is reported against its type" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |var a = Box(1)
+          |print(a.area())""".stripMargin
+      ) should include("no method 'area'")
+    }
+
+    "a member may not share a name with a field on a generic type" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    value(self) -> T = self.value""".stripMargin
+      ) should include("both a field and a member")
+    }
+
+    // The unbounded model checks a member's body per instantiation, so a numeric operation on the
+    // element is only rejected once a non-numeric element reaches it — at the call, not the
+    // definition. total's type mismatch would never surface without instantiating at a string.
+    "a method body that needs a numeric element is rejected at a non-numeric instantiation" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    inc(self) -> T = self.value + 1
+          |var a = Box("s")
+          |print(a.inc())""".stripMargin
+      ) should include("int")
     }
   }
 }

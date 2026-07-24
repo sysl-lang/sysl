@@ -101,13 +101,18 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     structDecls.contains(name) || enumDecls.contains(name) || scalarType(name).isDefined
 
   /** Records a type's members and lowers each to a function declaration under the mangled name
-   * `Type.member`, whose signature is registered so calls resolve like ordinary ones. Members on
-   * generic types and members that introduce their own type parameters wait on the generics work
-   * and are rejected with a clear diagnostic rather than silently mishandled.
+   * `Type.member`, whose signature is registered so calls resolve like ordinary ones.
+   *
+   * A member of a concrete type is hoisted eagerly, so an uncalled member is still type-checked at
+   * its definition. A member of a *generic* type cannot be: its signature mentions the type's
+   * parameters, which have no meaning until a call fixes them, so it is stored generic in
+   * `genericMembers` and instantiated on demand at each call site. Members that introduce their own
+   * type parameters, and associated functions on a generic type — whose type arguments would have
+   * to be inferred rather than read off a receiver — wait on later work and are rejected with a
+   * clear diagnostic rather than silently mishandled.
    */
   private def hoistMembers(tname: String, sdecl: StructDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
-    if sdecl.members.nonEmpty && sdecl.tparams.nonEmpty then
-      err(s"members of a generic type are not supported yet — '$tname' has type parameters")
+    val generic = sdecl.tparams.nonEmpty
 
     for m <- sdecl.members do
       if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '$tname.${m.name}'")
@@ -116,26 +121,35 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         err(s"type '$tname' has both a field and a member named '${m.name}'")
 
       memberDecls((tname, m.name)) = m
-      val fd = synthesize(tname, m)
-      out += fd
-      funcInsts(fd.name) =
-        (fd.params.map(p => (p.name, resolveType(p.typ, Map.empty))),
-         fd.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit))
+      val fd = synthesize(tname, sdecl.tparams, m)
+
+      if generic then
+        if m.receiver.isEmpty && !m.isProperty then
+          err(s"associated functions on generic types are not supported yet — '$tname.${m.name}'")
+        genericMembers((tname, m.name)) = fd
+      else
+        out += fd
+        funcInsts(fd.name) =
+          (fd.params.map(p => (p.name, resolveType(p.typ, Map.empty))),
+           fd.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit))
   }
 
   /** Builds the function a member lowers to: the receiver becomes an ordinary first parameter
    * named `self`, carrying the memory mode its sigil asked for. A property's receiver is an
-   * implicit by-value read; an associated function has no receiver.
+   * implicit by-value read; an associated function has no receiver. On a generic type the self
+   * type is the type applied to its own parameters (`Box[T]`, not `Box`), and the lowered function
+   * inherits those parameters, so instantiating it at a concrete `Box[int]` substitutes `T` in the
+   * receiver, the result, and the body alike.
    */
-  private def synthesize(tname: String, m: MethodDecl): FuncDecl = {
-    val selfRef = NamedType(tname, Nil)
+  private def synthesize(tname: String, tparams: List[String], m: MethodDecl): FuncDecl = {
+    val selfRef = NamedType(tname, tparams.map(tp => NamedType(tp, Nil)))
     val selfParam = m.receiver match
       case Some(RecvMode.ByValue)     => Some(Param("self", selfRef))
       case Some(RecvMode.ByPtr)       => Some(Param("self", PtrType(selfRef)))
       case Some(RecvMode.ByRef(sync)) => Some(Param("self", RefType(selfRef, sync)))
       case None if m.isProperty       => Some(Param("self", selfRef))
       case None                       => None
-    FuncDecl(s"$tname.${m.name}", Nil, selfParam.toList ::: m.params, m.retType, m.body)
+    FuncDecl(s"$tname.${m.name}", tparams, selfParam.toList ::: m.params, m.retType, m.body)
   }
 
   private def analyzeFuncBody(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
@@ -505,8 +519,9 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
               // A property reads with no parentheses, so it looks exactly like a field; its
               // receiver is an implicit by-value read of the instance.
               case Some(m) if m.isProperty =>
-                val (_, rtype) = funcInsts(s"${s.base}.$f")
-                TCall(s"${s.base}.$f", List(tr), rtype)
+                val fname      = memberFuncName(s.base, f, s)
+                val (_, rtype) = funcInsts(fname)
+                TCall(fname, List(tr), rtype)
               case Some(_) => err(s"'$f' is a method of '${s.name}' — call it with '$f(…)'")
               case None    => err(s"'${s.name}' has no field or property '$f'")
         // `len` and `bytes` are the first compiler-provided members: `len` a property on every

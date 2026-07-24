@@ -28,6 +28,13 @@ trait AnalyzerBase {
    */
   protected val memberDecls = mutable.LinkedHashMap.empty[(String, String), MethodDecl]
 
+  /** A member of a *generic* type, lowered to a function that is itself generic over the type's
+   * parameters and keyed by (type name, member name). Unlike a member of a concrete type — which
+   * is hoisted eagerly into `funcInsts` — a generic member is instantiated on demand at each call
+   * site, once the receiver's concrete type arguments are known.
+   */
+  protected val genericMembers = mutable.LinkedHashMap.empty[(String, String), FuncDecl]
+
   /** Instantiated types, keyed by their display name (`Point`, `Option[int]`) and held in
    * dependency order — a type is inserted only after the types it contains.
    */
