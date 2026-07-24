@@ -69,18 +69,52 @@ trait PatternAnalysis extends TypeResolution {
               TVariantPattern(en, v, args.zip(v.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
             case None =>
               err(s"enum '${en.name}' has no variant '$name'")
+        // The positional form destructures a struct's fields in declaration order, so it must name
+        // every field — adding one to the struct then turns each positional match into a checked
+        // to-do, the way a new enum variant does.
+        case s: Type.Struct =>
+          if name != s.base then err(s"'$name(…)' does not match a ${show(s)} value")
+          if args.length != s.fields.length then
+            err(s"struct '${s.base}' has ${s.fields.length} fields, but ${args.length} sub-patterns were given")
+          TStructPattern(s, args.zip(s.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
         case other =>
-          err(s"'$name(…)' matches an enum variant, but the value is ${show(other)}")
+          err(s"'$name(…)' matches an enum variant or a struct, but the value is ${show(other)}")
 
-  /** Whether a pattern binds any name (directly or inside a variant's sub-patterns). */
+    // The named form matches a struct by field name, in any order, and may leave fields unlisted —
+    // those are unconstrained. Both source forms end as one `TStructPattern` with a sub-pattern per
+    // field in declaration order, a wildcard filling any field the pattern did not mention.
+    case StructPattern(name, fieldPats) =>
+      ty match
+        case s: Type.Struct =>
+          if name != s.base then err(s"'$name{…}' does not match a ${show(s)} value")
+          fieldPats.map(_._1).groupBy(identity).collectFirst { case (n, xs) if xs.size > 1 => n }.foreach { n =>
+            err(s"field '$n' is matched more than once")
+          }
+          for (fname, _) <- fieldPats do
+            if !s.fields.exists(_._1 == fname) then err(s"struct '${s.base}' has no field '$fname'")
+          val byName = fieldPats.toMap
+          TStructPattern(
+            s,
+            s.fields.map { case (fname, fty) =>
+              byName.get(fname).map(analyzePattern(_, fty)).getOrElse(TWildPattern(fty))
+            },
+          )
+        case other =>
+          err(s"'$name{…}' matches a struct, but the value is ${show(other)}")
+
+  /** Whether a pattern binds any name (directly or inside a variant's or struct's sub-patterns). */
   protected def binds(p: TPattern): Boolean = p match
     case _: TBindPattern    => true
     case v: TVariantPattern => v.args.exists(binds)
+    case s: TStructPattern  => s.args.exists(binds)
     case _                  => false
 
-  /** A pattern that always matches, so an unguarded arm carrying it is a catch-all. */
+  /** A pattern that always matches, so an unguarded arm carrying it is a catch-all. A struct has
+   * one form, so a struct pattern is irrefutable exactly when every field's sub-pattern is.
+   */
   protected def irrefutable(p: TPattern): Boolean = p match
     case _: TWildPattern | _: TBindPattern => true
+    case s: TStructPattern                 => s.args.forall(irrefutable)
     case _                                 => false
 
   /** Checks exhaustiveness and returns the value type of a match (`unit` unless every arm

@@ -184,6 +184,15 @@ case class TVariantPattern(enumTy: Type.Enum, variant: Type.EnumVariant, args: L
   def ty: Type = enumTy
 }
 
+/** A struct pattern: `args` holds one sub-pattern per field in declaration order — a wildcard for
+ * any field the source left unlisted — so the positional and named source forms lower to one shape.
+ * A struct has a single form, so a struct pattern whose sub-patterns are all irrefutable matches
+ * every value of the type.
+ */
+case class TStructPattern(struct: Type.Struct, args: List[TPattern]) extends TPattern {
+  def ty: Type = struct
+}
+
 /** A block: a sequence of statements optionally ending in a value expression. When `result`
  * is `None` the block's type is `unit`.
  */

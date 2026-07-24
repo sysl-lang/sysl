@@ -129,6 +129,69 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
           |    else -> "big"""".stripMargin
       ) should include("match arms have different types: int and string")
     }
+
+    // A positional struct pattern must name every field, so a short one is a checked mistake.
+    "a positional struct pattern with the wrong field count is rejected" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |end Point
+          |f(p: Point) -> int = match p
+          |    Point(x) -> x
+          |    else -> 0""".stripMargin
+      ) should include("struct 'Point' has 2 fields, but 1 sub-patterns were given")
+    }
+
+    "a named struct pattern naming an unknown field is rejected" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |end Point
+          |f(p: Point) -> int = match p
+          |    Point{z} -> z
+          |    else -> 0""".stripMargin
+      ) should include("struct 'Point' has no field 'z'")
+    }
+
+    "a named struct pattern matching a field twice is rejected" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |end Point
+          |f(p: Point) -> int = match p
+          |    Point{x, x} -> x
+          |    else -> 0""".stripMargin
+      ) should include("field 'x' is matched more than once")
+    }
+
+    // A struct pattern must name the scrutinee's struct.
+    "a struct pattern for a different type is rejected" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |end Point
+          |f(p: Point) -> int = match p
+          |    Other(x, y) -> x
+          |    else -> 0""".stripMargin
+      ) should include("'Other(…)' does not match a Point value")
+    }
+
+    // A refutable struct pattern does not cover the type, so a value match on it still needs a
+    // fall-through.
+    "a refutable struct pattern in a value match still needs an else" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |end Point
+          |var r = match Point(1, 2)
+          |    Point(0, 0) -> 1""".stripMargin
+      ) should include("must be exhaustive")
+    }
   }
 
   "an unknown type in a signature" in {

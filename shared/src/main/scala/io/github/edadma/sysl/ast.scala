@@ -89,9 +89,16 @@ case class IdentPattern(name: String) extends Pattern
 
 /** `Circle(r)`, `Wrap(Val(v))` — matches a data-enum variant and recurses into its fields.
  * Each sub-pattern matches the field at that position (a binding, a nested variant, `_`, or a
- * literal).
+ * literal). Against a *struct* value the same positional form destructures every field in
+ * declaration order.
  */
 case class VariantPattern(name: String, args: List[Pattern]) extends Pattern
+
+/** `Point{x, y}`, `Point{x: 0}` — matches a struct by field name. Each entry is a field and the
+ * sub-pattern it must match; the shorthand `{x}` binds field `x` to a variable of the same name.
+ * Fields left unlisted are unconstrained, so a named pattern may match on a subset.
+ */
+case class StructPattern(name: String, fields: List[(String, Pattern)]) extends Pattern
 
 /** `pat, pat, … [if guard] -> body`. Alternatives share one body; the optional guard is a
  * boolean the scrutinee value must additionally satisfy. Each body is a statement list whose

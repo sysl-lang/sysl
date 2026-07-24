@@ -679,6 +679,17 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
           andI1(acc, patternTest(arg, variant.fields(i)._2, fv))
         }
 
+    // A struct has no tag, so the test is just its refutable fields' tests ANDed together; an
+    // irrefutable field needs none, so nothing is emitted for the parts a named pattern omitted.
+    // Any bindings such a field carries are established later, in `patternBind`.
+    case TStructPattern(struct, args) =>
+      args.zipWithIndex.foldLeft("true") { case (acc, (arg, i)) =>
+        if !refutable(arg) then acc
+        else
+          val fv = freshTemp(); emit(s"$fv = extractvalue ${struct.llvm} $value, $i")
+          andI1(acc, patternTest(arg, struct.fields(i)._2, fv))
+      }
+
   /** Establishes the bindings a pattern introduces, once its arm has been taken. Only binding
    * and (nested) variant patterns carry bindings; the rest are no-ops.
    */
@@ -694,12 +705,25 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       for (arg, i) <- args.zipWithIndex do
         val fv = freshTemp(); emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, $i")
         patternBind(arg, variant.fields(i)._2, fv)
+    case TStructPattern(struct, args) if args.exists(bindsAny) =>
+      for (arg, i) <- args.zipWithIndex if bindsAny(arg) do
+        val fv = freshTemp(); emit(s"$fv = extractvalue ${struct.llvm} $value, $i")
+        patternBind(arg, struct.fields(i)._2, fv)
     case _ => ()
 
   private def bindsAny(p: TPattern): Boolean = p match
     case _: TBindPattern    => true
     case v: TVariantPattern => v.args.exists(bindsAny)
+    case s: TStructPattern  => s.args.exists(bindsAny)
     case _                  => false
+
+  /** Whether a pattern needs a run-time test — false for a wildcard, a binding, or a struct whose
+   * fields all need none, so a struct pattern emits reads only for the fields it actually checks.
+   */
+  private def refutable(p: TPattern): Boolean = p match
+    case _: TWildPattern | _: TBindPattern => false
+    case s: TStructPattern                 => s.args.exists(refutable)
+    case _                                 => true
 
   /** ANDs / ORs two i1 values, folding away the `"true"` immediate a trivially-true pattern
    * produces so the emitted condition stays readable.

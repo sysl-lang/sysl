@@ -45,4 +45,55 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
       ),
     )
   }
+
+  "a positional struct pattern parses like a variant" in {
+    val src =
+      """match p
+        |    Point(0, y) -> print(y)
+        |    else -> print(0)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("p"),
+      List(
+        MatchArm(List(VariantPattern("Point", List(LitPattern(i(0)), IdentPattern("y")))), None, List(printStmt(Ident("y")))),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(0)))),
+      ),
+    )
+  }
+
+  "a named struct pattern carries field-name/sub-pattern pairs" in {
+    val src =
+      """match p
+        |    Point{x: 0, y} -> print(y)
+        |    else -> print(0)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("p"),
+      List(
+        MatchArm(
+          List(StructPattern("Point", List(("x", LitPattern(i(0))), ("y", IdentPattern("y"))))),
+          None,
+          List(printStmt(Ident("y"))),
+        ),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(0)))),
+      ),
+    )
+  }
+
+  "a named-field shorthand binds each field to its own name" in {
+    val src =
+      """match p
+        |    Point{x, y} -> print(x)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("p"),
+      List(
+        MatchArm(
+          List(StructPattern("Point", List(("x", IdentPattern("x")), ("y", IdentPattern("y"))))),
+          None,
+          List(printStmt(Ident("x"))),
+        ),
+      ),
+    )
+  }
 }

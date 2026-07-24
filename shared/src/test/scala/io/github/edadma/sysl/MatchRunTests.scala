@@ -54,6 +54,108 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "1 0\n"
   }
 
+  "a positional struct pattern destructures every field in order" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |end Point
+        |classify(p: Point) -> string
+        |    match p
+        |        Point(0, 0) -> "origin"
+        |        Point(x, 0) -> "x-axis"
+        |        Point(0, y) -> "y-axis"
+        |        else -> "elsewhere"
+        |print(classify(Point(0, 0)), classify(Point(5, 0)), classify(Point(0, 3)), classify(Point(1, 2)))""".stripMargin
+
+    run(src) shouldBe "origin x-axis y-axis elsewhere\n"
+  }
+
+  // A struct has one shape, so a positional pattern with irrefutable fields is a catch-all — a
+  // value match on it needs no `else`.
+  "an irrefutable struct pattern is exhaustive without an else" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |end Point
+        |sum(p: Point) -> int
+        |    match p
+        |        Point(x, y) -> x + y
+        |print(sum(Point(3, 4)))""".stripMargin
+
+    run(src) shouldBe "7\n"
+  }
+
+  "a named struct pattern matches fields by name and may omit them" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |end Point
+        |where(p: Point) -> string
+        |    match p
+        |        Point{x: 0} -> "y-axis"
+        |        Point{y: 0} -> "x-axis"
+        |        Point{x, y} -> "elsewhere"
+        |print(where(Point(0, 9)), where(Point(9, 0)), where(Point(3, 4)))""".stripMargin
+
+    run(src) shouldBe "y-axis x-axis elsewhere\n"
+  }
+
+  "a named-field shorthand binds each field to its own name" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |end Point
+        |swapSum(p: Point) -> int
+        |    match p
+        |        Point{y, x} -> x * 10 + y
+        |print(swapSum(Point(3, 4)))""".stripMargin
+
+    run(src) shouldBe "34\n"
+  }
+
+  "a struct pattern nests inside another struct pattern" in {
+    val src =
+      """struct Point
+        |    x: int
+        |    y: int
+        |end Point
+        |struct Line
+        |    a: Point
+        |    b: Point
+        |end Line
+        |describe(l: Line) -> string
+        |    match l
+        |        Line(Point(0, 0), b) -> "from origin"
+        |        else -> "other"
+        |print(describe(Line(Point(0, 0), Point(3, 4))), describe(Line(Point(1, 1), Point(2, 2))))""".stripMargin
+
+    run(src) shouldBe "from origin other\n"
+  }
+
+  // A bound refcounted field is retained on bind and released once, and the struct scrutinee is
+  // torn down each iteration — a leak or double-free would drift or crash over the loop.
+  "binding a refcounted struct field neither leaks nor frees twice" in {
+    val src =
+      """struct Named
+        |    tag: string
+        |    n: int
+        |end Named
+        |var total = 0
+        |for i in 1..5000
+        |    var nm = Named("ab" + "cd", i)
+        |    var got = match nm
+        |        Named{tag: t, n} -> int(t[0]) + n
+        |    total += got
+        |print(total)""".stripMargin
+
+    // per i: 'a' (97) + i; sum over 1..5000 = 5000*97 + 5000*5001/2 = 485000 + 12502500
+    run(src) shouldBe "12987500\n"
+  }
+
   "an exclusive range pattern excludes its upper bound" in {
     val src =
       """band(n: int) -> string

@@ -448,12 +448,14 @@ class SyslParser extends PackratParsers {
         case pats ~ guard ~ b => MatchArm(pats, guard, b)
       }
 
-  /** Patterns: scalar literals and ranges, the `_` wildcard, a variant destructuring
-   * `V(sub…)`, or a bare name — which the analyzer reads as a nullary-variant pattern when it
-   * names a variant of the scrutinee's enum, and as a binding otherwise.
+  /** Patterns: scalar literals and ranges, the `_` wildcard, a positional destructuring
+   * `V(sub…)` (an enum variant or a struct), a named struct destructuring `S{field: sub…}`, or a
+   * bare name — which the analyzer reads as a nullary-variant pattern when it names a variant of
+   * the scrutinee's enum, and as a binding otherwise.
    */
   private lazy val pattern: Parser[Pattern] =
     patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
+      structPattern |
       variantPattern |
       wildcard ^^^ WildcardPattern |
       ident ^^ IdentPattern.apply |
@@ -461,6 +463,15 @@ class SyslParser extends PackratParsers {
 
   private lazy val variantPattern: Parser[Pattern] =
     ident ~ (op("(") ~> repsep(pattern, op(",")) <~ op(")")) ^^ { case n ~ ps => VariantPattern(n, ps) }
+
+  /** `S{field: sub, other}` — a named struct pattern. A bare `field` is shorthand for
+   * `field: field`, binding the field to a variable of the same name.
+   */
+  private lazy val structPattern: Parser[Pattern] =
+    ident ~ (op("{") ~> repsep(fieldPattern, op(",")) <~ op("}")) ^^ { case n ~ fs => StructPattern(n, fs) }
+
+  private lazy val fieldPattern: Parser[(String, Pattern)] =
+    ident ~ opt(op(":") ~> pattern) ^^ { case n ~ p => (n, p.getOrElse(IdentPattern(n))) }
 
   private lazy val wildcard: Parser[Unit] =
     accept("'_'", { case t: lexical.Identifier if t.chars == "_" => () })
