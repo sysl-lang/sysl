@@ -124,7 +124,7 @@ class SyslParser extends PackratParsers {
       op("--") ^^^ ((e: Expr) => PostIncDec("--", e))
 
   lazy val primary: PackratParser[Expr] =
-    floatLit | intLit | charLit | strLit | boolLit | nullLit | selfExpr | identExpr | arrayLit |
+    floatLit | intLit | charLit | interpLit | strLit | boolLit | nullLit | selfExpr | identExpr | arrayLit |
       op("(") ~> parenTail
 
   /** `self` is reserved, so it never lexes as an identifier; inside a method body it reads as an
@@ -157,6 +157,55 @@ class SyslParser extends PackratParsers {
 
   private lazy val strLit: Parser[Expr] =
     accept("string literal", { case t: lexical.StrLit => StrLit(t.value) })
+
+  /** An interpolated string desugars to the concatenation of its literal segments with each
+   * embedded expression rendered by `str`: `s"a${e}b"` becomes `"a" + str(e) + "b"`. The embedded
+   * source is parsed here as an ordinary expression — so it may itself interpolate — and an empty
+   * literal segment is dropped, since it is the identity under `+`.
+   */
+  private lazy val interpLit: Parser[Expr] = Parser { in =>
+    in.first match
+      case t: lexical.StrInterp =>
+        desugarInterp(t) match
+          case Right(e) => Success(e, in.rest)
+          // A malformed embedded expression has no other reading, so the failure is fatal rather
+          // than a cue to backtrack — that keeps the real message instead of a generic one from
+          // whatever alternative the enclosing rule tries next.
+          case Left(msg) => Error(msg, in)
+      case _ => Failure("string interpolation expected", in)
+  }
+
+  private def desugarInterp(t: lexical.StrInterp): Either[String, Expr] = {
+    val parsed =
+      t.exprs.foldRight(Right(Nil): Either[String, List[Expr]]) { (src, acc) =>
+        for
+          rest <- acc
+          e    <- parseEmbedded(src)
+        yield e :: rest
+      }
+
+    parsed.map { exprs =>
+      val terms =
+        t.parts.head match
+          case "" => List.empty[Expr]
+          case p  => List(StrLit(p): Expr)
+
+      val rendered = exprs.zip(t.parts.tail).foldLeft(terms) { case (acc, (e, part)) =>
+        val withExpr = acc :+ Call(Ident("str"), List(e))
+        if part.isEmpty then withExpr else withExpr :+ StrLit(part)
+      }
+
+      rendered match
+        case Nil     => StrLit("")
+        case x :: xs => xs.foldLeft(x)((l, r) => Binary("+", l, r))
+    }
+  }
+
+  /** Lexes and parses the source of a `${ … }` interpolation as a single expression. */
+  private def parseEmbedded(src: String): Either[String, Expr] =
+    phrase(expression <~ rep(newline))(reader(src)) match
+      case Success(e, _) => Right(e)
+      case ns: NoSuccess => Left(s"in interpolation '$src': ${ns.msg}")
 
   private lazy val boolLit: Parser[Expr] =
     op("true") ^^^ BoolLit(true) | op("false") ^^^ BoolLit(false)

@@ -122,6 +122,34 @@ class LexerTests extends AnyFreeSpec with Matchers {
     l.bare("\"hello\"") shouldBe List(l.StrLit("hello"))
   }
 
+  "interpolated strings split into literal parts and embedded source" - {
+    "a hole separates the surrounding literals" in withLexer { l =>
+      l.bare("""s"a${x}b"""") shouldBe List(l.StrInterp(List("a", "b"), List("x")))
+    }
+
+    "a bare $name is a hole whose source is the name" in withLexer { l =>
+      l.bare("""s"hi $who"""") shouldBe List(l.StrInterp(List("hi ", ""), List("who")))
+    }
+
+    "the parts still decode escapes, but raw does not" in withLexer { l =>
+      l.bare("""s"a\tb"""") shouldBe List(l.StrInterp(List("a\tb"), Nil))
+      l.bare("""raw"a\tb"""") shouldBe List(l.StrInterp(List("a\\tb"), Nil))
+    }
+
+    "a hole's source keeps a nested string and brace verbatim for re-lexing" in withLexer { l =>
+      l.bare("""s"${ f("}") + {1} }"""") shouldBe
+        List(l.StrInterp(List("", ""), List(""" f("}") + {1} """)))
+    }
+
+    "$$ is one literal dollar, not a hole" in withLexer { l =>
+      l.bare("""s"$$"""") shouldBe List(l.StrInterp(List("$"), Nil))
+    }
+
+    "s or raw not against a quote is an ordinary identifier" in withLexer { l =>
+      l.bare("s + raw") shouldBe List(l.Identifier("s"), l.Keyword("+"), l.Identifier("raw"))
+    }
+  }
+
   "identifiers and reserved words" - {
     "an identifier" in withLexer { l =>
       l.bare("foo_bar1") shouldBe List(l.Identifier("foo_bar1"))

@@ -85,4 +85,55 @@ class ExpressionParserTests extends AnyFreeSpec with ParseSupport {
       expr("\"hi\"") shouldBe StrLit("hi")
     }
   }
+
+  "string interpolation" - {
+    def str(e: Expr): Expr = Call(Ident("str"), List(e))
+    def cat(es: Expr*): Expr = es.reduceLeft((l, r) => Binary("+", l, r))
+
+    "with no holes is just the literal" in {
+      expr("""s"plain"""") shouldBe StrLit("plain")
+      expr("""s""""") shouldBe StrLit("")
+    }
+
+    "a lone `$name` renders that name — no surrounding literals" in {
+      expr("""s"$name"""") shouldBe str(Ident("name"))
+    }
+
+    "surrounding text becomes the literal segments around each render" in {
+      expr("""s"a${x}b"""") shouldBe cat(StrLit("a"), str(Ident("x")), StrLit("b"))
+    }
+
+    "adjacent holes render each with no literal between them" in {
+      expr("""s"$x$y"""") shouldBe cat(str(Ident("x")), str(Ident("y")))
+    }
+
+    "a `${ … }` hole parses as a full expression" in {
+      expr("""s"= ${a + b * 2}"""") shouldBe
+        cat(StrLit("= "), str(Binary("+", Ident("a"), Binary("*", Ident("b"), i(2)))))
+    }
+
+    "a hole may itself contain a string, brace, and further interpolation" in {
+      expr("""s"${ f("x") + g }"""") shouldBe
+        str(Binary("+", Call(Ident("f"), List(StrLit("x"))), Ident("g")))
+    }
+
+    "`$$` is a literal dollar, not a hole" in {
+      expr("""s"$$5"""") shouldBe StrLit("$5")
+    }
+
+    "an empty hole-adjacent segment is dropped as the identity under `+`" in {
+      expr("""s"${x}${y}"""") shouldBe cat(str(Ident("x")), str(Ident("y")))
+    }
+
+    "raw keeps a backslash as an ordinary character but still interpolates" in {
+      expr("""raw"a\n$x"""") shouldBe cat(StrLit("a\\n"), str(Ident("x")))
+    }
+
+    "a malformed hole is a fatal error naming the interpolation" in {
+      val p = new SyslParser
+      p.parseExpression("""s"${1 +}"""") match
+        case p.Success(_, _)  => fail("expected a parse error")
+        case ns: p.NoSuccess  => ns.msg should include("in interpolation")
+    }
+  }
 }

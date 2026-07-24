@@ -7,8 +7,9 @@ that one first, and `07` for the view machinery it shares.
 
 What exists: the three-word representation, literals, `s.len`, `s[i]`, `s[a..b]` with both the
 bounds and the boundary checked, `s.bytes`, comparison by bytes, string literals as `match`
-patterns, **concatenation** — `a + b` and `s += t`, which allocate a fresh buffer — and **`str(x)`**,
-which renders a primitive value into one. What does not: the rest of the operations that produce
+patterns, **concatenation** — `a + b` and `s += t`, which allocate a fresh buffer — **`str(x)`**,
+which renders a primitive value into one, and **interpolation** — `s"…$x…"` and `raw"…"`, which
+desugar to concatenation and `str`. What does not: the rest of the operations that produce
 new bytes — `from_utf8`, `copy()`, `str.builder`, `cstring`, `string(c)` — since each needs either
 the raw-bytes surface or methods. A string is therefore no longer always traceable to a literal; a
 program can build one by joining or by rendering.
@@ -200,8 +201,28 @@ operators take, and it is what keeps a string's contents something a reader can 
 ## Literals
 
 Double-quoted, UTF-8, the escape table in `01`. A literal may not span a line break, and a
-comment marker inside one is ordinary text. Interpolation, concatenation of adjacent literals,
-and raw/multi-line forms are not yet specified.
+comment marker inside one is ordinary text. Concatenation of adjacent literals and multi-line forms
+are not yet specified.
+
+## Interpolation
+
+An interpolated string is a literal with a prefix — `s"…"` processes escapes, `raw"…"` leaves a
+backslash as an ordinary character — and inside it `$name` or `${ expression }` splices a value in.
+`$$` is one literal dollar. Each spliced value is rendered by `str`, so the same rules apply: a
+primitive renders, and a type that has no string form is an error at the splice. The whole thing
+desugars to the machinery already built — `s"a${e}b"` is exactly `"a" + str(e) + "b"` — so an
+interpolation is not a new kind of value, just a concise way to write a concatenation. A hole holds
+a full expression, which may itself interpolate, and an empty literal segment beside a hole is
+dropped since it is the identity under `+`.
+
+This follows Scala's interpolators, and deliberately not a `printf`-style format string in the
+default form: the value and the text around it stay where they are read, and the conversion is `str`
+applied at the splice rather than a directive parsed out of a separate string. A `printf`-style
+`f"…%d…"` form, where a hole carries an explicit specifier, layers on top and is specified
+separately.
+
+`s` and `raw` are only prefixes when written directly against the opening quote; used as ordinary
+names they are unaffected, so `s + raw` is an addition of two variables.
 
 ## C interop
 

@@ -55,6 +55,16 @@ class SyslLexical
     def chars: String = value
   }
 
+  /** An interpolated string, `s"…"` or `raw"…"`. The literal segments are already decoded (with
+   * escapes, unless `raw`); the embedded expressions are held as their raw source, to be lexed and
+   * parsed where the token is consumed. The invariant `parts.length == exprs.length + 1` lets the
+   * parser interleave them: `parts(0) + str(exprs(0)) + parts(1) + …`.
+   */
+  case class StrInterp(parts: List[String], exprs: List[String]) extends Token {
+    def chars: String =
+      parts.head + parts.tail.zip(exprs).map { case (p, e) => "${" + e + "}" + p }.mkString
+  }
+
   /** Reserved words. Type names are deliberately absent: `int`, `usize`, `f32` and the
    * rest are predeclared identifiers resolved by the analyzer, as in Go and Swift, so
    * the open `iN` / `uN` / `fN` families need no lexical support. This set grows as the
@@ -119,7 +129,9 @@ class SyslLexical
   }
 
   override def token: Parser[Token] =
-    identifier | number | character | string | (elem(EofCh) ^^^ EOF) | delim | failure("illegal character")
+    interpString | identifier | number | character | string | (elem(EofCh) ^^^ EOF) | delim | failure(
+      "illegal character",
+    )
 
   private def isDigit(c: Char): Boolean    = c >= '0' && c <= '9'
   private def isHexDigit(c: Char): Boolean = isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
@@ -306,6 +318,111 @@ class SyslLexical
 
       result.get
     }
+  }
+
+  /** An interpolated string is an identifier `s` or `raw` written directly against a `"`. The
+   * prefix has to be the whole identifier — `sfoo"…"` is an ordinary name beside a string, not an
+   * interpolation — so a mismatch falls through to `identifier`, which keeps `s` and `raw` usable
+   * as names.
+   */
+  private lazy val interpString: Parser[Token] = Parser { in =>
+    if (in.atEnd || !isIdentStart(in.first)) Failure("not an interpolated string", in)
+    else {
+      val (name, afterName) = takeWhile(in, isIdentPart)
+
+      if ((name == "s" || name == "raw") && !afterName.atEnd && afterName.first == '"')
+        scanInterp(afterName.rest, raw = name == "raw")
+      else Failure("not an interpolated string", in)
+    }
+  }
+
+  /** Scans the body of an interpolated string into its literal segments and embedded expressions.
+   * A `$` begins an interpolation — `$name` or `${ … }` — and `$$` is a literal dollar; every
+   * other character joins the current segment, decoded through the escape table unless the string
+   * is `raw`. The embedded expression is captured as source and lexed again where it is used.
+   */
+  private def scanInterp(start: Reader[Char], raw: Boolean): ParseResult[Token] = {
+    val parts = ListBuffer.empty[String]
+    val exprs = ListBuffer.empty[String]
+    val part  = new StringBuilder
+    var rest  = start
+
+    var result: Option[ParseResult[Token]] = None
+
+    while (result.isEmpty)
+      if (rest.atEnd || rest.first == '\n') result = Some(Success(errorToken("unterminated string literal"), rest))
+      else if (rest.first == '"') {
+        parts += part.toString
+        result = Some(Success(StrInterp(parts.toList, exprs.toList), rest.rest))
+      } else if (rest.first == '$') {
+        val after = rest.rest
+
+        if (after.atEnd) result = Some(Success(errorToken("expected a name or '{' after '$'"), after))
+        else if (after.first == '$') { part += '$'; rest = after.rest }
+        else if (after.first == '{')
+          scanBraced(after.rest) match {
+            case Left((msg, next)) => result = Some(Success(errorToken(msg), next))
+            case Right((expr, next)) =>
+              parts += part.toString; part.clear()
+              exprs += expr
+              rest = next
+          }
+        else if (isIdentStart(after.first)) {
+          val (name, next) = takeWhile(after, isIdentPart)
+
+          parts += part.toString; part.clear()
+          exprs += name
+          rest = next
+        } else result = Some(Success(errorToken("expected a name or '{' after '$'"), after))
+      } else if (raw) { part += rest.first; rest = rest.rest }
+      else
+        scanChar(rest) match {
+          case Left((msg, next)) => result = Some(Success(errorToken(msg), next))
+          case Right((cp, next)) =>
+            part ++= codepointToString(cp)
+            rest = next
+        }
+
+    result.get
+  }
+
+  /** Captures the source of a `${ … }` expression by matching its braces, skipping over nested
+   * braces and over any string or character literal inside so a `}` within one does not close the
+   * interpolation early. The captured text is re-lexed by the parser, which is where its own
+   * well-formedness is judged.
+   */
+  private def scanBraced(start: Reader[Char]): Either[(String, Reader[Char]), (String, Reader[Char])] = {
+    val buf   = new StringBuilder
+    var rest  = start
+    var depth = 1
+
+    var result: Option[Either[(String, Reader[Char]), (String, Reader[Char])]] = None
+
+    def copyQuoted(quote: Char): Unit = {
+      buf += quote; rest = rest.rest
+      var closed = false
+      while (!closed)
+        if (rest.atEnd || rest.first == '\n') closed = true
+        else if (rest.first == '\\' && !rest.rest.atEnd) { buf += '\\'; buf += rest.rest.first; rest = rest.rest.rest }
+        else if (rest.first == quote) { buf += quote; rest = rest.rest; closed = true }
+        else { buf += rest.first; rest = rest.rest }
+    }
+
+    while (result.isEmpty)
+      if (rest.atEnd || rest.first == '\n') result = Some(Left(("unterminated interpolation", rest)))
+      else
+        rest.first match {
+          case '{'          => depth += 1; buf += '{'; rest = rest.rest
+          case '}'          =>
+            depth -= 1
+            if (depth == 0) result = Some(Right((buf.toString, rest.rest)))
+            else { buf += '}'; rest = rest.rest }
+          case '"'          => copyQuoted('"')
+          case '\''         => copyQuoted('\'')
+          case c            => buf += c; rest = rest.rest
+        }
+
+    result.get
   }
 
   /** Reads one character of a character or string literal — an escape sequence, a plain

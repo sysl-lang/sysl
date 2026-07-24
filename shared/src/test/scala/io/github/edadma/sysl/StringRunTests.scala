@@ -309,6 +309,70 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  "interpolation" - {
+    "a name is spliced in where it is written" in {
+      run("""var who = "ada"
+            |print(s"hello, $who!")""".stripMargin) shouldBe "hello, ada!\n"
+    }
+
+    "a braced hole is any expression, rendered by str" in {
+      run("""var n = 20
+            |print(s"n is $n, doubled ${n * 2}")""".stripMargin) shouldBe "n is 20, doubled 40\n"
+    }
+
+    "each primitive type renders as str gives it" in {
+      run("""print(s"${1 < 2} ${3.5} ${'x'} ${-9}")""") shouldBe "true 3.5 x -9\n"
+    }
+
+    "a hole may itself hold a string expression" in {
+      run("""var a = "foo"
+            |print(s"[${ a + "!" }]")""".stripMargin) shouldBe "[foo!]\n"
+    }
+
+    "an interpolation with no holes is the literal, escapes and all" in {
+      run("""print(s"tab\tend", s"")""") shouldBe "tab\tend \n"
+    }
+
+    "adjacent holes butt together with nothing between them" in {
+      run("""var a = "ab"
+            |var b = "cd"
+            |print(s"$a$b")""".stripMargin) shouldBe "abcd\n"
+    }
+
+    "a doubled dollar is one literal dollar" in {
+      run("""var n = 5
+            |print(s"$$$n")""".stripMargin) shouldBe "$5\n"
+    }
+
+    "raw leaves a backslash alone yet still interpolates" in {
+      run("""var x = "hi"
+            |print(raw"a\n$x")""".stripMargin) shouldBe "a\\n" + "hi\n"
+    }
+
+    "the result is a real owning string, usable like any other" in {
+      run("""var w = "world"
+            |var s = s"hello $w"
+            |print(s, s.len, s[0..<5])""".stripMargin) shouldBe "hello world 11 hello\n"
+    }
+
+    "a nested interpolation composes" in {
+      run("""var n = "ada"
+            |print(s"[${ s"<$n>" }]")""".stripMargin) shouldBe "[<ada>]\n"
+    }
+
+    "interpolating in a loop neither leaks nor frees twice" in {
+      val src =
+        """var total = 0
+          |for i in 1..20000 do
+          |    var s = s"n=$i"
+          |    total += int(s[0])
+          |print(total)
+          |""".stripMargin
+
+      run(src) shouldBe "2200000\n"
+    }
+  }
+
   "comparison" - {
     "equality is by bytes" in {
       run("""print("abc" == "abc", "abc" == "abd", "abc" != "ab")""") shouldBe "true false true\n"
