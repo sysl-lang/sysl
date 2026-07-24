@@ -28,6 +28,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     if heap then
       out ++= "declare ptr @malloc(i64)\n"
       out ++= "declare void @free(ptr)\n"
+    if usesSnprintf then out ++= "declare i32 @snprintf(ptr, i64, ptr, ...)\n"
     for d <- satDecls do out ++= d + "\n"
     out ++= "\n"
 
@@ -280,6 +281,9 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       // into a fresh buffer this statement owns and releases.
       val v = genStr(arg)
       if arg.ty == Type.Str then v else ownTemp(v, Type.Str)
+
+    case TFormat(arg, spec) =>
+      ownTemp(genFormat(arg, spec), Type.Str)
 
     case TBinary(_, l, r, Type.Str) =>
       ownTemp(strConcat(genExpr(l), genExpr(r)), Type.Str)

@@ -124,29 +124,51 @@ class LexerTests extends AnyFreeSpec with Matchers {
 
   "interpolated strings split into literal parts and embedded source" - {
     "a hole separates the surrounding literals" in withLexer { l =>
-      l.bare("""s"a${x}b"""") shouldBe List(l.StrInterp(List("a", "b"), List("x")))
+      l.bare("""s"a${x}b"""") shouldBe List(l.StrInterp(List("a", "b"), List("x"), List(None)))
     }
 
     "a bare $name is a hole whose source is the name" in withLexer { l =>
-      l.bare("""s"hi $who"""") shouldBe List(l.StrInterp(List("hi ", ""), List("who")))
+      l.bare("""s"hi $who"""") shouldBe List(l.StrInterp(List("hi ", ""), List("who"), List(None)))
     }
 
     "the parts still decode escapes, but raw does not" in withLexer { l =>
-      l.bare("""s"a\tb"""") shouldBe List(l.StrInterp(List("a\tb"), Nil))
-      l.bare("""raw"a\tb"""") shouldBe List(l.StrInterp(List("a\\tb"), Nil))
+      l.bare("""s"a\tb"""") shouldBe List(l.StrInterp(List("a\tb"), Nil, Nil))
+      l.bare("""raw"a\tb"""") shouldBe List(l.StrInterp(List("a\\tb"), Nil, Nil))
     }
 
     "a hole's source keeps a nested string and brace verbatim for re-lexing" in withLexer { l =>
       l.bare("""s"${ f("}") + {1} }"""") shouldBe
-        List(l.StrInterp(List("", ""), List(""" f("}") + {1} """)))
+        List(l.StrInterp(List("", ""), List(""" f("}") + {1} """), List(None)))
     }
 
     "$$ is one literal dollar, not a hole" in withLexer { l =>
-      l.bare("""s"$$"""") shouldBe List(l.StrInterp(List("$"), Nil))
+      l.bare("""s"$$"""") shouldBe List(l.StrInterp(List("$"), Nil, Nil))
     }
 
     "s or raw not against a quote is an ordinary identifier" in withLexer { l =>
       l.bare("s + raw") shouldBe List(l.Identifier("s"), l.Keyword("+"), l.Identifier("raw"))
+    }
+
+    "an f-string captures a printf specifier after a hole" in withLexer { l =>
+      l.bare("""f"n=${x}%04d!"""") shouldBe List(l.StrInterp(List("n=", "!"), List("x"), List(Some("%04d"))))
+    }
+
+    "a specifier binds only after a hole; a stray percent is text" in withLexer { l =>
+      l.bare("""f"$x%.2f done 100%"""") shouldBe
+        List(l.StrInterp(List("", " done 100%"), List("x"), List(Some("%.2f"))))
+    }
+
+    "a hole with no specifier in an f-string carries None" in withLexer { l =>
+      l.bare("""f"$x and ${y}"""") shouldBe
+        List(l.StrInterp(List("", " and ", ""), List("x", "y"), List(None, None)))
+    }
+
+    "s and raw never capture a specifier — the percent is text" in withLexer { l =>
+      l.bare("""s"$x%d"""") shouldBe List(l.StrInterp(List("", "%d"), List("x"), List(None)))
+    }
+
+    "f is only a prefix against a quote" in withLexer { l =>
+      l.bare("f + 1") shouldBe List(l.Identifier("f"), l.Keyword("+"), l.IntLit(1, None))
     }
   }
 

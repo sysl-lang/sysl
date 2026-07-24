@@ -184,14 +184,22 @@ class SyslParser extends PackratParsers {
         yield e :: rest
       }
 
+    // A plain hole renders through `str`; a hole with a specifier renders through `format`, which
+    // carries the specifier as a literal for the analyzer to check against the value's type.
+    def render(e: Expr, spec: Option[String]): Expr = spec match
+      case None       => Call(Ident("str"), List(e))
+      case Some(fmt)  => Call(Ident("format"), List(e, StrLit(fmt)))
+
     parsed.map { exprs =>
       val terms =
         t.parts.head match
           case "" => List.empty[Expr]
           case p  => List(StrLit(p): Expr)
 
-      val rendered = exprs.zip(t.parts.tail).foldLeft(terms) { case (acc, (e, part)) =>
-        val withExpr = acc :+ Call(Ident("str"), List(e))
+      val holes = exprs.lazyZip(t.parts.tail).lazyZip(t.specs)
+
+      val rendered = holes.foldLeft(terms) { case (acc, (e, part, spec)) =>
+        val withExpr = acc :+ render(e, spec)
         if part.isEmpty then withExpr else withExpr :+ StrLit(part)
       }
 

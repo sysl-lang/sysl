@@ -260,6 +260,7 @@ trait ScalarEmitter extends StringEmitter {
 
     case f: Type.Floating =>
       heap = true
+      usesSnprintf = true
       val fn = request("sysl.str.float")(StringEmitter.float)
       val v  = convert(f, Type.Real, genExpr(arg))
       val r  = freshTemp()
@@ -267,6 +268,43 @@ trait ScalarEmitter extends StringEmitter {
       r
 
     case other => sys.error(s"unreachable str of ${other.llvm}")
+
+  /** `format(x, spec)` — one value rendered through a printf specifier, into a fresh owning string.
+   * A numeric value is widened and handed to `snprintf` with the C form of the specifier; a string
+   * is copied NUL-terminated and handed to `snprintf` as a `%s`, so width, precision, and
+   * justification are C's to apply. The result is always a fresh buffer this statement owns.
+   */
+  protected def genFormat(arg: TExpr, spec: String): String = {
+    heap = true
+    usesSnprintf = true
+
+    val c   = FormatSpec.conversion(spec)
+    val fmt = stringGlobal(FormatSpec.cFormat(spec))
+    val r   = freshTemp()
+
+    if FormatSpec.isStr(c) then
+      val fn     = request("sysl.str.fmt_s")(StringEmitter.fmtStr)
+      val (p, n) = strBytes(genExpr(arg))
+      emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, ptr $p, i64 $n)")
+    else if FormatSpec.isFloat(c) then
+      val fn = request("sysl.str.fmt_f")(StringEmitter.fmtFloat)
+      val v  = convert(arg.ty.asInstanceOf[Type.Floating], Type.Real, genExpr(arg))
+      emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, double $v)")
+    else
+      // A signed conversion widens by the value's own signedness, so a decimal keeps its value; an
+      // unsigned one reads the bits as unsigned, so `%x` shows exactly the value's own width. Both
+      // end at 64 bits and print through a `%ll…`.
+      val fn = request("sysl.str.fmt_i")(StringEmitter.fmtInt)
+      val i  = arg.ty.asInstanceOf[Type.Integer]
+      val v =
+        if FormatSpec.isSignedInt(c) then convert(i, Type.Integer(64, i.signed), genExpr(arg))
+        else
+          val unsigned = convert(i, Type.Integer(i.bits, signed = false), genExpr(arg))
+          convert(Type.Integer(i.bits, signed = false), Type.Integer(64, signed = false), unsigned)
+      emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, i64 $v)")
+
+    r
+  }
 
   /** Builds a string value from its three words. */
   private def strView(owner: String, ptr: String, len: String): String = {

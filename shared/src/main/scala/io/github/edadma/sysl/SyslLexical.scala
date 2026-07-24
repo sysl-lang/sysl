@@ -55,12 +55,14 @@ class SyslLexical
     def chars: String = value
   }
 
-  /** An interpolated string, `s"…"` or `raw"…"`. The literal segments are already decoded (with
-   * escapes, unless `raw`); the embedded expressions are held as their raw source, to be lexed and
-   * parsed where the token is consumed. The invariant `parts.length == exprs.length + 1` lets the
-   * parser interleave them: `parts(0) + str(exprs(0)) + parts(1) + …`.
+  /** An interpolated string, `s"…"`, `raw"…"`, or `f"…"`. The literal segments are already decoded
+   * (with escapes, unless `raw`); the embedded expressions are held as their raw source, to be
+   * lexed and parsed where the token is consumed. `specs` carries one entry per hole — the printf
+   * specifier written after it in an `f"…"` string, or `None` for a hole rendered by `str`. The
+   * invariants `parts.length == exprs.length + 1` and `specs.length == exprs.length` let the parser
+   * interleave them: `parts(0) + render(exprs(0)) + parts(1) + …`.
    */
-  case class StrInterp(parts: List[String], exprs: List[String]) extends Token {
+  case class StrInterp(parts: List[String], exprs: List[String], specs: List[Option[String]]) extends Token {
     def chars: String =
       parts.head + parts.tail.zip(exprs).map { case (p, e) => "${" + e + "}" + p }.mkString
   }
@@ -320,40 +322,50 @@ class SyslLexical
     }
   }
 
-  /** An interpolated string is an identifier `s` or `raw` written directly against a `"`. The
+  /** An interpolated string is an identifier `s`, `raw`, or `f` written directly against a `"`. The
    * prefix has to be the whole identifier — `sfoo"…"` is an ordinary name beside a string, not an
-   * interpolation — so a mismatch falls through to `identifier`, which keeps `s` and `raw` usable
-   * as names.
+   * interpolation — so a mismatch falls through to `identifier`, which keeps those names usable.
+   * `raw` alone keeps backslashes literal; `f` alone allows a printf specifier after a hole.
    */
   private lazy val interpString: Parser[Token] = Parser { in =>
     if (in.atEnd || !isIdentStart(in.first)) Failure("not an interpolated string", in)
     else {
       val (name, afterName) = takeWhile(in, isIdentPart)
 
-      if ((name == "s" || name == "raw") && !afterName.atEnd && afterName.first == '"')
-        scanInterp(afterName.rest, raw = name == "raw")
+      if ((name == "s" || name == "raw" || name == "f") && !afterName.atEnd && afterName.first == '"')
+        scanInterp(afterName.rest, escapes = name != "raw", allowSpec = name == "f")
       else Failure("not an interpolated string", in)
     }
   }
 
-  /** Scans the body of an interpolated string into its literal segments and embedded expressions.
-   * A `$` begins an interpolation — `$name` or `${ … }` — and `$$` is a literal dollar; every
-   * other character joins the current segment, decoded through the escape table unless the string
-   * is `raw`. The embedded expression is captured as source and lexed again where it is used.
+  /** Scans the body of an interpolated string into its literal segments, embedded expressions, and
+   * per-hole specifiers. A `$` begins an interpolation — `$name` or `${ … }` — and `$$` is a
+   * literal dollar; every other character joins the current segment, decoded through the escape
+   * table unless escapes are off. In an `f"…"` string a `%` immediately after a hole is scanned as
+   * that hole's specifier; a `%` that does not form a valid specifier stays ordinary text.
    */
-  private def scanInterp(start: Reader[Char], raw: Boolean): ParseResult[Token] = {
+  private def scanInterp(start: Reader[Char], escapes: Boolean, allowSpec: Boolean): ParseResult[Token] = {
     val parts = ListBuffer.empty[String]
     val exprs = ListBuffer.empty[String]
+    val specs = ListBuffer.empty[Option[String]]
     val part  = new StringBuilder
     var rest  = start
 
     var result: Option[ParseResult[Token]] = None
 
+    /** After a hole is recorded, take an optional specifier and advance past it. */
+    def takeSpec(): Unit =
+      if (allowSpec && !rest.atEnd && rest.first == '%')
+        scanSpec(rest) match
+          case Some((spec, next)) => specs += Some(spec); rest = next
+          case None               => specs += None
+      else specs += None
+
     while (result.isEmpty)
       if (rest.atEnd || rest.first == '\n') result = Some(Success(errorToken("unterminated string literal"), rest))
       else if (rest.first == '"') {
         parts += part.toString
-        result = Some(Success(StrInterp(parts.toList, exprs.toList), rest.rest))
+        result = Some(Success(StrInterp(parts.toList, exprs.toList, specs.toList), rest.rest))
       } else if (rest.first == '$') {
         val after = rest.rest
 
@@ -366,6 +378,7 @@ class SyslLexical
               parts += part.toString; part.clear()
               exprs += expr
               rest = next
+              takeSpec()
           }
         else if (isIdentStart(after.first)) {
           val (name, next) = takeWhile(after, isIdentPart)
@@ -373,8 +386,9 @@ class SyslLexical
           parts += part.toString; part.clear()
           exprs += name
           rest = next
+          takeSpec()
         } else result = Some(Success(errorToken("expected a name or '{' after '$'"), after))
-      } else if (raw) { part += rest.first; rest = rest.rest }
+      } else if (!escapes) { part += rest.first; rest = rest.rest }
       else
         scanChar(rest) match {
           case Left((msg, next)) => result = Some(Success(errorToken(msg), next))
@@ -384,6 +398,31 @@ class SyslLexical
         }
 
     result.get
+  }
+
+  /** Tries to read a printf specifier `%[-+ 0#]*[0-9]*(.[0-9]+)?[conv]` starting at a `%`. It
+   * commits only on a complete specifier ending in a conversion letter; anything else leaves the
+   * `%` as ordinary text, so a bare percent in an `f"…"` string prints literally.
+   */
+  private def scanSpec(in: Reader[Char]): Option[(String, Reader[Char])] = {
+    val sb   = new StringBuilder("%")
+    var rest = in.rest
+
+    val (flags, afterFlags) = takeWhile(rest, c => "-+ 0#".contains(c))
+    sb ++= flags; rest = afterFlags
+
+    val (width, afterWidth) = takeWhile(rest, isDigit)
+    sb ++= width; rest = afterWidth
+
+    if (!rest.atEnd && rest.first == '.') {
+      val (prec, afterPrec) = takeWhile(rest.rest, isDigit)
+      sb += '.'; sb ++= prec; rest = afterPrec
+    }
+
+    if (!rest.atEnd && "diouxXeEfgGs".contains(rest.first)) {
+      sb += rest.first
+      Some((sb.toString, rest.rest))
+    } else None
   }
 
   /** Captures the source of a `${ … }` expression by matching its braces, skipping over nested

@@ -424,6 +424,19 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         case _: Type.Integer | _: Type.Floating | Type.Bool | Type.Char | Type.Str => TStr(t)
         case _ => err(s"cannot make a string of a ${show(t.ty)} value")
 
+    // `format(value, "%spec")` renders one value through a printf specifier. It is the desugaring
+    // of an `f"…"` hole, so the specifier is always a literal here; the lexer has vetted its shape,
+    // and what is left is checking the conversion against the value's type.
+    case Call(Ident("format"), List(argExpr, StrLit(spec))) =>
+      val t = analyzeExpr(argExpr)
+      val c = FormatSpec.conversion(spec)
+      val ok =
+        if FormatSpec.isInt(c) then t.ty.isInstanceOf[Type.Integer]
+        else if FormatSpec.isFloat(c) then t.ty.isInstanceOf[Type.Floating]
+        else t.ty == Type.Str
+      if !ok then err(s"format '$spec' expects ${FormatSpec.expects(c)}, but the value has type ${show(t.ty)}")
+      TFormat(t, spec)
+
     // A conversion is written with call syntax, so a scalar type name in call position is one.
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && scalarType(name).isDefined =>
       if args.length != 1 then err(s"a '$name' conversion takes exactly one value")

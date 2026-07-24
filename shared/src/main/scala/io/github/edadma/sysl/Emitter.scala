@@ -17,6 +17,11 @@ trait Emitter {
   protected var charBuf  = false
   protected var traps    = false
 
+  /** Whether any string operation renders through `snprintf` — a float `str`, or an `f"…"` format.
+   * The single declaration then lives in the module header rather than in each helper.
+   */
+  protected var usesSnprintf = false
+
   /** LLVM intrinsic `declare` lines the module turned out to need — the saturating
    * float-to-integer casts, each declared once under its overload-mangled name.
    */

@@ -8,8 +8,8 @@ that one first, and `07` for the view machinery it shares.
 What exists: the three-word representation, literals, `s.len`, `s[i]`, `s[a..b]` with both the
 bounds and the boundary checked, `s.bytes`, comparison by bytes, string literals as `match`
 patterns, **concatenation** — `a + b` and `s += t`, which allocate a fresh buffer — **`str(x)`**,
-which renders a primitive value into one, and **interpolation** — `s"…$x…"` and `raw"…"`, which
-desugar to concatenation and `str`. What does not: the rest of the operations that produce
+which renders a primitive value into one, and **interpolation** — `s"…$x…"`, `raw"…"`, and
+`f"…${x}%d…"`, which desugar to concatenation, `str`, and printf-style formatting. What does not: the rest of the operations that produce
 new bytes — `from_utf8`, `copy()`, `str.builder`, `cstring`, `string(c)` — since each needs either
 the raw-bytes surface or methods. A string is therefore no longer always traceable to a literal; a
 program can build one by joining or by rendering.
@@ -217,12 +217,26 @@ dropped since it is the identity under `+`.
 
 This follows Scala's interpolators, and deliberately not a `printf`-style format string in the
 default form: the value and the text around it stay where they are read, and the conversion is `str`
-applied at the splice rather than a directive parsed out of a separate string. A `printf`-style
-`f"…%d…"` form, where a hole carries an explicit specifier, layers on top and is specified
-separately.
+applied at the splice rather than a directive parsed out of a separate string.
 
-`s` and `raw` are only prefixes when written directly against the opening quote; used as ordinary
-names they are unaffected, so `s + raw` is an addition of two variables.
+### Format specifiers
+
+`f"…"` is the third prefix, and it adds one thing: a hole may be followed by a printf specifier —
+`f"${x}%08.2f"`, `f"${n}%x"`, `f"${s}%-10s"` — that controls width, precision, sign, and
+justification. A hole with no specifier renders through `str` exactly as in an `s"…"` string; a
+specifier binds only to the `%` written immediately after a hole, so a bare `%` elsewhere in the
+text — `f"${n}%d done, 100% sure"` — is ordinary text. The specifier keeps the value beside its
+formatting, which is the point of putting it after the hole rather than in a separate format string.
+
+The conversion is checked against the value's type at compile time: `%d %i %x %X %o %u` want an
+integer, `%f %e %g %E %G` a float, `%s` a string. An unsigned conversion reads the value at its own
+width — `%x` of an `i32 -1` is `ffffffff`, of a `u8 255` is `ff` — while `%d` keeps the value's
+sign. A numeric value is formatted by handing it to the C library with the specifier translated to
+its 64-bit form; a string is copied NUL-terminated so C's `%s` can apply width and precision, which
+means an interior NUL ends the field, as it does for any `%s`.
+
+`s`, `raw`, and `f` are only prefixes when written directly against the opening quote; used as
+ordinary names they are unaffected, so `s + raw` and `f + 1` are ordinary expressions.
 
 ## C interop
 

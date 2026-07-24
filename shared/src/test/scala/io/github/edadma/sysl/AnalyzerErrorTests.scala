@@ -406,6 +406,26 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "format specifiers" - {
+    // An f-string specifier is checked against the value's type: a numeric conversion needs a
+    // number, a string conversion a string.
+    "an integer conversion rejects a non-integer" in {
+      err("""var s = "hi"
+            |print(f"${s}%d")""".stripMargin) should include(
+        "format '%d' expects an integer, but the value has type string",
+      )
+      err("""print(f"${3.5}%x")""") should include("format '%x' expects an integer")
+    }
+
+    "a float conversion rejects a non-float" in {
+      err("""print(f"${5}%f")""") should include("format '%f' expects a float, but the value has type int")
+    }
+
+    "a string conversion rejects a non-string" in {
+      err("""print(f"${5}%s")""") should include("format '%s' expects a string, but the value has type int")
+    }
+  }
+
   "methods" - {
     "a '&self' method rejects a bare stack value" in {
       err(

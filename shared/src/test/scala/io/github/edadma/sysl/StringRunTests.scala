@@ -373,6 +373,66 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  "format interpolation" - {
+    "an f-string hole formats through its specifier" in {
+      run("""var n = 42
+            |print(f"${n}%d ${n}%x ${n}%o ${n}%X")""".stripMargin) shouldBe "42 2a 52 2A\n"
+    }
+
+    "width, zero-pad, sign, and left-justify all apply" in {
+      run("""var n = 42
+            |print(f"[${n}%5d][${n}%05d][${n}%-5d][${n}%+d]")""".stripMargin) shouldBe
+        "[   42][00042][42   ][+42]\n"
+    }
+
+    "a float takes precision and width" in {
+      run("""var x = 3.14159
+            |print(f"${x}%.2f ${x}%8.3f")""".stripMargin) shouldBe "3.14    3.142\n"
+    }
+
+    "a string takes width, justification, and precision" in {
+      run("""var s = "hi"
+            |print(f"[${s}%5s][${s}%-5s][${"hello"}%.3s]")""".stripMargin) shouldBe "[   hi][hi   ][hel]\n"
+    }
+
+    // `%x` reads the value's own bit width: a negative i32 shows eight hex digits, a u8 two.
+    "an unsigned conversion shows the value's width, signed keeps its value" in {
+      run("""var neg: i32 = -1
+            |var b: u8 = 255
+            |print(f"${neg}%x ${b}%x ${neg}%d")""".stripMargin) shouldBe "ffffffff ff -1\n"
+    }
+
+    "a bare percent in an f-string is literal text" in {
+      run("""var n = 90
+            |print(f"${n}%d% complete")""".stripMargin) shouldBe "90% complete\n"
+    }
+
+    "plain and formatted holes mix in one string" in {
+      run("""var name = "ada"
+            |var n = 7
+            |print(f"$name scored ${n}%03d")""".stripMargin) shouldBe "ada scored 007\n"
+    }
+
+    "the formatted result is a real owning string" in {
+      run("""var n = 255
+            |var s = f"${n}%x"
+            |print(s, s.len, s[0])""".stripMargin) shouldBe "ff 2 102\n"
+    }
+
+    "formatting in a loop neither leaks nor frees twice" in {
+      val src =
+        """var total = 0
+          |for i in 1..20000 do
+          |    var s = f"${i}%08d"
+          |    total += int(s[0])
+          |print(total)
+          |""".stripMargin
+
+      // Every rendering is zero-padded to 8 digits, so s[0] is always '0' (48).
+      run(src) shouldBe "960000\n"
+    }
+  }
+
   "comparison" - {
     "equality is by bytes" in {
       run("""print("abc" == "abc", "abc" == "abd", "abc" != "ab")""") shouldBe "true false true\n"

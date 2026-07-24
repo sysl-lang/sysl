@@ -262,6 +262,7 @@ private class Escape(program: TProgram) {
     case TLen(r)                    => List(r)
     case TBytes(r)                  => List(r)
     case TStr(a)                    => List(a)
+    case TFormat(a, _)              => List(a)
     case TSlice(b, lo, hi, _, _)    => b :: lo.toList ::: hi.toList
     case TTry(v, _, _, _, _, _)     => List(v)
     case TField(r, _, _)            => List(r)

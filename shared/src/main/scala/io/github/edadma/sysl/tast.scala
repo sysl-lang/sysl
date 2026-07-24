@@ -108,6 +108,12 @@ case class TPrint(args: List[TExpr]) extends TExpr { def ty: Type = Type.Unit }
  */
 case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
 
+/** `format(value, spec)` — one value rendered through a printf specifier, the lowering of an
+ * `f"…"` hole. Always allocates a fresh string; `spec` is the sysl specifier (`%08.2f`), which
+ * codegen turns into the C one it hands `snprintf`.
+ */
+case class TFormat(arg: TExpr, spec: String) extends TExpr { def ty: Type = Type.Str }
+
 /** A call to a user function. */
 case class TCall(name: String, args: List[TExpr], ty: Type) extends TExpr
 

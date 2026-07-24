@@ -135,5 +135,23 @@ class ExpressionParserTests extends AnyFreeSpec with ParseSupport {
         case p.Success(_, _)  => fail("expected a parse error")
         case ns: p.NoSuccess  => ns.msg should include("in interpolation")
     }
+
+    "an f-string hole with a specifier renders through format, not str" in {
+      expr("""f"${n}%04d"""") shouldBe Call(Ident("format"), List(Ident("n"), StrLit("%04d")))
+    }
+
+    "an f-string hole with no specifier still renders through str" in {
+      expr("""f"$n"""") shouldBe str(Ident("n"))
+    }
+
+    "an f-string mixes formatted and plain holes around its literals" in {
+      expr("""f"x=${a}%d y=$b"""") shouldBe
+        cat(
+          StrLit("x="),
+          Call(Ident("format"), List(Ident("a"), StrLit("%d"))),
+          StrLit(" y="),
+          str(Ident("b")),
+        )
+    }
   }
 }

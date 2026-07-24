@@ -151,4 +151,49 @@ class StringCodegenTests extends AnyFreeSpec with CodegenSupport {
     out should not include "@sysl.str.float"
     out should not include "@sysl.str.from_bytes"
   }
+
+  "an f-string hole formats through snprintf with the C form of the specifier" in {
+    val out = ir("""var n = 42
+                   |print(f"${n}%04d")""".stripMargin)
+
+    out should include("""c"%04lld\00"""")
+    out should include regex raw"call \{ ptr, ptr, i64 \} @sysl\.str\.fmt_i\(ptr @\.str\d+, i64 %t\d+\)"
+    out should include("declare i32 @snprintf(ptr, i64, ptr, ...)")
+  }
+
+  "an unsigned integer conversion zero-extends, a signed one sign-extends" in {
+    val hex = ir("""var n: i32 = -1
+                   |print(f"${n}%x")""".stripMargin)
+    val dec = ir("""var n: i32 = -1
+                   |print(f"${n}%d")""".stripMargin)
+
+    hex should include("""c"%llx\00"""")
+    hex should include regex raw"zext i32 %t\d+ to i64"
+    dec should include("""c"%lld\00"""")
+    dec should include regex raw"sext i32 %t\d+ to i64"
+  }
+
+  "a float format passes the double straight through its specifier" in {
+    val out = ir("""var x = 1.5
+                   |print(f"${x}%.2f")""".stripMargin)
+
+    out should include("""c"%.2f\00"""")
+    out should include regex raw"call \{ ptr, ptr, i64 \} @sysl\.str\.fmt_f\(ptr @\.str\d+, double %t\d+\)"
+  }
+
+  "a string format copies a NUL-terminated argument for %s" in {
+    val out = ir("""var s = "hi"
+                   |print(f"${s}%-8s")""".stripMargin)
+
+    out should include("""c"%-8s\00"""")
+    out should include("define private { ptr, ptr, i64 } @sysl.str.fmt_s")
+    out should include("call void @free(ptr %cstr)")
+  }
+
+  "snprintf is declared once even when a float str and a format share it" in {
+    val out = ir("""var x = 1.5
+                   |print(str(x), f"${x}%.1f")""".stripMargin)
+
+    out.sliding("declare i32 @snprintf".length).count(_ == "declare i32 @snprintf") shouldBe 1
+  }
 }

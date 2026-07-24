@@ -305,7 +305,6 @@ object StringEmitter {
    */
   val float: String =
     """@sysl.str.g = private constant [3 x i8] c"%g\00"
-      |declare i32 @snprintf(ptr, i64, ptr, ...)
       |
       |define private { ptr, ptr, i64 } @sysl.str.float(double %v) {
       |entry:
@@ -321,6 +320,103 @@ object StringEmitter {
       |  store ptr @arc.free, ptr %hook
       |  %bytes = getelementptr %arc.header, ptr %p, i32 1
       |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr @sysl.str.g, double %v)
+      |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
+      |  %v1 = insertvalue { ptr, ptr, i64 } %v0, ptr %bytes, 1
+      |  %v2 = insertvalue { ptr, ptr, i64 } %v1, i64 %n64, 2
+      |  ret { ptr, ptr, i64 } %v2
+      |}
+      |""".stripMargin
+
+  /** An integer rendered through a printf specifier. The caller has widened the value to 64 bits
+   * and the format carries the `ll` length modifier, so `snprintf` and the value agree; a sizing
+   * call learns the length, and the digits are written into a fresh `StrBuf` a byte longer for the
+   * terminator `snprintf` writes, uncounted like the NUL after a literal.
+   */
+  val fmtInt: String =
+    """define private { ptr, ptr, i64 } @sysl.str.fmt_i(ptr %fmt, i64 %v) {
+      |entry:
+      |  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr null, i64 0, ptr %fmt, i64 %v)
+      |  %n64 = sext i32 %n to i64
+      |  %cap = add i64 %n64, 1
+      |  %hend = getelementptr %arc.header, ptr null, i32 1
+      |  %hsize = ptrtoint ptr %hend to i64
+      |  %size = add i64 %hsize, %cap
+      |  %p = call ptr @malloc(i64 %size)
+      |  store i64 1, ptr %p
+      |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
+      |  store ptr @arc.free, ptr %hook
+      |  %bytes = getelementptr %arc.header, ptr %p, i32 1
+      |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr %fmt, i64 %v)
+      |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
+      |  %v1 = insertvalue { ptr, ptr, i64 } %v0, ptr %bytes, 1
+      |  %v2 = insertvalue { ptr, ptr, i64 } %v1, i64 %n64, 2
+      |  ret { ptr, ptr, i64 } %v2
+      |}
+      |""".stripMargin
+
+  /** A float rendered through a printf specifier, the same shape as the integer case with a
+   * `double` argument the specifier expects directly.
+   */
+  val fmtFloat: String =
+    """define private { ptr, ptr, i64 } @sysl.str.fmt_f(ptr %fmt, double %v) {
+      |entry:
+      |  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr null, i64 0, ptr %fmt, double %v)
+      |  %n64 = sext i32 %n to i64
+      |  %cap = add i64 %n64, 1
+      |  %hend = getelementptr %arc.header, ptr null, i32 1
+      |  %hsize = ptrtoint ptr %hend to i64
+      |  %size = add i64 %hsize, %cap
+      |  %p = call ptr @malloc(i64 %size)
+      |  store i64 1, ptr %p
+      |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
+      |  store ptr @arc.free, ptr %hook
+      |  %bytes = getelementptr %arc.header, ptr %p, i32 1
+      |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr %fmt, double %v)
+      |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
+      |  %v1 = insertvalue { ptr, ptr, i64 } %v0, ptr %bytes, 1
+      |  %v2 = insertvalue { ptr, ptr, i64 } %v1, i64 %n64, 2
+      |  ret { ptr, ptr, i64 } %v2
+      |}
+      |""".stripMargin
+
+  /** A string rendered through a printf `%s` specifier, so that width, precision, and
+   * justification are the C library's to apply. A sysl string carries a length rather than a
+   * terminator, so a NUL-terminated copy is made for `snprintf` and freed after; an interior NUL
+   * therefore ends the field, which is exactly `%s`'s own rule.
+   */
+  val fmtStr: String =
+    """define private { ptr, ptr, i64 } @sysl.str.fmt_s(ptr %fmt, ptr %src, i64 %len) {
+      |entry:
+      |  %ccap = add i64 %len, 1
+      |  %cstr = call ptr @malloc(i64 %ccap)
+      |  br label %ccond
+      |ccond:
+      |  %i = phi i64 [ 0, %entry ], [ %inext, %cbody ]
+      |  %more = icmp ult i64 %i, %len
+      |  br i1 %more, label %cbody, label %cdone
+      |cbody:
+      |  %sp = getelementptr i8, ptr %src, i64 %i
+      |  %sb = load i8, ptr %sp
+      |  %dp = getelementptr i8, ptr %cstr, i64 %i
+      |  store i8 %sb, ptr %dp
+      |  %inext = add i64 %i, 1
+      |  br label %ccond
+      |cdone:
+      |  %nulp = getelementptr i8, ptr %cstr, i64 %len
+      |  store i8 0, ptr %nulp
+      |  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr null, i64 0, ptr %fmt, ptr %cstr)
+      |  %n64 = sext i32 %n to i64
+      |  %cap = add i64 %n64, 1
+      |  %hend = getelementptr %arc.header, ptr null, i32 1
+      |  %hsize = ptrtoint ptr %hend to i64
+      |  %size = add i64 %hsize, %cap
+      |  %p = call ptr @malloc(i64 %size)
+      |  store i64 1, ptr %p
+      |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
+      |  store ptr @arc.free, ptr %hook
+      |  %bytes = getelementptr %arc.header, ptr %p, i32 1
+      |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr %fmt, ptr %cstr)
+      |  call void @free(ptr %cstr)
       |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
       |  %v1 = insertvalue { ptr, ptr, i64 } %v0, ptr %bytes, 1
       |  %v2 = insertvalue { ptr, ptr, i64 } %v1, i64 %n64, 2
