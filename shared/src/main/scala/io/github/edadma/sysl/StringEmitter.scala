@@ -196,6 +196,138 @@ object StringEmitter {
       |}
       |""".stripMargin
 
+  /** Copies a run of bytes into a fresh owning string. A `StrBuf` sized for the bytes is
+   * allocated the way every ARC box is — a refcount of one, the `@arc.free` hook, then the
+   * payload — with the header size taken portably from `%arc.header`. Every `str(x)` that renders
+   * into a scratch buffer finishes through here, so the allocation and copy live in one place.
+   */
+  val fromBytes: String =
+    """define private { ptr, ptr, i64 } @sysl.str.from_bytes(ptr %src, i64 %n) {
+      |entry:
+      |  %hend = getelementptr %arc.header, ptr null, i32 1
+      |  %hsize = ptrtoint ptr %hend to i64
+      |  %size = add i64 %hsize, %n
+      |  %p = call ptr @malloc(i64 %size)
+      |  store i64 1, ptr %p
+      |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
+      |  store ptr @arc.free, ptr %hook
+      |  %bytes = getelementptr %arc.header, ptr %p, i32 1
+      |  br label %cond
+      |cond:
+      |  %i = phi i64 [ 0, %entry ], [ %next, %body ]
+      |  %more = icmp ult i64 %i, %n
+      |  br i1 %more, label %body, label %done
+      |body:
+      |  %s = getelementptr i8, ptr %src, i64 %i
+      |  %b = load i8, ptr %s
+      |  %d = getelementptr i8, ptr %bytes, i64 %i
+      |  store i8 %b, ptr %d
+      |  %next = add i64 %i, 1
+      |  br label %cond
+      |done:
+      |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
+      |  %v1 = insertvalue { ptr, ptr, i64 } %v0, ptr %bytes, 1
+      |  %v2 = insertvalue { ptr, ptr, i64 } %v1, i64 %n, 2
+      |  ret { ptr, ptr, i64 } %v2
+      |}
+      |""".stripMargin
+
+  /** One `char` as a string: its UTF-8 encoding, whose byte length follows from the codepoint's
+   * range. The bytes are laid down by the same encoder printing a `char` uses, into a scratch
+   * buffer, then copied out — the length is computed from the range rather than read as a
+   * NUL-terminated run, so `char(0)` becomes a one-byte string rather than an empty one.
+   */
+  val char: String =
+    """define private { ptr, ptr, i64 } @sysl.str.char(i32 %cp) {
+      |entry:
+      |  %buf = alloca [5 x i8]
+      |  call ptr @sysl.utf8(i32 %cp, ptr %buf)
+      |  %lt1 = icmp ult i32 %cp, 128
+      |  %lt2 = icmp ult i32 %cp, 2048
+      |  %lt3 = icmp ult i32 %cp, 65536
+      |  %l34 = select i1 %lt3, i64 3, i64 4
+      |  %l234 = select i1 %lt2, i64 2, i64 %l34
+      |  %len = select i1 %lt1, i64 1, i64 %l234
+      |  %r = call { ptr, ptr, i64 } @sysl.str.from_bytes(ptr %buf, i64 %len)
+      |  ret { ptr, ptr, i64 } %r
+      |}
+      |""".stripMargin
+
+  /** An integer as its decimal string, without libc. The digits are written from the end of a
+   * scratch buffer wide enough for the largest 64-bit magnitude plus a sign, dividing by ten each
+   * step; a negative signed value is turned into its magnitude first, which is correct even for
+   * `i64::MIN` because the negation wraps to the right unsigned bit pattern and the division that
+   * follows is unsigned. The `signed` flag distinguishes a two's-complement negative from a large
+   * unsigned value that happens to have its top bit set.
+   */
+  val int: String =
+    """define private { ptr, ptr, i64 } @sysl.str.int(i64 %v, i1 %signed) {
+      |entry:
+      |  %isneg = icmp slt i64 %v, 0
+      |  %neg = and i1 %isneg, %signed
+      |  %negv = sub i64 0, %v
+      |  %mag = select i1 %neg, i64 %negv, i64 %v
+      |  %buf = alloca [21 x i8]
+      |  %end = getelementptr i8, ptr %buf, i64 21
+      |  br label %loop
+      |loop:
+      |  %cur = phi i64 [ %mag, %entry ], [ %q, %loop ]
+      |  %pos = phi ptr [ %end, %entry ], [ %pp, %loop ]
+      |  %pp = getelementptr i8, ptr %pos, i64 -1
+      |  %q = udiv i64 %cur, 10
+      |  %r = urem i64 %cur, 10
+      |  %rb = trunc i64 %r to i8
+      |  %digit = add i8 %rb, 48
+      |  store i8 %digit, ptr %pp
+      |  %more = icmp ne i64 %q, 0
+      |  br i1 %more, label %loop, label %sign
+      |sign:
+      |  br i1 %neg, label %addsign, label %finish
+      |addsign:
+      |  %sp = getelementptr i8, ptr %pp, i64 -1
+      |  store i8 45, ptr %sp
+      |  br label %finish
+      |finish:
+      |  %start = phi ptr [ %pp, %sign ], [ %sp, %addsign ]
+      |  %si = ptrtoint ptr %start to i64
+      |  %ei = ptrtoint ptr %end to i64
+      |  %len = sub i64 %ei, %si
+      |  %res = call { ptr, ptr, i64 } @sysl.str.from_bytes(ptr %start, i64 %len)
+      |  ret { ptr, ptr, i64 } %res
+      |}
+      |""".stripMargin
+
+  /** A float as a string, rendered the way `print` renders one — `snprintf` with `%g`, so the two
+   * agree to the byte. A sizing call learns the length, then the digits are written into a
+   * `StrBuf` a byte longer to hold the terminator `snprintf` insists on writing, which rides along
+   * uncounted exactly as the NUL after a literal does. This is the one case that needs libc, and
+   * `print` already does, so it adds no dependency in practice.
+   */
+  val float: String =
+    """@sysl.str.g = private constant [3 x i8] c"%g\00"
+      |declare i32 @snprintf(ptr, i64, ptr, ...)
+      |
+      |define private { ptr, ptr, i64 } @sysl.str.float(double %v) {
+      |entry:
+      |  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr null, i64 0, ptr @sysl.str.g, double %v)
+      |  %n64 = sext i32 %n to i64
+      |  %cap = add i64 %n64, 1
+      |  %hend = getelementptr %arc.header, ptr null, i32 1
+      |  %hsize = ptrtoint ptr %hend to i64
+      |  %size = add i64 %hsize, %cap
+      |  %p = call ptr @malloc(i64 %size)
+      |  store i64 1, ptr %p
+      |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
+      |  store ptr @arc.free, ptr %hook
+      |  %bytes = getelementptr %arc.header, ptr %p, i32 1
+      |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr @sysl.str.g, double %v)
+      |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
+      |  %v1 = insertvalue { ptr, ptr, i64 } %v0, ptr %bytes, 1
+      |  %v2 = insertvalue { ptr, ptr, i64 } %v1, i64 %n64, 2
+      |  ret { ptr, ptr, i64 } %v2
+      |}
+      |""".stripMargin
+
   /** A continuation byte is `10xxxxxx`; every other byte starts a character. */
   val boundary: String =
     """define private i1 @sysl.str.boundary(ptr %p, i64 %n, i64 %i) {

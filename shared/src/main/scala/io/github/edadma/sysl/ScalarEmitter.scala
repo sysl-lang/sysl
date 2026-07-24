@@ -220,6 +220,61 @@ trait ScalarEmitter extends StringEmitter {
 
     flush("\n")
   }
+
+  /** `str(x)` — a value's string form. A `string` is returned unchanged, since it already is one;
+   * every other type is rendered into a fresh owning buffer, so the result is an owned temporary
+   * the enclosing statement releases. A `bool` renders to one of two immortal literals and needs
+   * no allocation at all.
+   */
+  protected def genStr(arg: TExpr): String = arg.ty match
+    case Type.Str =>
+      // Identity: the same value, its count already the argument's to manage.
+      genExpr(arg)
+
+    case Type.Bool =>
+      boolStrs = true
+      val v   = genExpr(arg)
+      val ptr = freshTemp(); emit(s"$ptr = select i1 $v, ptr @.true, ptr @.false")
+      val len = freshTemp(); emit(s"$len = select i1 $v, i64 4, i64 5")
+      strView("null", ptr, len)
+
+    case Type.Char =>
+      charBuf = true
+      heap = true
+      request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      val fn = request("sysl.str.char")(StringEmitter.char)
+      val cp = genExpr(arg)
+      val r  = freshTemp()
+      emit(s"$r = call ${Type.Str.llvm} @$fn(i32 $cp)")
+      r
+
+    case i: Type.Integer =>
+      heap = true
+      request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      val fn     = request("sysl.str.int")(StringEmitter.int)
+      val wide   = convert(i, Type.Integer(64, i.signed), genExpr(arg))
+      val signed = if i.signed then "1" else "0"
+      val r      = freshTemp()
+      emit(s"$r = call ${Type.Str.llvm} @$fn(i64 $wide, i1 $signed)")
+      r
+
+    case f: Type.Floating =>
+      heap = true
+      val fn = request("sysl.str.float")(StringEmitter.float)
+      val v  = convert(f, Type.Real, genExpr(arg))
+      val r  = freshTemp()
+      emit(s"$r = call ${Type.Str.llvm} @$fn(double $v)")
+      r
+
+    case other => sys.error(s"unreachable str of ${other.llvm}")
+
+  /** Builds a string value from its three words. */
+  private def strView(owner: String, ptr: String, len: String): String = {
+    val v0 = freshTemp(); emit(s"$v0 = insertvalue ${Type.Str.llvm} undef, ptr $owner, 0")
+    val v1 = freshTemp(); emit(s"$v1 = insertvalue ${Type.Str.llvm} $v0, ptr $ptr, 1")
+    val v2 = freshTemp(); emit(s"$v2 = insertvalue ${Type.Str.llvm} $v1, i64 $len, 2")
+    v2
+  }
 }
 
 object ScalarEmitter {

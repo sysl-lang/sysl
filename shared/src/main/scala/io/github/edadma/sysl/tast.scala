@@ -101,6 +101,13 @@ case class TCompare(operands: List[TExpr], ops: List[String]) extends TExpr { de
 /** The built-in `print`. */
 case class TPrint(args: List[TExpr]) extends TExpr { def ty: Type = Type.Unit }
 
+/** The built-in `str(x)` — a primitive value's string form: a decimal for an integer, its UTF-8
+ * for a `char`, `"true"`/`"false"` for a `bool`, a `%g` rendering for a float, and a `string`
+ * unchanged. It allocates a fresh buffer for every type but `string`, where it is the identity;
+ * a `Display` trait method replaces it once traits land.
+ */
+case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
+
 /** A call to a user function. */
 case class TCall(name: String, args: List[TExpr], ty: Type) extends TExpr
 

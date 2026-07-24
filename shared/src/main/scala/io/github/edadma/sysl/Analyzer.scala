@@ -413,6 +413,17 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
           case _ => t
       })
 
+    // `str(x)` is a builtin, not a conversion: it renders a value of a primitive type, and a
+    // `string` is rendered as itself. Anything else — a struct, an enum, a pointer, a slice — has
+    // no one string form to give, so asking for one is an error until a `Display` trait lets a
+    // type name its own.
+    case Call(Ident("str"), args) =>
+      if args.length != 1 then err("str takes exactly one value")
+      val t = analyzeExpr(args.head)
+      t.ty match
+        case _: Type.Integer | _: Type.Floating | Type.Bool | Type.Char | Type.Str => TStr(t)
+        case _ => err(s"cannot make a string of a ${show(t.ty)} value")
+
     // A conversion is written with call syntax, so a scalar type name in call position is one.
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && scalarType(name).isDefined =>
       if args.length != 1 then err(s"a '$name' conversion takes exactly one value")

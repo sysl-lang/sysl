@@ -275,6 +275,12 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       emit(s"store $w $nv, ptr $p")
       if pre then nv else cur
 
+    case TStr(arg) =>
+      // A string renders to itself, its count already the argument's; every other type renders
+      // into a fresh buffer this statement owns and releases.
+      val v = genStr(arg)
+      if arg.ty == Type.Str then v else ownTemp(v, Type.Str)
+
     case TBinary(_, l, r, Type.Str) =>
       ownTemp(strConcat(genExpr(l), genExpr(r)), Type.Str)
 

@@ -109,6 +109,10 @@ private class Escape(program: TProgram) {
       case TField(r, _, _)      => viewsFrame(r)
       case TIndex(r, _, _)      => viewsFrame(r)
       case TBytes(r)            => viewsFrame(r)
+      // `str(s)` on a string is the identity, so it inherits its argument's view; on any other
+      // type it allocates a fresh buffer, and that argument carries no view for `viewsFrame` to
+      // find, so the one rule covers both.
+      case TStr(a)              => viewsFrame(a)
       case TStore(_, v, _)      => viewsFrame(v)
       case TIf(_, t, e, _)      => blockValue(t) || e.exists(blockValue)
       case TMatch(_, arms, _)   => arms.exists(a => blockValue(a.body))
@@ -257,6 +261,7 @@ private class Escape(program: TProgram) {
     case TIndex(r, i, _)            => List(r, i)
     case TLen(r)                    => List(r)
     case TBytes(r)                  => List(r)
+    case TStr(a)                    => List(a)
     case TSlice(b, lo, hi, _, _)    => b :: lo.toList ::: hi.toList
     case TTry(v, _, _, _, _, _)     => List(v)
     case TField(r, _, _)            => List(r)

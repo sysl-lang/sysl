@@ -371,6 +371,41 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "str" - {
+    // `str` renders a primitive value; a type that has no one string form has to wait for a
+    // `Display` trait, so asking now is an error rather than a guess.
+    "will not render a struct, an enum, or a container" in {
+      err("""struct P
+            |    x: int
+            |end P
+            |print(str(P(1)))""".stripMargin) should include("cannot make a string of a P value")
+      err("""enum E
+            |    A
+            |    B
+            |end E
+            |print(str(A))""".stripMargin) should include("cannot make a string of a")
+      err("""var a = [1, 2, 3]
+            |print(str(a))""".stripMargin) should include("cannot make a string of a [3]int value")
+    }
+
+    "will not render a reference or a raw pointer" in {
+      err("""var r: &int = 5
+            |print(str(r))""".stripMargin) should include("cannot make a string of a")
+      err("""var n = 5
+            |var p = &n
+            |print(str(p))""".stripMargin) should include("cannot make a string of a")
+    }
+
+    "will not render a unit value" in {
+      err("print(str(print(1)))") should include("cannot make a string of a unit value")
+    }
+
+    "takes exactly one value" in {
+      err("""print(str(1, 2))""") should include("str takes exactly one value")
+      err("""print(str())""") should include("str takes exactly one value")
+    }
+  }
+
   "methods" - {
     "a '&self' method rejects a bare stack value" in {
       err(

@@ -7,10 +7,11 @@ that one first, and `07` for the view machinery it shares.
 
 What exists: the three-word representation, literals, `s.len`, `s[i]`, `s[a..b]` with both the
 bounds and the boundary checked, `s.bytes`, comparison by bytes, string literals as `match`
-patterns, and **concatenation** — `a + b` and `s += t`, which allocate a fresh buffer. What does
-not: the rest of the operations that produce new bytes — `from_utf8`, `copy()`, `str.builder`,
-`cstring`, `string(c)` — since each needs either the raw-bytes surface or methods. A string is
-therefore no longer always traceable to a literal; a program can build one by joining.
+patterns, **concatenation** — `a + b` and `s += t`, which allocate a fresh buffer — and **`str(x)`**,
+which renders a primitive value into one. What does not: the rest of the operations that produce
+new bytes — `from_utf8`, `copy()`, `str.builder`, `cstring`, `string(c)` — since each needs either
+the raw-bytes surface or methods. A string is therefore no longer always traceable to a literal; a
+program can build one by joining or by rendering.
 
 ## The decision in one paragraph
 
@@ -165,6 +166,36 @@ conversion the rest of the language refuses.
 
 `+` is the only arithmetic operator a string defines; `-`, `*`, and the rest are rejected the way
 they are for any type that does not define them.
+
+## Rendering a value
+
+`str(x)` is the written conversion from a value to its string form — the counterpart to the strict
+`+`, and the thing interpolation is built on. It renders each primitive type:
+
+| Type | Result |
+|---|---|
+| integer | its decimal digits, with a sign for a negative signed value |
+| `bool` | `"true"` or `"false"` |
+| `char` | the one scalar value's UTF-8 |
+| float | the same `%g` rendering `print` gives it |
+| `string` | itself, unchanged |
+
+Every case but a `string` allocates a fresh buffer, so the result owns its bytes like any built
+string; a `string` is returned as it is, since it is already one, and a `bool` renders to one of two
+immortal literals and allocates nothing. An integer is rendered without the C library — the digits
+are divided out into a scratch buffer, which is correct even for the most negative value because the
+magnitude is taken in unsigned arithmetic. A float goes through `snprintf`, the one case that needs
+libc, chosen so that `str(x)` and `print(x)` never disagree; it is `%g`, not the shortest
+round-tripping form this doc otherwise aspires to, and that gap is deliberate for now.
+
+`str` is a builtin because the language has no traits yet. When it gains them, `str(x)` becomes the
+call to a `Display` method, and a user type joins the primitives by implementing it — which is why
+`str` of a struct, an enum, a reference, a pointer, a slice, or an array is an error today rather
+than a guess: those are exactly the types that will name their own rendering later.
+
+A value of any other type is not silently rendered across `+` or in a `print`; the conversion is
+always written, at the point it happens. That is the same no-implicit-coercion stance the numeric
+operators take, and it is what keeps a string's contents something a reader can see the source of.
 
 ## Literals
 

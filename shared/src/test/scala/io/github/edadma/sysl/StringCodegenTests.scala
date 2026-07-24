@@ -101,4 +101,54 @@ class StringCodegenTests extends AnyFreeSpec with CodegenSupport {
   "a module that never joins strings emits no concatenation helper" in {
     ir("""print("hi")""") should not include "@sysl.str.concat"
   }
+
+  "rendering an integer is one call that allocates a buffer" in {
+    val out = ir("""print(str(42))""")
+
+    out should include regex raw"call \{ ptr, ptr, i64 \} @sysl\.str\.int\(i64 %t\d+, i1 1\)"
+    out should include("define private { ptr, ptr, i64 } @sysl.str.from_bytes")
+    out should include("declare ptr @malloc(i64)")
+  }
+
+  "rendering a string is the identity: no call, no allocation of its own" in {
+    val out = ir("""var s = "hi"
+                   |print(str(s))""".stripMargin)
+
+    out should not include "@sysl.str.int"
+    out should not include "@sysl.str.from_bytes"
+  }
+
+  "rendering a bool selects an immortal word rather than allocating" in {
+    val out = ir("""var b = true
+                   |print(str(b))""".stripMargin)
+
+    out should include regex raw"select i1 %t\d+, ptr @\.true, ptr @\.false"
+    out should include regex raw"select i1 %t\d+, i64 4, i64 5"
+    out should not include "@sysl.str.from_bytes"
+  }
+
+  "rendering a char goes through the same UTF-8 encoder printing one does" in {
+    val out = ir("""print(str('A'))""")
+
+    out should include("define private { ptr, ptr, i64 } @sysl.str.char")
+    out should include("call ptr @sysl.utf8(i32 %cp, ptr %buf)")
+    out should include("define private ptr @sysl.utf8")
+  }
+
+  "rendering a float matches print's %g through snprintf" in {
+    val out = ir("""print(str(1.5))""")
+
+    out should include("define private { ptr, ptr, i64 } @sysl.str.float")
+    out should include("declare i32 @snprintf(ptr, i64, ptr, ...)")
+    out should include("""c"%g\00"""")
+  }
+
+  "a module that never renders a value emits no str helpers" in {
+    val out = ir("""print("hi")""")
+
+    out should not include "@sysl.str.int"
+    out should not include "@sysl.str.char"
+    out should not include "@sysl.str.float"
+    out should not include "@sysl.str.from_bytes"
+  }
 }

@@ -204,6 +204,111 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  "str" - {
+    "renders an integer as its decimal digits, sign and all" in {
+      run("""print(str(0), str(7), str(-7), str(42), str(-1000))""") shouldBe "0 7 -7 42 -1000\n"
+    }
+
+    "renders the extremes of a 64-bit integer, signed and unsigned" in {
+      run("""var lo: i64 = -9223372036854775808
+            |var hi: i64 = 9223372036854775807
+            |var um: u64 = 18446744073709551615
+            |print(str(lo), str(hi), str(um))""".stripMargin) shouldBe
+        "-9223372036854775808 9223372036854775807 18446744073709551615\n"
+    }
+
+    // A narrow unsigned value renders by its magnitude, not sign-extended — 200 as a `u8`, not -56.
+    "renders a narrow value by widening for its signedness" in {
+      run("""var b: u8 = 200
+            |var s: i8 = -5
+            |print(str(b), str(s))""".stripMargin) shouldBe "200 -5\n"
+    }
+
+    "renders a bool as one of two words" in {
+      run("""print(str(true), str(false))""") shouldBe "true false\n"
+    }
+
+    "renders a char as its UTF-8, one byte or several" in {
+      run("""print(str('A'), str('é'), str('☃'), str('😀'))""") shouldBe "A é ☃ 😀\n"
+    }
+
+    // The NUL scalar value is a one-byte string, not the empty string a terminator would make it.
+    "renders the NUL char as a single byte" in {
+      run("""var s = str('\0')
+            |print(s.len, s[0])""".stripMargin) shouldBe "1 0\n"
+    }
+
+    "renders a float the way print does" in {
+      run("""print(str(3.5), str(-0.25), str(0.0), str(100.0))""") shouldBe "3.5 -0.25 0 100\n"
+    }
+
+    "hands a string straight back" in {
+      run("""var s = "hello"
+            |print(str(s), str(s) == s, str("x").len)""".stripMargin) shouldBe "hello true 1\n"
+    }
+
+    // The result is a real owning string: it can be joined, sliced, indexed, and compared.
+    "produces a fully-fledged string" in {
+      run("""var s = str(-40) + "!"
+            |print(s, s.len, s[0], s[1..<3])""".stripMargin) shouldBe "-40! 4 45 40\n"
+    }
+
+    "a rendered string outlives the frame when it is returned" in {
+      val src =
+        """label(n: int) -> string
+          |    "#" + str(n)
+          |end label
+          |print(label(17))
+          |""".stripMargin
+
+      run(src) shouldBe "#17\n"
+    }
+
+    "a rendered string survives being put on the heap" in {
+      val src =
+        """struct Tag
+          |    text: string
+          |end Tag
+          |make() -> string
+          |    var t: &Tag = Tag(str(99))
+          |    t.text
+          |end make
+          |print(make())
+          |""".stripMargin
+
+      run(src) shouldBe "99\n"
+    }
+
+    "rendering in a loop neither leaks nor frees twice" in {
+      val src =
+        """var total = 0
+          |for i in 1..20000 do
+          |    var s = str(i)
+          |    total += int(s.len)
+          |print(total)
+          |""".stripMargin
+
+      // 1..9 → 1 digit (9), 10..99 → 2 (180), 100..999 → 3 (2700), 1000..9999 → 4 (36000),
+      // 10000..20000 → 5 (50005): 9 + 180 + 2700 + 36000 + 50005.
+      run(src) shouldBe "88894\n"
+    }
+
+    // str(s) on a string is the identity — the same value, so the loop must not release it a
+    // second time on top of the variable it came from.
+    "the identity on a string does not free it twice" in {
+      val src =
+        """var s = "abcd"
+          |var total = 0
+          |for i in 1..20000 do
+          |    var t = str(s)
+          |    total += int(t[0])
+          |print(total)
+          |""".stripMargin
+
+      run(src) shouldBe "1940000\n"
+    }
+  }
+
   "comparison" - {
     "equality is by bytes" in {
       run("""print("abc" == "abc", "abc" == "abd", "abc" != "ab")""") shouldBe "true false true\n"
