@@ -252,6 +252,19 @@ class SyslParser extends PackratParsers {
   private lazy val typeParams: Parser[List[String]] =
     op("[") ~> rep1sep(ident, op(",")) <~ op("]")
 
+  /** The type-parameter list of a generic *function*, where a parameter may carry a trait bound:
+   * `[T, U: Show, V: Ord + Hash]`. It yields the parameter names alongside a name-keyed map of the
+   * bounds, so an unbounded parameter is simply absent from the map. Bounds on a type's own
+   * parameters (a struct or enum) are a separate, deferred surface, so only functions parse them.
+   */
+  private lazy val boundedTypeParams: Parser[(List[String], Map[String, List[String]])] =
+    op("[") ~> rep1sep(boundedTypeParam, op(",")) <~ op("]") ^^ { ps =>
+      (ps.map(_._1), ps.collect { case (n, bs) if bs.nonEmpty => n -> bs }.toMap)
+    }
+
+  private lazy val boundedTypeParam: Parser[(String, List[String])] =
+    ident ~ opt(op(":") ~> rep1sep(ident, op("+"))) ^^ { case n ~ bs => (n, bs.getOrElse(Nil)) }
+
   private lazy val varDecl: PackratParser[Stmt] =
     op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
       case n ~ t ~ e => VarDecl(n, t, e)
@@ -282,9 +295,10 @@ class SyslParser extends PackratParsers {
    * and nothing follows to open a body) and falls through to `exprStmt`.
    */
   private lazy val funcDecl: PackratParser[Stmt] =
-    ident ~ opt(typeParams) >> { case name ~ tps =>
+    ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
+      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
       (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
-        case params ~ ret ~ body => FuncDecl(name, tps.getOrElse(Nil), params, ret, body)
+        case params ~ ret ~ body => FuncDecl(name, names, params, ret, body, bounds)
       }
     }
 

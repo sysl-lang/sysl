@@ -68,6 +68,9 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       stmt match
         case f: FuncDecl =>
           if funcDecls.contains(f.name) then err(s"function '${f.name}' is already declared")
+          for (tp, traits) <- f.bounds; tr <- traits do
+            if !traitDecls.contains(tr) then
+              err(s"the bound on '$tp' in '${f.name}' names '$tr', which is not a trait")
           funcDecls(f.name) = f
           if f.tparams.isEmpty then
             funcInsts(f.name) =

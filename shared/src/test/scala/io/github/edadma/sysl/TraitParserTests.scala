@@ -81,4 +81,30 @@ class TraitParserTests extends AnyFreeSpec with ParseSupport {
 
     progError(src)
   }
+
+  "a generic function may bound a type parameter by a trait" in {
+    prog("render[T: Show](x: T) -> string = x.show()") shouldBe List(
+      FuncDecl(
+        "render",
+        List("T"),
+        List(Param("x", NamedType("T"))),
+        Some(NamedType("string")),
+        List(ExprStmt(Call(Field(Ident("x"), "show"), Nil))),
+        Map("T" -> List("Show")),
+      )
+    )
+  }
+
+  "bounds mix with unbounded parameters and join several traits with +" in {
+    prog("mix[T, U: Ord + Hash](x: T, y: U) -> int = 1") shouldBe List(
+      FuncDecl(
+        "mix",
+        List("T", "U"),
+        List(Param("x", NamedType("T")), Param("y", NamedType("U"))),
+        Some(NamedType("int")),
+        List(ExprStmt(i(1))),
+        Map("U" -> List("Ord", "Hash")),
+      )
+    )
+  }
 }

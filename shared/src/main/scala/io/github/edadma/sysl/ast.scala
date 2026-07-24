@@ -195,6 +195,11 @@ case class Continue(label: Option[String]) extends Stmt
  * implicit return value; an `= expr` short body is stored as a single-element list. A
  * missing `retType` means the function returns `unit`. `tparams` names the type parameters of
  * a generic function, which is instantiated afresh for each set of type arguments.
+ *
+ * `bounds` maps a type parameter to the traits it is bounded by (`f[T: Show, U: Ord + Hash]`),
+ * keyed by name so it carries no positional dependence on `tparams`; a parameter with no bound
+ * is absent from the map. A bound is what a caller must satisfy — the concrete type it supplies
+ * for that parameter must implement every trait named — and is checked at each call site.
  */
 case class FuncDecl(
     name: String,
@@ -202,6 +207,7 @@ case class FuncDecl(
     params: List[Param],
     retType: Option[TypeRef],
     body: List[Stmt],
+    bounds: Map[String, List[String]] = Map.empty,
 ) extends Stmt
 
 /** `struct Name[T…]` with `name: type` fields and, intermixed, member declarations (methods,

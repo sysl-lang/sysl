@@ -38,11 +38,31 @@ trait CallAnalysis extends TypeResolution {
         val provisional = args.map(analyzeExpr(_))
         val targs =
           solve(f.name, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected)
+        checkBounds(f, targs)
         (instantiateFunc(f, targs), Some(provisional))
 
     val (params, rtype) = funcInsts(name)
     TCall(name, checkArgs(f.name, params, args, pre), rtype)
   }
+
+  /** Enforces a generic function's trait bounds against the type arguments a call resolved to.
+   * For each bounded parameter, the concrete type must carry an `impl` of every trait the bound
+   * names — checked here at the call, so a caller supplying a type that does not implement the
+   * trait is told exactly that, rather than meeting a missing-method error deep inside the
+   * monomorphized body. Only a nominal type (a struct today) can carry an `impl`, so anything else
+   * fails the bound.
+   */
+  protected def checkBounds(f: FuncDecl, targs: List[Type]): Unit =
+    if f.bounds.nonEmpty then
+      val subst = f.tparams.zip(targs).toMap
+      for (tp, traits) <- f.bounds; tr <- traits do
+        val concrete = subst(tp)
+        val ok = concrete match
+          case s: Type.Struct => traitImpls.contains((tr, s.base))
+          case _              => false
+        if !ok then
+          err(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
+            s"but ${show(concrete)} does not")
 
   /** The name codegen emits for a member call on `s`. A member of a concrete type was hoisted
    * eagerly under `Type.member`; a member of a generic type is instantiated here, from the

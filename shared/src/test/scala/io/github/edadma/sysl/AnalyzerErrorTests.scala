@@ -901,8 +901,8 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("already implements 'Show'")
     }
 
-    // Stage 1a dispatches only through members that concretely exist; a trait method on a type
-    // with no impl has nothing to resolve to, and the diagnostic is the ordinary "no method" one.
+    // A trait method dispatches through a member that concretely exists; on a type with no impl
+    // there is nothing to resolve to, and the diagnostic is the ordinary "no method" one.
     "calling a trait method on a type with no impl is rejected" in {
       err(
         """trait Show
@@ -943,6 +943,64 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
           |impl Show for P
           |    v(self) -> int = 1""".stripMargin
       ) should include("both a field and a member")
+    }
+
+    // A bound is a promise the caller must keep: the concrete type it supplies must implement the
+    // trait. A struct with no such impl fails the bound at the call, naming the parameter and trait
+    // rather than surfacing a missing-method error from inside the monomorphized body.
+    "calling a bounded generic with a type that lacks the impl is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |struct Q
+          |    w: int
+          |impl Show for P
+          |    show(self) -> string = "p"
+          |render[T: Show](x: T) -> string = x.show()
+          |print(render(Q(1)))""".stripMargin
+      ) should include("requires its type parameter 'T' to implement 'Show', but Q does not")
+    }
+
+    // A scalar carries no impl, so it fails a trait bound the same way an unimplementing struct
+    // does — there is no structural conformance to fall back on.
+    "calling a bounded generic with a scalar type is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> string = "p"
+          |render[T: Show](x: T) -> string = x.show()
+          |print(render(7))""".stripMargin
+      ) should include("but int does not")
+    }
+
+    // Each bound in a multi-bound parameter is a separate requirement; supplying a type that
+    // implements one but not the other fails on the missing one.
+    "a multi-bound parameter rejects a type missing one of its bounds" in {
+      err(
+        """trait Named
+          |    name(self) -> string
+          |trait Aged
+          |    age(self) -> int
+          |struct P
+          |    v: int
+          |impl Named for P
+          |    name(self) -> string = "p"
+          |describe[T: Named + Aged](x: T) -> string = x.name()
+          |print(describe(P(1)))""".stripMargin
+      ) should include("to implement 'Aged', but P does not")
+    }
+
+    "a bound naming something that is not a trait is rejected" in {
+      err(
+        """struct Widget
+          |    v: int
+          |consume[T: Widget](x: T) -> int = 1""".stripMargin
+      ) should include("names 'Widget', which is not a trait")
     }
   }
 }
