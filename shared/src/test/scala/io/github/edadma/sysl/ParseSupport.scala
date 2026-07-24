@@ -24,6 +24,13 @@ trait ParseSupport extends Matchers { this: Assertions =>
       case Left(e)  => fail(e)
     }
 
+  /** Asserts a program does *not* parse, returning the error message for further checks. */
+  protected def progError(src: String): String =
+    SyslParser.parse(src) match {
+      case Right(p) => fail(s"expected a parse error, but it parsed as $p")
+      case Left(e)  => e
+    }
+
   /** A bare integer literal — the most common leaf in expected trees. */
   protected def i(n: Int): Expr = IntLit(BigInt(n), None)
 

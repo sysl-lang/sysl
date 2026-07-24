@@ -401,4 +401,53 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe (2328 * 2000).toString + "\n"
     }
   }
+
+  // A control-flow expression may sit on the right of an assignment, the same tail position a
+  // `var` initializer allows — so the value flows through the analyzer and codegen there too.
+  "control flow on the right of an assignment" - {
+    "a compound assignment accumulates a match value" in {
+      val src =
+        """var total = 0
+          |for i in 0..<4
+          |    total += match i % 2 == 0
+          |        true -> 10
+          |        false -> 1
+          |print(total)""".stripMargin
+
+      // even → +10, odd → +1, over i=0,1,2,3 → 10 + 1 + 10 + 1
+      run(src) shouldBe "22\n"
+    }
+
+    "a plain reassignment takes an if value" in {
+      val src =
+        """var x = 0
+          |x = if 3 > 2 then 100 else 200
+          |print(x)""".stripMargin
+
+      run(src) shouldBe "100\n"
+    }
+
+    "a reassignment takes a match value" in {
+      val src =
+        """var y = 0
+          |y = match 5
+          |    5 -> 50
+          |    else -> 0
+          |print(y)""".stripMargin
+
+      run(src) shouldBe "50\n"
+    }
+
+    "a compound assignment takes a loop's break value" in {
+      val src =
+        """var acc = 100
+          |acc += for k in 0..<10
+          |    if k * k > 20 then break k
+          |else -1
+          |print(acc)""".stripMargin
+
+      // k=5 first has k*k=25 > 20 → break 5; acc = 100 + 5
+      run(src) shouldBe "105\n"
+    }
+  }
 }

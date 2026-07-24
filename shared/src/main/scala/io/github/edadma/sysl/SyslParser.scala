@@ -60,9 +60,13 @@ class SyslParser extends PackratParsers {
   private def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))
 
-  /** Assignment is right-associative and lowest precedence, so it recurses on its right. */
+  /** Assignment is right-associative and lowest precedence, so it recurses on its right. The right
+   * side is a full `expression`, so a control-flow expression may sit there — `x = match …`,
+   * `total += if …` — in the same tail position `var x = …` already allows one; this does not put
+   * those forms into a binary operand, so `1 + match …` still does not parse.
+   */
   lazy val assignment: PackratParser[Expr] =
-    logicalOr ~ assignOp ~ assignment ^^ { case l ~ o ~ r => Assign(o, l, r) } |
+    logicalOr ~ assignOp ~ expression ^^ { case l ~ o ~ r => Assign(o, l, r) } |
       logicalOr
 
   private def assignOp: Parser[String] =
