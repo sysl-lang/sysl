@@ -1,0 +1,355 @@
+package io.github.edadma.sysl
+
+import org.scalatest.freespec.AnyFreeSpec
+
+/** Diagnostics for a type's members and dispatch: inherent methods and properties, members on a
+ * generic type, and traits — conformance of an `impl`, and the bounds a generic places on its
+ * type parameters.
+ */
+class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
+
+  "methods" - {
+    "a '&self' method rejects a bare stack value" in {
+      err(
+        """struct C
+          |    n: int
+          |    bump(&self)
+          |        self.n += 1
+          |var c = C(0)
+          |c.bump()""".stripMargin
+      ) should include("'&self' needs a reference")
+    }
+
+    "a property is read without parentheses" in {
+      err(
+        """struct P
+          |    x: int
+          |    twice -> int = self.x * 2
+          |var p = P(1)
+          |print(p.twice())""".stripMargin
+      ) should include("is a property")
+    }
+
+    "a method is called with parentheses" in {
+      err(
+        """struct P
+          |    x: int
+          |    twice(self) -> int = self.x * 2
+          |var p = P(1)
+          |print(p.twice)""".stripMargin
+      ) should include("is a method")
+    }
+
+    "an unknown method is reported against its type" in {
+      err(
+        """struct P
+          |    x: int
+          |var p = P(1)
+          |print(p.area())""".stripMargin
+      ) should include("no method 'area'")
+    }
+
+    "an unknown associated function is reported against its type" in {
+      err(
+        """struct P
+          |    x: int
+          |    id(self) -> int = self.x
+          |var p = P.make()""".stripMargin
+      ) should include("no associated function 'make'")
+    }
+
+    "a member may not share a name with a field" in {
+      err(
+        """struct P
+          |    x: int
+          |    x(self) -> int = 1""".stripMargin
+      ) should include("both a field and a member")
+    }
+
+    // An associated function on a generic type has no receiver to read the type arguments from,
+    // so it would need them inferred — a separate deferral with its own diagnostic. Methods and
+    // properties, whose type arguments come straight off the receiver, are supported.
+    "an associated function on a generic type waits on the generics work" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    empty() -> int = 0""".stripMargin
+      ) should include("associated functions on generic types are not supported yet")
+    }
+
+    // A method that introduces its own type parameter, even on a non-generic type, is a separate
+    // deferral with its own diagnostic.
+    "a generic method on a non-generic type waits on the generics work" in {
+      err(
+        """struct Registry
+          |    n: int
+          |    store[T](&self, item: T) -> int = self.n""".stripMargin
+      ) should include("generic methods are not supported yet")
+    }
+
+    // A method with its own type parameter is rejected even on a generic type — the receiver fixes
+    // the struct's parameters, but the method's own parameter still has nothing to infer it from.
+    "a generic method on a generic type waits on the generics work" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    cast[U](self, u: U) -> U = u""".stripMargin
+      ) should include("generic methods are not supported yet")
+    }
+  }
+
+  "members on generic types" - {
+    "a method call with the wrong arity is reported" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    plus(self, other: T) -> T = self.value + other
+          |var a = Box(1)
+          |print(a.plus(2, 3))""".stripMargin
+      ) should include("takes 1 arguments")
+    }
+
+    "a property on a generic type is read without parentheses" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    doubled -> T = self.value + self.value
+          |var a = Box(1)
+          |print(a.doubled())""".stripMargin
+      ) should include("is a property")
+    }
+
+    "a method on a generic type is called with parentheses" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    get(self) -> T = self.value
+          |var a = Box(1)
+          |print(a.get)""".stripMargin
+      ) should include("is a method")
+    }
+
+    "an unknown method on a generic type is reported against its type" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |var a = Box(1)
+          |print(a.area())""".stripMargin
+      ) should include("no method 'area'")
+    }
+
+    "a member may not share a name with a field on a generic type" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    value(self) -> T = self.value""".stripMargin
+      ) should include("both a field and a member")
+    }
+
+    // The unbounded model checks a member's body per instantiation, so a numeric operation on the
+    // element is only rejected once a non-numeric element reaches it — at the call, not the
+    // definition. total's type mismatch would never surface without instantiating at a string.
+    "a method body that needs a numeric element is rejected at a non-numeric instantiation" in {
+      err(
+        """struct Box[T]
+          |    value: T
+          |    inc(self) -> T = self.value + 1
+          |var a = Box("s")
+          |print(a.inc())""".stripMargin
+      ) should include("int")
+    }
+  }
+
+  "traits" - {
+    "an impl that omits a trait method is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |    label(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> string = "p"""".stripMargin
+      ) should include("method 'label' is missing")
+    }
+
+    "an impl method the trait does not declare is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> string = "p"
+          |    extra(self) -> int = 1""".stripMargin
+      ) should include("declares no method 'extra'")
+    }
+
+    "an impl method whose parameter type differs from the trait is rejected" in {
+      err(
+        """trait Add
+          |    add(self, x: int) -> int
+          |struct P
+          |    v: int
+          |impl Add for P
+          |    add(self, x: string) -> int = self.v""".stripMargin
+      ) should include("parameter 'x'")
+    }
+
+    "an impl method whose result type differs from the trait is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> int = self.v""".stripMargin
+      ) should include("but trait 'Show' declares")
+    }
+
+    "an impl method whose receiver mode differs from the trait is rejected" in {
+      err(
+        """trait Bump
+          |    bump(*self)
+          |struct P
+          |    v: int
+          |impl Bump for P
+          |    bump(self)
+          |        self.v""".stripMargin
+      ) should include("different receiver")
+    }
+
+    "implementing an unknown trait is rejected" in {
+      err(
+        """struct P
+          |    v: int
+          |impl Nope for P
+          |    go(self) -> int = self.v""".stripMargin
+      ) should include("unknown trait 'Nope'")
+    }
+
+    "implementing a trait for an unknown type is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |impl Show for Ghost
+          |    show(self) -> string = "g"""".stripMargin
+      ) should include("'Ghost' is not one")
+    }
+
+    "two impls of the same trait for one type are rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> string = "a"
+          |impl Show for P
+          |    show(self) -> string = "b"""".stripMargin
+      ) should include("already implements 'Show'")
+    }
+
+    // A trait method dispatches through a member that concretely exists; on a type with no impl
+    // there is nothing to resolve to, and the diagnostic is the ordinary "no method" one.
+    "calling a trait method on a type with no impl is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |var p = P(1)
+          |print(p.show())""".stripMargin
+      ) should include("has no method 'show'")
+    }
+
+    "a generic trait is rejected for now" in {
+      err(
+        """trait Into[T]
+          |    into(self) -> T""".stripMargin
+      ) should include("generic traits are not supported yet")
+    }
+
+    "implementing a trait for a generic struct is rejected for now" in {
+      err(
+        """trait Show
+          |    show(self) -> int
+          |struct Box[T]
+          |    v: T
+          |impl Show for Box
+          |    show(self) -> int = 1""".stripMargin
+      ) should include("generic type is not supported yet")
+    }
+
+    // A field and an impl method sharing a name collide the same way a field and an inherent
+    // method do, since both land in the one member table.
+    "an impl method colliding with a field is rejected" in {
+      err(
+        """trait Show
+          |    v(self) -> int
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    v(self) -> int = 1""".stripMargin
+      ) should include("both a field and a member")
+    }
+
+    // A bound is a promise the caller must keep: the concrete type it supplies must implement the
+    // trait. A struct with no such impl fails the bound at the call, naming the parameter and trait
+    // rather than surfacing a missing-method error from inside the monomorphized body.
+    "calling a bounded generic with a type that lacks the impl is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |struct Q
+          |    w: int
+          |impl Show for P
+          |    show(self) -> string = "p"
+          |render[T: Show](x: T) -> string = x.show()
+          |print(render(Q(1)))""".stripMargin
+      ) should include("requires its type parameter 'T' to implement 'Show', but Q does not")
+    }
+
+    // A scalar carries no impl, so it fails a trait bound the same way an unimplementing struct
+    // does — there is no structural conformance to fall back on.
+    "calling a bounded generic with a scalar type is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> string = "p"
+          |render[T: Show](x: T) -> string = x.show()
+          |print(render(7))""".stripMargin
+      ) should include("but int does not")
+    }
+
+    // Each bound in a multi-bound parameter is a separate requirement; supplying a type that
+    // implements one but not the other fails on the missing one.
+    "a multi-bound parameter rejects a type missing one of its bounds" in {
+      err(
+        """trait Named
+          |    name(self) -> string
+          |trait Aged
+          |    age(self) -> int
+          |struct P
+          |    v: int
+          |impl Named for P
+          |    name(self) -> string = "p"
+          |describe[T: Named + Aged](x: T) -> string = x.name()
+          |print(describe(P(1)))""".stripMargin
+      ) should include("to implement 'Aged', but P does not")
+    }
+
+    "a bound naming something that is not a trait is rejected" in {
+      err(
+        """struct Widget
+          |    v: int
+          |consume[T: Widget](x: T) -> int = 1""".stripMargin
+      ) should include("names 'Widget', which is not a trait")
+    }
+  }
+}
