@@ -76,10 +76,11 @@ otherwise. A prefix `&` on a construction was considered as an explicit mark and
 it would collide with address-of, which is a different operation with a different result type.
 
 The rule is about the *types*, not about the syntax: a `T` written where a `&T` is expected
-goes on the heap, whatever produced it. An `if`/`match` yields its value through its branches,
-so the `&T` expectation reaches each branch rather than the whole expression: every branch is
-boxed on its own, which is what lets a value branch and an already-`&T` branch meet at `&T`
-(`var p: &Point = if c then Point(1, 2) else q.origin`, where `q.origin` is already a reference).
+goes on the heap, whatever produced it. An `if`/`match` (and a loop, through its `break`s and
+`else`) yields its value through its branches, so the `&T` expectation reaches each branch
+rather than the whole expression: every branch is boxed on its own, which is what lets a value
+branch and an already-`&T` branch meet at `&T` (`var p: &Point = if c then Point(1, 2) else
+q.origin`, where `q.origin` is already a reference).
 It is also what lets a scalar be referenced (`var n: &int = 0`) without `int` needing a
 constructor of its own. Something that is *already* a `&T` passes through untouched — it is a
 reference, not a value looking for a home.

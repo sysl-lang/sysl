@@ -323,6 +323,55 @@ context-sensitive stop rules, no separate parser-vocabulary registration. The ol
 operator-munching complexity (and its double-registration) existed *solely* to support custom
 operators; with those gone, operator lexing is trivial, and even a library lexer stays clean.
 
+---
+
+## 10. Control flow is expression-oriented — `if`, `match`, and loops yield values
+
+`if`, `match`, `while`, and `for` are **expressions**, not statements. Each yields a value, so
+it can initialize a binding, be a function's body, or feed a branch of another:
+
+```
+var label = if n % 2 == 0 then "even" else "odd"
+fee(t: Tier) -> int = match t
+    Bronze -> 0
+    Silver -> 10
+    Gold   -> 25
+```
+
+In statement position the value is simply unused, so the same forms read as ordinary control
+flow. A branch or arm yields its block's **trailing expression**; a branch that only performs
+effects yields `unit`. An `if` used for a value needs an `else` (a missing one leaves the
+open branch at `unit`); a `match` used for a value must be exhaustive.
+
+**Loops carry a value out through `break`.** `break expr` leaves the nearest loop and makes
+`expr` the loop's value; `continue` skips to the next iteration. An optional **`else` block**
+(after the body, as in Python) runs when the loop finishes *normally* — the condition turned
+false, or the range ran out, with no `break` — and its trailing expression is the loop's value
+on that path:
+
+```
+var found = for x in xs
+    if pred(x) then break x
+else -1                        // the value when nothing matched
+```
+
+With no `else`, normal completion yields `unit`, so a value-carrying `break` needs an `else` to
+supply the matching value when the loop finishes on its own; every `break` value and the `else`
+value share one type, which becomes the loop's. A bare `break` with no `else` is the ordinary
+statement loop, of type `unit`.
+
+**Why.** An expression-oriented core removes the statement/expression split that forces a
+temporary-and-reassign dance in C (`int label; if (…) label = …; else label = …;`). It is the
+Rust/Scala/Kotlin consensus, and it makes the last-expression-is-the-value rule uniform across
+functions, branches, and loops. Value-carrying `break` in particular turns the most common
+reason to leave a loop early — *search for the first element that satisfies a predicate* — into
+a single expression whose type states, through the mandatory `else`, what happens when nothing
+is found. That is the same "make the absent case impossible to ignore" discipline that gives
+references no null and errors a `Result`: the loop cannot silently fall through to an undefined
+value. Because the value flows through the branches (or a loop's `break`s and `else`), a `&T`
+context reaches each one on its own — a value branch and an already-`&T` branch meet at `&T`
+(see `03-memory-model.md`), with no aggregate coercion.
+
 ## Open at the basics level (not yet decided)
 
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
