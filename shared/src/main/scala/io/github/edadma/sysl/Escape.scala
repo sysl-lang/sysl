@@ -257,6 +257,8 @@ private class Escape(program: TProgram) {
     case TCall(_, args, _)          => args
     case TStructNew(_, args)        => args
     case TEnumNew(_, _, args)       => args
+    case TEnumFromInt(v, _)         => List(v)
+    case TEnumTry(v, _, _, _, _)    => List(v)
     case TArrayLit(elems, _)        => elems
     case TIndex(r, i, _)            => List(r, i)
     case TLen(r)                    => List(r)

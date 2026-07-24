@@ -127,6 +127,17 @@ case class TEnumNew(enumTy: Type.Enum, variant: Type.EnumVariant, args: List[TEx
   def ty: Type = enumTy
 }
 
+/** `Color(n)` — an integer reinterpreted as a simple enum, checked: it traps on an integer that
+ * is not a declared discriminant. Yields the enum, stored at its underlying integer width.
+ */
+case class TEnumFromInt(value: TExpr, en: Type.Enum) extends TExpr { def ty: Type = en }
+
+/** `Color.try(n)` — the fallible constructor: `Some(Color)` when `n` is a declared discriminant,
+ * `None` otherwise. `optTy` is the resulting `Option[Color]` and `some`/`none` its two variants.
+ */
+case class TEnumTry(value: TExpr, en: Type.Enum, optTy: Type.Enum,
+                    some: Type.EnumVariant, none: Type.EnumVariant) extends TExpr { def ty: Type = optTy }
+
 /** The postfix `?` on an `Option`/`Result` value: yields the success payload, or returns the
  * enclosing function early with the failure re-wrapped in *its* return type.
  *

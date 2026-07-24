@@ -9,26 +9,14 @@ A modern, ref-counted, OS-level systems language — easier than Rust.
 
 ## What sysl is
 
-sysl is a systems language designed to keep the control that makes a systems language worth using
-while being meaningfully easier to learn and work with than Rust. Its guiding ideas:
+sysl is a systems language that aims to keep the control a systems language is used for while being
+meaningfully easier to learn and work with than Rust. It is ref-counted rather than borrow-checked:
+memory is managed through three explicit modes — `T` (value/stack), `&T` (ARC reference-counted
+heap), and `*T` (raw pointer) — with no garbage collector. Its intended showcase is an operating
+system written in sysl and readable end to end.
 
-- **Costs are visible.** Three explicit memory modes — `T` (value/stack), `&T` (ARC reference-counted
-  heap), `*T` (raw pointer). No garbage collector, no hidden allocation, no borrow checker to fight.
-- **Correctness is first-class.** Design-by-contract (`require` / `ensure`), exhaustive `match`, and
-  integer-overflow safety are part of the language, not bolted-on lint.
-- **It stays readable.** Small enough that its intended showcase — an operating system written in
-  sysl — can be read end-to-end.
-
-Where Rust reaches for lifetimes, sysl reaches for ARC and clear ownership trees: less to prove, less
-to fight, the same predictability.
-
-## Design decisions for this restart
-
-- **One backend: aarch64 via LLVM.** No interpreter, no multi-backend matrix. Compiled behavior is the
-  single source of truth for the language's semantics.
-- **Design precedes code.** The language surface is decided in a written spec before it is
-  implemented, and each feature ships with tests written in sysl itself.
-- **Disciplined testing.** One expected result per test, organized one directory per language feature.
+The language is designed in writing before it is implemented. The numbered specification lives in
+[`docs/design/`](docs/design/) — start there for what sysl is and why it is shaped the way it is.
 
 ## Building
 

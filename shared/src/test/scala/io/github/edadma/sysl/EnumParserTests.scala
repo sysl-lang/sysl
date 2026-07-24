@@ -23,6 +23,7 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
         EnumDecl(
           "Color",
           Nil,
+          None,
           List(
             EnumVariantDecl("Red", None, Nil),
             EnumVariantDecl("Green", None, Nil),
@@ -33,11 +34,27 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
       )
     }
 
+    "a simple enum with a pinned underlying integer type" in {
+      prog("enum Color: u8\n    Red\n    Green\n    Blue = 10") shouldBe List(
+        EnumDecl(
+          "Color",
+          Nil,
+          Some(NamedType("u8")),
+          List(
+            EnumVariantDecl("Red", None, Nil),
+            EnumVariantDecl("Green", None, Nil),
+            EnumVariantDecl("Blue", Some(i(10)), Nil),
+          ),
+        )
+      )
+    }
+
     "a data enum with payload and nullary variants" in {
       prog("enum Shape\n    Circle(radius: int)\n    Rect(w: int, h: int)\n    Empty") shouldBe List(
         EnumDecl(
           "Shape",
           Nil,
+          None,
           List(
             EnumVariantDecl("Circle", None, List(Param("radius", NamedType("int")))),
             EnumVariantDecl("Rect", None, List(Param("w", NamedType("int")), Param("h", NamedType("int")))),
@@ -74,7 +91,7 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
     "a matching end name closes an enum and a function" in {
       val src = "enum E\n    A\n    B\nend E\nf() -> int\n    1\nend f"
       prog(src) shouldBe List(
-        EnumDecl("E", Nil, List(EnumVariantDecl("A", None, Nil), EnumVariantDecl("B", None, Nil))),
+        EnumDecl("E", Nil, None, List(EnumVariantDecl("A", None, Nil), EnumVariantDecl("B", None, Nil))),
         FuncDecl("f", Nil, Nil, Some(NamedType("int")), List(ExprStmt(i(1)))),
       )
     }

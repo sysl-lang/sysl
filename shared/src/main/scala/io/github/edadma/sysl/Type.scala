@@ -221,9 +221,14 @@ object Type {
     var simple: Boolean            = true
     var variants: List[EnumVariant] = Nil
 
+    /** A simple enum's storage type — its `: iN` annotation, or `int` when unspecified. A data
+     * enum lowers to an aggregate and ignores this; its internal tag is always `i32`.
+     */
+    var underlying: Integer = Type.Int
+
     def name: String = qualified(base, targs)
 
-    def llvm: String = if simple then "i32" else s"%enum.${mangled(base, targs)}"
+    def llvm: String = if simple then underlying.llvm else s"%enum.${mangled(base, targs)}"
 
     def variant(v: String): Option[EnumVariant] = variants.find(_.name == v)
 

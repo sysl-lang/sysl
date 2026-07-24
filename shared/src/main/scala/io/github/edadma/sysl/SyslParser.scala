@@ -345,13 +345,14 @@ class SyslParser extends PackratParsers {
       op("&") ~> op("self") ^^^ RecvMode.ByRef(sync = false) |
       op("self") ^^^ RecvMode.ByValue
 
-  /** `enum Name[T…]` with indented variants. A variant is a bare name (`Empty`), a name with an
+  /** `enum Name[T…]` with indented variants, and an optional `: iN` underlying-type annotation
+   * that pins a simple enum's storage. A variant is a bare name (`Empty`), a name with an
    * explicit integer value (`Blue = 10`), or a name with a payload (`Circle(radius: int)`).
    */
   private lazy val enumDecl: PackratParser[Stmt] =
-    op("enum") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
+    op("enum") ~> ident ~ opt(typeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
       (newline ~> indent ~> opt(newlines) ~> repsep(enumVariant, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
-        variants => EnumDecl(name, tps.getOrElse(Nil), variants)
+        variants => EnumDecl(name, tps.getOrElse(Nil), under, variants)
       }
     }
 

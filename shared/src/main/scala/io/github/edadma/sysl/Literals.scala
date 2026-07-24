@@ -81,6 +81,11 @@ trait Literals extends TypeResolution {
       case (Type.Char, _: Type.Integer)         => true // total: every char is an integer
       case (_: Type.Integer, Type.Char)         => true // partial: traps on a non-scalar value
       case (Type.Char, Type.Char)               => true
+      // Enum → integer is total: every enum value is one of its declared discriminants. Only a
+      // simple enum has an integer value to give; a data enum is a tagged union, not a number.
+      case (e: Type.Enum, _: Type.Integer) =>
+        if !e.simple then err(s"only a simple enum converts to an integer — ${show(e)} carries data")
+        true
       case _                                    => false
 
     if !allowed then err(s"cannot convert ${show(t.ty)} to ${show(to)}")

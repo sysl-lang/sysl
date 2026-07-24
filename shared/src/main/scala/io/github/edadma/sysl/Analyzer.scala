@@ -40,6 +40,10 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
           structDecls(s.name) = s
         case e: EnumDecl =>
           if typeNameTaken(e.name) then err(s"type '${e.name}' is already declared")
+          // A generic enum has no single storage type to pin, and it is never instantiated
+          // eagerly, so the annotation is rejected here at the declaration rather than on use.
+          if e.underlying.isDefined && e.tparams.nonEmpty then
+            err(s"a generic enum cannot pin an underlying type — '${e.name}' takes type parameters")
           enumDecls(e.name) = e
           for v <- e.variants do
             if variantOwner.contains(v.name) then
@@ -479,18 +483,26 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && structDecls.contains(name) =>
       constructStruct(name, args, expected)
 
+    // A simple enum's name in call position is a checked cast from an integer — `Color(n)` traps
+    // on a value that is not a declared discriminant. Told from a data enum, which has no integer
+    // to reinterpret, and from a struct constructor, which line 479 already claimed.
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty && enumDecls.contains(name) =>
+      enumFromInt(name, args)
+
     case Call(Ident(name), args) if funcDecls.contains(name) =>
       callFunction(funcDecls(name), args, expected)
 
     case Call(Ident(name), _) =>
       err(s"undefined function '$name'")
 
-    // A data-carrying variant reached through its enum: `Shape.Circle(5)`, the qualified form of
-    // the bare `Circle(5)`.
+    // Reached through the enum name: `Color.try(n)` is the fallible constructor; otherwise a
+    // data-carrying variant `Shape.Circle(5)`, the qualified form of the bare `Circle(5)`.
     case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && enumDecls.contains(tname) =>
-      enumDecls(tname).variants.find(_.name == mname) match
-        case Some(_) => constructVariant(mname, args, expected)
-        case None    => err(s"enum '$tname' has no variant '$mname'")
+      if mname == "try" then enumTry(tname, args)
+      else
+        enumDecls(tname).variants.find(_.name == mname) match
+          case Some(_) => constructVariant(mname, args, expected)
+          case None    => err(s"enum '$tname' has no variant '$mname'")
 
     // `Type.name(…)` — an associated function, told from the positional constructor `Type(…)` by
     // the member selected from the type name rather than the bare name applied.

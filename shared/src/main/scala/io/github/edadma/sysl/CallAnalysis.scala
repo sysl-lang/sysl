@@ -180,6 +180,42 @@ trait CallAnalysis extends TypeResolution {
     TEnumNew(en, v, checkArgs(name, v.fields, args, pre))
   }
 
+  /** A non-generic simple enum whose name appears in call position, for the two conversions from
+   * an integer. The shared checks — not generic, not a data enum, exactly one integer argument —
+   * live here so `Color(n)` and `Color.try(n)` reject the same shapes the same way.
+   */
+  private def simpleEnumArg(name: String, args: List[Expr]): (Type.Enum, TExpr) = {
+    val decl = enumDecls(name)
+    if decl.tparams.nonEmpty then
+      err(s"'$name' is generic, so it has no single underlying integer type to convert")
+    val en = instantiateEnum(name, Nil)
+    if !en.simple then
+      err(s"'$name' carries data, so only a simple enum converts to and from an integer")
+    if args.length != 1 then
+      err(s"'$name' takes exactly one integer argument")
+    val t = analyzeExpr(args.head, Some(en.underlying))
+    if !t.ty.isInstanceOf[Type.Integer] then
+      err(s"'$name' converts an integer, but the value has type ${show(t.ty)}")
+    (en, t)
+  }
+
+  /** `Color(n)` — the checked cast: an integer becomes the enum, trapping at run time on a value
+   * that is not a declared discriminant.
+   */
+  protected def enumFromInt(name: String, args: List[Expr]): TExpr = {
+    val (en, t) = simpleEnumArg(name, args)
+    TEnumFromInt(t, en)
+  }
+
+  /** `Color.try(n)` — the fallible constructor: `Some(Color)` for a declared discriminant, `None`
+   * otherwise. The result is an ordinary `Option[Color]`, so nothing downstream is special-cased.
+   */
+  protected def enumTry(name: String, args: List[Expr]): TExpr = {
+    val (en, t) = simpleEnumArg(name, args)
+    val optTy   = instantiateEnum("Option", List(en))
+    TEnumTry(t, en, optTy, optTy.variant("Some").get, optTy.variant("None").get)
+  }
+
   /** `expr?` — unwraps an `Option`/`Result`, or returns the enclosing function early with the
    * failure re-wrapped in *its* return type. The two enums must agree, and a propagated error
    * must be the one the function returns.

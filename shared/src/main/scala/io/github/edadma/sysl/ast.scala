@@ -218,7 +218,11 @@ case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param
 /** `enum Name[T…]` with indented variants. All-dataless variants make a *simple* enum (integer
  * constants, auto-incrementing, with optional explicit `= value`); any data-carrying variant
  * makes a *data* enum (a tagged union whose variants are constructed and destructured).
+ *
+ * `underlying` is the `: iN`/`uN` annotation that pins a non-generic simple enum's storage type;
+ * unspecified it is `int`. It is meaningless on a generic or data enum, which the analyzer rejects.
  */
-case class EnumDecl(name: String, tparams: List[String], variants: List[EnumVariantDecl]) extends Stmt
+case class EnumDecl(name: String, tparams: List[String], underlying: Option[TypeRef],
+                    variants: List[EnumVariantDecl]) extends Stmt
 
 case class Program(body: List[Stmt])

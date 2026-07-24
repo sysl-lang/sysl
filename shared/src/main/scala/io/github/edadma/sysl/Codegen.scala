@@ -354,6 +354,12 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     case TEnumNew(en, variant, args) =>
       enumValue(en, variant, args.map(genExpr))
 
+    case TEnumFromInt(value, en) =>
+      genEnumFromInt(value, en)
+
+    case TEnumTry(value, en, optTy, some, none) =>
+      genEnumTry(value, en, optTy, some, none)
+
     case TTry(operand, ok, fail, retEnum, retFail, _) =>
       genTry(operand, ok, fail, retEnum, retFail)
 
@@ -519,6 +525,55 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
           val r = freshTemp()
           emit(s"$r = insertvalue ${en.llvm} $tagged, ${en.payloadLlvm(variant)} $payload, $slot")
           r
+
+  /** Whether an integer `v` of type `vt` equals one of the enum's declared discriminants — the
+   * membership test both integer-to-enum conversions share. Every comparison is done at 64 bits
+   * so a wide source cannot alias a narrow discriminant, matching how the checked `char`
+   * conversion widens before testing.
+   */
+  private def enumMembership(en: Type.Enum, vt: Type.Integer, v: String): String = {
+    val wide = convert(vt, Type.Integer(64, vt.signed), v)
+    en.variants.map { variant =>
+      val eq = freshTemp(); emit(s"$eq = icmp eq i64 $wide, ${variant.tag}")
+      eq
+    }.reduceOption(orI1).getOrElse("false")
+  }
+
+  /** `Color(n)` — the checked cast. Traps unless `n` is a declared discriminant, then stores the
+   * value at the enum's underlying width, which is the enum's representation.
+   */
+  private def genEnumFromInt(value: TExpr, en: Type.Enum): String = {
+    val vt = value.ty.asInstanceOf[Type.Integer]
+    val v  = genExpr(value)
+    trapUnless(enumMembership(en, vt, v), "enum")
+    convert(vt, en.underlying, v)
+  }
+
+  /** `Color.try(n)` — the fallible constructor. The membership test picks the branch: a match
+   * builds `Some(n as Color)`, a miss builds `None`. The result is an ordinary `Option[Color]`,
+   * whose element has no refcount, so a merge slot needs no ownership bookkeeping.
+   */
+  private def genEnumTry(value: TExpr, en: Type.Enum, optTy: Type.Enum,
+                         some: Type.EnumVariant, none: Type.EnumVariant): String = {
+    val vt    = value.ty.asInstanceOf[Type.Integer]
+    val v     = genExpr(value)
+    val ok    = enumMembership(en, vt, v)
+    val slot  = emitAlloca(freshTemp(), optTy.llvm)
+    val someL = freshLabel("try.some")
+    val noneL = freshLabel("try.none")
+    val endL  = freshLabel("try.end")
+
+    emitTerm(s"br i1 $ok, label %$someL, label %$noneL")
+    emitLabel(someL)
+    val ev = convert(vt, en.underlying, v)
+    emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(ev))}, ptr $slot")
+    emitTerm(s"br label %$endL")
+    emitLabel(noneL)
+    emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
+    emitTerm(s"br label %$endL")
+    emitLabel(endL)
+    val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot"); r
+  }
 
   /** Reads every field of a variant's payload out of an enum value. */
   private def payloadFields(en: Type.Enum, variant: Type.EnumVariant, value: String): List[String] =

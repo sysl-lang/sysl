@@ -31,6 +31,7 @@ class GenericsParserTests extends AnyFreeSpec with ParseSupport {
         EnumDecl(
           "Maybe",
           List("T"),
+          None,
           List(EnumVariantDecl("Just", None, List(Param("value", NamedType("T")))), EnumVariantDecl("Nothing", None, Nil)),
         )
       )

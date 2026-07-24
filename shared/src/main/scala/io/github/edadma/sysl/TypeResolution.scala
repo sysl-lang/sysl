@@ -142,15 +142,34 @@ trait TypeResolution extends AnalyzerBase {
         inProgress(key) = en
         resolving(key) = indirection
 
+        // The `: iN` annotation pins a simple enum's storage; it is meaningless on a generic or
+        // data enum, so those reject it rather than silently ignore it. Where present, every
+        // discriminant is range-checked against it, which is the whole point of pinning the type.
+        en.underlying = decl.underlying match
+          case None => Type.Int
+          case Some(ref) =>
+            if !en.simple then
+              err(s"only a simple enum has an underlying integer type — '$name' carries data")
+            resolveType(ref, Map.empty) match
+              case i: Type.Integer => i
+              case other           => err(s"an enum's underlying type must be an integer, not ${show(other)}")
+
         val subst    = decl.tparams.zip(targs).toMap
         var nextTag  = 0
         var nextSlot = 1
         en.variants = decl.variants.map { v =>
           if en.simple then
+            def fitting(n: BigInt): Int =
+              if !Type.fits(n, en.underlying) then
+                err(s"discriminant $n of variant '${v.name}' does not fit ${show(en.underlying)}")
+              n.toInt
             val tag = v.value match
-              case Some(IntLit(n, _)) => n.toInt
-              case Some(_)            => err(s"the value of variant '${v.name}' must be an integer literal")
-              case None               => nextTag
+              // A discriminant may be negative under a signed underlying type, where the parser
+              // gives the literal as a unary negation rather than a signed constant.
+              case Some(IntLit(n, _))                     => fitting(n)
+              case Some(Unary("-", IntLit(n, _)))         => fitting(-n)
+              case Some(_)                                => err(s"the value of variant '${v.name}' must be an integer literal")
+              case None                                   => fitting(nextTag)
             nextTag = tag + 1
             Type.EnumVariant(v.name, tag, Nil, None)
           else

@@ -697,4 +697,117 @@ class AnalyzerErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("int")
     }
   }
+
+  "enum ↔ integer conversion" - {
+    "converting a data enum to an integer is rejected" in {
+      err(
+        """enum Shape
+          |    Circle(radius: int)
+          |    Empty
+          |var s = Circle(3)
+          |print(int(s))""".stripMargin
+      ) should include("only a simple enum converts to an integer")
+    }
+
+    "a checked cast into a data enum is rejected" in {
+      err(
+        """enum Shape
+          |    Circle(radius: int)
+          |    Empty
+          |var s = Shape(0)""".stripMargin
+      ) should include("carries data")
+    }
+
+    "a checked cast on a generic enum is rejected" in {
+      err(
+        """enum Maybe[T]
+          |    Just(value: T)
+          |    Nothing
+          |var m = Maybe(0)""".stripMargin
+      ) should include("generic")
+    }
+
+    "a checked cast takes exactly one integer argument" in {
+      err(
+        """enum Color
+          |    Red
+          |    Green
+          |var c = Color(1, 2)""".stripMargin
+      ) should include("exactly one integer")
+    }
+
+    "a checked cast rejects a non-integer argument" in {
+      err(
+        """enum Color
+          |    Red
+          |    Green
+          |var c = Color("red")""".stripMargin
+      ) should include("converts an integer")
+    }
+
+    "the fallible constructor on a data enum is rejected" in {
+      err(
+        """enum Shape
+          |    Circle(radius: int)
+          |    Empty
+          |var s = Shape.try(0)""".stripMargin
+      ) should include("carries data")
+    }
+
+    "an unknown member on an enum is still reported, not swallowed by try" in {
+      err(
+        """enum Color
+          |    Red
+          |    Green
+          |var c = Color.Bogus(1)""".stripMargin
+      ) should include("no variant 'Bogus'")
+    }
+
+    "an underlying-type annotation on a generic enum is rejected" in {
+      err(
+        """enum Maybe[T]: u8
+          |    Just(value: T)
+          |    Nothing""".stripMargin
+      ) should include("generic enum cannot pin an underlying type")
+    }
+
+    "an underlying-type annotation on a data enum is rejected" in {
+      err(
+        """enum Shape: u8
+          |    Circle(radius: int)
+          |    Empty""".stripMargin
+      ) should include("only a simple enum has an underlying integer type")
+    }
+
+    "a non-integer underlying type is rejected" in {
+      err(
+        """enum Color: string
+          |    Red
+          |    Green""".stripMargin
+      ) should include("underlying type must be an integer")
+    }
+
+    "a discriminant that overflows the underlying type is rejected" in {
+      err(
+        """enum Color: u8
+          |    Red
+          |    Big = 300""".stripMargin
+      ) should include("does not fit")
+    }
+
+    "a negative discriminant under an unsigned underlying type is rejected" in {
+      err(
+        """enum Color: u8
+          |    Red = -1""".stripMargin
+      ) should include("does not fit")
+    }
+
+    "an auto-incremented discriminant that overflows the underlying type is rejected" in {
+      err(
+        """enum Small: u2
+          |    A = 3
+          |    B""".stripMargin
+      ) should include("does not fit")
+    }
+  }
 }

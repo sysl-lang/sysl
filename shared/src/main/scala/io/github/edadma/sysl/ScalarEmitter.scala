@@ -105,6 +105,10 @@ trait ScalarEmitter extends StringEmitter {
     case (Type.Char, b: Type.Integer) => convert(Type.Integer(32, signed = false), b, v)
     case (a: Type.Integer, Type.Char) => checkedChar(a, v)
 
+    // A simple enum is stored at its underlying integer width, so converting it to another
+    // integer is just that integer conversion; every enum value is already in range.
+    case (e: Type.Enum, b: Type.Integer) => convert(e.underlying, b, v)
+
     case _ => sys.error(s"unreachable conversion from ${from.llvm} to ${to.llvm}")
 
   private def castOp(instr: String, from: Type, to: Type, v: String): String = {
