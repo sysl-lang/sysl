@@ -22,6 +22,11 @@ trait Emitter {
    */
   protected var usesSnprintf = false
 
+  /** Whether any variadic body walked its tail, which is what the two `llvm.va_*` intrinsics are
+   * declared for. `va_arg` is an instruction and needs no declaration of its own.
+   */
+  protected var usesVarargs = false
+
   /** LLVM intrinsic `declare` lines the module turned out to need — the saturating
    * float-to-integer casts, each declared once under its overload-mangled name.
    */

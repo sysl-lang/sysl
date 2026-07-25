@@ -137,32 +137,68 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * everything downstream of the name — the arity check, argument checking, the emitted call — is
    * then the ordinary path, and what makes it an extern is that codegen finds it in `externDecls`
    * and declares it instead of looking for a body to define.
+   *
+   * **Registration comes before every check but the duplicate-name one**, which is the same rule as
+   * the paragraph above generalized: a declaration that fails a check still exists, because the body
+   * analysis that follows walks the source and will look this signature up whatever was wrong with
+   * it. Reporting the mistake must not also remove the thing it is about.
    */
   private def hoistFunc(stmt: Stmt): Unit = stmt match
     case f: FuncDecl =>
       if funcDecls.contains(f.name) then err(s"function '${f.name}' is already declared")
-      for (tp, traits) <- f.bounds; tr <- traits do
-        if !traitDecls.contains(tr) then
-          err(s"the bound on '$tp' in '${f.name}' names '$tr', which is not a trait")
       funcDecls(f.name) = f
       if f.tparams.isEmpty then
         funcInsts(f.name) =
           (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
+      checkSignatureRules(f.name, f.params, f.retType, f.variadic)
+      for (tp, traits) <- f.bounds; tr <- traits do
+        if !traitDecls.contains(tr) then
+          err(s"the bound on '$tp' in '${f.name}' names '$tr', which is not a trait")
 
     case e: ExternDecl =>
       if funcDecls.contains(e.name) then err(s"function '${e.name}' is already declared")
-      // C reads a variadic call's arguments relative to the last named parameter, so there has to
-      // be one; `f(...)` is not a callable declaration in any C either.
-      if e.variadic && e.params.isEmpty then
-        err(s"'${e.name}' needs at least one named parameter before '...'")
-      funcDecls(e.name) = FuncDecl(e.name, Nil, e.params, e.retType, Nil).setPos(e.pos)
+      funcDecls(e.name) = FuncDecl(e.name, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
       externDecls(e.name) = e
       funcInsts(e.name) =
         (e.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
          e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
+      checkSignatureRules(e.name, e.params, e.retType, e.variadic)
 
     case _ =>
+
+  /** The rules a declared signature must satisfy whichever declaration form it came from, checked
+   * after the name is registered so a failure reports the mistake without also erasing the
+   * declaration it is about.
+   */
+  private def checkSignatureRules(
+      name: String,
+      params: List[Param],
+      ret: Option[TypeRef],
+      variadic: Boolean,
+  ): Unit = {
+    // C reads a variadic call's arguments relative to the last named parameter, so there has to be
+    // one; `f(...)` is not a callable declaration in any C either.
+    if variadic && params.isEmpty then err(s"'$name' needs at least one named parameter before '...'")
+    checkNoVaList(name, params, ret)
+  }
+
+  /** A `va_list` may be a local, which is all a function needs to walk its own tail — but not a
+   * parameter or a result, because handing one to another function is C's `vprintf` shape and its
+   * calling convention is not implemented (`12 §Open g`). Refused with a diagnostic rather than
+   * lowered to something that would pass the wrong thing.
+   */
+  private def checkNoVaList(name: String, params: List[Param], ret: Option[TypeRef]): Unit = {
+    def isVaList(t: TypeRef) = t match
+      case NamedType(n, Nil) => scalarType(n).contains(Type.VaList)
+      case _                 => false
+
+    for p <- params if isVaList(p.typ) do
+      at(p.pos)(err(s"a va_list cannot be a parameter yet — '$name' would have to pass its tail on, " +
+        "which is not supported"))
+    for r <- ret if isVaList(r) do
+      at(r.pos)(err(s"a va_list cannot be returned — it walks '$name''s own tail, which is gone once it returns"))
+  }
 
   /** Structs, enums, and the built-in scalars share one type namespace, so a name may name at
    * most one of them. `never` is in it too: it names a type, so nothing else may.
@@ -321,13 +357,14 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     resetFunction()
     tsubst = subst
     retTy = rtype
+    variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
     val tbody   = analyzeValueBlock(f.body, if rtype == Type.Unit then None else Some(rtype))
 
     if rtype != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, rtype) then
       err(s"function '${f.name}' should return ${show(rtype)}, but its body yields ${show(tbody.ty)}")
 
-    TFunc(name, tparams, rtype, tbody)
+    TFunc(name, tparams, rtype, tbody, f.variadic)
   }
 
   /** Registers an instantiation of a generic function and returns the name codegen will emit.
@@ -664,8 +701,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         val t = analyzeExpr(a)
         t.ty match
           case Type.Unit => err("cannot print a unit value")
-          case Type.Never | _: Type.Struct | _: Type.Enum | _: Type.Ptr | _: Type.Ref | _: Type.Array |
-              _: Type.Slice =>
+          case Type.Never | Type.VaList | _: Type.Struct | _: Type.Enum | _: Type.Ptr | _: Type.Ref |
+              _: Type.Array | _: Type.Slice =>
             err(s"cannot print a ${show(t.ty)} value")
           case _ => t
       })
@@ -693,6 +730,27 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         else t.ty == Type.Str
       if !ok then err(s"format '$spec' expects ${FormatSpec.expects(c)}, but the value has type ${show(t.ty)}")
       TFormat(t, spec)
+
+    // The three ABI primitives of a variadic body (`12 §9`). Each works on the `va_list` itself
+    // rather than a copy — `va_arg` advances it — so the argument is a place whose address is handed
+    // over, exactly as `&ap` would be. They are language forms rather than prelude functions
+    // because no sysl body could implement one: the walk is the target ABI's, not the language's.
+    case Call(Ident("va_start"), args) =>
+      if !variadicFn then err("'va_start' is only allowed in a function declared with '...' — there is no tail here")
+      TVaStart(vaList("va_start", args))
+
+    case Call(Ident("va_end"), args) => TVaEnd(vaList("va_end", args))
+
+    // C writes the type as a second argument, which is not something a sysl expression can hold, so
+    // it comes from the context the value is read into — the same place `None` and `Ok(5)` get
+    // theirs. Nothing in the tail can confirm it, which is the unsafety C has here too.
+    case Call(Ident("va_arg"), args) =>
+      val ap = vaList("va_arg", args)
+      val ty = expected.getOrElse(
+        err("'va_arg' reads the next argument as some type, and nothing here says which — " +
+          "annotate the variable it is read into"),
+      )
+      TVaArg(ap, vaArgType(ty))
 
     // A conversion is written with call syntax, so a scalar type name in call position is one.
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && scalarType(name).isDefined =>
@@ -934,6 +992,35 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case _ => false
 
   /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
+  /** The `va_list` one of the three forms works on, as its address. */
+  private def vaList(what: String, args: List[Expr]): TExpr = {
+    if args.length != 1 then err(s"'$what' takes exactly one argument, the va_list it walks")
+    val place = analyzePlace(args.head, s"'$what'")
+    if place.ty != Type.VaList then err(s"'$what' needs a va_list, not ${show(place.ty)}")
+    TAddrOf(place, Type.Ptr(place.ty))
+  }
+
+  /** Checks that a type is one a variadic tail can be *read* as.
+   *
+   * Every argument was widened on the way in (`12 §1`), so asking for a narrower type than the
+   * promotion produced would read the wrong bytes — C's most common varargs mistake, and one worth
+   * a diagnostic rather than a wrong answer. Nothing is lost: read it at the promoted width and
+   * convert, which is what C's own callee has to do anyway.
+   */
+  private def vaArgType(ty: Type): Type = ty match
+    case i: Type.Integer if i.bits >= 32  => ty
+    case f: Type.Floating if f.bits == 64 => ty
+    case Type.Char | _: Type.Ptr          => ty
+    case i: Type.Integer =>
+      err(s"a variadic argument is promoted to at least 32 bits, so it cannot be read as " +
+        s"${show(i)} — read it as ${if i.signed then "'int'" else "'uint'"} and convert")
+    case f: Type.Floating =>
+      err(s"a variadic argument is promoted to double, so it cannot be read as ${show(f)} — " +
+        "read it as 'real' and convert")
+    case other =>
+      err(s"a variadic argument cannot be read as ${show(other)} — it may be an integer, a real, " +
+        "a char, or a raw pointer")
+
   private def analyzePlace(target: Expr, what: String): TExpr = {
     val t = analyzeExpr(target)
 

@@ -289,6 +289,10 @@ trait TypeResolution extends AnalyzerBase {
    */
   protected def hasZero(t: Type): Boolean = t match
     case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool | _: Type.Ptr => true
+    // A `va_list` has no meaningful starting value — `va_start` is what makes it usable — but
+    // `var ap: va_list` with no initializer is exactly how one is declared, so it zeroes like any
+    // other slot and `va_start` overwrites whatever was there.
+    case Type.VaList => true
     // A zeroed view owns nothing and names no elements, which is exactly the empty slice — and,
     // for a string, the empty string, which is well-formed UTF-8 the way anything empty is.
     case _: Type.View        => true

@@ -276,6 +276,12 @@ private class Escape(program: TProgram) {
     case TStr(a)                    => List(a)
     case TFormat(a, _)              => List(a)
     case TSlice(b, lo, hi, _, _)    => b :: lo.toList ::: hi.toList
+    // A `va_list` carries no view of this frame, and a value read out of the tail came from the
+    // caller's — so walking these finds nothing, and they are here to keep the walk complete
+    // rather than because anything can escape through them.
+    case TVaStart(ap)               => List(ap)
+    case TVaEnd(ap)                 => List(ap)
+    case TVaArg(ap, _)              => List(ap)
     case TTry(v, _, _, _, _, _)     => List(v)
     case TField(r, _, _)            => List(r)
     case TIf(c, t, el, _)           => c :: t.result.toList ::: el.flatMap(_.result).toList

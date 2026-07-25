@@ -48,6 +48,16 @@ object Type {
   case object Bool extends Type { def llvm = "i1"  }
   case object Unit extends Type { def llvm = "void" }
 
+  /** The state of a walk through a variadic function's tail (`12 §9`) — C's `va_list`.
+   *
+   * A predeclared type rather than a struct a program could have written, because its layout is the
+   * target ABI's: 24 bytes of register-save bookkeeping under x86-64 SysV, 32 under AAPCS64, a bare
+   * pointer under Darwin's arm64. Four pointers' worth covers every one of them, and only the
+   * prefix the ABI defines is ever touched — over-reserving a stack slot costs nothing, while
+   * under-reserving would be silent corruption.
+   */
+  case object VaList extends Type { def llvm = "[4 x ptr]" }
+
   /** The type of an expression that does not finish — a call to something that never returns, and
    * so the arm of a `match` or `if` that aborts rather than yielding a value.
    *
@@ -154,7 +164,8 @@ object Type {
     "ushort" -> Integer(16, signed = false),
     "uint"   -> Integer(32, signed = false),
     "ulong"  -> Integer(64, signed = false),
-    "real"   -> Floating(64),
+    "real"    -> Floating(64),
+    "va_list" -> VaList,
   )
 
   /** The alias a diagnostic prefers when a width has a friendly name. */
@@ -170,6 +181,7 @@ object Type {
     case Bool                     => "bool"
     case Str                      => "string"
     case Unit                     => "unit"
+    case VaList                   => "va_list"
     case Never                    => "never"
     case Unknown                  => "?"
     case Ptr(inner)               => s"*${show(inner)}"

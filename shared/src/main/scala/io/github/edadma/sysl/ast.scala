@@ -204,6 +204,10 @@ case class Continue(label: Option[String]) extends Stmt
  * keyed by name so it carries no positional dependence on `tparams`; a parameter with no bound
  * is absent from the map. A bound is what a caller must satisfy — the concrete type it supplies
  * for that parameter must implement every trait named — and is checked at each call site.
+ *
+ * `variadic` is the trailing `...` of `sum(n: int, ...)`: the same ellipsis an `extern` takes, under
+ * the same rules for what the tail may hold. The body reads it through `va_start`/`va_arg`/`va_end`
+ * (`12-functions-and-closures.md` §9).
  */
 case class FuncDecl(
     name: String,
@@ -212,6 +216,7 @@ case class FuncDecl(
     retType: Option[TypeRef],
     body: List[Stmt],
     bounds: Map[String, List[String]] = Map.empty,
+    variadic: Boolean = false,
 ) extends Stmt
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
@@ -222,9 +227,9 @@ case class FuncDecl(
  * `exit`, a driver's MMIO helper — and why the escape analysis has to assume the worst of it
  * (`05-escape-analysis.md`): every argument may be kept, and the result may view any of them.
  *
- * `variadic` is the trailing `...` of `extern printf(fmt: *u8, ...) -> int`: the C ellipsis, and
- * the only place in sysl a call's arity is not fixed by its declaration. A sysl *function* never
- * has one (`12-functions-and-closures.md` §9).
+ * `variadic` is the trailing `...` of `extern printf(fmt: *u8, ...) -> int`: the C ellipsis, which a
+ * sysl function may carry too (`12-functions-and-closures.md` §1, §9) under the same rules for what
+ * the tail may hold.
  */
 case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef],
                       variadic: Boolean = false) extends Stmt

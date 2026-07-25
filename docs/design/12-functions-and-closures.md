@@ -99,8 +99,8 @@ extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
 
 The ellipsis follows the named parameters and **there must be at least one**, because C reads a
 variadic call's tail relative to the last named argument; `extern f(...)` is not a callable
-declaration in any C either. A **sysl function never has one** (§9): the tail is a property of the
-foreign seam, not of the language's own calls.
+declaration in any C either. A **sysl function may have one too** (§9), and the rules for what may go
+in the tail are shared, so a caller need not know whether the callee it is reaching is foreign.
 
 A call to one is checked against the declared parameters exactly as any other call is — the
 ellipsis excuses nothing that comes before it, arity included, and the escape analysis still assumes
@@ -339,7 +339,61 @@ arrays, and an escaping local-array slice, all of which `capabilities.md` gates 
 `no alloc` program may still use the inlined `map`-shaped closures freely, because those never
 allocate.
 
-## 9. What is deliberately absent
+## 9. Variadic functions
+
+**A sysl function may be variadic**, with the same trailing `...` an `extern` takes (§1):
+
+```
+sum(n: int, ...) -> int
+    var ap: va_list
+    va_start(ap)
+    var total = 0
+    for i in 0..<n
+        total += va_arg[int](ap)
+    va_end(ap)
+    total
+end sum
+
+print(sum(3, 10, 20, 30))
+```
+
+**Why it is here at all.** C can do this, so sysl must: a capability C has and sysl lacks is a place
+sysl cannot be used, and sysl exists to be used where C is. That is the whole argument, and it
+overrides the aesthetic preference for fixed arity that an earlier draft of this chapter mistook for
+a decision. The concrete cases are the ones every C codebase has — a logging or formatting function
+whose arity is the caller's business, and a function that must be *callable from* C at a variadic
+signature or hand a tail onward to one.
+
+**The calling side is the same rule as §1**, and deliberately so: only what varargs can carry may go
+in the tail (an integer, a float, a `char`, a raw pointer), passed already widened by C's default
+argument promotions. One rule for a foreign callee and a sysl one means a caller does not have to
+know which it is reaching, and it means the two share their implementation rather than drifting.
+
+**The receiving side is C's, spelled sysl's way.**
+
+- **`va_list`** is a predeclared type, like `int` and `never` — not a struct the program could have
+  written, because its layout is the target ABI's.
+- **`va_start(ap)`** readies it. C also names the last fixed parameter here; sysl does not, because
+  the function already knows which parameter that is and repeating it is a chance to get it wrong.
+- **`va_arg[T](ap)`** takes the next argument as a `T` and advances. C writes the type as a second
+  argument, which is not a thing sysl expressions can hold, so it is a type argument — the same
+  position every other generic puts one in.
+- **`va_end(ap)`** finishes with it.
+
+These four are **language forms, not library functions**, in the same category as `sizeof`: each is
+an ABI primitive that no sysl body could implement, so there is nothing to put in the prelude. That
+is the line the "no functions built into the compiler" rule actually draws — `print` is on the wrong
+side of it because a program *could* write `print`; `va_arg` is on the right side because no program
+could write `va_arg`.
+
+**It is as unsafe as C's, and for the same reason.** Nothing checks that the callee asks for the
+types the caller passed, or that it stops at the right count; `va_arg` past the end reads whatever
+is there. The tail carries no type information, so there is nothing to check against — this is the
+one place in sysl where getting it wrong is undiagnosed, and it is why a *safe* variadic (a
+homogeneous `...T` collected into a slice, or a heterogeneous `...&Show` over trait objects) is
+worth adding **beside** it later (`§ Open i`), never instead of it.
+
+## 10. What is deliberately absent
 
 - **No `fn` / `func` / `lambda` keyword.** A function is a name and a parameter list; a closure is
   an arrow. Neither takes an introducer, consistent with the keyword-lightness of the enum,
@@ -351,10 +405,10 @@ allocate.
   `Fn(A) -> Fn(B) -> C`; a bare arrow type is `A -> B` with a single domain, and multi-argument
   types are parenthesized `(A, B) -> C` (§6), never chained. Partial application is a library
   concern (a closure that captures the first argument), not a language one.
-- **No variadic parameters on a sysl function.** A function has a fixed arity. The `...` of §1
-  belongs to `extern` alone, where it is C's ellipsis and carries C's rules; a sysl-side variadic
-  would need a way to *receive* a tail — a `va_list` equivalent, or an implicit slice — and nothing
-  in the language wants one, since a slice parameter already takes "however many of these".
+- *(An earlier draft of this chapter listed "no variadic parameters" here. That was wrong and is
+  reversed: a sysl function may be variadic, and §9 is the feature. Anything C can do, sysl must be
+  able to do — a capability C has and sysl lacks is a place sysl cannot be used, and nothing belongs
+  on this list for merely being unfashionable.)*
 
 ---
 
@@ -386,10 +440,16 @@ allocate.
   every program. An override (Rust's `#[link_name]`, a leading string) would let `extern` bind
   `snprintf` to a sysl-shaped name, and would let the prelude keep its own primitives out of the
   user's namespace. Additive; deferred until a real case needs it.
-- **g. Receiving a variadic tail, and `va_list`.** §1 lets sysl *call* a C variadic. Being handed
-  one — a callback with a `va_list` parameter, or `vsnprintf` — is the other direction, and needs
-  a type for the list plus the `va_start`/`va_arg`/`va_end` sequence, none of which any real case
-  has asked for yet. Deferred rather than guessed.
+- **g. `va_copy`, and a `va_list` that crosses a call.** §9 covers reading a tail in the function
+  that received it. Passing an `ap` on to another function (C's `vprintf` shape) and duplicating one
+  (`va_copy`) are the rest of C's surface here, and both belong — they are simply not built yet.
+- **h₂. A variadic method.** §9's ellipsis reaches a free function and an `extern`; a method's
+  parameter list is a separate production (it carries a receiver) and does not take one, so
+  `add(self, n: int, ...)` is a parse error. C has no methods, so no C capability is denied — but the
+  inconsistency with a free function is a gap rather than a decision.
+- **i. A *safe* variadic beside the C-faithful one.** A homogeneous `...T` collected into a slice
+  (Go's, Swift's) or a heterogeneous `...&Show` over trait objects would be checked, which §9's
+  cannot be. It is additive and wanted; the trait-object half waits on dynamic dispatch (`02`).
 - **h. Capability gating for externs.** An `extern` reaching into libc is exactly the kind of thing
   `capabilities.md` exists to gate, and a freestanding `no alloc` target's externs are a different
   set from a hosted one's. Which capability an extern requires — and whether that is a property of

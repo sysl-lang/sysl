@@ -120,6 +120,17 @@ case class TFormat(arg: TExpr, spec: String) extends TExpr { def ty: Type = Type
 /** A call to a user function. */
 case class TCall(name: String, args: List[TExpr], ty: Type) extends TExpr
 
+/** The three ABI primitives of a variadic body (`12 §9`), each holding the *address* of the
+ * `va_list` it works on — they advance it rather than reading a copy of it, so what the analyzer
+ * hands over is the place, exactly as `&ap` would.
+ *
+ * `TVaArg` carries the type it reads, which the analyzer took from the context the value is used
+ * in; there is nothing in the tail to check that against, which is what makes it as unsafe as C's.
+ */
+case class TVaStart(ap: TExpr) extends TExpr { def ty: Type = Type.Unit }
+case class TVaEnd(ap: TExpr)   extends TExpr { def ty: Type = Type.Unit }
+case class TVaArg(ap: TExpr, ty: Type) extends TExpr
+
 /** Positional construction of a value struct. */
 case class TStructNew(struct: Type.Struct, args: List[TExpr]) extends TExpr { def ty: Type = struct }
 
@@ -246,7 +257,8 @@ case class TContinue(depth: Int)                    extends TStmt
 /** A user function. Parameters carry their unique names (the codegen allocates a slot for
  * each so the body can read and mutate them uniformly).
  */
-case class TFunc(name: String, params: List[(String, Type)], retTy: Type, body: TBlock)
+case class TFunc(name: String, params: List[(String, Type)], retTy: Type, body: TBlock,
+                 variadic: Boolean = false)
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones
  * the program actually calls reach here, so an `extern` the prelude offers and nobody uses costs

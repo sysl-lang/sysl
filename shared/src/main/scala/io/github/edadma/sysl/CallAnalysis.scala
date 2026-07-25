@@ -32,9 +32,9 @@ trait CallAnalysis extends Literals {
   }
 
   protected def callFunction(f: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
-    // A variadic extern fixes only where its declared parameters stop; everything after them is
-    // the tail, checked by the rule of §1 below rather than against a parameter.
-    val variadic = externDecls.get(f.name).exists(_.variadic)
+    // A variadic callee — foreign or sysl's own — fixes only where its declared parameters stop;
+    // everything after them is the tail, checked by the rule below rather than against a parameter.
+    val variadic = f.variadic
 
     if variadic then
       if args.length < f.params.length then

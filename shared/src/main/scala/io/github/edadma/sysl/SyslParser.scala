@@ -361,8 +361,8 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val funcDecl: PackratParser[Stmt] =
     ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
       val (names, bounds) = tps.getOrElse((Nil, Map.empty))
-      (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
-        case params ~ ret ~ body => FuncDecl(name, names, params, ret, body, bounds)
+      (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
+        case ((params, variadic)) ~ ret ~ body => FuncDecl(name, names, params, ret, body, bounds, variadic)
       }
     }
 
@@ -371,15 +371,16 @@ class SyslParser(val source: Source) extends PackratParsers {
    * function; `-> never` says the callee does not come back.
    */
   private lazy val externDecl: PackratParser[Stmt] =
-    op("extern") ~> ident ~ (op("(") ~> externParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+    op("extern") ~> ident ~ (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
       case name ~ ((params, variadic)) ~ ret => ExternDecl(name, params, ret, variadic)
     }
 
-  /** An extern's parameters, which may end in `...` — the C ellipsis, and the one arity in the
-   * language a declaration does not fix. The `...`-only form parses so the analyzer can say why a
-   * variadic needs a named parameter before it, rather than the grammar reporting a stray token.
+  /** A declared parameter list, which may end in `...` — the C ellipsis, and the one arity a
+   * declaration does not fix. Shared by `extern` and by a sysl function, which may be variadic too.
+   * The `...`-only form parses so the analyzer can say why a variadic needs a named parameter before
+   * it, rather than the grammar reporting a stray token.
    */
-  private lazy val externParams: Parser[(List[Param], Boolean)] =
+  private lazy val paramList: Parser[(List[Param], Boolean)] =
     op("...") ^^^ (Nil, true) |
       repsep(param, op(",")) ~ opt(op(",") ~> op("...")) ^^ { case ps ~ dots => (ps, dots.isDefined) }
 

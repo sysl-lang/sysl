@@ -29,6 +29,9 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       out ++= "declare ptr @malloc(i64)\n"
       out ++= "declare void @free(ptr)\n"
     if usesSnprintf then out ++= "declare i32 @snprintf(ptr, i64, ptr, ...)\n"
+    if usesVarargs then
+      out ++= "declare void @llvm.va_start.p0(ptr)\n"
+      out ++= "declare void @llvm.va_end.p0(ptr)\n"
 
     // An `extern` the program calls is declared here, unless the runtime already declared it under
     // that name — a module may not declare one symbol twice, and the runtime's own spelling of
@@ -78,11 +81,16 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     out.toString
   }
 
-  /** The externs declared with a `...`, by name — the only callees a call is written differently
-   * for.
+  /** Every callee declared with a `...`, foreign or sysl's own, mapped to the LLVM function type a
+   * call to it must name: result type, declared parameter types, ellipsis.
    */
-  private val variadics: Map[String, TExtern] =
-    program.externs.filter(_.variadic).map(e => e.name -> e).toMap
+  private val variadics: Map[String, String] =
+    val fromExterns = program.externs.filter(_.variadic).map(e => e.name -> (e.retTy, e.params.map(_.llvm)))
+    val fromFuncs   = program.funcs.filter(_.variadic).map(f => f.name -> (f.retTy, f.params.map(_._2.llvm)))
+
+    (fromExterns ++ fromFuncs).map { case (name, (retTy, params)) =>
+      name -> s"${if Type.noValue(retTy) then "void" else retTy.llvm} (${(params :+ "...").mkString(", ")})"
+    }.toMap
 
   /** What a `call` names. For an ordinary function that is the result type, which is all LLVM
    * needs; for a variadic one it is the callee's *whole* function type, because the argument list
@@ -90,8 +98,8 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
    */
   private def calleeOf(name: String, ty: Type): String =
     variadics.get(name) match
-      case Some(e) => s"${e.retTy.llvm} (${(e.params.map(_.llvm) :+ "...").mkString(", ")}) @$name"
-      case None    => s"${if Type.noValue(ty) then "void" else ty.llvm} @$name"
+      case Some(fnTy) => s"$fnTy @$name"
+      case None       => s"${if Type.noValue(ty) then "void" else ty.llvm} @$name"
 
   private def genMain(stmts: List[TStmt]): String = {
     startFunction()
@@ -135,7 +143,8 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       case None =>
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
-    val params = f.params.map { case (name, ty) => s"${ty.llvm} %$name.param" }.mkString(", ")
+    val declared = f.params.map { case (name, ty) => s"${ty.llvm} %$name.param" }
+    val params   = (declared ++ Option.when(f.variadic)("...")).mkString(", ")
     finishFunction(s"define ${f.retTy.llvm} @${f.name}($params)")
   }
 
@@ -149,6 +158,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     case _: Type.Struct   => "zeroinitializer"
     case _: Type.Array    => "zeroinitializer"
     case _: Type.View     => "zeroinitializer"
+    case Type.VaList      => "zeroinitializer"
     case e: Type.Enum     => if e.simple then "0" else "zeroinitializer"
     case Type.Unit        => ""
     // Nothing is lowered from a program that has an error, and a type the analyzer could not work
@@ -382,6 +392,21 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       else
         val r = freshTemp(); emit(s"$r = call $callee(${argVals.mkString(", ")})")
         ownTemp(r, ty)
+
+    // The tail walk is the ABI's, so all three are LLVM's own: two intrinsic calls and the one
+    // instruction whose lowering every backend supplies for it.
+    case TVaStart(ap) =>
+      usesVarargs = true
+      emit(s"call void @llvm.va_start.p0(ptr ${genExpr(ap)})"); ""
+
+    case TVaEnd(ap) =>
+      usesVarargs = true
+      emit(s"call void @llvm.va_end.p0(ptr ${genExpr(ap)})"); ""
+
+    case TVaArg(ap, ty) =>
+      val r = freshTemp()
+      emit(s"$r = va_arg ptr ${genExpr(ap)}, ${ty.llvm}")
+      r
 
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)

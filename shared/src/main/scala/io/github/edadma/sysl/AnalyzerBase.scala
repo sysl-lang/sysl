@@ -109,6 +109,11 @@ trait AnalyzerBase {
   protected var retTy: Type                                                 = Type.Unit
   protected var tsubst: Map[String, Type]                                   = Map.empty
 
+  /** Whether the function being analyzed declared a `...`, which is what `va_start` needs: there is
+   * no tail to start walking in a function that does not have one. C's rule exactly.
+   */
+  protected var variadicFn: Boolean = false
+
   /** The enclosing loops, innermost first, so a `break`/`continue` finds the one it leaves and a
    * `break value` records its type against that loop's result. `expected` is the type the loop's
    * context wants, pushed down so a `break`/`else` value boxes to `&T` on its own. `label` is the
