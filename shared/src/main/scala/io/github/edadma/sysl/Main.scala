@@ -57,13 +57,13 @@ private def execute(cfg: Config): Int = {
 
   cfg.command match
     case "emit-llvm" =>
-      Compiler.compileToLlvm(source) match
-        case Left(err) => fail(err)
+      Compiler.compileToLlvm(source, cfg.file) match
+        case Left(err) => report(err)
         case Right(ir) => stdout(ir); 0
 
     case "build" =>
-      Compiler.compileToLlvm(source) match
-        case Left(err) => fail(err)
+      Compiler.compileToLlvm(source, cfg.file) match
+        case Left(err) => report(err)
         case Right(ir) =>
           val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
           Toolchain.build(ir, exe) match
@@ -71,8 +71,8 @@ private def execute(cfg: Config): Int = {
             case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
-      Compiler.compileToLlvm(source) match
-        case Left(err) => fail(err)
+      Compiler.compileToLlvm(source, cfg.file) match
+        case Left(err) => report(err)
         case Right(ir) =>
           val exe = createTempFile("sysl-", "")
           Toolchain.build(ir, exe) match
@@ -96,7 +96,16 @@ private def defaultOutputName(file: String): String = {
   if base.isEmpty then "a.out" else base
 }
 
+/** A driver failure — something that went wrong around the compiler rather than inside it. */
 private def fail(msg: String): Int = {
-  Console.err.println(s"sysl: $msg")
+  Console.err.println(s"sysl: error: $msg")
+  1
+}
+
+/** A diagnostic from the compiler, which already renders itself with its location and a caret
+ * under the offending column, so it is printed exactly as it came.
+ */
+private def report(diagnostic: String): Int = {
+  Console.err.println(diagnostic)
   1
 }

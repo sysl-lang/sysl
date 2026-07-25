@@ -72,6 +72,45 @@ whose diagnostics users hit most (statement heads, type positions, block openers
 buys a large amount of **development speed**, letting effort go to the language — types, memory
 model, semantics — rather than parser plumbing.
 
+## Source positions
+
+Every AST node carries the position of the first token its rule consumed, and every typed node
+inherits the position of the untyped node it came from — so a diagnostic from any pass names the
+file, quotes the line, and puts a caret under the column:
+
+```
+error: 'b' of 'add' is int, but string was given
+ --> hello.sysl:7:14
+  |
+7 | print(add(x, "two"))
+  |              ^
+```
+
+Three decisions make this cheap enough to apply everywhere:
+
+- **A position is a mutable field (`Positioned`), not a constructor parameter.** Putting it in a
+  case class's signature would put it into `equals`, and every structural comparison — which is
+  how the parser is tested — would then have to spell out positions it does not care about.
+  Keeping it out leaves `Binary("+", a, b) == Binary("+", a, b)` true regardless of what file
+  either side was parsed from.
+- **`setPos` keeps the first position it is given.** Parsing builds bottom-up, so the innermost
+  rule to claim a node is the most specific one that could: a `.field` tail records the dot, and
+  the enclosing expression rule, which would have recorded the start of the whole expression,
+  leaves it alone. An outer rule wrapping an inner one therefore costs nothing.
+- **The analyzer keeps a cursor rather than threading a position through every check.** Each
+  recursive entry point sets the cursor to the node it is about to work on and restores it after,
+  so a rule that fires *after* its children are done — comparing two branch types, say — still
+  points at the construct that raised it rather than at whatever was visited last.
+
+A `Pos` holds the `Source` it points into, which is what keeps the prelude's positions and the
+user's file's from being confused for one another, and what lets a diagnostic render itself
+without any pass having to carry the source text alongside the message.
+
+**Still open: one error at a time.** The analyzer reports by throwing, so a program with three
+mistakes shows one. Positions are the prerequisite for fixing that — a recovered error has to
+say where it was — and the recovery strategy itself (what to return in place of a failed
+subtree) is the remaining work.
+
 ## Reversibility (why this is not a lock-in)
 
 The seam is the **`List[Token]`**. If diagnostics or performance ever justify it, a

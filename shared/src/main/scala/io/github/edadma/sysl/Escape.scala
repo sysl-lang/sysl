@@ -163,7 +163,7 @@ private class Escape(program: TProgram) {
     }
 
     private def returned(v: TExpr): Unit =
-      if returningEscapes && viewsFrame(v) then report("is returned")
+      if returningEscapes && viewsFrame(v) then report(v, "is returned")
       else escaping(v)
 
     /** Walks an expression for the places a confined view stops being confined: the heap, a
@@ -171,28 +171,34 @@ private class Escape(program: TProgram) {
      */
     private def escaping(e: TExpr): Unit = {
       e match
-        case TBox(v, _) => if viewsFrame(v) then report("is put on the heap")
+        case TBox(v, _) => if viewsFrame(v) then report(v, "is put on the heap")
 
         case TStore(place, v, _) =>
           place match
             case _: TLoad => ()
-            case _        => if viewsFrame(v) then report("is stored somewhere the frame does not own")
+            case _        => if viewsFrame(v) then report(v, "is stored somewhere the frame does not own")
 
         case TCall(name, args, _) =>
           for (a, i) <- args.zipWithIndex do
-            if viewsFrame(a) && kept(name, i) then report(s"is passed to '$name', which holds on to it")
+            if viewsFrame(a) && kept(name, i) then report(a, s"is passed to '$name', which holds on to it")
 
         case _ =>
 
       children(e).foreach(escaping)
     }
 
-    private def report(how: String): Unit =
+    /** Reports the escape against the expression that causes it, so the caret lands on the slice
+     * that leaves the frame rather than on the function as a whole.
+     */
+    private def report(at: TExpr, how: String): Unit =
       if escape.isEmpty then
         escape = Some(
-          s"a slice of an array this frame owns $how, so it would outlive the array — " +
-            "put the storage on the heap as '&[N]T', or return a length and let the caller " +
-            "slice its own buffer",
+          Diagnostic.render(
+            s"a slice of an array this frame owns $how, so it would outlive the array — " +
+              "put the storage on the heap as '&[N]T', or return a length and let the caller " +
+              "slice its own buffer",
+            at.pos,
+          ),
         )
   }
 

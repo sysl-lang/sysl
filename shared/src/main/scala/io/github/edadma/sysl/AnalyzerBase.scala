@@ -3,9 +3,10 @@ package io.github.edadma.sysl
 import scala.collection.mutable
 
 /** An error raised by the analyzer: an unknown name, a type mismatch, a wrong arity — any
- * rule that the structural parse cannot catch.
+ * rule that the structural parse cannot catch. `pos` is where in the source it was found, which
+ * is absent only for a rule that fires away from any one node.
  */
-case class AnalyzerError(message: String) extends RuntimeException(message)
+case class AnalyzerError(message: String, pos: Option[Pos]) extends RuntimeException(message)
 
 /** The shared substrate of the analyzer, mixed into the feature traits (`TypeResolution`,
  * `Literals`, `CallAnalysis`, `PatternAnalysis`) and the `Analyzer` class itself.
@@ -93,7 +94,28 @@ trait AnalyzerBase {
     val breakTys = mutable.ListBuffer.empty[Type]
   protected var loops: List[LoopCtx] = Nil
 
-  protected def err(msg: String): Nothing = throw AnalyzerError(msg)
+  /** Where the analyzer currently is. Every recursive entry point (a statement, an expression, a
+   * type reference, a declaration) sets this to the node it is about to work on and restores it
+   * afterwards, so an error raised *after* the children are done still points at the parent that
+   * raised it rather than at whatever was visited last.
+   */
+  protected var currentPos: Option[Pos] = None
+
+  /** Runs `body` with diagnostics pointing at `p`, restoring the previous position after. A node
+   * with no position of its own leaves the enclosing one in place, which is what keeps a
+   * synthesized node's errors pointing somewhere useful.
+   */
+  protected def at[T](p: Option[Pos])(body: => T): T =
+    if p.isEmpty then body
+    else {
+      val saved = currentPos
+
+      currentPos = p
+      try body
+      finally currentPos = saved
+    }
+
+  protected def err(msg: String): Nothing = throw AnalyzerError(msg, currentPos)
 
   protected def show(t: Type): String = Type.show(t)
 

@@ -7,9 +7,13 @@ package io.github.edadma.sysl
  */
 object Compiler {
 
-  def compileToLlvm(source: String): Either[String, String] =
+  /** Compiles source text to an LLVM IR module, or to the first error as a rendered diagnostic.
+   * `name` is what a diagnostic calls the source — a path from the driver, a placeholder from a
+   * test — and it is carried by every position the front end records.
+   */
+  def compileToLlvm(source: String, name: String = "<input>"): Either[String, String] =
     for
-      tree    <- SyslParser.parse(source)
+      tree    <- SyslParser.parse(Source(name, source))
       typed   <- Analyzer.analyze(tree)
       checked <- Escape.check(typed).toLeft(typed)
     yield Codegen.generate(checked)

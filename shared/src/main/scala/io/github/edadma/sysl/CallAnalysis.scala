@@ -22,8 +22,11 @@ trait CallAnalysis extends TypeResolution {
       case Some(provisional) => provisional.zip(params).map { case (t, (_, pty)) => box(t, pty) }
       case None              => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
 
+    // The complaint is about one argument, so it is reported where that argument is written
+    // rather than at the call as a whole.
     for (t, (pname, pty)) <- ts.zip(params) do
-      if t.ty != pty then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")
+      at(t.pos):
+        if t.ty != pty then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")
 
     ts
   }

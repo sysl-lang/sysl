@@ -30,8 +30,8 @@ object Toolchain {
   /** Compiles, links, and runs a source program, returning its exit code and captured
    * stdout — the end-to-end path the run-it test tier exercises.
    */
-  def compileAndRun(source: String): Either[String, (Int, String)] =
-    Compiler.compileToLlvm(source).flatMap { ir =>
+  def compileAndRun(source: String, name: String = "<input>"): Either[String, (Int, String)] =
+    Compiler.compileToLlvm(source, name).flatMap { ir =>
       val exe = createTempFile("sysl-", "")
 
       build(ir, exe).map { _ =>

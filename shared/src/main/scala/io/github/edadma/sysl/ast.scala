@@ -10,9 +10,13 @@ package io.github.edadma.sysl
  *
  * The tree is *untyped*: the parser produces it structurally, and the analyzer
  * (`Analyzer`) turns it into a typed tree (`tast.scala`) that codegen consumes.
+ *
+ * Every node carries the source position the parser found it at (`Positioned`), which is what
+ * lets a diagnostic quote the line and point at the column. The position is deliberately not a
+ * constructor parameter, so structural equality is unaffected by it.
  */
 
-sealed trait Expr
+sealed trait Expr extends Positioned
 
 case class IntLit(value: BigInt, suffix: Option[String]) extends Expr
 case class FloatLit(text: String, suffix: Option[String]) extends Expr
@@ -104,14 +108,14 @@ case class StructPattern(name: String, fields: List[(String, Pattern)]) extends 
  * boolean the scrutinee value must additionally satisfy. Each body is a statement list whose
  * trailing expression is the arm's value.
  */
-case class MatchArm(patterns: List[Pattern], guard: Option[Expr], body: List[Stmt])
+case class MatchArm(patterns: List[Pattern], guard: Option[Expr], body: List[Stmt]) extends Positioned
 
 /** `match scrutinee` with indented arms — an **expression** yielding the taken arm's value
  * (or `unit` in statement position). Arms are tried top to bottom.
  */
 case class MatchExpr(scrutinee: Expr, arms: List[MatchArm]) extends Expr
 
-sealed trait TypeRef
+sealed trait TypeRef extends Positioned
 
 /** A named type, optionally applied to type arguments: `int`, `Box[int]`,
  * `Result[int, string]`. A bare name may also be a type *parameter* of the enclosing
@@ -129,7 +133,7 @@ case class RefType(inner: TypeRef, sync: Boolean) extends TypeRef
 case class ArrayType(length: Option[Expr], elem: TypeRef) extends TypeRef
 
 /** One `name: type` binding, shared by function parameters and struct fields. */
-case class Param(name: String, typ: TypeRef)
+case class Param(name: String, typ: TypeRef) extends Positioned
 
 /** How an instance member takes its receiver — the memory-mode sigil written before `self`.
  * A property receiver is implicit and not spelled, so it is absent here (a property carries no
@@ -155,9 +159,9 @@ case class MethodDecl(
     params: List[Param],
     retType: Option[TypeRef],
     body: List[Stmt],
-)
+) extends Positioned
 
-sealed trait Stmt
+sealed trait Stmt extends Positioned
 
 /** `var name [: type] [= init]`. A declaration with a type and no initializer starts at that
  * type's zero value, which is how a scratch buffer is written; a type that has no zero value
@@ -219,7 +223,7 @@ case class StructDecl(name: String, tparams: List[String], fields: List[Param], 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
  * variant; a variant with an optional `value` and no fields is a simple integer constant.
  */
-case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param])
+case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param]) extends Positioned
 
 /** `enum Name[T…]` with indented variants. All-dataless variants make a *simple* enum (integer
  * constants, auto-incrementing, with optional explicit `= value`); any data-carrying variant

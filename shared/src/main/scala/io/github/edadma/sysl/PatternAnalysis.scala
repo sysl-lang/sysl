@@ -10,7 +10,10 @@ trait PatternAnalysis extends TypeResolution {
   /** Analyzes one arm in its own scope so pattern bindings are visible to the guard and body.
    * Alternatives (`a | b`) may not bind, since the body cannot know which alternative matched.
    */
-  protected def analyzeArm(scrutTy: Type, arm: MatchArm, expected: Option[Type]): TArm = {
+  protected def analyzeArm(scrutTy: Type, arm: MatchArm, expected: Option[Type]): TArm =
+    at(arm.pos)(analyzeArmAt(scrutTy, arm, expected))
+
+  private def analyzeArmAt(scrutTy: Type, arm: MatchArm, expected: Option[Type]): TArm = {
     pushScope()
     val tpats = arm.patterns.map(analyzePattern(_, scrutTy))
     if tpats.length > 1 && tpats.exists(binds) then

@@ -7,9 +7,12 @@ package io.github.edadma.sysl
  * fail (unknown name, type mismatch, wrong arity) has already been checked. Codegen is then
  * a straight lowering — it selects instructions from the types it is handed and never makes
  * a semantic decision of its own.
+ *
+ * A typed node keeps the position of the untyped one it came from, so the passes that run *after*
+ * the analyzer — escape analysis, which sees only this tree — can point at source too.
  */
 
-sealed trait TExpr {
+sealed trait TExpr extends Positioned {
   def ty: Type
 }
 

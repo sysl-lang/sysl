@@ -14,8 +14,12 @@ import scala.util.parsing.input.{NoPosition, Position, Reader}
  *
  * The `List[Token]` is the reversibility seam: a hand-written parser could later consume the
  * same tokens with no change to the lexer.
+ *
+ * Every rule that builds a node wraps itself in `at`, which stamps the node with the position of
+ * the first token the rule consumed. A parser is bound to one `Source` so that stamp is complete
+ * — file, line, and column — the moment the node exists.
  */
-class SyslParser extends PackratParsers {
+class SyslParser(val source: Source) extends PackratParsers {
 
   val lexical: SyslLexical = new SyslLexical
   type Elem = lexical.Token
@@ -32,6 +36,35 @@ class SyslParser extends PackratParsers {
 
   private def reader(src: String): Reader[lexical.Token] =
     new PackratReader(new TokenReader(lexical.scanPositioned(src)))
+
+  // --- positions -----------------------------------------------------------------------
+
+  /** Where the next token starts, in this parser's source. */
+  private def posOf(in: Input): Pos = {
+    val p = in.pos
+
+    Pos(source, p.line, p.column)
+  }
+
+  /** Stamps whatever `p` builds with the position of the first token `p` consumed.
+   *
+   * Because `setPos` keeps the first position it is given (`Positioned`), wrapping an outer rule
+   * never overwrites what an inner one already recorded — so a rule that merely passes its
+   * operand through costs nothing, and only the rule that actually built the node decides where
+   * it points. `p` is by-name so a rule may wrap a `lazy val` declared later in the file.
+   */
+  private def at[T <: Positioned](p: => Parser[T]): Parser[T] =
+    Parser { in =>
+      p(in) match {
+        case Success(t, rest) => Success(t.setPos(posOf(in)), rest)
+        case other            => other
+      }
+    }
+
+  /** The current position, consuming nothing — for a rule that builds its node from a tail it
+   * has already passed, where the tail's own start is the better place to point.
+   */
+  private def here: Parser[Pos] = Parser(in => Success(posOf(in), in))
 
   // --- terminals -----------------------------------------------------------------------
 
@@ -55,7 +88,7 @@ class SyslParser extends PackratParsers {
   /** `if` and `match` are expressions (they yield the taken branch's value), so they sit at
    * the top of the grammar — an ordinary operand everywhere an expression is expected.
    */
-  lazy val expression: PackratParser[Expr] = ifExpr | matchExpr | whileExpr | forExpr | assignment
+  lazy val expression: PackratParser[Expr] = at(ifExpr | matchExpr | whileExpr | forExpr | assignment)
 
   private def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))
@@ -66,22 +99,26 @@ class SyslParser extends PackratParsers {
    * those forms into a binary operand, so `1 + match …` still does not parse.
    */
   lazy val assignment: PackratParser[Expr] =
-    logicalOr ~ assignOp ~ expression ^^ { case l ~ o ~ r => Assign(o, l, r) } |
-      logicalOr
+    at(
+      logicalOr ~ assignOp ~ expression ^^ { case l ~ o ~ r => Assign(o, l, r) } |
+        logicalOr,
+    )
 
   private def assignOp: Parser[String] =
     op("=") | op("+=") | op("-=") | op("*=") | op("/=") | op("%=") |
       op("&=") | op("|=") | op("^=") | op("<<=") | op(">>=")
 
-  lazy val logicalOr: PackratParser[Expr]  = chainl1(logicalAnd, binOp("||"))
-  lazy val logicalAnd: PackratParser[Expr] = chainl1(comparison, binOp("&&"))
+  lazy val logicalOr: PackratParser[Expr]  = at(chainl1(logicalAnd, binOp("||")))
+  lazy val logicalAnd: PackratParser[Expr] = at(chainl1(comparison, binOp("&&")))
 
   /** Comparison chains rather than associates: `a < b < c` becomes one `Compare`. */
   lazy val comparison: PackratParser[Expr] =
-    rangeExpr ~ rep(compareOp ~ rangeExpr) ^^ {
-      case first ~ Nil  => first
-      case first ~ rest => Compare(first :: rest.map { case _ ~ e => e }, rest.map { case o ~ _ => o })
-    }
+    at(
+      rangeExpr ~ rep(compareOp ~ rangeExpr) ^^ {
+        case first ~ Nil  => first
+        case first ~ rest => Compare(first :: rest.map { case _ ~ e => e }, rest.map { case o ~ _ => o })
+      },
+    )
 
   private def compareOp: Parser[String] =
     op("==") | op("!=") | op("<=") | op(">=") | op("<") | op(">")
@@ -92,44 +129,56 @@ class SyslParser extends PackratParsers {
    * end may be omitted (`a..`, `..b`).
    */
   lazy val rangeExpr: PackratParser[Expr] =
-    bitOr ~ opt(rangeOp ~ opt(bitOr)) ^^ {
-      case lo ~ None                => lo
-      case lo ~ Some(inc ~ hiOpt)   => RangeExpr(Some(lo), hiOpt, inc)
-    } |
-      rangeOp ~ bitOr ^^ { case inc ~ hi => RangeExpr(None, Some(hi), inc) } |
-      rangeOp ^^ (inc => RangeExpr(None, None, inc))
+    at(
+      bitOr ~ opt(rangeOp ~ opt(bitOr)) ^^ {
+        case lo ~ None              => lo
+        case lo ~ Some(inc ~ hiOpt) => RangeExpr(Some(lo), hiOpt, inc)
+      } |
+        rangeOp ~ bitOr ^^ { case inc ~ hi => RangeExpr(None, Some(hi), inc) } |
+        rangeOp ^^ (inc => RangeExpr(None, None, inc)),
+    )
 
-  lazy val bitOr: PackratParser[Expr]  = chainl1(bitXor, binOp("|"))
-  lazy val bitXor: PackratParser[Expr] = chainl1(bitAnd, binOp("^"))
-  lazy val bitAnd: PackratParser[Expr] = chainl1(additive, binOp("&"))
+  lazy val bitOr: PackratParser[Expr]  = at(chainl1(bitXor, binOp("|")))
+  lazy val bitXor: PackratParser[Expr] = at(chainl1(bitAnd, binOp("^")))
+  lazy val bitAnd: PackratParser[Expr] = at(chainl1(additive, binOp("&")))
   lazy val additive: PackratParser[Expr] =
-    chainl1(multiplicative, binOp("+") | binOp("-"))
+    at(chainl1(multiplicative, binOp("+") | binOp("-")))
 
   /** Shift binds like multiplication (the deliberate correction to C), so `<<`/`>>` live at
    * this level alongside `* / %`.
    */
   lazy val multiplicative: PackratParser[Expr] =
-    chainl1(unary, binOp("*") | binOp("/") | binOp("%") | binOp("<<") | binOp(">>"))
+    at(chainl1(unary, binOp("*") | binOp("/") | binOp("%") | binOp("<<") | binOp(">>")))
 
   lazy val unary: PackratParser[Expr] =
-    (op("-") | op("!") | op("~") | op("*") | op("&")) ~ unary ^^ { case o ~ e => Unary(o, e) } |
-      (op("++") | op("--")) ~ unary ^^ { case o ~ e => PreIncDec(o, e) } |
-      postfix
+    at(
+      (op("-") | op("!") | op("~") | op("*") | op("&")) ~ unary ^^ { case o ~ e => Unary(o, e) } |
+        (op("++") | op("--")) ~ unary ^^ { case o ~ e => PreIncDec(o, e) } |
+        postfix,
+    )
 
   lazy val postfix: PackratParser[Expr] =
-    primary ~ rep(postfixTail) ^^ { case p ~ tails => tails.foldLeft(p)((acc, f) => f(acc)) }
+    at(primary ~ rep(postfixTail) ^^ { case p ~ tails => tails.foldLeft(p)((acc, f) => f(acc)) })
 
+  /** A postfix tail points at *itself* rather than at the operand it extends: a missing field is
+   * a complaint about the `.name`, and a bad call is a complaint about the argument list, so the
+   * caret belongs on the tail, not back at the start of the receiver.
+   */
   private lazy val postfixTail: PackratParser[Expr => Expr] =
-    (op("[") ~> expression <~ op("]")) ^^ (idx => (e: Expr) => Index(e, idx)) |
-      (op(".") ~> ident) ^^ (n => (e: Expr) => Field(e, n)) |
-      (op("(") ~> repsep(expression, op(",")) <~ op(")")) ^^ (args => (e: Expr) => Call(e, args)) |
-      op("?") ^^^ ((e: Expr) => TryExpr(e)) |
-      op("++") ^^^ ((e: Expr) => PostIncDec("++", e)) |
-      op("--") ^^^ ((e: Expr) => PostIncDec("--", e))
+    here ~ (op("[") ~> expression <~ op("]")) ^^ { case p ~ idx => (e: Expr) => Index(e, idx).setPos(p) } |
+      here ~ (op(".") ~> ident) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
+      here ~ (op("(") ~> repsep(expression, op(",")) <~ op(")")) ^^ { case p ~ args =>
+        (e: Expr) => Call(e, args).setPos(p)
+      } |
+      here <~ op("?") ^^ (p => (e: Expr) => TryExpr(e).setPos(p)) |
+      here <~ op("++") ^^ (p => (e: Expr) => PostIncDec("++", e).setPos(p)) |
+      here <~ op("--") ^^ (p => (e: Expr) => PostIncDec("--", e).setPos(p))
 
   lazy val primary: PackratParser[Expr] =
-    floatLit | intLit | charLit | interpLit | strLit | boolLit | nullLit | selfExpr | identExpr | arrayLit |
-      op("(") ~> parenTail
+    at(
+      floatLit | intLit | charLit | interpLit | strLit | boolLit | nullLit | selfExpr | identExpr | arrayLit |
+        op("(") ~> parenTail,
+    )
 
   /** `self` is reserved, so it never lexes as an identifier; inside a method body it reads as an
    * ordinary name that the analyzer resolves to the receiver binding, and is undefined elsewhere.
@@ -213,11 +262,18 @@ class SyslParser extends PackratParsers {
     }
   }
 
-  /** Lexes and parses the source of a `${ … }` interpolation as a single expression. */
-  private def parseEmbedded(src: String): Either[String, Expr] =
-    phrase(expression <~ rep(newline))(reader(src)) match
-      case Success(e, _) => Right(e)
-      case ns: NoSuccess => Left(s"in interpolation '$src': ${ns.msg}")
+  /** Lexes and parses the source of a `${ … }` interpolation as a single expression.
+   *
+   * The embedded text is its own little source, so a position inside a hole points into the hole
+   * rather than into an unrelated column of the line the string sits on.
+   */
+  private def parseEmbedded(src: String): Either[String, Expr] = {
+    val sub = new SyslParser(Source(s"${source.name} (interpolation)", src))
+
+    sub.parseExpression match
+      case sub.Success(e, _) => Right(e)
+      case ns: sub.NoSuccess => Left(s"in interpolation '$src': ${ns.msg}")
+  }
 
   private lazy val boolLit: Parser[Expr] =
     op("true") ^^^ BoolLit(true) | op("false") ^^^ BoolLit(false)
@@ -229,7 +285,10 @@ class SyslParser extends PackratParsers {
   // --- statements ----------------------------------------------------------------------
 
   lazy val statement: PackratParser[Stmt] =
-    structDecl | enumDecl | traitDecl | implDecl | funcDecl | varDecl | returnStmt | breakStmt | continueStmt | exprStmt
+    at(
+      structDecl | enumDecl | traitDecl | implDecl | funcDecl | varDecl | returnStmt | breakStmt | continueStmt |
+        exprStmt,
+    )
 
   /** A type: a memory-mode sigil applied to a type, or a name optionally applied to type
    * arguments (`Box[int]`, `Result[T, string]`). `sync` stays a soft keyword — it is only
@@ -237,13 +296,15 @@ class SyslParser extends PackratParsers {
    * reference to a type actually named `sync` still parses.
    */
   private lazy val typeRef: Parser[TypeRef] =
-    op("*") ~> typeRef ^^ PtrType.apply |
-      op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
-      op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
-      (op("[") ~> opt(expression) <~ op("]")) ~ typeRef ^^ { case n ~ t => ArrayType(n, t) } |
-      ident ~ opt(op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")) ^^ {
-        case n ~ args => NamedType(n, args.getOrElse(Nil))
-      }
+    at(
+      op("*") ~> typeRef ^^ PtrType.apply |
+        op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
+        op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
+        (op("[") ~> opt(expression) <~ op("]")) ~ typeRef ^^ { case n ~ t => ArrayType(n, t) } |
+        ident ~ opt(op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")) ^^ { case n ~ args =>
+          NamedType(n, args.getOrElse(Nil))
+        },
+    )
 
   private lazy val softSync: Parser[Unit] =
     accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
@@ -270,7 +331,7 @@ class SyslParser extends PackratParsers {
       case n ~ t ~ e => VarDecl(n, t, e)
     }
 
-  private lazy val exprStmt: PackratParser[Stmt] = expression ^^ ExprStmt.apply
+  private lazy val exprStmt: PackratParser[Stmt] = expression ^^ (e => ExprStmt(e).setPos(e.pos))
 
   private lazy val returnStmt: PackratParser[Stmt] =
     op("return") ~> opt(expression) ^^ Return.apply
@@ -287,7 +348,7 @@ class SyslParser extends PackratParsers {
 
   /** One `name: type` binding — a function parameter or a struct field. */
   private lazy val param: Parser[Param] =
-    ident ~ (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) }
+    at(ident ~ (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) })
 
   /** A function declaration, Scala-style but keyword-less: `name[T…](params) -> ret = expr` or
    * a block body, `-> ret` optional (absent ⇒ `unit`). It is tried before an expression
@@ -306,7 +367,7 @@ class SyslParser extends PackratParsers {
    * indented block (whose trailing expression is the return value).
    */
   private lazy val funcBody: PackratParser[List[Stmt]] =
-    op("=") ~> (suite | expression ^^ (e => List(ExprStmt(e)))) | suite
+    op("=") ~> (suite | expression ^^ (e => List(ExprStmt(e).setPos(e.pos)))) | suite
 
   private lazy val structDecl: PackratParser[Stmt] =
     op("struct") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
@@ -330,10 +391,12 @@ class SyslParser extends PackratParsers {
    * a computed property.
    */
   private lazy val member: PackratParser[MethodDecl] =
-    ident ~ opt(typeParams) >> { case name ~ tps =>
-      methodTail(name, tps.getOrElse(Nil)) |
-        (if tps.isEmpty then propertyTail(name) else failure("a property takes no type parameters"))
-    }
+    at(
+      ident ~ opt(typeParams) >> { case name ~ tps =>
+        methodTail(name, tps.getOrElse(Nil)) |
+          (if tps.isEmpty then propertyTail(name) else failure("a property takes no type parameters"))
+      },
+    )
 
   private def methodTail(name: String, tparams: List[String]): Parser[MethodDecl] =
     (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
@@ -342,7 +405,7 @@ class SyslParser extends PackratParsers {
 
   private def propertyTail(name: String): Parser[MethodDecl] =
     (op("->") ~> typeRef) ~ (op("=") ~> expression) <~ endName(name) ^^ {
-      case ret ~ e => MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), List(ExprStmt(e)))
+      case ret ~ e => MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), List(ExprStmt(e).setPos(e.pos)))
     }
 
   /** The parenthesised part of a method: an optional receiver shorthand (`self`, `*self`,
@@ -371,9 +434,11 @@ class SyslParser extends PackratParsers {
     }
 
   private lazy val enumVariant: Parser[EnumVariantDecl] =
-    ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ^^ { case n ~ fs => EnumVariantDecl(n, None, fs) } |
-      ident ~ (op("=") ~> expression) ^^ { case n ~ v => EnumVariantDecl(n, Some(v), Nil) } |
-      ident ^^ (n => EnumVariantDecl(n, None, Nil))
+    at(
+      ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ^^ { case n ~ fs => EnumVariantDecl(n, None, fs) } |
+        ident ~ (op("=") ~> expression) ^^ { case n ~ v => EnumVariantDecl(n, Some(v), Nil) } |
+        ident ^^ (n => EnumVariantDecl(n, None, Nil)),
+    )
 
   /** `trait Name` with indented method signatures. A signature is a method header — a receiver, a
    * parameter list, and an optional result — with no body; it parses to a `MethodDecl` whose empty
@@ -391,10 +456,12 @@ class SyslParser extends PackratParsers {
    * shape.
    */
   private lazy val methodSig: PackratParser[MethodDecl] =
-    ident ~ opt(typeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
-      case name ~ tps ~ ((recv, params)) ~ ret =>
-        MethodDecl(name, recv, isProperty = false, tps.getOrElse(Nil), params, ret, Nil)
-    }
+    at(
+      ident ~ opt(typeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+        case name ~ tps ~ ((recv, params)) ~ ret =>
+          MethodDecl(name, recv, isProperty = false, tps.getOrElse(Nil), params, ret, Nil)
+      },
+    )
 
   /** `impl Trait for Type` with indented method definitions — ordinary members, reusing the same
    * grammar as a method written in a struct's own body. The block is closed by an optional
@@ -494,10 +561,12 @@ class SyslParser extends PackratParsers {
     }
 
   private lazy val matchArm: Parser[MatchArm] =
-    op("else") ~> (op("->") ~> (suite | inlineBody)) ^^ (b => MatchArm(List(WildcardPattern), None, b)) |
-      rep1sep(pattern, op("|")) ~ opt(op("if") ~> expression) ~ (op("->") ~> (suite | inlineBody)) ^^ {
-        case pats ~ guard ~ b => MatchArm(pats, guard, b)
-      }
+    at(
+      op("else") ~> (op("->") ~> (suite | inlineBody)) ^^ (b => MatchArm(List(WildcardPattern), None, b)) |
+        rep1sep(pattern, op("|")) ~ opt(op("if") ~> expression) ~ (op("->") ~> (suite | inlineBody)) ^^ {
+          case pats ~ guard ~ b => MatchArm(pats, guard, b)
+        },
+    )
 
   /** Patterns: scalar literals and ranges, the `_` wildcard, a positional destructuring
    * `V(sub…)` (an enum variant or a struct), a named struct destructuring `S{field: sub…}`, or a
@@ -539,25 +608,39 @@ class SyslParser extends PackratParsers {
 
   // --- entry points --------------------------------------------------------------------
 
-  /** Parses a single expression (used by the expression test tier). */
-  def parseExpression(src: String): ParseResult[Expr] =
-    phrase(expression <~ rep(newline))(reader(src))
+  /** Parses this parser's source as a single expression (used by the expression test tier). */
+  def parseExpression: ParseResult[Expr] =
+    phrase(expression <~ rep(newline))(reader(source.text))
 
-  /** Parses a whole program. */
-  def parseProgram(src: String): ParseResult[Program] =
-    phrase(program)(reader(src))
+  /** Parses this parser's source as a whole program. */
+  def parseProgram: ParseResult[Program] =
+    phrase(program)(reader(source.text))
 }
 
 object SyslParser {
 
-  /** Parses a program, returning either the AST or a human-readable error with location. */
-  def parse(src: String): Either[String, Program] = {
-    val p = new SyslParser
+  /** Parses a program, returning either the AST or a rendered diagnostic. */
+  def parse(src: String, name: String = "<input>"): Either[String, Program] =
+    parse(Source(name, src))
 
-    p.parseProgram(src) match {
+  def parse(source: Source): Either[String, Program] = {
+    val p = new SyslParser(source)
+
+    p.parseProgram match {
       case p.Success(prog, _) => Right(prog)
-      case ns: p.NoSuccess =>
-        Left(s"parse error at line ${ns.next.pos.line}, column ${ns.next.pos.column}: ${ns.msg}\n${ns.next.pos.longString}")
+      case ns: p.NoSuccess    => Left(failedAt(source, ns.next.pos).render(ns.msg))
     }
   }
+
+  /** Where a parse failed. Running out of tokens leaves no position at all, and pointing at the
+   * end of the last line is more use than pointing at nothing — an unclosed block is exactly the
+   * case that reports there.
+   */
+  private def failedAt(source: Source, at: scala.util.parsing.input.Position): Pos =
+    if at.line > 0 then Pos(source, at.line, at.column)
+    else {
+      val last = math.max(1, source.lines.length)
+
+      Pos(source, last, source.line(last).length + 1)
+    }
 }

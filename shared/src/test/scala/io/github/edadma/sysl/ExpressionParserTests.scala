@@ -130,8 +130,8 @@ class ExpressionParserTests extends AnyFreeSpec with ParseSupport {
     }
 
     "a malformed hole is a fatal error naming the interpolation" in {
-      val p = new SyslParser
-      p.parseExpression("""s"${1 +}"""") match
+      val p = new SyslParser(Source("<expr>", """s"${1 +}""""))
+      p.parseExpression match
         case p.Success(_, _)  => fail("expected a parse error")
         case ns: p.NoSuccess  => ns.msg should include("in interpolation")
     }

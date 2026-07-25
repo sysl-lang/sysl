@@ -10,8 +10,8 @@ trait ParseSupport extends Matchers { this: Assertions =>
 
   /** Parses a single expression. */
   protected def expr(src: String): Expr = {
-    val p = new SyslParser
-    val r = p.parseExpression(src)
+    val p = new SyslParser(Source("<expr>", src))
+    val r = p.parseExpression
 
     assert(r.successful, r.toString)
     r.get

@@ -17,8 +17,8 @@ class StatementParserTests extends AnyFreeSpec with ParseSupport {
   }
 
   "a parse error reports a location" in {
-    SyslParser.parse("var = 5") match {
-      case Left(msg) => msg should include("parse error at line 1, column 5")
+    SyslParser.parse("var = 5", "sample.sysl") match {
+      case Left(msg) => msg should include("--> sample.sysl:1:5")
       case Right(p)  => fail(s"expected a parse error, got $p")
     }
   }

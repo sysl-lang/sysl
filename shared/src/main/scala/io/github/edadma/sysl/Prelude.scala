@@ -21,9 +21,12 @@ object Prelude {
       |end Result
       |""".stripMargin
 
-  /** The parsed prelude declarations, parsed once. */
+  /** The parsed prelude declarations, parsed once. They carry positions into a source of their
+   * own, so a diagnostic against a prelude declaration quotes the prelude rather than the user's
+   * file at some unrelated line.
+   */
   lazy val decls: List[Stmt] =
-    SyslParser.parse(source) match
+    SyslParser.parse(Source("<prelude>", source)) match
       case Right(p) => p.body
       case Left(e)  => sys.error(s"the prelude does not parse: $e")
 

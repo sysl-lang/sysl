@@ -33,7 +33,10 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
   private def analyze(): TProgram = {
     val body = Prelude.decls ::: program.body
 
+    // Hoisting runs at the top level, where there is no enclosing position to return to, so each
+    // pass simply moves the cursor to the declaration it is registering.
     for stmt <- body do
+      currentPos = stmt.pos
       stmt match
         case s: StructDecl =>
           if typeNameTaken(s.name) then err(s"type '${s.name}' is already declared")
@@ -65,6 +68,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     for (n, d) <- structDecls if d.tparams.isEmpty do instantiateStruct(n, Nil)
 
     for stmt <- body do
+      currentPos = stmt.pos
       stmt match
         case f: FuncDecl =>
           if funcDecls.contains(f.name) then err(s"function '${f.name}' is already declared")
@@ -81,8 +85,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     // A type's members lower to ordinary functions under mangled names, registered here so a
     // method call and an associated-function call resolve exactly as a free call does.
     val members = mutable.ListBuffer.empty[FuncDecl]
-    for (tname, sdecl) <- structDecls do hoistMembers(tname, sdecl, members)
-    for impl <- traitImpls.values do hoistImpl(impl, members)
+    for (tname, sdecl) <- structDecls do at(sdecl.pos)(hoistMembers(tname, sdecl, members))
+    for impl <- traitImpls.values do at(impl.pos)(hoistImpl(impl, members))
 
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 
@@ -146,6 +150,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     val generic = tparams.nonEmpty
 
     for m <- members do
+      currentPos = m.pos.orElse(currentPos)
       if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '$tname.${m.name}'")
       if memberDecls.contains((tname, m.name)) then err(s"type '$tname' already has a member named '${m.name}'")
       if fieldNames.contains(m.name) then
@@ -242,7 +247,10 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     FuncDecl(s"$tname.${m.name}", tparams, selfParam.toList ::: m.params, m.retType, m.body)
   }
 
-  private def analyzeFuncBody(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
+  private def analyzeFuncBody(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc =
+    at(f.pos)(analyzeFuncBodyAt(name, f, subst))
+
+  private def analyzeFuncBodyAt(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
     val (params, rtype) = funcInsts(name)
     resetFunction()
     tsubst = subst
@@ -350,7 +358,9 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       err(s"a loop's break values and its 'else' must have the same type, but got ${tys.map(show).mkString(" and ")}")
   }
 
-  private def analyzeStmt(stmt: Stmt): TStmt = stmt match
+  private def analyzeStmt(stmt: Stmt): TStmt = at(stmt.pos)(analyzeStmtAt(stmt))
+
+  private def analyzeStmtAt(stmt: Stmt): TStmt = stmt match
     case VarDecl(name, typOpt, Some(init)) =>
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
@@ -411,7 +421,10 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * writing the ordinary construction is the whole spelling of an allocation. An expression
    * that is already a `&T` passes through untouched.
    */
-  protected def analyzeExpr(expr: Expr, expected: Option[Type]): TExpr = expected match
+  protected def analyzeExpr(expr: Expr, expected: Option[Type]): TExpr =
+    at(expr.pos)(analyzeExpected(expr, expected)).setPos(expr.pos)
+
+  private def analyzeExpected(expr: Expr, expected: Option[Type]): TExpr = expected match
     case Some(r: Type.Ref) =>
       expr match
         case NullLit() => err(s"a ${show(r)} always points at a live object — an absent one is Option[${show(r)}]")
@@ -428,10 +441,13 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * not exactly "a `T` where `&T` was expected" is left for the caller to diagnose.
    */
   protected def box(t: TExpr, expected: Type): TExpr = expected match
-    case r: Type.Ref if t.ty == r.inner => TBox(t, r)
+    case r: Type.Ref if t.ty == r.inner => TBox(t, r).setPos(t.pos)
     case _                              => t
 
-  private def analyzeValue(expr: Expr, expected: Option[Type]): TExpr = expr match
+  private def analyzeValue(expr: Expr, expected: Option[Type]): TExpr =
+    at(expr.pos)(analyzeValueAt(expr, expected)).setPos(expr.pos)
+
+  private def analyzeValueAt(expr: Expr, expected: Option[Type]): TExpr = expr match
     case IntLit(v, suffix)   => intLiteral(v, suffix, expected)
     case FloatLit(t, suffix) => floatLiteral(t, suffix, expected)
     case CharLit(cp)         => TIntLit(cp, Type.Char)
@@ -809,8 +825,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
 
 object Analyzer {
 
-  /** Analyzes a program to a typed tree, or returns the first error message. */
+  /** Analyzes a program to a typed tree, or returns the first error as a rendered diagnostic. */
   def analyze(program: Program): Either[String, TProgram] =
     try Right(new Analyzer(program).analyze())
-    catch case AnalyzerError(msg) => Left(msg)
+    catch case AnalyzerError(msg, pos) => Left(Diagnostic.render(msg, pos))
 }

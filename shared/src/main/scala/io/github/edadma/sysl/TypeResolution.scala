@@ -20,7 +20,10 @@ trait TypeResolution extends AnalyzerBase {
   /** Resolves a type reference under `subst`, which maps the enclosing declaration's type
    * parameters to the arguments it was instantiated with.
    */
-  protected def resolveType(t: TypeRef, subst: Map[String, Type]): Type = t match
+  protected def resolveType(t: TypeRef, subst: Map[String, Type]): Type =
+    at(t.pos)(resolveTypeAt(t, subst))
+
+  private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
     case PtrType(inner)       => Type.Ptr(underIndirection(resolveType(inner, subst)))
     case RefType(inner, sync) => Type.Ref(underIndirection(resolveType(inner, subst)), sync)
 
