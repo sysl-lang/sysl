@@ -78,10 +78,29 @@ trait Emitter {
                                ownedDepth: Int, tempDepth: Int)
   protected var genLoops: List[GenLoop] = Nil
 
-  /** Lowers an expression, returning the register or immediate holding its value. Defined by
-   * the class that walks the tree; the emitting traits call back into it.
+  /** Folding `and` / `or` over `i1`s, with the constant cases collapsed rather than emitted — a
+   * pattern test that cannot fail contributes `"true"`, and ANDing that in would be an instruction
+   * saying nothing. Both halves of codegen build conditions this way, so they live here.
    */
+  protected def andI1(a: String, b: String): String =
+    if a == "true" then b
+    else if b == "true" then a
+    else { val r = freshTemp(); emit(s"$r = and i1 $a, $b"); r }
+
+  protected def orI1(a: String, b: String): String =
+    if a == "true" || b == "true" then "true"
+    else { val r = freshTemp(); emit(s"$r = or i1 $a, $b"); r }
+
+  // --- hooks provided by the Codegen class ---------------------------------------------
+  //
+  // The recursive entry points live in the class that walks the tree; the emitting traits call
+  // back into them.
+
+  /** Lowers an expression, returning the register or immediate holding its value. */
   protected def genExpr(expr: TExpr): String
+
+  /** Lowers one statement for its effects. */
+  protected def genStmt(stmt: TStmt): Unit
 
   protected def startFunction(): Unit = {
     prologue = new mutable.StringBuilder

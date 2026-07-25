@@ -1,0 +1,257 @@
+package io.github.edadma.sysl
+
+/** Addressing a place, and building the composite values that have one.
+ *
+ * Two things live here because they are the same subject seen from either end. A **place** is
+ * something with an address — a local's slot, a dereference, a field or element of either — and
+ * reaching one is a `getelementptr` chain rather than a read of the value it sits in, which is what
+ * lets `s.f.g = v` write through without copying anything out. A **composite value** is what those
+ * addresses point into: an array, a slice, an enum and its payload.
+ *
+ * Every element access is bounds-checked, and a slice carries the owner it borrows from, so making
+ * one is also an ownership event rather than pointer arithmetic alone.
+ */
+trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
+
+  /** The address of a place, as a `ptr` register or an existing slot name. Every place bottoms
+   * out either in a local's stack slot or in a pointer the program already holds, so this walks
+   * the field chain with `getelementptr` rather than reading values out with `extractvalue`.
+   */
+  protected def address(place: TExpr): String = place match
+    case TLoad(name, _)     => s"%$name.addr"
+    case TDeref(operand, _) => payloadAddr(operand)
+    case TField(receiver, index, _) =>
+      val base = address(receiver)
+      val r    = freshTemp()
+      emit(s"$r = getelementptr ${receiver.ty.llvm}, ptr $base, i32 0, i32 $index")
+      r
+    case TIndex(receiver, index, _) => elementAddr(receiver, index)
+
+    // A computed value has no address of its own, so reaching into one means giving it a slot
+    // first. The analyzer has already refused to *assign* through anything but a real place, so
+    // this only ever happens on the way to a read.
+    case other =>
+      val slot = emitAlloca(freshTemp(), other.ty.llvm)
+      emit(s"store ${other.ty.llvm} ${genExpr(other)}, ptr $slot")
+      slot
+
+  /** The address of one element, after checking that it exists. An array is indexed from its
+   * own storage; a slice is indexed from the pointer it carries.
+   */
+  protected def elementAddr(receiver: TExpr, index: TExpr): String = {
+    val (base, len, elem) = receiver.ty match
+      case Type.Array(n, e) => (address(receiver), n.toString, e)
+      case w: Type.View =>
+        val v = genExpr(receiver)
+        val p = freshTemp(); emit(s"$p = extractvalue ${w.llvm} $v, 1")
+        val l = freshTemp(); emit(s"$l = extractvalue ${w.llvm} $v, 2")
+        (p, l, w.elem)
+      case other => sys.error(s"unreachable index into ${other.llvm}")
+
+    val i = widen64(index)
+    boundsCheck(i, len)
+    val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, i64 $i"); r
+  }
+
+  /** Takes a view of some of an array's, a slice's, or a string's elements. The base is evaluated
+   * once and gives up three things — what keeps the elements alive, where the first of them is,
+   * and how many there are — and the view is built by narrowing the last two and taking a share
+   * of the first.
+   */
+  protected def genSlice(
+      base: TExpr,
+      lo: Option[TExpr],
+      hi: Option[TExpr],
+      inclusive: Boolean,
+      sliceTy: Type.View,
+  ): String = {
+    val elem = sliceTy.elem
+
+    val (ownerV, first, len) = base.ty match
+      case Type.Ref(array @ Type.Array(n, _), _) =>
+        val r = genExpr(base)
+        val p = freshTemp(); emit(s"$p = getelementptr ${boxName(array)}, ptr $r, i32 0, i32 2")
+        (r, p, n.toString)
+      case s: Type.View =>
+        val v = genExpr(base)
+        val o = freshTemp(); emit(s"$o = extractvalue ${s.llvm} $v, 0")
+        val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
+        val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
+        (o, p, l)
+      // Storage this frame owns, or a `*T` region: there is nothing to keep alive, so the
+      // owner is null and counting it is a no-op. The escape analysis is what makes the first
+      // of those safe, and nothing makes the second safe — that is what `*T` is.
+      case Type.Array(n, _)             => ("null", address(base), n.toString)
+      case Type.Ptr(Type.Array(n, _))   => ("null", genExpr(base), n.toString)
+      case other                        => sys.error(s"unreachable slice of ${other.llvm}")
+
+    val start = lo.map(widen64).getOrElse("0")
+
+    // The check is on the half-open interval the view ends up naming. An inclusive high end
+    // additionally has to name an element that exists, which is also what stops `hi + 1` from
+    // wrapping past the end.
+    val end = hi match
+      case None => len
+      case Some(h) =>
+        val v = widen64(h)
+        if !inclusive then v
+        else
+          val within = freshTemp(); emit(s"$within = icmp ult i64 $v, $len")
+          trapUnless(within, "bounds")
+          val e = freshTemp(); emit(s"$e = add i64 $v, 1"); e
+
+    if hi.isDefined && !inclusive then
+      val fits = freshTemp(); emit(s"$fits = icmp ule i64 $end, $len")
+      trapUnless(fits, "bounds")
+
+    val ordered = freshTemp(); emit(s"$ordered = icmp ule i64 $start, $end")
+    trapUnless(ordered, "bounds")
+
+    // A substring has to be a string, so both ends must fall between characters. This runs after
+    // the bounds checks, which is what makes reading the byte at either end safe.
+    if sliceTy == Type.Str then
+      trapUnless(strBoundary(first, len, start), "boundary")
+      trapUnless(strBoundary(first, len, end), "boundary")
+
+    val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, i64 $start")
+    val n = freshTemp(); emit(s"$n = sub i64 $end, $start")
+
+    emit(s"call void @arc.retain_maybe(ptr $ownerV)")
+    maybeHeap = true
+    heap = true
+
+    val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $ownerV, 0")
+    val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $p, 1")
+    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, i64 $n, 2")
+
+    ownTemp(whole, sliceTy)
+  }
+
+  /** An index at 64 bits, keeping its signedness so a negative one stays negative through the
+   * widening and then fails the unsigned bounds test.
+   */
+  protected def widen64(index: TExpr): String = index.ty match
+    case i: Type.Integer => convert(i, Type.Integer(64, i.signed), genExpr(index))
+    case other           => sys.error(s"unreachable index of type ${other.llvm}")
+
+  /** Traps unless `i` names an element that exists. The comparison is unsigned at 64 bits, so a
+   * negative index arrives as a very large one and fails the same test.
+   */
+  protected def boundsCheck(i: String, len: String): Unit = {
+    val ok = freshTemp(); emit(s"$ok = icmp ult i64 $i, $len")
+    trapUnless(ok, "bounds")
+  }
+
+  /** Builds an enum value from already-lowered payload values: the tag, then the variant's
+   * payload aggregate dropped into its slot.
+   */
+  protected def enumValue(en: Type.Enum, variant: Type.EnumVariant, vals: List[String]): String =
+    if en.simple then variant.tag.toString
+    else
+      val tagged = freshTemp()
+      emit(s"$tagged = insertvalue ${en.llvm} undef, i32 ${variant.tag}, 0")
+      variant.payloadSlot match
+        case None => tagged
+        case Some(slot) =>
+          var payload = "undef"
+          for (v, i) <- vals.zipWithIndex do
+            val r = freshTemp()
+            emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, ${variant.fields(i)._2.llvm} $v, $i")
+            payload = r
+          val r = freshTemp()
+          emit(s"$r = insertvalue ${en.llvm} $tagged, ${en.payloadLlvm(variant)} $payload, $slot")
+          r
+
+  /** Whether an integer `v` of type `vt` equals one of the enum's declared discriminants — the
+   * membership test both integer-to-enum conversions share. Every comparison is done at 64 bits
+   * so a wide source cannot alias a narrow discriminant, matching how the checked `char`
+   * conversion widens before testing.
+   */
+  protected def enumMembership(en: Type.Enum, vt: Type.Integer, v: String): String = {
+    val wide = convert(vt, Type.Integer(64, vt.signed), v)
+    en.variants.map { variant =>
+      val eq = freshTemp(); emit(s"$eq = icmp eq i64 $wide, ${variant.tag}")
+      eq
+    }.reduceOption(orI1).getOrElse("false")
+  }
+
+  /** `Color(n)` — the checked cast. Traps unless `n` is a declared discriminant, then stores the
+   * value at the enum's underlying width, which is the enum's representation.
+   */
+  protected def genEnumFromInt(value: TExpr, en: Type.Enum): String = {
+    val vt = value.ty.asInstanceOf[Type.Integer]
+    val v  = genExpr(value)
+    trapUnless(enumMembership(en, vt, v), "enum")
+    convert(vt, en.underlying, v)
+  }
+
+  /** `Color.try(n)` — the fallible constructor. The membership test picks the branch: a match
+   * builds `Some(n as Color)`, a miss builds `None`. The result is an ordinary `Option[Color]`,
+   * whose element has no refcount, so a merge slot needs no ownership bookkeeping.
+   */
+  protected def genEnumTry(value: TExpr, en: Type.Enum, optTy: Type.Enum,
+                         some: Type.EnumVariant, none: Type.EnumVariant): String = {
+    val vt    = value.ty.asInstanceOf[Type.Integer]
+    val v     = genExpr(value)
+    val ok    = enumMembership(en, vt, v)
+    val slot  = emitAlloca(freshTemp(), optTy.llvm)
+    val someL = freshLabel("try.some")
+    val noneL = freshLabel("try.none")
+    val endL  = freshLabel("try.end")
+
+    emitTerm(s"br i1 $ok, label %$someL, label %$noneL")
+    emitLabel(someL)
+    val ev = convert(vt, en.underlying, v)
+    emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(ev))}, ptr $slot")
+    emitTerm(s"br label %$endL")
+    emitLabel(noneL)
+    emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
+    emitTerm(s"br label %$endL")
+    emitLabel(endL)
+    val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot"); r
+  }
+
+  /** Reads every field of a variant's payload out of an enum value. */
+  protected def payloadFields(en: Type.Enum, variant: Type.EnumVariant, value: String): List[String] =
+    variant.payloadSlot match
+      case None => Nil
+      case Some(slot) =>
+        val p = freshTemp()
+        emit(s"$p = extractvalue ${en.llvm} $value, $slot")
+        variant.fields.indices.map { i =>
+          val f = freshTemp()
+          emit(s"$f = extractvalue ${en.payloadLlvm(variant)} $p, $i")
+          f
+        }.toList
+
+  /** `expr?` — on success the payload becomes the expression's value; on failure the function
+   * returns immediately with the failure re-wrapped in its own return type, carrying the error
+   * payload across unchanged.
+   */
+  protected def genTry(
+      operand: TExpr,
+      ok: Type.EnumVariant,
+      fail: Type.EnumVariant,
+      retEnum: Type.Enum,
+      retFail: Type.EnumVariant,
+  ): String = {
+    val en = operand.ty.asInstanceOf[Type.Enum]
+    val v  = genExpr(operand)
+
+    val tag  = freshTemp(); emit(s"$tag = extractvalue ${en.llvm} $v, 0")
+    val isOk = freshTemp(); emit(s"$isOk = icmp eq i32 $tag, ${ok.tag}")
+
+    val okL   = freshLabel("try.ok")
+    val failL = freshLabel("try.fail")
+    emitTerm(s"br i1 $isOk, label %$okL, label %$failL")
+
+    emitLabel(failL)
+    val failed = enumValue(retEnum, retFail, payloadFields(en, fail, v))
+    retainValue(retEnum, failed)
+    releaseAll()
+    emitTerm(s"ret ${retEnum.llvm} $failed")
+
+    emitLabel(okL)
+    payloadFields(en, ok, v).head
+  }
+}
