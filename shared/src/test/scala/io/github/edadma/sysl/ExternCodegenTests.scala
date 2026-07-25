@@ -62,6 +62,107 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  /** A variadic callee is written two ways codegen has to get right: the `...` in its declaration,
+   * and the whole function type at each call — LLVM will not take the short form for a callee that
+   * has an ellipsis, because the argument list alone does not say where the declared parameters
+   * stop. The promotions are the analyzer's, so what is asserted here is that they arrive.
+   */
+  "variadic" - {
+    "the declaration carries the ellipsis" in {
+      ir("extern log(fmt: *u8, n: int, ...)\nvar p: *u8 = null\nlog(p, 1)") should
+        include("declare void @log(ptr, i32, ...)")
+    }
+
+    "a call names the callee's whole function type" in {
+      ir("extern f(n: int, ...) -> int\nprint(f(1, 2))") should include("call i32 (i32, ...) @f(i32 1, i32 2)")
+    }
+
+    "a call with no tail at all is written the same way" in {
+      ir("extern f(n: int, ...) -> int\nprint(f(1))") should include("call i32 (i32, ...) @f(i32 1)")
+    }
+
+    // An ordinary callee keeps the short form, so the ellipsis is what causes the difference and
+    // not merely something that happens to accompany it.
+    "a non-variadic extern is still called by result type alone" in {
+      val out = ir("extern f(n: int) -> int\nprint(f(1))")
+
+      out should include("call i32 @f(i32 1)")
+      out should include("declare i32 @f(i32)")
+    }
+
+    // LLVM applies no default argument promotions of its own, so a narrow value handed over as
+    // written would be read back as garbage. Signedness decides which widening.
+    "a narrow integer is widened to 32 bits, by its own signedness" in {
+      val out = ir("extern f(n: int, ...)\nvar a: u8 = 200\nvar b: i8 = -5\nf(1, a, b)")
+
+      out should include("zext i8")
+      out should include("sext i8")
+      out should include regex "call void \\(i32, \\.\\.\\.\\) @f\\(i32 1, i32 %t\\d+, i32 %t\\d+\\)"
+    }
+
+    "a narrow float is widened to double, whichever narrow float it is" in {
+      ir("extern f(n: int, ...)\nvar x: f32 = 1.5f32\nf(1, x)") should include("fpext float")
+      ir("extern f(n: int, ...)\nvar x: f16 = 1.5f16\nf(1, x)") should include("fpext half")
+    }
+
+    // Each variadic callee is written with *its own* function type, so two of them in one program
+    // must not be given each other's.
+    "two variadic externs each get their own signature" in {
+      val out = ir("extern f(n: int, ...)\nextern g(p: *u8, ...) -> int\nvar p: *u8 = null\nf(1)\nprint(g(p))")
+
+      out should include("call void (i32, ...) @f(i32 1)")
+      out should include regex "call i32 \\(ptr, \\.\\.\\.\\) @g\\(ptr %t\\d+\\)"
+      out should include("declare void @f(i32, ...)")
+      out should include("declare i32 @g(ptr, ...)")
+    }
+
+    // 32- and 64-bit values are already what C would promote them to, and a `char` is an `i32`
+    // already, so nothing is inserted for any of them.
+    "what is already wide enough is passed as it stands" in {
+      val out = ir("extern f(n: int, ...)\nvar a: i64 = 7i64\nvar b: real = 2.5\nf(1, a, b, 'A', 3)")
+
+      out should not include "zext"
+      out should not include "fpext"
+      out should include regex "call void \\(i32, \\.\\.\\.\\) @f\\(i32 1, i64 %t\\d+, double %t\\d+, i32 65, i32 3\\)"
+    }
+
+    "a raw pointer crosses as it stands" in {
+      ir("extern f(n: int, ...)\nvar x = 1\nf(1, &x)") should include regex
+        "call void \\(i32, \\.\\.\\.\\) @f\\(i32 1, ptr %[\\w.]+\\)"
+    }
+
+    // The runtime declares `printf` itself, so a program that declares it too must not emit a
+    // second `declare` — and the one that survives has to be the variadic form either way.
+    "declaring printf does not collide with the runtime's own" in {
+      val out = ir("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p))")
+
+      out.linesIterator.count(l => l.startsWith("declare") && l.contains("@printf(")) shouldBe 1
+      out should include("declare i32 @printf(ptr, ...)")
+    }
+
+    // `snprintf` is declared only by a program that renders a float or a format hole, so this is
+    // the same collision as `printf`'s reached through a condition rather than unconditionally.
+    "declaring snprintf does not collide with the runtime's own either" in {
+      val src =
+        """extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
+          |var buf: [4]u8
+          |var fmt: [3]u8 = [37u8, 100u8, 0u8]
+          |print(snprintf(&buf[0], 4usize, &fmt[0], 1), str(1.5))""".stripMargin
+      val out = ir(src)
+
+      out.linesIterator.count(l => l.startsWith("declare") && l.contains("@snprintf(")) shouldBe 1
+      out should include("declare i32 @snprintf(ptr, i64, ptr, ...)")
+    }
+
+    "a variadic that does not return still ends its block" in {
+      val out = ir("extern die(fmt: *u8, ...) -> never\nvar p: *u8 = null\ndie(p, 1)")
+
+      out should include("call void (ptr, ...) @die(ptr %t1, i32 1)")
+      out should include("declare void @die(ptr, ...)")
+      out should include("unreachable")
+    }
+  }
+
   "the prelude's forcing combinators" - {
     // They are members of a generic enum, so one exists per element type and no more — and a
     // program that never forces anything pays for none of it, nor for the `exit` they stop with.

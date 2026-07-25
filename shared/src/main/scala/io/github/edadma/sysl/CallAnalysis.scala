@@ -5,7 +5,7 @@ package io.github.edadma.sysl
  * the analyzer lowered every member to a function under the mangled name `Type.member` — so the
  * only method-specific work here is passing the receiver in the mode its `self` sigil declared.
  */
-trait CallAnalysis extends TypeResolution {
+trait CallAnalysis extends Literals {
 
   /** Type-checks positional arguments against a resolved parameter list. `pre` holds arguments
    * already analyzed during type-argument inference, so they are not analyzed twice.
@@ -32,7 +32,15 @@ trait CallAnalysis extends TypeResolution {
   }
 
   protected def callFunction(f: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
-    if args.length != f.params.length then
+    // A variadic extern fixes only where its declared parameters stop; everything after them is
+    // the tail, checked by the rule of §1 below rather than against a parameter.
+    val variadic = externDecls.get(f.name).exists(_.variadic)
+
+    if variadic then
+      if args.length < f.params.length then
+        err(s"function '${f.name}' takes at least ${quantity(f.params.length, "argument")}, " +
+          s"but ${supplied(args.length, "argument")}")
+    else if args.length != f.params.length then
       err(s"function '${f.name}' takes ${quantity(f.params.length, "argument")}, but ${supplied(args.length, "argument")}")
 
     // An extern is declared in the output only if something reaches it, which is what keeps an
@@ -49,7 +57,35 @@ trait CallAnalysis extends TypeResolution {
         (instantiateFunc(f, targs), Some(provisional))
 
     val (params, rtype) = funcInsts(name)
-    TCall(name, checkArgs(f.name, params, args, pre), rtype)
+    val declared        = checkArgs(f.name, params, args.take(params.length), pre)
+
+    TCall(name, declared ::: args.drop(params.length).map(variadicArg), rtype)
+  }
+
+  /** One argument in a variadic extern's tail.
+   *
+   * There is no declared parameter to check it against, so what stands in for one is the rule C
+   * itself imposes at the call: only what varargs can carry may be passed, and it is passed
+   * already widened. LLVM applies no default argument promotions of its own — an `i8` or an `f32`
+   * handed over as written is read back as garbage — so the widening happens here, in the tree,
+   * where it is something a test can see rather than a detail of the emitter.
+   *
+   * What may cross is what C can name on the other side: an integer, a float, a `char`, or a raw
+   * pointer. A `string`, a `&T`, a struct — every sysl layout C has no notion of — is refused,
+   * because unlike a declared parameter (`12 §1`) there is no written type saying what the callee
+   * agreed to receive.
+   */
+  private def variadicArg(a: Expr): TExpr = {
+    val t = analyzeExpr(a)
+
+    at(t.pos):
+      t.ty match
+        case i: Type.Integer if i.bits < 32   => convert(t, Type.Integer(32, i.signed))
+        case f: Type.Floating if f.bits < 64  => convert(t, Type.Real)
+        case _: Type.Integer | _: Type.Floating | Type.Char | _: Type.Ptr => t
+        case other =>
+          err(s"a ${show(other)} cannot be passed to '...' — a variadic argument must be an " +
+            "integer, a float, a char, or a raw pointer")
   }
 
   /** Enforces a generic function's trait bounds against the type arguments a call resolved to.

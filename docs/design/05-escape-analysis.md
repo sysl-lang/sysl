@@ -78,7 +78,9 @@ conservative answer.
 for exactly that — gets the pessimistic assumption: every parameter is kept, and the result views
 everything. A stack-backed slice therefore cannot be passed to one, which is correct: the foreign
 side may retain it, and nothing here can tell. This needs no separate machinery, because "not in
-this module's function table" is already the conservative case.
+this module's function table" is already the conservative case — and it covers a variadic extern's
+tail for the same reason, since the assumption is about the callee rather than about any one
+parameter position.
 
 ## What happens when a slice escapes
 

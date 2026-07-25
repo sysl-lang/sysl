@@ -371,9 +371,17 @@ class SyslParser(val source: Source) extends PackratParsers {
    * function; `-> never` says the callee does not come back.
    */
   private lazy val externDecl: PackratParser[Stmt] =
-    op("extern") ~> ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
-      case name ~ params ~ ret => ExternDecl(name, params, ret)
+    op("extern") ~> ident ~ (op("(") ~> externParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+      case name ~ ((params, variadic)) ~ ret => ExternDecl(name, params, ret, variadic)
     }
+
+  /** An extern's parameters, which may end in `...` — the C ellipsis, and the one arity in the
+   * language a declaration does not fix. The `...`-only form parses so the analyzer can say why a
+   * variadic needs a named parameter before it, rather than the grammar reporting a stray token.
+   */
+  private lazy val externParams: Parser[(List[Param], Boolean)] =
+    op("...") ^^^ (Nil, true) |
+      repsep(param, op(",")) ~ opt(op(",") ~> op("...")) ^^ { case ps ~ dots => (ps, dots.isDefined) }
 
   /** A function body is either an `= expr` short form (whose value is the return value) or an
    * indented block (whose trailing expression is the return value).

@@ -59,6 +59,68 @@ class ExternParserTests extends AnyFreeSpec with ParseSupport {
       )
   }
 
+  // `...` is the C ellipsis, and the parser's whole job with it is to tell the tail apart from a
+  // parameter — everything else about a variadic declaration is an ordinary header.
+  "variadic" - {
+    "a trailing ellipsis is recorded, and the named parameters keep their types" in {
+      prog("extern printf(fmt: *u8, ...) -> int") shouldBe
+        List(
+          ExternDecl(
+            "printf",
+            List(Param("fmt", PtrType(NamedType("u8")))),
+            Some(NamedType("int")),
+            variadic = true,
+          ),
+        )
+    }
+
+    "several named parameters may precede it" in {
+      prog("extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int") shouldBe
+        List(
+          ExternDecl(
+            "snprintf",
+            List(
+              Param("buf", PtrType(NamedType("u8"))),
+              Param("n", NamedType("usize")),
+              Param("fmt", PtrType(NamedType("u8"))),
+            ),
+            Some(NamedType("int")),
+            variadic = true,
+          ),
+        )
+    }
+
+    "the same declaration without one is not variadic" in {
+      prog("extern printf(fmt: *u8) -> int") shouldBe
+        List(ExternDecl("printf", List(Param("fmt", PtrType(NamedType("u8")))), Some(NamedType("int"))))
+    }
+
+    // `...` and `..` share a prefix, so the lexer has to prefer the longer one — and go on
+    // preferring the shorter one where that is what was written.
+    "the ellipsis does not swallow a range, nor a range the ellipsis" in {
+      prog("extern f(n: int, ...)") shouldBe
+        List(ExternDecl("f", List(Param("n", NamedType("int"))), None, variadic = true))
+      prog("for i in 1..3\n    print(i)") shouldBe
+        List(forStmt("i", RangeExpr(Some(i(1)), Some(i(3)), inclusive = true), List(printStmt(Ident("i")))))
+    }
+
+    // Rejected by the analyzer rather than the grammar, so that the message can say what is
+    // missing instead of pointing at a token the parser did not expect.
+    "an ellipsis with nothing before it parses, to be diagnosed later" in {
+      prog("extern f(...) -> int") shouldBe List(ExternDecl("f", Nil, Some(NamedType("int")), variadic = true))
+    }
+
+    "a result is optional here as everywhere" in {
+      prog("extern log(fmt: *u8, ...)") shouldBe
+        List(ExternDecl("log", List(Param("fmt", PtrType(NamedType("u8")))), None, variadic = true))
+    }
+
+    // A sysl function has a fixed arity (`12 §9`); the ellipsis belongs to the foreign seam only.
+    "a sysl function cannot have one" in {
+      progError("f(n: int, ...) -> int = n") should not be empty
+    }
+  }
+
   "never is an ordinary result type on a function" in {
     prog("stop() -> never = exit(1)") shouldBe
       List(

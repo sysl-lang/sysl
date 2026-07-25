@@ -89,7 +89,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
 
     val externs = externsUsed.toList.map { name =>
       val (params, rtype) = funcInsts(name)
-      TExtern(name, params.map(_._2), rtype)
+      TExtern(name, params.map(_._2), rtype, externDecls(name).variadic)
     }
 
     TProgram(
@@ -152,6 +152,10 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
 
     case e: ExternDecl =>
       if funcDecls.contains(e.name) then err(s"function '${e.name}' is already declared")
+      // C reads a variadic call's arguments relative to the last named parameter, so there has to
+      // be one; `f(...)` is not a callable declaration in any C either.
+      if e.variadic && e.params.isEmpty then
+        err(s"'${e.name}' needs at least one named parameter before '...'")
       funcDecls(e.name) = FuncDecl(e.name, Nil, e.params, e.retType, Nil).setPos(e.pos)
       externDecls(e.name) = e
       funcInsts(e.name) =

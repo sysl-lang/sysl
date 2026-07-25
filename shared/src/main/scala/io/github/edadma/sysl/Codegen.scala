@@ -38,7 +38,8 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       (if usesSnprintf then Set("snprintf") else Set.empty)
 
     for e <- program.externs if !declared(e.name) do
-      out ++= s"declare ${e.retTy.llvm} @${e.name}(${e.params.map(_.llvm).mkString(", ")})\n"
+      val params = e.params.map(_.llvm) ++ Option.when(e.variadic)("...")
+      out ++= s"declare ${e.retTy.llvm} @${e.name}(${params.mkString(", ")})\n"
 
     for d <- satDecls do out ++= d + "\n"
     out ++= "\n"
@@ -76,6 +77,21 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     out ++= mainText
     out.toString
   }
+
+  /** The externs declared with a `...`, by name — the only callees a call is written differently
+   * for.
+   */
+  private val variadics: Map[String, TExtern] =
+    program.externs.filter(_.variadic).map(e => e.name -> e).toMap
+
+  /** What a `call` names. For an ordinary function that is the result type, which is all LLVM
+   * needs; for a variadic one it is the callee's *whole* function type, because the argument list
+   * alone does not say where the declared parameters stop and the ellipsis begins.
+   */
+  private def calleeOf(name: String, ty: Type): String =
+    variadics.get(name) match
+      case Some(e) => s"${e.retTy.llvm} (${(e.params.map(_.llvm) :+ "...").mkString(", ")}) @$name"
+      case None    => s"${if Type.noValue(ty) then "void" else ty.llvm} @$name"
 
   private def genMain(stmts: List[TStmt]): String = {
     startFunction()
@@ -358,12 +374,13 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     // diverging arm needs no special handling anywhere else.
     case TCall(name, args, ty) =>
       val argVals = args.map(a => s"${a.ty.llvm} ${genExpr(a)}")
+      val callee  = calleeOf(name, ty)
       if Type.noValue(ty) then
-        emit(s"call void @$name(${argVals.mkString(", ")})")
+        emit(s"call $callee(${argVals.mkString(", ")})")
         if ty == Type.Never then emitTerm("unreachable")
         ""
       else
-        val r = freshTemp(); emit(s"$r = call ${ty.llvm} @$name(${argVals.mkString(", ")})")
+        val r = freshTemp(); emit(s"$r = call $callee(${argVals.mkString(", ")})")
         ownTemp(r, ty)
 
     case TStructNew(struct, args) =>

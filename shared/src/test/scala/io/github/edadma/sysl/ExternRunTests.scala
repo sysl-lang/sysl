@@ -43,6 +43,123 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** A variadic extern really reaching `printf`, which is the point of the feature: this is the
+   * one call shape sysl could not make before, and the one every C library reserves for its
+   * printing.
+   *
+   * `printf` wants a NUL-terminated format, which a sysl `string` is not (it carries a length),
+   * so these build one as a `[N]u8` and hand over `&fmt[0]` — the honest way to reach a C
+   * interface, and a reminder that `extern` is a seam rather than a bridge.
+   */
+  "a variadic extern" - {
+    /** A NUL-terminated `[N]u8` holding `text`, as a declaration the test can prepend. */
+    def format(name: String, text: String): String = {
+      val bytes = text.getBytes("UTF-8").map(b => s"${b & 0xff}u8") :+ "0u8"
+
+      s"var $name: [${bytes.length}]u8 = [${bytes.mkString(", ")}]"
+    }
+
+    "carries what it is given, in order" in {
+      val src =
+        s"""extern printf(fmt: *u8, ...) -> int
+           |${format("fmt", "%d %g %c|")}
+           |printf(&fmt[0], 42, 2.5, 'A')
+           |print("")""".stripMargin
+
+      run(src) shouldBe "42 2.5 A|\n"
+    }
+
+    // LLVM promotes nothing on its own, so an unwidened value would be read out of the wrong
+    // number of bytes — these are the cases that would print garbage if the widening were missing.
+    "widens a narrow argument the way C would have" in {
+      val src =
+        s"""extern printf(fmt: *u8, ...) -> int
+           |${format("fmt", "%u %d %g|")}
+           |var a: u8  = 200
+           |var b: i8  = -5
+           |var c: f32 = 1.5f32
+           |printf(&fmt[0], a, b, c)
+           |print("")""".stripMargin
+
+      run(src) shouldBe "200 -5 1.5|\n"
+    }
+
+    "passes a 64-bit value at its own width" in {
+      val src =
+        s"""extern printf(fmt: *u8, ...) -> int
+           |${format("fmt", "%lld|")}
+           |printf(&fmt[0], 9000000000i64)
+           |print("")""".stripMargin
+
+      run(src) shouldBe "9000000000|\n"
+    }
+
+    "may be called with no tail at all" in {
+      val src =
+        s"""extern printf(fmt: *u8, ...) -> int
+           |${format("fmt", "plain|")}
+           |printf(&fmt[0])
+           |print("")""".stripMargin
+
+      run(src) shouldBe "plain|\n"
+    }
+
+    "returns its result like any other call" in {
+      val src =
+        s"""extern printf(fmt: *u8, ...) -> int
+           |${format("fmt", "abc")}
+           |var n = printf(&fmt[0])
+           |print("")
+           |print(n)""".stripMargin
+
+      run(src) shouldBe "abc\n3\n"
+    }
+
+    // A variadic with several named parameters, and one whose tail is read into memory rather
+    // than printed — the other shape a C library offers.
+    "several named parameters precede the tail" in {
+      val src =
+        s"""extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
+           |extern printf(fmt: *u8, ...) -> int
+           |${format("fmt", "%d-%d")}
+           |${format("out", "%s|")}
+           |var buf: [16]u8
+           |var n = snprintf(&buf[0], 16usize, &fmt[0], 7, 8)
+           |printf(&out[0], &buf[0])
+           |print("")
+           |print(n)""".stripMargin
+
+      run(src) shouldBe "7-8|\n3\n"
+    }
+
+    "a call in a loop neither leaks nor gets confused" in {
+      val src =
+        s"""extern printf(fmt: *u8, ...) -> int
+           |${format("fmt", "%d,")}
+           |var total = 0
+           |for i in 1..5
+           |    total += printf(&fmt[0], i)
+           |print("")
+           |print(total)""".stripMargin
+
+      // Five calls of two characters each.
+      run(src) shouldBe "1,2,3,4,5,\n10\n"
+    }
+
+    // What a variadic call leaves behind still reaches the pipe, because the departure is the
+    // prelude's `exit` and `exit` flushes what was written.
+    "what it printed survives a departure taken right after it" in {
+      val src =
+        s"""extern printf(fmt: *u8, ...) -> int
+           |${format("fmt", "reached %d\\n")}
+           |printf(&fmt[0], 1)
+           |exit(3)
+           |printf(&fmt[0], 2)""".stripMargin
+
+      panics(src, "reached 1")
+    }
+  }
+
   "a call that does not return" - {
     "stops the program where it stands" in {
       val src =

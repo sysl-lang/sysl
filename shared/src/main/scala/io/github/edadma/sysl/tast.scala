@@ -252,7 +252,7 @@ case class TFunc(name: String, params: List[(String, Type)], retTy: Type, body: 
  * the program actually calls reach here, so an `extern` the prelude offers and nobody uses costs
  * the output nothing.
  */
-case class TExtern(name: String, params: List[Type], retTy: Type)
+case class TExtern(name: String, params: List[Type], retTy: Type, variadic: Boolean = false)
 
 /** A whole program: hoisted struct, enum, and function declarations, the externs it calls, plus
  * the top-level statements that make up `main`. Only data enums appear in `enums` — a simple enum

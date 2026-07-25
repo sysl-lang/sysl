@@ -213,6 +213,18 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
          |""".stripMargin) should include("declare void @take({ ptr, ptr, i64 })")
   }
 
+  // The tail is passed alongside the declared parameters rather than instead of them, so an
+  // ellipsis must not quietly excuse the argument that comes before it.
+  "an ellipsis does not excuse the parameters declared before it" in {
+    err("""extern take(s: []u8, ...)
+          |use()
+          |    var buf: [4]u8
+          |    take(buf[0..<2], 1)
+          |end use
+          |use()
+          |""".stripMargin) should include("is passed to 'take', which holds on to it")
+  }
+
   "a recursive function converges rather than assuming the worst" in {
     ir("""walk(s: []int, i: usize) -> int
          |    if i >= s.len then 0 else s[i] + walk(s, i + 1)

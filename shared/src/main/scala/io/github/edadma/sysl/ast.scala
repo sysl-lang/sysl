@@ -221,8 +221,13 @@ case class FuncDecl(
  * does. That is what makes it the seam a language reaches the outside world through — libc's
  * `exit`, a driver's MMIO helper — and why the escape analysis has to assume the worst of it
  * (`05-escape-analysis.md`): every argument may be kept, and the result may view any of them.
+ *
+ * `variadic` is the trailing `...` of `extern printf(fmt: *u8, ...) -> int`: the C ellipsis, and
+ * the only place in sysl a call's arity is not fixed by its declaration. A sysl *function* never
+ * has one (`12-functions-and-closures.md` §9).
  */
-case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef]) extends Stmt
+case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef],
+                      variadic: Boolean = false) extends Stmt
 
 /** `struct Name[T…]` with `name: type` fields and, intermixed, member declarations (methods,
  * properties, associated functions). Positional construction is `Name(a, b, …)`.

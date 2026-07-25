@@ -177,4 +177,106 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
       err("f() -> int\n    extern g() -> int\n    1") should include("may only be declared at the top level")
     }
   }
+
+  /** A variadic tail has no declared type to check an argument against, so what stands in for one
+   * is the C rule the call site must satisfy itself: only what varargs can carry may be passed.
+   * These are the other side of that — everything the ellipsis does *not* excuse.
+   */
+  "a variadic tail" - {
+    "needs a named parameter before it" in {
+      err("extern f(...) -> int\nprint(f(1))") should
+        include("'f' needs at least one named parameter before '...'")
+    }
+
+    "does not excuse the named parameters" in {
+      err("extern printf(fmt: *u8, ...) -> int\nprint(printf())") should
+        include("takes at least 1 argument, but 0 arguments were given")
+    }
+
+    "still checks the named parameters it does have" in {
+      err("extern printf(fmt: *u8, ...) -> int\nprint(printf(1, 2))") should
+        include("'fmt' of 'printf' is *byte, but int was given")
+    }
+
+    // Every one of these is a sysl layout with no C counterpart. A *declared* parameter may take
+    // one — the type is written down, so the promise is explicit — but a tail argument has no
+    // written type to make that promise with.
+    "carries no string" in {
+      err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, \"hi\"))") should
+        include("a string cannot be passed to '...'")
+    }
+
+    "carries no reference" in {
+      val src =
+        """extern printf(fmt: *u8, ...) -> int
+          |struct Inner
+          |    v: int
+          |var p: *u8 = null
+          |var r: &Inner = Inner(1)
+          |print(printf(p, r))""".stripMargin
+
+      err(src) should include("a &Inner cannot be passed to '...'")
+    }
+
+    "carries no struct" in {
+      val src =
+        """extern printf(fmt: *u8, ...) -> int
+          |struct Point
+          |    x: int
+          |    y: int
+          |var p: *u8 = null
+          |print(printf(p, Point(1, 2)))""".stripMargin
+
+      err(src) should include("a Point cannot be passed to '...'")
+    }
+
+    "carries no enum, simple or otherwise" in {
+      val src =
+        """extern printf(fmt: *u8, ...) -> int
+          |enum Color
+          |    Red
+          |    Green
+          |var p: *u8 = null
+          |print(printf(p, Red))""".stripMargin
+
+      err(src) should include("a Color cannot be passed to '...'")
+    }
+
+    "carries no slice" in {
+      val src =
+        """extern printf(fmt: *u8, ...) -> int
+          |var a: [3]int = [1, 2, 3]
+          |var p: *u8 = null
+          |print(printf(p, a))""".stripMargin
+
+      err(src) should include("cannot be passed to '...'")
+    }
+
+    // C promotes a `bool` to `int`, but sysl has no conversion that says so — nothing widens
+    // without being written — so there is nothing to promote it *with*, and it is refused rather
+    // than promoted by a rule that exists nowhere else in the language.
+    "carries no bool" in {
+      err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, true))") should
+        include("a bool cannot be passed to '...'")
+    }
+
+    "carries no unit, and nothing that never arrives" in {
+      err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, ()))") should
+        include("a unit cannot be passed to '...'")
+      err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, exit(1)))") should
+        include("a never cannot be passed to '...'")
+    }
+
+    "says what it would have taken" in {
+      err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, \"hi\"))") should
+        include("must be an integer, a float, a char, or a raw pointer")
+    }
+
+    // The tail is the extern's alone: a sysl function's arity is fixed, so an extra argument to
+    // one is the ordinary arity error however many the callee declares.
+    "belongs to the extern that declared it, not to every call" in {
+      err("extern printf(fmt: *u8, ...) -> int\nf(n: int) -> int = n\nprint(f(1, 2))") should
+        include("function 'f' takes 1 argument, but 2 arguments were given")
+    }
+  }
 }
