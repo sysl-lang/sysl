@@ -201,7 +201,10 @@ Key points:
   additionally on `bool` and on the two pointer-shaped modes `*T` and `&T`, which compare by
   address. Ordering on an address is not defined — a bare address has no meaningful one.
 - **Chained comparisons** (level 4): `a < b < c` means `a < b && b < c`, short-circuiting;
-  comparisons do not associate as plain left/right.
+  comparisons do not associate as plain left/right. The `&&` there is about *when* the later
+  comparisons happen, not a rewrite — a middle operand is **evaluated once** and compared twice, so
+  `1 < f() < 10` calls `f` once. Short-circuiting is what decides whether a later operand is
+  evaluated at all: `9 < f() < g()` never calls `g`.
 - **Assignment is an expression** (`00` §2): lowest precedence, right-associative
   (`a = b = c` = `a = (b = c)`).
 - `*` and `&` appear both as **prefix unary** (deref / addr-of, level 11) and as **binary**

@@ -380,12 +380,57 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       emitLabel(endL)
       val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
 
+    // One comparison has nothing to short-circuit, so it stays straight-line — which is what the
+    // overwhelming majority of comparisons are.
+    case TCompare(List(l, r), List(op)) =>
+      val lv = genExpr(l)
+      compareValue(op, l.ty, lv, genExpr(r))
+
+    // A **chain** short-circuits: `a < b < c` stops at the first comparison that fails, so a
+    // side-effecting later operand does not run. That is what `01` specifies, and what writing the
+    // chain out as `&&` already did.
+    //
+    // Each operand is still evaluated **exactly once**. Operand `k+1` is compared against operand
+    // `k`, so the shared middle value has to be the same value both times — which is why this is
+    // not a rewrite into `&&` over separate comparisons, and why the operands cannot simply be
+    // evaluated where they are used.
+    //
+    // That sharing is also what makes the ownership bookkeeping interesting: an operand evaluated
+    // in one block is used again in the next, so its temporaries outlive the block that made them
+    // and cannot be released there. Each block therefore opens its own region, and the exits
+    // **unwind them in reverse** — a path that leaves the chain early passes through exactly the
+    // pops for the regions it entered, and no others. Where nothing is owned, which is the usual
+    // case, every pop is empty and the ladder is branches alone.
     case TCompare(operands, ops) =>
-      // Each operand is evaluated exactly once — a chained comparison such as `1 < f() < 10` must
-      // not run its middle operand twice — then adjacent values are compared and the results ANDed.
-      val vals = operands.map(o => (o.ty, genExpr(o)))
-      val cmps = ops.indices.map(i => compareValue(ops(i), vals(i)._1, vals(i)._2, vals(i + 1)._2)).toList
-      cmps.reduce { (a, b) => val r = freshTemp(); emit(s"$r = and i1 $a, $b"); r }
+      val slot  = emitAlloca(freshTemp(), "i1")
+      val exits = ops.indices.map(_ => freshLabel("cmp.exit")).toList
+      val endL  = freshLabel("cmp.end")
+
+      var left = ""
+
+      for k <- ops.indices do
+        pushTemps()
+        if k == 0 then left = genExpr(operands.head)
+        val right = genExpr(operands(k + 1))
+        val c     = compareValue(ops(k), operands(k).ty, left, right)
+
+        emit(s"store i1 $c, ptr $slot")
+
+        if k == ops.length - 1 then emitTerm(s"br label %${exits(k)}")
+        else
+          val nextL = freshLabel("cmp.next")
+          emitTerm(s"br i1 $c, label %$nextL, label %${exits(k)}")
+          emitLabel(nextL)
+
+        left = right
+
+      for k <- ops.indices.reverse do
+        emitLabel(exits(k))
+        popTemps()
+        emitTerm(s"br label %${if k == 0 then endL else exits(k - 1)}")
+
+      emitLabel(endL)
+      val res = freshTemp(); emit(s"$res = load i1, ptr $slot"); res
 
     case TSeq(exprs) =>
       exprs.foreach(genExpr); ""

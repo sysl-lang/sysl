@@ -121,6 +121,73 @@ class ExpressionRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "tick\ntrue\n"
   }
 
+  // `01` specifies that a chain short-circuits, and for a long time it did not: every operand was
+  // evaluated up front and the pairs ANDed, so a side-effecting later operand ran even once an
+  // earlier comparison had already decided the answer.
+  "a chained comparison stops at the first comparison that fails" in {
+    val src =
+      """tick(n: int) -> int
+        |    print("tick")
+        |    n
+        |end tick
+        |print(9 < tick(2) < tick(3))""".stripMargin
+
+    // One tick: `9 < 2` is false, so the third operand is never reached.
+    run(src) shouldBe "tick\nfalse\n"
+  }
+
+  "and it stops wherever in the chain that happens" in {
+    val src =
+      """tick(label: int, n: int) -> int
+        |    print(label)
+        |    n
+        |end tick
+        |print(1 < tick(1, 2) < tick(2, 3) < tick(3, 0) < tick(4, 9))""".stripMargin
+
+    // Operands 1..3 run; `3 < 0` fails, so the fourth is never built.
+    run(src) shouldBe "1\n2\n3\nfalse\n"
+  }
+
+  "a chain that holds all the way through evaluates every operand" in {
+    val src =
+      """tick(label: int, n: int) -> int
+        |    print(label)
+        |    n
+        |end tick
+        |print(1 < tick(1, 2) < tick(2, 3) < tick(3, 4) < 100)""".stripMargin
+
+    run(src) shouldBe "1\n2\n3\ntrue\n"
+  }
+
+  // The operands a chain skips are the interesting case for ownership: a string operand owns its
+  // bytes, so one that is built must be released and one that is never built must not be. Looping
+  // it turns a double release into a crash and a missed one into unbounded growth.
+  "a chain over owned operands neither leaks nor releases twice" in {
+    val src =
+      """mk(p: *int, s: string) -> string
+        |    *p += 1
+        |    s + "!"
+        |end mk
+        |var built = 0
+        |var i = 0
+        |while i < 20000
+        |    var a = mk(&built, "b")
+        |    if mk(&built, "z") < a < mk(&built, "y") then print("unreachable")
+        |    i += 1
+        |print(built)""".stripMargin
+
+    // Two per iteration, never three: the chain fails at `"z!" < "b!"` and stops.
+    run(src) shouldBe "40000\n"
+  }
+
+  "a chain over strings compares the whole way when it holds" in {
+    val src =
+      """var s = "m"
+        |print("a" < s < "z", "z" < s < "a", "a" < s <= "m")""".stripMargin
+
+    run(src) shouldBe "true false true\n"
+  }
+
   // Arguments are evaluated left to right, each exactly once — a side-effecting argument prints
   // in call order and the packed result confirms each value landed in its own slot.
   "call arguments are evaluated left to right, once each" in {

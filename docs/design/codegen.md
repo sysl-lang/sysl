@@ -136,6 +136,14 @@ before they appear and may be mutually recursive).
   registered before its fields are resolved, so a field that points back at it finds it.
 - **Expressions:** the full settled precedence grammar (`01`) over the scalar types and
   string literals. `++`/`--`, unary `-`/`!`/`~`/`*`/`&`, chained comparison.
+- **A comparison chain short-circuits, sharing its middle operands.** `a < b < c` compares `a`
+  against `b` and, only if that holds, `b` against `c` — with `b` evaluated once and used twice, so
+  this is not a rewrite into `&&` over independent comparisons. Sharing is also what shapes the
+  ownership bookkeeping: an operand evaluated in one block is used again in the next, so it cannot
+  be released at the end of the block that made it. Each comparison opens its own region and the
+  exits **unwind in reverse**, so a path that leaves the chain early passes through exactly the
+  releases for the operands it built. A lone comparison has nothing to short-circuit and stays
+  straight-line.
 - **`print(a, b, …)`** — a **desugaring onto prelude functions**, not a builtin and not a user
   function. Each argument becomes a call to the renderer its static type reaches — `printi`,
   `printu`, `printr`, `printb`, `printc`, `prints` — widened to the width that renderer takes, with
@@ -228,17 +236,10 @@ arity.
    once traits can carry it. A related over-approximation shows up in the output: making a slice
    turns the ARC runtime on even where the owner is statically null, so a program that only prints
    an integer still carries the allocator declarations it never calls.
-8. **Chained comparisons `and` their pairs eagerly.** `a < b < c` lowers to `(a<b) and (b<c)`,
-   evaluating each operand exactly once but ANDing the pairs without short-circuiting the *chain* —
-   so a side-effecting later operand still runs when an earlier pair is already false, which `01`'s
-   "short-circuiting" does not intend. `&&` and `||` themselves now short-circuit (the right side is
-   a conditionally-entered block), so a guard like `p != null && *p > 0` never runs its unsafe side;
-   carrying that into the chain means evaluating its operands lazily, which the owned-operand
-   (string) case makes fiddly, so it waits.
-9. **`for` iterates a range, an array, or a slice.** `downTo`, `step`, and `reverse` are not
+8. **`for` iterates a range, an array, or a slice.** `downTo`, `step`, and `reverse` are not
    yet lowered, and nothing else is iterable — there is no iterator protocol, which is also why
    a string is iterated as `s.bytes` and has no `s.chars` yet.
-10. **Escape analysis rejects rather than promotes.** An array whose view escapes is
+9. **Escape analysis rejects rather than promotes.** An array whose view escapes is
    diagnosed where `05` says an allocator should silently promote it to the heap, so a program
    that means to return a view writes `&[N]T` itself. That is `05`'s `no alloc` behaviour
    applied everywhere — the safe direction to be wrong in — and `--explain-escapes` arrives
@@ -247,7 +248,7 @@ arity.
    tracked per local rather than per field, so a struct that holds one confined view is
    confined entirely. There is also no growable array: no `append`, no capacity, no `[]T` that
    owns rather than views. A bounds failure traps with no message, exactly as `char(u)` does.
-11. **Generics are monomorphized with local inference only.** Type arguments come from the
+10. **Generics are monomorphized with local inference only.** Type arguments come from the
     argument types and the expected type of the expression; there is no unification across a
     whole function body, no explicit type application at a call site, and no bounds or
     constraints on a type parameter. A parameter nothing determines is an error rather than a
