@@ -266,8 +266,20 @@ arity.
 
     Closing it means checking a generic body **once, abstractly**, with each type parameter
     treated as an opaque type supporting exactly what its bounds promise. The analyzer has no such
-    mode today: it only ever walks concrete instantiations. Until then every unbounded generic is a
-    definition that will need a bound added, so the cost of this one grows with the code.
+    mode today: it only ever walks concrete instantiations.
+
+    **An unbounded parameter stays perfectly legal** — this is not heading for a language where
+    every `[T]` needs a bound. An unbounded `T` supports what every type supports: being passed,
+    stored, returned, copied, released. `id[T](x: T) -> T`, `Pair[A, B]`, `pick[T](c, a, b)` need no
+    bound now and never will. What needs one is a body that uses a *capability*: a method call, an
+    operator, a rendering. Of the 35 generic declarations in the tree today, 16 already carry a
+    bound and exactly one of the other 19 uses a capability — so the migration this implies is
+    currently close to empty, and stays that way as long as new generics declare what they use.
+
+    One coupling worth knowing: `print(x)` inside a generic body works today because each
+    instantiation has a concrete type to pick a renderer for. Under abstract checking it needs
+    `T: Display` — the same trait `str` and `format` are waiting on (`04`, *Printing*), so the two
+    arrive together rather than costing separately.
 
 Only the last of these is a divergence from a settled design; the rest are the smallest lowering
 that runs a real program, chosen so the pieces above them (strings, methods, escape analysis) can
