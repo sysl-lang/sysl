@@ -141,6 +141,16 @@ trait AnalyzerBase {
 
   protected def show(t: Type): String = Type.show(t)
 
+  /** `1 argument`, `2 arguments` — a count with its noun agreeing. A diagnostic that misspells
+   * English reads like a bug in the thing reporting it, which is not the impression a compiler
+   * wants to give at the moment the programmer is already annoyed.
+   */
+  protected def quantity(n: Int, noun: String): String = if n == 1 then s"1 $noun" else s"$n ${noun}s"
+
+  /** `1 argument was given`, `2 arguments were given` — the same, with the verb agreeing too. */
+  protected def supplied(n: Int, noun: String): String =
+    s"${quantity(n, noun)} ${if n == 1 then "was" else "were"} given"
+
   // --- collecting errors ----------------------------------------------------------------
 
   /** Every error found so far, in the order the analyzer found them. Duplicates are dropped on

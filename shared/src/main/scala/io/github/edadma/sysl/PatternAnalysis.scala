@@ -68,7 +68,8 @@ trait PatternAnalysis extends TypeResolution {
               err(s"variant '$name' takes no arguments — match it as '$name'")
             case Some(v) =>
               if args.length != v.fields.length then
-                err(s"variant '$name' has ${v.fields.length} fields, but ${args.length} sub-patterns were given")
+                err(s"variant '$name' has ${quantity(v.fields.length, "field")}, " +
+                  s"but ${supplied(args.length, "sub-pattern")}")
               TVariantPattern(en, v, args.zip(v.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
             case None =>
               err(s"enum '${en.name}' has no variant '$name'")
@@ -78,7 +79,8 @@ trait PatternAnalysis extends TypeResolution {
         case s: Type.Struct =>
           if name != s.base then err(s"'$name(…)' does not match a ${show(s)} value")
           if args.length != s.fields.length then
-            err(s"struct '${s.base}' has ${s.fields.length} fields, but ${args.length} sub-patterns were given")
+            err(s"struct '${s.base}' has ${quantity(s.fields.length, "field")}, " +
+              s"but ${supplied(args.length, "sub-pattern")}")
           TStructPattern(s, args.zip(s.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
         case other =>
           err(s"'$name(…)' matches an enum variant or a struct, but the value is ${show(other)}")

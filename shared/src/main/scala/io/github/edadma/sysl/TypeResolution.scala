@@ -95,7 +95,9 @@ trait TypeResolution extends AnalyzerBase {
   protected def checkArity(name: String, tparams: List[String], targs: List[Type]): Unit =
     if tparams.length != targs.length then
       if tparams.isEmpty then err(s"type '$name' does not take type arguments")
-      else err(s"type '$name' takes ${tparams.length} type arguments, but ${targs.length} were given")
+      else
+        err(s"type '$name' takes ${quantity(tparams.length, "type argument")}, " +
+          s"but ${supplied(targs.length, "type argument")}")
 
   /** Instantiates a struct for one set of type arguments, memoized on the display name. The
    * instantiation is registered *before* its fields are resolved, so a field that points back

@@ -32,7 +32,8 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "constructing a variant with the wrong arity" in {
-      err("enum Shape\n    Circle(r: int)\n    Empty\nvar s = Circle(1, 2)") should include("has 1 fields")
+      err("enum Shape\n    Circle(r: int)\n    Empty\nvar s = Circle(1, 2)") should
+        include("has 1 field, but 2 values were given")
     }
 
     "a nullary variant cannot take arguments" in {
@@ -56,7 +57,7 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
   "generics" - {
     "the wrong number of type arguments" in {
       err("struct Box[T]\n    value: T\nf(b: Box[int, real])\n    print(1)") should
-        include("takes 1 type arguments")
+        include("takes 1 type argument, but 2 type arguments were given")
     }
 
     "type arguments on a type that takes none" in {

@@ -116,7 +116,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |f(p: Point) -> int = match p
           |    Point(x) -> x
           |    else -> 0""".stripMargin
-      ) should include("struct 'Point' has 2 fields, but 1 sub-patterns were given")
+      ) should include("struct 'Point' has 2 fields, but 1 sub-pattern was given")
     }
 
     "a named struct pattern naming an unknown field is rejected" in {

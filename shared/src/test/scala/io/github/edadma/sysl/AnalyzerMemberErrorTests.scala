@@ -106,7 +106,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |    plus(self, other: T) -> T = self.value + other
           |var a = Box(1)
           |print(a.plus(2, 3))""".stripMargin
-      ) should include("takes 1 arguments")
+      ) should include("takes 1 argument, but 2 arguments were given")
     }
 
     "a property on a generic type is read without parentheses" in {

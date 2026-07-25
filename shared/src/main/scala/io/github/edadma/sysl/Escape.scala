@@ -62,7 +62,7 @@ private class Escape(program: TProgram) {
         walk.escape
       }
 
-    if escapes.isEmpty then None else Some(escapes.mkString("\n\n"))
+    if escapes.isEmpty then None else Some(Diagnostic.report(escapes))
   }
 
   /** Whether a value of this type could carry a view of somebody's elements. */

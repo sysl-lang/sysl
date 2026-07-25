@@ -331,6 +331,76 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "how many errors are reported" - {
+    "stops at five, and says how many there were" in {
+      val src = (1 to 8).map(n => s"var v$n = nope$n").mkString("\n")
+      val out = diag(src)
+
+      count(out) shouldBe 5
+      at(out) shouldBe List(1, 2, 3, 4, 5)
+      out should endWith("showing the first 5 of 8 errors")
+    }
+
+    "keeps the earliest five, since an error early in a file is the one worth reading" in {
+      val src = (1 to 8).map(n => s"var v$n = nope$n").mkString("\n")
+
+      diag(src) should include("undefined name 'nope1'")
+      diag(src) should not include "nope6"
+    }
+
+    "says nothing extra when the count is exactly at the limit" in {
+      val src = (1 to 5).map(n => s"var v$n = nope$n").mkString("\n")
+      val out = diag(src)
+
+      count(out) shouldBe 5
+      out should not include "showing the first"
+    }
+
+    "caps escape errors the same way" in {
+      val funcs = (1 to 7).map { n =>
+        s"""f$n() -> []u8
+           |    var a$n: [4]u8
+           |    a$n[..]
+           |""".stripMargin
+      }.mkString("\n")
+      val out = diag(funcs)
+
+      count(out) shouldBe 5
+      out should endWith("showing the first 5 of 7 errors")
+    }
+  }
+
+  "counted things read as English" - {
+    "one argument is an argument, not arguments" in {
+      val src =
+        """f(a: int) -> int = a
+          |print(f(1, 2))
+          |""".stripMargin
+
+      diag(src) should include("takes 1 argument, but 2 arguments were given")
+    }
+
+    "one value given is 'was given', not 'were given'" in {
+      val src =
+        """struct P
+          |    x: int
+          |    y: int
+          |var p = P(1)
+          |""".stripMargin
+
+      diag(src) should include("has 2 fields, but 1 value was given")
+    }
+
+    "and the plural forms still agree" in {
+      val src =
+        """f(a: int, b: int) -> int = a
+          |print(f(1))
+          |""".stripMargin
+
+      diag(src) should include("takes 2 arguments, but 1 argument was given")
+    }
+  }
+
   "state left consistent by an abandoned region" - {
     "a field whose type does not resolve does not make later mentions look like a cycle" in {
       // The resolver marks a type as in-progress while it works out the fields. Leaving that mark

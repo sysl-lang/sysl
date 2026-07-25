@@ -33,7 +33,7 @@ trait CallAnalysis extends TypeResolution {
 
   protected def callFunction(f: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
     if args.length != f.params.length then
-      err(s"function '${f.name}' takes ${f.params.length} arguments, but ${args.length} were given")
+      err(s"function '${f.name}' takes ${quantity(f.params.length, "argument")}, but ${supplied(args.length, "argument")}")
 
     val (name, pre) =
       if f.tparams.isEmpty then (f.name, None)
@@ -90,7 +90,7 @@ trait CallAnalysis extends TypeResolution {
             val fname           = memberFuncName(base, mname, s)
             val (params, rtype) = funcInsts(fname)
             if args.length != params.length - 1 then
-              err(s"method '$fname' takes ${params.length - 1} arguments, but ${args.length} were given")
+              err(s"method '$fname' takes ${quantity(params.length - 1, "argument")}, but ${supplied(args.length, "argument")}")
             val recvArg  = buildReceiver(m.receiver.get, tr, s)
             val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
@@ -109,7 +109,7 @@ trait CallAnalysis extends TypeResolution {
         val fname           = s"$tname.$mname"
         val (params, rtype) = funcInsts(fname)
         if args.length != params.length then
-          err(s"associated function '$fname' takes ${params.length} arguments, but ${args.length} were given")
+          err(s"associated function '$fname' takes ${quantity(params.length, "argument")}, but ${supplied(args.length, "argument")}")
         val ts = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
         TCall(fname, checkArgs(fname, params, args, Some(ts)), rtype)
       case Some(m) if m.isProperty =>
@@ -158,7 +158,7 @@ trait CallAnalysis extends TypeResolution {
     val decl = structDecls(name)
 
     if args.length != decl.fields.length then
-      err(s"struct '$name' has ${decl.fields.length} fields, but ${args.length} were given")
+      err(s"struct '$name' has ${quantity(decl.fields.length, "field")}, but ${supplied(args.length, "value")}")
 
     val (targs, pre) =
       if decl.tparams.isEmpty then (Nil, None)
@@ -185,7 +185,7 @@ trait CallAnalysis extends TypeResolution {
     if vdecl.fields.nonEmpty && args.isEmpty then
       err(s"variant '$name' carries data — construct it with '$name(…)'")
     if args.length != vdecl.fields.length then
-      err(s"variant '$name' has ${vdecl.fields.length} fields, but ${args.length} were given")
+      err(s"variant '$name' has ${quantity(vdecl.fields.length, "field")}, but ${supplied(args.length, "value")}")
 
     val (targs, pre) =
       if decl.tparams.isEmpty then (Nil, None)

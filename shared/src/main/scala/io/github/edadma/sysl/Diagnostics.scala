@@ -101,10 +101,27 @@ trait Positioned {
 
 object Diagnostic {
 
+  /** How many errors one compilation reports.
+   *
+   * Five is already more than anyone fixes before compiling again, and the further down a broken
+   * file a diagnostic is, the likelier it is to be a consequence of one further up rather than a
+   * mistake of its own. A wall of them is not more information; it is the first five with the
+   * signal-to-noise falling off behind them.
+   */
+  val limit: Int = 5
+
   /** A message rendered against a position when there is one, and on its own when there is not —
    * a synthesized node (the prelude's, a desugaring's) may have no place to point at, and that
    * is a reason to say less rather than to say nothing.
    */
   def render(msg: String, pos: Option[Pos]): String =
     pos.map(_.render(msg)).getOrElse(s"error: $msg")
+
+  /** Assembles the diagnostics of one compilation: at most `limit` of them, separated by a blank
+   * line, with a closing count when there were more. The ones kept are the *first* — the list
+   * arrives in source order, and an error early in a file is the one worth reading.
+   */
+  def report(all: List[String]): String =
+    if all.length <= limit then all.mkString("\n\n")
+    else (all.take(limit) :+ s"showing the first $limit of ${all.length} errors").mkString("\n\n")
 }

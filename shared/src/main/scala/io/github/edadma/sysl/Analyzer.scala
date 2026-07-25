@@ -909,13 +909,13 @@ object Analyzer {
 
     outcome match
       case Right(tree) if found.isEmpty => Right(tree)
-      case Right(_)                     => Left(found.mkString("\n\n"))
+      case Right(_)                     => Left(Diagnostic.report(found))
       case Left(escaped) =>
         val all = found ::: escaped
 
         // Reaching here with nothing to say would mean the analyzer gave up without recording
         // why, which is a bug in the analyzer rather than in the program it was handed.
         if all.isEmpty then Left(Diagnostic.render("the analyzer stopped without reporting why", None))
-        else Left(all.mkString("\n\n"))
+        else Left(Diagnostic.report(all))
   }
 }
