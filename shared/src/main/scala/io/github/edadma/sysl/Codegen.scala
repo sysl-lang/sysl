@@ -661,6 +661,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
         emitTerm(s"br label %$endL")
       }
       emitLabel(endL)
+      endsNowhere(ty)
       ""
     else
       val slot = emitAlloca(freshTemp(), ty.llvm)
@@ -684,6 +685,17 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
   private def storeBlockValue(b: TBlock, ty: Type, slot: String): Unit =
     if b.ty == Type.Never then genBlockVoid(b)
     else emit(s"store ${ty.llvm} ${genBlockValue(b)}, ptr $slot")
+
+  /** Closes the merge point of an `if`, a `match`, or a loop whose every path diverges: no branch
+   * arrives, so the label control would have landed on is unreachable.
+   *
+   * This is what keeps the invariant every consumer of a value relies on — **a `never`-typed
+   * expression always leaves the block terminated** — true for the aggregate forms as well as for
+   * the call that starts it. With that, a `return`, a `store`, a `break`, or an argument built from
+   * one is dropped rather than emitted with nothing to say.
+   */
+  private def endsNowhere(ty: Type): Unit =
+    if ty == Type.Never then emitTerm("unreachable")
 
   private def genMatch(scrutinee: TExpr, arms: List[TArm], ty: Type): String = {
     val sv   = genExpr(scrutinee)
@@ -737,6 +749,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     // statement match simply proceeds.
     if Type.noValue(ty) then emitTerm(s"br label %$endL") else emitTerm("unreachable")
     emitLabel(endL)
+    endsNowhere(ty)
     if Type.noValue(ty) then ""
     else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
   }
@@ -955,6 +968,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       emitTerm(s"br label %$endL")
     }
     emitLabel(endL)
+    endsNowhere(ty)
     if Type.noValue(ty) then ""
     else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
   }

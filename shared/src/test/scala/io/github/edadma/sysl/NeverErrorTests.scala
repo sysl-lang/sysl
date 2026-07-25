@@ -129,6 +129,18 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
       err(src) should include("breaks with a int but has no 'else'")
     }
 
+    // A jumping block's *type* becomes `never`, but the jump itself is checked exactly as before:
+    // its value against the function's result, and its target against the loops in scope.
+    "a returning branch still checks the value it returns" in {
+      err("f() -> int\n    var x = if true then 1 else return \"no\"\n    x") should
+        include("return type mismatch: expected int, got string")
+    }
+
+    "a continuing branch still needs a loop to continue" in {
+      err("f() -> int\n    var x = if true then 1 else continue\n    x") should
+        include("'continue' is only allowed inside a loop")
+    }
+
     "a value branch beside a unit one is still a statement" in {
       ir("var n = 0\nif true then n = 1 else print(2)\nprint(n)") should include("define i32 @main()")
     }

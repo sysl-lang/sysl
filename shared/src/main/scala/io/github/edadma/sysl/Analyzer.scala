@@ -357,6 +357,11 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
 
   /** The body of a value block, using whatever scope the caller has established — a match arm
    * runs this after declaring its pattern bindings, so they are visible to the body.
+   *
+   * A block that ends in a **jump** — `return`, `break`, `continue` — has no trailing expression to
+   * be the value of, and it does not fall out the bottom either, so its type is `never` rather than
+   * `unit`. That is what lets `if c then 1 else return 0` be an `int`: the jump is still not an
+   * expression (`12 §3`), but the block around it is one, and its type says control does not arrive.
    */
   protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock =
     stmts.reverse match
@@ -364,6 +369,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         val init = initRev.reverse.map(recoverStmt)
         val tr   = analyzeExpr(e, expected)
         TBlock(init, Some(tr), tr.ty)
+      case (_: Return | _: Break | _: Continue) :: _ =>
+        TBlock(stmts.map(recoverStmt), None, Type.Never)
       case _ =>
         TBlock(stmts.map(recoverStmt), None, Type.Unit)
 

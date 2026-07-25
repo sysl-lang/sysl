@@ -298,6 +298,126 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  // A jump is not an expression, but the block around one is — and that block does not arrive at
+  // the bottom, so it has the same type a diverging call does. This is what makes the branch that
+  // leaves the function usable in a value position.
+  "a block that ends in a jump" - {
+    "a branch may return instead of yielding" in {
+      val src =
+        """halve(n: int) -> int
+          |    var h = if n % 2 == 0 then n / 2 else return -1
+          |    h * 10
+          |print(halve(8), halve(7))""".stripMargin
+
+      run(src) shouldBe "40 -1\n"
+    }
+
+    "an arm may return instead of yielding" in {
+      val src =
+        """first(o: Option[int]) -> int = match o
+          |    Some(v) -> v
+          |    None -> return -1
+          |print(first(Some(4)), first(None))""".stripMargin
+
+      run(src) shouldBe "4 -1\n"
+    }
+
+    "a branch may continue to the next iteration" in {
+      val src =
+        """sum_even(hi: int) -> int
+          |    var total = 0
+          |    var i = 1
+          |    while i <= hi
+          |        i++
+          |        var v = if (i - 1) % 2 == 0 then i - 1 else continue
+          |        total += v
+          |    total
+          |print(sum_even(10))""".stripMargin
+
+      run(src) shouldBe "30\n"
+    }
+
+    "a branch may break with the loop's value" in {
+      val src =
+        """find(hi: int) -> int
+          |    var i = 1
+          |    while i <= hi
+          |        var keep = if i * i > 20 then break i else i
+          |        i = keep + 1
+          |    else -1
+          |print(find(10), find(3))""".stripMargin
+
+      run(src) shouldBe "5 -1\n"
+    }
+
+    "a loop's else may return" in {
+      val src =
+        """find(hi: int) -> int
+          |    var i = 1
+          |    var found = while i <= hi
+          |        if i * i > 20 then break i
+          |        i++
+          |    else return -1
+          |    found * 100
+          |print(find(10), find(3))""".stripMargin
+
+      run(src) shouldBe "500 -1\n"
+    }
+
+    // Every path out of the body leaves through a `return`, so the point after the `if` is reached
+    // by nothing — and a merge that nothing reaches must not try to produce the value the function
+    // was declared to hand back.
+    "a body whose every branch returns needs no fall-through value" in {
+      val src =
+        """sign(c: bool) -> int
+          |    if c then return 1 else return 2
+          |print(sign(true), sign(false))""".stripMargin
+
+      run(src) shouldBe "1 2\n"
+    }
+
+    "a body whose every arm returns is the same shape" in {
+      val src =
+        """pick(o: Option[int]) -> int = match o
+          |    Some(v) -> return v * 2
+          |    None -> return -1
+          |print(pick(Some(3)), pick(None))""".stripMargin
+
+      run(src) shouldBe "6 -1\n"
+    }
+
+    "a nested all-returning if is still a value in the outer one" in {
+      val src =
+        """classify(n: int) -> int
+          |    var kind = if n > 0 then
+          |        if n > 10 then return 99 else return 1
+          |    else 0
+          |    kind + 5
+          |print(classify(-1), classify(5), classify(50))""".stripMargin
+
+      run(src) shouldBe "5 1 99\n"
+    }
+
+    "a diverging block still owns what it took" in {
+      val src =
+        """struct Inner
+          |    v: int
+          |grab(seed: int) -> &Inner
+          |    var held: &Inner = Inner(seed)
+          |    var out = if held.v >= 0 then held else return Inner(0)
+          |    out
+          |var i = 0
+          |var total = 0
+          |while i < 500000
+          |    var g = grab(i % 4)
+          |    total += g.v
+          |    i++
+          |print(total)""".stripMargin
+
+      run(src) shouldBe "750000\n"
+    }
+  }
+
   "the prelude's unwrap and expect" - {
     "Option hands over the value it holds" in {
       val src =

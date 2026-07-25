@@ -431,6 +431,20 @@ The rule runs in **one direction only**. A `never` may stand for a `T`; a `T` ma
 a promise the body has to keep — while `f(exit(1))` and `return exit(1)` are accepted as the dead
 code they are.
 
+**A block that ends in a jump has type `never` too.** `return`, `break`, and `continue` are not
+expressions (`12 §3`), so a block ending in one has no trailing expression to be its value — and it
+does not fall out the bottom either. Its type is therefore `never` rather than `unit`, which is what
+makes the branch that leaves usable where a value is expected:
+
+```
+halve(n: int) -> int
+    var h = if n % 2 == 0 then n / 2 else return -1     // the else branch is never
+    h * 10
+```
+
+The jump itself is checked exactly as it was: its value against the enclosing function's result,
+its label against the loops in scope. Only the *type of the block around it* is new.
+
 **There are no values of `never`, so it cannot be a value's type.** It may be written in exactly
 one position: a **result type** — a function's, a member's, or an `extern`'s. `var x: never`, a
 field of type `never`, an element type, `Option[never]`, a parameter — all are errors, and so is

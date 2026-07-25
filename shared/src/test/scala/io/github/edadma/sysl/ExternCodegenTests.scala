@@ -144,4 +144,45 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
       out should include("call void @stop()")
     }
   }
+
+  // A `never`-typed expression must leave its block terminated — that invariant is what lets every
+  // consumer of a value ignore the case where none arrives. For a call it falls out of the
+  // `unreachable`; for an `if` or `match` whose every path leaves, the merge label has to say so
+  // itself, or the `ret` that follows would be emitted with no value to return.
+  "a merge nothing reaches" - {
+    "an all-returning if ends in unreachable, not a valueless ret" in {
+      val out = ir("f(c: bool) -> int\n    if c then return 1 else return 2\nprint(f(true))")
+
+      out should include("ret i32 1")
+      out should include("ret i32 2")
+      out should include("unreachable")
+      out.linesIterator.map(_.trim).toList should not contain "ret i32"
+    }
+
+    "an all-returning match does too" in {
+      val src =
+        """f(o: Option[int]) -> int = match o
+          |    Some(v) -> return v
+          |    None -> return -1
+          |print(f(Some(1)))""".stripMargin
+      val out = ir(src)
+
+      out.linesIterator.map(_.trim).toList should not contain "ret i32"
+      out should include("unreachable")
+    }
+
+    "a loop whose break and else both diverge ends the same way" in {
+      val src =
+        """extern stop() -> never
+          |f(c: bool)
+          |    while c
+          |        break stop()
+          |    else stop()
+          |f(true)""".stripMargin
+      val out = ir(src)
+
+      out should include("call void @stop()")
+      out.linesIterator.map(_.trim).toList should not contain "store void"
+    }
+  }
 }

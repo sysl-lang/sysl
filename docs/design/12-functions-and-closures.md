@@ -127,6 +127,12 @@ classify(n: int) -> int
 control out of the function. The trailing-expression result is the structured default; `return`
 is the escape for the cases that would otherwise need an `else` ladder.
 
+That `return` is not an expression does not stop a *branch* that returns from sitting where a value
+is wanted. A block ending in a jump has type `never` (`00 §11`), so `var h = if ok then v else
+return -1` type-checks as an `int`: the branch that leaves contributes no type of its own, and the
+one that arrives decides. The distinction is worth keeping straight — the jump has no type, the
+block containing it does.
+
 ## 4. Declaration order does not matter
 
 Functions are **hoisted**: a function may call another that is declared later in the file, and a
