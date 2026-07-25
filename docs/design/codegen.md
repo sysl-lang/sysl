@@ -250,11 +250,25 @@ arity.
    owns rather than views. A bounds failure traps with no message, exactly as `char(u)` does.
 10. **Generics are monomorphized with local inference only.** Type arguments come from the
     argument types and the expected type of the expression; there is no unification across a
-    whole function body, no explicit type application at a call site, and no bounds or
-    constraints on a type parameter. A parameter nothing determines is an error rather than a
-    default. `?` is wired to the prelude's `Option` and `Result` **by name**, standing in for
-    the eventual trait that will describe "can be short-circuited".
+    whole function body and no explicit type application at a call site. A parameter nothing
+    determines is an error rather than a default. `?` is wired to the prelude's `Option` and
+    `Result` **by name**, standing in for the eventual trait that will describe "can be
+    short-circuited".
+11. **A generic body is checked per instantiation, not at its definition** — and this one is a
+    divergence from `10-generics.md` rather than merely less than it. A bound that *is* declared is
+    real: `bounded[T: Show](x)` is enforced at each call site, and instantiating it at a type that
+    does not implement `Show` names the bound it failed. But a bound is not *required*. An
+    unbounded `loose[T](x: T) -> int = x.show()` compiles, and is diagnosed only when something
+    instantiates it at a type with no `show` — which is exactly the C++ template model that `10`
+    rejects in as many words ("only C++ defers to instantiation"). The payoff `10` is after — the
+    error landing on the definition that made the unsupported assumption — is therefore available
+    only to an author who volunteers the bound.
 
-None of these are load-bearing design decisions — they are the smallest lowering that runs a
-real program, chosen so the pieces above them (strings, methods, escape analysis) can be added
-without reworking the pipeline shape.
+    Closing it means checking a generic body **once, abstractly**, with each type parameter
+    treated as an opaque type supporting exactly what its bounds promise. The analyzer has no such
+    mode today: it only ever walks concrete instantiations. Until then every unbounded generic is a
+    definition that will need a bound added, so the cost of this one grows with the code.
+
+Only the last of these is a divergence from a settled design; the rest are the smallest lowering
+that runs a real program, chosen so the pieces above them (strings, methods, escape analysis) can
+be added without reworking the pipeline shape.

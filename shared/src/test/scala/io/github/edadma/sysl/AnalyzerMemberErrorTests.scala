@@ -331,6 +331,25 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |print(render(Red))""".stripMargin
       ) should include("requires its type parameter 'T' to implement 'Show', but Color does not")
     }
+
+    // A declared bound is enforced, but one is not yet *required*: an unbounded generic body may
+    // call any method, and nothing complains until something instantiates it at a type without
+    // that method. `10-generics.md` rejects exactly this — it is the C++ template model, and the
+    // payoff it names is the error landing on the definition that made the assumption rather than
+    // on a caller. Closing it needs the body checked once with `T` opaque, which the analyzer has
+    // no mode for: it only ever walks concrete instantiations.
+    "an unbounded generic may not call a method its parameter does not promise" ignore {
+      err(
+        """trait Show
+          |    show(self) -> int
+          |struct P
+          |    v: int
+          |impl Show for P
+          |    show(self) -> int = self.v
+          |loose[T](x: T) -> int = x.show()
+          |print(loose(P(7)))""".stripMargin
+      ) should include("'show' needs 'T: Show'")
+    }
   }
 
   "members on generic types" - {
