@@ -40,8 +40,18 @@ trait AnalyzerBase {
    */
   protected val traitDecls = mutable.LinkedHashMap.empty[String, TraitDecl]
 
-  /** Every `impl Trait for Type`, keyed by (trait name, type name). The key catches a duplicate
-   * implementation, and it is what a trait bound will consult to decide whether a type conforms.
+  /** Every `impl Trait for Type` as written, in source order. Kept unresolved because the type it
+   * names may be declared further down the file; `hoistImpl` resolves each one after every type is
+   * registered, and that is where `traitImpls` gets filled.
+   */
+  protected val implDecls = mutable.ListBuffer.empty[ImplDecl]
+
+  /** Every `impl Trait for Type`, keyed by (trait name, the implementing type's **owner key**). The
+   * key catches a duplicate implementation, and it is what a trait bound consults to decide whether
+   * a type conforms.
+   *
+   * Keying by the owner key rather than by the name as written is what makes `impl Show for int` and
+   * `impl Show for i32` the one implementation they are — the same type reached by two spellings.
    */
   protected val traitImpls = mutable.LinkedHashMap.empty[(String, String), ImplDecl]
 
@@ -182,6 +192,29 @@ trait AnalyzerBase {
    */
   protected def nominalTparams(base: String): List[String] =
     structDecls.get(base).map(_.tparams).orElse(enumDecls.get(base).map(_.tparams)).getOrElse(Nil)
+
+  /** Where a type's members are registered: the key they are filed under, and the type arguments a
+   * generic type was instantiated with.
+   *
+   * **Every** type has one. A struct or an enum is filed under the name it was declared with; every
+   * other type under the name a diagnostic gives it, which is canonical — one name per type, and the
+   * same one whichever alias reached it (`int` and `i32` are one key, not two). That is what lets
+   * `5.show()` resolve exactly as `p.show()` does, with no separate machinery for the built-ins.
+   */
+  protected def memberOwner(t: Type): (String, List[Type]) = t match
+    case n: Type.Named => (n.base, n.targs)
+    case other         => (Type.show(other), Nil)
+
+  /** The key alone — what an `impl` is filed under, and what a trait bound looks up. */
+  protected def ownerKey(t: Type): String = memberOwner(t)._1
+
+  /** The type a member is looked up on, seeing through one level of `*T` / `&T` so a method may be
+   * called on a value, a pointer to it, or a reference to it alike.
+   */
+  protected def receiverType(t: Type): Type = t match
+    case Type.Ptr(inner)    => inner
+    case Type.Ref(inner, _) => inner
+    case other              => other
 
   /** `1 argument`, `2 arguments` — a count with its noun agreeing. A diagnostic that misspells
    * English reads like a bug in the thing reporting it, which is not the impression a compiler

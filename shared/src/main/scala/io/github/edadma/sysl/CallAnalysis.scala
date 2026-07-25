@@ -92,52 +92,49 @@ trait CallAnalysis extends Literals {
    * For each bounded parameter, the concrete type must carry an `impl` of every trait the bound
    * names — checked here at the call, so a caller supplying a type that does not implement the
    * trait is told exactly that, rather than meeting a missing-method error deep inside the
-   * monomorphized body. Only a nominal type — a struct or an enum — can carry an `impl`, so anything else
-   * fails the bound.
+   * monomorphized body. Any type can carry an `impl`, built-ins included, so the bound is decided by
+   * whether one was written for the type's owner key rather than by what kind of type it is.
    */
   protected def checkBounds(f: FuncDecl, targs: List[Type]): Unit =
     if f.bounds.nonEmpty then
       val subst = f.tparams.zip(targs).toMap
       for (tp, traits) <- f.bounds; tr <- traits do
         val concrete = subst(tp)
-        val ok = concrete match
-          case n: Type.Named => traitImpls.contains((tr, n.base))
-          case _             => false
-        if !ok then
+        if !traitImpls.contains((tr, ownerKey(concrete))) then
           err(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
             s"but ${show(concrete)} does not")
 
-  /** The name codegen emits for a member call on `n`. A member of a concrete type was hoisted
-   * eagerly under `Type.member`; a member of a generic type is instantiated here, from the
-   * receiver's own type arguments, and its body queued for analysis — so both resolve to a name
-   * that `funcInsts` holds.
+  /** The name codegen emits for a member call. A member of a concrete type was hoisted eagerly
+   * under `Type.member`; a member of a generic type is instantiated here, from the receiver's own
+   * type arguments, and its body queued for analysis — so both resolve to a name that `funcInsts`
+   * holds.
    */
-  protected def memberFuncName(base: String, mname: String, n: Type.Named): String =
+  protected def memberFuncName(base: String, mname: String, targs: List[Type]): String =
     if nominalTparams(base).isEmpty then s"$base.$mname"
-    else instantiateFunc(genericMembers((base, mname)), n.targs)
+    else instantiateFunc(genericMembers((base, mname)), targs)
 
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever
    * memory mode the method's `self` asked for.
+   *
+   * The receiver may be of *any* type: every type has an owner key its members are filed under, so
+   * `5.show()` takes this path exactly as `p.show()` does.
    */
   protected def callMethod(recv: Expr, mname: String, args: List[Expr]): TExpr = {
-    val tr = analyzeExpr(recv)
+    val tr            = analyzeExpr(recv)
+    val (base, targs) = memberOwner(receiverType(tr.ty))
 
-    namedBase(tr.ty) match
-      case Some(n) =>
-        memberDecls.get((n.base, mname)) match
-          case Some(m) if m.receiver.isDefined =>
-            val fname           = memberFuncName(n.base, mname, n)
-            val (params, rtype) = funcInsts(fname)
-            if args.length != params.length - 1 then
-              err(s"method '$fname' takes ${quantity(params.length - 1, "argument")}, but ${supplied(args.length, "argument")}")
-            val recvArg  = buildReceiver(m.receiver.get, tr)
-            val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
-            TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
-          case Some(_) => err(s"'$mname' is a property of '${n.name}' — read it as 'value.$mname', without '()'")
-          case None    => err(s"type '${n.name}' has no method '$mname'")
-      case None =>
-        err(s"cannot call method '$mname' on ${show(tr.ty)}")
+    memberDecls.get((base, mname)) match
+      case Some(m) if m.receiver.isDefined =>
+        val fname           = memberFuncName(base, mname, targs)
+        val (params, rtype) = funcInsts(fname)
+        if args.length != params.length - 1 then
+          err(s"method '$fname' takes ${quantity(params.length - 1, "argument")}, but ${supplied(args.length, "argument")}")
+        val recvArg  = buildReceiver(m.receiver.get, tr)
+        val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+        TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
+      case Some(_) => err(s"'$mname' is a property of '$base' — read it as 'value.$mname', without '()'")
+      case None    => err(s"type '$base' has no method '$mname'")
   }
 
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
@@ -156,16 +153,6 @@ trait CallAnalysis extends Literals {
         err(s"'$mname' is a property of '$tname' — read it on a value, as 'value.$mname'")
       case Some(_) => err(s"'$mname' is an instance method of '$tname' — call it on a value, not the type")
       case None    => err(s"type '$tname' has no associated function '$mname'")
-
-  /** The nominal type a receiver denotes — the struct or enum a member could be declared on —
-   * seeing through one level of `*T` / `&T`, so a method may be called on a value, a pointer to it,
-   * or a reference to it alike.
-   */
-  protected def namedBase(t: Type): Option[Type.Named] = t match
-    case n: Type.Named              => Some(n)
-    case Type.Ptr(n: Type.Named)    => Some(n)
-    case Type.Ref(n: Type.Named, _) => Some(n)
-    case _                          => None
 
   /** Passes the receiver in the mode the method's `self` declared, inserting the same conversion
    * a matching argument would: a value is copied, `*self` takes the instance's address, `&self`

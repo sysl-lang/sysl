@@ -276,15 +276,49 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("generic type is not supported yet")
     }
 
-    // A type that is neither a struct nor an enum has no body to hoist members into, and the
-    // diagnostic now names both kinds that do.
-    "implementing a trait for an unknown type names both nominal kinds" in {
+    // A trait may be implemented for any type, so what is wrong with `impl Show for Ghost` is not
+    // that `Ghost` is the wrong *kind* of type — it is that there is no such type at all, which is
+    // what the diagnostic says.
+    "implementing a trait for an unknown type says the name is unknown" in {
       err(
         """trait Show
           |    show(self) -> int
           |impl Show for Ghost
           |    show(self) -> int = 1""".stripMargin
-      ) should include("a trait can only be implemented for a struct or an enum")
+      ) should include("unknown type 'Ghost'")
+    }
+
+    "a built-in type may carry an impl, and its methods resolve on a value of it" in {
+      ir(
+        """trait Show
+          |    show(self) -> string
+          |impl Show for int
+          |    show(self) -> string = "i"
+          |print(5.show())""".stripMargin
+      ) should include("define { ptr, ptr, i64 } @int.show(")
+    }
+
+    // The key is the type, not the spelling it was reached by, so two aliases of one type are one
+    // implementation and the second is the duplicate it is.
+    "two spellings of one built-in type are one implementation" in {
+      err(
+        """trait Show
+          |    show(self) -> string
+          |impl Show for int
+          |    show(self) -> string = "a"
+          |impl Show for i32
+          |    show(self) -> string = "b"
+          |print(1)""".stripMargin
+      ) should include("already implements 'Show'")
+    }
+
+    "a type with no values, and one with only one, carry nothing" in {
+      val trait_ = "trait Show\n    show(self) -> string\n"
+
+      err(s"${trait_}impl Show for never\n    show(self) -> string = \"n\"\nprint(1)") should
+        include("'never' has no values")
+      err(s"${trait_}impl Show for unit\n    show(self) -> string = \"u\"\nprint(1)") should
+        include("a trait for it would say nothing")
     }
 
     "an enum that does not implement a bound's trait is rejected at the call" in {
@@ -435,7 +469,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |    show(self) -> string
           |impl Show for Ghost
           |    show(self) -> string = "g"""".stripMargin
-      ) should include("'Ghost' is not one")
+      ) should include("unknown type 'Ghost'")
     }
 
     "two impls of the same trait for one type are rejected" in {

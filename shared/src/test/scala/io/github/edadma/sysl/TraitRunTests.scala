@@ -274,4 +274,117 @@ class TraitRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "3\n"
   }
+
+  /** A trait may be implemented for a **built-in** type, not only a struct or an enum.
+   *
+   * A language whose `Show` cannot cover `int` has a `Show` no library can use, so this is what
+   * makes a trait worth having at all — and it is also what a prelude `Show` needs before `str` and
+   * `print` can stop being compiler builtins. Nothing here is special-cased: every type has an owner
+   * key its members are filed under, so `5.show()` takes the same path `p.show()` does.
+   */
+  /** A `Show` implemented for each built-in, as a preamble the tests below build on. */
+  private val showBuiltins =
+    """trait Show
+      |    show(self) -> string
+      |impl Show for int
+      |    show(self) -> string = if self == 0 then "zero" else "an int"
+      |impl Show for bool
+      |    show(self) -> string = if self then "yes" else "no"
+      |impl Show for char
+      |    show(self) -> string = "a char"
+      |impl Show for string
+      |    show(self) -> string = self
+      |impl Show for real
+      |    show(self) -> string = "a real"
+      |""".stripMargin
+
+  "traits over the built-in types" - {
+    "a method call resolves on a value of a built-in type" in {
+      val src = s"$showBuiltins\nprint(5.show(), 0.show(), true.show(), 'x'.show(), \"me\".show(), 2.5.show())"
+
+      run(src) shouldBe "an int zero yes a char me a real\n"
+    }
+
+    "it resolves on a variable, an expression, and a literal alike" in {
+      val src = s"$showBuiltins\nvar n = 3\nprint(n.show(), (n - 3).show(), 7.show())"
+
+      run(src) shouldBe "an int zero an int\n"
+    }
+
+    "a trait bound accepts a built-in type" in {
+      val src =
+        s"""$showBuiltins
+           |render[T: Show](x: T) -> string = x.show()
+           |print(render(1), render(true), render("s"))""".stripMargin
+
+      run(src) shouldBe "an int yes s\n"
+    }
+
+    "a built-in and a struct satisfy one bound together" in {
+      val src =
+        s"""$showBuiltins
+           |struct Point
+           |    x: int
+           |impl Show for Point
+           |    show(self) -> string = "a point"
+           |render[T: Show](x: T) -> string = x.show()
+           |print(render(1), render(Point(2)))""".stripMargin
+
+      run(src) shouldBe "an int a point\n"
+    }
+
+    // Distinct widths are distinct types, so each carries its own implementation and a call picks
+    // the one for the receiver's actual type rather than the nearest.
+    "each width is its own type with its own impl" in {
+      val src =
+        """trait Show
+          |    show(self) -> string
+          |impl Show for int
+          |    show(self) -> string = "32"
+          |impl Show for long
+          |    show(self) -> string = "64"
+          |impl Show for byte
+          |    show(self) -> string = "8"
+          |var a: long = 1i64
+          |var b: byte = 2u8
+          |print(1.show(), a.show(), b.show())""".stripMargin
+
+      run(src) shouldBe "32 64 8\n"
+    }
+
+    "a built-in's impl method may take parameters and return anything" in {
+      val src =
+        """trait Repeat
+          |    times(self, n: int) -> int
+          |impl Repeat for int
+          |    times(self, n: int) -> int = self * n
+          |print(6.times(7))""".stripMargin
+
+      run(src) shouldBe "42\n"
+    }
+
+    // Reached through a reference and through a pointer, which is the receiver-seeing-through rule
+    // applying to a built-in exactly as it does to a struct.
+    "it is reached through a reference and a pointer too" in {
+      val src =
+        s"""$showBuiltins
+           |var r: &int = 5
+           |var v = 6
+           |var p = &v
+           |print(r.show(), p.show())""".stripMargin
+
+      run(src) shouldBe "an int an int\n"
+    }
+
+    "an impl for a built-in may appear before the trait" in {
+      val src =
+        """impl Show for int
+          |    show(self) -> string = "late"
+          |trait Show
+          |    show(self) -> string
+          |print(1.show())""".stripMargin
+
+      run(src) shouldBe "late\n"
+    }
+  }
 }

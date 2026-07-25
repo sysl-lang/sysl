@@ -39,6 +39,15 @@ This replaces the old design's split into compile-time `trait`s and structural r
   value.
 - **Retrofitting is preserved** — you can `impl` your trait for a type you don't own; you just
   do it explicitly rather than by implicit structural match.
+- **Any type may carry an `impl`, the built-ins included.** `impl Show for int` is as ordinary as
+  `impl Show for Point`, and `5.show()` resolves by the same rule `p.show()` does. This is not a
+  convenience: a `Show` that cannot cover `int` is a `Show` no library can be written against, and
+  the prelude's own `Show` — the one that lets `str` and `print` stop being compiler builtins — is
+  the first thing that needs it. Every type has one **owner key** its members are filed under: a
+  struct or an enum by the name it was declared with, everything else by its one canonical name, so
+  `impl Show for int` and `impl Show for i32` are the single implementation they are rather than two.
+  Two types have no key because they have no behaviour to give: `never`, which has no values, and
+  `unit`, which has one.
 
 ## Why (summary; the design audit holds the long form)
 
@@ -68,3 +77,9 @@ This replaces the old design's split into compile-time `trait`s and structural r
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
 - **Trait bounds, associated types, generic interaction** — deferred to the generics spec.
+- **An `impl` for a *composed* type.** `impl Trait for Type` names its type with an identifier, so a
+  built-in reachable by name (`int`, `string`, `char`) may carry one but a composed type — `*u8`,
+  `[]int`, `[4]byte` — cannot yet be spelled there. Additive: it wants the implementing type to be a
+  full type reference rather than a name, and a key for each shape.
+- **An `impl` for a generic type.** `impl Show for Box[T]` is rejected for now; the implementing type
+  must be concrete. Wanted, and it interacts with monomorphizing the members.

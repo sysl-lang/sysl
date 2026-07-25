@@ -60,7 +60,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     val members = mutable.ListBuffer.empty[FuncDecl]
     for (tname, sdecl) <- structDecls do at(sdecl.pos)(recover(())(hoistMembers(tname, sdecl.members, members)))
     for (tname, edecl) <- enumDecls do at(edecl.pos)(recover(())(hoistMembers(tname, edecl.members, members)))
-    for impl <- traitImpls.values do at(impl.pos)(recover(())(hoistImpl(impl, members)))
+    for impl <- implDecls do at(impl.pos)(recover(())(hoistImpl(impl, members)))
 
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 
@@ -121,10 +121,9 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       if typeNameTaken(t.name) then err(s"the name '${t.name}' is already declared")
       if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
       traitDecls(t.name) = t
-    case i: ImplDecl =>
-      if traitImpls.contains((i.traitName, i.forType)) then
-        err(s"'${i.forType}' already implements '${i.traitName}'")
-      traitImpls((i.traitName, i.forType)) = i
+    // The type an `impl` names may be declared further down the file, so it cannot be resolved here
+    // — the duplicate check goes with the resolution, in `hoistImpl`.
+    case i: ImplDecl => implDecls += i
     case _ =>
 
   /** Registers one function's name and signature.
@@ -280,16 +279,41 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * member path with no dispatch machinery of its own.
    */
   private def hoistImpl(impl: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
-    val tr = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
-    val (tparams, taken, noun) = nominal(impl.forType).getOrElse(
-      err(s"a trait can only be implemented for a struct or an enum, and '${impl.forType}' is not one"),
-    )
-    if tparams.nonEmpty then
-      err(s"implementing a trait for a generic type is not supported yet — '${impl.forType}'")
+    val tr           = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
+    val (key, taken, noun) = implTarget(impl.forType)
+
+    // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
+    // are the one implementation they are.
+    if traitImpls.contains((impl.traitName, key)) then
+      err(s"'$key' already implements '${impl.traitName}'")
+    traitImpls((impl.traitName, key)) = impl
 
     checkConformance(tr, impl)
-    hoistMemberList(impl.forType, Nil, taken, noun, impl.methods, out)
+    hoistMemberList(key, Nil, taken, noun, impl.methods, out)
   }
+
+  /** The type an `impl` is for: the key its members are filed under, the names already spoken for
+   * inside a body, and what a diagnostic calls one of those.
+   *
+   * A trait may be implemented for **any** type, built-ins included — a language whose `Show` cannot
+   * cover `int` has a `Show` no library can use. A built-in has no fields or variants for a member to
+   * clash with and no type parameters, so it is the simple case; a struct or an enum brings both.
+   */
+  private def implTarget(written: String): (String, Set[String], String) =
+    nominal(written) match
+      case Some((tparams, taken, noun)) =>
+        if tparams.nonEmpty then
+          err(s"implementing a trait for a generic type is not supported yet — '$written'")
+        (written, taken, noun)
+      case None =>
+        // Resolved rather than taken as written, so the key is the type's one canonical name.
+        val ty = scalarType(written).getOrElse(
+          if written == neverName then err("'never' has no values, so nothing can be implemented for it")
+          else err(s"unknown type '$written'"),
+        )
+        if ty == Type.Unit then err("'unit' has one value and no behaviour — a trait for it would say nothing")
+        if ty == Type.VaList then err("a va_list is an ABI primitive, not something to implement a trait for")
+        (ownerKey(ty), Set.empty, "field")
 
   /** Verifies that `impl` supplies exactly the methods `tr` declares, each with an identical
    * resolved signature. A missing method, an extra one, or a mismatched receiver, parameter, or
@@ -946,7 +970,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
   private def readProperty(tr: TExpr, n: Type.Named, f: String): TExpr =
     memberDecls.get((n.base, f)) match
       case Some(m) if m.isProperty =>
-        val fname      = memberFuncName(n.base, f, n)
+        val fname      = memberFuncName(n.base, f, n.targs)
         val (_, rtype) = funcInsts(fname)
         TCall(fname, List(tr), rtype)
       case Some(_) => err(s"'$f' is a method of '${n.name}' — call it with '$f(…)'")
