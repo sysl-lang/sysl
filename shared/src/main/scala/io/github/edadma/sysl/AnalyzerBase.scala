@@ -306,6 +306,7 @@ trait AnalyzerBase {
 
   protected def analyzeExpr(expr: Expr, expected: Option[Type] = None): TExpr
   protected def analyzeBool(e: Expr): TExpr
+  protected def analyzePlace(target: Expr, what: String): TExpr
   protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock
   protected def box(t: TExpr, expected: Type): TExpr
   protected def autoDeref(t: TExpr): TExpr

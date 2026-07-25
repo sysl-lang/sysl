@@ -8,10 +8,12 @@ import scala.collection.mutable
  *
  * The work is split across traits mixed into this class, the way codegen is split across
  * `Emitter` and friends: `AnalyzerBase` holds the shared tables and name scopes, `TypeResolution`
- * resolves and instantiates types, `Literals` handles the scalar leaves, `CallAnalysis` handles
- * calls and construction, and `PatternAnalysis` handles `match`. What stays here is the spine —
- * the declaration-hoisting driver, statements, the expression dispatch, and places — plus the
- * recursive entry points the traits call back into through `AnalyzerBase`'s hooks.
+ * resolves and instantiates types, `Literals` handles the scalar leaves, `Hoisting` registers
+ * declarations, `StmtAnalysis` handles statements and blocks, `CallAnalysis` handles calls and
+ * construction, `PatternAnalysis` handles `match`, and `SpecialForms` holds the handful of call
+ * forms the compiler resolves by name. What stays here is the spine — the driver that runs the
+ * passes in order, function bodies, the expression dispatch, and places — plus the recursive entry
+ * points the traits call back into through `AnalyzerBase`'s hooks.
  *
  * Declarations are hoisted, so functions, structs, and enums may be used before they appear
  * and may be mutually recursive. Each function (and the synthetic `main` around the top-level
@@ -26,7 +28,13 @@ import scala.collection.mutable
  * *expected* type when the arguments alone do not determine them — which is what lets `None`
  * and `Ok(5)` take their type from the context they appear in.
  */
-class Analyzer private (program: Program) extends CallAnalysis with PatternAnalysis with Literals {
+class Analyzer private (program: Program)
+    extends CallAnalysis
+    with PatternAnalysis
+    with Literals
+    with Hoisting
+    with StmtAnalysis
+    with SpecialForms {
 
   /** Every error the walk found, rendered and in source order. */
   def errors: List[String] = diagnostics
@@ -126,279 +134,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     )
   }
 
-  /** Registers one type-shaped declaration: a struct, an enum, a trait, or an `impl`. */
-  private def hoistType(stmt: Stmt): Unit = stmt match
-    case s: StructDecl =>
-      if typeNameTaken(s.name) then err(s"type '${s.name}' is already declared")
-      structDecls(s.name) = s
-    case e: EnumDecl =>
-      if typeNameTaken(e.name) then err(s"type '${e.name}' is already declared")
-      // A generic enum has no single storage type to pin, and it is never instantiated
-      // eagerly, so the annotation is rejected here at the declaration rather than on use.
-      if e.underlying.isDefined && e.tparams.nonEmpty then
-        err(s"a generic enum cannot pin an underlying type — '${e.name}' takes type parameters")
-      enumDecls(e.name) = e
-      for v <- e.variants do
-        if variantOwner.contains(v.name) then
-          err(s"variant name '${v.name}' is already used by enum '${variantOwner(v.name)}'")
-        variantOwner(v.name) = e.name
-    case t: TraitDecl =>
-      if typeNameTaken(t.name) then err(s"the name '${t.name}' is already declared")
-      if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
-      traitDecls(t.name) = t
-    // The type an `impl` names may be declared further down the file, so it cannot be resolved here
-    // — the duplicate check goes with the resolution, in `hoistImpl`.
-    case i: ImplDecl => implDecls += i
-    case _ =>
-
-  /** Registers one function's name and signature.
-   *
-   * A parameter or result whose type does not resolve is recorded and taken as unknown rather
-   * than sinking the whole declaration, so the function still exists with the right arity and a
-   * call to it is not reported a second time as an undefined name.
-   *
-   * An `extern` is registered the same way, under a synthesized declaration with an empty body:
-   * everything downstream of the name — the arity check, argument checking, the emitted call — is
-   * then the ordinary path, and what makes it an extern is that codegen finds it in `externDecls`
-   * and declares it instead of looking for a body to define.
-   *
-   * **Registration comes before every check but the duplicate-name one**, which is the same rule as
-   * the paragraph above generalized: a declaration that fails a check still exists, because the body
-   * analysis that follows walks the source and will look this signature up whatever was wrong with
-   * it. Reporting the mistake must not also remove the thing it is about.
-   */
-  private def hoistFunc(stmt: Stmt): Unit = stmt match
-    case f: FuncDecl =>
-      if funcDecls.contains(f.name) then err(s"function '${f.name}' is already declared")
-      funcDecls(f.name) = f
-      if f.tparams.isEmpty then
-        funcInsts(f.name) =
-          (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
-           f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
-      checkSignatureRules(f.name, f.params, f.retType, f.variadic)
-      for (tp, traits) <- f.bounds; tr <- traits do
-        if !traitDecls.contains(tr) then
-          err(s"the bound on '$tp' in '${f.name}' names '$tr', which is not a trait")
-
-    case e: ExternDecl =>
-      if funcDecls.contains(e.name) then err(s"function '${e.name}' is already declared")
-      funcDecls(e.name) = FuncDecl(e.name, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
-      externDecls(e.name) = e
-      funcInsts(e.name) =
-        (e.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
-         e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
-      checkSignatureRules(e.name, e.params, e.retType, e.variadic)
-      for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
-        err(s"'$s' is not a symbol a linker can resolve")
-
-    case _ =>
-
-  /** The rules a declared signature must satisfy whichever declaration form it came from, checked
-   * after the name is registered so a failure reports the mistake without also erasing the
-   * declaration it is about.
-   */
-  private def checkSignatureRules(
-      name: String,
-      params: List[Param],
-      ret: Option[TypeRef],
-      variadic: Boolean,
-  ): Unit = {
-    // C reads a variadic call's arguments relative to the last named parameter, so there has to be
-    // one; `f(...)` is not a callable declaration in any C either.
-    if variadic && params.isEmpty then err(s"'$name' needs at least one named parameter before '...'")
-    checkNoVaList(name, params, ret)
-  }
-
-  /** A `va_list` may be a local, which is all a function needs to walk its own tail — but not a
-   * parameter or a result, because handing one to another function is C's `vprintf` shape and its
-   * calling convention is not implemented (`12 §Open g`). Refused with a diagnostic rather than
-   * lowered to something that would pass the wrong thing.
-   */
-  private def checkNoVaList(name: String, params: List[Param], ret: Option[TypeRef]): Unit = {
-    def isVaList(t: TypeRef) = t match
-      case NamedType(n, Nil) => scalarType(n).contains(Type.VaList)
-      case _                 => false
-
-    for p <- params if isVaList(p.typ) do
-      at(p.pos)(err(s"a va_list cannot be a parameter yet — '$name' would have to pass its tail on, " +
-        "which is not supported"))
-    for r <- ret if isVaList(r) do
-      at(r.pos)(err(s"a va_list cannot be returned — it walks '$name''s own tail, which is gone once it returns"))
-  }
-
-  /** Structs, enums, and the built-in scalars share one type namespace, so a name may name at
-   * most one of them. `never` is in it too: it names a type, so nothing else may.
-   */
-  private def typeNameTaken(name: String): Boolean =
-    structDecls.contains(name) || enumDecls.contains(name) || traitDecls.contains(name) ||
-      scalarType(name).isDefined || name == neverName
-
-  /** Records a type's members and lowers each to a function declaration under the mangled name
-   * `Type.member`, whose signature is registered so calls resolve like ordinary ones.
-   *
-   * A member of a concrete type is hoisted eagerly, so an uncalled member is still type-checked at
-   * its definition. A member of a *generic* type cannot be: its signature mentions the type's
-   * parameters, which have no meaning until a call fixes them, so it is stored generic in
-   * `genericMembers` and instantiated on demand at each call site. Members that introduce their own
-   * type parameters, and associated functions on a generic type — whose type arguments would have
-   * to be inferred rather than read off a receiver — wait on later work and are rejected with a
-   * clear diagnostic rather than silently mishandled.
-   */
-  private def hoistMembers(tname: String, members: List[MethodDecl], out: mutable.ListBuffer[FuncDecl]): Unit = {
-    val (tparams, taken, noun) = nominal(tname).get
-
-    hoistMemberList(tname, tparams, taken, noun, members, out)
-  }
-
-  /** What hoisting a member needs to know about the type it is hoisting into: the type parameters
-   * a member's signature may mention, the names already spoken for inside the body, and what a
-   * diagnostic calls one of those names. A struct's are its fields; an enum's are its variants.
-   *
-   * It answers for either kind, which is what lets member hoisting and `impl` conformance be
-   * written once — nothing below here knows or cares which it was handed.
-   */
-  private def nominal(name: String): Option[(List[String], Set[String], String)] =
-    structDecls
-      .get(name)
-      .map(s => (s.tparams, s.fields.map(_.name).toSet, "field"))
-      .orElse(enumDecls.get(name).map(e => (e.tparams, e.variants.map(_.name).toSet, "variant")))
-
-  /** Lowers a list of members of `tname` to functions, shared by a type's own body and an `impl`
-   * block. Each member is registered under (type, name) and synthesized to a `Type.member`
-   * function; a member of a concrete type is type-checked eagerly, while a member of a generic
-   * type waits for a concrete instantiation.
-   */
-  private def hoistMemberList(
-      tname: String,
-      tparams: List[String],
-      taken: Set[String],
-      noun: String,
-      members: List[MethodDecl],
-      out: mutable.ListBuffer[FuncDecl],
-  ): Unit = {
-    val generic = tparams.nonEmpty
-
-    for m <- members do
-      currentPos = m.pos.orElse(currentPos)
-      if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '$tname.${m.name}'")
-      if memberDecls.contains((tname, m.name)) then err(s"type '$tname' already has a member named '${m.name}'")
-      if taken.contains(m.name) then
-        err(s"type '$tname' has both a $noun and a member named '${m.name}'")
-
-      memberDecls((tname, m.name)) = m
-      val fd = synthesize(tname, tparams, m)
-
-      if generic then
-        if m.receiver.isEmpty && !m.isProperty then
-          err(s"associated functions on generic types are not supported yet — '$tname.${m.name}'")
-        genericMembers((tname, m.name)) = fd
-      else
-        out += fd
-        funcInsts(fd.name) =
-          (fd.params.map(p => (p.name, resolveType(p.typ, Map.empty))),
-           fd.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit))
-  }
-
-  /** Checks an `impl` conforms to its trait and lowers its methods to inherent members of the
-   * implementing type. Conformance is nominal and exact: the type must supply every trait method
-   * with a matching signature and no method the trait does not declare. The methods are then
-   * hoisted exactly as a type's own members are, so a call on a value resolves through the ordinary
-   * member path with no dispatch machinery of its own.
-   */
-  private def hoistImpl(impl: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
-    val tr           = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
-    val (key, taken, noun) = implTarget(impl.forType)
-
-    // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
-    // are the one implementation they are.
-    if traitImpls.contains((impl.traitName, key)) then
-      err(s"'$key' already implements '${impl.traitName}'")
-    traitImpls((impl.traitName, key)) = impl
-
-    checkConformance(tr, impl)
-    hoistMemberList(key, Nil, taken, noun, impl.methods, out)
-  }
-
-  /** The type an `impl` is for: the key its members are filed under, the names already spoken for
-   * inside a body, and what a diagnostic calls one of those.
-   *
-   * A trait may be implemented for **any** type, built-ins included — a language whose `Show` cannot
-   * cover `int` has a `Show` no library can use. A built-in has no fields or variants for a member to
-   * clash with and no type parameters, so it is the simple case; a struct or an enum brings both.
-   */
-  private def implTarget(written: String): (String, Set[String], String) =
-    nominal(written) match
-      case Some((tparams, taken, noun)) =>
-        if tparams.nonEmpty then
-          err(s"implementing a trait for a generic type is not supported yet — '$written'")
-        (written, taken, noun)
-      case None =>
-        // Resolved rather than taken as written, so the key is the type's one canonical name.
-        val ty = scalarType(written).getOrElse(
-          if written == neverName then err("'never' has no values, so nothing can be implemented for it")
-          else err(s"unknown type '$written'"),
-        )
-        if ty == Type.Unit then err("'unit' has one value and no behaviour — a trait for it would say nothing")
-        if ty == Type.VaList then err("a va_list is an ABI primitive, not something to implement a trait for")
-        (ownerKey(ty), Set.empty, "field")
-
-  /** Verifies that `impl` supplies exactly the methods `tr` declares, each with an identical
-   * resolved signature. A missing method, an extra one, or a mismatched receiver, parameter, or
-   * result is reported against the trait it fails to satisfy.
-   */
-  private def checkConformance(tr: TraitDecl, impl: ImplDecl): Unit = {
-    val declared = tr.methods.map(_.name).toSet
-
-    for tm <- tr.methods do
-      impl.methods.find(_.name == tm.name) match
-        case None     => err(s"'${impl.forType}' does not implement '${impl.traitName}': method '${tm.name}' is missing")
-        case Some(im) => checkSignature(impl.forType, impl.traitName, tm, im)
-
-    for im <- impl.methods do
-      if !declared.contains(im.name) then
-        err(s"trait '${impl.traitName}' declares no method '${im.name}', so this 'impl' cannot define it")
-  }
-
-  /** Compares one implementing method against the trait's signature: same receiver mode, same
-   * parameter types in order, and the same result. Types are resolved with the implementing type
-   * substituted for `self`, so `self` on both sides means the same concrete type.
-   */
-  private def checkSignature(forType: String, traitName: String, tm: MethodDecl, im: MethodDecl): Unit = {
-    if tm.receiver != im.receiver then
-      err(s"method '${im.name}' of 'impl $traitName for $forType' takes a different receiver than the trait declares")
-    if tm.params.length != im.params.length then
-      err(s"method '${im.name}' of 'impl $traitName for $forType' takes ${im.params.length} " +
-        s"parameters, but the trait declares ${tm.params.length}")
-
-    for (tp, ip) <- tm.params.zip(im.params) do
-      val want = resolveType(tp.typ, Map.empty)
-      val got  = resolveType(ip.typ, Map.empty)
-      if want != got then
-        err(s"parameter '${ip.name}' of method '${im.name}' is ${show(got)}, but trait '$traitName' declares ${show(want)}")
-
-    val want = tm.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
-    val got  = im.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
-    if want != got then
-      err(s"method '${im.name}' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")
-  }
-
-  /** Builds the function a member lowers to: the receiver becomes an ordinary first parameter
-   * named `self`, carrying the memory mode its sigil asked for. A property's receiver is an
-   * implicit by-value read; an associated function has no receiver. On a generic type the self
-   * type is the type applied to its own parameters (`Box[T]`, not `Box`), and the lowered function
-   * inherits those parameters, so instantiating it at a concrete `Box[int]` substitutes `T` in the
-   * receiver, the result, and the body alike.
-   */
-  private def synthesize(tname: String, tparams: List[String], m: MethodDecl): FuncDecl = {
-    val selfRef = NamedType(tname, tparams.map(tp => NamedType(tp, Nil)))
-    val selfParam = m.receiver match
-      case Some(RecvMode.ByValue)     => Some(Param("self", selfRef))
-      case Some(RecvMode.ByPtr)       => Some(Param("self", PtrType(selfRef)))
-      case Some(RecvMode.ByRef(sync)) => Some(Param("self", RefType(selfRef, sync)))
-      case None if m.isProperty       => Some(Param("self", selfRef))
-      case None                       => None
-    FuncDecl(s"$tname.${m.name}", tparams, selfParam.toList ::: m.params, m.retType, m.body)
-  }
+  // --- function bodies -----------------------------------------------------------------
 
   private def analyzeFuncBody(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc =
     at(f.pos)(analyzeFuncBodyAt(name, f, subst))
@@ -434,174 +170,6 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
 
     name
   }
-
-  // --- statements ----------------------------------------------------------------------
-
-  /** A block whose trailing expression (if any) is its value — a function body or an if/match
-   * branch. Statements share one lexical scope with the result expression.
-   */
-  private def analyzeValueBlock(stmts: List[Stmt], expected: Option[Type]): TBlock = {
-    pushScope()
-    val tb = analyzeBlockBody(stmts, expected)
-    popScope()
-    tb
-  }
-
-  /** The body of a value block, using whatever scope the caller has established — a match arm
-   * runs this after declaring its pattern bindings, so they are visible to the body.
-   *
-   * A block that ends in a **jump** — `return`, `break`, `continue` — has no trailing expression to
-   * be the value of, and it does not fall out the bottom either, so its type is `never` rather than
-   * `unit`. That is what lets `if c then 1 else return 0` be an `int`: the jump is still not an
-   * expression (`12 §3`), but the block around it is one, and its type says control does not arrive.
-   */
-  protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock =
-    stmts.reverse match
-      case ExprStmt(e) :: initRev =>
-        val init = initRev.reverse.map(recoverStmt)
-        val tr   = analyzeExpr(e, expected)
-        TBlock(init, Some(tr), tr.ty)
-      case (_: Return | _: Break | _: Continue) :: _ =>
-        TBlock(stmts.map(recoverStmt), None, Type.Never)
-      case _ =>
-        TBlock(stmts.map(recoverStmt), None, Type.Unit)
-
-  /** A statement sequence used only for its effects (a loop body): a fresh scope, no value. */
-  private def analyzeStmts(stmts: List[Stmt]): List[TStmt] = {
-    pushScope()
-    val r = stmts.map(recoverStmt)
-    popScope()
-    r
-  }
-
-  /** Analyzes a loop body with a fresh loop context on the stack, so `break`/`continue` inside it
-   * resolve to this loop and each `break` value is collected for the loop's result type. Returns
-   * the typed body together with the context the breaks were recorded in.
-   */
-  private def analyzeLoopBody(expected: Option[Type], label: Option[String])(
-      body: => List[TStmt],
-  ): (List[TStmt], LoopCtx) = {
-    label.foreach { l =>
-      if loops.exists(_.label.contains(l)) then err(s"label '$l is already in scope")
-    }
-    val ctx = new LoopCtx(expected, label)
-    loops = ctx :: loops
-    val tb = body
-    loops = loops.tail
-    (tb, ctx)
-  }
-
-  /** Resolves a `break`/`continue` to the loop it targets and that loop's distance out from the
-   * innermost. An absent label is the nearest loop; a `'name` is the nearest loop carrying it.
-   */
-  private def resolveLoop(keyword: String, label: Option[String]): (LoopCtx, Int) = label match
-    case None =>
-      loops match
-        case ctx :: _ => (ctx, 0)
-        case Nil      => err(s"'$keyword' is only allowed inside a loop")
-    case Some(l) =>
-      loops.indexWhere(_.label.contains(l)) match
-        case -1 => err(s"no enclosing loop is labeled '$l")
-        case i  => (loops(i), i)
-
-  /** The result type of a loop: every `break` value and the `else` value must meet at one type.
-   * With no `else`, normal completion yields `unit`, so a value-carrying `break` has nothing to
-   * meet on that path — a clear error rather than a silent mismatch.
-   */
-  private def loopResultType(ctx: LoopCtx, elseBlock: Option[TBlock]): Type = {
-    val elseTy = elseBlock.map(_.ty).getOrElse(Type.Unit)
-    val tys    = (ctx.breakTys.toList :+ elseTy).distinct
-    val joined = tys.foldLeft(Option(tys.head))((acc, t) => acc.flatMap(join(_, t)))
-
-    if joined.isDefined then joined.get
-    else if elseBlock.isEmpty then
-      val v = ctx.breakTys.find(t => !Type.noValue(t)).get
-      err(s"this loop breaks with a ${show(v)} but has no 'else' to give a value when it finishes normally — add an 'else'")
-    else
-      err(s"a loop's break values and its 'else' must have the same type, but got ${tys.map(show).mkString(" and ")}")
-  }
-
-  /** Analyzes one statement as its own recovery region, so a mistake costs the statement it is
-   * in and nothing after it.
-   *
-   * The statement it stands in for is a no-op: nothing is emitted from a program that has an
-   * error, so the substitute only has to be well-formed enough for the walk to continue.
-   */
-  private def recoverStmt(stmt: Stmt): TStmt = {
-    // A statement abandoned part-way may have opened a scope or entered a loop that it never got
-    // to close, so both are wound back to where the statement started. Without this an inner
-    // block's bindings would stay visible after it, and the analyzer would be *more* permissive
-    // after an error than before one.
-    val depth = scopes.length
-    val outer = loops
-
-    recover {
-      while scopes.length > depth do popScope()
-      loops = outer
-      bindFailed(stmt)
-      TExprStmt(TUnitLit())
-    }(analyzeStmt(stmt))
-  }
-
-  /** Keeps what the rest of the block will need from a statement that failed.
-   *
-   * A `var` binds its name even when its initializer did not analyze — at `Type.Unknown`, which
-   * poisons rather than reports — because otherwise one bad initializer turns every later use of
-   * the name into an "undefined name" of its own, and the real mistake is lost among them.
-   */
-  private def bindFailed(stmt: Stmt): Unit = stmt match
-    case VarDecl(name, _, _) => declare(name, Type.Unknown)
-    case _                   =>
-
-  private def analyzeStmt(stmt: Stmt): TStmt = at(stmt.pos)(analyzeStmtAt(stmt))
-
-  private def analyzeStmtAt(stmt: Stmt): TStmt = stmt match
-    case VarDecl(name, typOpt, Some(init)) =>
-      val declared = typOpt.map(rt)
-      val ti       = analyzeExpr(init, declared)
-      if ti.ty == Type.Unit then err(s"cannot bind '$name' to a unit value")
-      // A binding needs a value to hold, and an initializer that does not finish never produces
-      // one — the code after it is unreachable, so the declaration is a mistake rather than a
-      // clever way to spell divergence.
-      if ti.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
-      val declTy = declared.getOrElse(ti.ty)
-      if declared.isDefined && declTy != ti.ty then
-        err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
-      TVarDecl(declare(name, declTy), declTy, ti)
-
-    case VarDecl(name, typOpt, None) =>
-      val ty = typOpt.map(rt).getOrElse(err(s"'$name' needs either a type or an initial value"))
-      if !hasZero(ty) then err(s"${show(ty)} has no zero value, so '$name' needs an initial value")
-      TVarDecl(declare(name, ty), ty, TZero(ty))
-
-    case ExprStmt(e) =>
-      TExprStmt(analyzeExpr(e))
-
-    case Return(opt) =>
-      val tv = opt.map(analyzeExpr(_, Some(retTy)))
-      tv match
-        case Some(_) if retTy == Type.Unit    => err("cannot return a value from a function with no return type")
-        case Some(t) if disagree(t.ty, retTy) => err(s"return type mismatch: expected ${show(retTy)}, got ${show(t.ty)}")
-        case None if retTy != Type.Unit       => err(s"this function must return a ${show(retTy)} value")
-        case _                                =>
-      TReturn(tv)
-
-    // `break value` records its type against the loop it targets — the nearest, or the one a
-    // `'label` names — which unites it with that loop's other breaks and its `else` to fix the
-    // loop's result type. The value is analyzed in the target loop's expected type, so a `break &T`
-    // boxes the same way a `break` in a `&T` context asks.
-    case Break(label, opt) =>
-      val (ctx, depth) = resolveLoop("break", label)
-      val tv           = opt.map(e => analyzeExpr(e, ctx.expected))
-      ctx.breakTys += tv.map(_.ty).getOrElse(Type.Unit)
-      TBreak(tv, depth)
-
-    case Continue(label) =>
-      val (_, depth) = resolveLoop("continue", label)
-      TContinue(depth)
-
-    case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl =>
-      err("functions, structs, enums, traits, impls, and externs may only be declared at the top level")
 
   // --- expressions ---------------------------------------------------------------------
 
@@ -754,70 +322,16 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         err(s"'$op' would change the type of ${describe(target)}")
       TUpdate(place, op, tv, place.ty)
 
-    // `print` is a **desugaring**, not a builtin: each value becomes a call to the prelude function
-    // for its type, with a space between and a newline at the end. The compiler knows the names of
-    // those functions the way it already knows `Option`'s variants; it implements no printing.
-    //
-    // When a `Display` trait exists this retargets from `printi(x)` to `x.display()` and every
-    // program keeps working, which is the point of putting the seam here.
-    //
-    // The space and the newline go out as *characters* rather than as one-character strings, so
-    // that printing a number reaches nothing that allocates: a `string` is reference-counted, and a
-    // single `prints(" ")` would pull the whole ARC runtime and an allocator into a program whose
-    // own code never asks for either.
-    case Call(Ident("print"), args) =>
-      val parts = args.zipWithIndex.flatMap { case (a, i) =>
-        val sep = if i == 0 then Nil else List(printChar(' '))
-
-        sep :+ printOne(analyzeExpr(a))
-      }
-
-      TSeq(parts :+ printChar('\n'))
-
-    // `str(x)` is a builtin, not a conversion: it renders a value of a primitive type, and a
-    // `string` is rendered as itself. Anything else — a struct, an enum, a pointer, a slice — has
-    // no one string form to give, so asking for one is an error until a `Display` trait lets a
-    // type name its own.
-    case Call(Ident("str"), args) =>
-      if args.length != 1 then err("str takes exactly one value")
-      val t = analyzeExpr(args.head)
-      t.ty match
-        case _: Type.Integer | _: Type.Floating | Type.Bool | Type.Char | Type.Str => TStr(t)
-        case _ => err(s"cannot make a string of a ${show(t.ty)} value")
-
-    // `format(value, "%spec")` renders one value through a printf specifier. It is the desugaring
-    // of an `f"…"` hole, so the specifier is always a literal here; the lexer has vetted its shape,
-    // and what is left is checking the conversion against the value's type.
-    case Call(Ident("format"), List(argExpr, StrLit(spec))) =>
-      val t = analyzeExpr(argExpr)
-      val c = FormatSpec.conversion(spec)
-      val ok =
-        if FormatSpec.isInt(c) then t.ty.isInstanceOf[Type.Integer]
-        else if FormatSpec.isFloat(c) then t.ty.isInstanceOf[Type.Floating]
-        else t.ty == Type.Str
-      if !ok then err(s"format '$spec' expects ${FormatSpec.expects(c)}, but the value has type ${show(t.ty)}")
-      TFormat(t, spec)
-
-    // The three ABI primitives of a variadic body (`12 §9`). Each works on the `va_list` itself
-    // rather than a copy — `va_arg` advances it — so the argument is a place whose address is handed
-    // over, exactly as `&ap` would be. They are language forms rather than prelude functions
-    // because no sysl body could implement one: the walk is the target ABI's, not the language's.
-    case Call(Ident("va_start"), args) =>
-      if !variadicFn then err("'va_start' is only allowed in a function declared with '...' — there is no tail here")
-      TVaStart(vaList("va_start", args))
-
-    case Call(Ident("va_end"), args) => TVaEnd(vaList("va_end", args))
-
-    // C writes the type as a second argument, which is not something a sysl expression can hold, so
-    // it comes from the context the value is read into — the same place `None` and `Ok(5)` get
-    // theirs. Nothing in the tail can confirm it, which is the unsafety C has here too.
-    case Call(Ident("va_arg"), args) =>
-      val ap = vaList("va_arg", args)
-      val ty = expected.getOrElse(
-        err("'va_arg' reads the next argument as some type, and nothing here says which — " +
-          "annotate the variable it is read into"),
-      )
-      TVaArg(ap, vaArgType(ty))
+    // The forms the compiler resolves by name rather than by looking a function up: `print` and
+    // its two rendering companions, which are temporary and leave once a `Display` trait can carry
+    // them, and the three ABI primitives of a variadic body, which stay. What each one means is in
+    // `SpecialForms`; the dispatch is here so it reads in the order the match tries.
+    case Call(Ident("print"), args)                         => printCall(args)
+    case Call(Ident("str"), args)                           => strCall(args)
+    case Call(Ident("format"), List(argExpr, StrLit(spec))) => formatCall(argExpr, spec)
+    case Call(Ident("va_start"), args)                      => vaStart(args)
+    case Call(Ident("va_end"), args)                        => vaEnd(args)
+    case Call(Ident("va_arg"), args)                        => vaArg(args, expected)
 
     // A conversion is written with call syntax, so a scalar type name in call position is one.
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && scalarType(name).isDefined =>
@@ -1059,66 +573,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case _ => false
 
   /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
-  /** A call to a prelude function, built from an already-analyzed argument. */
-  private def callPrelude(name: String, arg: TExpr): TExpr = {
-    val (params, rtype) = funcInsts(name)
-
-    funcsUsed += name
-    TCall(name, List(arg), rtype)
-  }
-
-  /** One value, rendered by the prelude function that takes its type.
-   *
-   * Every argument is widened to the one width its renderer takes — the integers to `long` or
-   * `ulong`, the floats to `real` — so the prelude needs one function per *kind* rather than one
-   * per type, which sysl has no overloading to hide anyway.
-   */
-  private def printOne(t: TExpr): TExpr = t.ty match
-    case i: Type.Integer if i.signed => callPrelude("printi", widen(t, Type.Integer(64, signed = true)))
-    case _: Type.Integer             => callPrelude("printu", widen(t, Type.Integer(64, signed = false)))
-    case _: Type.Floating            => callPrelude("printr", widen(t, Type.Real))
-    case Type.Bool                   => callPrelude("printb", t)
-    case Type.Char                   => callPrelude("printc", t)
-    case Type.Str                    => callPrelude("prints", t)
-    case Type.Unit                   => err("cannot print a unit value")
-    case other                       => err(s"cannot print a ${show(other)} value")
-
-  /** The separator and the terminator `print` puts around its values. */
-  private def printChar(c: Char): TExpr = callPrelude("printc", TIntLit(c.toInt, Type.Char))
-
-  /** Widens a value to the width its renderer takes, leaving one that is already there alone. */
-  private def widen(t: TExpr, to: Type): TExpr = if t.ty == to then t else TCast(t, to).setPos(t.pos)
-
-  /** The `va_list` one of the three forms works on, as its address. */
-  private def vaList(what: String, args: List[Expr]): TExpr = {
-    if args.length != 1 then err(s"'$what' takes exactly one argument, the va_list it walks")
-    val place = analyzePlace(args.head, s"'$what'")
-    if place.ty != Type.VaList then err(s"'$what' needs a va_list, not ${show(place.ty)}")
-    TAddrOf(place, Type.Ptr(place.ty))
-  }
-
-  /** Checks that a type is one a variadic tail can be *read* as.
-   *
-   * Every argument was widened on the way in (`12 §1`), so asking for a narrower type than the
-   * promotion produced would read the wrong bytes — C's most common varargs mistake, and one worth
-   * a diagnostic rather than a wrong answer. Nothing is lost: read it at the promoted width and
-   * convert, which is what C's own callee has to do anyway.
-   */
-  private def vaArgType(ty: Type): Type = ty match
-    case i: Type.Integer if i.bits >= 32  => ty
-    case f: Type.Floating if f.bits == 64 => ty
-    case Type.Char | _: Type.Ptr          => ty
-    case i: Type.Integer =>
-      err(s"a variadic argument is promoted to at least 32 bits, so it cannot be read as " +
-        s"${show(i)} — read it as ${if i.signed then "'int'" else "'uint'"} and convert")
-    case f: Type.Floating =>
-      err(s"a variadic argument is promoted to double, so it cannot be read as ${show(f)} — " +
-        "read it as 'real' and convert")
-    case other =>
-      err(s"a variadic argument cannot be read as ${show(other)} — it may be an integer, a real, " +
-        "a char, or a raw pointer")
-
-  private def analyzePlace(target: Expr, what: String): TExpr = {
+  protected def analyzePlace(target: Expr, what: String): TExpr = {
     val t = analyzeExpr(target)
 
     t match
