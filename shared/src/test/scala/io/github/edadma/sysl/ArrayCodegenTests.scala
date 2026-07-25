@@ -67,7 +67,9 @@ class ArrayCodegenTests extends AnyFreeSpec with CodegenSupport {
     out.linesIterator.count(_.contains("call void @arc.retain(")) should be < 8
   }
 
+  // The null-tolerant pair exists for a slice's optional owner, so a program without a slice must
+  // not have them. It cannot print, either: `print` renders through a slice of a local buffer.
   "a program with no slice in it emits no null-tolerant helpers" in {
-    ir("struct P\n    x: int\nvar p: &P = P(1)\nprint(p.x)") should not include "@arc.retain_maybe"
+    ir("struct P\n    x: int\nvar p: &P = P(1)\nvar x = p.x") should not include "@arc.retain_maybe"
   }
 }

@@ -66,7 +66,13 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
 
     // A function whose body did not analyze is left out of the program rather than stood in for:
     // there is nothing to emit, and nothing will be emitted at all while an error stands.
-    for f <- body.collect { case f: FuncDecl if f.tparams.isEmpty => f } do
+    //
+    // The prelude's own functions are held back: they are analyzed below, and only if something
+    // reaches them. That keeps a program that never prints from carrying the printing surface.
+    val (fromPrelude, ours) =
+      body.collect { case f: FuncDecl if f.tparams.isEmpty => f }.partition(Prelude.declares)
+
+    for f <- ours do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
     for f <- members do
@@ -83,13 +89,32 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     val tmain = mainStmts.map(recoverStmt)
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint.
-    while pending.nonEmpty do
-      val (mangled, decl, subst) = pending.dequeue()
-      tfuncs ++= recoverOpt(analyzeFuncBody(mangled, decl, subst))
+    def drain(): Unit =
+      while pending.nonEmpty do
+        val (mangled, decl, subst) = pending.dequeue()
+        tfuncs ++= recoverOpt(analyzeFuncBody(mangled, decl, subst))
+
+    drain()
+
+    // A prelude function is analyzed only once something has called it, and analyzing one may call
+    // another — `printi` reaches `putbytes`, `printb` reaches `prints` — so this runs to a fixpoint
+    // too. Nothing reaches them in a program that never prints, and none of them is emitted.
+    val available = fromPrelude.map(f => f.name -> f).toMap
+    val analyzed  = mutable.HashSet.empty[String]
+    var reached   = true
+
+    while reached do
+      reached = false
+      for name <- funcsUsed.toList if available.contains(name) && !analyzed(name) do
+        analyzed += name
+        reached = true
+        tfuncs ++= recoverOpt(analyzeFuncBody(name, available(name), Map.empty))
+      drain()
 
     val externs = externsUsed.toList.map { name =>
       val (params, rtype) = funcInsts(name)
-      TExtern(name, params.map(_._2), rtype, externDecls(name).variadic)
+      val e               = externDecls(name)
+      TExtern(name, e.symbol, params.map(_._2), rtype, e.variadic)
     }
 
     TProgram(
@@ -163,6 +188,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         (e.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
          e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       checkSignatureRules(e.name, e.params, e.retType, e.variadic)
+      for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
+        err(s"'$s' is not a symbol a linker can resolve")
 
     case _ =>
 
@@ -727,16 +754,25 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         err(s"'$op' would change the type of ${describe(target)}")
       TUpdate(place, op, tv, place.ty)
 
+    // `print` is a **desugaring**, not a builtin: each value becomes a call to the prelude function
+    // for its type, with a space between and a newline at the end. The compiler knows the names of
+    // those functions the way it already knows `Option`'s variants; it implements no printing.
+    //
+    // When a `Display` trait exists this retargets from `printi(x)` to `x.display()` and every
+    // program keeps working, which is the point of putting the seam here.
+    //
+    // The space and the newline go out as *characters* rather than as one-character strings, so
+    // that printing a number reaches nothing that allocates: a `string` is reference-counted, and a
+    // single `prints(" ")` would pull the whole ARC runtime and an allocator into a program whose
+    // own code never asks for either.
     case Call(Ident("print"), args) =>
-      TPrint(args.map { a =>
-        val t = analyzeExpr(a)
-        t.ty match
-          case Type.Unit => err("cannot print a unit value")
-          case Type.Never | Type.VaList | _: Type.Struct | _: Type.Enum | _: Type.Ptr | _: Type.Ref |
-              _: Type.Array | _: Type.Slice =>
-            err(s"cannot print a ${show(t.ty)} value")
-          case _ => t
-      })
+      val parts = args.zipWithIndex.flatMap { case (a, i) =>
+        val sep = if i == 0 then Nil else List(printChar(' '))
+
+        sep :+ printOne(analyzeExpr(a))
+      }
+
+      TSeq(parts :+ printChar('\n'))
 
     // `str(x)` is a builtin, not a conversion: it renders a value of a primitive type, and a
     // `string` is rendered as itself. Anything else — a struct, an enum, a pointer, a slice — has
@@ -1023,6 +1059,36 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case _ => false
 
   /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
+  /** A call to a prelude function, built from an already-analyzed argument. */
+  private def callPrelude(name: String, arg: TExpr): TExpr = {
+    val (params, rtype) = funcInsts(name)
+
+    funcsUsed += name
+    TCall(name, List(arg), rtype)
+  }
+
+  /** One value, rendered by the prelude function that takes its type.
+   *
+   * Every argument is widened to the one width its renderer takes — the integers to `long` or
+   * `ulong`, the floats to `real` — so the prelude needs one function per *kind* rather than one
+   * per type, which sysl has no overloading to hide anyway.
+   */
+  private def printOne(t: TExpr): TExpr = t.ty match
+    case i: Type.Integer if i.signed => callPrelude("printi", widen(t, Type.Integer(64, signed = true)))
+    case _: Type.Integer             => callPrelude("printu", widen(t, Type.Integer(64, signed = false)))
+    case _: Type.Floating            => callPrelude("printr", widen(t, Type.Real))
+    case Type.Bool                   => callPrelude("printb", t)
+    case Type.Char                   => callPrelude("printc", t)
+    case Type.Str                    => callPrelude("prints", t)
+    case Type.Unit                   => err("cannot print a unit value")
+    case other                       => err(s"cannot print a ${show(other)} value")
+
+  /** The separator and the terminator `print` puts around its values. */
+  private def printChar(c: Char): TExpr = callPrelude("printc", TIntLit(c.toInt, Type.Char))
+
+  /** Widens a value to the width its renderer takes, leaving one that is already there alone. */
+  private def widen(t: TExpr, to: Type): TExpr = if t.ty == to then t else TCast(t, to).setPos(t.pos)
+
   /** The `va_list` one of the three forms works on, as its address. */
   private def vaList(what: String, args: List[Expr]): TExpr = {
     if args.length != 1 then err(s"'$what' takes exactly one argument, the va_list it walks")

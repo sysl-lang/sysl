@@ -37,7 +37,7 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
       val out = ir("print(1)")
 
       out should not include "@exit"
-      out should include("declare i32 @printf(ptr, ...)")
+      out should include("declare i32 @snprintf(ptr, i64, ptr, ...)") // one that print does reach
     }
 
     "an extern is declared once however many times it is called" in {
@@ -59,6 +59,51 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
 
       out.linesIterator.count(l => l.startsWith("declare") && l.contains("@malloc(")) shouldBe 1
       out should include("declare ptr @malloc(i64)")
+    }
+  }
+
+  /** A link name separates the symbol the linker resolves from the name the program calls it by,
+   * so a declaration can reach a C function whose spelling is taken, or shaped nothing like sysl.
+   * Both the `declare` and every call have to name the symbol; nothing else may.
+   */
+  "a link name" - {
+    "declares and calls the symbol, not the sysl name" in {
+      val out = ir("""extern "abort" stop() -> never
+                     |stop()""".stripMargin)
+
+      out should include("declare void @abort()")
+      out should include("call void @abort()")
+      out should not include "@stop"
+    }
+
+    "carries the ellipsis to the symbol as well" in {
+      val out = ir("""extern "printf" say(fmt: *u8, ...) -> int
+                     |var p: *u8 = null
+                     |print(say(p, 1))""".stripMargin)
+
+      out should include("declare i32 @printf(ptr, ...)")
+      out should include regex raw"call i32 \(ptr, \.\.\.\) @printf\(ptr %t\d+, i32 1\)"
+      out should not include "@say"
+    }
+
+    // The whole point: the prelude reaches `snprintf` under a name of its own, so a program may
+    // still declare `snprintf` itself. Two declarations, one symbol, one `declare`.
+    "lets two declarations share one symbol" in {
+      val src =
+        """extern "putchar" emit(c: int) -> int
+          |extern putchar(c: int) -> int
+          |print(emit(65), putchar(66))""".stripMargin
+      val out = ir(src)
+
+      out.linesIterator.count(l => l.startsWith("declare") && l.contains("@putchar(")) shouldBe 1
+      out should include("declare i32 @putchar(i32)")
+      out should include("call i32 @putchar(i32 65)")
+      out should include("call i32 @putchar(i32 66)")
+    }
+
+    "is rejected when it is not a symbol a linker could resolve" in {
+      err("""extern "no such thing" f()""") should include("is not a symbol a linker can resolve")
+      err("""extern "" f()""") should include("is not a symbol a linker can resolve")
     }
   }
 
@@ -131,13 +176,14 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
         "call void \\(i32, \\.\\.\\.\\) @f\\(i32 1, ptr %[\\w.]+\\)"
     }
 
-    // The runtime declares `printf` itself, so a program that declares it too must not emit a
-    // second `declare` — and the one that survives has to be the variadic form either way.
-    "declaring printf does not collide with the runtime's own" in {
+    // `printf` was the old `print` builtin's whole implementation, declared unconditionally. It is
+    // an ordinary foreign name now: declared where a program asks for it, and nowhere else.
+    "printf is declared only by a program that declares it" in {
       val out = ir("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p))")
 
       out.linesIterator.count(l => l.startsWith("declare") && l.contains("@printf(")) shouldBe 1
       out should include("declare i32 @printf(ptr, ...)")
+      ir("print(1)") should not include "@printf"
     }
 
     // `snprintf` is declared only by a program that renders a float or a format hole, so this is

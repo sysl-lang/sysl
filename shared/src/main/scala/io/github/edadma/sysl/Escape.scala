@@ -263,7 +263,7 @@ private class Escape(program: TProgram) {
     case TUnary(_, v, _)            => List(v)
     case TLogical(_, l, r)          => List(l, r)
     case TCompare(ops, _)           => ops
-    case TPrint(args)               => args
+    case TSeq(exprs)                => exprs
     case TCall(_, args, _)          => args
     case TStructNew(_, args)        => args
     case TEnumNew(_, _, args)       => args

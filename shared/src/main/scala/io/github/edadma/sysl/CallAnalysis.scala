@@ -59,6 +59,7 @@ trait CallAnalysis extends Literals {
     val (params, rtype) = funcInsts(name)
     val declared        = checkArgs(f.name, params, args.take(params.length), pre)
 
+    funcsUsed += name
     TCall(name, declared ::: args.drop(params.length).map(variadicArg), rtype)
   }
 

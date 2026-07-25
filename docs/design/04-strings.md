@@ -198,6 +198,50 @@ A value of any other type is not silently rendered across `+` or in a `print`; t
 always written, at the point it happens. That is the same no-implicit-coercion stance the numeric
 operators take, and it is what keeps a string's contents something a reader can see the source of.
 
+## Printing
+
+`print(a, b, c)` writes each value, a space between and a newline at the end. It is **not a function
+built into the compiler**: it is a desugaring onto ordinary prelude functions, one per *kind* of
+value, chosen by each argument's static type.
+
+```
+print(n, 2.5, "done")     ⟶     printi(long(n))
+                                printc(' ')
+                                printr(2.5)
+                                printc(' ')
+                                prints("done")
+                                printc('\n')
+```
+
+The prelude declares `printi`, `printu`, `printr`, `printb`, `printc`, and `prints`, and every one
+of them is sysl a program could have written. What the compiler knows is those six *names* and the
+rule that widens an argument to the width its renderer takes — an integer to `long` or `ulong` by
+its own signedness, a float to `real` — so that the prelude needs one function per kind rather than
+one per width, which a language without overloading has no other way to arrange. That is the same
+kind of knowledge it already has of `Option`'s variant names, and it is the whole of it: the
+compiler implements no printing.
+
+Everything reaches the outside through one sink, `putbytes`, and that is not incidental. Two
+mechanisms would mean two buffers and output arriving out of order. It writes a byte at a time
+because a sysl `string` may hold an interior NUL, and every shortcut through C — `puts`, `%s`, even
+the length-bounded `%.*s` — stops at one. It is also the only function a freestanding target has to
+replace: give it a `write` syscall and the rest of the surface is unchanged.
+
+The separator and the terminator go out as **characters** rather than one-character strings, so that
+printing a number reaches nothing that allocates — a `string` is reference-counted, and a single
+`prints(" ")` would pull the whole ARC runtime into a program whose own code never asked for it.
+
+The integer and float renderings call `snprintf`, which is formatting rather than I/O. Doing them in
+sysl is a small job for the integers and a large one for the floats, so they wait until there is a
+target without a C library to make it worth it. The prelude reaches `snprintf` and `putchar` under
+link names (`12` §1), so both stay free for a program to declare itself.
+
+**Where this goes.** When a `Display` trait lands (`02`, `14`), the desugaring retargets from
+`printi(x)` to `x.display()` and every program keeps working — which is the point of putting the
+seam at a name rather than at a rendering. The step after that is `print` becoming an ordinary
+variadic function over trait objects, which needs dynamic dispatch (`02`) and removes the last of
+the six names.
+
 ## Literals
 
 Double-quoted, UTF-8, the escape table in `01`. A literal may not span a line break, and a

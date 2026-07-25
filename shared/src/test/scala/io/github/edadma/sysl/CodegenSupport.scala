@@ -21,4 +21,22 @@ trait CodegenSupport extends Matchers { this: Assertions =>
       case Right(out) => fail(s"expected an error, got:\n$out")
       case Left(e)    => e
     }
+
+  /** One emitted function, for a test that counts instructions rather than looking for one.
+   *
+   * A whole-module count is not what such a test means: the module also holds the ARC runtime and
+   * whatever prelude functions the program reached, and either can grow without the lowering under
+   * test having changed.
+   */
+  protected def defineOf(out: String, name: String): String =
+    val header = (l: String) => l.startsWith("define") && l.contains(s"@$name(")
+    val body   = out.linesIterator.dropWhile(!header(_)).takeWhile(_ != "}")
+
+    body.mkString("\n")
+
+  /** Just `main`, which is where a top-level statement lands. */
+  protected def mainOf(out: String): String = defineOf(out, "main")
+
+  /** The IR of `main` alone. */
+  protected def irMain(src: String): String = mainOf(ir(src))
 }

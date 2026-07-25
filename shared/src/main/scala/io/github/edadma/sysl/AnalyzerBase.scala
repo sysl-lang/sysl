@@ -103,6 +103,12 @@ trait AnalyzerBase {
    */
   protected val externsUsed = mutable.LinkedHashSet.empty[String]
 
+  /** Every function name something has called, which is what decides whether a **prelude** function
+   * is worth analyzing and emitting at all: the printing surface lives there now, and a program that
+   * never prints should carry none of it.
+   */
+  protected val funcsUsed = mutable.LinkedHashSet.empty[String]
+
   /** Instantiations whose body has not been analyzed yet. Queued rather than analyzed inline
    * so an instantiation discovered mid-function does not disturb the enclosing context.
    */

@@ -101,8 +101,11 @@ case class TLogical(op: String, left: TExpr, right: TExpr) extends TExpr { def t
 /** A comparison chain `a < b < c`, ANDing the pairwise results. */
 case class TCompare(operands: List[TExpr], ops: List[String]) extends TExpr { def ty: Type = Type.Bool }
 
-/** The built-in `print`. */
-case class TPrint(args: List[TExpr]) extends TExpr { def ty: Type = Type.Unit }
+/** Several expressions evaluated in order for their effects, yielding nothing. `print(a, b, c)`
+ * desugars to one of these — a call per value, with the separators between — which is what lets the
+ * printing itself live in the prelude rather than in codegen.
+ */
+case class TSeq(exprs: List[TExpr]) extends TExpr { def ty: Type = Type.Unit }
 
 /** The built-in `str(x)` — a primitive value's string form: a decimal for an integer, its UTF-8
  * for a `char`, `"true"`/`"false"` for a `bool`, a `%g` rendering for a float, and a `string`
@@ -269,8 +272,13 @@ case class TFunc(name: String, params: List[(String, Type)], retTy: Type, body: 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones
  * the program actually calls reach here, so an `extern` the prelude offers and nobody uses costs
  * the output nothing.
+ *
+ * `name` is what the program calls it by and `symbol` is what the linker resolves; they differ only
+ * where the declaration gave a link name. Two declarations may share one symbol — the prelude's
+ * `snprintf` and a program's own — so the module declares each *symbol* once.
  */
-case class TExtern(name: String, params: List[Type], retTy: Type, variadic: Boolean = false)
+case class TExtern(name: String, symbol: String, params: List[Type], retTy: Type,
+                   variadic: Boolean = false)
 
 /** A whole program: hoisted struct, enum, and function declarations, the externs it calls, plus
  * the top-level statements that make up `main`. Only data enums appear in `enums` — a simple enum

@@ -162,69 +162,6 @@ trait ScalarEmitter extends StringEmitter {
     emitLabel(okL)
   }
 
-  // --- print ---------------------------------------------------------------------------
-
-  /** `print` is one `printf` per run of arguments that `printf` can carry. A string breaks the
-   * run, because it is written by length rather than up to a terminator, so the format built so
-   * far is flushed — with the separator that would have preceded the string tacked on — and a
-   * new one starts after it.
-   */
-  protected def genPrint(args: List[TExpr]): Unit = {
-    val specs    = mutable.ListBuffer.empty[String]
-    val callArgs = mutable.ListBuffer.empty[String]
-
-    def flush(tail: String): Unit =
-      if specs.nonEmpty || tail.nonEmpty then
-        val fmt = stringGlobal(specs.mkString + tail)
-        val r   = freshTemp()
-        emit(s"$r = call i32 (ptr, ...) @printf(${(s"ptr $fmt" :: callArgs.toList).mkString(", ")})")
-        specs.clear()
-        callArgs.clear()
-
-    for (arg, argIndex) <- args.zipWithIndex do
-      val sep = if argIndex == 0 then "" else " "
-
-      def spec(s: String, callArg: String): Unit = { specs += sep + s; callArgs += callArg }
-
-      arg.ty match
-        // Varargs promote, so a narrow value is widened here rather than left to the ABI.
-        case i: Type.Integer =>
-          val wide = if i.bits <= 32 then Type.Integer(32, i.signed) else Type.Integer(64, i.signed)
-          val v    = convert(i, wide, genExpr(arg))
-          spec(
-            if i.signed then (if wide.bits == 32 then "%d" else "%lld")
-            else if wide.bits == 32 then "%u"
-            else "%llu",
-            s"${wide.llvm} $v",
-          )
-
-        case f: Type.Floating =>
-          spec("%g", s"double ${convert(f, Type.Real, genExpr(arg))}")
-
-        case Type.Char =>
-          charBuf = true
-          val cp  = genExpr(arg)
-          val buf = emitAlloca(freshTemp(), "[5 x i8]")
-          val enc = freshTemp()
-          emit(s"$enc = call ptr @sysl.utf8(i32 $cp, ptr $buf)")
-          spec("%s", s"ptr $enc")
-
-        case Type.Str =>
-          flush(sep)
-          printStr(genExpr(arg))
-
-        case Type.Bool =>
-          boolStrs = true
-          val v   = genExpr(arg)
-          val sel = freshTemp()
-          emit(s"$sel = select i1 $v, ptr @.true, ptr @.false")
-          spec("%s", s"ptr $sel")
-
-        case other => sys.error(s"unreachable print of ${other.llvm}")
-
-    flush("\n")
-  }
-
   /** `str(x)` — a value's string form. A `string` is returned unchanged, since it already is one;
    * every other type is rendered into a fresh owning buffer, so the result is an owned temporary
    * the enclosing statement releases. A `bool` renders to one of two immortal literals and needs

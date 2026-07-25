@@ -373,11 +373,19 @@ class SyslParser(val source: Source) extends PackratParsers {
   /** `extern name(params) -> ret` — a header with no body at all, which is what tells it from a
    * function declaration. The result is optional and absent means `unit`, exactly as for a
    * function; `-> never` says the callee does not come back.
+   *
+   * A string before the name is the *symbol*, and the name after it is what the program calls it by:
+   * `extern "snprintf" fmt(…)` resolves to libc's `snprintf` without spending the name `snprintf`.
+   * A leading string is unambiguous — a declaration otherwise begins with an identifier — so this
+   * costs no keyword. Haskell's `foreign import ccall "snprintf" c_snprintf` is the same shape.
    */
   private lazy val externDecl: PackratParser[Stmt] =
-    op("extern") ~> ident ~ (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
-      case name ~ ((params, variadic)) ~ ret => ExternDecl(name, params, ret, variadic)
+    op("extern") ~> opt(linkName) ~ ident ~ (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+      case link ~ name ~ ((params, variadic)) ~ ret => ExternDecl(name, params, ret, variadic, link)
     }
+
+  private lazy val linkName: Parser[String] =
+    accept("symbol name", { case t: lexical.StrLit => t.value })
 
   /** A declared parameter list, which may end in `...` — the C ellipsis, and the one arity a
    * declaration does not fix. Shared by `extern` and by a sysl function, which may be variadic too.

@@ -7,19 +7,89 @@ package io.github.edadma.sysl
  * than built into the analyzer because they *are* just generic enums; only the `?` operator
  * knows their names.
  *
- * `exit` is the one thing here that is not sysl: an `extern`, resolved by the linker to the
- * hosted C library's. It is what `unwrap` and `expect` stop the program with — a diagnostic
- * printed and a non-zero status, which is what `11-error-handling.md` says a trap does under the
- * `os` capability — and it is the reason those two need no compiler support of their own.
+ * **The printing surface lives here rather than in the compiler.** `print(a, b, c)` is a
+ * desugaring onto these one-value functions, chosen by each argument's static type, so the
+ * compiler knows a handful of *names* and implements no printing of its own.
+ *
+ * Everything goes out through the single sink `putbytes`, and that is not incidental: two
+ * mechanisms means two buffers, and output emerging in the wrong order. It writes a byte at a time
+ * because a `string` may hold an interior NUL and every shortcut through C — `puts`, `%s`, even
+ * `%.*s` — stops at one. It is also the one function a freestanding target has to replace: swap its
+ * body for a `write` syscall and the rest of the surface is unchanged.
+ *
+ * The integer and float renderings lean on `snprintf`, which is formatting rather than I/O. Doing
+ * them in sysl is a small job for the integers and a large one for the floats (correct shortest
+ * round-trip), so they wait until there is a reason — a target without a C library.
+ *
+ * The three `extern`s are the only things here that are not sysl. Two of them are plumbing rather
+ * than surface, so they take a link name and leave `putchar` and `snprintf` free for a program to
+ * declare itself. `exit` is deliberately not one of those: it is the prelude's offer of the hosted
+ * exit, what `unwrap` and `expect` stop the program with — a diagnostic printed and a non-zero
+ * status, which is what `11-error-handling.md` says a trap does under the `os` capability — and it
+ * is the reason those two need no compiler support of their own.
  *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
- * only where a call asks for it, and an `extern` is declared in the output only if something
- * reaches it.
+ * only where a call asks for it, a top-level function is analyzed and emitted only if something
+ * reaches it, and an `extern` is declared only if something calls it.
  */
 object Prelude {
 
   val source: String =
     """extern exit(code: int) -> never
+      |extern "putchar" sysl_putchar(c: int) -> int
+      |extern "snprintf" sysl_snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
+      |
+      |putbytes(b: []u8)
+      |    var i = 0usize
+      |    while i < b.len
+      |        sysl_putchar(int(b[i]))
+      |        i += 1usize
+      |end putbytes
+      |
+      |prints(s: string) = putbytes(s.bytes)
+      |
+      |printi(n: long)
+      |    var buf: [24]u8
+      |    var k = sysl_snprintf(&buf[0], 24usize, c"%lld", n)
+      |    putbytes(buf[0..<usize(k)])
+      |end printi
+      |
+      |printu(n: ulong)
+      |    var buf: [24]u8
+      |    var k = sysl_snprintf(&buf[0], 24usize, c"%llu", n)
+      |    putbytes(buf[0..<usize(k)])
+      |end printu
+      |
+      |printr(x: real)
+      |    var buf: [32]u8
+      |    var k = sysl_snprintf(&buf[0], 32usize, c"%g", x)
+      |    putbytes(buf[0..<usize(k)])
+      |end printr
+      |
+      |printb(b: bool) = prints(if b then "true" else "false")
+      |
+      |printc(ch: char)
+      |    var buf: [4]u8
+      |    var cp = uint(ch)
+      |    if cp < 128u32 then
+      |        buf[0] = u8(cp)
+      |        putbytes(buf[0..<1usize])
+      |    elif cp < 2048u32 then
+      |        buf[0] = u8(192u32 | (cp >> 6u32))
+      |        buf[1] = u8(128u32 | (cp & 63u32))
+      |        putbytes(buf[0..<2usize])
+      |    elif cp < 65536u32 then
+      |        buf[0] = u8(224u32 | (cp >> 12u32))
+      |        buf[1] = u8(128u32 | ((cp >> 6u32) & 63u32))
+      |        buf[2] = u8(128u32 | (cp & 63u32))
+      |        putbytes(buf[0..<3usize])
+      |    else
+      |        buf[0] = u8(240u32 | (cp >> 18u32))
+      |        buf[1] = u8(128u32 | ((cp >> 12u32) & 63u32))
+      |        buf[2] = u8(128u32 | ((cp >> 6u32) & 63u32))
+      |        buf[3] = u8(128u32 | (cp & 63u32))
+      |        putbytes(buf[0..<4usize])
+      |end printc
       |
       |enum Option[T]
       |    Some(value: T)
@@ -76,14 +146,20 @@ object Prelude {
       |end Result
       |""".stripMargin
 
-  /** The parsed prelude declarations, parsed once. They carry positions into a source of their
-   * own, so a diagnostic against a prelude declaration quotes the prelude rather than the user's
-   * file at some unrelated line.
+  /** The source the prelude's own declarations point into, so a diagnostic against one quotes the
+   * prelude rather than the user's file at some unrelated line — and so a declaration can be told
+   * to have come from here, which is what makes an unused one droppable.
    */
+  val origin: Source = Source("<prelude>", source)
+
+  /** The parsed prelude declarations, parsed once. */
   lazy val decls: List[Stmt] =
-    SyslParser.parse(Source("<prelude>", source)) match
+    SyslParser.parse(origin) match
       case Right(p) => p.body
       case Left(e)  => sys.error(s"the prelude does not parse: $e")
+
+  /** Whether a declaration came from here rather than from the program being compiled. */
+  def declares(s: Positioned): Boolean = s.pos.exists(_.source eq origin)
 
   /** The enum `?` unwraps, paired with its success and failure variant names. */
   def tryVariants(base: String): Option[(String, String)] = base match

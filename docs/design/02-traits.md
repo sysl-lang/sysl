@@ -42,8 +42,9 @@ This replaces the old design's split into compile-time `trait`s and structural r
 - **Any type may carry an `impl`, the built-ins included.** `impl Show for int` is as ordinary as
   `impl Show for Point`, and `5.show()` resolves by the same rule `p.show()` does. This is not a
   convenience: a `Show` that cannot cover `int` is a `Show` no library can be written against, and
-  the prelude's own `Show` — the one that lets `str` and `print` stop being compiler builtins — is
-  the first thing that needs it. Every type has one **owner key** its members are filed under: a
+  the prelude's own `Show` — the one that lets `str` stop being a compiler builtin, and lets
+  `print`'s desugaring aim at a method instead of six names (`04`, *Printing*) — is the first thing
+  that needs it. Every type has one **owner key** its members are filed under: a
   struct or an enum by the name it was declared with, everything else by its one canonical name, so
   `impl Show for int` and `impl Show for i32` are the single implementation they are rather than two.
   Two types have no key because they have no behaviour to give: `never`, which has no values, and

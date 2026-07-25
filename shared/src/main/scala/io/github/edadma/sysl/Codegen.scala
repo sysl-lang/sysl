@@ -23,7 +23,6 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     while runtimeQueue.nonEmpty do runtimeTexts += runtimeQueue.dequeue()()
 
     val out = new mutable.StringBuilder
-    out ++= "declare i32 @printf(ptr, ...)\n"
     if traps then out ++= "declare void @llvm.trap()\n"
     if heap then
       out ++= "declare ptr @malloc(i64)\n"
@@ -33,16 +32,17 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       out ++= "declare void @llvm.va_start.p0(ptr)\n"
       out ++= "declare void @llvm.va_end.p0(ptr)\n"
 
-    // An `extern` the program calls is declared here, unless the runtime already declared it under
-    // that name — a module may not declare one symbol twice, and the runtime's own spelling of
-    // `malloc` is the one its code is calling.
-    val declared = Set("printf", "llvm.trap") ++
+    // An `extern` the program calls is declared here, unless the symbol is already declared — by the
+    // runtime, whose own spelling of `malloc` is the one its code calls, or by an earlier `extern`,
+    // since two declarations may name one symbol under different sysl names. A module may not
+    // declare one symbol twice.
+    val declared = mutable.Set("llvm.trap") ++
       (if heap then Set("malloc", "free") else Set.empty) ++
       (if usesSnprintf then Set("snprintf") else Set.empty)
 
-    for e <- program.externs if !declared(e.name) do
+    for e <- program.externs if declared.add(e.symbol) do
       val params = e.params.map(_.llvm) ++ Option.when(e.variadic)("...")
-      out ++= s"declare ${e.retTy.llvm} @${e.name}(${params.mkString(", ")})\n"
+      out ++= s"declare ${e.retTy.llvm} @${e.symbol}(${params.mkString(", ")})\n"
 
     for d <- satDecls do out ++= d + "\n"
     out ++= "\n"
@@ -92,14 +92,22 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       name -> s"${if Type.noValue(retTy) then "void" else retTy.llvm} (${(params :+ "...").mkString(", ")})"
     }.toMap
 
+  /** The symbol a called name resolves to, which differs from the name only for an `extern` given a
+   * link name. Everything a program defines is emitted under its own name.
+   */
+  private val symbols: Map[String, String] =
+    program.externs.collect { case e if e.symbol != e.name => e.name -> e.symbol }.toMap
+
   /** What a `call` names. For an ordinary function that is the result type, which is all LLVM
    * needs; for a variadic one it is the callee's *whole* function type, because the argument list
    * alone does not say where the declared parameters stop and the ellipsis begins.
    */
   private def calleeOf(name: String, ty: Type): String =
+    val symbol = symbols.getOrElse(name, name)
+
     variadics.get(name) match
-      case Some(fnTy) => s"$fnTy @$name"
-      case None       => s"${if Type.noValue(ty) then "void" else ty.llvm} @$name"
+      case Some(fnTy) => s"$fnTy @$symbol"
+      case None       => s"${if Type.noValue(ty) then "void" else ty.llvm} @$symbol"
 
   private def genMain(stmts: List[TStmt]): String = {
     startFunction()
@@ -379,8 +387,8 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       val cmps = ops.indices.map(i => compareValue(ops(i), vals(i)._1, vals(i)._2, vals(i + 1)._2)).toList
       cmps.reduce { (a, b) => val r = freshTemp(); emit(s"$r = and i1 $a, $b"); r }
 
-    case TPrint(args) =>
-      genPrint(args); ""
+    case TSeq(exprs) =>
+      exprs.foreach(genExpr); ""
 
     // A call to something declared `-> never` does not come back, so the block ends at it: what
     // follows in the same block is unreachable and `emit` drops it, which is exactly why a

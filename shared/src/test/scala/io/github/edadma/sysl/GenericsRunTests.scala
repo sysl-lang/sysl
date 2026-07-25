@@ -19,7 +19,9 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport {
                                        |print(id(1), id(2), id(3.5))
                                        |""".stripMargin)
 
-    out.map(_.linesIterator.count(_.startsWith("define"))) shouldBe Right(3) // id.int, id.real, main
+    // Counting only `id`'s own definitions: the module also holds the ARC runtime and whatever
+    // prelude renderers `print` reached, neither of which this is about.
+    out.map(_.linesIterator.count(l => l.startsWith("define") && l.contains("@id."))) shouldBe Right(2)
   }
 
   "a generic struct at two types" in {

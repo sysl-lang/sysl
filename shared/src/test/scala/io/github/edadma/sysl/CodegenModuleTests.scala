@@ -2,18 +2,30 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Codegen of the module scaffolding and the `print` builtin: the fixed preamble, string
- * interning, and per-type format specifiers.
+/** Codegen of the module scaffolding and of the `print` desugaring: the preamble a module carries,
+ * string interning, and which prelude renderer each type of value reaches.
  */
 class CodegenModuleTests extends AnyFreeSpec with CodegenSupport {
 
   "module scaffolding" - {
-    "declares printf and defines main" in {
+    "defines main" in {
       val out = ir("print(1)")
 
-      out should include("declare i32 @printf(ptr, ...)")
       out should include("define i32 @main() {")
       out should include("ret i32 0")
+    }
+
+    // `printf` was the old builtin's whole implementation. Nothing emits a call to it now, so
+    // nothing may declare it either — a program reaches libc only where it says so itself.
+    "declares no printf of its own" in {
+      ir("print(1)") should not include "@printf"
+    }
+
+    "an extern may still take the name" in {
+      val out = ir("""extern printf(fmt: *u8, ...) -> int
+                     |printf(c"hi\n")""".stripMargin)
+
+      out should include("declare i32 @printf(ptr, ...)")
     }
   }
 
@@ -22,22 +34,26 @@ class CodegenModuleTests extends AnyFreeSpec with CodegenSupport {
       ir("print(\"hi\")") should include("""c"hi\00"""")
     }
 
-    "an int prints via %d" in {
+    "an int goes to the signed renderer, widened to its width" in {
       val out = ir("print(42)")
 
-      out should include("""c"%d\0A\00"""")
-      out should include("i32 42")
+      mainOf(out) should include("call void @printi(i64 %t1)")
+      mainOf(out) should include("sext i32 42 to i64")
+      out should include("""c"%lld\00"""")
     }
 
-    "a float is emitted as a hex double and printed via %g" in {
+    "a float is emitted as a hex double and rendered via %g" in {
       val out = ir("print(1.5)")
 
-      out should include("double 0x3FF8000000000000")
-      out should include("%g")
+      mainOf(out) should include("call void @printr(double 0x3FF8000000000000)")
+      out should include("""c"%g\00"""")
     }
 
-    "multiple args are space-separated in the format string" in {
-      ir("print(1, 2)") should include("""c"%d %d\0A\00"""")
+    "multiple args are separated by a printed space" in {
+      val out = irMain("print(1, 2)")
+
+      out should include("call void @printc(i32 32)")
+      out.linesIterator.count(_.contains("@printi")) shouldBe 2
     }
   }
 }

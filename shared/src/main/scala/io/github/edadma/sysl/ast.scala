@@ -232,12 +232,20 @@ case class FuncDecl(
  * `exit`, a driver's MMIO helper — and why the escape analysis has to assume the worst of it
  * (`05-escape-analysis.md`): every argument may be kept, and the result may view any of them.
  *
+ * `link` is the optional leading string of `extern "snprintf" fmt(…)`: the symbol the linker
+ * resolves, when that differs from the name the program calls it by. Absent, the two are the same.
+ * The distinction exists because a symbol's spelling belongs to whoever exported it — it may be
+ * taken already, or shaped nothing like sysl — and because a declaration in the prelude would
+ * otherwise spend a name out of every program's namespace.
+ *
  * `variadic` is the trailing `...` of `extern printf(fmt: *u8, ...) -> int`: the C ellipsis, which a
  * sysl function may carry too (`12-functions-and-closures.md` §1, §9) under the same rules for what
  * the tail may hold.
  */
 case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef],
-                      variadic: Boolean = false) extends Stmt
+                      variadic: Boolean = false, link: Option[String] = None) extends Stmt:
+  /** The symbol the linker resolves this to. */
+  def symbol: String = link.getOrElse(name)
 
 /** `struct Name[T…]` with `name: type` fields and, intermixed, member declarations (methods,
  * properties, associated functions). Positional construction is `Name(a, b, …)`.

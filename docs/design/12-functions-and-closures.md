@@ -119,10 +119,31 @@ the callee keeps every argument. What the ellipsis governs is only what follows:
   widening is therefore part of the call, and visible in the tree as an ordinary conversion rather
   than buried in the emitter.
 
-**What this does not do.** Being able to declare `printf` is not the same as `print` becoming
-prelude sysl. `print` takes a heterogeneous argument list and renders each value by its type, which
-needs a `Display`-style trait (`02`, `14`) and a string written by length rather than to a
-terminator; the ellipsis is one of the things that was missing, not all of them.
+**An extern may name its symbol separately.** A string before the name is what the linker resolves;
+the identifier after it is what the program calls it by.
+
+```
+extern "snprintf" fmt(buf: *u8, n: usize, fmt: *u8, ...) -> int
+extern "abs" magnitude(n: int) -> int
+```
+
+Without one the two are the same, which is the common case and stays the default. The separation
+exists because a symbol's spelling belongs to whoever exported it: it may be shaped nothing like
+sysl, it may be a name the program wants for something of its own, and — the case that forced it —
+a declaration in the **prelude** would otherwise spend that name out of every program's namespace.
+The prelude renders integers and floats through `snprintf`, and a program that declares `snprintf`
+itself must not collide with it.
+
+The symbol must be one a linker could resolve — letters, digits, `_`, `$`, `.` — and a string that
+is not is rejected at the declaration rather than emitted as malformed IR. Two declarations may
+share one symbol under different sysl names; the module declares each symbol once.
+
+A link name is an `extern`'s alone. A sysl function is *defined* here, and what it is called is its
+name.
+
+**What this does not do.** Nothing here changes what a *sysl* function's own symbol is: it is the
+name, unmangled, so a program that defines `abs` collides with libc's whatever else it declares.
+That is a question for the module system (`13`) rather than for this seam.
 
 ## 2. Parameters are by-value bindings
 
@@ -382,9 +403,9 @@ know which it is reaching, and it means the two share their implementation rathe
 
 These four are **language forms, not library functions**, in the same category as `sizeof`: each is
 an ABI primitive that no sysl body could implement, so there is nothing to put in the prelude. That
-is the line the "no functions built into the compiler" rule actually draws — `print` is on the wrong
-side of it because a program *could* write `print`; `va_arg` is on the right side because no program
-could write `va_arg`.
+is the line the "no functions built into the compiler" rule actually draws — `va_arg` is on the
+right side of it because no program could write `va_arg`. `print` was on the wrong side, and is
+where it belongs now: prelude sysl, reached by a desugaring (`04`, *Printing*).
 
 **It is as unsafe as C's, and for the same reason.** Nothing checks that the callee asks for the
 types the caller passed, or that it stops at the right count; `va_arg` past the end reads whatever
@@ -435,11 +456,10 @@ worth adding **beside** it later (`§ Open i`), never instead of it.
   function be used as a callable. Whether `Point.origin` or `p.dist` (an associated function, a
   bound method) may likewise be passed as an `Fn` — and how a bound method carries its receiver —
   joins this chapter with `08` and is not settled here.
-- **f. A link name distinct from the sysl name.** Today an `extern`'s name *is* the symbol (§1), so
-  reaching a C function means taking its spelling — and a prelude extern occupies that name for
-  every program. An override (Rust's `#[link_name]`, a leading string) would let `extern` bind
-  `snprintf` to a sysl-shaped name, and would let the prelude keep its own primitives out of the
-  user's namespace. Additive; deferred until a real case needs it.
+- **f. A symbol for a sysl *definition*.** §1 lets an `extern` name the symbol it resolves to; the
+  other direction — a sysl function exported under a chosen symbol, C's side of the same seam — has
+  no spelling. It is the same question as how a sysl function's symbol is decided at all, which the
+  module system (`13`) settles, so it waits for that rather than growing a second mechanism here.
 - **g. `va_copy`, and a `va_list` that crosses a call.** §9 covers reading a tail in the function
   that received it. Passing an `ap` on to another function (C's `vprintf` shape) and duplicating one
   (`va_copy`) are the rest of C's surface here, and both belong — they are simply not built yet.

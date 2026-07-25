@@ -41,6 +41,30 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
 
       run(src) shouldBe "3 4\n"
     }
+
+    // A link name has to reach the *linker*, not just the emitted text: this only runs if `magn`
+    // really resolved to libc's `abs`.
+    "a link name resolves to the C function it names" in {
+      val src =
+        """extern "abs" magn(n: int) -> int
+          |print(magn(-7), magn(7))""".stripMargin
+
+      run(src) shouldBe "7 7\n"
+    }
+
+    // Why the prelude's own externs carry link names: `print` renders through `snprintf`, and a
+    // program is still free to declare `snprintf` for itself and have both reach libc's.
+    "the prelude leaves the C names it renders through free" in {
+      val src =
+        """extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
+          |var buf: [8]u8
+          |var fmt: [3]u8 = [37u8, 100u8, 0u8]
+          |var k = snprintf(&buf[0], 8usize, &fmt[0], 42)
+          |print(k, int(buf[0]), int(buf[1]))""".stripMargin
+
+      // "42" is two bytes, '4' and '2'.
+      run(src) shouldBe "2 52 50\n"
+    }
   }
 
   /** A variadic extern really reaching `printf`, which is the point of the feature: this is the

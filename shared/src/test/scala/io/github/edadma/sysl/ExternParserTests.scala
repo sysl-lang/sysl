@@ -126,6 +126,39 @@ class ExternParserTests extends AnyFreeSpec with ParseSupport {
     }
   }
 
+  // A string before the name is the symbol the linker resolves, and the name after it is what the
+  // program calls it by. A declaration otherwise begins with an identifier, so this needs no
+  // keyword — and the two spellings are the same production apart from that string.
+  "a link name" - {
+    "is the symbol, and the identifier after it is the sysl name" in {
+      prog("""extern "snprintf" fmt(buf: *u8, ...) -> int""") shouldBe
+        List(
+          ExternDecl(
+            "fmt",
+            List(Param("buf", PtrType(NamedType("u8")))),
+            Some(NamedType("int")),
+            variadic = true,
+            link = Some("snprintf"),
+          ),
+        )
+    }
+
+    "is absent by default, and then the name is the symbol" in {
+      prog("extern abort()") shouldBe List(ExternDecl("abort", Nil, None, link = None))
+      ExternDecl("abort", Nil, None).symbol shouldBe "abort"
+      ExternDecl("fmt", Nil, None, link = Some("snprintf")).symbol shouldBe "snprintf"
+    }
+
+    "may repeat the name it is already known by" in {
+      prog("""extern "abort" abort()""") shouldBe List(ExternDecl("abort", Nil, None, link = Some("abort")))
+    }
+
+    // Only an `extern` reaches outside the program, so only an `extern` takes one.
+    "is not something a sysl function may carry" in {
+      progError("""extern "abort" abort() = 1""") should not be empty
+    }
+  }
+
   "never is an ordinary result type on a function" in {
     prog("stop() -> never = exit(1)") shouldBe
       List(

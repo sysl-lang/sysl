@@ -170,7 +170,8 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
     }
 
     // Two element types are two independent monomorphized functions, exactly as for a generic
-    // struct's members: Maybe.get.int, Maybe.get.real, and main.
+    // struct's members: Maybe.get.int and Maybe.get.real. Only the member's own definitions are
+    // counted; the rest of the module is the ARC runtime and the renderers `print` reached.
     "the same generic enum method is monomorphized once per element type" in {
       val out = Compiler.compileToLlvm(
         """enum Maybe[T]
@@ -184,7 +185,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
           |print(a.get(0), b.get(0.0))""".stripMargin
       )
 
-      out.map(_.linesIterator.count(_.startsWith("define"))) shouldBe Right(3)
+      out.map(_.linesIterator.count(l => l.startsWith("define") && l.contains("@Maybe.get."))) shouldBe Right(2)
     }
   }
 
@@ -328,11 +329,18 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
     }
 
     // Nothing is emitted for a member no program calls: the two prelude enums are generic, so
-    // their members exist only once an instantiation asks for one. main alone here.
-    "an unused prelude member costs nothing in the output" in {
+    // their members exist only once an instantiation asks for one. A top-level prelude *function*
+    // is dropped the same way, by reachability — printing an int reaches three of them and none of
+    // the rest, so the whole printing surface does not land in every program.
+    "an unused prelude declaration costs nothing in the output" in {
       val out = Compiler.compileToLlvm("print(1)")
+      val defined = out.map(
+        _.linesIterator.filter(l => l.startsWith("define") && !l.startsWith("define private"))
+          .map(_.dropWhile(_ != '@').takeWhile(_ != '('))
+          .toSet,
+      )
 
-      out.map(_.linesIterator.count(_.startsWith("define"))) shouldBe Right(1)
+      defined shouldBe Right(Set("@printi", "@printc", "@putbytes", "@main"))
     }
   }
 }

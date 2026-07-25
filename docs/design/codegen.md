@@ -136,20 +136,22 @@ before they appear and may be mutually recursive).
   registered before its fields are resolved, so a field that points back at it finds it.
 - **Expressions:** the full settled precedence grammar (`01`) over the scalar types and
   string literals. `++`/`--`, unary `-`/`!`/`~`/`*`/`&`, chained comparison.
-- **`print(a, b, …)`** — a builtin, not a user function. Arguments are printed space-separated
-  followed by a newline, lowered to one `printf` per run of arguments `printf` can carry.
-  Integers widen to what varargs promote to and print as `%d` / `%u` / `%lld` / `%llu`; floats
-  widen to `double` and print as `%g`; a `char` is encoded to UTF-8 in a stack buffer and
-  printed as `%s`; `bool` is `%s` over `"true"` / `"false"`. A **string breaks the run**: it
-  carries its own length and may hold a NUL, and every `%s` conversion — including `%.*s`, whose
-  precision is a maximum rather than a count — stops at one, so its bytes are written by length
-  through `putchar` instead.
+- **`print(a, b, …)`** — a **desugaring onto prelude functions**, not a builtin and not a user
+  function. Each argument becomes a call to the renderer its static type reaches — `printi`,
+  `printu`, `printr`, `printb`, `printc`, `prints` — widened to the width that renderer takes, with
+  `printc(' ')` between and `printc('\n')` at the end. Every one of those is sysl in the prelude
+  (`04`, *Printing*); the compiler knows the six names and the widening rule and emits no printing
+  code of its own. They all write through one sink, `putbytes`, which walks a byte count rather
+  than stopping at a terminator, because a sysl string may hold an interior NUL and every `%s`
+  conversion — `%.*s` included, whose precision is a maximum rather than a count — would stop
+  there.
 
 ## IR dialect (locked against the dev toolchain)
 
 Textual LLVM IR with **opaque pointers** (`ptr`, never `i32*`), verified against Apple clang
 on arm64. Floats are emitted as **hex doubles** (`0x…`) so the textual round-trip loses no
-bits. `printf` is declared varargs; each `print` interns one format-string constant. Value
+bits. An `extern` is declared under its **symbol** — its link name where it has one, its sysl name
+otherwise — and each symbol is declared once however many declarations name it. Value
 structs lower to named aggregates (`%struct.Name = type { … }`); construction is an
 `insertvalue` chain, and a field read is `extractvalue`. A **write** instead computes the
 place's address — a local's own slot, a loaded pointer value, or a `getelementptr` chain over
@@ -221,8 +223,11 @@ arity.
    or literal sub-pattern does not count, so `Wrap(A) | Wrap(B)` covering `Wrap(Inner)` still
    needs an `else`. Guard expressions are evaluated after the pattern matches and its bindings
    are in scope.
-7. **`print` is a printf shim** — the stand-in for the eventual `std` I/O surface, not a
-   committed language builtin.
+7. **`print`'s renderers are the prelude's, not a `std` I/O surface**, and the desugaring picks one
+   by static type rather than by a `Display` trait — see `04`, *Printing*, for what it retargets to
+   once traits can carry it. A related over-approximation shows up in the output: making a slice
+   turns the ARC runtime on even where the owner is statically null, so a program that only prints
+   an integer still carries the allocator declarations it never calls.
 8. **Chained comparisons `and` their pairs eagerly.** `a < b < c` lowers to `(a<b) and (b<c)`,
    evaluating each operand exactly once but ANDing the pairs without short-circuiting the *chain* —
    so a side-effecting later operand still runs when an earlier pair is already false, which `01`'s

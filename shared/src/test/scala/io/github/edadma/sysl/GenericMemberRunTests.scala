@@ -84,9 +84,11 @@ class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
         |print(a.get(), b.get())""".stripMargin
     )
 
-    // Box.get.int, Box.get.real, and main — the member is compiled once per element type, exactly
-    // as a free generic function is, not shared across the two instantiations.
-    out.map(_.linesIterator.count(_.startsWith("define"))) shouldBe Right(3)
+    // Box.get.int and Box.get.real — the member is compiled once per element type, exactly as a
+    // free generic function is, not shared across the two instantiations. Only its own definitions
+    // are counted; the rest of the module is the ARC runtime and the prelude renderers `print`
+    // reached.
+    out.map(_.linesIterator.count(l => l.startsWith("define") && l.contains("@Box.get."))) shouldBe Right(2)
   }
 
   "a method uses both parameters of a two-parameter generic struct" in {

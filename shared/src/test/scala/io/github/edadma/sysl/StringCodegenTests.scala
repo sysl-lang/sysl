@@ -42,19 +42,40 @@ class StringCodegenTests extends AnyFreeSpec with CodegenSupport {
     out should include("define private void @arc.retain_maybe(ptr %p) {")
   }
 
+  // A sysl string may hold an interior NUL, so every shortcut through C — `puts`, `%s`, even the
+  // length-bounded `%.*s` — would stop early. The sink walks the byte count instead.
   "printing goes by length rather than by terminator" in {
-    val out = ir("""print("hi")""")
+    val out  = ir("""print("hi")""")
+    val sink = defineOf(out, "putbytes")
 
-    out should include("call void @sysl.str.write(ptr %t1, i64 %t2)")
-    out should include("declare i32 @putchar(i32)")
-    out should not include "%s\\n"
+    mainOf(out) should include regex raw"call void @prints\(\{ ptr, ptr, i64 \} .+\)"
+    sink should include regex raw"extractvalue \{ ptr, ptr, i64 \} %t\d+, 2"
+    sink should include regex raw"call i32 @putchar\(i32 %t\d+\)"
+    out.linesIterator.filter(_.startsWith("@.str")).foreach(_ should not include "%s")
   }
 
-  "a run of printable arguments still shares one printf" in {
-    val out = ir("""print(1, 2, "x", 3, 4)""")
+  // Every value is its own call to the renderer its type reaches, with a space between and a
+  // newline at the end — and the separators go out as characters rather than one-character
+  // strings, so printing a number never reaches the string runtime at all.
+  "each argument is rendered by its own call" in {
+    val out = irMain("""print(1, 2, "x", 3, 4)""")
 
-    out should include("""c"%d %d \00"""")
-    out should include("""c" %d %d\0A\00"""")
+    out.linesIterator.map(_.trim).filter(_.startsWith("call void @print")).map(_.takeWhile(_ != '(')).toList shouldBe
+      List(
+        "call void @printi",
+        "call void @printc",
+        "call void @printi",
+        "call void @printc",
+        "call void @prints",
+        "call void @printc",
+        "call void @printi",
+        "call void @printc",
+        "call void @printi",
+        "call void @printc",
+      )
+
+    out should include("call void @printc(i32 32)") // the separator
+    out should include("call void @printc(i32 10)") // the terminator
   }
 
   "comparison is a call, and every operator reads its answer" in {
