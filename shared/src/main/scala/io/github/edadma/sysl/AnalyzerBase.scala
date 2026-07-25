@@ -141,6 +141,13 @@ trait AnalyzerBase {
 
   protected def show(t: Type): String = Type.show(t)
 
+  /** The type parameters of a nominal type — a struct or an enum — by the name it was declared
+   * under. Empty both for a non-generic type and for a name that declares no type at all, which is
+   * what lets a caller ask "is this generic" without first knowing which kind it is.
+   */
+  protected def nominalTparams(base: String): List[String] =
+    structDecls.get(base).map(_.tparams).orElse(enumDecls.get(base).map(_.tparams)).getOrElse(Nil)
+
   /** `1 argument`, `2 arguments` — a count with its noun agreeing. A diagnostic that misspells
    * English reads like a bug in the thing reporting it, which is not the impression a compiler
    * wants to give at the moment the programmer is already annoyed.

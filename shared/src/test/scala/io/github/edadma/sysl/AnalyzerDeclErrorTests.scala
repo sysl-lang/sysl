@@ -141,7 +141,7 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
           |    Red
           |    Green
           |var c = Color.Bogus(1)""".stripMargin
-      ) should include("no variant 'Bogus'")
+      ) should include("enum 'Color' has no variant or associated function 'Bogus'")
     }
 
     "an underlying-type annotation on a generic enum is rejected" in {

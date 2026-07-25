@@ -65,6 +65,143 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
     }
   }
 
+  "members" - {
+    // A payload variant is a name followed by `name: type` bindings in parentheses — exactly the
+    // shape of a method header — so what tells the two apart is the body a member must have.
+    "a payload variant is not mistaken for a method header" in {
+      val src =
+        """enum Shape
+          |    Circle(radius: int)
+          |    sides(self) -> int = 1""".stripMargin
+
+      prog(src) shouldBe List(
+        EnumDecl(
+          "Shape",
+          Nil,
+          None,
+          List(EnumVariantDecl("Circle", None, List(Param("radius", NamedType("int"))))),
+          List(
+            MethodDecl("sides", Some(RecvMode.ByValue), isProperty = false, Nil, Nil,
+              Some(NamedType("int")), List(ExprStmt(i(1)))),
+          ),
+        )
+      )
+    }
+
+    "variants and members intermix, and a variant still parses after a member" in {
+      val src =
+        """enum Color
+          |    Red
+          |    code(self) -> int = 1
+          |    Green = 7""".stripMargin
+
+      prog(src) shouldBe List(
+        EnumDecl(
+          "Color",
+          Nil,
+          None,
+          List(EnumVariantDecl("Red", None, Nil), EnumVariantDecl("Green", Some(i(7)), Nil)),
+          List(
+            MethodDecl("code", Some(RecvMode.ByValue), isProperty = false, Nil, Nil,
+              Some(NamedType("int")), List(ExprStmt(i(1)))),
+          ),
+        )
+      )
+    }
+
+    // Each receiver shorthand, a property, and an associated function all parse in an enum body
+    // exactly as they do in a struct's, since it is the same `member` grammar.
+    "every member kind parses in an enum body" in {
+      val src =
+        """enum E
+          |    A
+          |    m(self) -> int = 1
+          |    p(*self) -> int = 2
+          |    r(&self) -> int = 3
+          |    doubled -> int = 4
+          |    make() -> int = 5""".stripMargin
+
+      prog(src) shouldBe List(
+        EnumDecl(
+          "E",
+          Nil,
+          None,
+          List(EnumVariantDecl("A", None, Nil)),
+          List(
+            MethodDecl("m", Some(RecvMode.ByValue), isProperty = false, Nil, Nil, Some(NamedType("int")),
+              List(ExprStmt(i(1)))),
+            MethodDecl("p", Some(RecvMode.ByPtr), isProperty = false, Nil, Nil, Some(NamedType("int")),
+              List(ExprStmt(i(2)))),
+            MethodDecl("r", Some(RecvMode.ByRef(sync = false)), isProperty = false, Nil, Nil,
+              Some(NamedType("int")), List(ExprStmt(i(3)))),
+            MethodDecl("doubled", None, isProperty = true, Nil, Nil, Some(NamedType("int")),
+              List(ExprStmt(i(4)))),
+            MethodDecl("make", None, isProperty = false, Nil, Nil, Some(NamedType("int")),
+              List(ExprStmt(i(5)))),
+          ),
+        )
+      )
+    }
+
+    // Blank lines between a variant and a member are how a real enum body is laid out, so the
+    // separator has to tolerate them the way a struct body's does.
+    "blank lines separate variants from members" in {
+      val src =
+        """enum E
+          |    A
+          |    B
+          |
+          |    m(self) -> int = 1
+          |end E""".stripMargin
+
+      prog(src) shouldBe List(
+        EnumDecl(
+          "E",
+          Nil,
+          None,
+          List(EnumVariantDecl("A", None, Nil), EnumVariantDecl("B", None, Nil)),
+          List(
+            MethodDecl("m", Some(RecvMode.ByValue), isProperty = false, Nil, Nil, Some(NamedType("int")),
+              List(ExprStmt(i(1)))),
+          ),
+        )
+      )
+    }
+
+    "a generic enum takes members and an underlying-typed one does too" in {
+      val src =
+        """enum Maybe[T]
+          |    Just(value: T)
+          |    tag(self) -> int = 1""".stripMargin
+
+      prog(src) shouldBe List(
+        EnumDecl(
+          "Maybe",
+          List("T"),
+          None,
+          List(EnumVariantDecl("Just", None, List(Param("value", NamedType("T"))))),
+          List(
+            MethodDecl("tag", Some(RecvMode.ByValue), isProperty = false, Nil, Nil, Some(NamedType("int")),
+              List(ExprStmt(i(1)))),
+          ),
+        )
+      )
+
+      prog("enum C: u8\n    Red\n    code(self) -> int = 1") shouldBe List(
+        EnumDecl(
+          "C",
+          Nil,
+          Some(NamedType("u8")),
+          List(EnumVariantDecl("Red", None, Nil)),
+          List(
+            MethodDecl("code", Some(RecvMode.ByValue), isProperty = false, Nil, Nil, Some(NamedType("int")),
+              List(ExprStmt(i(1)))),
+          ),
+        )
+      )
+    }
+  }
+
   "patterns" - {
     "a variant pattern binds its fields" in {
       arms("match s\n    Circle(r) -> print(r)\n    Empty -> print(0)").map(_.patterns) shouldBe List(

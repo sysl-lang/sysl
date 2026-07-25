@@ -13,11 +13,31 @@ object Prelude {
     """enum Option[T]
       |    Some(value: T)
       |    None
+      |
+      |    is_some(self) -> bool = match self
+      |        Some(_) -> true
+      |        None -> false
+      |
+      |    is_none(self) -> bool = !self.is_some()
+      |
+      |    unwrap_or(self, default: T) -> T = match self
+      |        Some(v) -> v
+      |        None -> default
       |end Option
       |
       |enum Result[T, E]
       |    Ok(value: T)
       |    Err(error: E)
+      |
+      |    is_ok(self) -> bool = match self
+      |        Ok(_) -> true
+      |        Err(_) -> false
+      |
+      |    is_err(self) -> bool = !self.is_ok()
+      |
+      |    unwrap_or(self, default: T) -> T = match self
+      |        Ok(v) -> v
+      |        Err(_) -> default
       |end Result
       |""".stripMargin
 

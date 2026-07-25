@@ -32,8 +32,8 @@ enum Option[T]                           // generic enum (09)
 
 A parameter name stands for a type not yet known; it may appear anywhere a type may — a
 parameter type, a return type, a field type, a variant payload, a local annotation. The three
-declaration forms are the whole of what can be parameterized; there is no generic `impl` block
-yet (methods on a generic type are `§ Open c`).
+declaration forms are the whole of what can be parameterized; a generic type's *own body* may hold
+members, while a generic `impl` block is still open (`§ Open c`).
 
 ## 2. `[]` means type application in a type, indexing in an expression
 
@@ -183,10 +183,13 @@ never by a covariant container.
   where the implementation exercises them. Whether a *type's* parameter may carry a bound
   (`struct SortedList[T: Ord]`) — and whether such a bound is required at the type or re-stated
   at each method — is open, and ties into (c).
-- **c. Methods on generic types.** A generic `impl` (methods on `Box[T]`) is currently deferred
-  with a diagnostic (per the implementation's generic-member deferral). Designing it is the
-  natural join of `08-methods.md` and this chapter, and it decides where a type parameter's
-  bounds are declared.
+- **c. Members on generic types.** Methods and properties on a generic struct *or enum* are
+  settled and implemented: the member is instantiated from the receiver's own type arguments, so
+  `Box[int].get` and `Box[real].get` are two monomorphized functions exactly as two instantiations
+  of a free generic function are. What remains open is the part with nothing to infer from — an
+  **associated function** on a generic type (no receiver to read the arguments off) and a member
+  carrying **its own** type parameters — both deferred with a diagnostic. A generic `impl` block is
+  the other half, and it is what decides where a type parameter's bounds are declared.
 - **d. `where` clauses.** An out-of-line bound syntax for readability when the inline `[T: A +
   B]` list grows long or involves relations between parameters. All of Rust/Swift/Kotlin have
   one; a candidate ergonomic addition, not a day-one need.

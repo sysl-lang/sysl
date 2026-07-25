@@ -431,10 +431,20 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val enumDecl: PackratParser[Stmt] =
     op("enum") ~> ident ~ opt(typeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
-      (newline ~> indent ~> opt(newlines) ~> repsep(enumVariant, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
-        variants => EnumDecl(name, tps.getOrElse(Nil), under, variants)
+      (newline ~> indent ~> opt(newlines) ~> repsep(enumItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
+        items =>
+          val variants = items.collect { case Left(v)  => v }
+          val members  = items.collect { case Right(m) => m }
+          EnumDecl(name, tps.getOrElse(Nil), under, variants, members)
       }
     }
+
+  /** A line inside an enum body is either a variant or a member declaration, told apart the same
+   * way a struct body's lines are: a member is tried first and needs a body to follow its header,
+   * so `Circle(radius: int)` — a header with nothing after it — falls through to `enumVariant`.
+   */
+  private lazy val enumItem: Parser[Either[EnumVariantDecl, MethodDecl]] =
+    member ^^ (Right(_)) | enumVariant ^^ (Left(_))
 
   private lazy val enumVariant: Parser[EnumVariantDecl] =
     at(

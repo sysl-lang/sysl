@@ -188,6 +188,26 @@ object Type {
       value >= -limit && value < limit
     else value >= 0 && value < (BigInt(1) << t.bits)
 
+  /** A type the programmer declared and may hang members off: a struct or an enum.
+   *
+   * Both are *nominal* — identified by the name they were declared under together with the type
+   * arguments this instantiation was made with — and that identity is what member lookup, trait
+   * conformance, and the mangled name of a lowered member all key on. Nothing about the two
+   * layouts is shared, so this carries only the identity, which is exactly the part the analyzer
+   * resolves members through: a method on an enum is found the same way a method on a struct is.
+   */
+  sealed trait Named extends Type {
+
+    /** The name the type was declared under, with no type arguments applied. */
+    def base: String
+
+    /** The type arguments this instantiation was made with; empty for a non-generic type. */
+    def targs: List[Type]
+
+    /** The instantiation as a diagnostic spells it: `Point`, `Option[int]`. */
+    def name: String
+  }
+
   /** A value struct: fields in declaration order, lowered to a named LLVM aggregate. `targs`
    * is empty for an ordinary struct and holds the instantiation for a generic one.
    *
@@ -196,7 +216,7 @@ object Type {
    * already in place. Identity is therefore `(base, targs)` — the display name identifies the
    * instantiation, and the field list is a consequence of it rather than part of it.
    */
-  final class Struct(val base: String, val targs: List[Type]) extends Type {
+  final class Struct(val base: String, val targs: List[Type]) extends Named {
     var fields: List[(String, Type)] = Nil
 
     def name: String = qualified(base, targs)
@@ -229,7 +249,7 @@ object Type {
    * a value aggregate `{ i32 tag, payload₁, payload₂, … }` with one payload slot per
    * data-carrying variant. The payload for variant `V` is the named aggregate `%Name.V`.
    */
-  final class Enum(val base: String, val targs: List[Type]) extends Type {
+  final class Enum(val base: String, val targs: List[Type]) extends Named {
     var simple: Boolean            = true
     var variants: List[EnumVariant] = Nil
 
@@ -275,8 +295,7 @@ object Type {
    * LLVM-name characters.
    */
   private def mangleOne(t: Type): String = t match
-    case s: Struct        => mangled(s.base, s.targs)
-    case e: Enum          => mangled(e.base, e.targs)
+    case n: Named         => mangled(n.base, n.targs)
     case Ptr(inner)       => s"ptr.${mangleOne(inner)}"
     case Ref(inner, false) => s"ref.${mangleOne(inner)}"
     case Ref(inner, true)  => s"sync.${mangleOne(inner)}"
@@ -288,7 +307,6 @@ object Type {
    * `byte`, `real`), the canonical width spelling otherwise (`i5`, `u12`, `f32`).
    */
   def show(t: Type): String = t match
-    case s: Struct => s.name
-    case e: Enum   => e.name
-    case other     => friendly.getOrElse(other, canonicalName(other))
+    case n: Named => n.name
+    case other    => friendly.getOrElse(other, canonicalName(other))
 }

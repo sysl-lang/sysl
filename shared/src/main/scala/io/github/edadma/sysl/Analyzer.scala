@@ -58,7 +58,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     // A type's members lower to ordinary functions under mangled names, registered here so a
     // method call and an associated-function call resolve exactly as a free call does.
     val members = mutable.ListBuffer.empty[FuncDecl]
-    for (tname, sdecl) <- structDecls do at(sdecl.pos)(recover(())(hoistMembers(tname, sdecl, members)))
+    for (tname, sdecl) <- structDecls do at(sdecl.pos)(recover(())(hoistMembers(tname, sdecl.members, members)))
+    for (tname, edecl) <- enumDecls do at(edecl.pos)(recover(())(hoistMembers(tname, edecl.members, members)))
     for impl <- traitImpls.values do at(impl.pos)(recover(())(hoistImpl(impl, members)))
 
     val tfuncs = mutable.ListBuffer.empty[TFunc]
@@ -152,8 +153,24 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * to be inferred rather than read off a receiver — wait on later work and are rejected with a
    * clear diagnostic rather than silently mishandled.
    */
-  private def hoistMembers(tname: String, sdecl: StructDecl, out: mutable.ListBuffer[FuncDecl]): Unit =
-    hoistMemberList(tname, sdecl.tparams, sdecl.fields.map(_.name).toSet, sdecl.members, out)
+  private def hoistMembers(tname: String, members: List[MethodDecl], out: mutable.ListBuffer[FuncDecl]): Unit = {
+    val (tparams, taken, noun) = nominal(tname).get
+
+    hoistMemberList(tname, tparams, taken, noun, members, out)
+  }
+
+  /** What hoisting a member needs to know about the type it is hoisting into: the type parameters
+   * a member's signature may mention, the names already spoken for inside the body, and what a
+   * diagnostic calls one of those names. A struct's are its fields; an enum's are its variants.
+   *
+   * It answers for either kind, which is what lets member hoisting and `impl` conformance be
+   * written once — nothing below here knows or cares which it was handed.
+   */
+  private def nominal(name: String): Option[(List[String], Set[String], String)] =
+    structDecls
+      .get(name)
+      .map(s => (s.tparams, s.fields.map(_.name).toSet, "field"))
+      .orElse(enumDecls.get(name).map(e => (e.tparams, e.variants.map(_.name).toSet, "variant")))
 
   /** Lowers a list of members of `tname` to functions, shared by a type's own body and an `impl`
    * block. Each member is registered under (type, name) and synthesized to a `Type.member`
@@ -163,7 +180,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
   private def hoistMemberList(
       tname: String,
       tparams: List[String],
-      fieldNames: Set[String],
+      taken: Set[String],
+      noun: String,
       members: List[MethodDecl],
       out: mutable.ListBuffer[FuncDecl],
   ): Unit = {
@@ -173,8 +191,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       currentPos = m.pos.orElse(currentPos)
       if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '$tname.${m.name}'")
       if memberDecls.contains((tname, m.name)) then err(s"type '$tname' already has a member named '${m.name}'")
-      if fieldNames.contains(m.name) then
-        err(s"type '$tname' has both a field and a member named '${m.name}'")
+      if taken.contains(m.name) then
+        err(s"type '$tname' has both a $noun and a member named '${m.name}'")
 
       memberDecls((tname, m.name)) = m
       val fd = synthesize(tname, tparams, m)
@@ -193,20 +211,19 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
   /** Checks an `impl` conforms to its trait and lowers its methods to inherent members of the
    * implementing type. Conformance is nominal and exact: the type must supply every trait method
    * with a matching signature and no method the trait does not declare. The methods are then
-   * hoisted exactly as a struct's own members, so a call on a value resolves through the ordinary
+   * hoisted exactly as a type's own members are, so a call on a value resolves through the ordinary
    * member path with no dispatch machinery of its own.
    */
   private def hoistImpl(impl: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
     val tr = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
-    val sdecl = structDecls.getOrElse(
-      impl.forType,
-      err(s"a trait can only be implemented for a struct so far, and '${impl.forType}' is not one"),
+    val (tparams, taken, noun) = nominal(impl.forType).getOrElse(
+      err(s"a trait can only be implemented for a struct or an enum, and '${impl.forType}' is not one"),
     )
-    if sdecl.tparams.nonEmpty then
+    if tparams.nonEmpty then
       err(s"implementing a trait for a generic type is not supported yet — '${impl.forType}'")
 
     checkConformance(tr, impl)
-    hoistMemberList(impl.forType, Nil, sdecl.fields.map(_.name).toSet, impl.methods, out)
+    hoistMemberList(impl.forType, Nil, taken, noun, impl.methods, out)
   }
 
   /** Verifies that `impl` supplies exactly the methods `tr` declares, each with an identical
@@ -659,13 +676,13 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       err(s"undefined function '$name'")
 
     // Reached through the enum name: `Color.try(n)` is the fallible constructor; otherwise a
-    // data-carrying variant `Shape.Circle(5)`, the qualified form of the bare `Circle(5)`.
+    // data-carrying variant `Shape.Circle(5)`, the qualified form of the bare `Circle(5)`, or an
+    // associated function the enum declares, which resolves exactly as a struct's does.
     case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && enumDecls.contains(tname) =>
       if mname == "try" then enumTry(tname, args)
-      else
-        enumDecls(tname).variants.find(_.name == mname) match
-          case Some(_) => constructVariant(mname, args, expected)
-          case None    => err(s"enum '$tname' has no variant '$mname'")
+      else if enumDecls(tname).variants.exists(_.name == mname) then constructVariant(mname, args, expected)
+      else if memberDecls.contains((tname, mname)) then callAssociated(tname, mname, args, expected)
+      else err(s"enum '$tname' has no variant or associated function '$mname'")
 
     // `Type.name(…)` — an associated function, told from the positional constructor `Type(…)` by
     // the member selected from the type name rather than the bare name applied.
@@ -679,9 +696,14 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       err("the thing being called must be a name")
 
     case Field(Ident(n), f) if lookupOpt(n).isEmpty && enumDecls.contains(n) =>
-      enumDecls(n).variants.find(_.name == f) match
-        case Some(_) => constructVariant(f, Nil, expected)
-        case None    => err(s"enum '$n' has no variant '$f'")
+      if enumDecls(n).variants.exists(_.name == f) then constructVariant(f, Nil, expected)
+      else
+        memberDecls.get((n, f)) match
+          case Some(m) if m.isProperty        => err(s"'$f' is a property of '$n' — read it on a value, as 'value.$f'")
+          case Some(m) if m.receiver.isDefined =>
+            err(s"'$f' is a method of '$n' — call it on a value, as 'value.$f(…)'")
+          case Some(_) => err(s"'$f' is an associated function of '$n' — call it with '$n.$f(…)'")
+          case None    => err(s"enum '$n' has no variant '$f'")
 
     case Field(receiver, f) =>
       val tr = autoDeref(analyzeExpr(receiver))
@@ -689,16 +711,10 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
           if idx >= 0 then TField(tr, idx, s.fields(idx)._2)
-          else
-            memberDecls.get((s.base, f)) match
-              // A property reads with no parentheses, so it looks exactly like a field; its
-              // receiver is an implicit by-value read of the instance.
-              case Some(m) if m.isProperty =>
-                val fname      = memberFuncName(s.base, f, s)
-                val (_, rtype) = funcInsts(fname)
-                TCall(fname, List(tr), rtype)
-              case Some(_) => err(s"'$f' is a method of '${s.name}' — call it with '$f(…)'")
-              case None    => err(s"'${s.name}' has no field or property '$f'")
+          else readProperty(tr, s, f)
+
+        // An enum has no fields to shadow a member, so every name read off one is a property.
+        case e: Type.Enum => readProperty(tr, e, f)
         // `len` and `bytes` are the first compiler-provided members: `len` a property on every
         // array, slice, and string, and `bytes` the reinterpretation of a string's three words
         // as a `[]u8`, dropping only the validity guarantee.
@@ -815,6 +831,24 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       err("a range is only allowed in a 'for' loop or a 'match' pattern")
 
     case _: Tuple => err("tuples are not supported yet")
+
+  /** `value.name` where `name` is not a field: a computed property, which reads with no
+   * parentheses and so is spelled exactly as a field is, with an implicit by-value receiver.
+   *
+   * The absent-member wording is the one difference between the two nominal kinds: a struct's `x`
+   * could have been either a field or a property, while an enum has no fields to have meant.
+   */
+  private def readProperty(tr: TExpr, n: Type.Named, f: String): TExpr =
+    memberDecls.get((n.base, f)) match
+      case Some(m) if m.isProperty =>
+        val fname      = memberFuncName(n.base, f, n)
+        val (_, rtype) = funcInsts(fname)
+        TCall(fname, List(tr), rtype)
+      case Some(_) => err(s"'$f' is a method of '${n.name}' — call it with '$f(…)'")
+      case None =>
+        n match
+          case _: Type.Struct => err(s"'${n.name}' has no field or property '$f'")
+          case _              => err(s"'${n.name}' has no property '$f'")
 
   /** One end of a slice range: an index like any other, so any integer will do. */
   private def bound(e: Expr): TExpr = {

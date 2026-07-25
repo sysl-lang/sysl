@@ -181,10 +181,13 @@ the same footing as C's `assert` compiled out by `NDEBUG`.
 - **a. `From`-style error conversion in `?`.** Let `?` convert the callee's `E` to the caller's
   `E` through a conversion trait, so cross-error-type propagation needs no manual step (§4).
   Additive over the exact-match baseline; waits on the stdlib trait layer.
-- **b. Forcing combinators (`unwrap` / `expect` / `unwrap_or`).** A method that traps on
-  `None`/`Err`, and the total `unwrap_or(default)`, are the obvious conveniences; they are
-  methods on a generic type, which is itself deferred (`10 §Open c`). Today code rolls the
-  equivalent `match` by hand.
+- **b. Forcing combinators (`unwrap` / `expect`).** The *total* conveniences now ship: `Option`
+  carries `is_some`, `is_none`, and `unwrap_or(default)`, and `Result` carries `is_ok`, `is_err`,
+  and `unwrap_or(default)`, written as ordinary members in the prelude once members on a generic
+  type landed (`10 §Open c`). The two that **trap** on `None`/`Err` still wait, and on two things
+  rather than one: a way for prelude source to reach a trap at all (every trap today is emitted by
+  the compiler around a check it inserted), and a bottom type, so the diverging arm can sit beside
+  the value-yielding one and the `match` still have a type.
 - **c. `Result`/`Option` combinator library.** `map`, `and_then`, `or_else`, `ok_or`, and the
   rest are stdlib surface, designed when the standard library is (they are not language
   features).

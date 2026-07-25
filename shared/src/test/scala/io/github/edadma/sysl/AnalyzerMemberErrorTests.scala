@@ -98,6 +98,207 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "members on enums" - {
+    // A variant is what an enum has instead of fields, so it is a variant a member may not shadow —
+    // and the diagnostic says variant, since there is no field to have meant.
+    "a member may not share a name with a variant" in {
+      err(
+        """enum Color
+          |    Red
+          |    Red(self) -> int = 1""".stripMargin
+      ) should include("type 'Color' has both a variant and a member named 'Red'")
+    }
+
+    "an unknown method on an enum is reported against its type" in {
+      err(
+        """enum Color
+          |    Red
+          |var c = Red
+          |print(c.area())""".stripMargin
+      ) should include("type 'Color' has no method 'area'")
+    }
+
+    // An enum has no fields at all, so an absent name can only have been a property — saying "field
+    // or property" here would point at something the type cannot have.
+    "an absent name read off an enum value is reported as a property" in {
+      err(
+        """enum Color
+          |    Red
+          |var c = Red
+          |print(c.nope)""".stripMargin
+      ) should include("'Color' has no property 'nope'")
+    }
+
+    "a property on an enum is read without parentheses" in {
+      err(
+        """enum Color
+          |    Red
+          |    code -> int = 1
+          |var c = Red
+          |print(c.code())""".stripMargin
+      ) should include("is a property")
+    }
+
+    "a method on an enum is called with parentheses" in {
+      err(
+        """enum Color
+          |    Red
+          |    code(self) -> int = 1
+          |var c = Red
+          |print(c.code)""".stripMargin
+      ) should include("is a method")
+    }
+
+    // A `&self` method needs the reference itself; a bare enum on the stack has no refcount to
+    // share, exactly as a bare struct has none.
+    "a '&self' method on an enum rejects a bare stack value" in {
+      err(
+        """enum Color
+          |    Red
+          |    code(&self) -> int = 1
+          |var c = Red
+          |print(c.code())""".stripMargin
+      ) should include("'&self' needs a reference")
+    }
+
+    // Reached through the type name rather than a value: an instance member is not a variant, and
+    // the diagnostic distinguishes the three member kinds rather than claiming the name is unknown.
+    "an instance member reached through the enum name says to use a value" in {
+      err(
+        """enum Color
+          |    Red
+          |    code(self) -> int = 1
+          |print(Color.code())""".stripMargin
+      ) should include("'code' is an instance method of 'Color'")
+
+      err(
+        """enum Color
+          |    Red
+          |    code(self) -> int = 1
+          |print(Color.code)""".stripMargin
+      ) should include("call it on a value, as 'value.code(…)'")
+
+      err(
+        """enum Color
+          |    Red
+          |    code -> int = 1
+          |print(Color.code)""".stripMargin
+      ) should include("'code' is a property of 'Color'")
+    }
+
+    "an associated function read off the enum name without parentheses is rejected" in {
+      err(
+        """enum Color
+          |    Red
+          |    make() -> int = 1
+          |print(Color.make)""".stripMargin
+      ) should include("'make' is an associated function of 'Color' — call it with 'Color.make(…)'")
+    }
+
+    "an unknown associated function on an enum is reported against its type" in {
+      err(
+        """enum Color
+          |    Red
+          |    make() -> int = 1
+          |print(Color.bogus())""".stripMargin
+      ) should include("enum 'Color' has no variant or associated function 'bogus'")
+    }
+
+    // The same two deferrals a struct's members meet, met on an enum: a member's own type
+    // parameter has nothing to infer it from, and an associated function has no receiver to read
+    // the enum's type arguments off.
+    "a generic method on an enum waits on the generics work" in {
+      err(
+        """enum Color
+          |    Red
+          |    store[T](self, item: T) -> int = 1""".stripMargin
+      ) should include("generic methods are not supported yet")
+    }
+
+    "an associated function on a generic enum waits on the generics work" in {
+      err(
+        """enum Maybe[T]
+          |    Just(value: T)
+          |    make() -> int = 1""".stripMargin
+      ) should include("associated functions on generic types are not supported yet")
+    }
+
+    "a data enum's method body must still cover every variant" in {
+      err(
+        """enum Shape
+          |    Circle(r: int)
+          |    Empty
+          |    area(self) -> int = match self
+          |        Empty -> 0""".stripMargin
+      ) should include("not exhaustive")
+    }
+
+    "the prelude's Option members are checked against the element type" in {
+      err(
+        """var a: Option[int] = Some(1)
+          |print(a.unwrap_or("no"))""".stripMargin
+      ) should include("is int, but string was given")
+    }
+  }
+
+  "traits on enums" - {
+    "an impl for an enum that omits a trait method is rejected" in {
+      err(
+        """trait Show
+          |    show(self) -> int
+          |    label(self) -> int
+          |enum Color
+          |    Red
+          |impl Show for Color
+          |    show(self) -> int = 1""".stripMargin
+      ) should include("method 'label' is missing")
+    }
+
+    "an impl method colliding with a variant is rejected" in {
+      err(
+        """trait Show
+          |    Red(self) -> int
+          |enum Color
+          |    Red
+          |impl Show for Color
+          |    Red(self) -> int = 1""".stripMargin
+      ) should include("both a variant and a member")
+    }
+
+    "implementing a trait for a generic enum is rejected for now" in {
+      err(
+        """trait Show
+          |    show(self) -> int
+          |enum Maybe[T]
+          |    Just(value: T)
+          |impl Show for Maybe
+          |    show(self) -> int = 1""".stripMargin
+      ) should include("generic type is not supported yet")
+    }
+
+    // A type that is neither a struct nor an enum has no body to hoist members into, and the
+    // diagnostic now names both kinds that do.
+    "implementing a trait for an unknown type names both nominal kinds" in {
+      err(
+        """trait Show
+          |    show(self) -> int
+          |impl Show for Ghost
+          |    show(self) -> int = 1""".stripMargin
+      ) should include("a trait can only be implemented for a struct or an enum")
+    }
+
+    "an enum that does not implement a bound's trait is rejected at the call" in {
+      err(
+        """trait Show
+          |    show(self) -> int
+          |enum Color
+          |    Red
+          |render[T: Show](x: T) -> int = x.show()
+          |print(render(Red))""".stripMargin
+      ) should include("requires its type parameter 'T' to implement 'Show', but Color does not")
+    }
+  }
+
   "members on generic types" - {
     "a method call with the wrong arity is reported" in {
       err(

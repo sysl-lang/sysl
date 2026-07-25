@@ -225,15 +225,17 @@ case class StructDecl(name: String, tparams: List[String], fields: List[Param], 
  */
 case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param]) extends Positioned
 
-/** `enum Name[T…]` with indented variants. All-dataless variants make a *simple* enum (integer
- * constants, auto-incrementing, with optional explicit `= value`); any data-carrying variant
- * makes a *data* enum (a tagged union whose variants are constructed and destructured).
+/** `enum Name[T…]` with indented variants and, intermixed, member declarations (methods,
+ * properties, associated functions) exactly as a struct body holds them. All-dataless variants make
+ * a *simple* enum (integer constants, auto-incrementing, with optional explicit `= value`); any
+ * data-carrying variant makes a *data* enum (a tagged union whose variants are constructed and
+ * destructured).
  *
  * `underlying` is the `: iN`/`uN` annotation that pins a non-generic simple enum's storage type;
  * unspecified it is `int`. It is meaningless on a generic or data enum, which the analyzer rejects.
  */
 case class EnumDecl(name: String, tparams: List[String], underlying: Option[TypeRef],
-                    variants: List[EnumVariantDecl]) extends Stmt
+                    variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil) extends Stmt
 
 /** `trait Name` with indented method **signatures** — a method with a receiver and a parameter
  * list but no body (`show(self) -> string`). A trait is nominal: a type participates only through

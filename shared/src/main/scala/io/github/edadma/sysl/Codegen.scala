@@ -122,6 +122,9 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     case _: Type.View     => "zeroinitializer"
     case e: Type.Enum     => if e.simple then "0" else "zeroinitializer"
     case Type.Unit        => ""
+    // Nothing is lowered from a program that has an error, and a type the analyzer could not work
+    // out is only ever produced by one, so reaching here would mean codegen ran on a broken tree.
+    case Type.Unknown     => sys.error("unreachable zero of an unknown type")
 
   // --- statements ----------------------------------------------------------------------
 
