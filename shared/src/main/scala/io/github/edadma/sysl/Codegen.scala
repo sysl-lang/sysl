@@ -752,7 +752,6 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
 
   private def genMatch(scrutinee: TExpr, arms: List[TArm], ty: Type): String = {
     val sv   = genExpr(scrutinee)
-    val sty  = scrutinee.ty
     val endL = freshLabel("match.end")
     val slot = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
 
@@ -760,12 +759,12 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       val bodyL = freshLabel("match.arm")
       val nextL = freshLabel("match.next")
       val patCond =
-        arm.patterns.map(patternTest(_, sty, sv)).reduce(orI1)
+        arm.patterns.map(patternTest(_, sv)).reduce(orI1)
 
       // Bindings are established only after the pattern matches, and a guard may reference them,
       // so a guarded arm branches first on the pattern, then binds, then tests the guard.
       // Only a single (non-alternative) pattern may bind.
-      def bind(): Unit = if arm.patterns.length == 1 then patternBind(arm.patterns.head, sty, sv)
+      def bind(): Unit = if arm.patterns.length == 1 then patternBind(arm.patterns.head, sv)
 
       arm.guard match
         case None =>
@@ -807,11 +806,12 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
   }
 
-  /** The i1 result of testing a pattern against a value of type `ty`. Pattern tests are pure
+  /** The i1 result of testing a pattern against a value. Every pattern node carries the type it
+   * tests at, so the value's type does not have to be passed alongside it. Pattern tests are pure
    * value reads (`extractvalue`, comparisons), so nested variant fields are extracted and
    * tested unconditionally — a failed outer tag simply ANDs a `false` through.
    */
-  private def patternTest(p: TPattern, ty: Type, value: String): String = p match
+  private def patternTest(p: TPattern, value: String): String = p match
     case _: TWildPattern | _: TBindPattern => "true"
     case TLitPattern(v)                    => compareValue("==", v.ty, value, genExpr(v))
     case TRangePattern(lo, hi, inclusive) =>
@@ -829,7 +829,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
         emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
         args.zipWithIndex.foldLeft(tagOk) { case (acc, (arg, i)) =>
           val fv = freshTemp(); emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, $i")
-          andI1(acc, patternTest(arg, variant.fields(i)._2, fv))
+          andI1(acc, patternTest(arg, fv))
         }
 
     // A struct has no tag, so the test is just its refutable fields' tests ANDed together; an
@@ -840,13 +840,13 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
         if !refutable(arg) then acc
         else
           val fv = freshTemp(); emit(s"$fv = extractvalue ${struct.llvm} $value, $i")
-          andI1(acc, patternTest(arg, struct.fields(i)._2, fv))
+          andI1(acc, patternTest(arg, fv))
       }
 
   /** Establishes the bindings a pattern introduces, once its arm has been taken. Only binding
    * and (nested) variant patterns carry bindings; the rest are no-ops.
    */
-  private def patternBind(p: TPattern, ty: Type, value: String): Unit = p match
+  private def patternBind(p: TPattern, value: String): Unit = p match
     case TBindPattern(name, bty) =>
       emitAlloca(s"%$name.addr", bty.llvm)
       retainValue(bty, value)
@@ -857,11 +857,11 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
       for (arg, i) <- args.zipWithIndex do
         val fv = freshTemp(); emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, $i")
-        patternBind(arg, variant.fields(i)._2, fv)
+        patternBind(arg, fv)
     case TStructPattern(struct, args) if args.exists(bindsAny) =>
       for (arg, i) <- args.zipWithIndex if bindsAny(arg) do
         val fv = freshTemp(); emit(s"$fv = extractvalue ${struct.llvm} $value, $i")
-        patternBind(arg, struct.fields(i)._2, fv)
+        patternBind(arg, fv)
     case _ => ()
 
   private def bindsAny(p: TPattern): Boolean = p match

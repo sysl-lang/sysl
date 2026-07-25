@@ -140,8 +140,12 @@ trait CallAnalysis extends Literals {
 
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
    * The positional constructor `Type(…)` is a different form and is handled elsewhere.
+   *
+   * The expected type plays no part: an associated function's result is the one it declares, and
+   * there is nothing to infer from the context because an associated function on a *generic* type
+   * is rejected at its declaration (`Hoisting`). That parameter comes back with those.
    */
-  protected def callAssociated(tname: String, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
+  protected def callAssociated(tname: String, mname: String, args: List[Expr]): TExpr =
     memberDecls.get((tname, mname)) match
       case Some(m) if m.receiver.isEmpty && !m.isProperty =>
         val fname           = s"$tname.$mname"

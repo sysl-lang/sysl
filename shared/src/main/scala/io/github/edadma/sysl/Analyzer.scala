@@ -362,13 +362,13 @@ class Analyzer private (program: Program)
     case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && enumDecls.contains(tname) =>
       if mname == "try" then enumTry(tname, args)
       else if enumDecls(tname).variants.exists(_.name == mname) then constructVariant(mname, args, expected)
-      else if memberDecls.contains((tname, mname)) then callAssociated(tname, mname, args, expected)
+      else if memberDecls.contains((tname, mname)) then callAssociated(tname, mname, args)
       else err(s"enum '$tname' has no variant or associated function '$mname'")
 
     // `Type.name(…)` — an associated function, told from the positional constructor `Type(…)` by
     // the member selected from the type name rather than the bare name applied.
     case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && structDecls.contains(tname) =>
-      callAssociated(tname, mname, args, expected)
+      callAssociated(tname, mname, args)
 
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args)

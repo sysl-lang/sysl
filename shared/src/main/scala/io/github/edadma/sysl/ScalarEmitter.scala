@@ -1,7 +1,5 @@
 package io.github.edadma.sysl
 
-import scala.collection.mutable
-
 /** The scalar end of codegen: arithmetic, comparison, conversion, and printing.
  *
  * Everything here follows from `01-scalar-types-and-operators.md` — arithmetic wraps at the

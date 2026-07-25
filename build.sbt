@@ -46,6 +46,12 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
         "-deprecation",
         "-feature",
         "-unchecked",
+        // Dead code is only dead once something says so. Without this the build is silent about an
+        // unused import, local, private member, or parameter, and a warning sweep before a release
+        // has nothing to find. `-Wvalue-discard` and `-Wnonunit-statement` are deliberately *not*
+        // here: between them they flag every non-final ScalaTest assertion, ~285 of them, which
+        // would bury the handful of warnings that mean something.
+        "-Wunused:all",
         "-language:postfixOps",
         "-language:implicitConversions",
         "-language:existentials",
