@@ -81,6 +81,18 @@ trait AnalyzerBase {
   /** Instantiated function signatures, keyed by the name codegen will emit. */
   protected val funcInsts = mutable.LinkedHashMap.empty[String, (List[(String, Type)], Type)]
 
+  /** Every `extern` the program declares. A call to one resolves exactly as a call to a sysl
+   * function does — the signature is in `funcInsts` like any other — so this exists only to say
+   * *which* names have no body: codegen declares them instead of defining them, and the escape
+   * analysis assumes the worst of them.
+   */
+  protected val externDecls = mutable.LinkedHashMap.empty[String, ExternDecl]
+
+  /** The externs something in the program actually calls, in the order they were first reached.
+   * An unused one is not declared in the output at all.
+   */
+  protected val externsUsed = mutable.LinkedHashSet.empty[String]
+
   /** Instantiations whose body has not been analyzed yet. Queued rather than analyzed inline
    * so an instantiation discovered mid-function does not disturb the enclosing context.
    */
@@ -132,12 +144,30 @@ trait AnalyzerBase {
   /** Abandons the current region without reporting, because whatever led here already did. */
   protected def poisoned(): Nothing = throw Poisoned()
 
-  /** Whether two types genuinely disagree. A type that could not be worked out agrees with
-   * everything: the mistake that produced it has been reported, and a second complaint about
-   * what it fails to match is noise about a consequence rather than a cause.
+  /** Whether a value of type `got` genuinely cannot stand where a `want` was asked for — an
+   * argument against a parameter, a returned value against a declared result.
+   *
+   * Two types agree for reasons of their own. A type that could not be worked out agrees with
+   * everything, in either direction: the mistake that produced it has been reported, and a second
+   * complaint about what it fails to match is noise about a consequence rather than a cause. A
+   * `never` agrees with everything in *one* direction only — it may stand anywhere, because control
+   * does not reach the place the value would have been used, but nothing may stand for it.
    */
-  protected def disagree(a: Type, b: Type): Boolean =
-    a != b && a != Type.Unknown && b != Type.Unknown
+  protected def disagree(got: Type, want: Type): Boolean =
+    got != want && got != Type.Unknown && want != Type.Unknown && got != Type.Never
+
+  /** The one type two alternatives meet at — the branches of an `if`, the arms of a `match`, a
+   * loop's `break` values and its `else` — or `None` when they have no common type.
+   *
+   * The only interesting case is `never`: an alternative that does not finish constrains nothing,
+   * so it takes the other side's type. Everything else must already agree, since sysl has no
+   * subtyping among concrete types to widen towards.
+   */
+  protected def join(a: Type, b: Type): Option[Type] =
+    if a == b then Some(a)
+    else if a == Type.Never then Some(b)
+    else if b == Type.Never then Some(a)
+    else None
 
   protected def show(t: Type): String = Type.show(t)
 

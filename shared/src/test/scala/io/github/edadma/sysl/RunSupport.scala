@@ -30,4 +30,18 @@ trait RunSupport extends Matchers { this: Assertions =>
       case Left(err)        => fail(err)
     }
   }
+
+  /** Asserts that a program stops itself *and says why* — the shape of a panic, as against the
+   * silent trap `exits` checks for. The diagnostic reaches the pipe because the panic leaves
+   * through `exit`, which flushes what was written; `abort` would not have to.
+   */
+  protected def panics(src: String, message: String): Unit = {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    Toolchain.compileAndRun(src) match {
+      case Right((0, out)) => fail(s"expected the program to stop, but it exited cleanly:\n$out")
+      case Right((_, out)) => out should include(message)
+      case Left(err)       => fail(err)
+    }
+  }
 }

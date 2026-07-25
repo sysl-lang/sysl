@@ -2,7 +2,7 @@
 
 **Status:** the top-level function surface is written against the implementation that already
 exists — keyword-less declarations, expression and block bodies, `return`, forward reference,
-recursion — and ratifies it. **Closures are not yet implemented**; the sections that describe
+recursion, and `extern` — and ratifies it. **Closures are not yet implemented**; the sections that describe
 them (§5 onward) are the design the rest of the docs already lean on — `05-escape-analysis.md`
 heap-boxes an escaping closure, and `capabilities.md` gates escaping closures behind `alloc` and
 inlines the non-escaping ones — written down here so that surface is decided before it is built,
@@ -47,6 +47,45 @@ written inline.
 **A missing `-> type` means the function returns `unit`.** `greet` above runs for its effect and
 yields nothing; there is no `-> unit` to write, though writing it is legal. This mirrors how a
 block whose trailing statement is not an expression has type `unit`.
+
+### A declaration with no body — `extern`
+
+`extern` declares a function this program does **not** define but may call, resolved by the linker
+under the name it is declared with:
+
+```
+extern exit(code: int) -> never
+extern abs(n: int) -> int
+extern memcpy(dst: *u8, src: *u8, n: usize) -> *u8
+```
+
+It is a function header and nothing else, and the **absence of a body** is the whole difference:
+everything downstream is the ordinary path. A call to an extern is checked against the declared
+signature, has its arity checked, and lowers to an ordinary call; the result type is optional and
+absent means `unit`, exactly as for a function. Externs live in the one function namespace, so an
+extern and a function cannot share a name. An extern is never generic — there is no body to
+monomorphize.
+
+**The name is the symbol.** `extern abs` binds to the C symbol `abs`; there is no separate link
+name to give (`§ Open f`). A declaration nothing calls is not emitted at all, so declaring more
+than a program uses costs nothing.
+
+**Two rules follow from having no body, and both are already written elsewhere.** The escape
+analysis assumes the worst of it — every argument may be kept, and the result may view any of them
+(`05`) — because nothing can tell whether the foreign side held on to what it was handed. And
+`extern f() -> never` is how a program says the callee does not come back (`00 §11`), which is what
+makes the exit path of a panic ordinary sysl rather than a compiler intrinsic.
+
+**Why the language needs it at all.** Sysl has no functions built into the compiler that a program
+could not have written: `Option` and `Result` are prelude enums, `unwrap` is a prelude member. The
+one thing a program genuinely cannot write for itself is the *first* call out of sysl — into libc
+on a hosted target, into a driver primitive on a bare one. `extern` is that seam and nothing more,
+which is why it is a declaration form rather than a set of known names.
+
+What crosses the boundary is the programmer's business. A scalar or a `*T` matches C directly; a
+`string` or a `&T` is a sysl layout that C has no notion of, and handing one over is the same kind
+of promise `*T` already is. Capability gating (an extern reaching libc plausibly needs `os`) and
+variadic externs are both open (`§ Open g`, `§ Open h`).
 
 ## 2. Parameters are by-value bindings
 
@@ -297,3 +336,16 @@ allocate.
   function be used as a callable. Whether `Point.origin` or `p.dist` (an associated function, a
   bound method) may likewise be passed as an `Fn` — and how a bound method carries its receiver —
   joins this chapter with `08` and is not settled here.
+- **f. A link name distinct from the sysl name.** Today an `extern`'s name *is* the symbol (§1), so
+  reaching a C function means taking its spelling — and a prelude extern occupies that name for
+  every program. An override (Rust's `#[link_name]`, a leading string) would let `extern` bind
+  `snprintf` to a sysl-shaped name, and would let the prelude keep its own primitives out of the
+  user's namespace. Additive; deferred until a real case needs it.
+- **g. Variadic externs.** `printf` and `snprintf` cannot be declared at all today, which is the
+  one thing keeping `print`, `str`, and `format` inside the compiler rather than in the prelude
+  where the rest of the surface lives. Needs a spelling for "and then whatever else", plus the
+  default-promotion rules that go with C varargs.
+- **h. Capability gating for externs.** An `extern` reaching into libc is exactly the kind of thing
+  `capabilities.md` exists to gate, and a freestanding `no alloc` target's externs are a different
+  set from a hosted one's. Which capability an extern requires — and whether that is a property of
+  the declaration or of the module — waits on capabilities being implemented at all.

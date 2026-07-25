@@ -6,11 +6,22 @@ package io.github.edadma.sysl
  * they use nothing the language does not already offer. `Option` and `Result` are here rather
  * than built into the analyzer because they *are* just generic enums; only the `?` operator
  * knows their names.
+ *
+ * `exit` is the one thing here that is not sysl: an `extern`, resolved by the linker to the
+ * hosted C library's. It is what `unwrap` and `expect` stop the program with — a diagnostic
+ * printed and a non-zero status, which is what `11-error-handling.md` says a trap does under the
+ * `os` capability — and it is the reason those two need no compiler support of their own.
+ *
+ * None of this costs an unused program anything: the enums' members are generic, so one exists
+ * only where a call asks for it, and an `extern` is declared in the output only if something
+ * reaches it.
  */
 object Prelude {
 
   val source: String =
-    """enum Option[T]
+    """extern exit(code: int) -> never
+      |
+      |enum Option[T]
       |    Some(value: T)
       |    None
       |
@@ -23,6 +34,18 @@ object Prelude {
       |    unwrap_or(self, default: T) -> T = match self
       |        Some(v) -> v
       |        None -> default
+      |
+      |    unwrap(self) -> T = match self
+      |        Some(v) -> v
+      |        None ->
+      |            print("panic: unwrap of a None value")
+      |            exit(1)
+      |
+      |    expect(self, msg: string) -> T = match self
+      |        Some(v) -> v
+      |        None ->
+      |            print("panic:", msg)
+      |            exit(1)
       |end Option
       |
       |enum Result[T, E]
@@ -38,6 +61,18 @@ object Prelude {
       |    unwrap_or(self, default: T) -> T = match self
       |        Ok(v) -> v
       |        Err(_) -> default
+      |
+      |    unwrap(self) -> T = match self
+      |        Ok(v) -> v
+      |        Err(_) ->
+      |            print("panic: unwrap of an Err value")
+      |            exit(1)
+      |
+      |    expect(self, msg: string) -> T = match self
+      |        Ok(v) -> v
+      |        Err(_) ->
+      |            print("panic:", msg)
+      |            exit(1)
       |end Result
       |""".stripMargin
 

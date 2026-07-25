@@ -129,14 +129,22 @@ trait PatternAnalysis extends TypeResolution {
   protected def matchResultType(scrutTy: Type, arms: List[TArm]): Type = {
     val bodyTys = arms.map(_.body.ty).distinct
 
+    // An arm that does not finish — one that aborts rather than yielding — constrains nothing, so
+    // it is set aside before the others are compared. That is what lets `None -> exit(1)` sit
+    // beside `Some(v) -> v` and the match still have the payload's type.
+    val reached = bodyTys.filterNot(_ == Type.Never)
+
     // Two arms that each yield a value cannot yield *different* value types — there is nothing to
     // unify them to. Diagnosed like an `if` with mismatched branches rather than collapsed to a
     // silent `unit`, which would hide the mistake. A value/unit mix is the "not every arm yields"
     // case and stays `unit`, exactly as an `if` with no `else` does.
-    val valueTys = bodyTys.filterNot(_ == Type.Unit)
+    val valueTys = reached.filterNot(_ == Type.Unit)
     if valueTys.size > 1 then
       err(s"match arms have different types: ${valueTys.map(show).mkString(" and ")}")
-    val valueTy = if bodyTys.size == 1 && bodyTys.head != Type.Unit then bodyTys.head else Type.Unit
+    val valueTy =
+      if reached.isEmpty then Type.Never
+      else if reached.size == 1 && reached.head != Type.Unit then reached.head
+      else Type.Unit
 
     val hasCatchAll = arms.exists(a => a.guard.isEmpty && a.patterns.exists(irrefutable))
 

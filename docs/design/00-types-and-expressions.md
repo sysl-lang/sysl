@@ -341,7 +341,8 @@ fee(t: Tier) -> int = match t
 In statement position the value is simply unused, so the same forms read as ordinary control
 flow. A branch or arm yields its block's **trailing expression**; a branch that only performs
 effects yields `unit`. An `if` used for a value needs an `else` (a missing one leaves the
-open branch at `unit`); a `match` used for a value must be exhaustive.
+open branch at `unit`); a `match` used for a value must be exhaustive. A branch that does not
+finish at all is the one alternative that constrains nothing — see `never` (§11).
 
 **Loops carry a value out through `break`.** `break expr` leaves the nearest loop and makes
 `expr` the loop's value; `continue` skips to the next iteration. An optional **`else` block**
@@ -399,6 +400,52 @@ references no null and errors a `Result`: the loop cannot silently fall through 
 value. Because the value flows through the branches (or a loop's `break`s and `else`), a `&T`
 context reaches each one on its own — a value branch and an already-`&T` branch meet at `&T`
 (see `03-memory-model.md`), with no aggregate coercion.
+
+## 11. `never` — the type of an expression that does not finish
+
+`never` is the **bottom type**: the type of an expression that transfers control away instead of
+producing a value. It is what a call to something declared not to return has, and it exists for
+one reason — so that a branch which aborts can sit beside one that yields:
+
+```
+unwrap(self) -> T = match self
+    Some(v) -> v
+    None ->
+        print("panic: unwrap of a None value")
+        exit(1)                                // this arm's type is never
+```
+
+**The whole of its behavior is one rule: a `never` stands where any type was asked for.** Control
+does not reach the place the value would have been used, so there is nothing to be wrong about.
+That makes the `match` above type `T` rather than a conflict between `T` and something else, and it
+is what lets a guard clause be an `if` with no `else`:
+
+```
+check(n: int) -> int
+    if n < 0 then exit(1)                      // the open branch yields never, not unit
+    n * 2
+```
+
+The rule runs in **one direction only**. A `never` may stand for a `T`; a `T` may never stand for a
+`never`. So a function declared `-> never` whose body could return is an error — the declaration is
+a promise the body has to keep — while `f(exit(1))` and `return exit(1)` are accepted as the dead
+code they are.
+
+**There are no values of `never`, so it cannot be a value's type.** It may be written in exactly
+one position: a **result type** — a function's, a member's, or an `extern`'s. `var x: never`, a
+field of type `never`, an element type, `Option[never]`, a parameter — all are errors, and so is
+binding a diverging expression to a name (`var x = exit(1)`), printing one, or putting one in an
+array. Each of those needs a value to *arrive*, and none ever does.
+
+This is Rust's `!` under a name that reads as prose, and it is deliberately **not** the analyzer's
+internal "type I could not work out": that one exists to suppress the noise after a mistake and
+never survives a clean compile, while `never` is a real type a correct program declares and reasons
+about.
+
+**Divergence is not the same as a trap.** A trap (`11 §6`) is the *runtime* response to a broken
+invariant, emitted by the compiler around a check it inserted. `never` is the *static* fact that
+control does not come back, and the two meet only in that the usual way to reach one is to call
+something that traps or exits.
 
 ## Open at the basics level (not yet decided)
 

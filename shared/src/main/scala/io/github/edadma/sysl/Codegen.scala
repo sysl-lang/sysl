@@ -29,6 +29,17 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       out ++= "declare ptr @malloc(i64)\n"
       out ++= "declare void @free(ptr)\n"
     if usesSnprintf then out ++= "declare i32 @snprintf(ptr, i64, ptr, ...)\n"
+
+    // An `extern` the program calls is declared here, unless the runtime already declared it under
+    // that name — a module may not declare one symbol twice, and the runtime's own spelling of
+    // `malloc` is the one its code is calling.
+    val declared = Set("printf", "llvm.trap") ++
+      (if heap then Set("malloc", "free") else Set.empty) ++
+      (if usesSnprintf then Set("snprintf") else Set.empty)
+
+    for e <- program.externs if !declared(e.name) do
+      out ++= s"declare ${e.retTy.llvm} @${e.name}(${e.params.map(_.llvm).mkString(", ")})\n"
+
     for d <- satDecls do out ++= d + "\n"
     out ++= "\n"
 
@@ -93,15 +104,17 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
 
     f.body.stmts.foreach(genStmt)
 
+    // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
+    // already terminated the block and the `ret` emitted here is dropped.
     f.body.result match
-      case Some(r) if f.retTy != Type.Unit =>
+      case Some(r) if !Type.noValue(f.retTy) =>
         val v = genExpr(r)
         retainValue(f.retTy, v)
         releaseAll()
         emitTerm(s"ret ${f.retTy.llvm} $v")
       case Some(r) =>
         genExpr(r); releaseAll(); emitTerm("ret void")
-      case None if f.retTy == Type.Unit =>
+      case None if Type.noValue(f.retTy) =>
         releaseAll(); emitTerm("ret void")
       case None =>
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
@@ -125,6 +138,9 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     // Nothing is lowered from a program that has an error, and a type the analyzer could not work
     // out is only ever produced by one, so reaching here would mean codegen ran on a broken tree.
     case Type.Unknown     => sys.error("unreachable zero of an unknown type")
+    // `never` has no values, so nothing ever starts at one: every path that would need this
+    // diverges before reaching it.
+    case Type.Never       => sys.error("unreachable zero of 'never'")
 
   // --- statements ----------------------------------------------------------------------
 
@@ -337,10 +353,15 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     case TPrint(args) =>
       genPrint(args); ""
 
+    // A call to something declared `-> never` does not come back, so the block ends at it: what
+    // follows in the same block is unreachable and `emit` drops it, which is exactly why a
+    // diverging arm needs no special handling anywhere else.
     case TCall(name, args, ty) =>
       val argVals = args.map(a => s"${a.ty.llvm} ${genExpr(a)}")
-      if ty == Type.Unit then
-        emit(s"call void @$name(${argVals.mkString(", ")})"); ""
+      if Type.noValue(ty) then
+        emit(s"call void @$name(${argVals.mkString(", ")})")
+        if ty == Type.Never then emitTerm("unreachable")
+        ""
       else
         val r = freshTemp(); emit(s"$r = call ${ty.llvm} @$name(${argVals.mkString(", ")})")
         ownTemp(r, ty)
@@ -629,7 +650,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     val endL   = freshLabel("if.end")
     val target = if elseBlock.isDefined then elseL else endL
 
-    if ty == Type.Unit then
+    if Type.noValue(ty) then
       emitTerm(s"br i1 $c, label %$thenL, label %$target")
       emitLabel(thenL)
       genBlockVoid(thenBlock)
@@ -645,10 +666,10 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       val slot = emitAlloca(freshTemp(), ty.llvm)
       emitTerm(s"br i1 $c, label %$thenL, label %$elseL")
       emitLabel(thenL)
-      emit(s"store ${ty.llvm} ${genBlockValue(thenBlock)}, ptr $slot")
+      storeBlockValue(thenBlock, ty, slot)
       emitTerm(s"br label %$endL")
       emitLabel(elseL)
-      emit(s"store ${ty.llvm} ${genBlockValue(elseBlock.get)}, ptr $slot")
+      storeBlockValue(elseBlock.get, ty, slot)
       emitTerm(s"br label %$endL")
       emitLabel(endL)
       // Each branch handed its value over with a count taken, so what the merge loads is the
@@ -656,11 +677,19 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty)
   }
 
+  /** Feeds one branch's value into the merge slot. A branch that does not finish — one that aborts
+   * or returns — has no value to feed and terminates its own block, so it is run for its effect
+   * and nothing is stored: the merge is reached only from the branches that do arrive.
+   */
+  private def storeBlockValue(b: TBlock, ty: Type, slot: String): Unit =
+    if b.ty == Type.Never then genBlockVoid(b)
+    else emit(s"store ${ty.llvm} ${genBlockValue(b)}, ptr $slot")
+
   private def genMatch(scrutinee: TExpr, arms: List[TArm], ty: Type): String = {
     val sv   = genExpr(scrutinee)
     val sty  = scrutinee.ty
     val endL = freshLabel("match.end")
-    val slot = if ty == Type.Unit then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
 
     for arm <- arms do
       val bodyL = freshLabel("match.arm")
@@ -697,8 +726,8 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
           emitTerm(s"br label %$nextL")
           emitLabel(bodyL)
 
-      if ty == Type.Unit then genBlockVoid(arm.body)
-      else emit(s"store ${ty.llvm} ${genBlockValue(arm.body)}, ptr $slot")
+      if Type.noValue(ty) then genBlockVoid(arm.body)
+      else storeBlockValue(arm.body, ty, slot)
       popOwned()
       emitTerm(s"br label %$endL")
       emitLabel(nextL)
@@ -706,9 +735,9 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     // Fallthrough with no matching arm: a value or enum match is exhaustive (the analyzer
     // required full coverage or a catch-all), so this point is unreachable; a plain scalar
     // statement match simply proceeds.
-    if ty == Type.Unit then emitTerm(s"br label %$endL") else emitTerm("unreachable")
+    if Type.noValue(ty) then emitTerm(s"br label %$endL") else emitTerm("unreachable")
     emitLabel(endL)
-    if ty == Type.Unit then ""
+    if Type.noValue(ty) then ""
     else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
   }
 
@@ -808,7 +837,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     val bodyL = freshLabel("while.body")
     val endL  = freshLabel("while.end")
     val elseL = if elseBlock.isDefined then freshLabel("while.else") else endL
-    val slot  = if ty == Type.Unit then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
     genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
 
     emitTerm(s"br label %$condL")
@@ -839,7 +868,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     val stepL = freshLabel("for.step")
     val endL  = freshLabel("for.end")
     val elseL = if elseBlock.isDefined then freshLabel("for.else") else endL
-    val slot  = if ty == Type.Unit then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
     emitAlloca(s"%$name.addr", w)
     emit(s"store $w $loV, ptr %$name.addr")
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
@@ -884,7 +913,7 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
     val stepL = freshLabel("each.step")
     val endL  = freshLabel("each.end")
     val elseL = if elseBlock.isDefined then freshLabel("each.else") else endL
-    val slot  = if ty == Type.Unit then "" else emitAlloca(freshTemp(), ty.llvm)
+    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
     emit(s"store i64 0, ptr $idx")
     genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
 
@@ -921,12 +950,12 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
                             elseBlock: Option[TBlock]): String = {
     elseBlock.foreach { eb =>
       emitLabel(elseL)
-      if ty == Type.Unit then genBlockVoid(eb)
-      else emit(s"store ${ty.llvm} ${genBlockValue(eb)}, ptr $slot")
+      if Type.noValue(ty) then genBlockVoid(eb)
+      else storeBlockValue(eb, ty, slot)
       emitTerm(s"br label %$endL")
     }
     emitLabel(endL)
-    if ty == Type.Unit then ""
+    if Type.noValue(ty) then ""
     else { val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot"); ownTemp(r, ty) }
   }
 

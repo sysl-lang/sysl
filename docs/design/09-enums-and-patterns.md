@@ -277,6 +277,11 @@ reads inside a `|` or a nested pattern.
 - **A match used for a value takes the common type of its arms.** When every arm's body yields
   the same non-unit type, that is the match's type; a match whose arms are only run for effect
   is `unit`.
+- **An arm that does not finish constrains nothing.** An arm that aborts or returns has type
+  `never` (`00 §11`), so it is set aside before the others are compared and the match takes their
+  type — which is what makes `None -> exit(1)` beside `Some(v) -> v` an `Option[T]`'s `T` rather
+  than a conflict. Exhaustiveness is unaffected: a diverging arm still has to be *reachable* by a
+  pattern that covers something.
 - **A `&T` context reaches each arm, not the whole match.** Under a `&Point` expectation, an arm
   that yields a bound `&Point` payload and an arm that builds a fresh value `Point` meet at
   `&Point` — the value arm is boxed on its own, the reference arm passes through untouched — the

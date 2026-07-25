@@ -74,10 +74,11 @@ views a stack-backed argument is itself stack-backed and inherits its restrictio
 fixpoint, so a self- or mutually-recursive function converges on the truth rather than on the
 conservative answer.
 
-**A function whose body is not available** (an `extern`, an FFI declaration) gets the
-pessimistic assumption: every parameter is kept, and the result views everything. A
-stack-backed slice therefore cannot be passed to one, which is correct — the foreign side may
-retain it, and nothing here can tell.
+**A function whose body is not available** — an `extern` (`12 §1`), which is the declaration form
+for exactly that — gets the pessimistic assumption: every parameter is kept, and the result views
+everything. A stack-backed slice therefore cannot be passed to one, which is correct: the foreign
+side may retain it, and nothing here can tell. This needs no separate machinery, because "not in
+this module's function table" is already the conservative case.
 
 ## What happens when a slice escapes
 

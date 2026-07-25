@@ -23,6 +23,20 @@ trait TypeResolution extends AnalyzerBase {
   protected def resolveType(t: TypeRef, subst: Map[String, Type]): Type =
     at(t.pos)(resolveTypeAt(t, subst))
 
+  /** The name of the bottom type. It is a predeclared identifier rather than a reserved word, like
+   * every other type name, and it is deliberately *not* one of the scalars: there is no value of
+   * it, so it is not something a variable, a field, or a type argument can be.
+   */
+  protected val neverName = "never"
+
+  /** Resolves a **result** type, which is the one position `never` may appear in — a function's,
+   * a member's, or an `extern`'s declared result, saying that it does not return. Everywhere else
+   * a type is resolved through `resolveType`, which rejects it.
+   */
+  protected def resolveReturn(t: TypeRef, subst: Map[String, Type]): Type = t match
+    case NamedType(n, Nil) if n == neverName && !subst.contains(n) => Type.Never
+    case _                                                         => resolveType(t, subst)
+
   private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
     case PtrType(inner)       => Type.Ptr(underIndirection(resolveType(inner, subst)))
     case RefType(inner, sync) => Type.Ref(underIndirection(resolveType(inner, subst)), sync)
@@ -45,6 +59,8 @@ trait TypeResolution extends AnalyzerBase {
           case Some(s)                        => plain(n, targs, s)
           case None if structDecls.contains(n) => instantiateStruct(n, targs)
           case None if enumDecls.contains(n)   => instantiateEnum(n, targs)
+          case None if n == neverName =>
+            err("'never' is the type of an expression that does not finish, so it can only be a result type")
           case None                            => err(s"unknown type '$n'")
 
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of

@@ -48,6 +48,20 @@ object Type {
   case object Bool extends Type { def llvm = "i1"  }
   case object Unit extends Type { def llvm = "void" }
 
+  /** The type of an expression that does not finish — a call to something that never returns, and
+   * so the arm of a `match` or `if` that aborts rather than yielding a value.
+   *
+   * It is the *bottom* type: a `never` stands where any type was asked for, because control never
+   * reaches the place the value would have been used. That one rule is the whole of it, and it is
+   * what lets `None -> exit(1)` sit beside `Some(v) -> v` and the `match` still have type `T`.
+   *
+   * It is not `Unknown`. `Unknown` is what a *mistake* leaves behind and never survives a clean
+   * compile; `never` is a real type a program declares (`exit(code: int) -> never`) and reasons
+   * about. Nothing is ever *of* type `never` at run time — there is no value of it — so it lowers
+   * to `void` and takes no slot, no register, and no `phi`.
+   */
+  case object Never extends Type { def llvm = "void" }
+
   /** The type of something whose real type could not be worked out, because the thing that would
    * have decided it was already reported as an error.
    *
@@ -156,12 +170,19 @@ object Type {
     case Bool                     => "bool"
     case Str                      => "string"
     case Unit                     => "unit"
+    case Never                    => "never"
     case Unknown                  => "?"
     case Ptr(inner)               => s"*${show(inner)}"
     case Ref(inner, sync)         => s"&${if sync then "sync " else ""}${show(inner)}"
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem)              => s"[]${show(elem)}"
     case other                    => other.llvm
+
+  /** Whether a type carries no value at run time: `unit`, whose only value is nothing at all, and
+   * `never`, which has no values. Both lower to `void`, so neither ever needs a merge slot, a
+   * result register, or a `store` — which is the one thing codegen has to know about either.
+   */
+  def noValue(t: Type): Boolean = t == Unit || t == Never
 
   def isNumeric(t: Type): Boolean = t match
     case _: Integer | _: Floating => true

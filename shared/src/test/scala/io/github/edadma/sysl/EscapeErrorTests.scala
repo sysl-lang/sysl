@@ -189,6 +189,30 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  // `05` gives the rule for a callee whose body is not here: assume it keeps everything, because
+  // nothing can tell whether the foreign side held on to what it was handed. An `extern` is that
+  // case made explicit, and it needs no new machinery — a name with no body is already the
+  // pessimistic one.
+  "an extern is assumed to keep whatever it is handed" in {
+    err("""extern take(s: []u8)
+          |use()
+          |    var buf: [4]u8
+          |    take(buf[0..<2])
+          |end use
+          |use()
+          |""".stripMargin) should include("is passed to 'take', which holds on to it")
+  }
+
+  "a heap-backed view may still be handed to an extern" in {
+    ir("""extern take(s: []u8)
+         |use()
+         |    var buf: &[4]u8 = [1, 2, 3, 4]
+         |    take(buf[0..<2])
+         |end use
+         |use()
+         |""".stripMargin) should include("declare void @take({ ptr, ptr, i64 })")
+  }
+
   "a recursive function converges rather than assuming the worst" in {
     ir("""walk(s: []int, i: usize) -> int
          |    if i >= s.len then 0 else s[i] + walk(s, i + 1)

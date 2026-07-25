@@ -289,8 +289,8 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      structDecl | enumDecl | traitDecl | implDecl | funcDecl | varDecl | returnStmt | breakStmt | continueStmt |
-        exprStmt,
+      structDecl | enumDecl | traitDecl | implDecl | externDecl | funcDecl | varDecl | returnStmt | breakStmt |
+        continueStmt | exprStmt,
     )
 
   /** A type: a memory-mode sigil applied to a type, or a name optionally applied to type
@@ -364,6 +364,15 @@ class SyslParser(val source: Source) extends PackratParsers {
       (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
         case params ~ ret ~ body => FuncDecl(name, names, params, ret, body, bounds)
       }
+    }
+
+  /** `extern name(params) -> ret` — a header with no body at all, which is what tells it from a
+   * function declaration. The result is optional and absent means `unit`, exactly as for a
+   * function; `-> never` says the callee does not come back.
+   */
+  private lazy val externDecl: PackratParser[Stmt] =
+    op("extern") ~> ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+      case name ~ params ~ ret => ExternDecl(name, params, ret)
     }
 
   /** A function body is either an `= expr` short form (whose value is the return value) or an

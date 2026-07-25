@@ -35,6 +35,10 @@ trait CallAnalysis extends TypeResolution {
     if args.length != f.params.length then
       err(s"function '${f.name}' takes ${quantity(f.params.length, "argument")}, but ${supplied(args.length, "argument")}")
 
+    // An extern is declared in the output only if something reaches it, which is what keeps an
+    // unused one — the prelude's `exit`, in a program that never panics — out of the module.
+    if externDecls.contains(f.name) then externsUsed += f.name
+
     val (name, pre) =
       if f.tparams.isEmpty then (f.name, None)
       else

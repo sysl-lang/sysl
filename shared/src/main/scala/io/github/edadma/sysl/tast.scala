@@ -248,13 +248,20 @@ case class TContinue(depth: Int)                    extends TStmt
  */
 case class TFunc(name: String, params: List[(String, Type)], retTy: Type, body: TBlock)
 
-/** A whole program: hoisted struct, enum, and function declarations, plus the top-level
- * statements that make up `main`. Only data enums appear in `enums` — a simple enum lowers to
- * `i32` and needs no type declaration.
+/** A function the linker supplies, which the module declares rather than defines. Only the ones
+ * the program actually calls reach here, so an `extern` the prelude offers and nobody uses costs
+ * the output nothing.
+ */
+case class TExtern(name: String, params: List[Type], retTy: Type)
+
+/** A whole program: hoisted struct, enum, and function declarations, the externs it calls, plus
+ * the top-level statements that make up `main`. Only data enums appear in `enums` — a simple enum
+ * lowers to `i32` and needs no type declaration.
  */
 case class TProgram(
     structs: List[Type.Struct],
     enums: List[Type.Enum],
+    externs: List[TExtern],
     funcs: List[TFunc],
     main: List[TStmt],
 )

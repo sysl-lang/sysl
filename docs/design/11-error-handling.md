@@ -1,9 +1,10 @@
 # Design Decisions: Error Handling
 
 **Status:** ratifies the error model the implementation already carries — `Option`, `Result`,
-the postfix `?`, and the trapping runtime checks — and settles the two decisions it left
-implicit: **traps abort** (no unwinding, no `catch`), and **`?` requires an exact error-type
-match** for now, with type-converting `?` designed but deferred. The recoverable half rests on
+the postfix `?`, the prelude's combinators up to `unwrap`/`expect` (§8), and the trapping runtime
+checks — and settles the two decisions it left implicit: **traps abort** (no unwinding, no
+`catch`), and **`?` requires an exact error-type match** for now, with type-converting `?` designed
+but deferred. The recoverable half rests on
 `09-enums-and-patterns.md` (both types are generic enums) and `10-generics.md` (`?` unwraps a
 generic enum); the trapping half rests on `03-memory-model.md` (the safety checks that trap) and
 `capabilities.md` (what a trap does depends on the environment).
@@ -174,6 +175,45 @@ the same footing as C's `assert` compiled out by `NDEBUG`.
   (`char.try`, `Color.try`), validate before dividing — turning the bug back into a `Result` at
   the point where untrusted input enters.
 
+## 8. The prelude's combinators, and how `unwrap` stops the program
+
+The conveniences on `Option` and `Result` are **ordinary members in the prelude** (`09 §4`,
+`10 §Open c`), not compiler knowledge. The *total* ones ask a question or supply a fallback:
+
+- `Option`: `is_some()`, `is_none()`, `unwrap_or(default)`
+- `Result`: `is_ok()`, `is_err()`, `unwrap_or(default)`
+
+The *forcing* ones hand over the payload and stop the program when there is none:
+
+- `Option`: `unwrap()`, `expect(msg)` — on `None`
+- `Result`: `unwrap()`, `expect(msg)` — on `Err`
+
+**They are written in sysl, with no compiler support of their own**, and that is the point worth
+recording: it is what keeps "a bug is a trap" from meaning "the compiler must know the name of
+every way to trap". Two pieces make it possible. The diverging arm has a type — `never` (`00 §11`)
+— so `None -> exit(1)` sits beside `Some(v) -> v` and the `match` still has the payload's type. And
+the departure itself is an `extern` (`12 §1`): the prelude declares `exit(code: int) -> never`, so
+stopping is a call, not an intrinsic.
+
+```
+unwrap(self) -> T = match self
+    Some(v) -> v
+    None ->
+        print("panic: unwrap of a None value")
+        exit(1)
+```
+
+This is §6's split in action: **the decision to stop is the language's, the action on stopping is
+the environment's.** On a hosted target the action is what §6 specifies — print a diagnostic, exit
+non-zero — and it is reached through the C library's `exit`, which flushes what was printed on its
+way out (`abort` would not have to). A freestanding target supplies its own departure and the
+prelude's `exit` is simply never called. The compiler's *own* checks — a bounds test, a failed cast
+— still trap through `llvm.trap` and print nothing; reconciling those two so that every stop says
+why is `§ Open c`.
+
+Nothing here costs a program that does not use it: the enums are generic, so a member exists only
+where a call asks for one, and an `extern` nothing reaches is not declared in the output.
+
 ---
 
 ## Open (not yet decided)
@@ -181,19 +221,12 @@ the same footing as C's `assert` compiled out by `NDEBUG`.
 - **a. `From`-style error conversion in `?`.** Let `?` convert the callee's `E` to the caller's
   `E` through a conversion trait, so cross-error-type propagation needs no manual step (§4).
   Additive over the exact-match baseline; waits on the stdlib trait layer.
-- **b. Forcing combinators (`unwrap` / `expect`).** The *total* conveniences now ship: `Option`
-  carries `is_some`, `is_none`, and `unwrap_or(default)`, and `Result` carries `is_ok`, `is_err`,
-  and `unwrap_or(default)`, written as ordinary members in the prelude once members on a generic
-  type landed (`10 §Open c`). The two that **trap** on `None`/`Err` still wait, and on two things
-  rather than one: a way for prelude source to reach a trap at all (every trap today is emitted by
-  the compiler around a check it inserted), and a bottom type, so the diverging arm can sit beside
-  the value-yielding one and the `match` still have a type.
-- **c. `Result`/`Option` combinator library.** `map`, `and_then`, `or_else`, `ok_or`, and the
+- **b. `Result`/`Option` combinator library.** `map`, `and_then`, `or_else`, `ok_or`, and the
   rest are stdlib surface, designed when the standard library is (they are not language
-  features).
-- **d. The panic-handler interface.** The exact signature a kernel installs to receive a trap
+  features). The *forcing* ones are settled and shipped (§8); these are the transforming ones.
+- **c. The panic-handler interface.** The exact signature a kernel installs to receive a trap
   (message, source location, register state) and whether a hosted program can customize the
   abort message are `capabilities.md`/runtime concerns, not settled here.
-- **e. Error context / chaining.** Attaching context as an error propagates (an
+- **d. Error context / chaining.** Attaching context as an error propagates (an
   `anyhow`/`?`-with-context style), and whether the language or only the library offers it, is
   left open pending real multi-layer error code.

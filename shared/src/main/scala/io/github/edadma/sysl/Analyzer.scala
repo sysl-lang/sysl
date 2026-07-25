@@ -73,8 +73,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
     val mainStmts = program.body.filter {
-      case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl => false
-      case _                                                                      => true
+      case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl => false
+      case _                                                                                      => true
     }
 
     resetFunction()
@@ -87,7 +87,18 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val (mangled, decl, subst) = pending.dequeue()
       tfuncs ++= recoverOpt(analyzeFuncBody(mangled, decl, subst))
 
-    TProgram(structInsts.values.toList, enumInsts.values.filterNot(_.simple).toList, tfuncs.toList, tmain)
+    val externs = externsUsed.toList.map { name =>
+      val (params, rtype) = funcInsts(name)
+      TExtern(name, params.map(_._2), rtype)
+    }
+
+    TProgram(
+      structInsts.values.toList,
+      enumInsts.values.filterNot(_.simple).toList,
+      externs,
+      tfuncs.toList,
+      tmain,
+    )
   }
 
   /** Registers one type-shaped declaration: a struct, an enum, a trait, or an `impl`. */
@@ -121,6 +132,11 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * A parameter or result whose type does not resolve is recorded and taken as unknown rather
    * than sinking the whole declaration, so the function still exists with the right arity and a
    * call to it is not reported a second time as an undefined name.
+   *
+   * An `extern` is registered the same way, under a synthesized declaration with an empty body:
+   * everything downstream of the name — the arity check, argument checking, the emitted call — is
+   * then the ordinary path, and what makes it an extern is that codegen finds it in `externDecls`
+   * and declares it instead of looking for a body to define.
    */
   private def hoistFunc(stmt: Stmt): Unit = stmt match
     case f: FuncDecl =>
@@ -132,15 +148,24 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       if f.tparams.isEmpty then
         funcInsts(f.name) =
           (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
-           f.retType.map(t => recover(Type.Unknown)(resolveType(t, Map.empty))).getOrElse(Type.Unit))
+           f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
+
+    case e: ExternDecl =>
+      if funcDecls.contains(e.name) then err(s"function '${e.name}' is already declared")
+      funcDecls(e.name) = FuncDecl(e.name, Nil, e.params, e.retType, Nil).setPos(e.pos)
+      externDecls(e.name) = e
+      funcInsts(e.name) =
+        (e.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
+         e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
+
     case _ =>
 
   /** Structs, enums, and the built-in scalars share one type namespace, so a name may name at
-   * most one of them.
+   * most one of them. `never` is in it too: it names a type, so nothing else may.
    */
   private def typeNameTaken(name: String): Boolean =
     structDecls.contains(name) || enumDecls.contains(name) || traitDecls.contains(name) ||
-      scalarType(name).isDefined
+      scalarType(name).isDefined || name == neverName
 
   /** Records a type's members and lowers each to a function declaration under the mangled name
    * `Type.member`, whose signature is registered so calls resolve like ordinary ones.
@@ -205,7 +230,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         out += fd
         funcInsts(fd.name) =
           (fd.params.map(p => (p.name, resolveType(p.typ, Map.empty))),
-           fd.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit))
+           fd.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit))
   }
 
   /** Checks an `impl` conforms to its trait and lowers its methods to inherent members of the
@@ -260,8 +285,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       if want != got then
         err(s"parameter '${ip.name}' of method '${im.name}' is ${show(got)}, but trait '$traitName' declares ${show(want)}")
 
-    val want = tm.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit)
-    val got  = im.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit)
+    val want = tm.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
+    val got  = im.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
     if want != got then
       err(s"method '${im.name}' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")
   }
@@ -312,7 +337,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val subst = f.tparams.zip(targs).toMap
       funcInsts(name) =
         (f.params.map(p => (p.name, resolveType(p.typ, subst))),
-         f.retType.map(resolveType(_, subst)).getOrElse(Type.Unit))
+         f.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit))
       pending.enqueue((name, f, subst))
 
     name
@@ -380,16 +405,18 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         case -1 => err(s"no enclosing loop is labeled '$l")
         case i  => (loops(i), i)
 
-  /** The result type of a loop: every `break` value and the `else` value must agree on one type.
+  /** The result type of a loop: every `break` value and the `else` value must meet at one type.
    * With no `else`, normal completion yields `unit`, so a value-carrying `break` has nothing to
    * meet on that path — a clear error rather than a silent mismatch.
    */
   private def loopResultType(ctx: LoopCtx, elseBlock: Option[TBlock]): Type = {
     val elseTy = elseBlock.map(_.ty).getOrElse(Type.Unit)
     val tys    = (ctx.breakTys.toList :+ elseTy).distinct
-    if tys.size == 1 then tys.head
+    val joined = tys.foldLeft(Option(tys.head))((acc, t) => acc.flatMap(join(_, t)))
+
+    if joined.isDefined then joined.get
     else if elseBlock.isEmpty then
-      val v = ctx.breakTys.find(_ != Type.Unit).get
+      val v = ctx.breakTys.find(t => !Type.noValue(t)).get
       err(s"this loop breaks with a ${show(v)} but has no 'else' to give a value when it finishes normally — add an 'else'")
     else
       err(s"a loop's break values and its 'else' must have the same type, but got ${tys.map(show).mkString(" and ")}")
@@ -434,6 +461,10 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
       if ti.ty == Type.Unit then err(s"cannot bind '$name' to a unit value")
+      // A binding needs a value to hold, and an initializer that does not finish never produces
+      // one — the code after it is unreachable, so the declaration is a mistake rather than a
+      // clever way to spell divergence.
+      if ti.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
       val declTy = declared.getOrElse(ti.ty)
       if declared.isDefined && declTy != ti.ty then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
@@ -470,8 +501,8 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val (_, depth) = resolveLoop("continue", label)
       TContinue(depth)
 
-    case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl =>
-      err("functions, structs, enums, traits, and impls may only be declared at the top level")
+    case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl =>
+      err("functions, structs, enums, traits, impls, and externs may only be declared at the top level")
 
   // --- expressions ---------------------------------------------------------------------
 
@@ -622,7 +653,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
         val t = analyzeExpr(a)
         t.ty match
           case Type.Unit => err("cannot print a unit value")
-          case _: Type.Struct | _: Type.Enum | _: Type.Ptr | _: Type.Ref | _: Type.Array |
+          case Type.Never | _: Type.Struct | _: Type.Enum | _: Type.Ptr | _: Type.Ref | _: Type.Array |
               _: Type.Slice =>
             err(s"cannot print a ${show(t.ty)} value")
           case _ => t
@@ -728,7 +759,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val ts      = elems.map(analyzeExpr(_, elemExp))
 
       for t <- ts do
-        if t.ty == Type.Unit then err("an array cannot hold unit values")
+        if Type.noValue(t.ty) then err(s"an array cannot hold ${show(t.ty)} values")
         if t.ty != ts.head.ty then
           err(s"an array literal needs one element type, got ${show(ts.head.ty)} and ${show(t.ty)}")
 
@@ -772,11 +803,16 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       val tc    = analyzeBool(cond)
       val tThen = analyzeValueBlock(thenBody, expected)
       val tElse = elseOpt.map(analyzeValueBlock(_, expected))
+      // The branches meet at one type, and a branch that does not finish takes the other's. A
+      // branch used only for its effect is a different thing: one `unit` branch makes the whole
+      // `if` a statement, whose value is nobody's, exactly as a missing `else` does.
       val ty = tElse match
-        case Some(eb) if eb.ty == tThen.ty                                                => tThen.ty
-        case Some(eb) if eb.ty != Type.Unit && tThen.ty != Type.Unit && eb.ty != tThen.ty =>
-          err(s"if branches have different types: ${show(tThen.ty)} and ${show(eb.ty)}")
-        case _ => Type.Unit
+        case Some(eb) =>
+          join(tThen.ty, eb.ty).getOrElse {
+            if eb.ty == Type.Unit || tThen.ty == Type.Unit then Type.Unit
+            else err(s"if branches have different types: ${show(tThen.ty)} and ${show(eb.ty)}")
+          }
+        case None => Type.Unit
       TIf(tc, tThen, tElse, ty)
 
     case MatchExpr(scrut, arms) =>

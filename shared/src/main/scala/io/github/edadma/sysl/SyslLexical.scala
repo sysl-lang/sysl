@@ -99,6 +99,7 @@ class SyslLexical
     "enum",
     "trait",
     "impl",
+    "extern",
     "return",
     "self",
     "weak",
