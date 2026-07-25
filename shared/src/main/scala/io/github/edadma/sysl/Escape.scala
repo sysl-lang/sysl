@@ -17,7 +17,10 @@ import scala.collection.mutable
  */
 object Escape {
 
-  /** Checks a whole program, returning the first escape it finds. */
+  /** Checks a whole program, returning every escape it finds as one rendered report — one per
+   * function body, since the first escape out of a frame is the one to fix and the rest of that
+   * body is usually the same mistake seen again.
+   */
   def check(program: TProgram): Option[String] = new Escape(program).run()
 }
 
@@ -52,13 +55,14 @@ private class Escape(program: TProgram) {
     val bodies: List[(List[TStmt], Option[TExpr])] =
       program.funcs.map(f => (f.body.stmts, f.body.result)) :+ (program.main, None)
 
-    bodies.iterator
-      .map { (stmts, result) =>
+    val escapes =
+      bodies.flatMap { (stmts, result) =>
         val walk = new Walk(Set.empty, returningEscapes = true)
         walk.seed(stmts, result)
         walk.escape
       }
-      .collectFirst { case Some(msg) => msg }
+
+    if escapes.isEmpty then None else Some(escapes.mkString("\n\n"))
   }
 
   /** Whether a value of this type could carry a view of somebody's elements. */

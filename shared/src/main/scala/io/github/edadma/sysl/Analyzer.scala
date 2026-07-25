@@ -28,73 +28,48 @@ import scala.collection.mutable
  */
 class Analyzer private (program: Program) extends CallAnalysis with PatternAnalysis with Literals {
 
+  /** Every error the walk found, rendered and in source order. */
+  def errors: List[String] = diagnostics
+
   // --- program -------------------------------------------------------------------------
 
   private def analyze(): TProgram = {
     val body = Prelude.decls ::: program.body
 
+    // Each declaration, each function body, and each statement is a **recovery region**: a
+    // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
+    // That is what turns one error per compilation into one error per mistake.
+    //
     // Hoisting runs at the top level, where there is no enclosing position to return to, so each
     // pass simply moves the cursor to the declaration it is registering.
     for stmt <- body do
       currentPos = stmt.pos
-      stmt match
-        case s: StructDecl =>
-          if typeNameTaken(s.name) then err(s"type '${s.name}' is already declared")
-          structDecls(s.name) = s
-        case e: EnumDecl =>
-          if typeNameTaken(e.name) then err(s"type '${e.name}' is already declared")
-          // A generic enum has no single storage type to pin, and it is never instantiated
-          // eagerly, so the annotation is rejected here at the declaration rather than on use.
-          if e.underlying.isDefined && e.tparams.nonEmpty then
-            err(s"a generic enum cannot pin an underlying type — '${e.name}' takes type parameters")
-          enumDecls(e.name) = e
-          for v <- e.variants do
-            if variantOwner.contains(v.name) then
-              err(s"variant name '${v.name}' is already used by enum '${variantOwner(v.name)}'")
-            variantOwner(v.name) = e.name
-        case t: TraitDecl =>
-          if typeNameTaken(t.name) then err(s"the name '${t.name}' is already declared")
-          if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
-          traitDecls(t.name) = t
-        case i: ImplDecl =>
-          if traitImpls.contains((i.traitName, i.forType)) then
-            err(s"'${i.forType}' already implements '${i.traitName}'")
-          traitImpls((i.traitName, i.forType)) = i
-        case _ =>
+      recover(())(hoistType(stmt))
 
     // A non-generic type is instantiated eagerly, so it is emitted whether or not it is used;
     // a generic one only exists once something asks for a concrete instantiation.
-    for (n, d) <- enumDecls if d.tparams.isEmpty do instantiateEnum(n, Nil)
-    for (n, d) <- structDecls if d.tparams.isEmpty do instantiateStruct(n, Nil)
+    for (n, d) <- enumDecls if d.tparams.isEmpty do recover(())(instantiateEnum(n, Nil))
+    for (n, d) <- structDecls if d.tparams.isEmpty do recover(())(instantiateStruct(n, Nil))
 
     for stmt <- body do
       currentPos = stmt.pos
-      stmt match
-        case f: FuncDecl =>
-          if funcDecls.contains(f.name) then err(s"function '${f.name}' is already declared")
-          for (tp, traits) <- f.bounds; tr <- traits do
-            if !traitDecls.contains(tr) then
-              err(s"the bound on '$tp' in '${f.name}' names '$tr', which is not a trait")
-          funcDecls(f.name) = f
-          if f.tparams.isEmpty then
-            funcInsts(f.name) =
-              (f.params.map(p => (p.name, resolveType(p.typ, Map.empty))),
-               f.retType.map(resolveType(_, Map.empty)).getOrElse(Type.Unit))
-        case _ =>
+      recover(())(hoistFunc(stmt))
 
     // A type's members lower to ordinary functions under mangled names, registered here so a
     // method call and an associated-function call resolve exactly as a free call does.
     val members = mutable.ListBuffer.empty[FuncDecl]
-    for (tname, sdecl) <- structDecls do at(sdecl.pos)(hoistMembers(tname, sdecl, members))
-    for impl <- traitImpls.values do at(impl.pos)(hoistImpl(impl, members))
+    for (tname, sdecl) <- structDecls do at(sdecl.pos)(recover(())(hoistMembers(tname, sdecl, members)))
+    for impl <- traitImpls.values do at(impl.pos)(recover(())(hoistImpl(impl, members)))
 
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 
+    // A function whose body did not analyze is left out of the program rather than stood in for:
+    // there is nothing to emit, and nothing will be emitted at all while an error stands.
     for f <- body.collect { case f: FuncDecl if f.tparams.isEmpty => f } do
-      tfuncs += analyzeFuncBody(f.name, f, Map.empty)
+      tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
     for f <- members do
-      tfuncs += analyzeFuncBody(f.name, f, Map.empty)
+      tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
     val mainStmts = program.body.filter {
       case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl => false
@@ -104,15 +79,60 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     resetFunction()
     tsubst = Map.empty
     retTy = Type.Int
-    val tmain = mainStmts.map(analyzeStmt(_))
+    val tmain = mainStmts.map(recoverStmt)
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint.
     while pending.nonEmpty do
       val (mangled, decl, subst) = pending.dequeue()
-      tfuncs += analyzeFuncBody(mangled, decl, subst)
+      tfuncs ++= recoverOpt(analyzeFuncBody(mangled, decl, subst))
 
     TProgram(structInsts.values.toList, enumInsts.values.filterNot(_.simple).toList, tfuncs.toList, tmain)
   }
+
+  /** Registers one type-shaped declaration: a struct, an enum, a trait, or an `impl`. */
+  private def hoistType(stmt: Stmt): Unit = stmt match
+    case s: StructDecl =>
+      if typeNameTaken(s.name) then err(s"type '${s.name}' is already declared")
+      structDecls(s.name) = s
+    case e: EnumDecl =>
+      if typeNameTaken(e.name) then err(s"type '${e.name}' is already declared")
+      // A generic enum has no single storage type to pin, and it is never instantiated
+      // eagerly, so the annotation is rejected here at the declaration rather than on use.
+      if e.underlying.isDefined && e.tparams.nonEmpty then
+        err(s"a generic enum cannot pin an underlying type — '${e.name}' takes type parameters")
+      enumDecls(e.name) = e
+      for v <- e.variants do
+        if variantOwner.contains(v.name) then
+          err(s"variant name '${v.name}' is already used by enum '${variantOwner(v.name)}'")
+        variantOwner(v.name) = e.name
+    case t: TraitDecl =>
+      if typeNameTaken(t.name) then err(s"the name '${t.name}' is already declared")
+      if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
+      traitDecls(t.name) = t
+    case i: ImplDecl =>
+      if traitImpls.contains((i.traitName, i.forType)) then
+        err(s"'${i.forType}' already implements '${i.traitName}'")
+      traitImpls((i.traitName, i.forType)) = i
+    case _ =>
+
+  /** Registers one function's name and signature.
+   *
+   * A parameter or result whose type does not resolve is recorded and taken as unknown rather
+   * than sinking the whole declaration, so the function still exists with the right arity and a
+   * call to it is not reported a second time as an undefined name.
+   */
+  private def hoistFunc(stmt: Stmt): Unit = stmt match
+    case f: FuncDecl =>
+      if funcDecls.contains(f.name) then err(s"function '${f.name}' is already declared")
+      for (tp, traits) <- f.bounds; tr <- traits do
+        if !traitDecls.contains(tr) then
+          err(s"the bound on '$tp' in '${f.name}' names '$tr', which is not a trait")
+      funcDecls(f.name) = f
+      if f.tparams.isEmpty then
+        funcInsts(f.name) =
+          (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
+           f.retType.map(t => recover(Type.Unknown)(resolveType(t, Map.empty))).getOrElse(Type.Unit))
+    case _ =>
 
   /** Structs, enums, and the built-in scalars share one type namespace, so a name may name at
    * most one of them.
@@ -258,7 +278,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
     val tbody   = analyzeValueBlock(f.body, if rtype == Type.Unit then None else Some(rtype))
 
-    if rtype != Type.Unit && tbody.result.isDefined && tbody.ty != rtype then
+    if rtype != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, rtype) then
       err(s"function '${f.name}' should return ${show(rtype)}, but its body yields ${show(tbody.ty)}")
 
     TFunc(name, tparams, rtype, tbody)
@@ -299,16 +319,16 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
   protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock =
     stmts.reverse match
       case ExprStmt(e) :: initRev =>
-        val init = initRev.reverse.map(analyzeStmt(_))
+        val init = initRev.reverse.map(recoverStmt)
         val tr   = analyzeExpr(e, expected)
         TBlock(init, Some(tr), tr.ty)
       case _ =>
-        TBlock(stmts.map(analyzeStmt(_)), None, Type.Unit)
+        TBlock(stmts.map(recoverStmt), None, Type.Unit)
 
   /** A statement sequence used only for its effects (a loop body): a fresh scope, no value. */
   private def analyzeStmts(stmts: List[Stmt]): List[TStmt] = {
     pushScope()
-    val r = stmts.map(analyzeStmt(_))
+    val r = stmts.map(recoverStmt)
     popScope()
     r
   }
@@ -358,6 +378,38 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
       err(s"a loop's break values and its 'else' must have the same type, but got ${tys.map(show).mkString(" and ")}")
   }
 
+  /** Analyzes one statement as its own recovery region, so a mistake costs the statement it is
+   * in and nothing after it.
+   *
+   * The statement it stands in for is a no-op: nothing is emitted from a program that has an
+   * error, so the substitute only has to be well-formed enough for the walk to continue.
+   */
+  private def recoverStmt(stmt: Stmt): TStmt = {
+    // A statement abandoned part-way may have opened a scope or entered a loop that it never got
+    // to close, so both are wound back to where the statement started. Without this an inner
+    // block's bindings would stay visible after it, and the analyzer would be *more* permissive
+    // after an error than before one.
+    val depth = scopes.length
+    val outer = loops
+
+    recover {
+      while scopes.length > depth do popScope()
+      loops = outer
+      bindFailed(stmt)
+      TExprStmt(TUnitLit())
+    }(analyzeStmt(stmt))
+  }
+
+  /** Keeps what the rest of the block will need from a statement that failed.
+   *
+   * A `var` binds its name even when its initializer did not analyze — at `Type.Unknown`, which
+   * poisons rather than reports — because otherwise one bad initializer turns every later use of
+   * the name into an "undefined name" of its own, and the real mistake is lost among them.
+   */
+  private def bindFailed(stmt: Stmt): Unit = stmt match
+    case VarDecl(name, _, _) => declare(name, Type.Unknown)
+    case _                   =>
+
   private def analyzeStmt(stmt: Stmt): TStmt = at(stmt.pos)(analyzeStmtAt(stmt))
 
   private def analyzeStmtAt(stmt: Stmt): TStmt = stmt match
@@ -381,10 +433,10 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case Return(opt) =>
       val tv = opt.map(analyzeExpr(_, Some(retTy)))
       tv match
-        case Some(_) if retTy == Type.Unit => err("cannot return a value from a function with no return type")
-        case Some(t) if t.ty != retTy      => err(s"return type mismatch: expected ${show(retTy)}, got ${show(t.ty)}")
-        case None if retTy != Type.Unit    => err(s"this function must return a ${show(retTy)} value")
-        case _                             =>
+        case Some(_) if retTy == Type.Unit    => err("cannot return a value from a function with no return type")
+        case Some(t) if disagree(t.ty, retTy) => err(s"return type mismatch: expected ${show(retTy)}, got ${show(t.ty)}")
+        case None if retTy != Type.Unit       => err(s"this function must return a ${show(retTy)} value")
+        case _                                =>
       TReturn(tv)
 
     // `break value` records its type against the loop it targets — the nearest, or the one a
@@ -421,8 +473,17 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
    * writing the ordinary construction is the whole spelling of an allocation. An expression
    * that is already a `&T` passes through untouched.
    */
-  protected def analyzeExpr(expr: Expr, expected: Option[Type]): TExpr =
-    at(expr.pos)(analyzeExpected(expr, expected)).setPos(expr.pos)
+  protected def analyzeExpr(expr: Expr, expected: Option[Type]): TExpr = {
+    val t = at(expr.pos)(analyzeExpected(expr, expected)).setPos(expr.pos)
+
+    // A value whose type could not be worked out — a name whose declaration failed, a field of a
+    // type that did not resolve, a call to a function with an unusable signature — abandons this
+    // statement quietly. The mistake was reported where it was made, and every consequence of it
+    // reported as well would bury the one diagnostic worth reading.
+    if t.ty == Type.Unknown then poisoned()
+
+    t
+  }
 
   private def analyzeExpected(expr: Expr, expected: Option[Type]): TExpr = expected match
     case Some(r: Type.Ref) =>
@@ -468,7 +529,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
 
     case Ident(name) =>
       lookupOpt(name) match
-        case Some((u, ty)) => TLoad(u, ty)
+        case Some((u, ty))                       => TLoad(u, ty)
         case None if variantOwner.contains(name) => constructVariant(name, Nil, expected)
         case None                                => err(s"undefined name '$name'")
 
@@ -724,7 +785,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
             case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
           pushScope()
           val u            = declare(name, vty)
-          val (tb, ctx)    = analyzeLoopBody(expected, label)(body.map(analyzeStmt(_)))
+          val (tb, ctx)    = analyzeLoopBody(expected, label)(body.map(recoverStmt))
           popScope()
           val telse        = elseOpt.map(analyzeValueBlock(_, expected))
           TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
@@ -742,7 +803,7 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
               err(s"'for' iterates an integer range, an array, or a slice, not ${show(other)}")
           pushScope()
           val u         = declare(name, elem)
-          val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(analyzeStmt(_)))
+          val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
           popScope()
           val telse     = elseOpt.map(analyzeValueBlock(_, expected))
           TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
@@ -825,8 +886,36 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
 
 object Analyzer {
 
-  /** Analyzes a program to a typed tree, or returns the first error as a rendered diagnostic. */
-  def analyze(program: Program): Either[String, TProgram] =
-    try Right(new Analyzer(program).analyze())
-    catch case AnalyzerError(msg, pos) => Left(Diagnostic.render(msg, pos))
+  /** Analyzes a program to a typed tree, or returns every error it found, rendered and in source
+   * order.
+   *
+   * The walk itself never stops at the first mistake — each declaration, function body, and
+   * statement is a recovery region — so what comes back on the left is the whole list. An error
+   * escaping the regions entirely is still caught here, since a diagnostic that reaches the user
+   * beats a stack trace.
+   */
+  def analyze(program: Program): Either[String, TProgram] = {
+    val analyzer = new Analyzer(program)
+
+    val outcome =
+      try Right(analyzer.analyze())
+      catch
+        case AnalyzerError(msg, pos) => Left(List(Diagnostic.render(msg, pos)))
+        // A poisoned region carries no message of its own: it means an error was already
+        // recorded, and those are what the caller is told about.
+        case Poisoned() => Left(Nil)
+
+    val found = analyzer.errors
+
+    outcome match
+      case Right(tree) if found.isEmpty => Right(tree)
+      case Right(_)                     => Left(found.mkString("\n\n"))
+      case Left(escaped) =>
+        val all = found ::: escaped
+
+        // Reaching here with nothing to say would mean the analyzer gave up without recording
+        // why, which is a bug in the analyzer rather than in the program it was handed.
+        if all.isEmpty then Left(Diagnostic.render("the analyzer stopped without reporting why", None))
+        else Left(all.mkString("\n\n"))
+  }
 }

@@ -48,6 +48,17 @@ object Type {
   case object Bool extends Type { def llvm = "i1"  }
   case object Unit extends Type { def llvm = "void" }
 
+  /** The type of something whose real type could not be worked out, because the thing that would
+   * have decided it was already reported as an error.
+   *
+   * It exists only so the analyzer can keep going after a mistake: a `var` whose initializer
+   * failed still binds its name, at this type, so the rest of the function reads as the
+   * programmer wrote it instead of dissolving into "undefined name". Nothing of this type ever
+   * reaches codegen — a program with an error is never lowered — and touching a value of it
+   * raises `Poisoned`, which abandons the statement without reporting a second time.
+   */
+  case object Unknown extends Type { def llvm = "void" }
+
   /** `*T` — a bare machine address: no length, no refcount, no checks, and a lifetime the
    * programmer keeps track of. The one unsafe primitive, and the reason it is spelled with a
    * sigil is so a reader can find every place a program takes on C's risks.
@@ -145,6 +156,7 @@ object Type {
     case Bool                     => "bool"
     case Str                      => "string"
     case Unit                     => "unit"
+    case Unknown                  => "?"
     case Ptr(inner)               => s"*${show(inner)}"
     case Ref(inner, sync)         => s"&${if sync then "sync " else ""}${show(inner)}"
     case Array(n, elem)           => s"[$n]${show(elem)}"

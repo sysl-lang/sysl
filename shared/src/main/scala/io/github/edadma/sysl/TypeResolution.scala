@@ -117,9 +117,20 @@ trait TypeResolution extends AnalyzerBase {
         inProgress(key) = s
         resolving(key) = indirection
         val subst = decl.tparams.zip(targs).toMap
-        s.fields = decl.fields.map(f => (f.name, resolveType(f.typ, subst)))
-        resolving -= key
-        inProgress -= key
+
+        // A field whose type does not resolve is recorded and taken as unknown, so the struct
+        // still has the shape the programmer wrote: the right fields, in the right order, with
+        // the right count. Abandoning the instantiation instead would leave every later mention
+        // of the type reporting something about a struct that never finished being built.
+        //
+        // The `finally` is what keeps the resolver's own bookkeeping honest whatever happens
+        // here: an entry left in `inProgress` would make the next mention of this type look
+        // like a cycle, which is a diagnostic about nothing at all.
+        try s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveType(f.typ, subst))))
+        finally
+          resolving -= key
+          inProgress -= key
+
         structInsts(key) = s
         s
   }
@@ -160,7 +171,7 @@ trait TypeResolution extends AnalyzerBase {
         val subst    = decl.tparams.zip(targs).toMap
         var nextTag  = 0
         var nextSlot = 1
-        en.variants = decl.variants.map { v =>
+        try en.variants = decl.variants.map { v =>
           if en.simple then
             def fitting(n: BigInt): Int =
               if !Type.fits(n, en.underlying) then
@@ -179,13 +190,14 @@ trait TypeResolution extends AnalyzerBase {
             if v.value.isDefined then
               err(s"variant '${v.name}' carries data, so it cannot also have an explicit value")
             val tag    = nextTag; nextTag += 1
-            val fields = v.fields.map(f => (f.name, resolveType(f.typ, subst)))
+            val fields = v.fields.map(f => (f.name, recover(Type.Unknown)(resolveType(f.typ, subst))))
             val slot   = if fields.nonEmpty then { val s = nextSlot; nextSlot += 1; Some(s) } else None
             Type.EnumVariant(v.name, tag, fields, slot)
         }
+        finally
+          resolving -= key
+          inProgress -= key
 
-        resolving -= key
-        inProgress -= key
         enumInsts(key) = en
         en
   }

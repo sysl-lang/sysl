@@ -5,8 +5,20 @@ import scala.collection.mutable
 /** An error raised by the analyzer: an unknown name, a type mismatch, a wrong arity — any
  * rule that the structural parse cannot catch. `pos` is where in the source it was found, which
  * is absent only for a rule that fires away from any one node.
+ *
+ * Raising one abandons the *region* it was raised in — a statement, a function body, a
+ * declaration — which is caught at the nearest recovery point so the analyzer can go on to find
+ * the mistakes further down the file.
  */
 case class AnalyzerError(message: String, pos: Option[Pos]) extends RuntimeException(message)
+
+/** Raised where a value derives from something that was already reported.
+ *
+ * It abandons the enclosing region exactly as an error does, but records nothing: the mistake
+ * was reported where it was made, and saying so again at every later use of the name would bury
+ * the real diagnostic under its own consequences.
+ */
+case class Poisoned() extends RuntimeException
 
 /** The shared substrate of the analyzer, mixed into the feature traits (`TypeResolution`,
  * `Literals`, `CallAnalysis`, `PatternAnalysis`) and the `Analyzer` class itself.
@@ -117,7 +129,51 @@ trait AnalyzerBase {
 
   protected def err(msg: String): Nothing = throw AnalyzerError(msg, currentPos)
 
+  /** Abandons the current region without reporting, because whatever led here already did. */
+  protected def poisoned(): Nothing = throw Poisoned()
+
+  /** Whether two types genuinely disagree. A type that could not be worked out agrees with
+   * everything: the mistake that produced it has been reported, and a second complaint about
+   * what it fails to match is noise about a consequence rather than a cause.
+   */
+  protected def disagree(a: Type, b: Type): Boolean =
+    a != b && a != Type.Unknown && b != Type.Unknown
+
   protected def show(t: Type): String = Type.show(t)
+
+  // --- collecting errors ----------------------------------------------------------------
+
+  /** Every error found so far, in the order the analyzer found them. Duplicates are dropped on
+   * the way in: the same complaint at the same place is one mistake however many times a pass
+   * arrives at it — a generic function instantiated three times has one bad line, not three.
+   */
+  private val found = mutable.LinkedHashSet.empty[(String, Option[Pos])]
+
+  /** The errors, rendered and ordered by where they are, so reading them top to bottom is
+   * reading the file top to bottom. A diagnostic with no position sorts last, since there is
+   * nowhere to file it.
+   */
+  protected def diagnostics: List[String] =
+    found.toList
+      .sortBy { case (_, pos) =>
+        (pos.isEmpty, pos.map(_.source.name).getOrElse(""), pos.map(_.line).getOrElse(0), pos.map(_.col).getOrElse(0))
+      }
+      .map { case (msg, pos) => Diagnostic.render(msg, pos) }
+
+  /** Runs `body`, and if it abandons its region, records the error and yields `fallback` so the
+   * walk carries on to whatever comes after. A `Poisoned` region yields the same fallback and
+   * records nothing.
+   */
+  protected def recover[T](fallback: => T)(body: => T): T =
+    try body
+    catch
+      case AnalyzerError(msg, pos) => found += ((msg, pos)); fallback
+      case Poisoned()              => fallback
+
+  /** The same, for a region that has no useful value to stand in for a failure — a function
+   * whose body did not analyze is simply left out of the program.
+   */
+  protected def recoverOpt[T](body: => T): Option[T] = recover(None)(Some(body))
 
   // --- scopes and unique naming --------------------------------------------------------
 

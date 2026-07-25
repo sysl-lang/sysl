@@ -106,10 +106,40 @@ A `Pos` holds the `Source` it points into, which is what keeps the prelude's pos
 user's file's from being confused for one another, and what lets a diagnostic render itself
 without any pass having to carry the source text alongside the message.
 
-**Still open: one error at a time.** The analyzer reports by throwing, so a program with three
-mistakes shows one. Positions are the prerequisite for fixing that — a recovered error has to
-say where it was — and the recovery strategy itself (what to return in place of a failed
-subtree) is the remaining work.
+## Reporting every error, not just the first
+
+A compilation reports **every mistake it can find**, rendered in source order and separated by a
+blank line. The analyzer still signals an error by throwing — 150-odd call sites say `err(…)` and
+mean it — but the throw is caught at a **recovery region** boundary, the error is recorded, and
+the walk resumes at the next region. The regions are the boundaries a well-formed program can
+resynchronize on:
+
+- each **declaration** as it is hoisted, so a bad struct does not hide the next one;
+- each **function body**, so a bad function does not hide the next one;
+- each **statement**, so a bad line does not hide the rest of its block.
+
+The parser is not among them: a combinator grammar has no recovery, so a syntax error still stops
+at the first one. That is the known cost recorded above.
+
+**Consequences are not errors.** Reporting every mistake is only useful if what gets reported is
+mistakes rather than their fallout, so two mechanisms keep the count honest:
+
+- **`Type.Unknown` and `Poisoned`.** A declaration that failed still binds its name, at
+  `Type.Unknown`. Any expression that comes out with that type raises `Poisoned`, which abandons
+  its statement exactly as an error does but records nothing — the mistake was reported where it
+  was made. So `var a = nope` followed by five uses of `a` is one error, not six. The same applies
+  to a parameter or a struct field whose type did not resolve: the function keeps its arity and
+  the struct keeps its shape, so calls and field reads stay quiet instead of each inventing a
+  complaint of their own.
+- **Duplicates are dropped.** The same message at the same place is one mistake however many
+  times a pass arrives at it — a generic function instantiated at three types has one bad line,
+  not three.
+
+**A region that is abandoned leaves nothing behind.** A statement that failed part-way may have
+opened a scope or entered a loop it never closed, and the resolver may have marked a type as
+in-progress; both are wound back. This is not tidiness — leaving them made the analyzer *more*
+permissive after an error than before one, and made the next mention of a half-built type report
+that it contained itself.
 
 ## Reversibility (why this is not a lock-in)
 

@@ -26,7 +26,7 @@ trait CallAnalysis extends TypeResolution {
     // rather than at the call as a whole.
     for (t, (pname, pty)) <- ts.zip(params) do
       at(t.pos):
-        if t.ty != pty then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")
+        if disagree(t.ty, pty) then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")
 
     ts
   }
