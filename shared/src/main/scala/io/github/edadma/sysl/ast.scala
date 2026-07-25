@@ -22,6 +22,11 @@ case class IntLit(value: BigInt, suffix: Option[String]) extends Expr
 case class FloatLit(text: String, suffix: Option[String]) extends Expr
 case class CharLit(codepoint: Int)                        extends Expr
 case class StrLit(value: String)                          extends Expr
+
+/** `c"…"` — a NUL-terminated C string, of type `*u8`. It is the shape a C interface reads a string
+ * as, which a sysl `string` is not: that carries a length and no terminator (`04`).
+ */
+case class CStrLit(value: String) extends Expr
 case class BoolLit(value: Boolean)                        extends Expr
 
 /** `()` — the sole value of `unit`. */

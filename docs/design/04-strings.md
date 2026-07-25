@@ -249,15 +249,29 @@ cstring(s) -> CString      // allocates a NUL-terminated copy; the caller owns i
 This is Go's `C.CString`, and it is explicit for the same reason: a length-carrying string can
 contain a NUL as an ordinary byte, so the conversion can fail or truncate and must be visible.
 
-**One optimization is worth building in.** The compiler emits a NUL byte after every string
-literal in read-only data. It costs one byte, it is not counted in `len`, and it means passing
-a *literal* to a C function needs no allocation and no copy — which is what kernel and driver
-code actually does with strings. Swift does the same thing internally.
+**The literal case needs no allocation at all, and it is spelled `c"…"`.** The compiler emits a NUL
+byte after every string literal in read-only data — it costs one byte and is not counted in `len` —
+so a literal is already sitting in memory in exactly the shape C reads. `c"%g"` is that constant's
+address: a plain `*u8`, no allocation, no copy, no runtime.
 
-A NUL *inside* a literal stays an ordinary byte — that is what carrying a length means, and
-`"a\0b"` has three bytes and prints as three. What such a literal loses is only the free ride to
-C, so that is where the diagnostic belongs: at the conversion, which can see that the bytes it
-was asked to hand over would be cut short. Passing one to C is an error, not a truncation.
+```
+extern printf(fmt: *u8, ...) -> int
+
+printf(c"%d items\n", n)
+```
+
+**It is a distinct literal form rather than an inferred optimization**, and deliberately: whether an
+expression is *literally a literal* is not something a reader should have to work out, and a rule
+that silently allocates for `s` but not for `"…"` hides a cost the language promises to show
+(`principles.md`). `c"…"` says at the call site which one this is. It is Rust's `c"…"` (stable since
+1.77) and Zig's null-terminated literal, for the same reason both added it.
+
+A `c"…"` containing an interior NUL is a **compile error**, not a truncation: the bytes after it
+could never be seen by the callee, so the value would not be what was written. An ordinary `"a\0b"`
+is unaffected — it has three bytes and prints as three, because carrying a length is the whole
+point — and only the free ride to C is lost, which is exactly where the diagnostic belongs.
+
+The general, non-literal direction stays the allocating `cstring(s)` above.
 
 ## The allocator-free subset
 

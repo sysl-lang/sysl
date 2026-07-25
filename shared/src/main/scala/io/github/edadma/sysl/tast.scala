@@ -117,6 +117,12 @@ case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
  */
 case class TFormat(arg: TExpr, spec: String) extends TExpr { def ty: Type = Type.Str }
 
+/** `c"…"` — the address of a NUL-terminated constant, which is what a C interface reads a string
+ * as. The terminator is not counted in anything: it is there for the callee to find the end by, and
+ * the value is a plain `*u8`.
+ */
+case class TCStrLit(value: String) extends TExpr { def ty: Type = Type.Ptr(Type.Integer(8, signed = false)) }
+
 /** A call to a user function. */
 case class TCall(name: String, args: List[TExpr], ty: Type) extends TExpr
 

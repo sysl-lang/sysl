@@ -227,6 +227,9 @@ class Codegen private (program: TProgram) extends ArcEmitter with ScalarEmitter 
   protected def genExpr(expr: TExpr): String = expr match
     case TIntLit(v, _) => v.toString
     case TStrLit(s)    => stringValue(s)
+    // Every interned constant is already laid down NUL-terminated, so a C string is the same global
+    // read as a plain pointer — the terminator the sysl string ignores is exactly what C reads by.
+    case TCStrLit(s)   => stringGlobal(s)
     case TBoolLit(b)   => if b then "1" else "0"
     case TNullLit(_)   => "null"
     case TUnitLit()    => ""

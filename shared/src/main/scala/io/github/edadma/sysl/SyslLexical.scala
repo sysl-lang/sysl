@@ -62,6 +62,14 @@ class SyslLexical
     def chars: String = value
   }
 
+  /** A C string literal, `c"…"` — the same decoded value, marked for the terminator C expects and
+   * the `*u8` it reads as. Told apart at the token so nothing downstream has to remember which
+   * quote form produced a given value.
+   */
+  case class CStrLit(value: String) extends Token {
+    def chars: String = s"c\"$value\""
+  }
+
   /** An interpolated string, `s"…"`, `raw"…"`, or `f"…"`. The literal segments are already decoded
    * (with escapes, unless `raw`); the embedded expressions are held as their raw source, to be
    * lexed and parsed where the token is consumed. `specs` carries one entry per hole — the printf
@@ -141,7 +149,7 @@ class SyslLexical
   }
 
   override def token: Parser[Token] =
-    interpString | identifier | number | label | character | string | (elem(EofCh) ^^^ EOF) | delim | failure(
+    interpString | cString | identifier | number | label | character | string | (elem(EofCh) ^^^ EOF) | delim | failure(
       "illegal character",
     )
 
@@ -323,17 +331,37 @@ class SyslLexical
     }
   }
 
-  private lazy val string: Parser[Token] = Parser { in =>
+  private lazy val string: Parser[Token] = stringBody(StrLit.apply)
+
+  /** `c"…"` — a **C string**: the same literal, laid down NUL-terminated and read as a `*u8`, which
+   * is what a C interface expects and what a sysl `string` (a length, no terminator — `04`) is not.
+   * The prefix has to be the whole identifier, as an interpolation prefix does, so a name beginning
+   * with `c` beside a string stays two tokens.
+   */
+  private lazy val cString: Parser[Token] = Parser { in =>
+    if (in.atEnd || in.first != 'c') Failure("not a C string literal", in)
+    else {
+      val (name, after) = takeWhile(in, isIdentPart)
+
+      if (name == "c" && !after.atEnd && after.first == '"') stringBody(CStrLit.apply)(after)
+      else Failure("not a C string literal", in)
+    }
+  }
+
+  /** The shared body of both quote forms: scan to the closing `"`, decoding escapes. `token` is what
+   * to build from the decoded value, which is the only thing the two forms differ by.
+   */
+  private def stringBody(token: String => Token): Parser[Token] = Parser { in =>
     if (in.atEnd || in.first != '"') Failure("not a string literal", in)
     else {
-      val buf                                        = new StringBuilder
-      var rest                                       = in.rest
-      var result: Option[ParseResult[Token]]         = None
+      val buf                                = new StringBuilder
+      var rest                               = in.rest
+      var result: Option[ParseResult[Token]] = None
 
       while (result.isEmpty)
         if (rest.atEnd || rest.first == '\n') result = Some(Success(errorToken("unterminated string literal"), rest))
         else if (rest.first == '"') {
-          result = Some(Success(StrLit(buf.toString), rest.rest))
+          result = Some(Success(token(buf.toString), rest.rest))
         } else
           scanChar(rest) match {
             case Left((msg, next)) => result = Some(Success(errorToken(msg), next))

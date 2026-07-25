@@ -633,6 +633,13 @@ class Analyzer private (program: Program) extends CallAnalysis with PatternAnaly
     case FloatLit(t, suffix) => floatLiteral(t, suffix, expected)
     case CharLit(cp)         => TIntLit(cp, Type.Char)
     case StrLit(s)           => TStrLit(s)
+    // A C callee finds the end by the terminator, so an interior NUL would hide everything written
+    // after it. Refused outright rather than silently truncated — an ordinary `"a\0b"` is unaffected,
+    // since carrying a length is exactly what lets it hold one.
+    case CStrLit(s) =>
+      if s.indexOf(0) >= 0 then
+        err("a C string ends at its first NUL, so it cannot contain one — the bytes after it could never be read")
+      TCStrLit(s)
     case BoolLit(b)          => TBoolLit(b)
     case UnitLit()           => TUnitLit()
 

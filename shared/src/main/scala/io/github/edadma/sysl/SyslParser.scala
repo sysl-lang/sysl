@@ -179,7 +179,8 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   lazy val primary: PackratParser[Expr] =
     at(
-      floatLit | intLit | charLit | interpLit | strLit | boolLit | nullLit | selfExpr | identExpr | arrayLit |
+      floatLit | intLit | charLit | interpLit | cStrLit | strLit | boolLit | nullLit | selfExpr | identExpr |
+        arrayLit |
         op("(") ~> parenTail,
     )
 
@@ -213,6 +214,9 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   private lazy val strLit: Parser[Expr] =
     accept("string literal", { case t: lexical.StrLit => StrLit(t.value) })
+
+  private lazy val cStrLit: Parser[Expr] =
+    accept("C string literal", { case t: lexical.CStrLit => CStrLit(t.value) })
 
   /** An interpolated string desugars to the concatenation of its literal segments with each
    * embedded expression rendered by `str`: `s"a${e}b"` becomes `"a" + str(e) + "b"`. The embedded
