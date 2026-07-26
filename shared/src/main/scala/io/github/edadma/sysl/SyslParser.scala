@@ -495,9 +495,9 @@ class SyslParser(val source: Source) extends PackratParsers {
     }
 
   /** A line inside a trait body. A **definition** is tried first, since it is a signature with more
-   * after it: `member` needs a body to follow the header, so a bare signature falls through to
-   * `methodSig`, and a property — which a trait cannot declare yet — to `propertySig`, where it is
-   * parsed so the analyzer can say so rather than leaving a parse error to explain it.
+   * after it: `member` needs a body to follow the header, so a bare method signature falls through
+   * to `methodSig` and a bare property signature to `propertySig`. A signature of either kind asks
+   * an implementation for that member; one written with a body supplies a default instead.
    */
   private lazy val traitMember: PackratParser[MethodDecl] = member | methodSig | propertySig
 
@@ -523,13 +523,17 @@ class SyslParser(val source: Source) extends PackratParsers {
    * grammar as a method written in a struct's own body. The block is closed by an optional
    * `end Type`.
    *
+   * The type is a full type reference, not a name: `impl Show for []int` is as ordinary as
+   * `impl Show for Point`, and which types an `impl` may be *for* is the analyzer's to decide
+   * rather than something to leave the grammar unable to express.
+   *
    * The block itself is optional, because a trait whose every method has a default leaves a
    * conforming type nothing to write: `impl Zero for E` on its own line is the whole of that
    * implementation, and the opt-in it states is the point of writing it.
    */
   private lazy val implDecl: PackratParser[Stmt] =
-    op("impl") ~> ident ~ (op("for") ~> ident) >> { case tname ~ forType =>
-      (implBody | success(Nil)) <~ endName(forType) ^^ { methods => ImplDecl(tname, forType, methods) }
+    op("impl") ~> ident ~ (op("for") ~> typeRef) >> { case tname ~ forType =>
+      (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods => ImplDecl(tname, forType, methods) }
     }
 
   private lazy val implBody: PackratParser[List[MethodDecl]] =
@@ -545,6 +549,15 @@ class SyslParser(val source: Source) extends PackratParsers {
     ident >> { n =>
       if n == expected then success(()) else err(s"'end $n' does not match '$expected'")
     }
+
+  /** The same marker closing an `impl`, whose subject is a type rather than a name — `end []int`
+   * as readily as `end Point`. The two references are compared as written, since nothing has
+   * resolved either of them yet and matching the spelling is all this marker was ever doing.
+   */
+  private def endTypeRef(expected: TypeRef): Parser[Unit] =
+    opt(opt(newlines) ~> softEnd ~> (typeRef >> { t =>
+      if t == expected then success(()) else err(s"'end ${t.show}' does not match '${expected.show}'")
+    })) ^^^ (())
 
   /** An indented block: a leading `Newline`+`Indent` (the lexer's off-side signal) wraps a
    * statement sequence closed by `Dedent`.

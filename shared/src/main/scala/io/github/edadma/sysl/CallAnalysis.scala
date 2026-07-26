@@ -118,10 +118,18 @@ trait CallAnalysis extends Literals with TraitObjects {
    * under `Type.member`; a member of a generic type is instantiated here, from the receiver's own
    * type arguments, and its body queued for analysis — so both resolve to a name that `funcInsts`
    * holds.
+   *
+   * The prefix is the type **mangled**, not the key its members are filed under, because a type an
+   * `impl` may name is not always a name: `[]int` is a fine key and an impossible LLVM symbol. The
+   * two coincide for every type that *is* named, so nothing about a struct's members changed when
+   * the composed types arrived.
    */
-  protected def memberFuncName(base: String, mname: String, targs: List[Type]): String =
-    if nominalTparams(base).isEmpty then s"$base.$mname"
+  protected def memberFuncName(ty: Type, mname: String): String = {
+    val (base, targs) = memberOwner(ty)
+
+    if nominalTparams(base).isEmpty then s"${Type.mangle(ty)}.$mname"
     else instantiateFunc(genericMembers((base, mname)), targs)
+  }
 
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever
@@ -137,11 +145,11 @@ trait CallAnalysis extends Literals with TraitObjects {
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
       case t: Type.Trait    => callTraitObject(tr, t, mname, args)
       case rty =>
-        val (base, targs) = memberOwner(rty)
+        val (base, _) = memberOwner(rty)
 
         memberDecls.get((base, mname)) match
           case Some(m) if m.receiver.isDefined =>
-            val fname           = memberFuncName(base, mname, targs)
+            val fname           = memberFuncName(rty, mname)
             val (params, rtype) = funcInsts(fname)
             if args.length != params.length - 1 then
               err(s"method '$fname' takes ${quantity(params.length - 1, "argument")}, " +

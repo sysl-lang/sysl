@@ -1,7 +1,8 @@
 # Traits (Polymorphism)
 
 **Status:** decided (core model), and **built** — static dispatch through bounds, dynamic dispatch
-through `*Trait` / `&Trait`, **default bodies**, and **properties** alongside methods. Some
+through `*Trait` / `&Trait`, **default bodies**, **properties** alongside methods, and an `impl` for
+any concrete type, **composed types included**. Some
 surface-syntax details are flagged open at the end. How a
 plain method and its receiver are spelled — the hole this doc used to leave open — is settled in
 `08-methods.md`; a trait's methods are declared and called the same way, with the receiver an
@@ -42,16 +43,16 @@ This replaces the old design's split into compile-time `trait`s and structural r
   value.
 - **Retrofitting is preserved** — you can `impl` your trait for a type you don't own; you just
   do it explicitly rather than by implicit structural match.
-- **Any type may carry an `impl`, the built-ins included.** `impl Show for int` is as ordinary as
-  `impl Show for Point`, and `5.show()` resolves by the same rule `p.show()` does. This is not a
-  convenience: a `Show` that cannot cover `int` is a `Show` no library can be written against, and
-  the prelude's own `Show` — the one that lets `str` stop being a compiler builtin, and lets
-  `print`'s desugaring aim at a method instead of six names (`04`, *Printing*) — is the first thing
-  that needs it. Every type has one **owner key** its members are filed under: a
-  struct or an enum by the name it was declared with, everything else by its one canonical name, so
-  `impl Show for int` and `impl Show for i32` are the single implementation they are rather than two.
-  Two types have no key because they have no behaviour to give: `never`, which has no values, and
-  `unit`, which has one.
+- **Any type may carry an `impl`, the built-ins and the composed types included.** `impl Show for
+  int` is as ordinary as `impl Show for Point`, `impl Show for []int` is as ordinary as either, and
+  `5.show()` resolves by the same rule `p.show()` does. This is not a convenience: a `Show` that
+  cannot cover `int` is a `Show` no library can be written against, and the prelude's own `Show` —
+  the one that lets `str` stop being a compiler builtin, and lets `print`'s desugaring aim at a
+  method instead of six names (`04`, *Printing*) — is the first thing that needs it. Every type has
+  one **owner key** its members are filed under: a struct or an enum by the name it was declared
+  with, everything else by its one canonical name, so `impl Show for int` and `impl Show for i32`
+  are the single implementation they are rather than two. Two types have no key because they have no
+  behaviour to give: `never`, which has no values, and `unit`, which has one.
 
 ## Why (summary; the design audit holds the long form)
 
@@ -172,6 +173,50 @@ happens to be spelled like a field, so a trait can promise it. A **field** stays
 whatever the bounds say, because a field is layout and no promise about behaviour reaches one
 (`10 §5`) — which is what the diagnostic on `x.v` says when nothing declares a property of the name.
 
+## An `impl` is for a type, and a type is not always a name
+
+`impl Trait for Type` names its subject with a **type reference**, not an identifier, so the types
+that have no name of their own carry an implementation exactly as the named ones do:
+
+```
+impl Display for []int
+    display(self, out: *Writer, fmt: FormatSpec)
+        …
+
+impl Total for [3]int
+    total(self) -> int = self[0] + self[1] + self[2]
+```
+
+Nothing downstream is special about them. The members are filed under the type's owner key
+(`[]int`, `[3]int`), a call finds them the way it finds a struct's, a bound is satisfied the way a
+struct satisfies one, and an erasure gets a table with the same slots. The one thing that had to
+differ is invisible: an owner key is what a *diagnostic* calls the type, and `[]int` is no name a
+linker would take, so the members are **emitted** under the type mangled — `slice.int.total`,
+`arr3.int.total`. The two spellings coincide for every type that is a name, which is why nothing
+about a struct's members moved.
+
+Two spellings of one type are still one implementation, since the key is the resolved type:
+`impl Show for []int` and `impl Show for []i32` collide exactly as `int` and `i32` do. An array's
+**length is part of its type**, so `[2]int` and `[3]int` are two types and may implement the same
+trait differently.
+
+Three shapes are refused, each because an implementation for it would be about nothing:
+
+- **A memory mode** — `*Point`, `&Point`. A mode is a way of *holding* a `Point`, not a type
+  beside it, and a member call already sees through one level of `*` / `&` to find the receiver's
+  members (`08`). An `impl` for the mode would register members nothing could ever reach.
+- **A trait object** — `*Show`. An `impl` says how one particular type behaves, and which type it
+  holds is precisely what an erased value has forgotten.
+- **A generic type** — `Box`, `Box[T]`. Still open, below. A generic type *already applied* is
+  concrete and perfectly ordinary: `impl Total for []Box[int]` is allowed, because `Box[int]` is a
+  type and a slice of it is a type.
+
+Members the compiler provides are out of reach for the same reason a field is: `len` on a slice or
+an array, and `bytes` on a string, are reached ahead of the member table rather than through it, so
+an `impl` that declared one would register a member no reader could find. That is the built-in
+counterpart of an `impl` method colliding with a struct's field, and it is reported at the
+declaration for the same reason.
+
 ## Trait objects, as built
 
 A trait object is a **fat pointer** — two words, the method table for the type it forgot and the
@@ -246,7 +291,8 @@ signature, which stands in for every implementation because conformance is exact
 ## Kept / dropped
 
 - **Kept:** static dispatch (monomorphized bounds), dynamic dispatch (boxed trait object),
-  retrofitting foreign types (explicit `impl`), default bodies, properties as members.
+  retrofitting foreign types (explicit `impl`), default bodies, properties as members, an `impl` for
+  any concrete type — named or composed.
 - **Dropped:** the separate structural `interface`; implicit/structural conformance; the
   invisible `owns` flag (replaced by explicit three-mode ownership).
 
@@ -256,12 +302,12 @@ signature, which stands in for every implementation because conformance is exact
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
 - **Trait bounds, associated types, generic interaction** — deferred to the generics spec.
-- **An `impl` for a *composed* type.** `impl Trait for Type` names its type with an identifier, so a
-  built-in reachable by name (`int`, `string`, `char`) may carry one but a composed type — `*u8`,
-  `[]int`, `[4]byte` — cannot yet be spelled there. Additive: it wants the implementing type to be a
-  full type reference rather than a name, and a key for each shape.
 - **An `impl` for a generic type.** `impl Show for Box[T]` is rejected for now; the implementing type
-  must be concrete. Wanted, and it interacts with monomorphizing the members.
+  must be concrete. Wanted, and it interacts with monomorphizing the members — the block would carry
+  type parameters of its own, its members would be instantiated per receiver like a generic type's
+  are, and a bound would have to be answered by matching the head rather than by a key lookup.
+  **Conditional conformance** (`impl Show for Box[T]` only where `T: Show`) is the same work: the
+  bound on the block is what makes the members' bodies checkable at the definition.
 - **A property's body must be an expression.** `name -> T = expr` is the only spelling, so a property
   cannot open an indented block the way a method's `= …`-less form can. That is `08`'s grammar rather
   than anything about traits, and it bites a default property the same way it bites an inherent one.

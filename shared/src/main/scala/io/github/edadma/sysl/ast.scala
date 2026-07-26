@@ -120,7 +120,22 @@ case class MatchArm(patterns: List[Pattern], guard: Option[Expr], body: List[Stm
  */
 case class MatchExpr(scrutinee: Expr, arms: List[MatchArm]) extends Expr
 
-sealed trait TypeRef extends Positioned
+sealed trait TypeRef extends Positioned {
+
+  /** The reference written back out, for a diagnostic that has to name a type before anything has
+   * resolved it — the `end` marker closing an `impl`, and the complaints about what an `impl` may
+   * be for. Every other message names the *resolved* type, which is canonical; this one can only
+   * repeat the spelling it was given.
+   */
+  def show: String = this match
+    case NamedType(n, Nil)                => n
+    case NamedType(n, args)               => s"$n[${args.map(_.show).mkString(", ")}]"
+    case PtrType(inner)                   => s"*${inner.show}"
+    case RefType(inner, sync)             => s"&${if sync then "sync " else ""}${inner.show}"
+    case ArrayType(None, elem)            => s"[]${elem.show}"
+    case ArrayType(Some(IntLit(n, _)), e) => s"[$n]${e.show}"
+    case ArrayType(Some(_), elem)         => s"[…]${elem.show}"
+}
 
 /** A named type, optionally applied to type arguments: `int`, `Box[int]`,
  * `Result[int, string]`. A bare name may also be a type *parameter* of the enclosing
@@ -300,7 +315,11 @@ case class TraitDecl(name: String, tparams: List[String], methods: List[MethodDe
  * methods then become inherent members of `forType`, callable as `value.method(…)` exactly as a
  * method written in the type's own body. A default the block leaves out becomes a member of
  * `forType` just the same, from the body the trait supplied.
+ *
+ * `forType` is a full type reference rather than a name, because a trait may be implemented for a
+ * type that has no name to be written under — `impl Show for []int` says how a slice of ints
+ * renders, and `[]int` is a type the same way `Point` is.
  */
-case class ImplDecl(traitName: String, forType: String, methods: List[MethodDecl]) extends Stmt
+case class ImplDecl(traitName: String, forType: TypeRef, methods: List[MethodDecl]) extends Stmt
 
 case class Program(body: List[Stmt])

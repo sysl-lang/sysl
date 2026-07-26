@@ -95,6 +95,13 @@ before they appear and may be mutually recursive).
   spells — by value — so it needs nothing of its own at either dispatch: a bound licenses `x.size`
   the way it licenses a call, and an object reads one through a table slot beside the methods. What
   a bound still never reaches is a **field**, since a field is layout rather than behaviour.
+- **An `impl` for a composed type (`02`).** The type an `impl` is for is a full type reference, so
+  `impl Display for []int` and `impl Total for [3]int` are as ordinary as one for a struct: same
+  member table, same bound, same vtable slots. The members are *emitted* under the type **mangled**
+  (`slice.int.display`, `arr3.int.total`) rather than under the owner key a diagnostic uses, because
+  `[]int` is no symbol a linker would take; the two coincide for every type that is a name. A memory
+  mode (`*Point`), a trait object (`*Show`), and a still-generic type (`Box`, `Box[T]`) are refused —
+  an already-applied generic like `[]Box[int]` is concrete and allowed.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over

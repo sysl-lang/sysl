@@ -53,6 +53,15 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
       |var s: *Sized = &b
       |print(s.size)""".stripMargin
 
+  private val slice =
+    """trait Total
+      |    total(self) -> int
+      |impl Total for []int
+      |    total(self) -> int = 0
+      |var a: &[2]int = [1, 2]
+      |var t: &Total = a[0..]
+      |print(t.total())""".stripMargin
+
   "the table" - {
     // The order is the trait's declaration order, which is what a call site indexes by, and a
     // `*self` method's receiver already is the data word — so that slot names the implementation
@@ -119,6 +128,32 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     // parentheses are the source's, not the table's.
     "reads through the slot, passing the data word and no arguments" in {
       mainOf(ir(withProperty)) should include regex raw"call i32 %t\d+\(ptr %t\d+\)"
+    }
+  }
+
+  // A type an `impl` may be for is not always a type with a *name*: `[]int` is the key its members
+  // are filed under and an impossible LLVM symbol, so the lowered functions carry the type mangled
+  // instead. Nothing else about the table changes, which is what these pin.
+  "a type with no name of its own" - {
+    "emits its members under the mangled type" in {
+      ir(slice) should include("define i32 @slice.int.total(")
+    }
+
+    "names its table by the same mangling, and fills the slot from it" in {
+      ir(slice) should include("@vt.ref.Total.slice.int = private constant [1 x ptr]")
+      ir(slice) should include("@vt.adapt.ref.slice.int.total")
+      defineOf(ir(slice), "vt.adapt.ref.slice.int.total") should include("call i32 @slice.int.total(")
+    }
+
+    "mangles an array's length into the name too" in {
+      ir(
+        """trait Total
+          |    total(self) -> int
+          |impl Total for [3]int
+          |    total(self) -> int = self[0]
+          |var a: [3]int = [1, 2, 3]
+          |print(a.total())""".stripMargin,
+      ) should include("define i32 @arr3.int.total(")
     }
   }
 

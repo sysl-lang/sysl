@@ -211,6 +211,21 @@ makes new bytes — is compiler-provided too, and lands as these same member for
 (`04`, `00`). A user `struct` or `enum` is the case that declares its members in its own body;
 the built-ins are the case where the body is the language.
 
+A compiler-provided member is reached **ahead of** the member table rather than through it, which is
+what puts these names out of reach for an `impl` (`02`): a member declared as `len` on a slice or
+`bytes` on a string would be registered and never found, so it is refused at the declaration. This
+is the same rule that stops an `impl` method from colliding with a struct's field, applied to a type
+whose "fields" are the language's.
+
+### A type with no name still has members
+
+The forms above are written in a type's own body, which only a `struct` or an `enum` has. Everything
+else gains members through an `impl` (`02`) — and that includes the types with no name to write a
+body for: `impl Total for []int` gives every `[]int` a `total`, read as `xs.total()` exactly as a
+struct's is. The receiver is the composed type itself, so `self` in such a member is a `[]int`,
+`*self` a `*[]int`, and the conversions at the call site are the ones the table above already
+describes.
+
 ## Generics
 
 A member of a generic type is monomorphized with the type, so `Box[T]`'s methods are emitted per

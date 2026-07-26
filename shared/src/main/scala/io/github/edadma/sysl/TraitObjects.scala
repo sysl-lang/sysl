@@ -69,12 +69,11 @@ trait TraitObjects extends TypeResolution {
    * is the trait's methods in declaration order, which is the order a call site indexes by.
    */
   private def vtableFor(traitName: String, ty: Type, boxed: Boolean): String = {
-    val key  = ownerKey(ty)
     val name = s"vt.${if boxed then "ref." else ""}$traitName.${Type.mangle(ty)}"
 
     if !vtables.contains(name) then
       val slots = traitDecls(traitName).methods.map { m =>
-        val fname           = s"$key.${m.name}"
+        val fname           = s"${Type.mangle(ty)}.${m.name}"
         val (params, rtype) = funcInsts(fname)
 
         funcsUsed += fname

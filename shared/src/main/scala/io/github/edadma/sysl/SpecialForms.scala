@@ -140,16 +140,18 @@ trait SpecialForms extends CallAnalysis {
           (name, widen(t, want))
 
         case None =>
-          val (base, targs) = memberOwner(ty)
-
-          if !traitImpls.contains(("Display", base)) then
+          if !traitImpls.contains(("Display", ownerKey(ty))) then
+            // Naming the `impl` to write is only advice where one could be written at all: a
+            // memory mode and a generic type are the two shapes `02` still refuses, so those are
+            // told what is true of them rather than pointed at a block that would not compile.
             val fix = ty match
-              case n: Type.Named => s"write an 'impl Display for ${n.name}' to say how it renders"
-              case _             => "it does not implement 'Display'"
+              case n: Type.Named if n.targs.isEmpty => s"write an 'impl Display for ${n.name}' to say how it renders"
+              case _: Type.Array | _: Type.Slice    => s"write an 'impl Display for ${show(ty)}' to say how it renders"
+              case _                                => "it does not implement 'Display'"
             val asked = if op == "print" then "cannot print" else "cannot make a string of"
             err(s"$asked a ${show(ty)} value — $fix")
 
-          val fname = memberFuncName(base, "display", targs)
+          val fname = memberFuncName(ty, "display")
 
           funcsUsed += fname
           (fname, t)

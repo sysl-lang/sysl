@@ -59,7 +59,7 @@ class TraitParserTests extends AnyFreeSpec with ParseSupport {
     prog(src) shouldBe List(
       ImplDecl(
         "Show",
-        "Point",
+        NamedType("Point"),
         List(
           MethodDecl(
             "show",

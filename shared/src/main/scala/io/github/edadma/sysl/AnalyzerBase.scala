@@ -288,6 +288,18 @@ trait AnalyzerBase {
   /** The key alone — what an `impl` is filed under, and what a trait bound looks up. */
   protected def ownerKey(t: Type): String = memberOwner(t)._1
 
+  /** Whether a member of that name is one the *compiler* provides for the type (`08`).
+   *
+   * `len` and `bytes` are members of built-ins that have no source body to declare them in, so they
+   * are reached ahead of the member table rather than through it. An `impl` for such a type could
+   * otherwise register a member of the same name that nothing would ever find, which is why this is
+   * asked at the declaration.
+   */
+  protected def builtinMember(t: Type, name: String): Boolean = (t, name) match
+    case (_: Type.Array | _: Type.View, "len") => true
+    case (Type.Str, "bytes")                   => true
+    case _                                     => false
+
   /** Whether a type implements a trait, which is the one question a bound asks.
    *
    * There are two ways to answer yes and they are not interchangeable. A **user** type opts in with

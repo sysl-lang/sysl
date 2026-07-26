@@ -669,11 +669,11 @@ class Analyzer private (program: Program)
    * been either a field or a property, while an enum and a built-in have no fields to have meant.
    */
   private def readProperty(tr: TExpr, ty: Type, f: String): TExpr = {
-    val (base, targs) = memberOwner(ty)
+    val (base, _) = memberOwner(ty)
 
     memberDecls.get((base, f)) match
       case Some(m) if m.isProperty =>
-        val fname      = memberFuncName(base, f, targs)
+        val fname      = memberFuncName(ty, f)
         val (_, rtype) = funcInsts(fname)
         TCall(fname, List(tr), rtype)
       case Some(_) => err(s"'$f' is a method of '${show(ty)}' — call it with '$f(…)'")
