@@ -27,6 +27,27 @@ object FormatSpec {
     if isInt(c) then spec.dropRight(1) + "ll" + c else spec
   }
 
+  /** The three parts of a specifier a `Display` implementation is handed: the minimum field width,
+   * the precision, and whether the field is left-justified (`14 §8 d`).
+   *
+   * A width of `0` and a precision of `-1` mean neither was written, which is the reading `%s` and
+   * `%.0s` would otherwise be confused by. Only these three cross the boundary: the numeric flags
+   * belong to a conversion the prelude's own renderers apply, and a type rendering itself has no
+   * conversion letter to interpret.
+   */
+  def parts(spec: String): (Int, Int, Boolean) = {
+    val flagged        = spec.drop(1).dropRight(1)
+    val flags          = flagged.takeWhile("-+0 #".contains(_))
+    val (width, after) = flagged.drop(flags.length).span(_.isDigit)
+    val precision      = after.drop(1)
+
+    (
+      if width.isEmpty then 0 else width.toInt,
+      if after.isEmpty then -1 else if precision.isEmpty then 0 else precision.toInt,
+      flags.contains('-'),
+    )
+  }
+
   /** A human phrase for the kind of value a conversion wants, for a mismatch diagnostic. */
   def expects(c: Char): String =
     if isInt(c) then "an integer"

@@ -190,9 +190,9 @@ trait AnalyzerBase {
    * instantiation, and reporting it from here as well would report it against a body no call site
    * may ever ask for.
    *
-   * What is still dropped rather than reported is a use of a parameter that no bound could license
-   * *yet* — a `print` of one above all, which wants `T: Display`, and `Display` waits on the
-   * `Writer` sink of `14 §8 d`. Reporting those would reject a body with no fix available to write.
+   * Every use a bound could license now reports through `boundErr`, rendering included: `Display`
+   * and its `Writer` sink are built, so a `print` of a parameter names the bound that would allow
+   * it rather than being dropped for want of one to name.
    */
   protected var abstractPass: Boolean = false
 
@@ -201,6 +201,10 @@ trait AnalyzerBase {
    * It records the diagnostic itself rather than raising an `AnalyzerError`, because the abstract
    * pass drops those: this is the one kind of complaint that pass is for, and it survives whatever
    * recovery region it was raised inside.
+   *
+   * Rendering a parameter goes through here too, now that `Display` exists to license it: a body
+   * that prints a `T` is told to write `T: Display` rather than having the complaint dropped for
+   * want of a bound to name.
    */
   protected def boundErr(msg: String): Nothing = {
     found += ((msg, currentPos))

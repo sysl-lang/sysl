@@ -62,8 +62,41 @@ private class Escape(program: TProgram) {
         walk.escape
       }
 
-    if escapes.isEmpty then None else Some(Diagnostic.report(escapes))
+    val all = borrowed ::: escapes
+
+    if all.isEmpty then None else Some(Diagnostic.report(all))
   }
+
+  /** A `Writer` is handed a **borrowed** view of the bytes to write, and that is the whole reason
+   * the sink takes bytes rather than a string: a renderer writes into a buffer on its own stack and
+   * passes a slice of it, which is what keeps rendering allocation-free (`14 §2`).
+   *
+   * Nothing in the type says "borrowed", so it is checked here instead of trusted. An
+   * implementation that lets those bytes outlive the call is rejected, which is what licenses the
+   * call site below to pass a frame-backed slice through a `Writer` at all.
+   */
+  private def borrowed: List[String] = {
+    // Both flavours of a type's table name the same implementation, so the offender is named once
+    // however many ways the program erased it.
+    val offenders =
+      for
+        vt   <- program.vtables if vt.traitName == "Writer"
+        slot <- vt.slots.headOption.toList if keeps((slot.target, 1))
+      yield slot.target
+
+    offenders.distinct.map { name =>
+      Diagnostic.render(
+        s"'$name' keeps the bytes it is written, but a 'Writer' borrows them for the call — they " +
+          "may be a view of the caller's stack, so copy what the writer needs into storage of its own",
+        None,
+      )
+    }
+  }
+
+  /** Whether a trait object's methods borrow what they are passed rather than possibly keeping it.
+   * `Writer` is the one trait that says so, and the check above is what makes it true.
+   */
+  private def borrows(ty: Type): Boolean = Type.erasedTrait(ty).exists(_.name == "Writer")
 
   /** Whether a value of this type could carry a view of somebody's elements. */
   private def carriesView(t: Type): Boolean = t match
@@ -189,8 +222,9 @@ private class Escape(program: TProgram) {
 
         // Which body a trait object's call reaches is decided at run time, so there is no one
         // summary to consult — the conservative answer is the only sound one, exactly as it is for
-        // a function whose body this program does not have.
-        case TVCall(_, _, args, _) =>
+        // a function whose body this program does not have. A `Writer` is the exception, and only
+        // because every implementation of one has been checked to borrow rather than keep.
+        case TVCall(recv, _, args, _) if !borrows(recv.ty) =>
           for a <- args do
             if viewsFrame(a) then report(a, "is passed through a trait object, which may hold on to it")
 
@@ -288,6 +322,9 @@ private class Escape(program: TProgram) {
     case TBytes(r)                  => List(r)
     case TStr(a)                    => List(a)
     case TFormat(a, _)              => List(a)
+    // A render's result is a fresh string that owns its own bytes, so it views nothing here; what
+    // is worth walking is the value and the specifier it hands the implementation.
+    case TRender(v, _, s)           => List(v, s)
     case TSlice(b, lo, hi, _, _)    => b :: lo.toList ::: hi.toList
     // A `va_list` carries no view of this frame, and a value read out of the tail came from the
     // caller's — so walking these finds nothing, and they are here to keep the walk complete

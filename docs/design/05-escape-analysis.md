@@ -74,6 +74,14 @@ views a stack-backed argument is itself stack-backed and inherits its restrictio
 fixpoint, so a self- or mutually-recursive function converges on the truth rather than on the
 conservative answer.
 
+**A call through a trait object** is the same conservative case for the same reason: which body it
+reaches is a word read at run time, so there is no one summary to consult and every argument is
+assumed kept. **`Writer` is the one exception** (`14 §2`), and it is earned rather than assumed: a
+writer takes a borrowed view of the bytes to write — which is what lets a renderer pass a slice of
+its own stack buffer, and so what keeps rendering allocation-free — and every `impl Writer` is
+checked here to make sure its `write` really does let go. An implementation that keeps the bytes is
+rejected, naming the function; a caller may then pass one a frame-backed slice freely.
+
 **A function whose body is not available** — an `extern` (`12 §1`), which is the declaration form
 for exactly that — gets the pessimistic assumption: every parameter is kept, and the result views
 everything. A stack-backed slice therefore cannot be passed to one, which is correct: the foreign

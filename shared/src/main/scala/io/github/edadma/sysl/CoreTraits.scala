@@ -117,6 +117,28 @@ object CoreTraits {
 
     case "Eq"  => Type.isEquatable(t)
     case "Ord" => Type.isOrdered(t)
-    case _     => false
+
+    // Everything with one textual form worth printing. A pointer is deliberately left out: an
+    // address renders differently on every run, so a program that wants one in its output asks for
+    // it rather than getting it from `print(p)`.
+    case "Display" => Type.isNumeric(t) || t == Type.Str || t == Type.Char || t == Type.Bool
+
+    case _ => false
   }
+
+  /** The prelude function a built-in's `Display` renders through (`14 §5`), which is the sink
+   * counterpart of the one `print` reaches for the same type.
+   *
+   * A built-in has no `impl` block and so no lowered `int.display` to call, exactly as it has no
+   * `int.add`; what it has is a rendering the prelude already writes, and naming it here is what
+   * lets a `Display` written for a struct render the struct's own fields.
+   */
+  def display(t: Type): Option[(String, Type)] = t match
+    case i: Type.Integer if i.signed => Some(("display_int", Type.Integer(64, signed = true)))
+    case _: Type.Integer             => Some(("display_uint", Type.Integer(64, signed = false)))
+    case _: Type.Floating            => Some(("display_real", Type.Real))
+    case Type.Bool                   => Some(("display_bool", Type.Bool))
+    case Type.Char                   => Some(("display_char", Type.Char))
+    case Type.Str                    => Some(("display_str", Type.Str))
+    case _                           => None
 }

@@ -189,10 +189,13 @@ magnitude is taken in unsigned arithmetic. A float goes through `snprintf`, the 
 libc, chosen so that `str(x)` and `print(x)` never disagree; it is `%g`, not the shortest
 round-tripping form this doc otherwise aspires to, and that gap is deliberate for now.
 
-`str` is a builtin because the language has no traits yet. When it gains them, `str(x)` becomes the
-call to a `Display` method, and a user type joins the primitives by implementing it — which is why
-`str` of a struct, an enum, a reference, a pointer, a slice, or an array is an error today rather
-than a guess: those are exactly the types that will name their own rendering later.
+**Any other type renders through `Display`** (`14 §6`). A struct or an enum that carries an
+`impl Display` writes itself into a growable buffer, and the bytes that land there become the
+string — so `str` of a user type is now an ordinary call rather than an error, and `str` of one
+*without* an implementation is a diagnostic naming the `impl` to write. The primitives keep the
+direct renderings above, which is `14 §8 b`'s answer rather than an omission: the two agree to the
+byte, so the one that needs no sink is the one to emit. A reference, a pointer, a slice, and an
+array remain errors, since none of them can carry an `impl` yet.
 
 A value of any other type is not silently rendered across `+` or in a `print`; the conversion is
 always written, at the point it happens. That is the same no-implicit-coercion stance the numeric
@@ -236,11 +239,11 @@ sysl is a small job for the integers and a large one for the floats, so they wai
 target without a C library to make it worth it. The prelude reaches `snprintf` and `putchar` under
 link names (`12` §1), so both stay free for a program to declare itself.
 
-**Where this goes.** When a `Display` trait lands (`02`, `14`), the desugaring retargets from
-`printi(x)` to `x.display()` and every program keeps working — which is the point of putting the
-seam at a name rather than at a rendering. The step after that is `print` becoming an ordinary
-variadic function over trait objects, which needs dynamic dispatch (`02`) and removes the last of
-the six names.
+**Where this goes.** `Display` has landed (`14 §6`), and the seam being a name is what let it: a
+value that is not a scalar now reaches `x.display(out, fmt)` instead of a `print*` function, and
+every program that printed a number kept working. What is left is `print` becoming an ordinary
+variadic function over trait objects rather than a desugaring — which needs a variadic surface that
+can carry them, and would remove the last of the names the compiler knows.
 
 ## Literals
 

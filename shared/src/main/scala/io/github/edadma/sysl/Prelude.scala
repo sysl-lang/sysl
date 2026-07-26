@@ -27,6 +27,21 @@ package io.github.edadma.sysl
  * — and that part lives in `CoreTraits`, because the open `iN` / `uN` families have no finite list
  * of scalars an `impl` could be written for.
  *
+ * **`Writer` and `Display`** (`14 §2`, `§6`) are the rendering half of that catalog. A `Display`
+ * writes its value's text into a sink rather than returning a fresh `string`, so rendering costs no
+ * allocation and a `no alloc` module can still log; the sink is a `*Writer`, which is the trait
+ * object of `02`. `Writer` takes bytes rather than a `string` because that is the direction that is
+ * free — a `string` *is* a validated `[]u8` — and it reports failure by latching rather than by
+ * returning, so an implementation stays straight-line and `print(x)` stays a statement.
+ *
+ * The `display_*` family is the sink counterpart of the `print*` family above: the same renderings,
+ * into a `*Writer` instead of into standard output, and in the argument order `Display` declares.
+ * They are the built-ins' `display` — what `x.display(out, fmt)` lowers to when `x` is a scalar
+ * (`14 §5`) — so a `Display` written for a struct can render the struct's own fields without
+ * leaving the allocation-free path. The two families are separate because the writer that stands
+ * for standard output cannot be written here: it has no state to give a struct, which is also why
+ * `print` keeps its direct path rather than routing through a sink it cannot name.
+ *
  * The three `extern`s are the only things here that are not sysl. Two of them are plumbing rather
  * than surface, so they take a link name and leave `putchar` and `snprintf` free for a program to
  * declare itself. `exit` is deliberately not one of those: it is the prelude's offer of the hosted
@@ -36,7 +51,10 @@ package io.github.edadma.sysl
  *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
- * reaches it, and an `extern` is declared only if something calls it.
+ * reaches it, and an `extern` is declared only if something calls it. `FormatSpec` is the one
+ * exception, and not one of this file's making — a non-generic type is instantiated eagerly
+ * wherever it is declared, so its layout is emitted whether or not anything renders. That is a
+ * type declaration with no code behind it, which is why the rule is worth what it saves.
  */
 object Prelude {
 
@@ -113,6 +131,63 @@ object Prelude {
       |
       |trait Ord
       |    lt(self, rhs: Self) -> bool
+      |
+      |trait Writer
+      |    write(*self, bytes: []u8)
+      |    failed(*self) -> bool
+      |
+      |struct FormatSpec
+      |    width: int
+      |    prec: int
+      |    left: bool
+      |
+      |trait Display
+      |    display(self, out: *Writer, fmt: FormatSpec)
+      |
+      |display_str(s: string, out: *Writer, fmt: FormatSpec) = out.write(s.bytes)
+      |
+      |display_int(n: long, out: *Writer, fmt: FormatSpec)
+      |    var buf: [24]u8
+      |    var k = sysl_snprintf(&buf[0], 24usize, c"%lld", n)
+      |    out.write(buf[0..<usize(k)])
+      |end display_int
+      |
+      |display_uint(n: ulong, out: *Writer, fmt: FormatSpec)
+      |    var buf: [24]u8
+      |    var k = sysl_snprintf(&buf[0], 24usize, c"%llu", n)
+      |    out.write(buf[0..<usize(k)])
+      |end display_uint
+      |
+      |display_real(x: real, out: *Writer, fmt: FormatSpec)
+      |    var buf: [32]u8
+      |    var k = sysl_snprintf(&buf[0], 32usize, c"%g", x)
+      |    out.write(buf[0..<usize(k)])
+      |end display_real
+      |
+      |display_bool(b: bool, out: *Writer, fmt: FormatSpec) = display_str(if b then "true" else "false", out, fmt)
+      |
+      |display_char(ch: char, out: *Writer, fmt: FormatSpec)
+      |    var buf: [4]u8
+      |    var cp = uint(ch)
+      |    if cp < 128u32 then
+      |        buf[0] = u8(cp)
+      |        out.write(buf[0..<1usize])
+      |    elif cp < 2048u32 then
+      |        buf[0] = u8(192u32 | (cp >> 6u32))
+      |        buf[1] = u8(128u32 | (cp & 63u32))
+      |        out.write(buf[0..<2usize])
+      |    elif cp < 65536u32 then
+      |        buf[0] = u8(224u32 | (cp >> 12u32))
+      |        buf[1] = u8(128u32 | ((cp >> 6u32) & 63u32))
+      |        buf[2] = u8(128u32 | (cp & 63u32))
+      |        out.write(buf[0..<3usize])
+      |    else
+      |        buf[0] = u8(240u32 | (cp >> 18u32))
+      |        buf[1] = u8(128u32 | ((cp >> 12u32) & 63u32))
+      |        buf[2] = u8(128u32 | ((cp >> 6u32) & 63u32))
+      |        buf[3] = u8(128u32 | (cp & 63u32))
+      |        out.write(buf[0..<4usize])
+      |end display_char
       |
       |printb(b: bool) = prints(if b then "true" else "false")
       |

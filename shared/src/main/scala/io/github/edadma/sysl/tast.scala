@@ -140,6 +140,25 @@ case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
  */
 case class TFormat(arg: TExpr, spec: String) extends TExpr { def ty: Type = Type.Str }
 
+/** Standard output as a `*Writer` — the sink a value renders itself into when `print` is given one
+ * that is not a built-in (`14 §6`).
+ *
+ * It carries no state at all, and that is why it is a node rather than a value the prelude could
+ * have declared: a writer over standard output has nothing to keep, and there is no struct with no
+ * fields for it to be one of. Its data word is therefore null, and the `write` in its table is the
+ * prelude's own `putbytes` — so the one function a freestanding target replaces is still that one.
+ */
+case class TStdout() extends TExpr { def ty: Type = Type.Ptr(Type.Trait("Writer")) }
+
+/** `str(x)` and an `f"…"` hole on a value that renders itself: `method` is the `display` its type
+ * reaches, and it writes into a growable buffer whose bytes this yields as a fresh `string`.
+ *
+ * That buffer is the second sink the compiler provides, for the sibling of `TStdout`'s reason — a
+ * growable byte buffer is not something sysl can express yet (`07`, *Not yet*), so the prelude
+ * could no more declare this writer than the other one.
+ */
+case class TRender(value: TExpr, method: String, spec: TExpr) extends TExpr { def ty: Type = Type.Str }
+
 /** `c"…"` — the address of a NUL-terminated constant, which is what a C interface reads a string
  * as. The terminator is not counted in anything: it is there for the callee to find the end by, and
  * the value is a plain `*u8`.

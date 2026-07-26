@@ -93,6 +93,12 @@ trait Literals extends TypeResolution {
     TCast(t, to)
   }
 
+  /** Widens a value to the one width a renderer takes, leaving one that is already there alone.
+   * The prelude carries one rendering per *kind* rather than one per type, so every integer meets
+   * `long` or `ulong` and every float meets `real` on the way in.
+   */
+  protected def widen(t: TExpr, to: Type): TExpr = if t.ty == to then t else TCast(t, to).setPos(t.pos)
+
   /** The result type of an arithmetic or bitwise binary operator. Operands must already have
    * the same type — there is no implicit promotion, so a mixed-width expression is an error
    * asking for a conversion rather than a silent widening. `+` on two strings concatenates,

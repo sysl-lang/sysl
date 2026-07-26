@@ -1,19 +1,18 @@
 # Core Traits, Operators, and Definition-Checked Bounds
 
-**Status:** decided. **§1–§5 are implemented** — `Self`, the catalog (minus `Display`), the one
-dispatch rule, definition-checked bounds on both method calls and operators, and the
-compiler-provided scalar memberships. What remains is **§6**, which needs `Display`, which needs the
-`Writer` sink of `§8 d` — now the only thing in the way, since the trait objects `*Writer` is one of
-are built (`02`). This is the concrete spec for three things the earlier chapters *decided* but
-left unbuilt, because all three turn on the same missing layer:
+**Status:** decided, and **§1–§6 are implemented** — `Self`, the whole catalog, the one dispatch
+rule, definition-checked bounds on both method calls and operators, the compiler-provided scalar
+memberships, and `print`/`str` requiring `Display`. `§8 b` and `§8 d` settled on the way; what is
+left open is listed in `§8`. This is the concrete spec for three things the earlier chapters
+*decided* but left unbuilt, because all three turned on the same missing layer:
 
 - **`00 §9` / `01` / `08 §"Interaction with traits"`** — operators are trait methods (`+` is
   `Add`, `<` is `Ord`, `==` is `Eq`), overloaded by `impl Trait for Type`. The *token set* is
   closed; the *meanings* are trait methods. But the traits themselves were never written down.
 - **`10 §5`** — a generic's body may assume only what its bounds promise, checked **at the
-  definition** (`sum[T: Add]` type-checks `a + b` *because* `T: Add`). The implementation is
-  still unbounded/template-style; the chapter marked that as scaffolding to tighten.
-- **`08` / `tast.scala`** — `print` and `str` on a user type wait for a `Display` trait.
+  definition** (`sum[T: Add]` type-checks `a + b` *because* `T: Add`). The implementation was
+  unbounded/template-style; the chapter marked that as scaffolding to tighten.
+- **`08` / `tast.scala`** — `print` and `str` on a user type waited for a `Display` trait.
 
 This document supplies the layer those three rest on: the **`Self` type**, the **core trait
 catalog** (the operator traits plus `Eq`, `Ord`, `Display`), the **one dispatch rule** that
@@ -28,14 +27,11 @@ instead of a method per operator. Swift is the DNA match (`principles §2`), and
 decision below has a Swift precedent — the exception being `Display`, which follows Rust in
 writing to a sink, because Swift has no allocator-free target to answer to (`§2`).
 
-Sections 1–5 are complete and implementable as written. **§6 has one unspecified dependency** —
-the `Writer` sink that `Display` renders into (`§8 d`).
-
 §4 landed in two parts, and the split was the catalog: a **method** call on a type parameter needs
 only the parameter's own bounds, which are traits a program already writes, so it came first; an
-**operator** on one needed `Add` and friends to exist. Both are now built, and `sum[T](a, b) = a + b`
-fails on its own line asking for `T: Add`. A `print` of a parameter is the one use still left to
-monomorphization, because `Display` is the trait the catalog lacks.
+**operator** on one needed `Add` and friends to exist. Both are built, and `sum[T](a, b) = a + b`
+fails on its own line asking for `T: Add`. `print(x)` on a parameter now does the same, asking for
+`T: Display` — which was the last use the abstract pass had to drop for want of a bound to name.
 
 ---
 
@@ -145,10 +141,7 @@ treatment of float `<` as the plain IEEE comparison.
 
 | Trait | Method |
 |---|---|
-| `Display` | `display(self, out: *Writer) -> unit` |
-
-`Display` is the one trait in this catalog the prelude does not yet declare, because its signature
-mentions `Writer` and that sink is unspecified (`§8 d`). Everything else in §2 is built.
+| `Display` | `display(self, out: *Writer, fmt: FormatSpec) -> unit` |
 
 `Display` is what `str` and `print` require of their argument (`§6`). One method, which **writes
 the value's textual form into a sink** rather than returning a freshly built `string`. It is the
@@ -162,15 +155,51 @@ wants it. Writing into a sink costs nothing there: a kernel passes a UART writer
 `str(x)` — which must materialize a `string` — that carries the `alloc` requirement, exactly where
 the allocation actually happens (`§6`).
 
-`Writer` is a **trait**, so `*Writer` is the type-erased trait object of `02` — which is built, so a
-signature written this way now types. That is also what the capability story turns on:
-`capabilities.md` gates `&Trait` behind `alloc` but not `*Trait`, so a raw-pointer sink is available
-in the allocator-free subset. Swift's `CustomStringConvertible` returns a
-`String` and Rust's `Display` writes into a formatter; sysl follows Rust here, and for Rust's
-reason, since Swift has no allocator-free target to answer to.
+`Writer` is a **trait**, so `*Writer` is the type-erased trait object of `02`. That is also what the
+capability story turns on: `capabilities.md` gates `&Trait` behind `alloc` but not `*Trait`, so a
+raw-pointer sink is available in the allocator-free subset. Swift's `CustomStringConvertible`
+returns a `String` and Rust's `Display` writes into a formatter; sysl follows Rust here, and for
+Rust's reason, since Swift has no allocator-free target to answer to.
 
-The `Writer` trait's own surface — whether it takes `[]u8`, a `string`, or both, and what it
-returns on failure — is **not settled here** (`§8 d`).
+**`FormatSpec`** is the second parameter, and it is why `f"${x}%-10s"` can mean something to a type
+that renders itself. It carries the three parts of a specifier that survive not knowing what is
+being rendered — the minimum field width, the precision, and whether the field is left-justified —
+and `print` and `str`, which are written with no specifier at all, hand over the neutral one. It is
+a *struct* rather than more parameters precisely so that a fourth part can be added later without
+touching a single `impl`.
+
+### The `Writer` surface, as built (`§8 d`)
+
+| Trait | Methods |
+|---|---|
+| `Writer` | `write(*self, bytes: []u8) -> unit`, `failed(*self) -> bool` |
+
+Three decisions, each following Rust's experience rather than its packaging:
+
+- **One method, on bytes.** Rust splits `core::fmt::Write` (a `&str`) from `std::io::Write` (a
+  `&[u8]`); sysl needs one, because a `string` here *is* a validated byte view of identical layout,
+  so `s.bytes` costs nothing. Bytes is also the direction that is free: a renderer lays digits into
+  a buffer on its own stack and writes a slice of it, where a `string` sink would have made it
+  allocate and validate to say the same thing.
+- **Latched, not `Result`.** A write returns nothing and `failed` reports a sticky error. Rust's
+  `fmt::Error` carries no information at all, precisely because a fallible `Display` taxes every
+  implementation for a failure almost no sink has; latching keeps implementations straight-line,
+  keeps `print(x)` a statement, and needs no error type designed, which is what decoupled `§6` from
+  io-error work that has not started.
+- **The bytes are borrowed.** A `Writer` may not keep what it is written — they may be a view of the
+  caller's stack. Nothing in the type says so, so it is *checked*: escape analysis rejects an
+  implementation whose `write` lets its parameter outlive the call, which is what licenses a
+  renderer to pass a stack-backed slice through a trait object at all (`05`).
+
+`*self` on both methods is what makes a writer stateful — a counter, a latch, a buffer — while
+staying object-safe for a raw object (`02`), so a sink needs no allocator.
+
+**Which writers the prelude supplies: neither, and that is deliberate.** The two that `print` and
+`str` themselves need are the compiler's, because neither has a *type* sysl can give it — a writer
+over standard output holds no state and there is no struct with no fields, and a growable byte
+buffer is `07`'s *Not yet*. What a program writes for itself is an ordinary `impl Writer for
+MyThing`, which is the case the trait exists for. The standard-output writer's `write` is the
+prelude's own `putbytes`, so the one function a freestanding target replaces is still that one.
 
 ## 3. One dispatch rule for operators
 
@@ -308,17 +337,33 @@ They differ in *where* the rendering goes, and that difference is what splits th
 requirements:
 
 - **`print(x)` writes to the output sink and allocates nothing.** It calls
-  `Display::display(x, out)` with the standard output writer, so it is available in a `no alloc`
-  module — a kernel supplies a UART writer and logs with the same builtin application code uses.
+  `Display::display(x, out, fmt)` with the standard output writer, so it is available in a
+  `no alloc` module — a kernel supplies a UART writer and logs with the same builtin application
+  code uses.
 - **`str(x)` materializes a `string`**, so it renders into a growable buffer and returns it.
   Building that buffer is an allocating string operation, so **`str` requires `alloc`** while
   `print` does not. The requirement lands on the operation that actually allocates rather than on
   the trait, which is the point of the sink signature (`§2`).
 
-This removes the current special case where `str`/`print` accept only a fixed set of scalar types
-and reject everything else with "cannot make a string of a …". That message becomes the ordinary
-"`T` is not `Display`" — a missing-bound or missing-impl diagnostic like any other. A user type
-prints once it has `impl Display`, which is the capability `08`/`tast.scala` were waiting on.
+This removes the special case where `str`/`print` accepted only a fixed set of scalar types and
+rejected everything else with "cannot make a string of a …". That message is now a missing-impl or
+missing-bound diagnostic like any other, and it names what to write: `cannot print a Q value — write
+an 'impl Display for Q' to say how it renders`. A user type prints once it has `impl Display`, which
+is the capability `08`/`tast.scala` were waiting on.
+
+**How the three forms differ, as built.** A **scalar** keeps its direct path in `print` — `§8 b`'s
+answer, since the two renderings are identical and the one that does not build a sink is the one to
+emit — and keeps its own `str`, which allocates the string directly. Everything else reaches
+`display`: `print(x)` supplies the standard-output sink, and `str(x)` supplies a growable buffer
+whose bytes become the string. An `f"…"` hole is `str` with the written specifier instead of the
+neutral one, and only for a type that renders itself: `%s` on an integer stays the mistake it was,
+rather than quietly becoming a rendering that drops the width the programmer asked for.
+
+`x.display(out, fmt)` works on a **built-in** too, and has to: a `Display` for a struct renders the
+struct's own fields, and if `self.x.display(out, fmt)` on an `int` did not resolve, every such
+implementation would have to leave the allocation-free path to render a number. A built-in has no
+`impl` block, so what the call lowers to is the prelude renderer its membership provides — `5.add(3)`
+exactly (`§5`), one row further down the catalog.
 
 ## 7. What stays deferred
 
@@ -351,51 +396,29 @@ prints once it has `impl Display`, which is the capability `08`/`tast.scala` wer
   types to write one for. This matches Swift's library protocols the compiler privileges. What is
   still open is the *module* question `13` owns — which module the catalog lives in once there is
   more than one — not whether it is source.
-- **b. Whether `str`/`print` desugar through the *same* `Display::display` for scalars, or keep
-  the scalar fast path and route only user types through the method.** Semantically identical;
-  a codegen choice about whether a scalar render is a call or inlined. Default to inlined for
-  scalars (no behavioural difference, no call overhead).
+- **b. ~~Whether `str`/`print` desugar through the *same* `Display::display` for scalars.~~
+  Settled: the scalar keeps its own path.** `print(5)` still calls the prelude renderer for its
+  width and `str(5)` still builds the string directly, so a program that prints only numbers builds
+  no sink and carries no method table. A scalar's `display` exists all the same, and is what
+  `x.display(out, fmt)` reaches — the two agree to the byte, which is what made the choice free.
 - **c. `Ord` totality and `NaN`.** `Ord` on a float uses IEEE `<`, which is not a total order at
   `NaN`. §2 keeps the scalars on their native ordered comparisons rather than on the derived ones
   precisely so this stays today's behaviour; whether a separate total-order facility is ever wanted
   (for sort keys) is deferred, not decided here. A neighbouring question this chapter does *not*
   answer: `!=` on floats lowers to `fcmp one`, so `NaN != NaN` is false where IEEE says true. That
   is a pre-existing scalar-semantics question for `01`, not a consequence of anything here.
-- **d. The `Writer` sink surface.** `Display::display` writes into a `*Writer` (§2), but the
-  `Writer` trait itself is unspecified: what its write method takes (`[]u8`, `string`, or both),
-  what it returns when the underlying sink fails, and which writers the prelude supplies — a
-  standard-output one for `print`, a growable-buffer one for `str`, and whatever a freestanding
-  target registers. **This is the one dependency blocking implementation of §6**, and it wants the
-  prelude surface `13` leaves open. Nothing in §1–§5 waits on it.
+- **d. ~~The `Writer` sink surface.~~ Settled — see `§2`.** One method on `[]u8`, a latched
+  `failed` rather than a returned error, and the format specifier passed alongside the sink rather
+  than folded into it. The last of those is Rust's `Formatter` capability without Rust's packaging:
+  a `Formatter` carries the spec *and* is the sink, which is the only reason `{:>10}` works on a
+  user type there; separating them gets the same reach and keeps the sink a plain trait a kernel
+  can implement.
 
-  What used to sit under it no longer does: `*Writer` is a trait object, and trait objects are now
-  built (`02`), so a signature written here types and dispatches. What is left is the three
-  questions above — a decision rather than a layer.
-
-  A trait object does put one constraint on the answer, worth knowing before it is written: object
-  safety refuses a method that mentions `Self` away from its receiver, so `Writer`'s write method
-  must take `[]u8` (or a `string`) rather than anything phrased in terms of the implementing type.
-  The first note below already wanted exactly that for its own reasons.
-
-  Three notes toward the decision, from Rust:
-
-  - Rust splits the sink in two — `core::fmt::Write` takes a `&str`, `std::io::Write` takes a
-    `&[u8]` with partial writes and a real error. sysl needs only **one, on `[]u8`**: a `string`
-    here *is* a validated byte view of identical layout, so `s.bytes` costs nothing, and the prelude
-    already builds `prints` on `putbytes` for exactly that reason.
-  - Rust's `fmt::Error` carries **no information at all**, because a `Display` impl must compile in
-    `core`, which has no error taxonomy; the real `io::Error` is stashed by an adapter and swapped
-    back at the top. The lesson is that a fallible `Display` taxes every impl for a failure almost
-    no sink has. A **latched** writer — writes return nothing, a `failed` query reports a sticky
-    error — keeps impls straight-line, keeps `print(x)` a statement returning `unit`, and needs no
-    error type designed, which decouples §6 from work that has not started.
-  - Rust's `Display` does not take a bare sink; it takes a `Formatter`, which **also carries the
-    format spec**. That is the only reason `{:>10}` works on a user type. sysl already parses
-    `f"{x:%08d}"` into a real `FormatSpec`, so the same problem is already here: with a bare
-    `*Writer`, a user type could not honour a width without rendering to a temporary and padding it,
-    which allocates — exactly what the sink signature exists to avoid. Passing the spec as a second
-    parameter, rather than conflating it into the sink object, gets Rust's capability without its
-    packaging.
+  What remains open under it is smaller than it was: **no writer honours a `FormatSpec` yet.** The
+  spec reaches every implementation, and a type that wants to act on it can, but the prelude's own
+  renderers ignore it — so `f"${5}%8d"` pads through `snprintf` while `f"${p}%8s"` pads only if `p`
+  says how. Closing that means padding in the renderers, which wants a scratch buffer and is worth
+  doing once rather than six times.
 - **e. ~~Sharing an operand across a trait-dispatched operator.~~ Settled — see `§3`.** A chained
   comparison and a compound assignment each use one operand twice from a single evaluation, and both
   now work on a trait-dispatched type. What settled it was noticing that codegen already holds the

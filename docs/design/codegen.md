@@ -84,6 +84,15 @@ before they appear and may be mutually recursive).
   an object type is expected, so an `if` whose arms are different concrete types meets at one.
   A trait is object-safe when every method has a receiver and mentions `Self` nowhere else,
   which excludes the whole operator catalog of `14` — those traits are for bounds.
+- **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
+  writes itself into a sink rather than returning a string, so rendering allocates nothing and a
+  `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over
+  standard output and `str` supplies a growable buffer whose bytes become the string, and both are
+  the compiler's, because a stateless writer has no struct to be and a growable buffer is not yet
+  something sysl can express. A **scalar** keeps its direct path in `print` and its own `str`, so a
+  program that prints only numbers builds no sink at all. A `Writer` **borrows** the bytes it is
+  written — checked by escape analysis, which is what lets a renderer pass a slice of its own stack
+  buffer through a trait object.
 - **`Option[T]` / `Result[T, E]` and `?`.** Both come from the prelude as ordinary generic
   enums. The postfix `?` unwraps the success payload of one, or returns from the enclosing
   function early with the failure re-wrapped in *that* function's return type — so `?` needs
@@ -242,11 +251,13 @@ arity.
    or literal sub-pattern does not count, so `Wrap(A) | Wrap(B)` covering `Wrap(Inner)` still
    needs an `else`. Guard expressions are evaluated after the pattern matches and its bindings
    are in scope.
-7. **`print`'s renderers are the prelude's, not a `std` I/O surface**, and the desugaring picks one
-   by static type rather than by a `Display` trait — see `04`, *Printing*, for what it retargets to
-   once traits can carry it. A related over-approximation shows up in the output: making a slice
-   turns the ARC runtime on even where the owner is statically null, so a program that only prints
-   an integer still carries the allocator declarations it never calls.
+7. **`print`'s renderers are the prelude's, not a `std` I/O surface**, and the desugaring picks a
+   *scalar's* by static type rather than through its `Display` — deliberately, so a program that
+   prints only numbers builds no sink (`14 §8 b`). A related over-approximation shows up in the
+   output: making a slice turns the ARC runtime on even where the owner is statically null, so a
+   program that only prints an integer still carries the allocator declarations it never calls, and
+   `FormatSpec`'s layout is emitted whether or not anything renders, since a non-generic type is
+   instantiated eagerly wherever it is declared.
 8. **`for` iterates a range, an array, or a slice.** `downTo`, `step`, and `reverse` are not
    yet lowered, and nothing else is iterable — there is no iterator protocol, which is also why
    a string is iterated as `s.bytes` and has no `s.chars` yet.
@@ -265,31 +276,27 @@ arity.
     determines is an error rather than a default. `?` is wired to the prelude's `Option` and
     `Result` **by name**, standing in for the eventual trait that will describe "can be
     short-circuited".
-11. **A `print` of a generic parameter is checked per instantiation, not at its definition.** All of
-    `14 §4` is otherwise implemented. A generic function is analyzed once more with each type
-    parameter standing in for itself; a method call and an *operator* on one both resolve through
-    the union of its bounds' traits; and `sum[T](a, b) = a + b` is diagnosed on its own line as
-    needing `T: Add`, whether or not anything instantiates it. Forwarding a parameter to a bounded
-    callee is checked the same way: a bound is satisfied by a bound.
+11. **No writer honours a format specifier yet.** All of `14` is otherwise implemented, `§4`
+    included: a generic function is analyzed once more with each type parameter standing in for
+    itself; a method call, an *operator*, and a rendering on one all resolve through the union of
+    its bounds' traits; and `sum[T](a, b) = a + b` is diagnosed on its own line as needing
+    `T: Add`, whether or not anything instantiates it. Forwarding a parameter to a bounded callee is
+    checked the same way: a bound is satisfied by a bound.
 
-    What is left is a `print` or a `str` of a parameter, which wants `T: Display` — and `Display` is
-    the one catalog trait that does not exist, because its method writes into a `Writer` and that
-    sink is unspecified (`14 §8 d`). Reporting it at the definition today would reject a body with no
-    bound the author could write to fix it, so the abstract pass drops that complaint and
-    monomorphization catches it at each instantiation, exactly as it always did.
+    What is left is narrower than it looks. A `FormatSpec` reaches every `Display`, and a type that
+    wants to act on its width or precision can — but the prelude's own renderers ignore it, so
+    `f"${5}%8d"` pads through `snprintf` while `f"${p}%8s"` pads only if `p` says how. Closing that
+    means padding inside the renderers, which wants a scratch buffer and is worth doing once rather
+    than six times.
 
     **An unbounded parameter stays perfectly legal** — this is not heading for a language where
     every `[T]` needs a bound. An unbounded `T` supports what every type supports: being passed,
     stored, returned, copied, released. `id[T](x: T) -> T`, `Pair[A, B]`, `pick[T](c, a, b)` need no
     bound now and never will. What needs one is a body that uses a *capability*: a method call, an
-    operator, a rendering.
+    operator, a rendering. That last one is the change a body written before `Display` may feel:
+    `countdown[T](n: int, x: T)` that prints its parameter now says `countdown[T: Display]`, which
+    is the cost of a use being written where the parameter is declared rather than discovered at
+    whichever call site happened to supply a printable type.
 
-    One coupling worth knowing: `print(x)` inside a generic body works today because each
-    instantiation has a concrete type to pick a renderer for. Under abstract checking it needs
-    `T: Display` — the same trait `str` and `format` are waiting on (`04`, *Printing*), so the two
-    arrive together rather than costing separately. `Display` is the one catalog trait the prelude
-    does **not** declare, because its method writes into a `Writer` and that sink is unspecified.
-
-Only the last of these is a divergence from a settled design; the rest are the smallest lowering
-that runs a real program, chosen so the pieces above them (strings, methods, escape analysis) can
-be added without reworking the pipeline shape.
+These are the smallest lowering that runs a real program, chosen so the pieces above them (strings,
+methods, escape analysis) can be added without reworking the pipeline shape.

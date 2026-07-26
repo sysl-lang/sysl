@@ -117,8 +117,11 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport {
           |""".stripMargin) shouldBe "true\n"
   }
 
+  // The bound is `14 §6` working as intended: a body that prints its parameter says so, and the
+  // cost that use imposes is written where the parameter is declared rather than discovered at
+  // whichever call site happened to supply a printable type.
   "a recursive generic function" in {
-    run("""countdown[T](n: int, x: T)
+    run("""countdown[T: Display](n: int, x: T)
           |    if n > 0 then
           |        print(n, x)
           |        countdown(n - 1, x)

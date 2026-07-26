@@ -150,8 +150,37 @@ trait CallAnalysis extends Literals with TraitObjects {
             val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
           case Some(_) => err(s"'$mname' is a property of '$base' — read it as 'value.$mname', without '()'")
-          case None    => builtinMethod(rty, mname, tr, args).getOrElse(err(s"type '$base' has no method '$mname'"))
+          case None =>
+            builtinMethod(rty, mname, tr, args)
+              .orElse(builtinDisplay(rty, mname, tr, args))
+              .getOrElse(err(s"type '$base' has no method '$mname'"))
   }
+
+  /** `5.display(out, fmt)` — the rendering a built-in's `Display` membership provides (`14 §5`).
+   *
+   * It is `5.add(3)`'s sibling and exists for the same reason: a built-in has no `impl` block, so
+   * there is no lowered `int.display` to call. What it has is a renderer the prelude already writes,
+   * declared in the argument order `Display` does, so naming it here is the whole lowering — and it
+   * is what lets a `Display` written for a struct render the struct's own fields without leaving
+   * the allocation-free path the sink exists for.
+   */
+  private def builtinDisplay(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
+    for
+      m           <- Option.when(mname == "display")(traitDecls.get("Display")).flatten
+      sig         <- m.methods.find(_.name == "display")
+      (fname, to) <- CoreTraits.display(rty)
+    yield {
+      val params = sig.params.map(p => (p.name, rt(p.typ)))
+
+      if args.length != params.length then
+        err(s"method 'Display.display' takes ${quantity(params.length, "argument")}, " +
+          s"but ${supplied(args.length, "argument")}")
+
+      val self = widen(buildReceiver(RecvMode.ByValue, recv), to)
+
+      funcsUsed += fname
+      TCall(fname, self :: checkArgs("Display.display", params, args, None), Type.Unit)
+    }
 
   /** `5.add(3)`, `x.lt(y)` — a core-trait method on a type whose membership the compiler provides.
    *

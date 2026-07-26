@@ -15,7 +15,7 @@ import scala.collection.mutable
  * `ControlFlowEmitter` everything that makes a basic block. What stays here is the spine — the
  * module assembly, statements, and the expression dispatch the traits call back into.
  */
-class Codegen private (program: TProgram) extends ControlFlowEmitter with VtableEmitter {
+class Codegen private (program: TProgram) extends ControlFlowEmitter with VtableEmitter with WriterEmitter {
 
   // --- module --------------------------------------------------------------------------
 
@@ -388,6 +388,35 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
 
     case TFormat(arg, spec) =>
       ownTemp(genFormat(arg, spec), Type.Str)
+
+    // A sink with no state: the table is the compiler's and the data word is null, because a writer
+    // over standard output has nothing to point at.
+    case TStdout() =>
+      val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @${stdoutTable()}, 0")
+      val b = freshTemp(); emit(s"$b = insertvalue ${Type.fatPointer} $a, ptr null, 1")
+      b
+
+    // Rendering into a buffer: a zeroed stack slot becomes the sink, the value writes itself into
+    // it, and what landed there is copied into a string the statement owns. The slot is re-zeroed
+    // on every arrival rather than once, since an alloca is hoisted to the entry block and a render
+    // inside a loop meets the same one each time round.
+    case TRender(value, method, spec) =>
+      heap = true
+      request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+
+      val table = bufferTable()
+      val v     = genExpr(value)
+      val s     = genExpr(spec)
+      val slot  = emitAlloca(freshTemp(), bufferLayout)
+
+      emit(s"store $bufferLayout zeroinitializer, ptr $slot")
+      val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$table, 0")
+      val w = freshTemp(); emit(s"$w = insertvalue ${Type.fatPointer} $a, ptr $slot, 1")
+      emit(s"call void @$method(${value.ty.llvm} $v, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
+
+      val r = freshTemp()
+      emit(s"$r = call ${Type.Str.llvm} @sysl.w.buf.finish(ptr $slot)")
+      ownTemp(r, Type.Str)
 
     case TBinary(_, l, r, Type.Str) =>
       ownTemp(strConcat(genExpr(l), genExpr(r)), Type.Str)

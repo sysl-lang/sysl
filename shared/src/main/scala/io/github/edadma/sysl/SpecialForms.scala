@@ -9,19 +9,19 @@ package io.github.edadma.sysl
  *
  * The three `va_*` forms belong here permanently. Each is an **ABI primitive** that no sysl body
  * could implement, in the same category as `sizeof`, so there is nothing to put in the prelude
- * (`12` §9). The other three are the temporary ones: `print` is already a desugaring onto prelude
- * functions and needs only a `Display` trait to become an ordinary call, and `str` and `format`
- * follow it out on the same trait.
+ * (`12` §9). The other three are the temporary ones: all three are now desugarings onto a
+ * `Display`, and what keeps them here is the sink each supplies — standard output for `print`, a
+ * fresh buffer for `str` and `format` — neither of which the prelude can name yet.
  */
-trait SpecialForms extends Literals {
+trait SpecialForms extends CallAnalysis {
 
   /** `print(a, b, …)` — each value rendered by the prelude function its type reaches, a space
    * between and a newline at the end.
    *
-   * This is a **desugaring**, not a builtin: the compiler knows six *names* the way it already
-   * knows `Option`'s variants, and implements no printing of its own. When a `Display` trait exists
-   * it retargets from `printi(x)` to `x.display()` and every program keeps working, which is the
-   * point of putting the seam at a name.
+   * This is a **desugaring**, not a builtin: the compiler knows a handful of *names* the way it
+   * already knows `Option`'s variants, and implements no printing of its own. A scalar reaches the
+   * prelude renderer for its width; everything else reaches its own `Display`, which is what
+   * putting the seam at a name was for.
    *
    * The space and the newline go out as *characters* rather than one-character strings, so that
    * printing a number reaches nothing that allocates: a `string` is reference-counted, and a single
@@ -43,6 +43,10 @@ trait SpecialForms extends Literals {
    * Every argument is widened to the one width its renderer takes — the integers to `long` or
    * `ulong`, the floats to `real` — so the prelude needs one function per *kind* rather than one
    * per type, which sysl has no overloading to hide anyway.
+   *
+   * A scalar keeps this direct path rather than going through its `Display` (`14 §8 b`): the two
+   * render identically, and the one that does not build a sink is the one to emit. Everything else
+   * writes itself into standard output through the trait.
    */
   private def printOne(t: TExpr): TExpr = t.ty match
     case i: Type.Integer if i.signed => callPrelude("printi", widen(t, Type.Integer(64, signed = true)))
@@ -51,14 +55,13 @@ trait SpecialForms extends Literals {
     case Type.Bool                   => callPrelude("printb", t)
     case Type.Char                   => callPrelude("printc", t)
     case Type.Str                    => callPrelude("prints", t)
-    case Type.Unit                   => err("cannot print a unit value")
-    case other                       => err(s"cannot print a ${show(other)} value")
+    case _ =>
+      val (method, value) = displayOf(t, "print")
+
+      TCall(method, List(value, stdout(), plainSpec), Type.Unit)
 
   /** The separator and the terminator `print` puts around its values. */
   private def printChar(c: Char): TExpr = callPrelude("printc", TIntLit(c.toInt, Type.Char))
-
-  /** Widens a value to the width its renderer takes, leaving one that is already there alone. */
-  private def widen(t: TExpr, to: Type): TExpr = if t.ty == to then t else TCast(t, to).setPos(t.pos)
 
   /** A call to a prelude function, built from an already-analyzed argument. Recording the name is
    * what brings the function itself into the program: a prelude declaration nothing reaches is
@@ -71,9 +74,8 @@ trait SpecialForms extends Literals {
     TCall(name, List(arg), rtype)
   }
 
-  /** `str(x)` renders a value of a primitive type, and a `string` as itself. Anything else — a
-   * struct, an enum, a pointer, a slice — has no one string form to give, so asking for one is an
-   * error until a `Display` trait lets a type name its own.
+  /** `str(x)` renders a value of a primitive type, and a `string` as itself. Anything else writes
+   * itself into a buffer through its `Display`, and the bytes that land there become the string.
    */
   protected def strCall(args: List[Expr]): TExpr = {
     if args.length != 1 then err("str takes exactly one value")
@@ -81,12 +83,21 @@ trait SpecialForms extends Literals {
 
     t.ty match
       case _: Type.Integer | _: Type.Floating | Type.Bool | Type.Char | Type.Str => TStr(t)
-      case _ => err(s"cannot make a string of a ${show(t.ty)} value")
+      case _ =>
+        val (method, value) = displayOf(t, "str")
+
+        TRender(value, method, plainSpec)
   }
 
   /** `format(value, "%spec")` renders one value through a printf specifier. It is the desugaring of
    * an `f"…"` hole, so the specifier is always a literal here; the lexer has vetted its shape, and
    * what is left is checking the conversion against the value's type.
+   *
+   * A type that renders itself has no printf conversion, so `%s` is what reaches it — and the
+   * specifier is handed on rather than applied, since only the implementation knows what a width
+   * means for the text it is about to write. A **built-in** keeps the strict check: `%s` on an
+   * integer stays the mistake it was, rather than becoming a rendering that silently drops the
+   * width the programmer asked for.
    */
   protected def formatCall(argExpr: Expr, spec: String): TExpr = {
     val t = analyzeExpr(argExpr)
@@ -96,8 +107,90 @@ trait SpecialForms extends Literals {
       else if FormatSpec.isFloat(c) then t.ty.isInstanceOf[Type.Floating]
       else t.ty == Type.Str
 
-    if !ok then err(s"format '$spec' expects ${FormatSpec.expects(c)}, but the value has type ${show(t.ty)}")
-    TFormat(t, spec)
+    if ok then TFormat(t, spec)
+    else if FormatSpec.isStr(c) && rendersItself(t.ty) then
+      val (method, value) = displayOf(t, "format")
+      val (width, prec, left) = FormatSpec.parts(spec)
+
+      TRender(value, method, specValue(width, prec, left))
+    else err(s"format '$spec' expects ${FormatSpec.expects(c)}, but the value has type ${show(t.ty)}")
+  }
+
+  // --- rendering through Display ---------------------------------------------------------
+
+  /** The `display` a value renders through, and the value in whatever width that renderer takes.
+   *
+   * The three answers are `14 §3`'s one dispatch rule, applied to rendering: a **built-in** reaches
+   * the prelude renderer its membership provides (`§5`), a **user type** the member its `impl`
+   * produced, and a **bounded type parameter** the trait's own method, since which implementation
+   * runs is monomorphization's to decide once a concrete type is known.
+   *
+   * `op` is the form that asked, so a type that renders no way at all is complained about in the
+   * words the programmer wrote rather than in the machinery underneath them.
+   */
+  private def displayOf(t: TExpr, op: String): (String, TExpr) = { checkWriterShape(); t.ty } match
+    case a: Type.Abstract =>
+      if !a.bounds.contains("Display") then boundErr(s"'$op' needs '${a.name}: Display'")
+      ("Display.display", t)
+
+    case ty =>
+      CoreTraits.display(ty) match
+        case Some((name, want)) =>
+          funcsUsed += name
+          (name, widen(t, want))
+
+        case None =>
+          val (base, targs) = memberOwner(ty)
+
+          if !traitImpls.contains(("Display", base)) then
+            val fix = ty match
+              case n: Type.Named => s"write an 'impl Display for ${n.name}' to say how it renders"
+              case _             => "it does not implement 'Display'"
+            val asked = if op == "print" then "cannot print" else "cannot make a string of"
+            err(s"$asked a ${show(ty)} value — $fix")
+
+          val fname = memberFuncName(base, "display", targs)
+
+          funcsUsed += fname
+          (fname, t)
+
+  /** Whether a type renders through an `impl` rather than through a printf conversion — which is
+   * the case `format` hands its specifier on for instead of applying it.
+   */
+  private def rendersItself(ty: Type): Boolean = ty match
+    case a: Type.Abstract => a.bounds.contains("Display")
+    case _                => traitImpls.contains(("Display", ownerKey(ty)))
+
+  /** The compiler's own writers are laid out by hand and reached by slot index, so `Writer`'s shape
+   * is something the emitter depends on rather than merely reads. Checking it here turns a later
+   * edit to the prelude into a failed build instead of a call through the wrong slot.
+   */
+  private def checkWriterShape(): Unit = {
+    val declared = traitDecls.get("Writer").map(_.methods.map(_.name)).getOrElse(Nil)
+
+    if declared != List("write", "failed") then
+      sys.error(s"the compiler's own writers assume 'Writer' declares 'write' then 'failed', " +
+        s"but the prelude declares ${declared.mkString("'", "', '", "'")}")
+  }
+
+  /** Standard output as a sink. Recording `putbytes` is what brings it into the program: the table
+   * this node's writer dispatches through ends at that function, and a prelude declaration nothing
+   * reaches is neither analyzed nor emitted.
+   */
+  private def stdout(): TExpr = {
+    funcsUsed += "putbytes"
+    TStdout()
+  }
+
+  /** The specifier `print` and `str` hand a `Display`: no width, no precision, no justification,
+   * since neither was written with one.
+   */
+  private def plainSpec: TExpr = specValue(0, -1, left = false)
+
+  private def specValue(width: Int, prec: Int, left: Boolean): TExpr = {
+    val s = instantiateStruct("FormatSpec", Nil)
+
+    TStructNew(s, List(TIntLit(width, s.fields.head._2), TIntLit(prec, s.fields(1)._2), TBoolLit(left)))
   }
 
   /** `va_start(ap)` readies a variadic body's tail. C also names the last fixed parameter here;
