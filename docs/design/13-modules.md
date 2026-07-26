@@ -53,27 +53,60 @@ relaxation — the "Step 3b" hack that let a file in `oskit/arch/x86_64/` declar
 `module oskit.arch` — by making the name/location agreement a first-class, checked rule rather
 than a loosened validation.
 
-## 2. Visibility — public by default
+## 2. Visibility — public by default, and `private` means *this file*
 
 A top-level declaration is **public by default**: visible to any module that imports it. Two
-modifiers restrict it, following Scala exactly:
+modifiers restrict it:
 
-- **`private`** — visible only **within its own module** (the directory), across all that
-  module's files, and invisible to importers. This is the everyday internal-helper marker: a
-  function, type, or field that the module uses to build its public surface but does not export.
-- **`private[ancestor]`** — Scala's **scoped** private: visible up to and including a named
-  enclosing module. `private[oskit]` on a member of `oskit.arch` makes it visible throughout
-  `oskit.*` — every sibling and descendant module under `oskit` — but not outside it. This is how
-  a subsystem shares internals across its sub-modules without making them part of the world's
-  API.
+- **`private`** — visible only **within the file that declares it**. Not to sibling files of its
+  own module, not to importers. This is the file-local helper: a declaration that exists to build
+  something in this one file and is not part of even the module's internal surface.
+- **`private[M]`** — **scoped** private, where `M` names the declaring module or one of its
+  ancestors. Visibility extends to that module and everything beneath it. `private[arch]` on a
+  member of `oskit.arch` makes it visible across all of `oskit.arch`'s files — this is the
+  everyday module-internal helper — and `private[oskit]` widens it to every sibling and descendant
+  module under `oskit`, without making it part of the world's API.
+
+So the four levels are one keyword and its scope argument:
+
+| form | visible to |
+|---|---|
+| `private` | this file |
+| `private[own_module]` | every file of this module |
+| `private[ancestor]` | the named ancestor module and its whole subtree |
+| *(unmarked)* | any module that imports it |
 
 ```
 pub_by_default() -> int = 42            // exported
 
-private lookup(fd: int) -> &File = …    // this module only
+private lookup(fd: int) -> &File = …    // this file only
+
+private[arch] scratch: [u8; 64] = …     // every file of oskit.arch
 
 private[oskit] struct FrameHeader …     // anywhere under oskit.*
 ```
+
+**`M` resolves innermost-outward.** The argument is a **simple name**, not a path, and it is
+matched against the enclosing module names from the declaring module outward, first hit winning.
+That disambiguates a repeated segment — `private[geom]` inside `geom/mesh/geom/tri` binds to the
+nearer `geom`. A name matching no enclosing module is an error; there is no way to name an
+unrelated module, so a visibility scope is always a contiguous subtree containing the declaration.
+Because the name is resolved where it is declared, moving a subtree elsewhere does not change what
+its internal `private[M]` annotations mean.
+
+**Why file-scoped and not module-scoped.** This is a deliberate divergence from Scala, where
+`private` means the enclosing class or package. Making the bare form file-scoped costs nothing in
+expressiveness — module-private is exactly `private[own_module]`, the degenerate case of the
+scoped form, so no separate keyword is needed for it — and it buys the one level that provably
+**never crosses a file boundary**. That is the level at which a declaration can be fully inferred,
+mangling can be skipped, and LLVM `internal` linkage applies; everything wider needs an external
+symbol, because §1's shared module scope means a sibling file can call it. §3 of the module-system
+notes develops what rests on that property.
+
+The cost is honest and worth naming: the everyday module-internal helper is now `private[arch]`
+rather than a bare `private`, so the common case is the wordier one. The alternative — a second
+keyword whose only job is the module level — spends a keyword to save a bracket, and leaves the
+file level either unspellable or spelled by something even less obvious.
 
 **Why public-default and not export-on-`pub`.** Rust makes a declaration private until `pub`;
 Scala and Kotlin make it public until restricted, and that is the precedent chosen here. The
@@ -222,6 +255,8 @@ the directory graph, never on how a module's own files refer to one another.
   propagation need a module's bodies or a summary of them across the boundary (`05`,
   `capabilities.md`); the on-disk form of that metadata, and whether modules compile separately or
   the whole graph compiles together, is an implementation decision not settled here.
-- **e. `private[X]` scoping corners.** The exact set of names `X` may take (only ancestor
-  modules, or also sibling paths), and how scoped-private interacts with re-export (b), follows
-  Scala but has corners to pin when the feature is built.
+- **e. `private[M]` and re-export.** §2 settles what `M` may name (the declaring module or an
+  ancestor, as a simple name, resolved innermost-outward) and therefore that a visibility scope is
+  always a contiguous subtree. What is left open is how scoped-private interacts with re-export
+  (b) — whether a facade module may forward a name it can see but its own importers cannot — which
+  cannot be pinned before (b) is.

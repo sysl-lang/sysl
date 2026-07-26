@@ -241,7 +241,8 @@ declared as `impl Trait for Type`, never an inherent method with an operator nam
 - **Static (type-level) properties and stored associated constants.** Associated *functions*
   exist; a type-level constant or computed property (`int.max`, `Point.origin` without the call)
   is deferred with settable properties, since both turn on the same accessor machinery.
-- **Method visibility.** Everything is visible for now; a `pub`/module-private distinction waits
-  on the module system.
+- **Method visibility.** Everything is visible for now; applying `13`'s levels — public by
+  default, `private` for the declaring file, `private[M]` for a module or an ancestor subtree — to
+  methods and to individual fields waits on the module system being built.
 - **Default trait method bodies and trait-level invariants** — those are `02`'s open items, not
   this document's.
