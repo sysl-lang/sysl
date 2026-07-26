@@ -254,27 +254,26 @@ arity.
     determines is an error rather than a default. `?` is wired to the prelude's `Option` and
     `Result` **by name**, standing in for the eventual trait that will describe "can be
     short-circuited".
-11. **A generic body is checked per instantiation, not at its definition** — and this one is a
-    divergence from `10-generics.md` rather than merely less than it. A bound that *is* declared is
-    real: `bounded[T: Show](x)` is enforced at each call site, and instantiating it at a type that
-    does not implement `Show` names the bound it failed. But a bound is not *required*. An
-    unbounded `loose[T](x: T) -> int = x.show()` compiles, and is diagnosed only when something
-    instantiates it at a type with no `show` — which is exactly the C++ template model that `10`
-    rejects in as many words ("only C++ defers to instantiation"). The payoff `10` is after — the
-    error landing on the definition that made the unsupported assumption — is therefore available
-    only to an author who volunteers the bound.
+11. **A generic body's *operators* are checked per instantiation, not at its definition.** The
+    method half of `14 §4` is implemented: a generic function is analyzed once more with each type
+    parameter standing in for itself, a method call on one resolves through the union of its bounds'
+    traits, and an unbounded `loose[T](x: T) -> int = x.show()` is now diagnosed on its own line
+    whether or not anything instantiates it. Forwarding a parameter to a bounded callee is checked
+    the same way: a bound is satisfied by a bound.
 
-    Closing it means checking a generic body **once, abstractly**, with each type parameter
-    treated as an opaque type supporting exactly what its bounds promise. The analyzer has no such
-    mode today: it only ever walks concrete instantiations.
+    What is still per-instantiation is every *other* use of a parameter — an operator, an index, a
+    field access, a `print`. Those wait on the core trait catalog of `14 §2`: until `Add` and
+    `Display` exist there is no bound an author could write to license one, so reporting them at the
+    definition would reject a body with no way to fix it. The abstract pass therefore reports only
+    what a bound could have licensed, and drops its other complaints; monomorphization catches those
+    at each instantiation exactly as it always did. Lifting the suppression is what `14 §4`'s
+    operator half means, and it lands with the catalog.
 
     **An unbounded parameter stays perfectly legal** — this is not heading for a language where
     every `[T]` needs a bound. An unbounded `T` supports what every type supports: being passed,
     stored, returned, copied, released. `id[T](x: T) -> T`, `Pair[A, B]`, `pick[T](c, a, b)` need no
     bound now and never will. What needs one is a body that uses a *capability*: a method call, an
-    operator, a rendering. Of the 35 generic declarations in the tree today, 16 already carry a
-    bound and exactly one of the other 19 uses a capability — so the migration this implies is
-    currently close to empty, and stays that way as long as new generics declare what they use.
+    operator, a rendering.
 
     One coupling worth knowing: `print(x)` inside a generic body works today because each
     instantiation has a concrete type to pick a renderer for. Under abstract checking it needs

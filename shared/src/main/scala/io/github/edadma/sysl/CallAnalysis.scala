@@ -100,10 +100,18 @@ trait CallAnalysis extends Literals {
     if f.bounds.nonEmpty then
       val subst = f.tparams.zip(targs).toMap
       for (tp, traits) <- f.bounds; tr <- traits do
-        val concrete = subst(tp)
-        if !traitImpls.contains((tr, ownerKey(concrete))) then
-          err(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
-            s"but ${show(concrete)} does not")
+        subst(tp) match
+          // A type parameter standing in for itself, during the definition-time pass. It is not a
+          // type anything has an `impl` for, so what it can promise a callee is exactly what its
+          // own bounds promise: a bound is satisfied by a bound.
+          case a: Type.Abstract =>
+            if !a.bounds.contains(tr) then
+              boundErr(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
+                s"but '${a.name}' is not bounded by it")
+          case concrete =>
+            if !traitImpls.contains((tr, ownerKey(concrete))) then
+              err(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
+                s"but ${show(concrete)} does not")
 
   /** The name codegen emits for a member call. A member of a concrete type was hoisted eagerly
    * under `Type.member`; a member of a generic type is instantiated here, from the receiver's own
@@ -122,21 +130,70 @@ trait CallAnalysis extends Literals {
    * `5.show()` takes this path exactly as `p.show()` does.
    */
   protected def callMethod(recv: Expr, mname: String, args: List[Expr]): TExpr = {
-    val tr            = analyzeExpr(recv)
-    val (base, targs) = memberOwner(receiverType(tr.ty))
+    val tr = analyzeExpr(recv)
 
-    memberDecls.get((base, mname)) match
-      case Some(m) if m.receiver.isDefined =>
-        val fname           = memberFuncName(base, mname, targs)
-        val (params, rtype) = funcInsts(fname)
-        if args.length != params.length - 1 then
-          err(s"method '$fname' takes ${quantity(params.length - 1, "argument")}, but ${supplied(args.length, "argument")}")
-        val recvArg  = buildReceiver(m.receiver.get, tr)
-        val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
-        TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
-      case Some(_) => err(s"'$mname' is a property of '$base' — read it as 'value.$mname', without '()'")
-      case None    => err(s"type '$base' has no method '$mname'")
+    receiverType(tr.ty) match
+      case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
+      case rty =>
+        val (base, targs) = memberOwner(rty)
+
+        memberDecls.get((base, mname)) match
+          case Some(m) if m.receiver.isDefined =>
+            val fname           = memberFuncName(base, mname, targs)
+            val (params, rtype) = funcInsts(fname)
+            if args.length != params.length - 1 then
+              err(s"method '$fname' takes ${quantity(params.length - 1, "argument")}, " +
+                s"but ${supplied(args.length, "argument")}")
+            val recvArg  = buildReceiver(m.receiver.get, tr)
+            val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+            TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
+          case Some(_) => err(s"'$mname' is a property of '$base' — read it as 'value.$mname', without '()'")
+          case None    => err(s"type '$base' has no method '$mname'")
   }
+
+  /** `x.m(…)` where `x` is a type parameter, during the definition-time pass of `14 §4`.
+   *
+   * The method is looked up in the traits the parameter's bounds name, and the call checked against
+   * the **trait's** signature rather than any implementation's. That is what makes one walk stand in
+   * for every instantiation: an `impl` conforms to the trait exactly (`Hoisting.checkConformance`),
+   * so a call the trait signature accepts is one every implementation accepts.
+   *
+   * The tree it builds is discarded with the rest of the pass — the name it carries is the trait's,
+   * and which implementation runs is monomorphization's to decide once a concrete type is known.
+   */
+  private def callBoundMethod(a: Type.Abstract, recv: TExpr, mname: String, args: List[Expr]): TExpr = {
+    val declared =
+      a.bounds.flatMap(traitDecls.get).flatMap(t => t.methods.find(_.name == mname).map((t.name, _)))
+
+    declared.headOption match
+      case None => unlicensed(a, mname)
+      case Some((trName, m)) =>
+        reported {
+          val fname = s"$trName.$mname"
+          if m.receiver.isEmpty then
+            err(s"'$mname' is a property of '$trName' — read it as 'value.$mname', without '()'")
+          val params = m.params.map(p => (p.name, resolveType(p.typ, Map.empty)))
+          if args.length != params.length then
+            err(s"method '$fname' takes ${quantity(params.length, "argument")}, " +
+              s"but ${supplied(args.length, "argument")}")
+          val ts    = args.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
+          val rtype = m.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
+          TCall(fname, recv :: checkArgs(fname, params, args, Some(ts)), rtype)
+        }
+  }
+
+  /** The diagnostic for a method no bound licenses. It names the bound that *would* license it,
+   * since the fix is to write that bound rather than to stop making the call — which is the whole
+   * point of checking at the definition instead of at some caller three files away.
+   */
+  private def unlicensed(a: Type.Abstract, mname: String): Nothing =
+    traitDecls.values.filter(_.methods.exists(_.name == mname)).map(_.name).toList match
+      case Nil =>
+        boundErr(s"no trait declares a method '$mname', so no bound on '${a.name}' could license this call")
+      case one :: Nil =>
+        boundErr(s"'$mname' needs '${a.name}: $one'")
+      case many =>
+        boundErr(s"'$mname' needs a bound on '${a.name}' — it is declared by ${many.mkString("'", "', '", "'")}")
 
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
    * The positional constructor `Type(…)` is a different form and is handled elsewhere.

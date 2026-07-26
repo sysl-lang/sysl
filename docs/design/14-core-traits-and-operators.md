@@ -1,6 +1,8 @@
 # Core Traits, Operators, and Definition-Checked Bounds
 
-**Status:** decided; not yet implemented. This is the concrete spec for three things the earlier
+**Status:** decided. **§4's method half is implemented** — a generic body is checked at its
+definition, and a method call on a type parameter resolves through its bounds. Everything else here
+is still unbuilt. This is the concrete spec for three things the earlier
 chapters *decided* but left unbuilt, because all three turn on the same missing layer:
 
 - **`00 §9` / `01` / `08 §"Interaction with traits"`** — operators are trait methods (`+` is
@@ -25,8 +27,14 @@ decision below has a Swift precedent — the exception being `Display`, which fo
 writing to a sink, because Swift has no allocator-free target to answer to (`§2`).
 
 Sections 1–5 are complete and implementable as written. **§6 has one unspecified dependency** —
-the `Writer` sink that `Display` renders into (`§8 d`) — which does not block the definition-time
-checking of §4, the piece the rest of the compiler is waiting on.
+the `Writer` sink that `Display` renders into (`§8 d`).
+
+§4 landed in two parts, and the split is the catalog: a **method** call on a type parameter needs
+only the parameter's own bounds, which are traits a program already writes, so it is built. An
+**operator** on one needs `Add` and friends to exist as traits, and a `print` of one needs
+`Display` — so until §2's catalog is compiler-provided, an operator on a parameter has no bound an
+author *could* write. The definition-time pass therefore reports what a bound could have licensed
+and leaves the rest to monomorphization, which is where those checks have always happened.
 
 ---
 

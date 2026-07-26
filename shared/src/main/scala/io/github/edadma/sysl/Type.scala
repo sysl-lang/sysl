@@ -83,6 +83,23 @@ object Type {
    */
   case object Unknown extends Type { def llvm = "void" }
 
+  /** A type parameter as the body that declares it sees it: opaque, and licensed to do exactly
+   * what `bounds` promise (`14 §4`).
+   *
+   * It exists for the one pass that checks a generic body **at its definition**, where `T` stands
+   * for itself rather than for whatever a call site supplied. A value of it may be copied, passed,
+   * returned, and stored — the operations every sysl value has — and may additionally call a method
+   * one of its bounds declares. Nothing else is licensed.
+   *
+   * It is a diagnostic type, not a lowered one. Monomorphization is still what emits code, and it
+   * never sees this: the pass discards the tree it builds, and `llvm` says so rather than inventing
+   * a representation for a type that has none.
+   */
+  case class Abstract(name: String, bounds: List[String]) extends Type {
+    def llvm: String =
+      throw new IllegalStateException(s"the type parameter '$name' reached codegen")
+  }
+
   /** `*T` — a bare machine address: no length, no refcount, no checks, and a lifetime the
    * programmer keeps track of. The one unsafe primitive, and the reason it is spelled with a
    * sigil is so a reader can find every place a program takes on C's risks.
@@ -188,6 +205,7 @@ object Type {
     case Ref(inner, sync)         => s"&${if sync then "sync " else ""}${show(inner)}"
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem)              => s"[]${show(elem)}"
+    case Abstract(n, _)           => n
     case other                    => other.llvm
 
   /** Whether a type carries no value at run time: `unit`, whose only value is nothing at all, and

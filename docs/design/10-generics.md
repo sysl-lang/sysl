@@ -2,12 +2,14 @@
 
 **Status:** ratifies the generic surface the implementation already carries — type-parameter
 lists on functions, structs, and enums; monomorphization; and bidirectional inference — and
-settles the one decision the code left implicit and got backwards: **bounds**. The
-implementation today is *unbounded* (a type parameter may be used for anything, and a misuse is
-caught only when it is instantiated); this chapter commits sysl to **bounded, definition-checked**
-generics, matching `02-traits.md`'s already-written promise that by-value polymorphism is "a
-generic bounded by the trait, monomorphized," and marks the current unbounded checking as
-bring-up scaffolding to tighten.
+settles the one decision the code left implicit and got backwards: **bounds**. This chapter commits
+sysl to **bounded, definition-checked** generics, matching `02-traits.md`'s already-written promise
+that by-value polymorphism is "a generic bounded by the trait, monomorphized."
+
+The mechanism is specified in `14 §4`, and its **method half is built**: a body's method calls on a
+type parameter are checked once, at the definition, against the parameter's bounds alone. Operators
+on a parameter are still checked per instantiation, because the traits that would license one do
+not exist yet (`14 §2`); `codegen.md` shortcut 11 holds what is left.
 
 This chapter rests on `02-traits.md` (a bound *is* a trait), `03-memory-model.md` (why every
 value is copyable, which decides what an unbounded parameter may do), and `09-enums-and-

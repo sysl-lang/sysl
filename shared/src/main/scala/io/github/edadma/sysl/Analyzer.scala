@@ -70,6 +70,11 @@ class Analyzer private (program: Program)
     for (tname, edecl) <- enumDecls do at(edecl.pos)(recover(())(hoistMembers(tname, edecl.members, members)))
     for impl <- implDecls do at(impl.pos)(recover(())(hoistImpl(impl, members)))
 
+    // Every generic body is checked once here, against its bounds alone, before any instantiation
+    // is looked at. That is what makes `sum[T](a: T, b: T) = a.plus(b)` fail on its own line
+    // instead of at whichever call site first supplied a type without a `plus`.
+    checkAbstractBodies(body)
+
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 
     // A function whose body did not analyze is left out of the program rather than stood in for:
@@ -134,6 +139,42 @@ class Analyzer private (program: Program)
     )
   }
 
+  // --- definition-checked bounds -------------------------------------------------------
+
+  /** Checks every generic body once, at its definition, with each type parameter opaque except for
+   * what its bounds promise (`14 §4`). This is the mechanism `10 §5` committed to, and what tells
+   * sysl's generics apart from a C++ template: a body that assumes more than it declared is wrong
+   * whether or not anything ever instantiates it, and this is where it is told so.
+   *
+   * Only a function that declares its own type parameters is walked. A member of a generic type
+   * inherits the *type's* parameters, and those carry no bounds — there is nowhere to write one —
+   * so holding such a member to its bounds would be holding it to nothing at all.
+   */
+  private def checkAbstractBodies(body: List[Stmt]): Unit = {
+    val generics = body.collect { case f: FuncDecl if f.tparams.nonEmpty => f }
+
+    if generics.nonEmpty then
+      sandboxed {
+        abstractPass = true
+
+        try
+          for f <- generics do
+            currentPos = f.pos
+            recover(())(checkAbstractBody(f))
+        finally abstractPass = false
+      }
+  }
+
+  /** One generic body, analyzed with each of its type parameters substituted by itself. */
+  private def checkAbstractBody(f: FuncDecl): Unit = at(f.pos) {
+    val subst: Map[String, Type] =
+      f.tparams.map(tp => tp -> Type.Abstract(tp, f.bounds.getOrElse(tp, Nil))).toMap
+    val params = f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, subst))))
+    val rtype  = f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, subst))).getOrElse(Type.Unit)
+
+    analyzeBodyWith(f.name, f, subst, params, rtype)
+  }
+
   // --- function bodies -----------------------------------------------------------------
 
   private def analyzeFuncBody(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc =
@@ -141,6 +182,21 @@ class Analyzer private (program: Program)
 
   private def analyzeFuncBodyAt(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
     val (params, rtype) = funcInsts(name)
+
+    analyzeBodyWith(name, f, subst, params, rtype)
+  }
+
+  /** Analyzes one body against a signature it is handed, rather than one looked up in `funcInsts`.
+   * An instantiation's signature is registered there; the definition-time pass of `14 §4` resolves
+   * its own, since a generic declaration has no entry until something instantiates it.
+   */
+  private def analyzeBodyWith(
+      name: String,
+      f: FuncDecl,
+      subst: Map[String, Type],
+      params: List[(String, Type)],
+      rtype: Type,
+  ): TFunc = {
     resetFunction()
     tsubst = subst
     retTy = rtype

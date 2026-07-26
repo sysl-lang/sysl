@@ -165,6 +165,47 @@ trait AnalyzerBase {
   /** Abandons the current region without reporting, because whatever led here already did. */
   protected def poisoned(): Nothing = throw Poisoned()
 
+  /** Whether the analyzer is running the definition-time pass of `14 §4` — a generic body walked
+   * once with its type parameters standing in for themselves.
+   *
+   * The pass exists to report what a body does that its bounds do not license, and those
+   * diagnostics go through `boundErr`. Every *other* complaint the walk raises is dropped while it
+   * is set, because the abstract pass is additive: a mistake in the concrete part of a generic body
+   * is found where it always was, at each instantiation, and reporting it from here as well would
+   * report it against a body no call site may ever ask for.
+   *
+   * That suppression is what the operator half of `14 §4` lifts. Until the core trait catalog of
+   * `§2` exists there is no `T: Add` to write, and no `T: Display` for a body that prints its
+   * parameter, so an unlicensed operator has no bound the programmer could add to fix it.
+   */
+  protected var abstractPass: Boolean = false
+
+  /** Reports something a type parameter's bounds do not license, and abandons the region.
+   *
+   * It records the diagnostic itself rather than raising an `AnalyzerError`, because the abstract
+   * pass drops those: this is the one kind of complaint that pass is for, and it survives whatever
+   * recovery region it was raised inside.
+   */
+  protected def boundErr(msg: String): Nothing = {
+    found += ((msg, currentPos))
+    poisoned()
+  }
+
+  /** Runs `body` with whatever it complains about recorded, rather than dropped as the abstract
+   * pass otherwise drops a complaint.
+   *
+   * It is for the checks that only *exist* in that pass — the arity and argument types of a call on
+   * a type parameter, checked against the trait's signature. Nothing else will ever check them: an
+   * instantiation resolves the same call against a concrete implementation instead, so a mistake
+   * here is caught at the definition or nowhere.
+   */
+  protected def reported[T](body: => T): T =
+    try body
+    catch
+      case AnalyzerError(msg, pos) =>
+        found += ((msg, pos))
+        poisoned()
+
   /** Whether a value of type `got` genuinely cannot stand where a `want` was asked for — an
    * argument against a parameter, a returned value against a declared result.
    *
@@ -258,8 +299,42 @@ trait AnalyzerBase {
   protected def recover[T](fallback: => T)(body: => T): T =
     try body
     catch
-      case AnalyzerError(msg, pos) => found += ((msg, pos)); fallback
-      case Poisoned()              => fallback
+      case AnalyzerError(msg, pos) =>
+        if !abstractPass then found += ((msg, pos))
+        fallback
+      case Poisoned() => fallback
+
+  /** Runs `body` and then restores every table the emitted program is built from.
+   *
+   * The definition-time pass of `14 §4` walks a generic body exactly as an ordinary one is walked,
+   * so it registers instantiations exactly as an ordinary one does — a `Box[T]`, a call to another
+   * generic function, a prelude renderer reached by a `print`. None of those is a real
+   * instantiation: `T` is not a type anything can be laid out at, and nothing at run time reaches
+   * them. Dropping what the pass registered is what keeps a diagnostics-only walk from putting a
+   * type parameter into the emitted module.
+   */
+  protected def sandboxed[T](body: => T): T = {
+    val structs = structInsts.toList
+    val enums   = enumInsts.toList
+    val funcs   = funcInsts.toList
+    val reached = funcsUsed.toList
+    val externs = externsUsed.toList
+    val queued  = pending.toList
+
+    try body
+    finally
+      restore(structInsts, structs)
+      restore(enumInsts, enums)
+      restore(funcInsts, funcs)
+      funcsUsed.clear();   funcsUsed ++= reached
+      externsUsed.clear(); externsUsed ++= externs
+      pending.clear();     pending ++= queued
+  }
+
+  private def restore[K, V](table: mutable.LinkedHashMap[K, V], saved: List[(K, V)]): Unit = {
+    table.clear()
+    table ++= saved
+  }
 
   /** The same, for a region that has no useful value to stand in for a failure — a function
    * whose body did not analyze is simply left out of the program.

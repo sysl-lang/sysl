@@ -332,13 +332,10 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("requires its type parameter 'T' to implement 'Show', but Color does not")
     }
 
-    // A declared bound is enforced, but one is not yet *required*: an unbounded generic body may
-    // call any method, and nothing complains until something instantiates it at a type without
-    // that method. `10-generics.md` rejects exactly this — it is the C++ template model, and the
-    // payoff it names is the error landing on the definition that made the assumption rather than
-    // on a caller. Closing it needs the body checked once with `T` opaque, which the analyzer has
-    // no mode for: it only ever walks concrete instantiations.
-    "an unbounded generic may not call a method its parameter does not promise" ignore {
+    // The definition-time check of `14 §4`: the body is walked once with `T` opaque, so a method
+    // it did not declare a bound for is reported against the definition that assumed it rather
+    // than against whichever caller happened to supply a type without that method.
+    "an unbounded generic may not call a method its parameter does not promise" in {
       err(
         """trait Show
           |    show(self) -> int
@@ -349,6 +346,124 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |loose[T](x: T) -> int = x.show()
           |print(loose(P(7)))""".stripMargin
       ) should include("'show' needs 'T: Show'")
+    }
+  }
+
+  /** `14 §4` — a generic body is checked once, at its definition, with each type parameter opaque
+   * except for what its bounds promise. What separates this from the template model is that the
+   * body is wrong on its own, so the diagnostic does not wait for a call site to expose it.
+   */
+  "definition-checked bounds" - {
+    val show = "trait Show\n    show(self) -> int\n"
+
+    "a generic nothing instantiates is still checked" in {
+      err(s"${show}loose[T](x: T) -> int = x.show()\nprint(1)") should
+        include("'show' needs 'T: Show'")
+    }
+
+    "the bound is what licenses the call" in {
+      ir(
+        s"""${show}struct P
+           |    v: int
+           |impl Show for P
+           |    show(self) -> int = self.v
+           |render[T: Show](x: T) -> int = x.show()
+           |print(render(P(7)))""".stripMargin
+      ) should include("@P.show")
+    }
+
+    "the union of several bounds is available" in {
+      ir(
+        s"""${show}trait Size
+           |    size(self) -> int
+           |struct P
+           |    v: int
+           |impl Show for P
+           |    show(self) -> int = self.v
+           |impl Size for P
+           |    size(self) -> int = 1
+           |both[T: Show + Size](x: T) -> int = x.show() + x.size()
+           |print(both(P(7)))""".stripMargin
+      ) should include("@P.size")
+    }
+
+    // Nothing else will check these: an instantiation resolves the same call against a concrete
+    // implementation, so a call that disagrees with the *trait* is caught here or nowhere.
+    "the call is checked against the trait's signature, not an implementation's" in {
+      err(s"${show}render[T: Show](x: T) -> int = x.show(1)\nprint(1)") should
+        include("method 'Show.show' takes 0 arguments, but 1 argument was given")
+
+      err(
+        """trait Scale
+          |    by(self, n: int) -> int
+          |render[T: Scale](x: T) -> int = x.by("a")
+          |print(1)""".stripMargin
+      ) should include("'n' of 'Scale.by' is int, but string was given")
+    }
+
+    "a method no trait declares names no bound to add" in {
+      err("loose[T](x: T) -> int = x.nope()\nprint(1)") should
+        include("no trait declares a method 'nope'")
+    }
+
+    "a method two traits declare offers both bounds" in {
+      err(
+        s"""${show}trait Render
+           |    show(self) -> int
+           |loose[T](x: T) -> int = x.show()
+           |print(1)""".stripMargin
+      ) should include("it is declared by 'Show', 'Render'")
+    }
+
+    // A parameter's bounds are what it can promise a callee, so forwarding one to a bounded
+    // parameter needs the bound written on both.
+    "an unbounded parameter cannot satisfy a callee's bound" in {
+      err(
+        s"""${show}render[T: Show](x: T) -> int = x.show()
+           |outer[U](x: U) -> int = render(x)
+           |print(1)""".stripMargin
+      ) should include("requires its type parameter 'T' to implement 'Show', but 'U' is not bounded by it")
+    }
+
+    "a bound satisfies the same bound" in {
+      ir(
+        s"""${show}struct P
+           |    v: int
+           |impl Show for P
+           |    show(self) -> int = self.v
+           |render[T: Show](x: T) -> int = x.show()
+           |outer[U: Show](x: U) -> int = render(x)
+           |print(outer(P(7)))""".stripMargin
+      ) should include("@P.show")
+    }
+
+    // The operations every sysl value has need no bound, so a generic that only moves its
+    // parameter around stays legal with nothing declared about it.
+    "moving a value around needs no bound" in {
+      irMain(
+        """id[T](x: T) -> T = x
+          |keep[T](x: T) -> T
+          |    var y = x
+          |    y
+          |print(id(3))
+          |print(keep(4))""".stripMargin
+      ) should include("@keep.int")
+    }
+
+    // The pass walks the body exactly as an ordinary one is walked, so it registers `Box[T]` on
+    // the way through. A type parameter is not something anything can be laid out at, and nothing
+    // at run time reaches it, so what the pass registered must not survive into the module.
+    "the pass leaves no type parameter in the emitted module" in {
+      val out = ir(
+        """struct Box[T]
+          |    value: T
+          |wrap[T](x: T) -> Box[T] = Box(x)
+          |var b = wrap(3)
+          |print(b.value)""".stripMargin
+      )
+
+      out should include("%struct.Box.int")
+      out should not include "Box.T"
     }
   }
 

@@ -181,6 +181,10 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
     // `never` has no values, so nothing ever starts at one: every path that would need this
     // diverges before reaching it.
     case Type.Never       => sys.error("unreachable zero of 'never'")
+    // A type parameter reaches codegen from nowhere: the pass that stands one in for itself is
+    // for diagnostics and throws its tree away, and monomorphization substitutes a concrete type
+    // before anything is emitted.
+    case _: Type.Abstract => sys.error("unreachable zero of a type parameter")
 
   // --- statements ----------------------------------------------------------------------
 
