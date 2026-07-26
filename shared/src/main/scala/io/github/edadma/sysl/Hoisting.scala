@@ -38,13 +38,10 @@ trait Hoisting extends TypeResolution {
       traitDecls(t.name) = t
       if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
       for m <- t.methods do
-        // A property's declaration form *is* its body (`name -> T = expr`), so a trait has no way to
-        // ask for one without also answering it. Reported here rather than left to the grammar, so
-        // the message says what is missing instead of where the parse stopped.
-        if m.isProperty then
-          at(m.pos)(err(s"a trait cannot declare a property yet — '${t.name}.${m.name}' would need a " +
-            "signature form of its own, and only methods have one"))
-        if m.receiver.isEmpty && m.body.nonEmpty then
+        // A property carries its receiver without writing one, so the reading below — no receiver
+        // and a body, which for a method means a default with nothing to work on — is not what a
+        // property with a body is. That one is a default property, and it is allowed.
+        if m.receiver.isEmpty && !m.isProperty && m.body.nonEmpty then
           at(m.pos)(err(s"'${t.name}.${m.name}' has no receiver, so a default body has no value to " +
             "work on — give it a 'self' parameter or drop the body"))
         // No implementation could supply one either, so the trait is where it is worth saying so.
@@ -290,13 +287,13 @@ trait Hoisting extends TypeResolution {
         if ty == Type.VaList then err("a va_list is an ABI primitive, not something to implement a trait for")
         (ty, ownerKey(ty), Set.empty, "field")
 
-  /** Verifies that `impl` supplies the methods `tr` declares, each with an identical resolved
-   * signature, and yields the **defaults it inherits** — the trait methods it did not write and does
-   * not have to, because the trait supplied a body for them.
+  /** Verifies that `impl` supplies the members `tr` declares, each with an identical resolved
+   * signature, and yields the **defaults it inherits** — the members it did not write and does not
+   * have to, because the trait supplied a body for them.
    *
-   * A method the trait declares without a default and the block leaves out, a method the trait does
-   * not declare at all, or a mismatched receiver, parameter, or result is reported against the trait
-   * it fails to satisfy.
+   * A member the trait declares without a default and the block leaves out, a member the trait does
+   * not declare at all, or a mismatched kind, receiver, parameter, or result is reported against the
+   * trait it fails to satisfy.
    */
   private def checkConformance(tr: TraitDecl, impl: ImplDecl, self: Map[String, Type]): List[MethodDecl] = {
     val declared  = tr.methods.map(_.name).toSet
@@ -307,14 +304,21 @@ trait Hoisting extends TypeResolution {
         case Some(im) => checkSignature(impl.forType, impl.traitName, tm, im, self)
         case None if tm.body.nonEmpty => inherited += tm
         case None =>
-          err(s"'${impl.forType}' does not implement '${impl.traitName}': method '${tm.name}' is missing")
+          err(s"'${impl.forType}' does not implement '${impl.traitName}': ${kind(tm)} '${tm.name}' is missing")
 
     for im <- impl.methods do
       if !declared.contains(im.name) then
-        err(s"trait '${impl.traitName}' declares no method '${im.name}', so this 'impl' cannot define it")
+        err(s"trait '${impl.traitName}' declares no ${kind(im)} '${im.name}', so this 'impl' cannot define it")
 
     inherited.toList
   }
+
+  /** What a diagnostic calls one member of a trait. The three kinds are told apart by shape rather
+   * than by a keyword, so a message that names the wrong one sends the reader looking for the wrong
+   * mistake.
+   */
+  private def kind(m: MethodDecl): String =
+    if m.isProperty then "property" else if m.receiver.isEmpty then "associated function" else "method"
 
   /** Compares one implementing method against the trait's signature: same receiver mode, same
    * parameter types in order, and the same result.
@@ -331,6 +335,16 @@ trait Hoisting extends TypeResolution {
       im: MethodDecl,
       self: Map[String, Type],
   ): Unit = {
+    // Which *kind* of member it is comes first, because two of the three kinds have no receiver
+    // between them: a property and an associated function both answer `None`, so the receiver
+    // comparison below would let one stand for the other without ever noticing.
+    if tm.isProperty != im.isProperty then
+      if tm.isProperty then
+        err(s"'${im.name}' is a property of trait '$traitName', so an implementation writes it as " +
+          s"'${im.name} -> …' with no parameter list")
+      else
+        err(s"'${im.name}' is a method of trait '$traitName', so an implementation writes it with a " +
+          "parameter list — a property has none")
     if tm.receiver != im.receiver then
       err(s"method '${im.name}' of 'impl $traitName for $forType' takes a different receiver than the trait declares")
     if tm.params.length != im.params.length then
@@ -364,12 +378,11 @@ trait Hoisting extends TypeResolution {
   /** The `self` parameter a member's receiver becomes, at the self type it is a member of. A
    * property's receiver is an implicit by-value read; an associated function has none.
    */
-  private def receiverParam(m: MethodDecl, selfRef: TypeRef): Option[Param] = m.receiver match
-    case Some(RecvMode.ByValue)     => Some(Param("self", selfRef))
-    case Some(RecvMode.ByPtr)       => Some(Param("self", PtrType(selfRef)))
-    case Some(RecvMode.ByRef(sync)) => Some(Param("self", RefType(selfRef, sync)))
-    case None if m.isProperty       => Some(Param("self", selfRef))
-    case None                       => None
+  private def receiverParam(m: MethodDecl, selfRef: TypeRef): Option[Param] = m.recvMode.map {
+    case RecvMode.ByValue     => Param("self", selfRef)
+    case RecvMode.ByPtr       => Param("self", PtrType(selfRef))
+    case RecvMode.ByRef(sync) => Param("self", RefType(selfRef, sync))
+  }
 
   /** Every trait default, as the generic function each one is: one type parameter, `Self`, bounded
    * by the trait that declared it.
@@ -379,6 +392,10 @@ trait Hoisting extends TypeResolution {
    * of `14 §4` check it once, at the trait, with the machinery a bounded generic already uses. The
    * declarations exist only for that walk; the body a program runs is the copy `hoistImpl` makes for
    * each implementing type.
+   *
+   * A **property** with a body is a default like any other, and needs nothing said about it here: its
+   * declaration form already carries a body, so the only question was whether the trait was allowed
+   * to write one, and the receiver it never spelled becomes a `self` parameter the same way.
    */
   protected def traitDefaults: List[FuncDecl] =
     for

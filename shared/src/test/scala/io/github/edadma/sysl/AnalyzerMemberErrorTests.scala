@@ -829,14 +829,14 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       err("same[T](a: T, b: T) -> bool = a == b") should include("'==' needs 'T: Eq'")
     }
 
-    // Every other unlicensed use names a bound that would allow it; a field names none, because a
-    // trait promises methods and a field is layout. So this one is settled at the definition
-    // outright rather than deferred to whatever types turn up — which `10 §5` already said.
+    // Every other unlicensed use names a bound that would allow it. This one names none — nothing
+    // declares a property `v`, and a *field* is layout, which no bound reaches. So it is settled at
+    // the definition outright rather than deferred to whatever types turn up (`10 §5`).
     "a field read off a type parameter is refused outright, with no bound to suggest" in {
       val out = err("first[T](x: T) -> int = x.v")
 
       out should include("has no fields to read")
-      out should include("a bound promises methods, not a layout")
+      out should include("no trait declares a property 'v'")
     }
 
     "a field read is refused even where every instantiation would have had the field" in {

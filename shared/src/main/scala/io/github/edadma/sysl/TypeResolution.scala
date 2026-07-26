@@ -109,9 +109,11 @@ trait TypeResolution extends AnalyzerBase {
    * `Self` result has no size to hand back. That excludes every trait in the operator catalog —
    * `add(self, rhs: Self) -> Self` first among them — which is why those traits are for bounds.
    *
-   * An associated function has no receiver to dispatch on. And `&self` asks for its receiver to be
-   * inside a reference-counted box, which only the counted object has: `&Trait` carries one, so it
-   * accepts such a method, and `*Trait` points straight at a value and does not.
+   * An associated function has no receiver to dispatch on. A **property** does — it just never spells
+   * one — so a trait that asks for a property is as object-safe as one that asks for a method, and
+   * the slot it gets is the same slot. And `&self` asks for its receiver to be inside a
+   * reference-counted box, which only the counted object has: `&Trait` carries one, so it accepts
+   * such a method, and `*Trait` points straight at a value and does not.
    */
   protected def checkObjectSafe(name: String, sigil: String): Unit = {
     val obj = s"'$sigil$name'"
@@ -123,7 +125,7 @@ trait TypeResolution extends AnalyzerBase {
       case ArrayType(_, e)    => mentionsSelf(e)
 
     for m <- traitDecls(name).methods do
-      if m.receiver.isEmpty then
+      if m.recvMode.isEmpty then
         err(s"'$name' declares the associated function '${m.name}', which has no receiver to " +
           s"dispatch on — so there is no $obj to form")
       if m.receiver.exists(_.isInstanceOf[RecvMode.ByRef]) && sigil == "*" then

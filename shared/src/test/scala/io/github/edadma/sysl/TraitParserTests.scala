@@ -129,9 +129,9 @@ class TraitParserTests extends AnyFreeSpec with ParseSupport {
     )
   }
 
-  // A trait cannot ask for a property yet, and the point of parsing one is that the analyzer gets
-  // to say so — a parse error would only report where the parse stopped.
-  "a property in a trait parses, and is refused by name" in {
+  // A property signature is the one member shape with neither a parameter list nor a body, so it is
+  // told from a method by what does *not* follow the name.
+  "a property signature in a trait parses as a member with no parameters" in {
     val src =
       """trait Sized
         |    size -> int""".stripMargin

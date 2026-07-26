@@ -136,6 +136,11 @@ mutate it, so no sigil is written and none is needed. Inside the body, `self` is
 refers to the instance. A property is read-only for now; a settable property (a paired getter
 and setter, so `p.name = v` runs code) is a later addition and is noted under *Not yet*.
 
+Dropping the body leaves the **signature** form, `name -> type`, which is what a trait writes to ask
+an implementation for a property (`02`). That the receiver is unwritten changes nothing about the
+member being an instance member: it dispatches through a bound and through a trait object's table
+exactly as a method does, and the parentheses are the only thing missing at either end.
+
 The point of the no-parens form is honesty about cost that a systems reader depends on: `s.len`
 is O(1) and reads like the field it nearly is, while `s.copy()` allocates and is written with
 the parentheses that mark a call. A property should therefore be cheap — a field-like projection

@@ -42,6 +42,17 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
       |o.go()
       |print(o.v())""".stripMargin
 
+  private val withProperty =
+    """trait Sized
+      |    size -> int
+      |struct Box
+      |    n: int
+      |impl Sized for Box
+      |    size -> int = self.n
+      |var b = Box(7)
+      |var s: *Sized = &b
+      |print(s.size)""".stripMargin
+
   "the table" - {
     // The order is the trait's declaration order, which is what a call site indexes by, and a
     // `*self` method's receiver already is the data word — so that slot names the implementation
@@ -93,6 +104,21 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
 
       body should include("%t1 = getelementptr %arc.S, ptr %d, i32 0, i32 2")
       body should include("%t2 = load %struct.S, ptr %t1")
+    }
+  }
+
+  "a property" - {
+    // A property's receiver is by value and never written, so it takes a slot and an adapter exactly
+    // as a by-value method does — which is the whole of what declaring one in a trait cost.
+    "takes a slot like a method, with the by-value adapter one needs" in {
+      ir(withProperty) should include("@vt.Sized.Box = private constant [1 x ptr] [ptr @vt.adapt.Box.size]")
+      defineOf(ir(withProperty), "vt.adapt.Box.size") should include("%t1 = load %struct.Box, ptr %d")
+    }
+
+    // Reading one is the indirect call a method is, with nothing after the data word: the absent
+    // parentheses are the source's, not the table's.
+    "reads through the slot, passing the data word and no arguments" in {
+      mainOf(ir(withProperty)) should include regex raw"call i32 %t\d+\(ptr %t\d+\)"
     }
   }
 

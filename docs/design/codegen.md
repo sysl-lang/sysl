@@ -82,14 +82,19 @@ before they appear and may be mutually recursive).
   its implementation declared. A slot whose receiver already *is* the data word holds the
   implementation directly; the rest hold a small adapter. Erasure is a coercion applied wherever
   an object type is expected, so an `if` whose arms are different concrete types meets at one.
-  A trait is object-safe when every method has a receiver and mentions `Self` nowhere else,
+  A trait is object-safe when every member has a receiver and mentions `Self` nowhere else,
   which excludes the whole operator catalog of `14` — those traits are for bounds.
-- **Default method bodies (`02`).** A trait method written with a body is one an `impl` inherits
-  unless it writes its own, and a trait whose every method has one needs no block at all. The body
+- **Default bodies (`02`).** A trait member written with a body is one an `impl` inherits
+  unless it writes its own, and a trait whose every member has one needs no block at all. The body
   is checked once at the trait, as a generic function over `Self` bounded by that trait, so it may
   assume exactly what the trait declares — and then **copied per implementing type** under that
   type's own `Type.method` name, which is why a call, a vtable slot, and the escape summary all find
   an ordinary function. The prelude uses one: `Writer.failed` defaults to `false`.
+- **Properties as trait members (`02`).** A trait asks for one by dropping the body from `08`'s
+  property form (`size -> int`), and an `impl` supplies it. A property has a receiver it never
+  spells — by value — so it needs nothing of its own at either dispatch: a bound licenses `x.size`
+  the way it licenses a call, and an object reads one through a table slot beside the methods. What
+  a bound still never reaches is a **field**, since a field is layout rather than behaviour.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over
@@ -288,16 +293,18 @@ arity.
     included: a generic function is analyzed once more with each type parameter standing in for
     itself; a method call, an *operator*, and a rendering on one all resolve through the union of
     its bounds' traits; and `sum[T](a, b) = a + b` is diagnosed on its own line as needing
-    `T: Add`, whether or not anything instantiates it. Forwarding a parameter to a bounded callee is
-    checked the same way: a bound is satisfied by a bound. A trait's default bodies go through the
-    same pass, bounded by their own trait.
+    `T: Add`, whether or not anything instantiates it. A **property** a bound declares resolves the
+    same way, since a property is behaviour that happens to read like a field. Forwarding a parameter
+    to a bounded callee is checked the same way too: a bound is satisfied by a bound. A trait's
+    default bodies go through the same pass, bounded by their own trait.
 
     The pass reaches what a bound could license and no further. A mistake that needs the *concrete*
     type to settle — a result that disagrees with its declared type for reasons `Self` alone cannot
     decide — is caught where every other concrete mistake in a generic body is, at each
     instantiation. So a generic nothing calls, or a trait nothing implements, gets its bounds checked
     and nothing more. A field read is deliberately not in that category: no bound could ever license
-    one, so it is settled at the definition (`10 §5`).
+    one — a field is layout, not behaviour — so it is settled at the definition (`10 §5`), and the
+    diagnostic says so after finding that no trait declares a property of the name either.
 
     A `FormatSpec` is now **acted on** as well as delivered. Every prelude renderer ends at one
     `display_pad`, so `f"${p}%8s"` puts a type's own text in a field of eight exactly as

@@ -168,7 +168,18 @@ case class MethodDecl(
     params: List[Param],
     retType: Option[TypeRef],
     body: List[Stmt],
-) extends Positioned
+) extends Positioned {
+
+  /** The mode this member takes its receiver in, or `None` for an associated function — which is the
+   * one kind that has no receiver at all.
+   *
+   * A property's is by value and unwritten, so asking `receiver` about one answers `None` and means
+   * something else entirely. Everything that dispatches on a receiver — a lowered `self` parameter,
+   * a vtable slot, the object-safety rule — asks here instead, and a property is then the instance
+   * member it is rather than a shape each of those has to special-case.
+   */
+  def recvMode: Option[RecvMode] = receiver.orElse(Option.when(isProperty)(RecvMode.ByValue))
+}
 
 sealed trait Stmt extends Positioned
 

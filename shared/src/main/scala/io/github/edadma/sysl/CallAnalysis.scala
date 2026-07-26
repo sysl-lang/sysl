@@ -230,8 +230,11 @@ trait CallAnalysis extends Literals with TraitObjects {
       case Some((trName, m)) =>
         reported {
           val fname = s"$trName.$mname"
-          if m.receiver.isEmpty then
+          if m.isProperty then
             err(s"'$mname' is a property of '$trName' — read it as 'value.$mname', without '()'")
+          if m.receiver.isEmpty then
+            err(s"'$mname' is an associated function of '$trName', so it has no receiver — a value " +
+              "cannot be the thing it is called on")
           // `Self` in the trait's signature is the parameter itself here, which is what makes
           // `Add::add` yield a `T` and `Ord::lt` a `bool` inside a body that has not met a concrete
           // type yet (`14 §4`).
@@ -245,6 +248,46 @@ trait CallAnalysis extends Literals with TraitObjects {
           TCall(fname, recv :: checkArgs(fname, params, args, Some(ts)), rtype)
         }
   }
+
+  /** `x.p` where `x` is a type parameter and `p` is a property one of its bounds declares — the read
+   * `callBoundMethod` is to a call, checked the same way and for the same reason.
+   *
+   * A field would be refused here whatever the bounds said, because a field is layout and no promise
+   * about behaviour reaches one (`10 §5`). A property is the opposite case: it is behaviour that
+   * happens to be spelled like a field, so a trait can promise it, and a bounded body may read one
+   * exactly as it may call a method.
+   */
+  protected def readBoundProperty(a: Type.Abstract, recv: TExpr, name: String): TExpr = {
+    val declared =
+      a.bounds.flatMap(traitDecls.get).flatMap(t => t.methods.find(_.name == name).map((t.name, _)))
+
+    declared.headOption match
+      case None => unlicensedProperty(a, name)
+      case Some((trName, m)) =>
+        reported {
+          if !m.isProperty then
+            err(s"'$name' is a method of '$trName' — call it with '$name(…)'")
+          val self  = selfBinding(a)
+          val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
+          TCall(s"$trName.$name", List(recv), rtype)
+        }
+  }
+
+  /** The diagnostic for a property read that no bound licenses.
+   *
+   * With no trait declaring one of that name there is nothing a bound could be, and the honest
+   * complaint is the older one about a field: a type parameter has no layout to read. Where a trait
+   * *does* declare it, the fix is the bound, and naming it is what checking at the definition is for.
+   */
+  private def unlicensedProperty(a: Type.Abstract, name: String): Nothing =
+    traitDecls.values.filter(_.methods.exists(m => m.name == name && m.isProperty)).map(_.name).toList match
+      case Nil =>
+        boundErr(s"'${a.name}' is a type parameter, so it has no fields to read — a field is layout, " +
+          s"and no trait declares a property '$name' that a bound could promise instead")
+      case one :: Nil =>
+        boundErr(s"'$name' needs '${a.name}: $one'")
+      case many =>
+        boundErr(s"'$name' needs a bound on '${a.name}' — it is declared by ${many.mkString("'", "', '", "'")}")
 
   /** `obj.m(…)` on a `*Trait` or a `&Trait` — the dynamic half of `02`.
    *
@@ -261,6 +304,8 @@ trait CallAnalysis extends Literals with TraitObjects {
       case None =>
         err(s"trait '${t.name}' declares no method '$mname' — it has " +
           decl.methods.map(_.name).mkString("'", "', '", "'"))
+      case Some((m, _)) if m.isProperty =>
+        err(s"'$mname' is a property of '${t.name}' — read it as 'value.$mname', without '()'")
       case Some((m, slot)) =>
         val params = m.params.map(p => (p.name, rt(p.typ)))
         val fname  = s"${t.name}.$mname"
@@ -273,6 +318,24 @@ trait CallAnalysis extends Literals with TraitObjects {
         val rtype = m.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
 
         TVCall(recv, slot, checkArgs(fname, params, args, Some(ts)), rtype)
+  }
+
+  /** `obj.p` on a `*Trait` or a `&Trait` — a property read through the table, which is the same
+   * indirect call a method is with no arguments to pass and no parentheses to write.
+   *
+   * An object has no fields at all: the layout is exactly what erasure forgot. So every name read off
+   * one is either a property the trait declares or a mistake, and the second half of this says which.
+   */
+  protected def readTraitObjectProperty(recv: TExpr, t: Type.Trait, name: String): TExpr = {
+    val decl = traitDecls(t.name)
+
+    decl.methods.zipWithIndex.find(_._1.name == name) match
+      case Some((m, slot)) if m.isProperty =>
+        TVCall(recv, slot, Nil, m.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit))
+      case Some(_) =>
+        err(s"'$name' is a method of '${t.name}' — call it with '$name(…)'")
+      case None =>
+        err(s"a ${show(recv.ty)} has no fields, and trait '${t.name}' declares no '$name'")
   }
 
   /** The diagnostic for a method no bound licenses. It names the bound that *would* license it,

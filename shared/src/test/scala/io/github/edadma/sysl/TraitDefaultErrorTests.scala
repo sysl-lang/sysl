@@ -84,20 +84,6 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "what a trait may declare" - {
-    "a property in a trait is refused by name" in {
-      err(
-        """trait Sized
-          |    size -> int""".stripMargin
-      ) should include("a trait cannot declare a property yet")
-    }
-
-    "a property with a body in a trait is refused the same way" in {
-      err(
-        """trait Sized
-          |    size -> int = 4""".stripMargin
-      ) should include("a trait cannot declare a property yet")
-    }
-
     "a default on something with no receiver has nothing to work on" in {
       err(
         """trait Maker

@@ -78,9 +78,10 @@ trait TraitObjects extends TypeResolution {
         val (params, rtype) = funcInsts(fname)
 
         funcsUsed += fname
-        // Object safety already refused a trait with an associated function in it, so every method
-        // reaching a slot has a receiver to dispatch on.
-        TVSlot(fname, m.receiver.get, params.tail.map(_._2), rtype)
+        // Object safety already refused a trait with an associated function in it, so every member
+        // reaching a slot has a receiver to dispatch on — a property's being the by-value one it
+        // never had to write.
+        TVSlot(fname, m.recvMode.get, params.tail.map(_._2), rtype)
       }
 
       vtables(name) = TVtable(name, traitName, ty, boxed, slots)

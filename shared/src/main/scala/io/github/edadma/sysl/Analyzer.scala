@@ -515,12 +515,9 @@ class Analyzer private (program: Program)
       val tr = autoDeref(analyzeExpr(receiver))
       tr.ty match
         // A trait object has no fields: the layout is exactly what it forgot. What it still has is
-        // whatever the trait declares, and a trait declares methods, which are called.
+        // whatever the trait declares, and a property is declared to be read exactly like this.
         case _ if Type.erased(tr.ty) =>
-          val name = Type.erasedTrait(tr.ty).get.name
-          if traitDecls(name).methods.exists(_.name == f) then
-            err(s"'$f' is a method of '$name' — call it with '$f(…)'")
-          else err(s"a ${show(tr.ty)} has no fields, and trait '$name' declares no '$f'")
+          readTraitObjectProperty(tr, Type.erasedTrait(tr.ty).get, f)
 
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
@@ -530,20 +527,22 @@ class Analyzer private (program: Program)
         // An enum has no fields to shadow a member, so every name read off one is a property.
         case e: Type.Enum => readProperty(tr, e, f)
 
-        // A field is layout, and a bound promises methods — so no bound could ever license this,
-        // which is why it is reported from the definition pass rather than dropped for want of one
-        // to name. `10 §5`: what an unbounded parameter may not do is anything that assumes
-        // structure, and a field is the plainest case of that.
-        case a: Type.Abstract =>
-          boundErr(s"'${a.name}' is a type parameter, so it has no fields to read — a bound promises " +
-            s"methods, not a layout, so no bound would license '.$f'")
+        // A bound promises behaviour, and a property is behaviour spelled like a field — so this is
+        // a bound's to license after all, and it is checked at the definition like every other use
+        // of a parameter. What no bound reaches is a real *field*: that is layout, which is `10 §5`'s
+        // rule and the complaint left when nothing declares a property of the name.
+        case a: Type.Abstract => readBoundProperty(a, tr, f)
         // `len` and `bytes` are the first compiler-provided members: `len` a property on every
         // array, slice, and string, and `bytes` the reinterpretation of a string's three words
         // as a `[]u8`, dropping only the validity guarantee.
         case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
         case Type.Str if f == "bytes"                   => TBytes(tr)
-        case other =>
-          err(s"cannot read field '$f' of ${show(other)}")
+
+        // Any other type reaches its own members too, since an `impl` may be written for one and a
+        // trait may ask for a property. A name none of them supplies is the older complaint, which
+        // is the better one there: nothing about `x.foo` on an `int` says a property was meant.
+        case other if memberDecls.contains((ownerKey(other), f)) => readProperty(tr, other, f)
+        case other                                               => err(s"cannot read field '$f' of ${show(other)}")
 
     case ArrayLit(elems) =>
       val elemExp = expected.collect { case Type.Array(_, e) => e }
@@ -662,20 +661,27 @@ class Analyzer private (program: Program)
   /** `value.name` where `name` is not a field: a computed property, which reads with no
    * parentheses and so is spelled exactly as a field is, with an implicit by-value receiver.
    *
-   * The absent-member wording is the one difference between the two nominal kinds: a struct's `x`
-   * could have been either a field or a property, while an enum has no fields to have meant.
+   * The receiver may be of **any** type, because every type has an owner key its members are filed
+   * under and a trait may declare a property for an `impl` to supply — so `21.twice` reads one
+   * exactly as `p.twice` does, through the member the implementation was lowered to.
+   *
+   * The absent-member wording is the one difference between the kinds: a struct's `x` could have
+   * been either a field or a property, while an enum and a built-in have no fields to have meant.
    */
-  private def readProperty(tr: TExpr, n: Type.Named, f: String): TExpr =
-    memberDecls.get((n.base, f)) match
+  private def readProperty(tr: TExpr, ty: Type, f: String): TExpr = {
+    val (base, targs) = memberOwner(ty)
+
+    memberDecls.get((base, f)) match
       case Some(m) if m.isProperty =>
-        val fname      = memberFuncName(n.base, f, n.targs)
+        val fname      = memberFuncName(base, f, targs)
         val (_, rtype) = funcInsts(fname)
         TCall(fname, List(tr), rtype)
-      case Some(_) => err(s"'$f' is a method of '${n.name}' — call it with '$f(…)'")
+      case Some(_) => err(s"'$f' is a method of '${show(ty)}' — call it with '$f(…)'")
       case None =>
-        n match
-          case _: Type.Struct => err(s"'${n.name}' has no field or property '$f'")
-          case _              => err(s"'${n.name}' has no property '$f'")
+        ty match
+          case _: Type.Struct => err(s"'${show(ty)}' has no field or property '$f'")
+          case _              => err(s"'${show(ty)}' has no property '$f'")
+  }
 
   /** One end of a slice range: an index like any other, so any integer will do. */
   private def bound(e: Expr): TExpr = {

@@ -1,8 +1,8 @@
 # Traits (Polymorphism)
 
 **Status:** decided (core model), and **built** — static dispatch through bounds, dynamic dispatch
-through `*Trait` / `&Trait`, and **default method bodies**. Some surface-syntax details are flagged
-open at the end. How a
+through `*Trait` / `&Trait`, **default bodies**, and **properties** alongside methods. Some
+surface-syntax details are flagged open at the end. How a
 plain method and its receiver are spelled — the hole this doc used to leave open — is settled in
 `08-methods.md`; a trait's methods are declared and called the same way, with the receiver an
 `impl`'s type instead of a concrete one. A signature that has to name the implementing type writes
@@ -139,6 +139,39 @@ every other concrete mistake in a generic body is — at each type it is materia
 with no implementations therefore gets its bounds checked and nothing more, which is the same reach
 the definition-time pass has over a generic function nothing instantiates.
 
+## A trait may ask for a property
+
+A trait's members are not only methods. A **property** — a member with no parameter list, read as
+`value.name` with no parentheses (`08`) — is asked for by dropping the body from its declaration
+form, and supplied by an `impl` writing that body:
+
+```
+trait Sized
+    size -> int
+
+impl Sized for Box
+    size -> int = self.w * self.h
+```
+
+`b.size` then reads it, `f[T: Sized](x: T) = x.size` reads it through a bound, and `s.size` on a
+`*Sized` reads it through the object's table. Nothing about either dispatch path is different: a
+property has a receiver, it simply never spells one, so it takes a table slot beside the methods and
+a bound licenses reading it exactly as one licenses calling them. A property with a body in a trait is
+a **default** on the same terms as a method's, which needed nothing added at all — a property's
+declaration form already carries the body a default is.
+
+Which kind a member is has to match between the trait and the implementation, and that is a real
+check rather than a formality: a property and an associated function both have no receiver to
+compare, so `size(self) -> int` would otherwise quietly stand in for `size -> int` and every reader
+of `x.size` would meet a mistake somewhere else. The diagnostics name the kind for the same reason —
+a missing *property* reported as a missing method sends the reader off to write the one thing that
+would keep it from conforming.
+
+What a bound licenses is behaviour, and this is where that shows: a property *is* behaviour that
+happens to be spelled like a field, so a trait can promise it. A **field** stays out of reach
+whatever the bounds say, because a field is layout and no promise about behaviour reaches one
+(`10 §5`) — which is what the diagnostic on `x.v` says when nothing declares a property of the name.
+
 ## Trait objects, as built
 
 A trait object is a **fat pointer** — two words, the method table for the type it forgot and the
@@ -169,7 +202,9 @@ So the common case costs one indirect call and nothing else.
 Erasure forgets the type, so a method may promise nothing that depends on knowing it. A trait may be
 made into an object when every method:
 
-- **has a receiver.** An associated function has nothing to dispatch on.
+- **has a receiver.** An associated function has nothing to dispatch on. A property does have one —
+  by value, and unwritten — so a trait that asks for a property is as safe to erase as one that asks
+  for a method.
 - **mentions `Self` nowhere but that receiver.** A second `Self` would have to be the *same*
   forgotten type as the first, which is exactly the fact an object no longer carries, and a `Self`
   result has no size to hand back.
@@ -211,7 +246,7 @@ signature, which stands in for every implementation because conformance is exact
 ## Kept / dropped
 
 - **Kept:** static dispatch (monomorphized bounds), dynamic dispatch (boxed trait object),
-  retrofitting foreign types (explicit `impl`), default method bodies.
+  retrofitting foreign types (explicit `impl`), default bodies, properties as members.
 - **Dropped:** the separate structural `interface`; implicit/structural conformance; the
   invisible `owns` flag (replaced by explicit three-mode ownership).
 
@@ -227,12 +262,10 @@ signature, which stands in for every implementation because conformance is exact
   full type reference rather than a name, and a key for each shape.
 - **An `impl` for a generic type.** `impl Show for Box[T]` is rejected for now; the implementing type
   must be concrete. Wanted, and it interacts with monomorphizing the members.
-- **A property in a trait.** The signature spelling (`name -> T`, with no `=`) now *parses*, so a
-  trait that asks for a property is refused by name rather than by a stalled parse — but it is still
-  refused. What it wants is the rest of the path: an `impl` supplying it, a bound reading it, and a
-  slot for it in an object. Additive; nothing about either dispatch path changes. A *default*
-  property would fall out of the same work, since a property's declaration form already carries the
-  body a default needs.
+- **A property's body must be an expression.** `name -> T = expr` is the only spelling, so a property
+  cannot open an indented block the way a method's `= …`-less form can. That is `08`'s grammar rather
+  than anything about traits, and it bites a default property the same way it bites an inherent one.
+  Additive: the property form wants the `funcBody` a method already uses.
 - **`&Trait` is not yet gated on `alloc`.** `capabilities.md` puts a counted trait object behind the
   allocator capability, alongside `&T` itself. Neither is gated, because the capability system needs
   the project config and the module system, and both are still to be written — so this is the same
