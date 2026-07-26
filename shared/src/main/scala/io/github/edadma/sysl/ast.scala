@@ -174,6 +174,10 @@ enum RecvMode:
  * An **empty `body` means a signature rather than a definition**, which is a shape only a trait's
  * members have: the grammar gives every other member a body, and a trait member written with one
  * is a default an `impl` inherits.
+ *
+ * `tparams` and `bounds` are the member's **own** type parameters, which are not the type's: a
+ * method of a `Box[T]` that also takes a `[U]` is generic over `U` at each call, while `T` is fixed
+ * by the receiver. A property has none — there would be nothing at the read to fix them with.
  */
 case class MethodDecl(
     name: String,
@@ -183,6 +187,7 @@ case class MethodDecl(
     params: List[Param],
     retType: Option[TypeRef],
     body: List[Stmt],
+    bounds: Map[String, List[String]] = Map.empty,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the

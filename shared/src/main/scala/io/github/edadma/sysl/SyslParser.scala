@@ -427,18 +427,24 @@ class SyslParser(val source: Source) extends PackratParsers {
   /** A member of a type's body. What follows the name decides the kind: `(params)` is a method
    * (or, with no `self`, an associated function), and `-> type = body` with no parameter list is
    * a computed property.
+   *
+   * A member may declare **type parameters of its own**, in the same bracketed list every other
+   * generic declaration writes and in the same position — directly after the name. They are the
+   * member's, not the type's: a call fixes them from what it passes, while the type's own are
+   * already fixed by the receiver.
    */
   private lazy val member: PackratParser[MethodDecl] =
     at(
-      ident ~ opt(typeParams) >> { case name ~ tps =>
-        methodTail(name, tps.getOrElse(Nil)) |
+      ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
+        methodTail(name, tps.getOrElse((Nil, Map.empty))) |
           (if tps.isEmpty then propertyTail(name) else failure("a property takes no type parameters"))
       },
     )
 
-  private def methodTail(name: String, tparams: List[String]): Parser[MethodDecl] =
+  private def methodTail(name: String, generics: (List[String], Map[String, List[String]])): Parser[MethodDecl] =
     (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
-      case (recv, params) ~ ret ~ body => MethodDecl(name, recv, isProperty = false, tparams, params, ret, body)
+      case (recv, params) ~ ret ~ body =>
+        MethodDecl(name, recv, isProperty = false, generics._1, params, ret, body, generics._2)
     }
 
   private def propertyTail(name: String): Parser[MethodDecl] =
@@ -514,9 +520,10 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val methodSig: PackratParser[MethodDecl] =
     at(
-      ident ~ opt(typeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+      ident ~ opt(boundedTypeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
         case name ~ tps ~ ((recv, params)) ~ ret =>
-          MethodDecl(name, recv, isProperty = false, tps.getOrElse(Nil), params, ret, Nil)
+          val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+          MethodDecl(name, recv, isProperty = false, names, params, ret, Nil, bounds)
       },
     )
 

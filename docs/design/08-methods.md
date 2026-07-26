@@ -267,11 +267,35 @@ declared on one of those or on an `impl` block for one. A block for a built-in o
 type (`impl[T] Make for []T`) has no name a call could reach it through, and one written there is
 refused at the declaration rather than left as a member nothing could use.
 
-A **generic method** — one that introduces type parameters of its own, beyond the type's — is
-allowed by the same machinery that makes generic free functions work, and reads with the type
-parameters after the member name (`map[U](self, f: …) -> Box[U]`). Where a member's type
-parameters and the type's own interact in a bound is a question the generics spec owns, not this
-one.
+A member may introduce **type parameters of its own**, beyond the type's, written in the same
+bracketed list every other generic declaration uses and in the same place — directly after the
+member name, bounds included:
+
+    struct Box[T]
+        v: T
+        with[U](self, x: U) -> Pair[T, U] = Pair(self.v, x)
+
+The two lists are fixed from two different places, and that is the whole of the rule. The **type's**
+parameters are already settled by the time the call is made, because the receiver is a type and a
+type carries its arguments; they are read off it, and what the type asked of them was answered where
+the receiver's type was made. The member's **own** are settled by the call, from what it passes and
+from the type the context expects — the associated-function rule above, applied to the parameters a
+receiver says nothing about. So `b.with("hi")` on a `Box[int]` is `T = int` from the receiver and
+`U = string` from the argument, and a member whose own parameter appears only in its result
+(`zero[U](self) -> U`) needs the expecting side to say which. A parameter neither route reaches is
+an error at the call, naming that parameter, and a bound the *member* wrote is checked against what
+was inferred and reported in the member's name — the member is where it is written.
+
+A type that declares no parameters at all may still have a member that declares some: nothing about
+that inference goes through the receiver, so `Counter.make[T](x: T)` and `c.with[U](…)` need the
+type to be generic no more than a free function does.
+
+The two lists must stay apart, so a member may not spell one of its own the way its type spells one
+of its — a `T` in the body has to mean one thing. And a **property** declares none: a property is
+read rather than called, so there would be nothing at the read to fix them with.
+
+A trait declares no generic method yet (`02`), which is what an `impl` block's members must match,
+so a generic member is an inherent one for now.
 
 ## Interaction with traits
 

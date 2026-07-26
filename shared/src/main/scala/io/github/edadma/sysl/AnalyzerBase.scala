@@ -462,11 +462,20 @@ trait AnalyzerBase {
    *
    * It lives here rather than with the calls because a vtable slot asks the same question a call
    * does, and a slot naming a member by any other rule is a slot pointing at nothing.
+   *
+   * A member with type parameters **of its own** is not named by its receiver: the arguments that
+   * fix those come from the call, so the call is where it is named. Nothing that asks here can
+   * reach one — a vtable slot, an operator, a property read are all members a trait declares, and
+   * a trait declares no generic method — so the case is reported rather than answered with a name
+   * built from too few arguments.
    */
   protected def memberFuncName(ty: Type, mname: String): String = {
     val (base, targs) = memberKey(ty, mname)
 
     genericMembers.get((base, mname)) match
+      case Some(fd) if fd.tparams.length > targs.length =>
+        err(s"'$mname' has type parameters of its own, so ${show(ty)} alone does not say which " +
+          "instantiation is meant — call it, and the arguments will")
       case Some(fd) => instantiateFunc(fd, targs)
       case None     => s"${Type.mangle(ty)}.$mname"
   }

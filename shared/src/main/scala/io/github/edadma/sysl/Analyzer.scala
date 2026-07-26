@@ -556,7 +556,7 @@ class Analyzer private (program: Program)
       callAssociated(tname, mname, args, expected)
 
     case Call(Field(recv, mname), args) =>
-      callMethod(recv, mname, args)
+      callMethod(recv, mname, args, expected)
 
     case Call(_, _) =>
       err("the thing being called must be a name")

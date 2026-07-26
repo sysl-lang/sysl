@@ -135,6 +135,15 @@ before they appear and may be mutually recursive).
   so `-> Self` and `-> Box[T]` infer alike. A parameter neither route reaches is an error naming it;
   the bound is checked against what was inferred, in the *type's* name. Only a struct or an enum is
   named in call position, so a block for a built-in or a composed shape may not declare one.
+- **Members with type parameters of their own (`10 § Open b`).** `with[U](self, x: U) -> Pair[T, U]`
+  carries two lists that are fixed from two places: the type's are read off the receiver, which is
+  already a type and already carries them, and the member's own are solved at the call by the rule
+  above. The lowered function takes the type's parameters first and the member's after, so appending
+  what the call solved to what the receiver said is the whole instantiation. A type with no
+  parameters may still have a member with some, since none of that goes through the receiver. Each
+  list is held to its bounds in the name it was written under, a name collision between the two is
+  refused at the declaration, a property may declare none, and — because a trait declares no generic
+  method — neither may an `impl`.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over

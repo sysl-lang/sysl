@@ -78,24 +78,26 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("cannot infer the type argument 'T' of 'Box.empty'")
     }
 
-    // A method that introduces its own type parameter, even on a non-generic type, is a separate
-    // deferral with its own diagnostic.
-    "a generic method on a non-generic type waits on the generics work" in {
+    // A method may introduce type parameters of its own, on a type that has none of its own to
+    // fix them: the receiver settles nothing there, so the call is the whole of what does.
+    "a method's own type parameter is inferred at the call, and must be" in {
       err(
         """struct Registry
           |    n: int
-          |    store[T](&self, item: T) -> int = self.n""".stripMargin
-      ) should include("generic methods are not supported yet")
+          |    store[T](&self) -> int = self.n
+          |var r: &Registry = Registry(1)
+          |print(r.store())""".stripMargin
+      ) should include("cannot infer the type argument 'T' of 'Registry.store'")
     }
 
-    // A method with its own type parameter is rejected even on a generic type — the receiver fixes
-    // the struct's parameters, but the method's own parameter still has nothing to infer it from.
-    "a generic method on a generic type waits on the generics work" in {
+    // The type's parameters and the member's own end up in one signature, so a member spelling one
+    // of its own the way the type spells one of its would leave a `T` in the body ambiguous.
+    "a member may not reuse a type parameter name the type declares" in {
       err(
         """struct Box[T]
           |    value: T
-          |    cast[U](self, u: U) -> U = u""".stripMargin
-      ) should include("generic methods are not supported yet")
+          |    cast[T](self, u: T) -> T = u""".stripMargin
+      ) should include("'Box' already declares a type parameter 'T', so member 'cast' cannot declare one of that name")
     }
   }
 
@@ -205,14 +207,16 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("enum 'Color' has no variant or associated function 'bogus'")
     }
 
-    // The deferral a struct's members meet, met on an enum: a member's own type parameter has
-    // nothing to infer it from.
-    "a generic method on an enum waits on the generics work" in {
+    // The rule a struct's members meet, met on an enum: a member's own type parameter is the call's
+    // to fix, and one nothing at the call mentions cannot be fixed.
+    "a method's own type parameter is inferred at the call here too" in {
       err(
         """enum Color
           |    Red
-          |    store[T](self, item: T) -> int = 1""".stripMargin
-      ) should include("generic methods are not supported yet")
+          |    store[T](self) -> int = 1
+          |var c = Red
+          |print(c.store())""".stripMargin
+      ) should include("cannot infer the type argument 'T' of 'Color.store'")
     }
 
     "an associated function on a generic enum infers the enum's arguments from the call" in {

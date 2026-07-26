@@ -190,7 +190,7 @@ trait Hoisting extends TypeResolution {
       out,
     )
 
-    if tparams.nonEmpty then abstractMembers ++= lowered
+    abstractMembers ++= lowered.filter(_.tparams.nonEmpty)
   }
 
   /** Everything hoisting a list of members needs to know about the type they belong to, whichever
@@ -265,12 +265,19 @@ trait Hoisting extends TypeResolution {
       members: List[MethodDecl],
       out: mutable.ListBuffer[FuncDecl],
   ): List[FuncDecl] = {
-    val generic = home.tparams.nonEmpty
     val lowered = mutable.ListBuffer.empty[FuncDecl]
 
     for m <- members do
       currentPos = m.pos.orElse(currentPos)
-      if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '${home.label}.${m.name}'")
+
+      // A member's parameters and its type's are two lists that end up in one signature, so a name
+      // used by both would leave the lowered function with two parameters of that name and nothing
+      // to say which one a `T` in the body meant.
+      for tp <- m.tparams if home.tparams.contains(tp) do
+        err(s"'${home.label}' already declares a type parameter '$tp', so member '${m.name}' " +
+          "cannot declare one of that name")
+
+      checkBoundNames(s"${home.label}.${m.name}", m.bounds)
 
       // An associated function is reached by naming its type — `Box.of(…)` — and only a struct or
       // an enum has a name to be reached through. A block for a built-in or a composed type would
@@ -318,10 +325,13 @@ trait Hoisting extends TypeResolution {
 
       lowered += fd
 
-      if generic then
+      // A signature mentioning a type parameter — the type's own, or the member's — has no meaning
+      // until something fixes it, so the member is kept as written and made real per call.
+      if fd.tparams.nonEmpty then
         genericMembers((home.key, m.name)) = fd
-        // `Self` here is the type applied to its own parameters, which is not a type yet. The
-        // reference is what waits, and every substitution that fixes the parameters fixes it too.
+        // On a generic type `Self` is the type applied to its own parameters, which is not a type
+        // yet. The reference is what waits, and every substitution that fixes the parameters fixes
+        // it too; on a concrete type it is already the answer and resolves to the same thing.
         genericSelf(fd.name) = home.selfRef
       else
         out += fd
@@ -395,7 +405,7 @@ trait Hoisting extends TypeResolution {
     // the block wrote on its own parameters — the same walk a generic type's members take. An
     // inherited default is left out: it was checked at the trait, against what the trait promises,
     // which is the whole of what its body may assume wherever it is copied to.
-    if home.tparams.nonEmpty then abstractMembers ++= lowered.filterNot(f => defaultOrigin.contains(f.name))
+    abstractMembers ++= lowered.filter(_.tparams.nonEmpty).filterNot(f => defaultOrigin.contains(f.name))
   }
 
   /** What a signature written inside these members resolves under.
@@ -664,6 +674,13 @@ trait Hoisting extends TypeResolution {
           "parameter list — a property has none")
     if tm.receiver != im.receiver then
       err(s"method '${im.name}' of 'impl $traitName for $forType' takes a different receiver than the trait declares")
+    // A member of an `impl` is the trait's member supplied, so its shape is the trait's — including
+    // how many types of its own it is generic over. The trait declares none today, which makes this
+    // the diagnostic for writing a generic method in an `impl`.
+    if tm.tparams.length != im.tparams.length then
+      err(s"${kind(im)} '${im.name}' of 'impl $traitName for $forType' declares " +
+        s"${quantity(im.tparams.length, "type parameter")}, but trait '$traitName' declares " +
+        s"${tm.tparams.length}")
     if tm.params.length != im.params.length then
       err(s"method '${im.name}' of 'impl $traitName for $forType' takes ${im.params.length} " +
         s"parameters, but the trait declares ${tm.params.length}")
@@ -686,15 +703,20 @@ trait Hoisting extends TypeResolution {
    * type is the type applied to its own parameters (`Box[T]`, not `Box`), and the lowered function
    * inherits those parameters, so instantiating it at a concrete `Box[int]` substitutes `T` in the
    * receiver, the result, and the body alike.
+   *
+   * A member's **own** parameters follow the type's, in that order and never interleaved, because
+   * the two are fixed from different places and the order is what lets them be: a call reads the
+   * type's off the receiver and appends the ones it solved, so the same positional substitution
+   * serves a member that adds parameters and one that adds none.
    */
   private def synthesize(home: MemberHome, m: MethodDecl): FuncDecl =
     FuncDecl(
       s"${home.symbol}.${m.name}",
-      home.tparams,
+      home.tparams ::: m.tparams,
       receiverParam(m, home.selfRef).toList ::: m.params,
       m.retType,
       m.body,
-      home.bounds,
+      home.bounds ++ m.bounds,
     ).setPos(m.pos)
 
   /** The `self` parameter a member's receiver becomes, at the self type it is a member of. A

@@ -109,17 +109,22 @@ trait CallAnalysis extends Literals with TraitObjects {
    *
    * The receiver may be of *any* type: every type has an owner key its members are filed under, so
    * `5.show()` takes this path exactly as `p.show()` does.
+   *
+   * A method with type parameters **of its own** is the one shape the receiver does not settle, and
+   * `callGenericMethod` is where the rest of the answer comes from.
    */
-  protected def callMethod(recv: Expr, mname: String, args: List[Expr]): TExpr = {
+  protected def callMethod(recv: Expr, mname: String, args: List[Expr], expected: Option[Type]): TExpr = {
     val tr = analyzeExpr(recv)
 
     receiverType(tr.ty) match
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
       case t: Type.Trait    => callTraitObject(tr, t, mname, args)
       case rty =>
-        val (base, _) = memberKey(rty, mname)
+        val (base, targs) = memberKey(rty, mname)
 
         memberDecls.get((base, mname)) match
+          case Some(m) if m.receiver.isDefined && m.tparams.nonEmpty =>
+            callGenericMethod(genericMembers((base, mname)), m, targs, tr, args, expected)
           case Some(m) if m.receiver.isDefined =>
             val fname           = memberFuncName(rty, mname)
             val (params, rtype) = funcInsts(fname)
@@ -139,6 +144,52 @@ trait CallAnalysis extends Literals with TraitObjects {
             builtinMethod(rty, mname, tr, args)
               .orElse(builtinDisplay(rty, mname, tr, args))
               .getOrElse(err(s"type '$base' has no method '$mname'"))
+  }
+
+  /** `value.m(…)` where `m` declares type parameters of its own, at the instantiation this call
+   * resolves to.
+   *
+   * The two lists of parameters the lowered function carries are fixed from two different places,
+   * which is the whole of what makes this its own path. The **type's** are already settled — the
+   * receiver is a type, and a type has its arguments — so they are read off it and held to nothing
+   * further here, having been checked where the receiver's type was made. The **member's own** are
+   * solved from the arguments and from the type the context expects, exactly as a generic free
+   * function's are, and held to the bounds the member wrote, reported in the member's name.
+   *
+   * Appending the solved arguments to the receiver's is what `synthesize` laid the two lists out in
+   * that order for, so the substitution instantiating the function needs to know nothing about
+   * which parameter came from where.
+   */
+  private def callGenericMethod(
+      fd: FuncDecl,
+      m: MethodDecl,
+      ownerArgs: List[Type],
+      recv: TExpr,
+      args: List[Expr],
+      expected: Option[Type],
+  ): TExpr = {
+    if args.length != fd.params.length - 1 then
+      err(s"method '${fd.name}' takes ${quantity(fd.params.length - 1, "argument")}, " +
+        s"but ${supplied(args.length, "argument")}")
+
+    val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)(ref => spellSelf(_, ref))
+    val provisional = args.map(analyzeExpr(_))
+    val own = solve(
+      fd.name,
+      m.tparams,
+      fd.params.tail.map(p => spell(p.typ)),
+      provisional.map(_.ty),
+      fd.retType.map(spell),
+      expected,
+    )
+
+    checkParamBounds(fd.name, m.tparams, fd.bounds, own)
+
+    val name            = instantiateFunc(fd, ownerArgs ::: own)
+    val (params, rtype) = funcInsts(name)
+    val recvArg         = buildReceiver(m.receiver.get, recv)
+
+    TCall(name, checkArgs(fd.name, params, args, Some(recvArg :: provisional)), rtype)
   }
 
   /** `5.display(out, fmt)` — the rendering a built-in's `Display` membership provides (`14 §5`).
@@ -452,7 +503,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     memberDecls.get((tname, mname)) match
       case Some(m) if m.receiver.isEmpty && !m.isProperty =>
         genericMembers.get((tname, mname)) match
-          case Some(fd) => callGenericAssociated(tname, fd, args, expected)
+          case Some(fd) => callGenericAssociated(tname, fd, m, args, expected)
           case None =>
             val fname           = s"$tname.$mname"
             val (params, rtype) = funcInsts(fname)
@@ -474,10 +525,17 @@ trait CallAnalysis extends Literals with TraitObjects {
    * `Self` is rewritten to the type applied to its own parameters before solving, so a constructor
    * written `-> Self` infers from an expected `Box[int]` exactly as one written `-> Box[T]` does.
    *
-   * The bound the resolved arguments are held to is the **type's**, so it is reported in the type's
-   * name — the member inherited it and is not where it is written.
+   * The two lists of parameters are held to their bounds under the name each was written in. The
+   * type's are reported in the type's name — the member inherited them and is not where they are
+   * written — and the member's own in the member's, which is where they are.
    */
-  private def callGenericAssociated(owner: String, fd: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
+  private def callGenericAssociated(
+      owner: String,
+      fd: FuncDecl,
+      m: MethodDecl,
+      args: List[Expr],
+      expected: Option[Type],
+  ): TExpr = {
     if args.length != fd.params.length then
       err(s"associated function '${fd.name}' takes ${quantity(fd.params.length, "argument")}, " +
         s"but ${supplied(args.length, "argument")}")
@@ -493,7 +551,11 @@ trait CallAnalysis extends Literals with TraitObjects {
       expected,
     )
 
-    checkParamBounds(owner, fd.tparams, fd.bounds, targs)
+    val (ownerTps, ownTps)   = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)
+    val (ownerArgs, ownArgs) = targs.splitAt(ownerTps.length)
+
+    checkParamBounds(owner, ownerTps, fd.bounds, ownerArgs)
+    checkParamBounds(fd.name, ownTps, fd.bounds, ownArgs)
 
     val name            = instantiateFunc(fd, targs)
     val (params, rtype) = funcInsts(name)

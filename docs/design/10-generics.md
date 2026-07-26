@@ -42,9 +42,10 @@ enum Option[T]                           // generic enum (09)
 ```
 
 A parameter name stands for a type not yet known; it may appear anywhere a type may — a
-parameter type, a return type, a field type, a variant payload, a local annotation. A fourth form
-takes parameters without declaring a type: an **`impl` block**, whose subject is a generic type or a
-composed shape applied to them (`02`). A generic type's *own body* may hold members (`§ Open b`).
+parameter type, a return type, a field type, a variant payload, a local annotation. Two further
+forms take parameters without declaring a type: an **`impl` block**, whose subject is a generic type
+or a composed shape applied to them (`02`), and a **member**, which may be generic over types of its
+own beyond its type's (`08`, §4 below).
 
 ## 2. `[]` means type application in a type, indexing in an expression
 
@@ -94,6 +95,15 @@ receiver, which puts it in the position a generic free function is always in: `B
 `T = int` from the argument, and a `none() -> Cursor[T]` solves from `var c: Cursor[int] = …`.
 `Self` in the signature is the type applied to its own parameters, so writing `-> Self` and writing
 `-> Box[T]` infer alike.
+
+**A member's own type parameters are inferred by it too**, and for the same reason: the receiver
+says what the *type's* arguments are and nothing about the member's, which leaves those in the
+position the rule already covers. So `with[U](self, x: U) -> Pair[T, U]` on a `Box[int]` receiver has
+`T` read and `U` solved — from the argument, or from the expected type where the argument does not
+mention it. The two lists are held to their bounds separately and under the name each was written
+in: the type's in the type's, the member's in the member's. That a member's parameters and the
+type's must not collide is the one thing the two-list form adds, and it is settled by refusing a
+member that spells one of its own the way its type spells one of its.
 
 ## 5. Bounds — the core decision
 
@@ -254,14 +264,14 @@ never by a covariant container.
   (§2). If explicit arguments prove necessary, they need a disambiguating syntax (a Rust-style
   turbofish marker, or a rule that a type-argument list is only read in a call head). Deferred
   until a real case cannot be served by inference.
-- **b. Members on generic types.** Methods, properties, and associated functions on a generic
-  struct *or enum* are settled and implemented: a method or property is instantiated from the
-  receiver's own type arguments, so `Box[int].get` and `Box[real].get` are two monomorphized
-  functions exactly as two instantiations of a free generic function are; an associated function,
-  having no receiver, infers those arguments from the call by §4's ordinary rule. The same holds for
-  the members a generic `impl` adds (`02`). What remains open is a member carrying **its own** type
-  parameters — `map[U](self, f: …) -> Box[U]` — which is deferred with a diagnostic, and with it the
-  question of how a member's parameters and the type's interact in a bound.
+- **b. Members on generic types** — settled and implemented, and no longer open. A method or
+  property is instantiated from the receiver's own type arguments, so `Box[int].get` and
+  `Box[real].get` are two monomorphized functions exactly as two instantiations of a free generic
+  function are; an associated function, having no receiver, infers those arguments from the call by
+  §4's ordinary rule; a member carrying **its own** type parameters solves those by that same rule
+  while the type's are read off the receiver (§4). The same holds for the members a generic `impl`
+  adds (`02`). What a *trait* may declare is `02`'s question, and it declares no generic method
+  today, so a generic member is an inherent one.
 - **c. `where` clauses.** An out-of-line bound syntax for readability when the inline `[T: A +
   B]` list grows long or involves relations between parameters. All of Rust/Swift/Kotlin have
   one; a candidate ergonomic addition, not a day-one need.

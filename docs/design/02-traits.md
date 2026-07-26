@@ -409,6 +409,14 @@ signature, which stands in for every implementation because conformance is exact
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
 - **Trait bounds, associated types, generic interaction** — deferred to the generics spec.
+- **A trait method with type parameters of its own.** An inherent member may declare them (`08`,
+  `10 §4`); a trait's may not, and so neither may an `impl`'s, which must match what the trait
+  declares. Three questions come with allowing it and none is answered here: how a conformance
+  comparison treats two signatures whose parameters are spelled differently, what a default body may
+  assume of them, and — the one that decides the shape of the rest — that a generic method makes a
+  trait unusable as a trait object, since no vtable slot can hold a function that does not exist
+  until a call names its types. Refusing at the declaration is what keeps that from being discovered
+  at the `*Trait` instead.
 - **Specialization.** A shape and a type of that shape written out in full are refused as the two
   implementations for one type they are, as above. Allowing both and letting the written one win is
   the one thing here that would be genuinely useful (`[]byte` rendering differently from every other
