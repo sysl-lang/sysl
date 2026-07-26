@@ -100,17 +100,49 @@ object Type {
       throw new IllegalStateException(s"the type parameter '$name' reached codegen")
   }
 
+  /** A trait, in the one position a trait may stand where a type is asked for: behind a memory
+   * mode. `*Trait` and `&Trait` are the **trait objects** of `02` — a value whose type has been
+   * forgotten, carried with the method table that says what may still be done to it.
+   *
+   * It is never a type on its own. An erased value has no known size, so there is nothing to lay
+   * out, nothing to copy by value, and nothing to return; the sigil is what makes it a pointer,
+   * and the trait-ness is what makes that pointer fat. Resolving a bare trait name says so rather
+   * than producing one of these.
+   */
+  case class Trait(name: String) extends Type {
+    def llvm: String =
+      throw new IllegalStateException(s"the trait '$name' reached codegen as a type of its own")
+  }
+
+  /** The layout of a trait object: the method table for the type it forgot, and the value itself.
+   * Two words rather than one, which is the whole of what a `dyn` keyword would have announced.
+   */
+  val fatPointer = "{ ptr, ptr }"
+
+  /** Whether a memory mode points at a trait rather than at a concrete type, and so is fat. */
+  def erased(t: Type): Boolean = erasedTrait(t).isDefined
+
+  /** The trait a `*Trait` / `&Trait` dispatches through. */
+  def erasedTrait(t: Type): Option[Trait] = t match
+    case Ptr(tr: Trait)    => Some(tr)
+    case Ref(tr: Trait, _) => Some(tr)
+    case _                 => None
+
   /** `*T` — a bare machine address: no length, no refcount, no checks, and a lifetime the
    * programmer keeps track of. The one unsafe primitive, and the reason it is spelled with a
    * sigil is so a reader can find every place a program takes on C's risks.
    */
-  case class Ptr(inner: Type) extends Type { def llvm = "ptr" }
+  case class Ptr(inner: Type) extends Type {
+    def llvm: String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+  }
 
   /** `&T` — a reference to a reference-counted heap object, and `&sync T` when its refcount is
    * atomic so the reference may cross a concurrency domain. The two are distinct types with no
    * conversion either way: atomicity is fixed when the object is allocated.
    */
-  case class Ref(inner: Type, sync: Boolean) extends Type { def llvm = "ptr" }
+  case class Ref(inner: Type, sync: Boolean) extends Type {
+    def llvm: String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+  }
 
   /** `[N]T` — N elements of `T`, laid out end to end with no header. An array *is* its
    * elements: copying one copies all of them, and its length is part of its type, which is what
@@ -147,12 +179,14 @@ object Type {
     case _           => None
 
   /** The type a `*T` or `&T` points at, for the one level of automatic dereference that field
-   * selection performs.
+   * selection performs. A trait object has none: it has forgotten what it points at, which is
+   * exactly why its methods are reached through a table instead.
    */
   def pointee(t: Type): Option[Type] = t match
-    case Ptr(inner)    => Some(inner)
-    case Ref(inner, _) => Some(inner)
-    case _             => None
+    case _ if erased(t)  => None
+    case Ptr(inner)      => Some(inner)
+    case Ref(inner, _)   => Some(inner)
+    case _               => None
 
   /** The types an unsuffixed literal falls back to when nothing else fixes it. */
   val Int: Integer   = Integer(32, signed = true)
@@ -206,6 +240,7 @@ object Type {
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem)              => s"[]${show(elem)}"
     case Abstract(n, _)           => n
+    case Trait(n)                 => n
     case other                    => other.llvm
 
   /** Whether a type carries no value at run time: `unit`, whose only value is nothing at all, and
@@ -225,8 +260,13 @@ object Type {
 
   /** Whether `==` and `!=` are defined. Everything ordered, plus the types that have equality
    * without an ordering: `bool`, and the two pointer-shaped modes, which compare by address.
+   *
+   * A trait object is two words rather than one, and only the second of them is an address — two
+   * objects over the same value through different traits are the same value and different tables —
+   * so what "equal" would mean is a question the trait has to answer, not the machine.
    */
   def isEquatable(t: Type): Boolean = t match
+    case _ if erased(t)         => false
     case Bool | _: Ptr | _: Ref => true
     case _                      => isOrdered(t)
 

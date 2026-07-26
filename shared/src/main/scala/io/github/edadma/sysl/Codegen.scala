@@ -15,13 +15,16 @@ import scala.collection.mutable
  * `ControlFlowEmitter` everything that makes a basic block. What stays here is the spine — the
  * module assembly, statements, and the expression dispatch the traits call back into.
  */
-class Codegen private (program: TProgram) extends ControlFlowEmitter {
+class Codegen private (program: TProgram) extends ControlFlowEmitter with VtableEmitter {
 
   // --- module --------------------------------------------------------------------------
 
   private def gen(): String = {
-    val funcTexts = program.funcs.map(genFunction)
-    val mainText  = genMain(program.main)
+    val funcTexts  = program.funcs.map(genFunction)
+    val mainText   = genMain(program.main)
+    // The tables come after the bodies because a table only exists for a type something erased, and
+    // it may ask for an adapter, which the queue below is what emits.
+    val vtableText = program.vtables.map(genVtable).mkString
 
     // Emitting a runtime helper may ask for another (a destructor releases the references its
     // payload holds), so this runs until nothing new is requested.
@@ -74,7 +77,8 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
       out ++= "@.true = private constant [5 x i8] c\"true\\00\"\n"
       out ++= "@.false = private constant [6 x i8] c\"false\\00\"\n"
     out ++= globals.toString
-    if globals.nonEmpty || boolStrs then out ++= "\n"
+    out ++= vtableText
+    if globals.nonEmpty || boolStrs || vtableText.nonEmpty then out ++= "\n"
 
     if charBuf then out ++= ScalarEmitter.utf8Encoder
     if heap then out ++= ArcEmitter.core
@@ -193,6 +197,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
     case _: Type.Floating => "0.0"
     case Type.Char        => "0"
     case Type.Bool        => "0"
+    // A trait object is two words, so its zero is a zeroed pair rather than a null address — and,
+    // like every null pointer, calling through one is the programmer's business.
+    case _: Type.Ptr | _: Type.Ref if Type.erased(ty) => "zeroinitializer"
     case _: Type.Ptr      => "null"
     case _: Type.Ref      => "null"
     case _: Type.Struct   => "zeroinitializer"
@@ -211,6 +218,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
     // for diagnostics and throws its tree away, and monomorphization substitutes a concrete type
     // before anything is emitted.
     case _: Type.Abstract => sys.error("unreachable zero of a type parameter")
+    // A trait is only ever the pointee of a `*Trait` / `&Trait`, both handled above; resolving a
+    // bare trait name is a diagnostic, so nothing of this type is ever laid out.
+    case _: Type.Trait    => sys.error("unreachable zero of a trait")
 
   // --- statements ----------------------------------------------------------------------
 
@@ -275,7 +285,8 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
     // read as a plain pointer — the terminator the sysl string ignores is exactly what C reads by.
     case TCStrLit(s)   => stringGlobal(s)
     case TBoolLit(b)   => if b then "1" else "0"
-    case TNullLit(_)   => "null"
+    // A trait object is two words, so its null is a zeroed pair rather than a bare address.
+    case TNullLit(ty)  => zero(ty)
     case TUnitLit()    => ""
     case TZero(ty)     => zero(ty)
 
@@ -484,6 +495,34 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
         ""
       else
         val r = freshTemp(); emit(s"$r = call $callee(${argVals.mkString(", ")})")
+        ownTemp(r, ty)
+
+    // Erasing costs one word: the value goes on pointing where it pointed, and the table for the
+    // type it is losing is a constant beside it. Nothing is retained — a counted object holds the
+    // count its operand already had, which is what makes `f(&T)` and `f(&Trait)` the same handover.
+    case TErase(operand, vtable, _) =>
+      val d = genExpr(operand)
+      val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$vtable, 0")
+      val b = freshTemp(); emit(s"$b = insertvalue ${Type.fatPointer} $a, ptr $d, 1")
+      b
+
+    // A call whose callee is a word in the object's table rather than a name. The data word goes in
+    // front of the declared arguments, which is the shape every slot was built to.
+    case TVCall(receiver, slot, args, ty) =>
+      val obj     = genExpr(receiver)
+      val table   = freshTemp(); emit(s"$table = extractvalue ${Type.fatPointer} $obj, 0")
+      val data    = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $obj, 1")
+      val argVals = args.map(a => s"${a.ty.llvm} ${genExpr(a)}")
+      val entry   = freshTemp(); emit(s"$entry = getelementptr ptr, ptr $table, i64 $slot")
+      val fn      = freshTemp(); emit(s"$fn = load ptr, ptr $entry")
+      val passed  = (s"ptr $data" :: argVals).mkString(", ")
+
+      if Type.noValue(ty) then
+        emit(s"call void $fn($passed)")
+        if ty == Type.Never then emitTerm("unreachable")
+        ""
+      else
+        val r = freshTemp(); emit(s"$r = call ${ty.llvm} $fn($passed)")
         ownTemp(r, ty)
 
     // The tail walk is the ABI's, so all three are LLVM's own: two intrinsic calls and the one

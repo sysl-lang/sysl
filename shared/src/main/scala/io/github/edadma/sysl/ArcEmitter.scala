@@ -34,10 +34,24 @@ trait ArcEmitter extends Emitter {
     n
   }
 
+  /** The box a counted trait object holds, which is its second word — the first is the method
+   * table, a constant that owns nothing.
+   */
+  protected def erasedBox(v: String): String = {
+    val b = freshTemp(); emit(s"$b = extractvalue ${Type.fatPointer} $v, 1"); b
+  }
+
   /** Takes a share of everything a value refers to. A bare reference is one refcount; an
    * aggregate delegates to a per-type helper that walks its reference-carrying fields.
    */
   protected def retainValue(ty: Type, v: String): Unit = ty match
+    // A `&Trait` counts exactly as the `&T` it was made from does: the box carries its own
+    // destructor, so letting go of one needs no more knowledge of the payload than this has.
+    case Type.Ref(_: Type.Trait, sync) =>
+      heap = true
+      syncHeap ||= sync
+      emit(s"call void @arc.retain${if sync then "_sync" else ""}(ptr ${erasedBox(v)})")
+
     case Type.Ref(_, sync) =>
       heap = true
       syncHeap ||= sync
@@ -48,6 +62,11 @@ trait ArcEmitter extends Emitter {
 
   /** Gives back a share of everything a value refers to. */
   protected def releaseValue(ty: Type, v: String): Unit = ty match
+    case Type.Ref(_: Type.Trait, sync) =>
+      heap = true
+      syncHeap ||= sync
+      emit(s"call void @arc.release${if sync then "_sync" else ""}(ptr ${erasedBox(v)})")
+
     case Type.Ref(_, sync) =>
       heap = true
       syncHeap ||= sync

@@ -149,6 +149,21 @@ case class TCStrLit(value: String) extends TExpr { def ty: Type = Type.Ptr(Type.
 /** A call to a user function. */
 case class TCall(name: String, args: List[TExpr], ty: Type) extends TExpr
 
+/** Forgets a value's type, keeping what its trait says can still be done to it (`02`): the operand
+ * goes on pointing where it pointed, and the method table for the type it is losing rides beside it.
+ *
+ * The operand is a `*T` for a raw trait object and a `&T` for a counted one, which is what decides
+ * which of the type's two tables this names — the data word addresses the value in the first case
+ * and its box in the second.
+ */
+case class TErase(operand: TExpr, vtable: String, ty: Type) extends TExpr
+
+/** A call through a trait object's method table. `slot` is the method's index in the trait's
+ * declaration order, and the receiver's data word is the first argument — so which function runs is
+ * read out of the table at run time rather than named here.
+ */
+case class TVCall(receiver: TExpr, slot: Int, args: List[TExpr], ty: Type) extends TExpr
+
 /** The three ABI primitives of a variadic body (`12 §9`), each holding the *address* of the
  * `va_list` it works on — they advance it rather than reading a copy of it, so what the analyzer
  * hands over is the place, exactly as `&ap` would.
@@ -300,13 +315,31 @@ case class TFunc(name: String, params: List[(String, Type)], retTy: Type, body: 
 case class TExtern(name: String, symbol: String, params: List[Type], retTy: Type,
                    variadic: Boolean = false)
 
-/** A whole program: hoisted struct, enum, and function declarations, the externs it calls, plus
- * the top-level statements that make up `main`. Only data enums appear in `enums` — a simple enum
- * lowers to `i32` and needs no type declaration.
+/** One method table — the constant a trait object's first word points at, holding one function
+ * pointer per method the trait declares, in declaration order.
+ *
+ * There is one table per (trait, implementing type, **memory mode**), and the mode is why `boxed`
+ * is here: a `*Trait`'s data word is the value's own address, while a `&Trait`'s is the address of
+ * the reference-counted box the value sits inside, so the two reach the same implementation through
+ * different arithmetic.
+ */
+case class TVtable(name: String, traitName: String, forType: Type, boxed: Boolean, slots: List[TVSlot])
+
+/** One slot of a method table: the function it ends at, how that function wants its receiver, and
+ * the signature a call site sees. Between the data word and the receiver the function declared
+ * there may be a header to step over and a value to load, which is what the mode decides.
+ */
+case class TVSlot(target: String, recv: RecvMode, params: List[Type], retTy: Type)
+
+/** A whole program: hoisted struct, enum, and function declarations, the method tables its trait
+ * objects dispatch through, the externs it calls, plus the top-level statements that make up
+ * `main`. Only data enums appear in `enums` — a simple enum lowers to `i32` and needs no type
+ * declaration.
  */
 case class TProgram(
     structs: List[Type.Struct],
     enums: List[Type.Enum],
+    vtables: List[TVtable],
     externs: List[TExtern],
     funcs: List[TFunc],
     main: List[TStmt],

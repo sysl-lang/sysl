@@ -133,6 +133,7 @@ class Analyzer private (program: Program)
     TProgram(
       structInsts.values.toList,
       enumInsts.values.filterNot(_.simple).toList,
+      vtables.values.toList,
       externs,
       tfuncs.toList,
       tmain,
@@ -276,22 +277,44 @@ class Analyzer private (program: Program)
   }
 
   private def analyzeExpected(expr: Expr, expected: Option[Type]): TExpr = expected match
+    // An `if`/`match`/loop yields its value through its branches — a loop's, through its `break`s
+    // and its `else` — so a context that *converts* belongs to each of those rather than to the
+    // aggregate: every branch boxes or erases on its own. That is what lets a `&T` branch and a
+    // plain-value branch meet at `&T`, and two branches of different concrete types meet at one
+    // trait object. Converting the whole expression instead would ask each branch for something it
+    // may already be past being able to supply.
+    case Some(want) if converts(want) && branching(expr) => analyzeValue(expr, Some(want))
+
+    // A trait object asks the expression for nothing in particular: what may be erased into one is
+    // whatever implements the trait, and pushing the object's own type down would be asking for a
+    // value of a type that has no layout. `null` is the exception — a raw address is written at
+    // the type it is expected to have, rather than converted into it.
+    case Some(o) if Type.erased(o) =>
+      expr match
+        case NullLit() => analyzeValue(expr, Some(o))
+        case _         => coerce(analyzeValue(expr, None), o)
+
     case Some(r: Type.Ref) =>
       expr match
         case NullLit() => err(s"a ${show(r)} always points at a live object — an absent one is Option[${show(r)}]")
-        // An `if`/`match`/loop yields its value through its branches (a loop's, through its
-        // `break`s and `else`), so the `&T` context belongs to each of those, not to the
-        // aggregate: every one boxes to `&T` on its own, letting a `&T` branch and a value branch
-        // meet at `&T`. Boxing the whole expression instead would ask the branches for a plain
-        // `T`, and a branch already holding a `&T` could not comply.
-        case _: IfExpr | _: MatchExpr | _: While | _: For => analyzeValue(expr, Some(r))
-        case _                        => box(analyzeValue(expr, Some(r.inner)), r)
+        case _         => coerce(analyzeValue(expr, Some(r.inner)), r)
     case _ => analyzeValue(expr, expected)
 
-  /** Boxes a value the context wanted by reference. Nothing else coerces: a mismatch that is
-   * not exactly "a `T` where `&T` was expected" is left for the caller to diagnose.
+  /** Whether a context of this type converts what it is given rather than simply requiring it. */
+  private def converts(want: Type): Boolean = Type.erased(want) || want.isInstanceOf[Type.Ref]
+
+  /** Whether an expression yields its value through branches rather than producing one itself. */
+  private def branching(expr: Expr): Boolean = expr match
+    case _: IfExpr | _: MatchExpr | _: While | _: For => true
+    case _                                            => false
+
+  /** The two conversions a context may apply to a value that does not already have its type: a
+   * `T` the context wanted by reference is boxed, and something concrete where a trait object was
+   * wanted is erased into one. Nothing else coerces — any other mismatch is left for the caller to
+   * diagnose, where the message can name the parameter or the variable it is about.
    */
-  protected def box(t: TExpr, expected: Type): TExpr = expected match
+  protected def coerce(t: TExpr, expected: Type): TExpr = expected match
+    case _ if Type.erased(expected)     => eraseTo(t, expected)
     case r: Type.Ref if t.ty == r.inner => TBox(t, r).setPos(t.pos)
     case _                              => t
 
@@ -363,8 +386,13 @@ class Analyzer private (program: Program)
     case Unary("*", e) =>
       val t = analyzeExpr(e)
       Type.pointee(t.ty) match
-        case Some(inner) => TDeref(t, inner)
-        case None        => err(s"'*' needs a pointer or a reference, not ${show(t.ty)}")
+        case Some(inner)                => TDeref(t, inner)
+        // A trait object points somewhere, but it has forgotten what is there, so there is no type
+        // to read out — its methods are the whole of what it still offers.
+        case None if Type.erased(t.ty) =>
+          err(s"a ${show(t.ty)} has forgotten what it points at, so there is no value to read " +
+            "through it — call one of the trait's methods instead")
+        case None                       => err(s"'*' needs a pointer or a reference, not ${show(t.ty)}")
 
     case Unary(op, _) =>
       err(s"unary '$op' is not supported yet")
@@ -469,6 +497,14 @@ class Analyzer private (program: Program)
     case Field(receiver, f) =>
       val tr = autoDeref(analyzeExpr(receiver))
       tr.ty match
+        // A trait object has no fields: the layout is exactly what it forgot. What it still has is
+        // whatever the trait declares, and a trait declares methods, which are called.
+        case _ if Type.erased(tr.ty) =>
+          val name = Type.erasedTrait(tr.ty).get.name
+          if traitDecls(name).methods.exists(_.name == f) then
+            err(s"'$f' is a method of '$name' — call it with '$f(…)'")
+          else err(s"a ${show(tr.ty)} has no fields, and trait '$name' declares no '$f'")
+
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
           if idx >= 0 then TField(tr, idx, s.fields(idx)._2)

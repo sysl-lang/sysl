@@ -1,6 +1,7 @@
 # Traits (Polymorphism)
 
-**Status:** decided (core model). Some surface-syntax details are flagged open at the end. How a
+**Status:** decided (core model), and **built** — static dispatch through bounds, and dynamic
+dispatch through `*Trait` / `&Trait`. Some surface-syntax details are flagged open at the end. How a
 plain method and its receiver are spelled — the hole this doc used to leave open — is settled in
 `08-methods.md`; a trait's methods are declared and called the same way, with the receiver an
 `impl`'s type instead of a concrete one. A signature that has to name the implementing type writes
@@ -92,6 +93,68 @@ interface change to that module, visible to everything downstream — the same r
 `given`/`using`-style implicit resolution out of scope (`13` §7): unrestricted search and separate
 compilation are not compatible.
 
+## Trait objects, as built
+
+A trait object is a **fat pointer** — two words, the method table for the type it forgot and the
+value itself:
+
+```
+{ ptr vtable, ptr data }
+```
+
+The sigil says who owns the second word, and nothing else changes between the two:
+
+- **`*Trait`** — the data word is the value's own address. Raw and unmanaged, like every `*T`, and
+  the reason `14 §2` reached for a `*Writer`: a sink a kernel can pass around needs no allocator.
+- **`&Trait`** — the data word is the reference-counted **box** the value sits in. It counts exactly
+  as the `&T` it was erased from does, because the box carries its own destructor (`03`) — so
+  letting go of a trait object needs no more knowledge of the payload than letting go of a `&T`
+  does, which is the same erasure ARC already relied on for a slice's owner.
+
+**The table is per (trait, type, sigil).** Two flavours rather than one because the data word means
+different things: an entry has to reach a receiver, and from a box that is one step further in than
+from a bare value. Where the data word already *is* the receiver an implementation declared — a
+`*self` method under `*Trait`, a `&self` method under `&Trait` — the entry names the implementation
+itself; otherwise it names a small adapter that steps over the box header, loads the value, or both.
+So the common case costs one indirect call and nothing else.
+
+### Object safety
+
+Erasure forgets the type, so a method may promise nothing that depends on knowing it. A trait may be
+made into an object when every method:
+
+- **has a receiver.** An associated function has nothing to dispatch on.
+- **mentions `Self` nowhere but that receiver.** A second `Self` would have to be the *same*
+  forgotten type as the first, which is exactly the fact an object no longer carries, and a `Self`
+  result has no size to hand back.
+- **does not take `&self`, for a `*Trait` only.** `&self` asks for its receiver inside a box, and a
+  raw object points straight at a value. A `&Trait` carries one, so it accepts such a method; the
+  diagnostic says which sigil to write.
+
+The middle rule excludes **every trait in the operator catalog** — `add(self, rhs: Self) -> Self`
+first among them — and that is the right answer rather than a limitation: `14`'s traits describe an
+operator over two values of one type, which is a question about types known at compile time. They
+are for bounds. It also means every type reaching a table got there through a source `impl`, so
+every slot is a function that exists — a compiler-provided membership (`14 §5`) is an instruction,
+not something a pointer can name.
+
+### Forming and using one
+
+Erasure is a **coercion**, applied wherever a trait-object type is expected: at an argument, a
+declared variable, an assignment, a returned value, an array element, a struct field. `&r` erases to
+`*Shape`; a `&Rect` erases to `&Shape`; and a plain `Rect(3, 4)` where a `&Shape` is expected is
+boxed and then erased, which is the ordinary "write the construction and it is allocated" rule of
+`03` with one more step. A `*Trait` will not take a bare value — a raw pointer needs an address, and
+taking one of a temporary silently is how a program acquires a dangling pointer.
+
+Because the coercion applies per branch, an `if` or a `match` whose arms are *different concrete
+types* meets at one trait object, which is the point of having them.
+
+What an object still offers is the trait's methods, and nothing else: no dereference, no fields, no
+comparison (two objects over one value through different traits are the same value and different
+tables, so what equality means is the trait's question). A call is checked against the **trait's**
+signature, which stands in for every implementation because conformance is exact.
+
 ## Kept / dropped
 
 - **Kept:** static dispatch (monomorphized bounds), dynamic dispatch (boxed trait object),
@@ -113,3 +176,11 @@ compilation are not compatible.
   full type reference rather than a name, and a key for each shape.
 - **An `impl` for a generic type.** `impl Show for Box[T]` is rejected for now; the implementing type
   must be concrete. Wanted, and it interacts with monomorphizing the members.
+- **A property in a trait.** A trait declares method *signatures*, and the property form is
+  `name -> T = expr` — a body, which a signature has none of. So a trait cannot require a property
+  today, through a bound or through an object. It wants a signature spelling of its own
+  (`name -> T`, with no `=`), and it is additive: nothing about either dispatch path changes.
+- **`&Trait` is not yet gated on `alloc`.** `capabilities.md` puts a counted trait object behind the
+  allocator capability, alongside `&T` itself. Neither is gated, because the capability system needs
+  the project config and the module system, and both are still to be written — so this is the same
+  gap `&T` already has rather than a new one.

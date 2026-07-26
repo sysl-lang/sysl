@@ -73,6 +73,17 @@ before they appear and may be mutually recursive).
   the surrounding context expects when the arguments alone do not determine them — which is
   what lets `var o: Option[int] = None` and `f() -> Result[int, string] = Ok(5)` work. There is
   no syntax for applying type arguments explicitly at a call site.
+- **Traits, both ways they dispatch (`02`).** An `impl Trait for Type` lowers its methods to the
+  same `Type.method` functions a method written in the type's own body produces, so **static**
+  dispatch through a bound (`f[T: Shape](x: T)`) is monomorphized down to a direct call with no
+  indirection. **Dynamic** dispatch is `*Trait` / `&Trait`, a two-word `{ vtable, data }` value:
+  the sigil says whether the data word is the value's own address or the reference-counted box
+  it sits in, and there is one table per (trait, type, sigil) so a slot can reach the receiver
+  its implementation declared. A slot whose receiver already *is* the data word holds the
+  implementation directly; the rest hold a small adapter. Erasure is a coercion applied wherever
+  an object type is expected, so an `if` whose arms are different concrete types meets at one.
+  A trait is object-safe when every method has a receiver and mentions `Self` nowhere else,
+  which excludes the whole operator catalog of `14` — those traits are for bounds.
 - **`Option[T]` / `Result[T, E]` and `?`.** Both come from the prelude as ordinary generic
   enums. The postfix `?` unwraps the success payload of one, or returns from the enclosing
   function early with the failure re-wrapped in *that* function's return type — so `?` needs

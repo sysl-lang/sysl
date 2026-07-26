@@ -52,8 +52,11 @@ trait TypeResolution extends AnalyzerBase {
     case _                                                         => resolveType(t, subst)
 
   private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
-    case PtrType(inner)       => Type.Ptr(underIndirection(resolveType(inner, subst)))
-    case RefType(inner, sync) => Type.Ref(underIndirection(resolveType(inner, subst)), sync)
+    case PtrType(inner) =>
+      traitObject(inner, subst, "*").fold(Type.Ptr(underIndirection(resolveType(inner, subst))))(Type.Ptr.apply)
+    case RefType(inner, sync) =>
+      traitObject(inner, subst, "&")
+        .fold(Type.Ref(underIndirection(resolveType(inner, subst)), sync))(Type.Ref(_, sync))
 
     // An array holds its elements, so it is no indirection at all and a type cannot contain an
     // array of itself. A slice only points at them, so it breaks a cycle exactly as `*T` does.
@@ -78,7 +81,58 @@ trait TypeResolution extends AnalyzerBase {
           case None if n == selfName =>
             err("'Self' names the type a trait is implemented for, so it is only meaningful inside " +
               "a 'trait' or an 'impl'")
+          // A trait describes what a value can do, not how one is laid out, so it stands where a
+          // type is asked for only behind a sigil — and the two ways of reaching it are named here,
+          // since which one a program wants is the whole of the choice it has to make.
+          case None if traitDecls.contains(n) =>
+            err(s"'$n' is a trait, so it describes behaviour rather than a layout — write '*$n' or " +
+              s"'&$n' for a trait object, or bound a type parameter with '[T: $n]'")
           case None                            => err(s"unknown type '$n'")
+
+  /** A trait named behind a memory-mode sigil, which is what makes the pointer a trait object
+   * (`02`): `*Trait` raw and unmanaged, `&Trait` reference-counted. `None` for everything else,
+   * including a type parameter that happens to be spelled like a trait — the substitution wins,
+   * since that is what shadowing means everywhere else a name is resolved.
+   */
+  private def traitObject(inner: TypeRef, subst: Map[String, Type], sigil: String): Option[Type.Trait] =
+    inner match
+      case NamedType(n, Nil) if traitDecls.contains(n) && !subst.contains(n) =>
+        at(inner.pos)(checkObjectSafe(n, sigil))
+        Some(Type.Trait(n))
+      case _ => None
+
+  /** Whether a trait may be erased into an object at all, and what to say when it may not (`02`).
+   *
+   * An erased value has forgotten its type, so a method may promise nothing that depends on knowing
+   * it. `Self` may stand for the receiver and nowhere else: a second `Self` would have to be the
+   * same forgotten type as the first, which is exactly the fact a trait object no longer has, and a
+   * `Self` result has no size to hand back. That excludes every trait in the operator catalog —
+   * `add(self, rhs: Self) -> Self` first among them — which is why those traits are for bounds.
+   *
+   * An associated function has no receiver to dispatch on. And `&self` asks for its receiver to be
+   * inside a reference-counted box, which only the counted object has: `&Trait` carries one, so it
+   * accepts such a method, and `*Trait` points straight at a value and does not.
+   */
+  protected def checkObjectSafe(name: String, sigil: String): Unit = {
+    val obj = s"'$sigil$name'"
+
+    def mentionsSelf(t: TypeRef): Boolean = t match
+      case NamedType(n, args) => n == selfName || args.exists(mentionsSelf)
+      case PtrType(i)         => mentionsSelf(i)
+      case RefType(i, _)      => mentionsSelf(i)
+      case ArrayType(_, e)    => mentionsSelf(e)
+
+    for m <- traitDecls(name).methods do
+      if m.receiver.isEmpty then
+        err(s"'$name' declares the associated function '${m.name}', which has no receiver to " +
+          s"dispatch on — so there is no $obj to form")
+      if m.receiver.exists(_.isInstanceOf[RecvMode.ByRef]) && sigil == "*" then
+        err(s"'${m.name}' of '$name' takes '&self', so it needs its receiver inside a " +
+          s"reference-counted box — $obj points straight at a value, so write '&$name' instead")
+      if m.params.exists(p => mentionsSelf(p.typ)) || m.retType.exists(mentionsSelf) then
+        err(s"'${m.name}' of '$name' mentions 'Self' away from its receiver, and an erased value " +
+          s"has forgotten which type that is — so there is no $obj to form")
+  }
 
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
    * whatever type is currently being laid out.
@@ -267,8 +321,11 @@ trait TypeResolution extends AnalyzerBase {
       actual match
         case Type.Array(_, e) => unify(elem, e, tparams, sub)
         case _                => ()
+    // A trait never binds a type parameter. `f[T](p: *T)` handed a `*Writer` would otherwise
+    // instantiate at a type with no layout, and the body could then write `var v: T` for a value
+    // that cannot exist; leaving it unsolved reports the inference failure instead.
     case NamedType(n, Nil) if tparams(n) =>
-      if !sub.contains(n) then sub(n) = actual
+      if !sub.contains(n) && !actual.isInstanceOf[Type.Trait] then sub(n) = actual
     case NamedType(n, argRefs) =>
       actual match
         case s: Type.Struct if s.base == n && s.targs.length == argRefs.length =>

@@ -107,6 +107,7 @@ private class Escape(program: TProgram) {
           case _             => viewsFrame(base)
       case TLoad(name, _)       => confined(name)
       case TCall(_, args, _)    => args.exists(viewsFrame)
+      case TVCall(_, _, args, _) => args.exists(viewsFrame)
       case TStructNew(_, args)  => args.exists(viewsFrame)
       case TEnumNew(_, _, args) => args.exists(viewsFrame)
       case TArrayLit(elems, _)  => elems.exists(viewsFrame)
@@ -185,6 +186,13 @@ private class Escape(program: TProgram) {
         case TCall(name, args, _) =>
           for (a, i) <- args.zipWithIndex do
             if viewsFrame(a) && kept(name, i) then report(a, s"is passed to '$name', which holds on to it")
+
+        // Which body a trait object's call reaches is decided at run time, so there is no one
+        // summary to consult — the conservative answer is the only sound one, exactly as it is for
+        // a function whose body this program does not have.
+        case TVCall(_, _, args, _) =>
+          for a <- args do
+            if viewsFrame(a) then report(a, "is passed through a trait object, which may hold on to it")
 
         case _ =>
 
@@ -265,6 +273,11 @@ private class Escape(program: TProgram) {
     case TCompare(ops, _)           => ops
     case TSeq(exprs)                => exprs
     case TCall(_, args, _)          => args
+    // Which function a trait object's call reaches is a run-time word, so there is no parameter
+    // list to ask whether an argument is kept — a callee that might keep anything is exactly what
+    // `kept` already assumes of a name it does not recognise.
+    case TVCall(r, _, args, _)      => r :: args
+    case TErase(v, _, _)            => List(v)
     case TStructNew(_, args)        => args
     case TEnumNew(_, _, args)       => args
     case TEnumFromInt(v, _)         => List(v)

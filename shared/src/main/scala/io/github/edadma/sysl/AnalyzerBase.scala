@@ -55,6 +55,12 @@ trait AnalyzerBase {
    */
   protected val traitImpls = mutable.LinkedHashMap.empty[(String, String), ImplDecl]
 
+  /** The method tables the program's trait objects dispatch through, keyed by the global each is
+   * emitted under and registered the first time an erasure needs one. A program that never erases a
+   * type carries none.
+   */
+  protected val vtables = mutable.LinkedHashMap.empty[String, TVtable]
+
   /** A type's inherent members, keyed by (type name, member name). Methods, properties, and
    * associated functions all live here; each is also lowered to an ordinary function under the
    * mangled name `Type.member`, so calling one is a call and codegen needs no method concept.
@@ -337,6 +343,7 @@ trait AnalyzerBase {
     val structs = structInsts.toList
     val enums   = enumInsts.toList
     val funcs   = funcInsts.toList
+    val tables  = vtables.toList
     val reached = funcsUsed.toList
     val externs = externsUsed.toList
     val queued  = pending.toList
@@ -346,6 +353,7 @@ trait AnalyzerBase {
       restore(structInsts, structs)
       restore(enumInsts, enums)
       restore(funcInsts, funcs)
+      restore(vtables, tables)
       funcsUsed.clear();   funcsUsed ++= reached
       externsUsed.clear(); externsUsed ++= externs
       pending.clear();     pending ++= queued
@@ -403,7 +411,7 @@ trait AnalyzerBase {
   protected def analyzeBool(e: Expr): TExpr
   protected def analyzePlace(target: Expr, what: String): TExpr
   protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock
-  protected def box(t: TExpr, expected: Type): TExpr
+  protected def coerce(t: TExpr, expected: Type): TExpr
   protected def autoDeref(t: TExpr): TExpr
   protected def isPlace(t: TExpr): Boolean
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String

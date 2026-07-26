@@ -1,0 +1,334 @@
+package io.github.edadma.sysl
+
+import org.scalatest.freespec.AnyFreeSpec
+
+/** Tier-2 runtime behaviour of trait objects — the dynamic half of `02`.
+ *
+ * The thing every test here has to establish is that dispatch is genuinely *dynamic*: a static
+ * resolution could produce the right answer for one type by coincidence, so each case drives two
+ * types whose implementations return values that could not be confused, through one variable, one
+ * parameter, or one array element.
+ */
+class TraitObjectRunTests extends AnyFreeSpec with RunSupport {
+
+  /** Two shapes whose areas are far apart, so a call that reached the wrong one is obvious. */
+  private val shape =
+    """trait Shape
+      |    area(self) -> int
+      |struct Rect
+      |    w: int
+      |    h: int
+      |struct Sq
+      |    s: int
+      |impl Shape for Rect
+      |    area(self) -> int = self.w * self.h
+      |impl Shape for Sq
+      |    area(self) -> int = self.s * self.s
+      |""".stripMargin
+
+  "a raw trait object" - {
+    "dispatches to the implementation of whatever it points at" in {
+      val out = run(shape +
+        """report(s: *Shape) -> int = s.area()
+          |var r = Rect(3, 4)
+          |var q = Sq(5)
+          |print(report(&r), report(&q))""".stripMargin)
+
+      out shouldBe "12 25\n"
+    }
+
+    // One variable, two types, two answers — read through the same call site both times, so the
+    // call cannot have been resolved when it was compiled.
+    "changes which implementation it reaches when it is reassigned" in {
+      val out = run(shape +
+        """var r = Rect(3, 4)
+          |var q = Sq(5)
+          |var s: *Shape = &r
+          |print(s.area())
+          |s = &q
+          |print(s.area())""".stripMargin)
+
+      out shouldBe "12\n25\n"
+    }
+
+    "holds types of different sizes in one array" in {
+      val out = run(shape +
+        """var r = Rect(3, 4)
+          |var q = Sq(5)
+          |var all: [2]*Shape = [&r, &q]
+          |var total = 0
+          |for s in all
+          |    total += s.area()
+          |print(total)""".stripMargin)
+
+      out shouldBe "37\n"
+    }
+
+    "reaches a '*self' method, which mutates the value it points at" in {
+      val out = run(
+        """trait Bump
+          |    bump(*self, by: int)
+          |struct C
+          |    n: int
+          |impl Bump for C
+          |    bump(*self, by: int)
+          |        self.n += by
+          |var c = C(1)
+          |var b: *Bump = &c
+          |b.bump(41)
+          |print(c.n)""".stripMargin)
+
+      out shouldBe "42\n"
+    }
+
+    // A built-in has an owner key its members are filed under exactly as a struct does, so an
+    // `impl` for one is erasable exactly as a struct's is.
+    "erases a built-in type" in {
+      val out = run(
+        """trait Show
+          |    show(self) -> string
+          |impl Show for int
+          |    show(self) -> string = "an int"
+          |impl Show for bool
+          |    show(self) -> string = "a bool"
+          |var n = 5
+          |var b = true
+          |var x: *Show = &n
+          |var y: *Show = &b
+          |print(x.show(), y.show())""".stripMargin)
+
+      out shouldBe "an int a bool\n"
+    }
+
+    "erases an enum" in {
+      val out = run(
+        """trait Shape
+          |    area(self) -> int
+          |enum E
+          |    One
+          |    Two
+          |impl Shape for E
+          |    area(self) -> int = match self
+          |        One -> 1
+          |        Two -> 2
+          |var e = Two
+          |var s: *Shape = &e
+          |print(s.area())""".stripMargin)
+
+      out shouldBe "2\n"
+    }
+
+    // Two traits over one type make two tables, and each object reaches only its own — the two
+    // methods return different values, so a shared table would show up as one of them answering
+    // for both.
+    "one value erased to two traits reaches the right table each time" in {
+      val out = run(
+        """trait A
+          |    a(self) -> int
+          |trait B
+          |    b(self) -> int
+          |struct S
+          |    n: int
+          |impl A for S
+          |    a(self) -> int = self.n
+          |impl B for S
+          |    b(self) -> int = self.n * 2
+          |var s = S(21)
+          |var x: *A = &s
+          |var y: *B = &s
+          |print(x.a(), y.b())""".stripMargin)
+
+      out shouldBe "21 42\n"
+    }
+
+    "a method takes arguments and returns a value of any type" in {
+      val out = run(
+        """trait Talk
+          |    say(self, to: string, times: int) -> string
+          |struct P
+          |    who: string
+          |impl Talk for P
+          |    say(self, to: string, times: int) -> string =
+          |        if times > 1 then self.who + " to " + to + "!" else self.who + " to " + to
+          |var p = P("ada")
+          |var t: *Talk = &p
+          |print(t.say("bob", 1))
+          |print(t.say("bob", 2))""".stripMargin)
+
+      out shouldBe "ada to bob\nada to bob!\n"
+    }
+
+    "a method returning nothing runs for its effect" in {
+      val out = run(
+        """trait Sink
+          |    put(self, n: int)
+          |struct S
+          |    tag: int
+          |impl Sink for S
+          |    put(self, n: int)
+          |        print(self.tag + n)
+          |var s = S(40)
+          |var k: *Sink = &s
+          |k.put(2)""".stripMargin)
+
+      out shouldBe "42\n"
+    }
+  }
+
+  "a counted trait object" - {
+    // The allocation is the construction, exactly as it is for a plain `&T`: writing the value
+    // where a `&Trait` is expected boxes it and erases the box in one step.
+    "is made by writing the value a context expects one at" in {
+      val out = run(shape +
+        """var a: &Shape = Rect(3, 4)
+          |var b: &Shape = Sq(5)
+          |print(a.area(), b.area())""".stripMargin)
+
+      out shouldBe "12 25\n"
+    }
+
+    "is also made from a reference already in hand" in {
+      val out = run(shape +
+        """var r: &Rect = Rect(6, 7)
+          |var s: &Shape = r
+          |print(s.area())""".stripMargin)
+
+      out shouldBe "42\n"
+    }
+
+    // `&self` needs its receiver inside the box, which is exactly what a counted object carries —
+    // so the mutation is to the shared object and survives the call.
+    "reaches a '&self' method, which mutates the shared object" in {
+      val out = run(
+        """trait Ticker
+          |    tick(&self)
+          |    value(self) -> int
+          |struct Clock
+          |    t: int
+          |impl Ticker for Clock
+          |    tick(&self)
+          |        self.t += 1
+          |    value(self) -> int = self.t
+          |var c: &Ticker = Clock(0)
+          |c.tick()
+          |c.tick()
+          |c.tick()
+          |print(c.value())""".stripMargin)
+
+      out shouldBe "3\n"
+    }
+
+    "meets two branches of different concrete types at one type" in {
+      val out = run(shape +
+        """make(big: bool) -> &Shape = if big then Sq(5) else Rect(3, 4)
+          |var pick = 1
+          |var m: &Shape = match pick
+          |    1 -> Sq(6)
+          |    _ -> Rect(1, 1)
+          |print(make(true).area(), make(false).area(), m.area())""".stripMargin)
+
+      out shouldBe "25 12 36\n"
+    }
+
+    "is carried through a struct field and an enum payload" in {
+      val out = run(shape +
+        """struct Holder
+          |    it: &Shape
+          |var h = Holder(Rect(6, 7))
+          |var o: Option[&Shape] = Some(Sq(5))
+          |var second = match o
+          |    Some(s) -> s.area()
+          |    None -> 0
+          |print(h.it.area(), second)""".stripMargin)
+
+      out shouldBe "42 25\n"
+    }
+  }
+
+  /** Every counted object holds one count of the box it erased, so the ordinary discipline has to
+   * carry over unchanged: a leak grows the heap without bound and a double free crashes, and a long
+   * loop is what makes either of those show up as something other than a passing test.
+   */
+  "ownership" - {
+    "a counted object made and dropped in a loop neither leaks nor frees twice" in {
+      val out = run(shape +
+        """var i = 0
+          |var total = 0
+          |while i < 300000
+          |    var s: &Shape = Sq(5)
+          |    total += s.area()
+          |    i++
+          |print(total)""".stripMargin)
+
+      out shouldBe "7500000\n"
+    }
+
+    // The object's payload holds a reference of its own, so releasing the object has to release
+    // what the payload held — which is the box's destructor doing its ordinary work through a
+    // pointer whose static type has been forgotten.
+    "a counted object over a reference-carrying payload is torn down completely" in {
+      val out = run(
+        """trait Held
+          |    v(self) -> int
+          |struct Inner
+          |    n: int
+          |struct Tag
+          |    label: string
+          |    inner: &Inner
+          |impl Held for Tag
+          |    v(self) -> int = self.inner.n
+          |var i = 0
+          |var total = 0
+          |while i < 200000
+          |    var h: &Held = Tag("tag", Inner(3))
+          |    total += h.v()
+          |    i++
+          |print(total)""".stripMargin)
+
+      out shouldBe "600000\n"
+    }
+
+    "a method returning a counted object hands over a count of its own" in {
+      val out = run(shape +
+        """trait Maker
+          |    make(self) -> &Shape
+          |struct M
+          |    n: int
+          |impl Maker for M
+          |    make(self) -> &Shape = Sq(self.n)
+          |var m = M(5)
+          |var k: *Maker = &m
+          |var i = 0
+          |var total = 0
+          |while i < 200000
+          |    total += k.make().area()
+          |    i++
+          |print(total)""".stripMargin)
+
+      out shouldBe "5000000\n"
+    }
+
+    // A by-value receiver is loaded out of the object and handed to the implementation, which
+    // retains it on entry and releases it on return. Getting that wrong in either direction shows
+    // up here: the string field would be freed out from under the object, or never freed at all.
+    "a by-value receiver carrying a string leaves the object's own count alone" in {
+      val out = run(
+        """trait Label
+          |    label(self) -> string
+          |struct Tag
+          |    text: string
+          |impl Label for Tag
+          |    label(self) -> string = self.text
+          |var i = 0
+          |var total: usize = 0
+          |while i < 200000
+          |    var t: &Label = Tag("abcd")
+          |    total += t.label().len
+          |    total += t.label().len
+          |    i++
+          |print(total)""".stripMargin)
+
+      out shouldBe "1600000\n"
+    }
+  }
+}

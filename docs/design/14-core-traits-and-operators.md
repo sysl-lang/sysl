@@ -3,8 +3,8 @@
 **Status:** decided. **§1–§5 are implemented** — `Self`, the catalog (minus `Display`), the one
 dispatch rule, definition-checked bounds on both method calls and operators, and the
 compiler-provided scalar memberships. What remains is **§6**, which needs `Display`, which needs the
-`Writer` sink of `§8 d` — and that in turn needs trait objects, which chapter `02` specifies and
-nothing has built. This is the concrete spec for three things the earlier chapters *decided* but
+`Writer` sink of `§8 d` — now the only thing in the way, since the trait objects `*Writer` is one of
+are built (`02`). This is the concrete spec for three things the earlier chapters *decided* but
 left unbuilt, because all three turn on the same missing layer:
 
 - **`00 §9` / `01` / `08 §"Interaction with traits"`** — operators are trait methods (`+` is
@@ -162,9 +162,10 @@ wants it. Writing into a sink costs nothing there: a kernel passes a UART writer
 `str(x)` — which must materialize a `string` — that carries the `alloc` requirement, exactly where
 the allocation actually happens (`§6`).
 
-`Writer` is a **trait**, so `*Writer` is the type-erased trait object of `02`. That matters for the
-capability story: `capabilities.md` gates `&Trait` behind `alloc` but not `*Trait`, so a raw-pointer
-sink is available in the allocator-free subset. Swift's `CustomStringConvertible` returns a
+`Writer` is a **trait**, so `*Writer` is the type-erased trait object of `02` — which is built, so a
+signature written this way now types. That is also what the capability story turns on:
+`capabilities.md` gates `&Trait` behind `alloc` but not `*Trait`, so a raw-pointer sink is available
+in the allocator-free subset. Swift's `CustomStringConvertible` returns a
 `String` and Rust's `Display` writes into a formatter; sysl follows Rust here, and for Rust's
 reason, since Swift has no allocator-free target to answer to.
 
@@ -367,11 +368,14 @@ prints once it has `impl Display`, which is the capability `08`/`tast.scala` wer
   target registers. **This is the one dependency blocking implementation of §6**, and it wants the
   prelude surface `13` leaves open. Nothing in §1–§5 waits on it.
 
-  Implementing it needs one thing more than a decision: `*Writer` is a trait object, and **trait
-  objects are not built**. A trait name does not resolve as a type at all today — there is no method
-  table, no fat pointer, no `Type` case for one — so `02`'s dynamic-dispatch half has to land before
-  any signature written here can be typed. That is the real order of work, and it is larger than the
-  three questions above.
+  What used to sit under it no longer does: `*Writer` is a trait object, and trait objects are now
+  built (`02`), so a signature written here types and dispatches. What is left is the three
+  questions above — a decision rather than a layer.
+
+  A trait object does put one constraint on the answer, worth knowing before it is written: object
+  safety refuses a method that mentions `Self` away from its receiver, so `Writer`'s write method
+  must take `[]u8` (or a `string`) rather than anything phrased in terms of the implementing type.
+  The first note below already wanted exactly that for its own reasons.
 
   Three notes toward the decision, from Rust:
 

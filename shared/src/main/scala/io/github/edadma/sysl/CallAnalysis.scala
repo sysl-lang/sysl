@@ -5,7 +5,7 @@ package io.github.edadma.sysl
  * the analyzer lowered every member to a function under the mangled name `Type.member` — so the
  * only method-specific work here is passing the receiver in the mode its `self` sigil declared.
  */
-trait CallAnalysis extends Literals {
+trait CallAnalysis extends Literals with TraitObjects {
 
   /** Type-checks positional arguments against a resolved parameter list. `pre` holds arguments
    * already analyzed during type-argument inference, so they are not analyzed twice.
@@ -17,9 +17,10 @@ trait CallAnalysis extends Literals {
       pre: Option[List[TExpr]],
   ): List[TExpr] = {
     // An argument analyzed during inference was analyzed without an expected type, so a value
-    // headed for a `&T` parameter is boxed here instead of at its own analysis.
+    // headed for a `&T` parameter is boxed here instead of at its own analysis, and one headed for
+    // a trait object is erased here.
     val ts = pre match
-      case Some(provisional) => provisional.zip(params).map { case (t, (_, pty)) => box(t, pty) }
+      case Some(provisional) => provisional.zip(params).map { case (t, (_, pty)) => coerce(t, pty) }
       case None              => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
 
     // The complaint is about one argument, so it is reported where that argument is written
@@ -134,6 +135,7 @@ trait CallAnalysis extends Literals {
 
     receiverType(tr.ty) match
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
+      case t: Type.Trait    => callTraitObject(tr, t, mname, args)
       case rty =>
         val (base, targs) = memberOwner(rty)
 
@@ -213,6 +215,35 @@ trait CallAnalysis extends Literals {
           val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
           TCall(fname, recv :: checkArgs(fname, params, args, Some(ts)), rtype)
         }
+  }
+
+  /** `obj.m(…)` on a `*Trait` or a `&Trait` — the dynamic half of `02`.
+   *
+   * The signature checked against is the **trait's**, because the implementation is exactly what an
+   * erased value no longer says: which function runs is a word read out of the object's table at
+   * run time, and what stands in for knowing it is that every `impl` conforms to the trait exactly
+   * (`Hoisting.checkConformance`). `Self` is not resolved at all — object safety already refused
+   * any trait that mentions it away from the receiver, so no signature reaching here contains one.
+   */
+  protected def callTraitObject(recv: TExpr, t: Type.Trait, mname: String, args: List[Expr]): TExpr = {
+    val decl = traitDecls(t.name)
+
+    decl.methods.zipWithIndex.find(_._1.name == mname) match
+      case None =>
+        err(s"trait '${t.name}' declares no method '$mname' — it has " +
+          decl.methods.map(_.name).mkString("'", "', '", "'"))
+      case Some((m, slot)) =>
+        val params = m.params.map(p => (p.name, rt(p.typ)))
+        val fname  = s"${t.name}.$mname"
+
+        if args.length != params.length then
+          err(s"method '$fname' takes ${quantity(params.length, "argument")}, " +
+            s"but ${supplied(args.length, "argument")}")
+
+        val ts    = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+        val rtype = m.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
+
+        TVCall(recv, slot, checkArgs(fname, params, args, Some(ts)), rtype)
   }
 
   /** The diagnostic for a method no bound licenses. It names the bound that *would* license it,
