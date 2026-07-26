@@ -47,6 +47,24 @@ package io.github.edadma.sysl
  * for standard output cannot be written here: it has no state to give a struct, which is also why
  * `print` keeps its direct path rather than routing through a sink it cannot name.
  *
+ * **Each of them honours its `FormatSpec`**, and `display_pad` is where they all end up: it puts a
+ * finished run of bytes in the field the specifier asked for, padding with spaces on whichever side
+ * justification says. Doing it once is the point — six renderers each growing their own padding is
+ * six chances for `%8s` to mean something slightly different.
+ *
+ * A specifier describes **the field the whole value occupies**, so an implementation rendering
+ * *parts* hands each part the neutral specifier and applies `fmt` to the whole — which
+ * `display_pad` is public for. Forwarding `fmt` straight down is right only when the part being
+ * rendered *is* the whole rendering, as it is for a wrapper around one field.
+ *
+ * What a precision means is left to each renderer, because the conversion letter does not cross the
+ * boundary — only a width, a precision, and a justification do. Text truncates to it, a number
+ * fills out to it in digits, and a real reads it as significant digits, which is printf's meaning
+ * under each of `%s`, `%d`, and `%g` respectively. Width and precision count **bytes**, as C's do,
+ * so a `string` renders the same width whether it went through `snprintf` or through here — with
+ * the one refinement that truncation backs off to a character boundary rather than handing a sink
+ * half of a codepoint.
+ *
  * The three `extern`s are the only things here that are not sysl. Two of them are plumbing rather
  * than surface, so they take a link name and leave `putchar` and `snprintf` free for a program to
  * declare itself. `exit` is deliberately not one of those: it is the prelude's offer of the hosted
@@ -149,24 +167,66 @@ object Prelude {
       |trait Display
       |    display(self, out: *Writer, fmt: FormatSpec)
       |
-      |display_str(s: string, out: *Writer, fmt: FormatSpec) = out.write(s.bytes)
+      |display_fill(out: *Writer, b: u8, n: int)
+      |    var buf: [16]u8
+      |    for i in 0..<16 do buf[i] = b
+      |    var left = n
+      |    while left > 0
+      |        var k = if left < 16 then left else 16
+      |        out.write(buf[0..<usize(k)])
+      |        left -= k
+      |end display_fill
+      |
+      |display_pad(text: []u8, out: *Writer, fmt: FormatSpec)
+      |    var pad = fmt.width - int(text.len)
+      |    if pad < 0 then pad = 0
+      |    if !fmt.left then display_fill(out, 32u8, pad)
+      |    out.write(text)
+      |    if fmt.left then display_fill(out, 32u8, pad)
+      |end display_pad
+      |
+      |display_digits(text: []u8, out: *Writer, fmt: FormatSpec)
+      |    var sign = if text.len > 0usize && text[0] == 45u8 then 1usize else 0usize
+      |    var zeros = 0
+      |    if fmt.prec > int(text.len - sign) then zeros = fmt.prec - int(text.len - sign)
+      |    var pad = fmt.width - int(text.len) - zeros
+      |    if pad < 0 then pad = 0
+      |    if !fmt.left then display_fill(out, 32u8, pad)
+      |    if sign > 0usize then out.write(text[0..<1usize])
+      |    display_fill(out, 48u8, zeros)
+      |    out.write(text[sign..<text.len])
+      |    if fmt.left then display_fill(out, 32u8, pad)
+      |end display_digits
+      |
+      |display_str(s: string, out: *Writer, fmt: FormatSpec)
+      |    var b = s.bytes
+      |    var n = b.len
+      |    if fmt.prec >= 0 && usize(fmt.prec) < n then
+      |        n = usize(fmt.prec)
+      |        while n > 0usize && (b[n] & 192u8) == 128u8
+      |            n -= 1usize
+      |    display_pad(b[0..<n], out, fmt)
+      |end display_str
       |
       |display_int(n: long, out: *Writer, fmt: FormatSpec)
       |    var buf: [24]u8
       |    var k = sysl_snprintf(&buf[0], 24usize, c"%lld", n)
-      |    out.write(buf[0..<usize(k)])
+      |    display_digits(buf[0..<usize(k)], out, fmt)
       |end display_int
       |
       |display_uint(n: ulong, out: *Writer, fmt: FormatSpec)
       |    var buf: [24]u8
       |    var k = sysl_snprintf(&buf[0], 24usize, c"%llu", n)
-      |    out.write(buf[0..<usize(k)])
+      |    display_digits(buf[0..<usize(k)], out, fmt)
       |end display_uint
       |
       |display_real(x: real, out: *Writer, fmt: FormatSpec)
-      |    var buf: [32]u8
-      |    var k = sysl_snprintf(&buf[0], 32usize, c"%g", x)
-      |    out.write(buf[0..<usize(k)])
+      |    var buf: [64]u8
+      |    var p = fmt.prec
+      |    if p < 0 then p = 6
+      |    if p > 40 then p = 40
+      |    var k = sysl_snprintf(&buf[0], 64usize, c"%.*g", p, x)
+      |    display_pad(buf[0..<usize(k)], out, fmt)
       |end display_real
       |
       |display_bool(b: bool, out: *Writer, fmt: FormatSpec) = display_str(if b then "true" else "false", out, fmt)
@@ -174,24 +234,26 @@ object Prelude {
       |display_char(ch: char, out: *Writer, fmt: FormatSpec)
       |    var buf: [4]u8
       |    var cp = uint(ch)
+      |    var n = 0usize
       |    if cp < 128u32 then
       |        buf[0] = u8(cp)
-      |        out.write(buf[0..<1usize])
+      |        n = 1usize
       |    elif cp < 2048u32 then
       |        buf[0] = u8(192u32 | (cp >> 6u32))
       |        buf[1] = u8(128u32 | (cp & 63u32))
-      |        out.write(buf[0..<2usize])
+      |        n = 2usize
       |    elif cp < 65536u32 then
       |        buf[0] = u8(224u32 | (cp >> 12u32))
       |        buf[1] = u8(128u32 | ((cp >> 6u32) & 63u32))
       |        buf[2] = u8(128u32 | (cp & 63u32))
-      |        out.write(buf[0..<3usize])
+      |        n = 3usize
       |    else
       |        buf[0] = u8(240u32 | (cp >> 18u32))
       |        buf[1] = u8(128u32 | ((cp >> 12u32) & 63u32))
       |        buf[2] = u8(128u32 | ((cp >> 6u32) & 63u32))
       |        buf[3] = u8(128u32 | (cp & 63u32))
-      |        out.write(buf[0..<4usize])
+      |        n = 4usize
+      |    display_pad(buf[0..<n], out, fmt)
       |end display_char
       |
       |printb(b: bool) = prints(if b then "true" else "false")

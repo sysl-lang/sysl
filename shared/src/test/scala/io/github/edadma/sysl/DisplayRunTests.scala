@@ -218,16 +218,19 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
   }
 
   "a format specifier reaches the implementation" - {
+    // The parts are handed the neutral specifier rather than the one that arrived: `%-12.3s`
+    // describes the field this *value* occupies, so applying it to each piece would pad three times.
     "an f-string hole hands its width, precision, and justification over" in {
       run("""struct W
             |    n: int
             |impl Display for W
             |    display(self, out: *Writer, fmt: FormatSpec)
-            |        fmt.width.display(out, fmt)
-            |        display_char(' ', out, fmt)
-            |        fmt.prec.display(out, fmt)
-            |        display_char(' ', out, fmt)
-            |        fmt.left.display(out, fmt)
+            |        var plain = FormatSpec(0, -1, false)
+            |        fmt.width.display(out, plain)
+            |        display_char(' ', out, plain)
+            |        fmt.prec.display(out, plain)
+            |        display_char(' ', out, plain)
+            |        fmt.left.display(out, plain)
             |print(f"${W(0)}%-12.3s")""".stripMargin) shouldBe "12 3 true\n"
     }
 
@@ -247,11 +250,23 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
             |print(str(W(0)))""".stripMargin) shouldBe "0 -1 false\n0 -1 false\n"
     }
 
-    "an implementation that ignores the specifier renders plainly" in {
+    // A wrapper whose whole rendering *is* one field's hands the specifier straight down, and the
+    // width arrives where the text does.
+    "is honoured by the renderer an implementation forwards it to" in {
       run("""struct P
             |    n: int
             |impl Display for P
             |    display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+            |print(f"[${P(7)}%10s]")""".stripMargin) shouldBe "[         7]\n"
+    }
+
+    // An implementation is free to drop it, and then nothing pads: the specifier is something a
+    // `Display` is told, not something applied around it.
+    "leaves an implementation that ignores it rendering plainly" in {
+      run("""struct P
+            |    n: int
+            |impl Display for P
+            |    display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, FormatSpec(0, -1, false))
             |print(f"[${P(7)}%10s]")""".stripMargin) shouldBe "[7]\n"
     }
   }

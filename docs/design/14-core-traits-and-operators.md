@@ -2,8 +2,9 @@
 
 **Status:** decided, and **§1–§6 are implemented** — `Self`, the whole catalog, the one dispatch
 rule, definition-checked bounds on both method calls and operators, the compiler-provided scalar
-memberships, and `print`/`str` requiring `Display`. `§8 b` and `§8 d` settled on the way; what is
-left open is listed in `§8`. This is the concrete spec for three things the earlier chapters
+memberships, `print`/`str` requiring `Display`, and every renderer honouring the specifier it is
+handed. `§8 b`, `§8 d`, and `§8 e` settled on the way, leaving `§8 a` and `§8 c` — neither of which
+is about this chapter's own surface. This is the concrete spec for three things the earlier chapters
 *decided* but left unbuilt, because all three turned on the same missing layer:
 
 - **`00 §9` / `01` / `08 §"Interaction with traits"`** — operators are trait methods (`+` is
@@ -167,6 +168,22 @@ being rendered — the minimum field width, the precision, and whether the field
 and `print` and `str`, which are written with no specifier at all, hand over the neutral one. It is
 a *struct* rather than more parameters precisely so that a fourth part can be added later without
 touching a single `impl`.
+
+**A specifier describes the field the whole value occupies**, and every renderer the prelude
+supplies acts on it. They converge on one function, `display_pad`, which puts a finished run of
+bytes in that field — six renderers each growing their own padding would be six chances for `%8s`
+to mean something slightly different. `display_pad` is public for the same reason: an
+implementation that renders *parts* hands each part the neutral specifier and applies `fmt` to its
+own complete text, and that is the call that does it. Forwarding `fmt` straight down is right only
+where the part being rendered *is* the whole rendering, as in a wrapper around a single field.
+
+What a **precision** means is each renderer's own, because the conversion letter is exactly what
+does not cross the boundary: text truncates to it, an integer fills out to it in digits, and a real
+reads it as significant digits — printf's meaning under `%s`, `%d`, and `%g` respectively. Width
+and precision count **bytes**, as C's do, so a `string` occupies the same field whether it was
+rendered by `snprintf` or by a `Display`; the one refinement is that truncation backs off to a
+character boundary rather than handing a sink half a codepoint. A sink is a byte sink, and there is
+no recovering from an invalid sequence once it has been written.
 
 ### The `Writer` surface, as built (`§8 d`)
 
@@ -415,11 +432,11 @@ exactly (`§5`), one row further down the catalog.
   user type there; separating them gets the same reach and keeps the sink a plain trait a kernel
   can implement.
 
-  What remains open under it is smaller than it was: **no writer honours a `FormatSpec` yet.** The
-  spec reaches every implementation, and a type that wants to act on it can, but the prelude's own
-  renderers ignore it — so `f"${5}%8d"` pads through `snprintf` while `f"${p}%8s"` pads only if `p`
-  says how. Closing that means padding in the renderers, which wants a scratch buffer and is worth
-  doing once rather than six times.
+  Nothing remains open under it. The renderers **honour the specifier**, through the one
+  `display_pad` the whole family ends at, so `f"${p}%8s"` puts a type's own text in a field of eight
+  exactly as `f"${5}%8d"` does — see `§2`. What a precision means is left to each renderer, since
+  the conversion letter is the part of a specifier that cannot cross a boundary drawn at "some
+  value renders itself".
 - **e. ~~Sharing an operand across a trait-dispatched operator.~~ Settled — see `§3`.** A chained
   comparison and a compound assignment each use one operand twice from a single evaluation, and both
   now work on a trait-dispatched type. What settled it was noticing that codegen already holds the

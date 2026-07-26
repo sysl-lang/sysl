@@ -98,7 +98,9 @@ before they appear and may be mutually recursive).
   something sysl can express. A **scalar** keeps its direct path in `print` and its own `str`, so a
   program that prints only numbers builds no sink at all. A `Writer` **borrows** the bytes it is
   written — checked by escape analysis, which is what lets a renderer pass a slice of its own stack
-  buffer through a trait object.
+  buffer through a trait object. A hole's format specifier travels to the `Display` it calls and is
+  **acted on** there: every prelude renderer pads through one `display_pad`, and an implementation
+  applies the same call to its own complete text.
 - **`Option[T]` / `Result[T, E]` and `?`.** Both come from the prelude as ordinary generic
   enums. The postfix `?` unwraps the success payload of one, or returns from the enclosing
   function early with the failure re-wrapped in *that* function's return type — so `?` needs
@@ -282,7 +284,7 @@ arity.
     determines is an error rather than a default. `?` is wired to the prelude's `Option` and
     `Result` **by name**, standing in for the eventual trait that will describe "can be
     short-circuited".
-11. **No writer honours a format specifier yet.** All of `14` is otherwise implemented, `§4`
+11. **A generic body is checked against its bounds and no further.** All of `14` is implemented, `§4`
     included: a generic function is analyzed once more with each type parameter standing in for
     itself; a method call, an *operator*, and a rendering on one all resolve through the union of
     its bounds' traits; and `sum[T](a, b) = a + b` is diagnosed on its own line as needing
@@ -297,11 +299,11 @@ arity.
     and nothing more. A field read is deliberately not in that category: no bound could ever license
     one, so it is settled at the definition (`10 §5`).
 
-    What is left is narrower than it looks. A `FormatSpec` reaches every `Display`, and a type that
-    wants to act on its width or precision can — but the prelude's own renderers ignore it, so
-    `f"${5}%8d"` pads through `snprintf` while `f"${p}%8s"` pads only if `p` says how. Closing that
-    means padding inside the renderers, which wants a scratch buffer and is worth doing once rather
-    than six times.
+    A `FormatSpec` is now **acted on** as well as delivered. Every prelude renderer ends at one
+    `display_pad`, so `f"${p}%8s"` puts a type's own text in a field of eight exactly as
+    `f"${5}%8d"` does, and an implementation rendering parts pads its complete text with the same
+    call. A specifier names the field the whole value occupies, so the parts are handed the neutral
+    one; forwarding it down is right only where the part *is* the whole rendering (`14 §2`).
 
     **An unbounded parameter stays perfectly legal** — this is not heading for a language where
     every `[T]` needs a bound. An unbounded `T` supports what every type supports: being passed,
