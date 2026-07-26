@@ -34,6 +34,11 @@ package io.github.edadma.sysl
  * free — a `string` *is* a validated `[]u8` — and it reports failure by latching rather than by
  * returning, so an implementation stays straight-line and `print(x)` stays a statement.
  *
+ * `failed` carries a **default** of `false`, which is the prelude's own use of the mechanism `02`
+ * calls for: most sinks cannot fail, and one that cannot should not have to write down that it
+ * cannot. A sink that can — a bounded buffer, a device that goes away — overrides it, and nothing
+ * about the latch changes.
+ *
  * The `display_*` family is the sink counterpart of the `print*` family above: the same renderings,
  * into a `*Writer` instead of into standard output, and in the argument order `Display` declares.
  * They are the built-ins' `display` — what `x.display(out, fmt)` lowers to when `x` is a scalar
@@ -134,7 +139,7 @@ object Prelude {
       |
       |trait Writer
       |    write(*self, bytes: []u8)
-      |    failed(*self) -> bool
+      |    failed(*self) -> bool = false
       |
       |struct FormatSpec
       |    width: int

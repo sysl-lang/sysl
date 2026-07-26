@@ -829,6 +829,25 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       err("same[T](a: T, b: T) -> bool = a == b") should include("'==' needs 'T: Eq'")
     }
 
+    // Every other unlicensed use names a bound that would allow it; a field names none, because a
+    // trait promises methods and a field is layout. So this one is settled at the definition
+    // outright rather than deferred to whatever types turn up — which `10 §5` already said.
+    "a field read off a type parameter is refused outright, with no bound to suggest" in {
+      val out = err("first[T](x: T) -> int = x.v")
+
+      out should include("has no fields to read")
+      out should include("a bound promises methods, not a layout")
+    }
+
+    "a field read is refused even where every instantiation would have had the field" in {
+      err(
+        """struct P
+          |    v: int
+          |first[T](x: T) -> int = x.v
+          |print(first(P(7)))""".stripMargin
+      ) should include("has no fields to read")
+    }
+
     "a chained comparison still needs its operands to agree" in {
       err(
         """struct M

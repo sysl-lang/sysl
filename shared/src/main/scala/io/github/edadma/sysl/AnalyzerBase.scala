@@ -67,6 +67,19 @@ trait AnalyzerBase {
    */
   protected val memberDecls = mutable.LinkedHashMap.empty[(String, String), MethodDecl]
 
+  /** Which trait default a member was copied from, keyed by the name the copy was lowered to.
+   *
+   * A default is materialized per implementing type (`02`), so one source body becomes several
+   * functions. This says which — so a default the definition-time pass already reported is not
+   * reported again by every copy of it.
+   */
+  protected val defaultOrigin = mutable.LinkedHashMap.empty[String, String]
+
+  /** Trait defaults whose body the definition-time pass reported, by the `Trait.method` name each
+   * was checked under. The copies made for the implementing types are dropped rather than analyzed.
+   */
+  protected val brokenDefaults = mutable.HashSet.empty[String]
+
   /** A member of a *generic* type, lowered to a function that is itself generic over the type's
    * parameters and keyed by (type name, member name). Unlike a member of a concrete type — which
    * is hoisted eagerly into `funcInsts` — a generic member is instantiated on demand at each call
@@ -310,6 +323,11 @@ trait AnalyzerBase {
    * arrives at it — a generic function instantiated three times has one bad line, not three.
    */
   private val found = mutable.LinkedHashSet.empty[(String, Option[Pos])]
+
+  /** How many distinct mistakes have been found, which is what tells a walk that reported something
+   * from one that came through clean.
+   */
+  protected def diagnosticCount: Int = found.size
 
   /** The errors, rendered and ordered by where they are, so reading them top to bottom is
    * reading the file top to bottom. A diagnostic with no position sorts last, since there is

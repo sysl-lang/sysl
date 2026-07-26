@@ -88,7 +88,7 @@ class Analyzer private (program: Program)
     for f <- ours do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
-    for f <- members do
+    for f <- members if !defaultOrigin.get(f.name).exists(brokenDefaults) do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
     val mainStmts = program.body.filter {
@@ -150,11 +150,18 @@ class Analyzer private (program: Program)
    * Only a function that declares its own type parameters is walked. A member of a generic type
    * inherits the *type's* parameters, and those carry no bounds — there is nowhere to write one —
    * so holding such a member to its bounds would be holding it to nothing at all.
+   *
+   * **A trait's default bodies are walked here too**, each as the generic function it is: one
+   * parameter, `Self`, bounded by its own trait (`Hoisting.traitDefaults`). A default may assume of
+   * its receiver exactly what the trait promises, which is the same rule this pass already enforces
+   * — so it is checked at the trait, once, rather than once per implementing type, and a trait with
+   * no implementations at all still has its defaults checked.
    */
   private def checkAbstractBodies(body: List[Stmt]): Unit = {
     val generics = body.collect { case f: FuncDecl if f.tparams.nonEmpty => f }
+    val defaults = traitDefaults
 
-    if generics.nonEmpty then
+    if generics.nonEmpty || defaults.nonEmpty then
       sandboxed {
         abstractPass = true
 
@@ -162,6 +169,16 @@ class Analyzer private (program: Program)
           for f <- generics do
             currentPos = f.pos
             recover(())(checkAbstractBody(f))
+
+          // A default that fails here has been reported, at the trait, against the body a
+          // programmer actually wrote. The copies made for each implementing type would fail the
+          // same way — against the same source line, blaming a type the line does not mention — so
+          // they are dropped rather than analyzed, and one mistake stays one diagnostic.
+          for f <- defaults do
+            currentPos = f.pos
+            val before = diagnosticCount
+            recover(())(checkAbstractBody(f))
+            if diagnosticCount > before then brokenDefaults += f.name
         finally abstractPass = false
       }
   }
@@ -512,6 +529,14 @@ class Analyzer private (program: Program)
 
         // An enum has no fields to shadow a member, so every name read off one is a property.
         case e: Type.Enum => readProperty(tr, e, f)
+
+        // A field is layout, and a bound promises methods — so no bound could ever license this,
+        // which is why it is reported from the definition pass rather than dropped for want of one
+        // to name. `10 §5`: what an unbounded parameter may not do is anything that assumes
+        // structure, and a field is the plainest case of that.
+        case a: Type.Abstract =>
+          boundErr(s"'${a.name}' is a type parameter, so it has no fields to read — a bound promises " +
+            s"methods, not a layout, so no bound would license '.$f'")
         // `len` and `bytes` are the first compiler-provided members: `len` a property on every
         // array, slice, and string, and `bytes` the reinterpretation of a string's three words
         // as a `[]u8`, dropping only the validity guarantee.

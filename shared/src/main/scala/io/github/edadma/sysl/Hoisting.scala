@@ -35,8 +35,21 @@ trait Hoisting extends TypeResolution {
         variantOwner(v.name) = e.name
     case t: TraitDecl =>
       if typeNameTaken(t.name) then err(s"the name '${t.name}' is already declared")
-      if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
       traitDecls(t.name) = t
+      if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
+      for m <- t.methods do
+        // A property's declaration form *is* its body (`name -> T = expr`), so a trait has no way to
+        // ask for one without also answering it. Reported here rather than left to the grammar, so
+        // the message says what is missing instead of where the parse stopped.
+        if m.isProperty then
+          at(m.pos)(err(s"a trait cannot declare a property yet — '${t.name}.${m.name}' would need a " +
+            "signature form of its own, and only methods have one"))
+        if m.receiver.isEmpty && m.body.nonEmpty then
+          at(m.pos)(err(s"'${t.name}.${m.name}' has no receiver, so a default body has no value to " +
+            "work on — give it a 'self' parameter or drop the body"))
+        // No implementation could supply one either, so the trait is where it is worth saying so.
+        if m.tparams.nonEmpty then
+          at(m.pos)(err(s"generic methods are not supported yet — '${t.name}.${m.name}'"))
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
     // — the duplicate check goes with the resolution, in `hoistImpl`.
     case i: ImplDecl => implDecls += i
@@ -240,8 +253,16 @@ trait Hoisting extends TypeResolution {
 
     val self = selfBinding(ty)
 
-    checkConformance(tr, impl, self)
-    hoistMemberList(key, Nil, taken, noun, impl.methods, out, self)
+    // A default the block left out is hoisted for this type exactly as a written method is, from the
+    // body the trait supplied — so everything downstream (a call, a vtable slot, the escape summary)
+    // finds an ordinary `Type.method` and needs to know nothing about where it came from. What is
+    // recorded is where each copy came *from*, which is only ever read to keep one bad default from
+    // being reported once per implementing type.
+    val inherited = checkConformance(tr, impl, self)
+
+    for m <- inherited do defaultOrigin(s"$key.${m.name}") = s"${impl.traitName}.${m.name}"
+
+    hoistMemberList(key, Nil, taken, noun, impl.methods ::: inherited, out, self)
   }
 
   /** The type an `impl` is for: the key its members are filed under, the names already spoken for
@@ -269,21 +290,30 @@ trait Hoisting extends TypeResolution {
         if ty == Type.VaList then err("a va_list is an ABI primitive, not something to implement a trait for")
         (ty, ownerKey(ty), Set.empty, "field")
 
-  /** Verifies that `impl` supplies exactly the methods `tr` declares, each with an identical
-   * resolved signature. A missing method, an extra one, or a mismatched receiver, parameter, or
-   * result is reported against the trait it fails to satisfy.
+  /** Verifies that `impl` supplies the methods `tr` declares, each with an identical resolved
+   * signature, and yields the **defaults it inherits** — the trait methods it did not write and does
+   * not have to, because the trait supplied a body for them.
+   *
+   * A method the trait declares without a default and the block leaves out, a method the trait does
+   * not declare at all, or a mismatched receiver, parameter, or result is reported against the trait
+   * it fails to satisfy.
    */
-  private def checkConformance(tr: TraitDecl, impl: ImplDecl, self: Map[String, Type]): Unit = {
-    val declared = tr.methods.map(_.name).toSet
+  private def checkConformance(tr: TraitDecl, impl: ImplDecl, self: Map[String, Type]): List[MethodDecl] = {
+    val declared  = tr.methods.map(_.name).toSet
+    val inherited = mutable.ListBuffer.empty[MethodDecl]
 
     for tm <- tr.methods do
       impl.methods.find(_.name == tm.name) match
-        case None     => err(s"'${impl.forType}' does not implement '${impl.traitName}': method '${tm.name}' is missing")
         case Some(im) => checkSignature(impl.forType, impl.traitName, tm, im, self)
+        case None if tm.body.nonEmpty => inherited += tm
+        case None =>
+          err(s"'${impl.forType}' does not implement '${impl.traitName}': method '${tm.name}' is missing")
 
     for im <- impl.methods do
       if !declared.contains(im.name) then
         err(s"trait '${impl.traitName}' declares no method '${im.name}', so this 'impl' cannot define it")
+
+    inherited.toList
   }
 
   /** Compares one implementing method against the trait's signature: same receiver mode, same
@@ -328,12 +358,38 @@ trait Hoisting extends TypeResolution {
    */
   private def synthesize(tname: String, tparams: List[String], m: MethodDecl): FuncDecl = {
     val selfRef = NamedType(tname, tparams.map(tp => NamedType(tp, Nil)))
-    val selfParam = m.receiver match
-      case Some(RecvMode.ByValue)     => Some(Param("self", selfRef))
-      case Some(RecvMode.ByPtr)       => Some(Param("self", PtrType(selfRef)))
-      case Some(RecvMode.ByRef(sync)) => Some(Param("self", RefType(selfRef, sync)))
-      case None if m.isProperty       => Some(Param("self", selfRef))
-      case None                       => None
-    FuncDecl(s"$tname.${m.name}", tparams, selfParam.toList ::: m.params, m.retType, m.body)
+    FuncDecl(s"$tname.${m.name}", tparams, receiverParam(m, selfRef).toList ::: m.params, m.retType, m.body)
   }
+
+  /** The `self` parameter a member's receiver becomes, at the self type it is a member of. A
+   * property's receiver is an implicit by-value read; an associated function has none.
+   */
+  private def receiverParam(m: MethodDecl, selfRef: TypeRef): Option[Param] = m.receiver match
+    case Some(RecvMode.ByValue)     => Some(Param("self", selfRef))
+    case Some(RecvMode.ByPtr)       => Some(Param("self", PtrType(selfRef)))
+    case Some(RecvMode.ByRef(sync)) => Some(Param("self", RefType(selfRef, sync)))
+    case None if m.isProperty       => Some(Param("self", selfRef))
+    case None                       => None
+
+  /** Every trait default, as the generic function each one is: one type parameter, `Self`, bounded
+   * by the trait that declared it.
+   *
+   * That is what a default body *means* — it may assume of its receiver exactly what the trait
+   * promises, and nothing else — so writing it down this way is what lets the definition-time pass
+   * of `14 §4` check it once, at the trait, with the machinery a bounded generic already uses. The
+   * declarations exist only for that walk; the body a program runs is the copy `hoistImpl` makes for
+   * each implementing type.
+   */
+  protected def traitDefaults: List[FuncDecl] =
+    for
+      tr <- traitDecls.values.toList
+      m  <- tr.methods if m.body.nonEmpty
+    yield FuncDecl(
+      s"${tr.name}.${m.name}",
+      List(selfName),
+      receiverParam(m, NamedType(selfName, Nil)).toList ::: m.params,
+      m.retType,
+      m.body,
+      bounds = Map(selfName -> List(tr.name)),
+    ).setPos(m.pos)
 }

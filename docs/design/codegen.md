@@ -84,6 +84,12 @@ before they appear and may be mutually recursive).
   an object type is expected, so an `if` whose arms are different concrete types meets at one.
   A trait is object-safe when every method has a receiver and mentions `Self` nowhere else,
   which excludes the whole operator catalog of `14` — those traits are for bounds.
+- **Default method bodies (`02`).** A trait method written with a body is one an `impl` inherits
+  unless it writes its own, and a trait whose every method has one needs no block at all. The body
+  is checked once at the trait, as a generic function over `Self` bounded by that trait, so it may
+  assume exactly what the trait declares — and then **copied per implementing type** under that
+  type's own `Type.method` name, which is why a call, a vtable slot, and the escape summary all find
+  an ordinary function. The prelude uses one: `Writer.failed` defaults to `false`.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over
@@ -281,7 +287,15 @@ arity.
     itself; a method call, an *operator*, and a rendering on one all resolve through the union of
     its bounds' traits; and `sum[T](a, b) = a + b` is diagnosed on its own line as needing
     `T: Add`, whether or not anything instantiates it. Forwarding a parameter to a bounded callee is
-    checked the same way: a bound is satisfied by a bound.
+    checked the same way: a bound is satisfied by a bound. A trait's default bodies go through the
+    same pass, bounded by their own trait.
+
+    The pass reaches what a bound could license and no further. A mistake that needs the *concrete*
+    type to settle — a result that disagrees with its declared type for reasons `Self` alone cannot
+    decide — is caught where every other concrete mistake in a generic body is, at each
+    instantiation. So a generic nothing calls, or a trait nothing implements, gets its bounds checked
+    and nothing more. A field read is deliberately not in that category: no bound could ever license
+    one, so it is settled at the definition (`10 §5`).
 
     What is left is narrower than it looks. A `FormatSpec` reaches every `Display`, and a type that
     wants to act on its width or precision can — but the prelude's own renderers ignore it, so

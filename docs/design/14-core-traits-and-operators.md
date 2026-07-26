@@ -172,7 +172,7 @@ touching a single `impl`.
 
 | Trait | Methods |
 |---|---|
-| `Writer` | `write(*self, bytes: []u8) -> unit`, `failed(*self) -> bool` |
+| `Writer` | `write(*self, bytes: []u8) -> unit`, `failed(*self) -> bool = false` |
 
 Three decisions, each following Rust's experience rather than its packaging:
 
@@ -185,7 +185,8 @@ Three decisions, each following Rust's experience rather than its packaging:
   `fmt::Error` carries no information at all, precisely because a fallible `Display` taxes every
   implementation for a failure almost no sink has; latching keeps implementations straight-line,
   keeps `print(x)` a statement, and needs no error type designed, which is what decoupled `§6` from
-  io-error work that has not started.
+  io-error work that has not started. `failed` **defaults to `false`** (`02`), so a sink that cannot
+  fail — a counter, a fixed device — writes nothing about failure at all; one that can overrides it.
 - **The bytes are borrowed.** A `Writer` may not keep what it is written — they may be a view of the
   caller's stack. Nothing in the type says so, so it is *checked*: escape analysis rejects an
   implementation whose `write` lets its parameter outlive the call, which is what licenses a

@@ -483,16 +483,23 @@ class SyslParser(val source: Source) extends PackratParsers {
         ident ^^ (n => EnumVariantDecl(n, None, Nil)),
     )
 
-  /** `trait Name` with indented method signatures. A signature is a method header — a receiver, a
-   * parameter list, and an optional result — with no body; it parses to a `MethodDecl` whose empty
-   * body marks it as a signature rather than a definition.
+  /** `trait Name` with indented member declarations. Each is a method header — a receiver, a
+   * parameter list, and an optional result — either bare, which requires an implementation to
+   * supply it, or followed by a body, which supplies a **default** every `impl` inherits unless it
+   * writes its own.
    */
   private lazy val traitDecl: PackratParser[Stmt] =
     op("trait") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
-      (newline ~> indent ~> opt(newlines) ~> repsep(methodSig, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
-        methods => TraitDecl(name, tps.getOrElse(Nil), methods)
-      }
+      (newline ~> indent ~> opt(newlines) ~> repsep(traitMember, newlines) <~ opt(newlines) <~ dedent) <~
+        endName(name) ^^ { methods => TraitDecl(name, tps.getOrElse(Nil), methods) }
     }
+
+  /** A line inside a trait body. A **definition** is tried first, since it is a signature with more
+   * after it: `member` needs a body to follow the header, so a bare signature falls through to
+   * `methodSig`, and a property — which a trait cannot declare yet — to `propertySig`, where it is
+   * parsed so the analyzer can say so rather than leaving a parse error to explain it.
+   */
+  private lazy val traitMember: PackratParser[MethodDecl] = member | methodSig | propertySig
 
   /** A trait method signature: a header with no `= body`. The receiver and parameters parse
    * exactly as a real method's do, so a signature and its implementation are compared shape for
@@ -506,16 +513,27 @@ class SyslParser(val source: Source) extends PackratParsers {
       },
     )
 
+  /** A property signature — `name -> type` with neither a parameter list nor a body. */
+  private lazy val propertySig: PackratParser[MethodDecl] =
+    at(ident ~ (op("->") ~> typeRef) ^^ { case name ~ ret =>
+      MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), Nil)
+    })
+
   /** `impl Trait for Type` with indented method definitions — ordinary members, reusing the same
    * grammar as a method written in a struct's own body. The block is closed by an optional
    * `end Type`.
+   *
+   * The block itself is optional, because a trait whose every method has a default leaves a
+   * conforming type nothing to write: `impl Zero for E` on its own line is the whole of that
+   * implementation, and the opt-in it states is the point of writing it.
    */
   private lazy val implDecl: PackratParser[Stmt] =
     op("impl") ~> ident ~ (op("for") ~> ident) >> { case tname ~ forType =>
-      (newline ~> indent ~> opt(newlines) ~> repsep(member, newlines) <~ opt(newlines) <~ dedent) <~ endName(forType) ^^ {
-        methods => ImplDecl(tname, forType, methods)
-      }
+      (implBody | success(Nil)) <~ endName(forType) ^^ { methods => ImplDecl(tname, forType, methods) }
     }
+
+  private lazy val implBody: PackratParser[List[MethodDecl]] =
+    newline ~> indent ~> opt(newlines) ~> repsep(member, newlines) <~ opt(newlines) <~ dedent
 
   /** An optional `end Name` marker closing a declaration block, Scala-style. `end` is a soft
    * keyword; the trailing name must equal the declaration's own name, or it is a parse error.

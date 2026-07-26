@@ -169,6 +169,20 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
             |print(c.n)""".stripMargin) shouldBe "8\n"
     }
 
+    // Most sinks cannot fail, and `Writer.failed` defaults to saying so — a writer that only
+    // counts bytes writes nothing about failure at all.
+    "may leave out 'failed', which the trait defaults to false" in {
+      run("""struct Counter
+            |    n: usize
+            |impl Writer for Counter
+            |    write(*self, bytes: []u8)
+            |        self.n += bytes.len
+            |var c: Counter
+            |var w: *Writer = &c
+            |display_str("abc", w, FormatSpec(0, -1, false))
+            |print(c.n, w.failed())""".stripMargin) shouldBe "3 false\n"
+    }
+
     // The latch: a write that overruns sets a flag the trait's other method reports, and nothing in
     // between had to return or check anything.
     "latches a failure the writes themselves do not report" in {

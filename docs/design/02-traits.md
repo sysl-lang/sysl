@@ -1,7 +1,8 @@
 # Traits (Polymorphism)
 
-**Status:** decided (core model), and **built** — static dispatch through bounds, and dynamic
-dispatch through `*Trait` / `&Trait`. Some surface-syntax details are flagged open at the end. How a
+**Status:** decided (core model), and **built** — static dispatch through bounds, dynamic dispatch
+through `*Trait` / `&Trait`, and **default method bodies**. Some surface-syntax details are flagged
+open at the end. How a
 plain method and its receiver are spelled — the hole this doc used to leave open — is settled in
 `08-methods.md`; a trait's methods are declared and called the same way, with the receiver an
 `impl`'s type instead of a concrete one. A signature that has to name the implementing type writes
@@ -93,6 +94,51 @@ interface change to that module, visible to everything downstream — the same r
 `given`/`using`-style implicit resolution out of scope (`13` §7): unrestricted search and separate
 compilation are not compatible.
 
+## Defaults — a trait may answer as well as ask
+
+A trait method is written either as a bare signature, which an implementation must supply, or with a
+body, which supplies a **default** every `impl` inherits unless it writes its own:
+
+```
+trait Greet
+    name(self) -> string
+    greet(self) -> string = "hello, " + self.name()
+```
+
+`impl Greet for Cat` then writes `name` and gets `greet` free, or writes both and overrides it. A
+trait whose every method has a default leaves nothing to write at all, so the block is optional —
+`impl Zero for E` on its own line is a complete implementation, and the opt-in is the point of
+writing it.
+
+This is the Swift / Kotlin / Scala / Rust consensus, and it settles the question the chapter left
+open. What it buys beyond convenience is that **a trait can grow**: adding a method with a default
+does not break the implementations that already exist, which is the difference between a trait a
+library can evolve and one frozen at its first release. `14 §8 d` had to design around not having
+this — `FormatSpec` went into `Display`'s signature early precisely because adding a parameter later
+would have broken every `impl` — and the prelude now uses a default itself, for `Writer.failed`
+(most sinks cannot fail, and one that cannot should not have to say so).
+
+**A default may assume of its receiver exactly what its own trait declares.** That is not a
+restriction bolted on; it is what a default *is*, since the body must serve every implementing type
+and the trait is all they have in common. So a default's body is checked once, at the trait, as the
+generic function it is — one type parameter, `Self`, bounded by the trait — through the same
+definition-time pass `14 §4` runs over every bounded generic. A default calling a method the trait
+does not declare is reported at the trait, on its own line, **even when nothing implements the trait
+at all**. It may not read a *field* of its receiver either: a bound promises methods, and a field is
+layout, so no bound could ever license one (`10 §5`).
+
+The body a program runs is a **copy per implementing type**, materialized under that type's own
+`Type.method` name. That is monomorphization with `Self` for the parameter, and it means everything
+downstream — an ordinary call, a vtable slot, the escape summary — finds a function that exists and
+needs to know nothing about where it came from. One source body, one diagnostic if it is wrong: a
+default the definition-time pass already reported is not reported again by each copy.
+
+What a default cannot do is stand in for the checks that need the *implementing* type. A body whose
+result disagrees with its declared type for reasons only a concrete type settles is caught where
+every other concrete mistake in a generic body is — at each type it is materialized for. A trait
+with no implementations therefore gets its bounds checked and nothing more, which is the same reach
+the definition-time pass has over a generic function nothing instantiates.
+
 ## Trait objects, as built
 
 A trait object is a **fat pointer** — two words, the method table for the type it forgot and the
@@ -165,14 +211,12 @@ signature, which stands in for every implementation because conformance is exact
 ## Kept / dropped
 
 - **Kept:** static dispatch (monomorphized bounds), dynamic dispatch (boxed trait object),
-  retrofitting foreign types (explicit `impl`).
+  retrofitting foreign types (explicit `impl`), default method bodies.
 - **Dropped:** the separate structural `interface`; implicit/structural conformance; the
   invisible `owns` flag (replaced by explicit three-mode ownership).
 
 ## Details still to settle
 
-- **Default methods.** Whether a trait may supply default method bodies (as Swift / Kotlin /
-  Scala do). Likely yes; specify with the trait-declaration grammar.
 - **Laws / invariants on traits.** The old `trait` could assert invariants ("`Ord` is a total
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
@@ -183,10 +227,12 @@ signature, which stands in for every implementation because conformance is exact
   full type reference rather than a name, and a key for each shape.
 - **An `impl` for a generic type.** `impl Show for Box[T]` is rejected for now; the implementing type
   must be concrete. Wanted, and it interacts with monomorphizing the members.
-- **A property in a trait.** A trait declares method *signatures*, and the property form is
-  `name -> T = expr` — a body, which a signature has none of. So a trait cannot require a property
-  today, through a bound or through an object. It wants a signature spelling of its own
-  (`name -> T`, with no `=`), and it is additive: nothing about either dispatch path changes.
+- **A property in a trait.** The signature spelling (`name -> T`, with no `=`) now *parses*, so a
+  trait that asks for a property is refused by name rather than by a stalled parse — but it is still
+  refused. What it wants is the rest of the path: an `impl` supplying it, a bound reading it, and a
+  slot for it in an object. Additive; nothing about either dispatch path changes. A *default*
+  property would fall out of the same work, since a property's declaration form already carries the
+  body a default needs.
 - **`&Trait` is not yet gated on `alloc`.** `capabilities.md` puts a counted trait object behind the
   allocator capability, alongside `&T` itself. Neither is gated, because the capability system needs
   the project config and the module system, and both are still to be written — so this is the same

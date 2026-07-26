@@ -10,7 +10,11 @@ The mechanism is specified in `14 §4`, and it is **built**: a body's method cal
 *renderings* of a type parameter are checked once, at the definition, against the parameter's bounds
 alone. `sum[T: Add](a, b) = a + b` type-checks because `T: Add` promises `+`, and dropping the bound
 fails on that line rather than at some caller; `print(x)` on a parameter asks for `T: Display` the
-same way (`14 §6`).
+same way (`14 §6`). A **field** read off a parameter is refused there too, and with no bound
+suggested, because none could license it — see §5.
+
+The same pass checks a trait's **default method bodies** (`02`), each as the generic function it is:
+one parameter, `Self`, bounded by its own trait.
 
 This chapter rests on `02-traits.md` (a bound *is* a trait), `03-memory-model.md` (why every
 value is copyable, which decides what an unbounded parameter may do), and `09-enums-and-
@@ -103,6 +107,14 @@ along any `T`" is the free, unmarked baseline.
 What an unbounded `T` may **not** do is anything that assumes structure: no `+`, `<`, `==`, or
 other operator; no method call; no field access; no index; no cast. Each of those is a
 capability some types have and others do not, so each requires a bound that guarantees it.
+
+**A field is the exception that proves the rule.** Every other unlicensed use names the bound that
+would allow it — the diagnostic's whole job is to say what to write. A field names none, because a
+trait promises *methods* and a field is *layout*, so no bound could ever supply one. It is therefore
+settled outright at the definition rather than deferred to the types that turn up: `first[T](x: T) =
+x.v` is wrong even if every call happens to pass a type with a `v`. Reaching a value's data through
+a generic means going through a method the bound declares, which is also what lets two types satisfy
+one bound while storing the value differently.
 
 ### A bound is a trait, written `[T: Trait]`
 

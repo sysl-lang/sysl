@@ -155,6 +155,10 @@ enum RecvMode:
  *   - an **associated function** has no `receiver` and a parameter list, called `Type.name(…)`;
  *   - a **computed property** has `isProperty` set, no parameter list at all, and an implicit
  *     borrow receiver, read as `value.name` with no parentheses.
+ *
+ * An **empty `body` means a signature rather than a definition**, which is a shape only a trait's
+ * members have: the grammar gives every other member a body, and a trait member written with one
+ * is a default an `impl` inherits.
  */
 case class MethodDecl(
     name: String,
@@ -270,16 +274,21 @@ case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param
 case class EnumDecl(name: String, tparams: List[String], underlying: Option[TypeRef],
                     variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil) extends Stmt
 
-/** `trait Name` with indented method **signatures** — a method with a receiver and a parameter
- * list but no body (`show(self) -> string`). A trait is nominal: a type participates only through
- * an explicit `impl`, never by coincidence of method names. Each signature is a `MethodDecl` with
- * an empty `body`, which is what tells a signature from a real method.
+/** `trait Name` with indented method declarations — a method with a receiver and a parameter list,
+ * written either as a bare **signature** (`show(self) -> string`) or with a body, which makes it a
+ * **default**. A trait is nominal: a type participates only through an explicit `impl`, never by
+ * coincidence of method names.
+ *
+ * A signature is a `MethodDecl` with an empty `body`, and that is the whole of the difference: a
+ * method with one is a definition every `impl` inherits unless it writes its own.
  */
 case class TraitDecl(name: String, tparams: List[String], methods: List[MethodDecl]) extends Stmt
 
-/** `impl Trait for Type` with indented method **bodies**. Every method the trait declares must be
- * present with a matching signature, and no others; the methods then become inherent members of
- * `forType`, callable as `value.method(…)` exactly as a method written in the type's own body.
+/** `impl Trait for Type` with indented method **bodies**. Every method the trait declares without a
+ * default must be present with a matching signature, and no method the trait does not declare; the
+ * methods then become inherent members of `forType`, callable as `value.method(…)` exactly as a
+ * method written in the type's own body. A default the block leaves out becomes a member of
+ * `forType` just the same, from the body the trait supplied.
  */
 case class ImplDecl(traitName: String, forType: String, methods: List[MethodDecl]) extends Stmt
 

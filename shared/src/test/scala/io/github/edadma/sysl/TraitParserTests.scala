@@ -2,7 +2,8 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Parsing of trait declarations and `impl` blocks: a trait holds bodiless method signatures,
+/** Parsing of trait declarations and `impl` blocks: a trait holds method declarations, bodiless
+ * when an implementation must supply them and carrying a body when the trait supplies a default,
  * and an `impl Trait for Type` holds ordinary method definitions in the same grammar a struct's
  * own body uses.
  */
@@ -74,12 +75,74 @@ class TraitParserTests extends AnyFreeSpec with ParseSupport {
     )
   }
 
-  "a trait method signature carrying a body is a parse error" in {
+  // A body after the header is what tells a default from a signature, and the two live side by
+  // side in one trait — so the parse has to keep them apart on that alone.
+  "a trait method carrying a body parses as a default" in {
     val src =
       """trait Show
-        |    show(self) -> string = "x"""".stripMargin
+        |    name(self) -> string
+        |    show(self) -> string = self.name()""".stripMargin
 
-    progError(src)
+    prog(src) shouldBe List(
+      TraitDecl(
+        "Show",
+        Nil,
+        List(
+          MethodDecl("name", Some(RecvMode.ByValue), isProperty = false, Nil, Nil, Some(NamedType("string")), Nil),
+          MethodDecl(
+            "show",
+            Some(RecvMode.ByValue),
+            isProperty = false,
+            Nil,
+            Nil,
+            Some(NamedType("string")),
+            List(ExprStmt(Call(Field(Ident("self"), "name"), Nil))),
+          ),
+        ),
+      )
+    )
+  }
+
+  "a default may be an indented block rather than an '=' expression" in {
+    val src =
+      """trait Counter
+        |    bump(*self)
+        |        var n = 1
+        |        n + 1""".stripMargin
+
+    prog(src) shouldBe List(
+      TraitDecl(
+        "Counter",
+        Nil,
+        List(
+          MethodDecl(
+            "bump",
+            Some(RecvMode.ByPtr),
+            isProperty = false,
+            Nil,
+            Nil,
+            None,
+            List(VarDecl("n", None, Some(i(1))), ExprStmt(Binary("+", Ident("n"), i(1)))),
+          )
+        ),
+      )
+    )
+  }
+
+  // A trait cannot ask for a property yet, and the point of parsing one is that the analyzer gets
+  // to say so — a parse error would only report where the parse stopped.
+  "a property in a trait parses, and is refused by name" in {
+    val src =
+      """trait Sized
+        |    size -> int""".stripMargin
+
+    prog(src) shouldBe List(
+      TraitDecl(
+        "Sized",
+        Nil,
+        List(MethodDecl("size", None, isProperty = true, Nil, Nil, Some(NamedType("int")), Nil)),
+      )
+    )
   }
 
   "a generic function may bound a type parameter by a trait" in {
