@@ -140,9 +140,12 @@ no alloc                        no alloc            // same clause, enforced ide
 - **Propagation is over the module graph.** A module's effective requirement is its own uses plus
   the requirements of every module it imports, transitively, and the whole graph must fit the
   target (`capabilities.md`). A `no alloc` module importing a `requires alloc` module is an error
-  at the import, not deep in codegen. Because the module import graph may contain cycles (§6), the
-  propagation is a fixpoint — started optimistic and iterated — the same shape escape analysis
-  uses for recursive functions (`05`).
+  at the import, not deep in codegen. Because the module import graph is acyclic (§6), the
+  propagation is a **single sweep in reverse topological order** — each module's requirement set is
+  final before any importer of it is visited — not an iterated fixpoint. The fixpoint that escape
+  analysis uses for mutual recursion (`05`) is still needed *within* a module, where sibling files
+  share one scope and may call each other freely; it is the cross-module direction that the DAG
+  removes.
 
 ## 5. Platform selection rides the same name
 
@@ -160,15 +163,30 @@ the active target is chosen, and the `sysl.conf` schema that ties it together �
 only that the *module identity* is invariant under platform selection; the file axis lives below
 the module name, not beside it.
 
-## 6. Cyclic module references are allowed
+## 6. The module graph is acyclic
 
-Two modules may import each other. The analyzer collects **every module's signatures before it
-checks any body** — the cross-directory extension of the top-level hoisting of `12` §4 — so a
-mutually recursive pair of modules resolves the same way a mutually recursive pair of functions
-does, without a forward declaration or an ordering constraint on the build. This is the Scala
-model (a package's compilation units may depend on each other freely), and it is the only choice
-that does not force a project's directory layout to be a DAG of its own call graph. The capability
-fixpoint of §4 is what makes the cyclic case well-defined for propagation.
+**Two modules may not import each other**, directly or through a chain. The import graph is a
+**DAG**, and a cycle in it is a compile error naming the modules on the cycle. This is Go's rule,
+and it is a deliberate divergence from Scala, where a package's compilation units may depend on
+each other freely.
+
+Three things follow from it:
+
+- **Modules can be compiled in dependency order, and independent modules in parallel.** A
+  topological sort exists, so a module's imports are all fully known before it is checked. A cyclic
+  graph would force the whole strongly-connected component to be collected and checked as one unit,
+  which is the same as saying it was never really more than one module.
+- **Capability propagation is a sweep, not a fixpoint** (§4).
+- **A cycle is a design error, and the fix is cheap.** Two directories that need each other are
+  either one module drawn along the wrong line — merge them, which changes no import, since a
+  module is a directory and its file count is not part of its name (§1) — or they share something
+  that belongs in a third module both import. Neither fix costs an importer anything.
+
+**Within** a module, cycles are free and carry no ceremony. All files of a directory share one
+scope (§1), so mutually recursive functions and types across sibling files need no forward
+declaration and no ordering: the analyzer collects **every signature in the module before it checks
+any body**, the cross-file extension of the top-level hoisting of `12` §4. The restriction is on
+the directory graph, never on how a module's own files refer to one another.
 
 ## 7. What is deliberately absent
 
