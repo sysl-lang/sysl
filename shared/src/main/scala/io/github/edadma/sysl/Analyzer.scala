@@ -547,13 +547,13 @@ class Analyzer private (program: Program)
     case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && enumDecls.contains(tname) =>
       if mname == "try" then enumTry(tname, args)
       else if enumDecls(tname).variants.exists(_.name == mname) then constructVariant(mname, args, expected)
-      else if memberDecls.contains((tname, mname)) then callAssociated(tname, mname, args)
+      else if memberDecls.contains((tname, mname)) then callAssociated(tname, mname, args, expected)
       else err(s"enum '$tname' has no variant or associated function '$mname'")
 
     // `Type.name(…)` — an associated function, told from the positional constructor `Type(…)` by
     // the member selected from the type name rather than the bare name applied.
     case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && structDecls.contains(tname) =>
-      callAssociated(tname, mname, args)
+      callAssociated(tname, mname, args, expected)
 
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args)
@@ -570,6 +570,17 @@ class Analyzer private (program: Program)
             err(s"'$f' is a method of '$n' — call it on a value, as 'value.$f(…)'")
           case Some(_) => err(s"'$f' is an associated function of '$n' — call it with '$n.$f(…)'")
           case None    => err(s"enum '$n' has no variant '$f'")
+
+    // A struct name is not a value, so a member selected from it is one of the three that could
+    // have been meant rather than a field read — which is what the name would otherwise be reported
+    // as, in an undefined-name message naming the type instead of the member.
+    case Field(Ident(n), f) if lookupOpt(n).isEmpty && structDecls.contains(n) =>
+      memberDecls.get((n, f)) match
+        case Some(m) if m.isProperty => err(s"'$f' is a property of '$n' — read it on a value, as 'value.$f'")
+        case Some(m) if m.receiver.isDefined =>
+          err(s"'$f' is a method of '$n' — call it on a value, as 'value.$f(…)'")
+        case Some(_) => err(s"'$f' is an associated function of '$n' — call it with '$n.$f(…)'")
+        case None    => err(s"type '$n' has no member '$f' — and '$n' is a type, not a value")
 
     case Field(receiver, f) =>
       val tr = autoDeref(analyzeExpr(receiver))

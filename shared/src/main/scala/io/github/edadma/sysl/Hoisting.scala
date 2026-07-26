@@ -150,10 +150,11 @@ trait Hoisting extends TypeResolution {
    * A member of a concrete type is hoisted eagerly, so an uncalled member is still type-checked at
    * its definition. A member of a *generic* type cannot be: its signature mentions the type's
    * parameters, which have no meaning until a call fixes them, so it is stored generic in
-   * `genericMembers` and instantiated on demand at each call site. Members that introduce their own
-   * type parameters, and associated functions on a generic type — whose type arguments would have
-   * to be inferred rather than read off a receiver — wait on later work and are rejected with a
-   * clear diagnostic rather than silently mishandled.
+   * `genericMembers` and instantiated on demand at each call site. A method reads those arguments
+   * off its receiver; an **associated function** has no receiver, so its call infers them from what
+   * it is passed and from the type the context expects, exactly as a call to a generic free function
+   * does. Members that introduce their own type parameters wait on later work and are rejected with
+   * a clear diagnostic rather than silently mishandled.
    *
    * A generic type's members are handed to the definition-time pass of `14 §4` all the same. What
    * they may assume of the type's parameters is what the type asks of them — nothing, where it asks
@@ -270,6 +271,15 @@ trait Hoisting extends TypeResolution {
     for m <- members do
       currentPos = m.pos.orElse(currentPos)
       if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '${home.label}.${m.name}'")
+
+      // An associated function is reached by naming its type — `Box.of(…)` — and only a struct or
+      // an enum has a name to be reached through. A block for a built-in or a composed type would
+      // register one that nothing could ever call, which is worth saying at the declaration rather
+      // than leaving as a member the program cannot use.
+      if m.receiver.isEmpty && !m.isProperty && nominal(home.key).isEmpty then
+        err(s"'${m.name}' has no receiver, and '${home.label}' is not a name a call could reach it " +
+          "through — give it a 'self' parameter")
+
       if memberDecls.contains((home.key, m.name)) then
         err(s"type '${home.label}' already has a member named '${m.name}'")
       if home.taken.contains(m.name) then
@@ -309,8 +319,6 @@ trait Hoisting extends TypeResolution {
       lowered += fd
 
       if generic then
-        if m.receiver.isEmpty && !m.isProperty then
-          err(s"associated functions on generic types are not supported yet — '${home.label}.${m.name}'")
         genericMembers((home.key, m.name)) = fd
         // `Self` here is the type applied to its own parameters, which is not a type yet. The
         // reference is what waits, and every substitution that fixes the parameters fixes it too.
@@ -383,8 +391,8 @@ trait Hoisting extends TypeResolution {
 
     val lowered = hoistMemberList(home, impl.methods ::: inherited, out)
 
-    // The one thing a generic `impl` has that a generic *type* does not is bounds on its parameters,
-    // and that is exactly what makes its members checkable before anything instantiates them. An
+    // A generic block's members are checkable before anything instantiates them, against the bounds
+    // the block wrote on its own parameters — the same walk a generic type's members take. An
     // inherited default is left out: it was checked at the trait, against what the trait promises,
     // which is the whole of what its body may assume wherever it is copied to.
     if home.tparams.nonEmpty then abstractMembers ++= lowered.filterNot(f => defaultOrigin.contains(f.name))

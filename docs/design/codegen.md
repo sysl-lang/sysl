@@ -128,6 +128,13 @@ before they appear and may be mutually recursive).
   their definition like a generic `impl`'s, which removes the last asymmetry between the two. The
   question is answered after every `impl` is hoisted, so a bound may be met by an implementation
   written further down the file.
+- **Associated functions on generic types (`10 § Open b`).** `Box.of(41)` is a member with no
+  receiver, so the type's arguments are inferred from the call the way a generic free function's are
+  — from the arguments, and from the expected type where those do not settle them (`var c:
+  Cursor[int] = Cursor.none()`). `Self` in the signature is the type applied to its own parameters,
+  so `-> Self` and `-> Box[T]` infer alike. A parameter neither route reaches is an error naming it;
+  the bound is checked against what was inferred, in the *type's* name. Only a struct or an enum is
+  named in call position, so a block for a built-in or a composed shape may not declare one.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over

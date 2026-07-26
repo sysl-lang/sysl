@@ -197,16 +197,16 @@ class ImplGenericErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "the rest of the member surface" - {
 
-    // An associated function on a generic type would have its type arguments inferred rather than
-    // read off a receiver, which is the reason a generic *type* refuses one — and a generic block
-    // is that same situation reached another way.
-    "an associated function is refused as it is on a generic type" in {
+    // An associated function has no receiver, so a block's parameter that its signature never
+    // mentions has nothing at the call to fix it — the same failure a free `f[T]() -> int` meets.
+    "an associated function whose signature never mentions the parameter cannot be called" in {
       err(
         s"""trait Make
            |    make() -> int
            |${box}impl[T] Make for Box[T]
-           |    make() -> int = 1""".stripMargin,
-      ) should include("associated functions on generic types are not supported yet — 'Box.make'")
+           |    make() -> int = 1
+           |print(Box.make())""".stripMargin,
+      ) should include("cannot infer the type argument 'T' of 'Box.make'")
     }
 
     "a member colliding with the type's field is refused" in {

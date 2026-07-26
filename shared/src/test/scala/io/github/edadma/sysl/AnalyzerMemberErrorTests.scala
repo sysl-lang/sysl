@@ -66,15 +66,16 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("both a field and a member")
     }
 
-    // An associated function on a generic type has no receiver to read the type arguments from,
-    // so it would need them inferred — a separate deferral with its own diagnostic. Methods and
-    // properties, whose type arguments come straight off the receiver, are supported.
-    "an associated function on a generic type waits on the generics work" in {
+    // An associated function on a generic type has no receiver to read the type arguments from, so
+    // they are inferred from the call — and a parameter its signature never mentions leaves the
+    // call with nothing to infer from.
+    "an associated function whose signature never mentions the parameter cannot be called" in {
       err(
         """struct Box[T]
           |    value: T
-          |    empty() -> int = 0""".stripMargin
-      ) should include("associated functions on generic types are not supported yet")
+          |    empty() -> int = 0
+          |print(Box.empty())""".stripMargin
+      ) should include("cannot infer the type argument 'T' of 'Box.empty'")
     }
 
     // A method that introduces its own type parameter, even on a non-generic type, is a separate
@@ -204,9 +205,8 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("enum 'Color' has no variant or associated function 'bogus'")
     }
 
-    // The same two deferrals a struct's members meet, met on an enum: a member's own type
-    // parameter has nothing to infer it from, and an associated function has no receiver to read
-    // the enum's type arguments off.
+    // The deferral a struct's members meet, met on an enum: a member's own type parameter has
+    // nothing to infer it from.
     "a generic method on an enum waits on the generics work" in {
       err(
         """enum Color
@@ -215,12 +215,13 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("generic methods are not supported yet")
     }
 
-    "an associated function on a generic enum waits on the generics work" in {
+    "an associated function on a generic enum infers the enum's arguments from the call" in {
       err(
         """enum Maybe[T]
           |    Just(value: T)
-          |    make() -> int = 1""".stripMargin
-      ) should include("associated functions on generic types are not supported yet")
+          |    make() -> int = 1
+          |print(Maybe.make())""".stripMargin
+      ) should include("cannot infer the type argument 'T' of 'Maybe.make'")
     }
 
     "a data enum's method body must still cover every variant" in {

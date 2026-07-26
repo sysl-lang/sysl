@@ -55,6 +55,20 @@ trait TypeResolution extends AnalyzerBase {
   protected def withSelf(fname: String, subst: Map[String, Type]): Map[String, Type] =
     genericSelf.get(fname).fold(subst)(ref => subst + (selfName -> resolveType(ref, subst)))
 
+  /** Rewrites `Self` in a written type reference to the reference it stands for.
+   *
+   * `withSelf` above is the same idea one stage later, on resolved types; this one is needed where
+   * a signature is read *before* anything is resolved — inferring a generic associated function's
+   * type arguments, where `-> Self` has to be seen as the `Box[T]` it means for `T` to be solved
+   * from the expected type. Everywhere else the resolved binding is enough.
+   */
+  protected def spellSelf(ref: TypeRef, selfRef: TypeRef): TypeRef = ref match
+    case NamedType(n, Nil) if n == selfName => selfRef
+    case NamedType(n, args)                 => NamedType(n, args.map(spellSelf(_, selfRef)))
+    case PtrType(inner)                     => PtrType(spellSelf(inner, selfRef))
+    case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
+    case ArrayType(len, elem)               => ArrayType(len, spellSelf(elem, selfRef))
+
   /** Resolves a **result** type, which is the one position `never` may appear in — a function's,
    * a member's, or an `extern`'s declared result, saying that it does not return. Everywhere else
    * a type is resolved through `resolveType`, which rejects it.

@@ -189,6 +189,9 @@ namespace. The two never collide because one is the bare type name applied to ar
 other is a member selected from it. A named constructor that wants validation or a default is an
 associated function returning the type; the positional form remains the zero-ceremony default.
 
+On a **generic** type the same form works, with the type's arguments inferred from the call rather
+than read off a receiver there is none of — see *Generics* below.
+
 ## Built-in members
 
 `string`, `char`, arrays, slices, and the numeric types have no source body to write members
@@ -249,6 +252,20 @@ A trait may also be implemented for a generic type as a whole, or for a composed
 parameters and bounds on the block itself (`02`). Such a member is a member of the type exactly as
 one written in its body is, and is instantiated by the same rule — a shape's from the element type
 the receiver turned out to have.
+
+An **associated function** has no receiver, so there is nothing to read the type's arguments off.
+They are inferred from the call instead, exactly as a generic free function's are (`10 §4`): from
+what the arguments turn out to be, and from the type the context expects where the arguments do not
+settle them. So `Box.of(41)` is a `Box[int]` because `41` is an `int`, and a `none()` whose only
+mention of the parameter is in its result needs the expecting side to say — `var c: Cursor[int] =
+Cursor.none()`. A parameter that neither route reaches is an error at the call, naming the parameter
+it could not infer; the bound the type wrote on that parameter is checked against what was inferred,
+in the type's name, because the type is where it is written.
+
+Only a struct or an enum has a name that appears in call position, so an associated function is
+declared on one of those or on an `impl` block for one. A block for a built-in or for a composed
+type (`impl[T] Make for []T`) has no name a call could reach it through, and one written there is
+refused at the declaration rather than left as a member nothing could use.
 
 A **generic method** — one that introduces type parameters of its own, beyond the type's — is
 allowed by the same machinery that makes generic free functions work, and reads with the type

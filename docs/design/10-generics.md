@@ -87,6 +87,14 @@ undetermined by **both** directions, that is a compile error asking for an annot
 binding (`var e: Option[real] = …`) — never a silent default and never a stuck inference
 variable.
 
+**An associated function on a generic type is inferred by exactly this rule**, and that is the whole
+reason it needs no machinery of its own (`08`). A *method* never asks the question — its receiver
+already is a `Box[int]`, so the arguments are read rather than solved. An associated function has no
+receiver, which puts it in the position a generic free function is always in: `Box.of(41)` solves
+`T = int` from the argument, and a `none() -> Cursor[T]` solves from `var c: Cursor[int] = …`.
+`Self` in the signature is the type applied to its own parameters, so writing `-> Self` and writing
+`-> Box[T]` infer alike.
+
 ## 5. Bounds — the core decision
 
 A type parameter is **bounded by a trait**, and the bound is what the body of a generic is
@@ -246,13 +254,14 @@ never by a covariant container.
   (§2). If explicit arguments prove necessary, they need a disambiguating syntax (a Rust-style
   turbofish marker, or a rule that a type-argument list is only read in a call head). Deferred
   until a real case cannot be served by inference.
-- **b. Members on generic types.** Methods and properties on a generic struct *or enum* are
-  settled and implemented: the member is instantiated from the receiver's own type arguments, so
-  `Box[int].get` and `Box[real].get` are two monomorphized functions exactly as two instantiations
-  of a free generic function are. The same holds for the members a generic `impl` adds (`02`). What
-  remains open is the part with nothing to infer from — an **associated function** on a generic type
-  (no receiver to read the arguments off) and a member carrying **its own** type parameters — both
-  deferred with a diagnostic.
+- **b. Members on generic types.** Methods, properties, and associated functions on a generic
+  struct *or enum* are settled and implemented: a method or property is instantiated from the
+  receiver's own type arguments, so `Box[int].get` and `Box[real].get` are two monomorphized
+  functions exactly as two instantiations of a free generic function are; an associated function,
+  having no receiver, infers those arguments from the call by §4's ordinary rule. The same holds for
+  the members a generic `impl` adds (`02`). What remains open is a member carrying **its own** type
+  parameters — `map[U](self, f: …) -> Box[U]` — which is deferred with a diagnostic, and with it the
+  question of how a member's parameters and the type's interact in a bound.
 - **c. `where` clauses.** An out-of-line bound syntax for readability when the inline `[T: A +
   B]` list grows long or involves relations between parameters. All of Rust/Swift/Kotlin have
   one; a candidate ergonomic addition, not a day-one need.

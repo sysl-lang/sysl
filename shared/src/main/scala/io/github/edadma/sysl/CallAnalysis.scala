@@ -129,7 +129,12 @@ trait CallAnalysis extends Literals with TraitObjects {
             val recvArg  = buildReceiver(m.receiver.get, tr)
             val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
-          case Some(_) => err(s"'$mname' is a property of '$base' — read it as 'value.$mname', without '()'")
+          // Neither of the two remaining kinds takes a receiver, and they are not the same mistake:
+          // a property is this call with the parentheses dropped, an associated function is not
+          // reached through a value at all.
+          case Some(m) if m.isProperty =>
+            err(s"'$mname' is a property of '$base' — read it as 'value.$mname', without '()'")
+          case Some(_) => err(s"'$mname' is an associated function of '$base' — call it with '$base.$mname(…)'")
           case None =>
             builtinMethod(rty, mname, tr, args)
               .orElse(builtinDisplay(rty, mname, tr, args))
@@ -439,23 +444,63 @@ trait CallAnalysis extends Literals with TraitObjects {
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
    * The positional constructor `Type(…)` is a different form and is handled elsewhere.
    *
-   * The expected type plays no part: an associated function's result is the one it declares, and
-   * there is nothing to infer from the context because an associated function on a *generic* type
-   * is rejected at its declaration (`Hoisting`). That parameter comes back with those.
+   * On a **generic** type there is no receiver to read the type arguments off, so they are inferred
+   * the way a generic free function's are: from the arguments, and from the type the context expects
+   * where the arguments do not determine them.
    */
-  protected def callAssociated(tname: String, mname: String, args: List[Expr]): TExpr =
+  protected def callAssociated(tname: String, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
     memberDecls.get((tname, mname)) match
       case Some(m) if m.receiver.isEmpty && !m.isProperty =>
-        val fname           = s"$tname.$mname"
-        val (params, rtype) = funcInsts(fname)
-        if args.length != params.length then
-          err(s"associated function '$fname' takes ${quantity(params.length, "argument")}, but ${supplied(args.length, "argument")}")
-        val ts = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
-        TCall(fname, checkArgs(fname, params, args, Some(ts)), rtype)
+        genericMembers.get((tname, mname)) match
+          case Some(fd) => callGenericAssociated(tname, fd, args, expected)
+          case None =>
+            val fname           = s"$tname.$mname"
+            val (params, rtype) = funcInsts(fname)
+            if args.length != params.length then
+              err(s"associated function '$fname' takes ${quantity(params.length, "argument")}, but ${supplied(args.length, "argument")}")
+            val ts = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+            TCall(fname, checkArgs(fname, params, args, Some(ts)), rtype)
       case Some(m) if m.isProperty =>
         err(s"'$mname' is a property of '$tname' — read it on a value, as 'value.$mname'")
       case Some(_) => err(s"'$mname' is an instance method of '$tname' — call it on a value, not the type")
       case None    => err(s"type '$tname' has no associated function '$mname'")
+
+  /** An associated function of a generic type, at the instantiation this call resolves to.
+   *
+   * The arity check comes first, because inference reads the arguments against the parameters
+   * pairwise and a mismatched count would silently leave a parameter unsolved — reporting a failure
+   * to infer where the real mistake is the number of arguments.
+   *
+   * `Self` is rewritten to the type applied to its own parameters before solving, so a constructor
+   * written `-> Self` infers from an expected `Box[int]` exactly as one written `-> Box[T]` does.
+   *
+   * The bound the resolved arguments are held to is the **type's**, so it is reported in the type's
+   * name — the member inherited it and is not where it is written.
+   */
+  private def callGenericAssociated(owner: String, fd: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
+    if args.length != fd.params.length then
+      err(s"associated function '${fd.name}' takes ${quantity(fd.params.length, "argument")}, " +
+        s"but ${supplied(args.length, "argument")}")
+
+    val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)(ref => spellSelf(_, ref))
+    val provisional = args.map(analyzeExpr(_))
+    val targs = solve(
+      fd.name,
+      fd.tparams,
+      fd.params.map(p => spell(p.typ)),
+      provisional.map(_.ty),
+      fd.retType.map(spell),
+      expected,
+    )
+
+    checkParamBounds(owner, fd.tparams, fd.bounds, targs)
+
+    val name            = instantiateFunc(fd, targs)
+    val (params, rtype) = funcInsts(name)
+
+    funcsUsed += name
+    TCall(name, checkArgs(fd.name, params, args, Some(provisional)), rtype)
+  }
 
   /** Passes the receiver in the mode the method's `self` declared, inserting the same conversion
    * a matching argument would: a value is copied, `*self` takes the instance's address, `&self`
