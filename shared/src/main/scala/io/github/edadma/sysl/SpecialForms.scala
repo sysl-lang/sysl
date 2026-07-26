@@ -140,14 +140,18 @@ trait SpecialForms extends CallAnalysis {
           (name, widen(t, want))
 
         case None =>
-          if !traitImpls.contains(("Display", ownerKey(ty))) then
-            // Naming the `impl` to write is only advice where one could be written at all: a
-            // memory mode and a generic type are the two shapes `02` still refuses, so those are
-            // told what is true of them rather than pointed at a block that would not compile.
+          if !conforms("Display", ty) then
+            // Naming the `impl` to write is only advice where one could be written at all: a memory
+            // mode is the shape `02` refuses, so it is told what is true of it rather than pointed
+            // at a block that would not compile. A generic type is written for as a whole, so the
+            // advice names the block's own parameters rather than the arguments this value has.
             val fix = ty match
-              case n: Type.Named if n.targs.isEmpty => s"write an 'impl Display for ${n.name}' to say how it renders"
-              case _: Type.Array | _: Type.Slice    => s"write an 'impl Display for ${show(ty)}' to say how it renders"
-              case _                                => "it does not implement 'Display'"
+              case n: Type.Named if n.targs.nonEmpty =>
+                val tps = nominalTparams(n.base).mkString(", ")
+                s"write an 'impl[$tps] Display for ${n.base}[$tps]' to say how it renders"
+              case n: Type.Named                 => s"write an 'impl Display for ${n.name}' to say how it renders"
+              case _: Type.Array | _: Type.Slice => s"write an 'impl Display for ${show(ty)}' to say how it renders"
+              case _                             => "it does not implement 'Display'"
             val asked = if op == "print" then "cannot print" else "cannot make a string of"
             err(s"$asked a ${show(ty)} value — $fix")
 
@@ -161,7 +165,7 @@ trait SpecialForms extends CallAnalysis {
    */
   private def rendersItself(ty: Type): Boolean = ty match
     case a: Type.Abstract => a.bounds.contains("Display")
-    case _                => traitImpls.contains(("Display", ownerKey(ty)))
+    case _                => conforms("Display", ty)
 
   /** The compiler's own writers are laid out by hand and reached by slot index, so `Writer`'s shape
    * is something the emitter depends on rather than merely reads. Checking it here turns a later

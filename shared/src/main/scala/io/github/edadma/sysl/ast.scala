@@ -319,7 +319,20 @@ case class TraitDecl(name: String, tparams: List[String], methods: List[MethodDe
  * `forType` is a full type reference rather than a name, because a trait may be implemented for a
  * type that has no name to be written under — `impl Show for []int` says how a slice of ints
  * renders, and `[]int` is a type the same way `Point` is.
+ *
+ * `tparams` are the block's own type parameters, written between `impl` and the trait —
+ * `impl[T] Show for Box[T]` implements the trait for **every** `Box`, and its methods are
+ * monomorphized per instantiation the way a generic type's own members are. `bounds` are what the
+ * block asks of them: `impl[T: Show] Show for Box[T]` is **conditional conformance**, so a
+ * `Box[int]` implements `Show` exactly when `int` does. Both are empty for an ordinary `impl`,
+ * whose subject is one concrete type.
  */
-case class ImplDecl(traitName: String, forType: TypeRef, methods: List[MethodDecl]) extends Stmt
+case class ImplDecl(
+    traitName: String,
+    forType: TypeRef,
+    methods: List[MethodDecl],
+    tparams: List[String] = Nil,
+    bounds: Map[String, List[String]] = Map.empty,
+) extends Stmt
 
 case class Program(body: List[Stmt])

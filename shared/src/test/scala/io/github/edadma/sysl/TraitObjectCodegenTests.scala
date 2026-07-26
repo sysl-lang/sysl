@@ -53,6 +53,18 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
       |var s: *Sized = &b
       |print(s.size)""".stripMargin
 
+  private val generic =
+    """trait Total
+      |    total(self) -> int
+      |struct Box[T]
+      |    v: T
+      |    n: int
+      |impl[T] Total for Box[T]
+      |    total(self) -> int = self.n
+      |var a: &Total = Box("x", 7)
+      |var b: &Total = Box(1, 8)
+      |print(a.total(), b.total())""".stripMargin
+
   private val slice =
     """trait Total
       |    total(self) -> int
@@ -154,6 +166,27 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
           |var a: [3]int = [1, 2, 3]
           |print(a.total())""".stripMargin,
       ) should include("define i32 @arr3.int.total(")
+    }
+  }
+
+  /** A member of a generic type is named by its **instantiation** (`Box.total.int`), not by the
+   * type mangled with the member on the end (`Box.int.total`) — so a slot filled by any other rule
+   * would name a function that does not exist. The table itself keeps the mangled-type naming,
+   * since that is what identifies which instantiation was erased.
+   */
+  "a generic type's table" - {
+    "names the slot as the instantiated member, not as the type with the name appended" in {
+      val out = ir(generic)
+
+      out should include("define i32 @Box.total.string(")
+      defineOf(out, "vt.adapt.ref.Box.total.string") should include("call i32 @Box.total.string(")
+    }
+
+    "gives two instantiations two tables of their own" in {
+      val out = ir(generic)
+
+      out should include("@vt.ref.Total.Box.string = private constant [1 x ptr]")
+      out should include("@vt.ref.Total.Box.int = private constant [1 x ptr]")
     }
   }
 

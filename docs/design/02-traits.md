@@ -1,9 +1,9 @@
 # Traits (Polymorphism)
 
 **Status:** decided (core model), and **built** — static dispatch through bounds, dynamic dispatch
-through `*Trait` / `&Trait`, **default bodies**, **properties** alongside methods, and an `impl` for
-any concrete type, **composed types included**. Some
-surface-syntax details are flagged open at the end. How a
+through `*Trait` / `&Trait`, **default bodies**, **properties** alongside methods, an `impl` for any
+concrete type (**composed types included**), and an `impl` for a **generic** type, with
+**conditional conformance**. Some surface-syntax details are flagged open at the end. How a
 plain method and its receiver are spelled — the hole this doc used to leave open — is settled in
 `08-methods.md`; a trait's methods are declared and called the same way, with the receiver an
 `impl`'s type instead of a concrete one. A signature that has to name the implementing type writes
@@ -200,22 +200,87 @@ Two spellings of one type are still one implementation, since the key is the res
 **length is part of its type**, so `[2]int` and `[3]int` are two types and may implement the same
 trait differently.
 
-Three shapes are refused, each because an implementation for it would be about nothing:
+Two shapes are refused, each because an implementation for it would be about nothing:
 
 - **A memory mode** — `*Point`, `&Point`. A mode is a way of *holding* a `Point`, not a type
   beside it, and a member call already sees through one level of `*` / `&` to find the receiver's
   members (`08`). An `impl` for the mode would register members nothing could ever reach.
 - **A trait object** — `*Show`. An `impl` says how one particular type behaves, and which type it
   holds is precisely what an erased value has forgotten.
-- **A generic type** — `Box`, `Box[T]`. Still open, below. A generic type *already applied* is
-  concrete and perfectly ordinary: `impl Total for []Box[int]` is allowed, because `Box[int]` is a
-  type and a slice of it is a type.
 
 Members the compiler provides are out of reach for the same reason a field is: `len` on a slice or
 an array, and `bytes` on a string, are reached ahead of the member table rather than through it, so
 an `impl` that declared one would register a member no reader could find. That is the built-in
 counterpart of an `impl` method colliding with a struct's field, and it is reported at the
 declaration for the same reason.
+
+## An `impl` covers a generic type as a whole
+
+A block may declare **type parameters of its own**, written where a generic function writes them —
+directly after the keyword that opens the declaration:
+
+```
+impl[T] Show for Box[T]
+    show(self) -> string = "a box"
+```
+
+That is one implementation for **every** `Box`, and its members are monomorphized per receiver
+exactly as a generic type's own members are: `Box[int].show` and `Box[string].show` are two
+functions, from one source body, instantiated the moment something calls one.
+
+Its subject must be the type applied to the block's parameters and nothing else — each argument one
+parameter, each parameter used once, all of them spoken for. `impl Show for Box[int]` is refused,
+and so is `impl[T] Show for Pair[T, int]`, because **a generic type has one key for all of its
+instantiations**: a type's members are filed under the name it was declared with, so an
+implementation for *some* instantiations would be a second implementation for a key that holds one.
+Overlapping implementations, and the specialization rule that would be needed to pick between them,
+are deliberately not in the language. The parameters are matched to the arguments **by position in
+the subject**, not by the order they were declared in, so `impl[X, Y] Show for Pair[Y, X]` reads as
+it looks.
+
+### Conditional conformance
+
+A bound on the block is what makes the conformance conditional:
+
+```
+impl[T: Display] Show for Box[T]
+    show(self) -> string = str(self.v)
+```
+
+A `Box[int]` implements `Show` precisely when `int` implements `Display`. That question is asked one
+step in and composes: under `impl[T: Show] Show for Box[T]`, a `Box[Box[int]]` conforms exactly when
+`Box[int]` does, which is what makes a conditional implementation usable on nested types at all.
+Everything that asks whether a type conforms asks it the same way — a generic function's bound, an
+erasure to a trait object, `print` reaching for a `Display` — so an instantiation that fails the
+condition is refused at each of them, while its siblings are not.
+
+What the bounds buy beyond deciding conformance is that **the members become checkable at their
+definition**. A block states what it assumes of its parameters, so its bodies are walked once,
+against those bounds alone, by the same definition-time pass `14 §4` runs over every bounded generic
+— and a method calling something no bound licenses is reported on its own line, with nothing
+instantiated:
+
+```
+impl[T] Show for Box[T]
+    show(self) -> string = self.v.show()    // error: 'show' needs 'T: Show'
+```
+
+This is the one place a generic `impl` and a generic *type* differ. A type's own members inherit the
+type's parameters, and those carry no bounds — there is nowhere to write one (`10` open b) — so
+holding such a member to its bounds would be holding it to nothing, and it is checked per
+instantiation instead. The block is where a bound can be written, so the block is where the check
+becomes possible.
+
+`Self` inside such a block is the subject applied to its parameters, which is not a type until an
+instantiation says what they are — so it is resolved alongside them rather than ahead of them, and
+`-> Self` and `-> Box[T]` are the one signature conformance compares. The same now holds inside a
+generic type's *own* body (`08`), which had been the one place `Self` named nothing.
+
+What stays out is matching a **composed** type by its shape: `impl[T] Display for []T` is not
+supported, because a composed type's members are filed under the whole type (`[]int`, not `[]`), so
+there is no head to match and — unlike the nominal case — a shape-matched block and a written
+`impl Display for []int` could both claim one value. That needs an overlap rule the language does
+not have, which is exactly why the nominal case does not need one.
 
 ## Trait objects, as built
 
@@ -292,7 +357,7 @@ signature, which stands in for every implementation because conformance is exact
 
 - **Kept:** static dispatch (monomorphized bounds), dynamic dispatch (boxed trait object),
   retrofitting foreign types (explicit `impl`), default bodies, properties as members, an `impl` for
-  any concrete type — named or composed.
+  any concrete type — named or composed — and an `impl` for a generic type, conditionally.
 - **Dropped:** the separate structural `interface`; implicit/structural conformance; the
   invisible `owns` flag (replaced by explicit three-mode ownership).
 
@@ -302,12 +367,13 @@ signature, which stands in for every implementation because conformance is exact
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
 - **Trait bounds, associated types, generic interaction** — deferred to the generics spec.
-- **An `impl` for a generic type.** `impl Show for Box[T]` is rejected for now; the implementing type
-  must be concrete. Wanted, and it interacts with monomorphizing the members — the block would carry
-  type parameters of its own, its members would be instantiated per receiver like a generic type's
-  are, and a bound would have to be answered by matching the head rather than by a key lookup.
-  **Conditional conformance** (`impl Show for Box[T]` only where `T: Show`) is the same work: the
-  bound on the block is what makes the members' bodies checkable at the definition.
+- **An `impl` matching a composed type by its shape.** `impl[T] Display for []T` is rejected; a
+  composed type is implemented for whole (`[]int`), as above. What it would need is a *head* to file
+  members under and an overlap rule to choose between a shape-matched block and a written one — the
+  question the nominal case avoids by having exactly one key per generic type.
+- **Bounds on a generic type's own parameters.** `struct SortedList[T: Ord]` is `10` open b, and it
+  is what would let a generic *type's* members be checked at their definition the way a generic
+  `impl`'s now are.
 - **A property's body must be an expression.** `name -> T = expr` is the only spelling, so a property
   cannot open an indented block the way a method's `= …`-less form can. That is `08`'s grammar rather
   than anything about traits, and it bites a default property the same way it bites an inherent one.

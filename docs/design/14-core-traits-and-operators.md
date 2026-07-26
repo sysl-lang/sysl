@@ -52,6 +52,10 @@ trait Add
 - In an **`impl Trait for Point`** block, `Self` *is* `Point`. Writing the concrete name and
   writing `Self` are interchangeable there; conformance compares *resolved* types, so
   `add(self, rhs: Self) -> Self` and `add(self, rhs: Point) -> Point` are the same signature.
+- In a **generic** context — a generic type's own body, or an `impl[T] Trait for Box[T]` (`02`) —
+  `Self` is the type applied to its parameters, and that is not a type until an instantiation says
+  what they are. So it is resolved alongside them: `-> Self` and `-> Box[T]` are one signature, and
+  each becomes `Box[int]` at a `Box[int]` receiver.
 
 `Self` is distinct from the lowercase receiver `self` (`08`): `self` is the receiver *value*,
 `Self` is its *type*. This mirrors Swift (`Self`), Rust (`Self`), and Scala (`this.type`), and it

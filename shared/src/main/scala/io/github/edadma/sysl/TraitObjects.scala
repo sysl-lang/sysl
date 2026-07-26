@@ -53,8 +53,7 @@ trait TraitObjects extends TypeResolution {
    * distinction: object safety already refuses every trait in the catalog, so the only traits that
    * reach here are ones a program declared and implemented itself.
    */
-  private def implements(traitName: String, t: Type): Boolean =
-    traitImpls.contains((traitName, ownerKey(t)))
+  private def implements(traitName: String, t: Type): Boolean = conforms(traitName, t)
 
   private def erase(t: TExpr, tr: Type.Trait, inner: Type, want: Type, boxed: Boolean): TExpr =
     if !implements(tr.name, inner) then
@@ -65,15 +64,18 @@ trait TraitObjects extends TypeResolution {
   /** The method table for one type seen as one trait, registered the first time it is needed.
    *
    * Every conforming type reaches this through a source `impl`, whose methods were lowered to
-   * ordinary functions under `Type.method` — so a slot is a name that already exists, and the table
-   * is the trait's methods in declaration order, which is the order a call site indexes by.
+   * ordinary functions — so a slot is a name that already exists, and the table is the trait's
+   * methods in declaration order, which is the order a call site indexes by. A slot is named by the
+   * rule a *call* uses, since a table naming a member any other way is a table pointing at nothing:
+   * a member of a generic type is instantiated here as it would be at a call site, so erasing a
+   * `Box[int]` brings that instantiation into the program.
    */
   private def vtableFor(traitName: String, ty: Type, boxed: Boolean): String = {
     val name = s"vt.${if boxed then "ref." else ""}$traitName.${Type.mangle(ty)}"
 
     if !vtables.contains(name) then
       val slots = traitDecls(traitName).methods.map { m =>
-        val fname           = s"${Type.mangle(ty)}.${m.name}"
+        val fname           = memberFuncName(ty, m.name)
         val (params, rtype) = funcInsts(fname)
 
         funcsUsed += fname

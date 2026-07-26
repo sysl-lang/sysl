@@ -100,8 +100,17 @@ before they appear and may be mutually recursive).
   member table, same bound, same vtable slots. The members are *emitted* under the type **mangled**
   (`slice.int.display`, `arr3.int.total`) rather than under the owner key a diagnostic uses, because
   `[]int` is no symbol a linker would take; the two coincide for every type that is a name. A memory
-  mode (`*Point`), a trait object (`*Show`), and a still-generic type (`Box`, `Box[T]`) are refused —
-  an already-applied generic like `[]Box[int]` is concrete and allowed.
+  mode (`*Point`) and a trait object (`*Show`) are refused, since an implementation for either would
+  be about nothing.
+- **An `impl` for a generic type, conditionally (`02`).** `impl[T: Show] Show for Box[T]` implements
+  the trait for every `Box` at once; its members are monomorphized per receiver exactly as a generic
+  type's own are, and are *named* as those are (`Box.show.int`), which is what a vtable slot has to
+  use as well. The subject must be the type applied to the block's parameters — one key per generic
+  type, so no overlapping implementations and no specialization rule to need. The bounds decide
+  **which instantiations conform**, asked one step in so the answer composes, and they make the
+  members checkable at their **definition**: a body using what no bound licenses is reported on its
+  own line with nothing instantiated. Matching a *composed* type by its shape (`[]T`) is not
+  supported — there is no head to file members under.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over
@@ -303,7 +312,11 @@ arity.
     `T: Add`, whether or not anything instantiates it. A **property** a bound declares resolves the
     same way, since a property is behaviour that happens to read like a field. Forwarding a parameter
     to a bounded callee is checked the same way too: a bound is satisfied by a bound. A trait's
-    default bodies go through the same pass, bounded by their own trait.
+    default bodies go through the same pass, bounded by their own trait, and so do the members of a
+    generic `impl`, bounded by what the block declares (`02`). A member of a generic *type* is the
+    one thing left out, and for a reason rather than an omission: it inherits the type's parameters,
+    which carry no bounds because there is nowhere to write one (`10` open b), so there is nothing to
+    hold it to. Those are still checked per instantiation.
 
     The pass reaches what a bound could license and no further. A mistake that needs the *concrete*
     type to settle — a result that disagrees with its declared type for reasons `Self` alone cannot

@@ -75,6 +75,35 @@ class TraitParserTests extends AnyFreeSpec with ParseSupport {
     )
   }
 
+  // The block's own type parameters go where a generic function's do — straight after the keyword
+  // that opens the declaration — and carry bounds in the same spelling, which is what makes the
+  // conformance conditional.
+  "an impl may declare bounded type parameters of its own" in {
+    val src =
+      """impl[T: Show] Show for Box[T]
+        |    show(self) -> string = self.v.show()""".stripMargin
+
+    prog(src) shouldBe List(
+      ImplDecl(
+        "Show",
+        NamedType("Box", List(NamedType("T"))),
+        List(
+          MethodDecl(
+            "show",
+            Some(RecvMode.ByValue),
+            isProperty = false,
+            Nil,
+            Nil,
+            Some(NamedType("string")),
+            List(ExprStmt(Call(Field(Field(Ident("self"), "v"), "show"), Nil))),
+          )
+        ),
+        List("T"),
+        Map("T" -> List("Show")),
+      )
+    )
+  }
+
   // A body after the header is what tells a default from a signature, and the two live side by
   // side in one trait — so the parse has to keep them apart on that alone.
   "a trait method carrying a body parses as a default" in {

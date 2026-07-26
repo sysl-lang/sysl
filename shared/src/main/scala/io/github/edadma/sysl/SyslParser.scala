@@ -527,13 +527,22 @@ class SyslParser(val source: Source) extends PackratParsers {
    * `impl Show for Point`, and which types an `impl` may be *for* is the analyzer's to decide
    * rather than something to leave the grammar unable to express.
    *
-   * The block itself is optional, because a trait whose every method has a default leaves a
+   * The block may declare **type parameters of its own**, in the same bracketed list a generic
+   * function writes and in the same position — directly after the keyword that opens the
+   * declaration: `impl[T: Show] Show for Box[T]`. They are what makes the implementation cover a
+   * generic type as a whole, and the bounds on them are what make it conditional.
+   *
+   * The body itself is optional, because a trait whose every method has a default leaves a
    * conforming type nothing to write: `impl Zero for E` on its own line is the whole of that
    * implementation, and the opt-in it states is the point of writing it.
    */
   private lazy val implDecl: PackratParser[Stmt] =
-    op("impl") ~> ident ~ (op("for") ~> typeRef) >> { case tname ~ forType =>
-      (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods => ImplDecl(tname, forType, methods) }
+    op("impl") ~> opt(boundedTypeParams) ~ ident ~ (op("for") ~> typeRef) >> { case tps ~ tname ~ forType =>
+      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+
+      (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
+        ImplDecl(tname, forType, methods, names, bounds)
+      }
     }
 
   private lazy val implBody: PackratParser[List[MethodDecl]] =

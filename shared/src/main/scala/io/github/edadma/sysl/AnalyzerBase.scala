@@ -55,6 +55,43 @@ trait AnalyzerBase {
    */
   protected val traitImpls = mutable.LinkedHashMap.empty[(String, String), ImplDecl]
 
+  /** What a **generic** `impl` asks of the type arguments its subject is applied to, one entry per
+   * argument position, keyed exactly as `traitImpls` is.
+   *
+   * `impl[T: Show] Show for Box[T]` is **conditional conformance**: a `Box` implements `Show` when
+   * its element does, and this is the condition, in the order the implementation's subject wrote its
+   * arguments. An unconditional `impl` — generic or not — has no entry, which is what makes the
+   * ordinary case a lookup that asks nothing further.
+   */
+  protected val implBounds = mutable.LinkedHashMap.empty[(String, String), List[List[String]]]
+
+  /** What `Self` means inside a member of a *generic* type, as the reference it was written from —
+   * `Box[T]` for the members of `Box`, whichever declaration form brought them.
+   *
+   * A concrete type's members have their `Self` resolved once, at hoist, into `memberSelf`. A
+   * generic type's cannot: `Box[T]` is not a type until a call fixes `T`. So the *reference* is
+   * kept, and resolving it under the substitution an instantiation supplies is what gives `Self` its
+   * meaning there — the same answer, one step later.
+   */
+  protected val genericSelf = mutable.LinkedHashMap.empty[String, TypeRef]
+
+  /** The members of a generic `impl`, each as the generic function it was lowered to, for the
+   * definition-time pass of `14 §4` to walk.
+   *
+   * A member of a generic *type* is not checked there and cannot be: it inherits the type's
+   * parameters, which carry no bounds, so holding it to them would be holding it to nothing. A
+   * generic `impl` is the case that changed — the block declares its own parameters and may bound
+   * them — so its members are checked once, at the definition, exactly as a bounded generic function
+   * is.
+   */
+  protected val abstractMembers = mutable.ListBuffer.empty[FuncDecl]
+
+  /** Generic `impl` members whose body the definition-time pass reported, by the name each was
+   * lowered to. The instantiations made for concrete type arguments are dropped rather than
+   * analyzed, so one mistake stays one diagnostic.
+   */
+  protected val brokenMembers = mutable.HashSet.empty[String]
+
   /** The method tables the program's trait objects dispatch through, keyed by the global each is
    * emitted under and registered the first time an erasure needs one. A program that never erases a
    * type carries none.
@@ -288,6 +325,25 @@ trait AnalyzerBase {
   /** The key alone — what an `impl` is filed under, and what a trait bound looks up. */
   protected def ownerKey(t: Type): String = memberOwner(t)._1
 
+  /** The name codegen emits for one of a type's members. A member of a concrete type was hoisted
+   * eagerly under `Type.member`; a member of a generic type is instantiated here, from the
+   * receiver's own type arguments, and its body queued for analysis — so both answer with a name
+   * that `funcInsts` holds.
+   *
+   * The prefix is the type **mangled**, not the key its members are filed under, because a type an
+   * `impl` may name is not always a name: `[]int` is a fine key and an impossible LLVM symbol. The
+   * two coincide for every type that *is* named.
+   *
+   * It lives here rather than with the calls because a vtable slot asks the same question a call
+   * does, and a slot naming a member by any other rule is a slot pointing at nothing.
+   */
+  protected def memberFuncName(ty: Type, mname: String): String = {
+    val (base, targs) = memberOwner(ty)
+
+    if nominalTparams(base).isEmpty then s"${Type.mangle(ty)}.$mname"
+    else instantiateFunc(genericMembers((base, mname)), targs)
+  }
+
   /** Whether a member of that name is one the *compiler* provides for the type (`08`).
    *
    * `len` and `bytes` are members of built-ins that have no source body to declare them in, so they
@@ -302,13 +358,33 @@ trait AnalyzerBase {
 
   /** Whether a type implements a trait, which is the one question a bound asks.
    *
-   * There are two ways to answer yes and they are not interchangeable. A **user** type opts in with
-   * an explicit `impl`, filed under its owner key — nominal conformance, never structural. A
+   * There are three ways to answer yes and they are not interchangeable. A **user** type opts in
+   * with an explicit `impl`, filed under its owner key — nominal conformance, never structural. A
    * **built-in** is a member by the compiler's own rule (`14 §5`), because it has no module to write
-   * an `impl` in and the integer family has no finite list of types to write one for.
+   * an `impl` in and the integer family has no finite list of types to write one for. And a **type
+   * parameter** implements exactly what its own bounds promise, which is what lets a bounded body
+   * hand its parameter on to something that asks the same of it.
    */
-  protected def satisfies(traitName: String, t: Type): Boolean =
-    traitImpls.contains((traitName, ownerKey(t))) || CoreTraits.builtin(traitName, t)
+  protected def satisfies(traitName: String, t: Type): Boolean = t match
+    case a: Type.Abstract => a.bounds.contains(traitName)
+    case _                => conforms(traitName, t) || CoreTraits.builtin(traitName, t)
+
+  /** Whether a type implements a trait **through a source `impl`** — conformance a table can point
+   * at, as against a membership the compiler provides by rule.
+   *
+   * A generic `impl` may be conditional, and this is where the condition is answered: the
+   * implementing type's own arguments must satisfy what the block asked of them, which is the same
+   * question one step in. So `Box[int]` implements `Show` under `impl[T: Show] Show for Box[T]`
+   * exactly when `int` does, and a `Box[Point]` over a `Point` with no `Show` does not.
+   */
+  protected def conforms(traitName: String, t: Type): Boolean = {
+    val (key, targs) = memberOwner(t)
+
+    traitImpls.contains((traitName, key)) && implBounds.get((traitName, key)).forall { required =>
+      targs.length == required.length &&
+      targs.zip(required).forall { case (arg, traits) => traits.forall(satisfies(_, arg)) }
+    }
+  }
 
   /** The type a member is looked up on, seeing through one level of `*T` / `&T` so a method may be
    * called on a value, a pointer to it, or a reference to it alike.

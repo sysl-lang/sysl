@@ -114,23 +114,6 @@ trait CallAnalysis extends Literals with TraitObjects {
               err(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
                 s"but ${show(concrete)} does not")
 
-  /** The name codegen emits for a member call. A member of a concrete type was hoisted eagerly
-   * under `Type.member`; a member of a generic type is instantiated here, from the receiver's own
-   * type arguments, and its body queued for analysis — so both resolve to a name that `funcInsts`
-   * holds.
-   *
-   * The prefix is the type **mangled**, not the key its members are filed under, because a type an
-   * `impl` may name is not always a name: `[]int` is a fine key and an impossible LLVM symbol. The
-   * two coincide for every type that *is* named, so nothing about a struct's members changed when
-   * the composed types arrived.
-   */
-  protected def memberFuncName(ty: Type, mname: String): String = {
-    val (base, targs) = memberOwner(ty)
-
-    if nominalTparams(base).isEmpty then s"${Type.mangle(ty)}.$mname"
-    else instantiateFunc(genericMembers((base, mname)), targs)
-  }
-
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever
    * memory mode the method's `self` asked for.
@@ -404,16 +387,18 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   private def dispatchFor(trName: String, op: String, ty: Type): Option[TDispatch] = {
     val (swap, negate) = CoreTraits.derivation.getOrElse(op, (false, false))
-
-    def named(owner: String) = TDispatch(s"$owner.${CoreTraits.required(trName)._1}", swap, negate)
+    val method         = CoreTraits.required(trName)._1
 
     if CoreTraits.builtin(trName, ty) then None
     else
       ty match
         case a: Type.Abstract =>
           if !a.bounds.contains(trName) then boundErr(s"'$op' needs '${a.name}: $trName'")
-          Some(named(trName))
-        case _ => Option.when(satisfies(trName, ty))(named(ownerKey(ty)))
+          Some(TDispatch(s"$trName.$method", swap, negate))
+        // The implementation is named by the rule a method call uses, which for a generic type is
+        // the instantiation the receiver's own arguments make — `a + b` on a `Box[int]` reaches the
+        // same function `a.add(b)` would.
+        case _ => Option.when(satisfies(trName, ty))(TDispatch(memberFuncName(ty, method), swap, negate))
   }
 
   /** The other operand of a dispatched binary operator, against what the trait's signature asks for

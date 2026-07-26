@@ -231,7 +231,13 @@ describes.
 A member of a generic type is monomorphized with the type, so `Box[T]`'s methods are emitted per
 instantiation exactly as its construction and field access already are (`03`). Inside a member,
 the type's parameters are in scope, and the receiver's type is the type applied to them —
-`self: Box[T]`, `&self: &Box[T]`, and so on.
+`self: Box[T]`, `&self: &Box[T]`, and so on. **`Self` means that same type**, which is not a type
+until an instantiation says what the parameters are, so it is resolved alongside them rather than
+ahead of them: `same(self) -> Self` is `same(self) -> Box[int]` at a `Box[int]` receiver.
+
+A trait may also be implemented for a generic type as a whole, with type parameters and bounds on
+the block itself (`02`). Such a member is a member of the type exactly as one written in its body
+is, and is instantiated by the same rule.
 
 A **generic method** — one that introduces type parameters of its own, beyond the type's — is
 allowed by the same machinery that makes generic free functions work, and reads with the type

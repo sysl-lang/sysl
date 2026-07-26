@@ -101,11 +101,16 @@ class Analyzer private (program: Program)
     retTy = Type.Int
     val tmain = mainStmts.map(recoverStmt)
 
-    // Draining the queue may itself discover further instantiations, so it runs to a fixpoint.
+    // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An
+    // instantiation of a member the definition-time pass already reported is dropped rather than
+    // analyzed, for the reason that pass exists: the diagnostic naming the missing bound is the one
+    // worth reading, and every instantiation would add another about a consequence of it.
     def drain(): Unit =
       while pending.nonEmpty do
         val (mangled, decl, subst) = pending.dequeue()
-        tfuncs ++= recoverOpt(analyzeFuncBody(mangled, decl, subst))
+        val reported = brokenMembers(decl.name) || defaultOrigin.get(decl.name).exists(brokenDefaults)
+
+        if !reported then tfuncs ++= recoverOpt(analyzeFuncBody(mangled, decl, subst))
 
     drain()
 
@@ -147,9 +152,14 @@ class Analyzer private (program: Program)
    * sysl's generics apart from a C++ template: a body that assumes more than it declared is wrong
    * whether or not anything ever instantiates it, and this is where it is told so.
    *
-   * Only a function that declares its own type parameters is walked. A member of a generic type
-   * inherits the *type's* parameters, and those carry no bounds — there is nowhere to write one —
-   * so holding such a member to its bounds would be holding it to nothing at all.
+   * Only a declaration that carries its own type parameters is walked. A member of a generic *type*
+   * inherits the type's, and those carry no bounds — there is nowhere to write one — so holding such
+   * a member to its bounds would be holding it to nothing at all.
+   *
+   * **A generic `impl`'s members are walked**, and that is the difference a block of its own makes:
+   * `impl[T: Show] Show for Box[T]` states what it assumes of `T`, so its methods are checkable
+   * before anything instantiates them, exactly as a bounded generic function's body is. That is what
+   * conditional conformance buys beyond deciding whether a `Box[int]` conforms.
    *
    * **A trait's default bodies are walked here too**, each as the generic function it is: one
    * parameter, `Self`, bounded by its own trait (`Hoisting.traitDefaults`). A default may assume of
@@ -159,9 +169,10 @@ class Analyzer private (program: Program)
    */
   private def checkAbstractBodies(body: List[Stmt]): Unit = {
     val generics = body.collect { case f: FuncDecl if f.tparams.nonEmpty => f }
+    val members  = abstractMembers.toList
     val defaults = traitDefaults
 
-    if generics.nonEmpty || defaults.nonEmpty then
+    if generics.nonEmpty || members.nonEmpty || defaults.nonEmpty then
       sandboxed {
         abstractPass = true
 
@@ -169,6 +180,16 @@ class Analyzer private (program: Program)
           for f <- generics do
             currentPos = f.pos
             recover(())(checkAbstractBody(f))
+
+          // A member reported here has been reported against the body as written, naming the bound
+          // that would license what it does. Every instantiation would fail the same way and say so
+          // in terms of whatever type it was made at, so those are dropped instead — one mistake,
+          // one diagnostic, in the words that name the fix.
+          for f <- members do
+            currentPos = f.pos
+            val before = diagnosticCount
+            recover(())(checkAbstractBody(f))
+            if diagnosticCount > before then brokenMembers += f.name
 
           // A default that fails here has been reported, at the trait, against the body a
           // programmer actually wrote. The copies made for each implementing type would fail the
@@ -186,7 +207,7 @@ class Analyzer private (program: Program)
   /** One generic body, analyzed with each of its type parameters substituted by itself. */
   private def checkAbstractBody(f: FuncDecl): Unit = at(f.pos) {
     val subst: Map[String, Type] =
-      f.tparams.map(tp => tp -> Type.Abstract(tp, f.bounds.getOrElse(tp, Nil))).toMap
+      withSelf(f.name, f.tparams.map(tp => tp -> Type.Abstract(tp, f.bounds.getOrElse(tp, Nil))).toMap)
     val params = f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, subst))))
     val rtype  = f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, subst))).getOrElse(Type.Unit)
 
@@ -255,7 +276,7 @@ class Analyzer private (program: Program)
     val name = Type.mangled(f.name, targs)
 
     if !funcInsts.contains(name) then
-      val subst = f.tparams.zip(targs).toMap
+      val subst = withSelf(f.name, f.tparams.zip(targs).toMap)
       funcInsts(name) =
         (f.params.map(p => (p.name, resolveType(p.typ, subst))),
          f.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit))

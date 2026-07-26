@@ -142,6 +142,20 @@ class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "42\n"
   }
 
+  // `Self` inside a generic type's own body is the type applied to its parameters, which is not a
+  // type until an instantiation says what they are — so it is resolved alongside them rather than
+  // ahead of them, and means there exactly what it means in a concrete type's body.
+  "a member may write 'Self' for the type it belongs to" in {
+    val src =
+      """struct Box[T]
+        |    v: T
+        |    same(self) -> Self = self
+        |var b = Box(41)
+        |print(b.same().v)""".stripMargin
+
+    run(src) shouldBe "41\n"
+  }
+
   // A &self method on a generic type that hands out a &T field: the returned reference is retained
   // so it outlives the receiver dropped when extract returns. Over a long loop this must free each
   // boxed value exactly once — a leak grows RSS, a double-free crashes. total = sum of i%4 = 750000.

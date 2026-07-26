@@ -265,7 +265,9 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("both a variant and a member")
     }
 
-    "implementing a trait for a generic enum is rejected for now" in {
+    // A generic type has one key for all of its instantiations, so an implementation covers it as a
+    // whole and the block declares the parameters that says so.
+    "implementing a trait for a generic enum needs the block's own parameters" in {
       err(
         """trait Show
           |    show(self) -> int
@@ -273,7 +275,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |    Just(value: T)
           |impl Show for Maybe
           |    show(self) -> int = 1""".stripMargin
-      ) should include("generic type is not supported yet")
+      ) should include("write 'impl[T] Show for Maybe[T]'")
     }
 
     // A trait may be implemented for any type, so what is wrong with `impl Show for Ghost` is not
@@ -639,7 +641,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("generic traits are not supported yet")
     }
 
-    "implementing a trait for a generic struct is rejected for now" in {
+    "implementing a trait for a generic struct needs the block's own parameters" in {
       err(
         """trait Show
           |    show(self) -> int
@@ -647,7 +649,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |    v: T
           |impl Show for Box
           |    show(self) -> int = 1""".stripMargin
-      ) should include("generic type is not supported yet")
+      ) should include("write 'impl[T] Show for Box[T]'")
     }
 
     // A field and an impl method sharing a name collide the same way a field and an inherent
@@ -729,16 +731,6 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
 
     // A member of a generic type has no one meaning for `Self` — it would be `Box[T]`, which waits
     // for an instantiation — so it is left unbound rather than bound to something convenient.
-    "'Self' in a member of a generic type names nothing" in {
-      err(
-        """struct Box[T]
-          |    v: T
-          |    same(self) -> Self = self
-          |var b = Box(1)
-          |print(b.same().v)""".stripMargin
-      ) should include("only meaningful inside a 'trait' or an 'impl'")
-    }
-
     "a type may not be declared with the name 'Self'" in {
       err(
         """struct Self

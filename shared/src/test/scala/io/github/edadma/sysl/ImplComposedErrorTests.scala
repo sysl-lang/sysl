@@ -46,13 +46,15 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport {
       msg should include("has forgotten which type it holds")
     }
 
-    "an applied generic type is refused, naming the instantiation" in {
+    // An implementation for one instantiation is a second implementation for a key that holds one,
+    // which is why the fix is the block that covers the type as a whole.
+    "an applied generic type is refused, naming the block to write instead" in {
       err(
         s"""${show}struct Box[T]
            |    v: T
            |impl Show for Box[int]
            |    show(self) -> string = "b"""".stripMargin,
-      ) should include("generic type is not supported yet — 'Box[int]'")
+      ) should include("write 'impl[T] Show for Box[T]'")
     }
 
     "an element type that does not exist is an unknown type, not a bad impl" in {

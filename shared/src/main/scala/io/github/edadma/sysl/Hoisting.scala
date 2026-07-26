@@ -149,12 +149,13 @@ trait Hoisting extends TypeResolution {
     val (tparams, taken, noun) = nominal(tname).get
 
     // A member of a concrete type may write `Self` for the type it is a member of, exactly as an
-    // `impl`'s method may. A member of a *generic* one may not: `Self` there is `Box[T]`, whose
-    // meaning waits for an instantiation, and binding it to anything else would be a lie.
+    // `impl`'s method may. A member of a *generic* one has its `Self` bound one step later, at each
+    // instantiation, since `Box[T]` is not a type until `T` is one — `genericSelf` is where the
+    // reference waits for that.
     val self = if tparams.nonEmpty then Map.empty else concrete(tname).fold(Map.empty[String, Type])(selfBinding)
 
     hoistMemberList(
-      MemberHome(tname, tname, NamedType(tname, tparams.map(NamedType(_, Nil))), tparams, taken, noun, self),
+      MemberHome(tname, tname, NamedType(tname, tparams.map(NamedType(_, Nil))), tparams, Map.empty, taken, noun, self),
       members,
       out,
     )
@@ -168,16 +169,21 @@ trait Hoisting extends TypeResolution {
    *     differ only for a type that has no name of its own: `[]int` is a fine key and an impossible
    *     LLVM symbol, so its members are emitted under `slice.int`.
    *   - `selfRef` is the receiver's type as written, so a `self` parameter needs no reconstructing.
-   *   - `tparams` are the parameters a member's signature may mention, `taken` the names already
-   *     spoken for inside the body (a struct's fields, an enum's variants), and `noun` what a
-   *     diagnostic calls one of those.
-   *   - `self` is what `Self` means inside these members, empty where it means nothing.
+   *   - `tparams` are the parameters a member's signature may mention — a generic type's own, or a
+   *     generic `impl`'s, **in the order the implementing type applies them**, so that instantiating
+   *     a member from a receiver's type arguments substitutes them positionally. `bounds` is what
+   *     the block asks of them, which only an `impl` can say.
+   *   - `taken` are the names already spoken for inside the body (a struct's fields, an enum's
+   *     variants), and `noun` what a diagnostic calls one of those.
+   *   - `self` is what `Self` means inside these members, empty where the answer waits for an
+   *     instantiation (a generic type's members) or means nothing at all.
    */
   private case class MemberHome(
       key: String,
       symbol: String,
       selfRef: TypeRef,
       tparams: List[String],
+      bounds: Map[String, List[String]],
       taken: Set[String],
       noun: String,
       self: Map[String, Type],
@@ -201,13 +207,17 @@ trait Hoisting extends TypeResolution {
    * member is registered under (type, name) and synthesized to a `Type.member` function; a member
    * of a concrete type is type-checked eagerly, while a member of a generic type waits for a
    * concrete instantiation.
+   *
+   * The declarations come back so that a caller with something further to do with them — a generic
+   * `impl`, whose members are checked at their definition — needs no second walk to find them.
    */
   private def hoistMemberList(
       home: MemberHome,
       members: List[MethodDecl],
       out: mutable.ListBuffer[FuncDecl],
-  ): Unit = {
+  ): List[FuncDecl] = {
     val generic = home.tparams.nonEmpty
+    val lowered = mutable.ListBuffer.empty[FuncDecl]
 
     for m <- members do
       currentPos = m.pos.orElse(currentPos)
@@ -234,16 +244,23 @@ trait Hoisting extends TypeResolution {
       memberDecls((home.key, m.name)) = m
       val fd = synthesize(home, m)
 
+      lowered += fd
+
       if generic then
         if m.receiver.isEmpty && !m.isProperty then
           err(s"associated functions on generic types are not supported yet — '${home.key}.${m.name}'")
         genericMembers((home.key, m.name)) = fd
+        // `Self` here is the type applied to its own parameters, which is not a type yet. The
+        // reference is what waits, and every substitution that fixes the parameters fixes it too.
+        genericSelf(fd.name) = home.selfRef
       else
         out += fd
         if home.self.nonEmpty then memberSelf(fd.name) = home.self
         funcInsts(fd.name) =
           (fd.params.map(p => (p.name, resolveType(p.typ, home.self))),
            fd.retType.map(resolveReturn(_, home.self)).getOrElse(Type.Unit))
+
+    lowered.toList
   }
 
   /** Checks an `impl` conforms to its trait and lowers its methods to inherent members of the
@@ -254,7 +271,7 @@ trait Hoisting extends TypeResolution {
    */
   protected def hoistImpl(impl: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
     val tr         = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
-    val (ty, home) = implTarget(impl.forType)
+    val (ty, home) = implTarget(impl)
 
     // A built-in's memberships come from the compiler (`14 §5`), so an `impl` for one is not adding
     // a capability but competing with the one that is already there — and the operator would keep
@@ -263,53 +280,91 @@ trait Hoisting extends TypeResolution {
       err(s"'${home.key}' already implements '${impl.traitName}' — the compiler provides it")
 
     // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
-    // are the one implementation they are, and so are `[]int` and `[]i32`.
+    // are the one implementation they are, and so are `[]int` and `[]i32`. A generic type has one
+    // key for all of its instantiations, which is what makes an implementation cover the type as a
+    // whole and two of them for one generic type a collision rather than a choice.
     if traitImpls.contains((impl.traitName, home.key)) then
       err(s"'${home.key}' already implements '${impl.traitName}'")
     traitImpls((impl.traitName, home.key)) = impl
+
+    if home.tparams.nonEmpty && home.bounds.nonEmpty then
+      implBounds((impl.traitName, home.key)) = home.tparams.map(home.bounds.getOrElse(_, Nil))
 
     // A default the block left out is hoisted for this type exactly as a written method is, from the
     // body the trait supplied — so everything downstream (a call, a vtable slot, the escape summary)
     // finds an ordinary `Type.method` and needs to know nothing about where it came from. What is
     // recorded is where each copy came *from*, which is only ever read to keep one bad default from
     // being reported once per implementing type.
-    val inherited = checkConformance(tr, impl, home)
+    //
+    // Conformance is checked with the block's parameters standing in for themselves, which resolves
+    // a signature mentioning one — and `Self`, which for a generic `impl` is the type applied to
+    // them. Those instantiations are diagnostic only, so the walk is sandboxed the way `14 §4`'s is.
+    val inherited = sandboxed(checkConformance(tr, impl, home, signatures(home)))
 
     for m <- inherited do defaultOrigin(s"${home.symbol}.${m.name}") = s"${impl.traitName}.${m.name}"
 
-    hoistMemberList(home, impl.methods ::: inherited, out)
+    val lowered = hoistMemberList(home, impl.methods ::: inherited, out)
+
+    // The one thing a generic `impl` has that a generic *type* does not is bounds on its parameters,
+    // and that is exactly what makes its members checkable before anything instantiates them. An
+    // inherited default is left out: it was checked at the trait, against what the trait promises,
+    // which is the whole of what its body may assume wherever it is copied to.
+    if home.tparams.nonEmpty then abstractMembers ++= lowered.filterNot(f => defaultOrigin.contains(f.name))
   }
+
+  /** What a signature written inside these members resolves under.
+   *
+   * A concrete `impl` binds only `Self`, to the one type it is for. A generic one binds its own
+   * parameters to themselves — the opaque stand-in of `14 §4` — and `Self` to the type applied to
+   * them, so `-> Self` and `-> Box[T]` are the one signature conformance compares, exactly as
+   * `-> Self` and `-> Point` are on a concrete implementation.
+   */
+  private def signatures(home: MemberHome): Map[String, Type] =
+    if home.tparams.isEmpty then home.self
+    else
+      val abstracts: Map[String, Type] =
+        home.tparams.map(tp => tp -> Type.Abstract(tp, home.bounds.getOrElse(tp, Nil))).toMap
+
+      abstracts + (selfName -> resolveType(home.selfRef, abstracts))
 
   /** The type an `impl` is for, and where its members belong.
    *
    * A trait may be implemented for **any** type it makes sense to name: built-ins included — a
-   * language whose `Show` cannot cover `int` has a `Show` no library can use — and the composed
-   * types too, so `impl Display for []int` says how a slice of ints renders. A struct or an enum
-   * brings its own fields or variants for a member to collide with; nothing else has any.
+   * language whose `Show` cannot cover `int` has a `Show` no library can use — the composed types
+   * too, so `impl Display for []int` says how a slice of ints renders, and a **generic** struct or
+   * enum as a whole, which is what an `impl` with type parameters of its own is for. A struct or an
+   * enum brings its own fields or variants for a member to collide with; nothing else has any.
    *
-   * Three shapes are refused, each because an `impl` for it would be about nothing. A **memory
-   * mode** is a way of holding a type rather than a type, and a member call already sees through
-   * one. A **trait object** has forgotten which type it holds, which is the one thing an `impl` is
-   * written about. And a **generic** type is the case that waits on later work.
+   * Two shapes are refused outright, each because an `impl` for it would be about nothing. A
+   * **memory mode** is a way of holding a type rather than a type, and a member call already sees
+   * through one. A **trait object** has forgotten which type it holds, which is the one thing an
+   * `impl` is written about.
    */
-  private def implTarget(ref: TypeRef): (Type, MemberHome) = {
-    def home(ty: Type, key: String, taken: Set[String], noun: String) =
-      (ty, MemberHome(key, Type.mangle(ty), ref, Nil, taken, noun, selfBinding(ty)))
+  private def implTarget(impl: ImplDecl): (Type, MemberHome) = {
+    val ref = impl.forType
 
     ref match
-      // A bare name naming a struct or an enum is the one shape whose type arguments are absent
-      // rather than written, so a generic one is caught here rather than by an arity complaint. Its
-      // key is the name it was declared under, which stands even where the declaration itself
+      // A name declaring a struct or an enum is the one shape that may be generic, so it is settled
+      // here rather than by resolving a reference whose arguments are the block's own parameters.
+      // Its key is the name it was declared under, which stands even where the declaration itself
       // failed to resolve and there is no instantiation to read one off.
-      case NamedType(written, Nil) if nominal(written).isDefined =>
+      case NamedType(written, argRefs) if nominal(written).isDefined =>
         val (tparams, taken, noun) = nominal(written).get
 
-        if tparams.nonEmpty then
-          err(s"implementing a trait for a generic type is not supported yet — '$written'")
+        if tparams.isEmpty then
+          if impl.tparams.nonEmpty then
+            err(s"'$written' takes no type arguments, so an 'impl' for it has nothing to be generic over")
+          if argRefs.nonEmpty then err(s"type '$written' does not take type arguments")
 
-        val ty = concrete(written).getOrElse(Type.Unknown)
+          val ty = concrete(written).getOrElse(Type.Unknown)
 
-        (ty, MemberHome(written, written, ref, Nil, taken, noun, selfBinding(ty)))
+          (ty, MemberHome(written, written, ref, Nil, Map.empty, taken, noun, selfBinding(ty)))
+        else
+          val order = implArgs(impl, written, tparams)
+
+          // A generic type has no one instantiation to be, and nothing that reaches this needs one:
+          // an implementation covers every `Box` at once, and each member is made real per receiver.
+          (Type.Unknown, MemberHome(written, written, ref, order, impl.bounds, taken, noun, Map.empty))
 
       case NamedType(n, Nil) if n == selfName =>
         err("'Self' is the type an 'impl' is for, so it cannot also be the type it names")
@@ -317,6 +372,8 @@ trait Hoisting extends TypeResolution {
         err("'never' has no values, so nothing can be implemented for it")
 
       case _ =>
+        if impl.tparams.nonEmpty then notGeneric(ref)
+
         // Resolved rather than taken as written, so the key is the type's one canonical name and
         // two spellings of one type are one implementation.
         val ty = resolveType(ref, Map.empty)
@@ -327,13 +384,66 @@ trait Hoisting extends TypeResolution {
               "particular type behaves — so it is written for that type, not for an object over it")
           case Type.Ptr(inner)       => err(modeIsNotAType("*", inner))
           case Type.Ref(inner, sync) => err(modeIsNotAType(if sync then "&sync " else "&", inner))
-          case n: Type.Named if n.targs.nonEmpty =>
-            err(s"implementing a trait for a generic type is not supported yet — '${n.name}'")
           case Type.Unit   => err("'unit' has one value and no behaviour — a trait for it would say nothing")
           case Type.VaList => err("a va_list is an ABI primitive, not something to implement a trait for")
           case _           =>
 
-        home(ty, ownerKey(ty), Set.empty, "field")
+        (ty, MemberHome(ownerKey(ty), Type.mangle(ty), ref, Nil, Map.empty, Set.empty, "field", selfBinding(ty)))
+  }
+
+  /** Why a block declaring type parameters has nothing to apply them to.
+   *
+   * A **name** is resolved on its own first, so that a type that does not exist, or a trait, is
+   * reported as itself rather than through a complaint about the parameters — which would send the
+   * reader looking at the one part of the line that is written correctly. Everything else is a
+   * composed type, whose members are filed under the whole type (`[]int`, not `[]`), so matching one
+   * by its shape is a key it does not have rather than the same feature one step over.
+   */
+  private def notGeneric(ref: TypeRef): Nothing = ref match
+    case NamedType(n, _) =>
+      resolveType(NamedType(n, Nil), Map.empty)
+      err(s"'$n' takes no type arguments, so an 'impl' for it has nothing to be generic over")
+    case _ =>
+      err(s"an 'impl' takes type parameters for a generic struct or enum, whose name is what its " +
+        s"members are filed under — matching '${ref.show}' by its shape is not supported yet")
+
+  /** The block's type parameters **in the order the implementing type applies them**, which is what
+   * lets a member be instantiated from a receiver's own type arguments by position.
+   *
+   * An `impl` covers a generic type as a whole, so its subject must be that type applied to the
+   * block's parameters and nothing else: each argument one parameter, each parameter used once, all
+   * of them spoken for. Anything narrower — `Box[int]`, `Pair[T, int]` — is an implementation for
+   * *some* instantiations, which is a second implementation for a key that holds one.
+   */
+  private def implArgs(impl: ImplDecl, written: String, tparams: List[String]): List[String] = {
+    val declared = impl.tparams.toSet
+    val args     = impl.forType match
+      case NamedType(_, as) => as
+      case _                => Nil
+    val spelled = s"impl[${tparams.mkString(", ")}] ${impl.traitName} for $written[${tparams.mkString(", ")}]"
+
+    if impl.tparams.isEmpty then
+      err(s"'$written' is generic, so an 'impl' for it covers every instantiation at once — " +
+        s"write '$spelled'")
+    if args.length != tparams.length then
+      err(s"'$written' takes ${quantity(tparams.length, "type argument")}, but " +
+        s"${supplied(args.length, "type argument")}")
+
+    val names = args.map {
+      case NamedType(n, Nil) if declared(n) => n
+      case other =>
+        err(s"'${other.show}' fixes an argument of '$written' to one type, and an 'impl' covers " +
+          s"the whole of a generic type — write one of the block's own parameters here")
+    }
+
+    if names.distinct.length != names.length then
+      err(s"each argument of '$written' takes a type parameter of its own, and this 'impl' " +
+        s"names '${names.diff(names.distinct).head}' twice")
+    if declared != names.toSet then
+      err(s"'${(declared -- names).mkString("', '")}' is declared by this 'impl' but does not " +
+        s"appear in '${impl.forType.show}', so nothing would ever fix it")
+
+    names
   }
 
   private def modeIsNotAType(sigil: String, inner: Type): String =
@@ -348,13 +458,18 @@ trait Hoisting extends TypeResolution {
    * not declare at all, or a mismatched kind, receiver, parameter, or result is reported against the
    * trait it fails to satisfy.
    */
-  private def checkConformance(tr: TraitDecl, impl: ImplDecl, home: MemberHome): List[MethodDecl] = {
+  private def checkConformance(
+      tr: TraitDecl,
+      impl: ImplDecl,
+      home: MemberHome,
+      sig: Map[String, Type],
+  ): List[MethodDecl] = {
     val declared  = tr.methods.map(_.name).toSet
     val inherited = mutable.ListBuffer.empty[MethodDecl]
 
     for tm <- tr.methods do
       impl.methods.find(_.name == tm.name) match
-        case Some(im) => checkSignature(home.key, impl.traitName, tm, im, home.self)
+        case Some(im) => checkSignature(home.key, impl.traitName, tm, im, sig)
         case None if tm.body.nonEmpty => inherited += tm
         case None =>
           err(s"'${home.key}' does not implement '${impl.traitName}': ${kind(tm)} '${tm.name}' is missing")
@@ -430,7 +545,8 @@ trait Hoisting extends TypeResolution {
       receiverParam(m, home.selfRef).toList ::: m.params,
       m.retType,
       m.body,
-    )
+      home.bounds,
+    ).setPos(m.pos)
 
   /** The `self` parameter a member's receiver becomes, at the self type it is a member of. A
    * property's receiver is an implicit by-value read; an associated function has none.

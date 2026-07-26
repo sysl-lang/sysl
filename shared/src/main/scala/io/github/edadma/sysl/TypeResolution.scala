@@ -43,6 +43,18 @@ trait TypeResolution extends AnalyzerBase {
   /** The substitution that gives `Self` its meaning, for the one type it currently stands for. */
   protected def selfBinding(t: Type): Map[String, Type] = Map(selfName -> t)
 
+  /** `subst`, extended with whatever `Self` means inside `fname` — which is a question only a
+   * member of a *generic* type leaves open.
+   *
+   * A concrete type's members had their `Self` resolved at hoist. A generic type's could not be:
+   * `Box[T]` is not a type until `T` is one, so what was kept is the reference, and resolving it
+   * under the very substitution that fixed the parameters is what fixes `Self` alongside them.
+   * Both places that build such a substitution — an instantiation and the definition-time pass —
+   * come through here, so `Self` means the same thing in a checked body and in a run one.
+   */
+  protected def withSelf(fname: String, subst: Map[String, Type]): Map[String, Type] =
+    genericSelf.get(fname).fold(subst)(ref => subst + (selfName -> resolveType(ref, subst)))
+
   /** Resolves a **result** type, which is the one position `never` may appear in — a function's,
    * a member's, or an `extern`'s declared result, saying that it does not return. Everywhere else
    * a type is resolved through `resolveType`, which rejects it.
