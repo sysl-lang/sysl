@@ -81,7 +81,7 @@ pub_by_default() -> int = 42            // exported
 
 private lookup(fd: int) -> &File = …    // this file only
 
-private[arch] scratch: [u8; 64] = …     // every file of oskit.arch
+private[arch] reset(c: *Cpu) -> unit = …  // every file of oskit.arch
 
 private[oskit] struct FrameHeader …     // anywhere under oskit.*
 ```
@@ -107,6 +107,36 @@ The cost is honest and worth naming: the everyday module-internal helper is now 
 rather than a bare `private`, so the common case is the wordier one. The alternative — a second
 keyword whose only job is the module level — spends a keyword to save a bracket, and leaves the
 file level either unspellable or spelled by something even less obvious.
+
+### Anything visible outside its file states its types
+
+**A declaration visible beyond the file that declares it carries explicit types.** Inference is
+available only at the bare-`private` level — the one level that provably never crosses a file
+boundary (above), which is why the two rules are really one.
+
+Most of this the existing syntax already enforces, and nothing changes:
+
+- **Parameter and field types are mandatory** — a function parameter and a struct field are the
+  same `name: type` binding, and neither may omit the type (`12` §1, `08`).
+- **A return type is written, or its absence *means* `unit`** (`12` §1). That is a default, not an
+  inference: the signature is complete as written either way, and a reader never has to consult a
+  body to learn what a function returns.
+
+So the rule binds in exactly one place today — a **top-level `var`**, whose annotation is optional
+and whose type otherwise comes from its initializer. Such a declaration must be annotated unless it
+is file-`private`:
+
+```
+var counter: int = 0             // visible past this file: annotated
+private var scratch = 0          // file-private: inferred, as a local is
+```
+
+**Why: it makes interface extraction parse-only.** A file's exported surface can then be read off
+its syntax tree — without resolving a name, checking a body, or having compiled anything the file
+imports. That is what lets the collect pass of §1 depend on nothing but parsing, and it is the
+property that a fast, parallel, and eventually incremental build rests on. Scala infers types for
+public members and pays for it with a far heavier extraction step; this is a deliberate divergence,
+and it is cheap here precisely because sysl's signatures were already explicit for other reasons.
 
 **Why public-default and not export-on-`pub`.** Rust makes a declaration private until `pub`;
 Scala and Kotlin make it public until restricted, and that is the precedent chosen here. The
