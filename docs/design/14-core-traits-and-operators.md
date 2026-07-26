@@ -4,9 +4,8 @@
 dispatch rule, definition-checked bounds on both method calls and operators, and the
 compiler-provided scalar memberships. What remains is **§6**, which needs `Display`, which needs the
 `Writer` sink of `§8 d` — and that in turn needs trait objects, which chapter `02` specifies and
-nothing has built. Two lowerings are also refused for now: see `codegen.md` shortcut 11. This is the
-concrete spec for three things the earlier chapters *decided* but left unbuilt, because all three
-turn on the same missing layer:
+nothing has built. This is the concrete spec for three things the earlier chapters *decided* but
+left unbuilt, because all three turn on the same missing layer:
 
 - **`00 §9` / `01` / `08 §"Interaction with traits"`** — operators are trait methods (`+` is
   `Add`, `<` is `Ord`, `==` is `Eq`), overloaded by `impl Trait for Type`. The *token set* is
@@ -118,11 +117,11 @@ compiler:
 - `a <= b` is `!(b < a)` — `!lt(b, a)`.
 - `a >= b` is `!(a < b)` — `!lt(a, b)`.
 
-Two of the six **swap their operands** — `a > b` is `lt(b, a)`, and `a <= b` is `!lt(b, a)` — so on
-a type whose `lt` is a real call, those two evaluate the right-hand expression first. It is
-invisible on a scalar, which never goes through the derivation, and invisible on operands with no
-side effects, which is nearly all of them. Making it invisible everywhere would mean binding both
-operands to temporaries before the call; whether that is worth doing is `§8 e`.
+Two of the six **swap their operands** — `a > b` is `lt(b, a)`, and `a <= b` is `!lt(b, a)` — and
+the swap is of the two *values*, applied at the call, not of the expressions that produced them.
+`a > b` therefore evaluates `a` first and then `b`, exactly as a scalar comparison does, and the
+derivation is invisible in evaluation order as well as in the answer. That falls out of dispatching
+on values rather than rebuilding the comparison as a call over operand trees (`§3`).
 
 **These derivations govern a type that implements the trait in source. The scalars do not go
 through them.** §5's compiler-provided impls supply all six comparisons directly, at the IEEE
@@ -195,6 +194,26 @@ type-checks iff the type of `a` (which must equal the type of `b`) satisfies `Op
 
 The comparison and rendering builtins fold in the same way: `==` needs `Eq`, `<` needs `Ord`,
 `print`/`str` need `Display`, whether the operand is a scalar, a user type, or a bounded `T`.
+
+### The dispatch travels as a name, not as a call
+
+In most positions "lowers to the member function" can be taken literally: the analyzer replaces the
+operator node with the call. Two positions cannot, and they are the reason the rule is stated as
+*which method*, rather than as a rewrite.
+
+A **comparison chain** compares each middle operand against both its neighbours, and evaluates it
+**once** — that is what `01` promises, and a chain that evaluated the middle twice would be a
+different language for anything with a side effect. A **compound assignment** updates the place it
+just read. In both, one value is used twice, and codegen already holds it in a register.
+
+So a trait-supplied operator in those positions carries the **name of the method** on the node the
+operator already lowers to, and codegen applies it to the values it is holding. A call rebuilt over
+the operand's own expression would evaluate that operand a second time; naming the method instead
+costs nothing and keeps every guarantee the scalar lowering makes — single evaluation, left-to-right
+order, and short-circuit at the first comparison that fails — true of a user type as well.
+
+The same carrier holds the two derivations of `§2`, which is why `a > b` calls `lt` with the values
+exchanged while still evaluating `a` before `b`.
 
 ## 4. Definition-checked bounds
 
@@ -373,10 +392,10 @@ prints once it has `impl Display`, which is the capability `08`/`tast.scala` wer
     which allocates — exactly what the sink signature exists to avoid. Passing the spec as a second
     parameter, rather than conflating it into the sink object, gets Rust's capability without its
     packaging.
-- **e. Sharing an operand across a trait-dispatched operator.** A chained comparison and a compound
-  assignment both use one operand twice — the chain compares each middle value against both
-  neighbours, `a += b` updates the place it read — and the scalar lowering keeps that value in a
-  register. A trait call has nowhere to hold it, so both are refused on a trait-dispatched type
-  today. The same machinery would fix the evaluation-order swap in `>` and `<=` (§2): a synthesized
-  temporary binding in the analyzer, which is a small piece of work whose only cost is deciding
-  where the bindings live in the tree.
+- **e. ~~Sharing an operand across a trait-dispatched operator.~~ Settled — see `§3`.** A chained
+  comparison and a compound assignment each use one operand twice from a single evaluation, and both
+  now work on a trait-dispatched type. What settled it was noticing that codegen already holds the
+  shared operand in a register for the scalar lowering, so what a dispatched operator needs from the
+  analyzer is a **method to apply to that value** rather than a call tree over the operand's own
+  expression. No synthesized bindings, and no new evaluation-order question — the answer to the one
+  §2 used to have is that there is nothing to reorder.

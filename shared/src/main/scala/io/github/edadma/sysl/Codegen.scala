@@ -115,6 +115,32 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
       case Some(fnTy) => s"$fnTy @$symbol"
       case None       => s"${if Type.noValue(ty) then "void" else ty.llvm} @$symbol"
 
+  /** One comparison, over two values the caller is holding: an instruction where the operand type
+   * has one, the method its `Eq`/`Ord` supplies otherwise.
+   */
+  private def comparison(c: TCmp, ty: Type, av: String, bv: String): String =
+    c.dispatch match
+      case Some(d) => dispatchValue(d, ty, av, bv, Type.Bool)
+      case None    => compareValue(c.op, ty, av, bv)
+
+  /** Applies an operator's trait method to two **values** rather than two expressions (`14 §3`).
+   *
+   * That is the whole distinction from lowering a `TCall`: the forms that reach here — a comparison
+   * chain and a compound assignment — each use one operand twice from a single evaluation, and the
+   * value is already in a register. `swap` and `negate` carry the derivation of the comparisons the
+   * catalog declares no method for (`14 §2`), so `a > b` calls the one `lt` its `impl` wrote.
+   */
+  private def dispatchValue(d: TDispatch, ty: Type, av: String, bv: String, resultTy: Type): String = {
+    val (l, r) = if d.swap then (bv, av) else (av, bv)
+    val res    = freshTemp()
+
+    emit(s"$res = call ${calleeOf(d.name, resultTy)}(${ty.llvm} $l, ${ty.llvm} $r)")
+
+    if !d.negate then res
+    else
+      val n = freshTemp(); emit(s"$n = xor i1 $res, true"); n
+  }
+
   private def genMain(stmts: List[TStmt]): String = {
     startFunction()
     pushTemps()
@@ -316,23 +342,24 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
       else emit(s"store ${ty.llvm} $v, ptr $p")
       v
 
-    case TUpdate(place, op, value, ty) =>
+    case TUpdate(place, op, value, ty, dispatch) =>
       val p       = address(place)
       val cur     = freshTemp(); emit(s"$cur = load ${ty.llvm}, ptr $p")
       val v       = genExpr(value)
-      // A string slot holds a count, so `s += t` retains the fresh join for the slot and releases
-      // what was there before, exactly like a plain assignment; every other type just overwrites.
-      ty match
-        case Type.Str =>
-          val updated = ownTemp(strConcat(cur, v), Type.Str)
-          retainValue(ty, updated)
-          emit(s"store ${ty.llvm} $updated, ptr $p")
-          releaseValue(ty, cur)
-          updated
-        case _ =>
-          val updated = arith(op.dropRight(1), ty, cur, v)
-          emit(s"store ${ty.llvm} $updated, ptr $p")
-          updated
+      // A slot that holds a count — a string, or a struct with a reference in it — retains the fresh
+      // value for the slot and releases what was there before, exactly like a plain assignment; a
+      // slot of anything else just overwrites.
+      val updated = (ty, dispatch) match
+        case (_, Some(d))  => ownTemp(dispatchValue(d, ty, cur, v, ty), ty)
+        case (Type.Str, _) => ownTemp(strConcat(cur, v), Type.Str)
+        case _             => arith(op.dropRight(1), ty, cur, v)
+
+      if containsRef(ty) then
+        retainValue(ty, updated)
+        emit(s"store ${ty.llvm} $updated, ptr $p")
+        releaseValue(ty, cur)
+      else emit(s"store ${ty.llvm} $updated, ptr $p")
+      updated
 
     case TIncDec(place, op, pre, ty) =>
       val w   = ty.llvm
@@ -392,9 +419,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
 
     // One comparison has nothing to short-circuit, so it stays straight-line — which is what the
     // overwhelming majority of comparisons are.
-    case TCompare(List(l, r), List(op)) =>
+    case TCompare(List(l, r), List(c)) =>
       val lv = genExpr(l)
-      compareValue(op, l.ty, lv, genExpr(r))
+      comparison(c, l.ty, lv, genExpr(r))
 
     // A **chain** short-circuits: `a < b < c` stops at the first comparison that fails, so a
     // side-effecting later operand does not run. That is what `01` specifies, and what writing the
@@ -411,22 +438,22 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
     // **unwind them in reverse** — a path that leaves the chain early passes through exactly the
     // pops for the regions it entered, and no others. Where nothing is owned, which is the usual
     // case, every pop is empty and the ladder is branches alone.
-    case TCompare(operands, ops) =>
+    case TCompare(operands, cmps) =>
       val slot  = emitAlloca(freshTemp(), "i1")
-      val exits = ops.indices.map(_ => freshLabel("cmp.exit")).toList
+      val exits = cmps.indices.map(_ => freshLabel("cmp.exit")).toList
       val endL  = freshLabel("cmp.end")
 
       var left = ""
 
-      for k <- ops.indices do
+      for k <- cmps.indices do
         pushTemps()
         if k == 0 then left = genExpr(operands.head)
         val right = genExpr(operands(k + 1))
-        val c     = compareValue(ops(k), operands(k).ty, left, right)
+        val c     = comparison(cmps(k), operands(k).ty, left, right)
 
         emit(s"store i1 $c, ptr $slot")
 
-        if k == ops.length - 1 then emitTerm(s"br label %${exits(k)}")
+        if k == cmps.length - 1 then emitTerm(s"br label %${exits(k)}")
         else
           val nextL = freshLabel("cmp.next")
           emitTerm(s"br i1 $c, label %$nextL, label %${exits(k)}")
@@ -434,7 +461,7 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter {
 
         left = right
 
-      for k <- ops.indices.reverse do
+      for k <- cmps.indices.reverse do
         emitLabel(exits(k))
         popTemps()
         emitTerm(s"br label %${if k == 0 then endL else exits(k - 1)}")

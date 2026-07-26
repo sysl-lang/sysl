@@ -267,13 +267,6 @@ arity.
     bound the author could write to fix it, so the abstract pass drops that complaint and
     monomorphization catches it at each instantiation, exactly as it always did.
 
-    Two lowerings are refused rather than approximated, both for the same reason — they share an
-    operand between two uses, which the scalar lowering does with a register and a trait call has
-    nowhere to hold. A **chained comparison** (`a < b < c`) compares each middle operand against both
-    neighbours from one evaluation; **compound assignment** (`a += b`) updates the place it read.
-    Both are diagnostics on a trait-dispatched type and both are lifted by the same future work: a
-    synthesized temporary binding in the analyzer.
-
     **An unbounded parameter stays perfectly legal** — this is not heading for a language where
     every `[T]` needs a bound. An unbounded `T` supports what every type supports: being passed,
     stored, returned, copied, released. `id[T](x: T) -> T`, `Pair[A, B]`, `pick[T](c, a, b)` need no

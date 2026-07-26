@@ -11,6 +11,23 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class CoreTraitRunTests extends AnyFreeSpec with RunSupport {
 
+  /** A user type with the three memberships an operand-sharing form needs, plus a way of building
+   * one that says when it is evaluated.
+   */
+  private val tagged =
+    """struct M
+      |    v: int
+      |impl Ord for M
+      |    lt(self, rhs: Self) -> bool = self.v < rhs.v
+      |impl Eq for M
+      |    eq(self, rhs: Self) -> bool = self.v == rhs.v
+      |impl Add for M
+      |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+      |tag(v: int) -> M
+      |    print(v)
+      |    M(v)
+      |""".stripMargin
+
   "Self" - {
     "a trait signature written with 'Self' is the implementing type" in {
       val src =
@@ -303,6 +320,140 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport {
           |print(p.add(2))""".stripMargin
 
       run(src) shouldBe "42\n"
+    }
+  }
+
+  /** A comparison chain and a compound assignment each use one operand **twice from a single
+   * evaluation**, so what they need from a trait-supplied operator is a method to apply to a value
+   * already in hand rather than a call built over the operand's expression. These pin that: an
+   * operand that announces itself must announce itself exactly once.
+   */
+  "an operand-sharing form evaluates each operand once" - {
+
+    "a chain of user types compares each neighbouring pair" in {
+      val src =
+        """struct M
+          |    v: int
+          |impl Ord for M
+          |    lt(self, rhs: Self) -> bool = self.v < rhs.v
+          |var a = M(1)
+          |var b = M(2)
+          |var c = M(3)
+          |print(a < b < c, a < c < b, c < b < a)""".stripMargin
+
+      run(src) shouldBe "true false false\n"
+    }
+
+    // The middle operand is compared against both its neighbours, and announces itself once.
+    "the middle operand of a dispatched chain is evaluated once" in {
+      val out = run(tagged + "print(tag(1) < tag(2) < tag(3))")
+
+      out shouldBe "1\n2\n3\ntrue\n"
+    }
+
+    // Left to right, and no further: the chain stops at the comparison that failed, so the third
+    // operand is never reached — the same short-circuit `01` specifies for a chain of scalars.
+    "a dispatched chain short-circuits at the first failure" in {
+      val out = run(tagged + "print(tag(2) < tag(1) < tag(3))")
+
+      out shouldBe "2\n1\nfalse\n"
+    }
+
+    // `>` derives as `lt(b, a)`, which swaps the *values* at the call and not the expressions that
+    // produced them — so the left operand is still evaluated first, as it is for a scalar.
+    "a derived operator does not reorder evaluation" in {
+      val out = run(tagged + "print(tag(1) > tag(2))")
+
+      out shouldBe "1\n2\nfalse\n"
+    }
+
+    // Two middle operands, each shared by the pair of comparisons around it, and the links are not
+    // all the same operator — `<=` is derived and `<` is not, so a chain has to carry the two
+    // derivations independently.
+    "a longer chain shares every middle operand" in {
+      val out = run(tagged + "print(tag(1) < tag(2) <= tag(2) < tag(3))")
+
+      out shouldBe "1\n2\n2\n3\ntrue\n"
+    }
+
+    "compound assignment on a user type updates through its 'Add'" in {
+      val src =
+        """struct M
+          |    v: int
+          |impl Add for M
+          |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+          |var a = M(1)
+          |a += M(2)
+          |a += M(39)
+          |print(a.v)""".stripMargin
+
+      run(src) shouldBe "42\n"
+    }
+
+    // The place is read once and written once, whatever the expression naming it costs to evaluate.
+    "compound assignment reads its place once" in {
+      val src =
+        """struct M
+          |    v: int
+          |impl Add for M
+          |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+          |var a = [M(1), M(10)]
+          |at(i: int) -> int
+          |    print(i)
+          |    i
+          |a[at(1)] += M(32)
+          |print(a[0].v, a[1].v)""".stripMargin
+
+      run(src) shouldBe "1\n1 42\n"
+    }
+
+    // The whole point of definition-checked bounds: one body, and the chain in it works for every
+    // type the bound admits — a scalar's instruction and a user type's method alike.
+    "a chain inside a bounded generic serves both a scalar and a user type" in {
+      val src =
+        """between[T: Ord](lo: T, x: T, hi: T) -> bool = lo < x < hi
+          |struct M
+          |    v: int
+          |impl Ord for M
+          |    lt(self, rhs: Self) -> bool = self.v < rhs.v
+          |print(between(1, 5, 9), between(5, 1, 9))
+          |print(between(M(1), M(5), M(9)), between(M(5), M(1), M(9)))""".stripMargin
+
+      run(src) shouldBe "true false\ntrue false\n"
+    }
+
+    "a compound assignment inside a bounded generic serves both" in {
+      val src =
+        """total[T: Add](a: T, b: T, c: T) -> T
+          |    var acc = a
+          |    acc += b
+          |    acc += c
+          |    acc
+          |struct M
+          |    v: int
+          |impl Add for M
+          |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+          |print(total(1, 2, 3))
+          |print(total(M(10), M(20), M(12)).v)""".stripMargin
+
+      run(src) shouldBe "6\n42\n"
+    }
+
+    // A chain whose operands own heap storage: each is released once, by the region the codegen
+    // ladder opened for it, however early the chain exits.
+    "a dispatched chain over reference-carrying operands neither leaks nor frees twice" in {
+      val src =
+        """struct Tag
+          |    name: string
+          |impl Ord for Tag
+          |    lt(self, rhs: Self) -> bool = self.name < rhs.name
+          |var n = 0
+          |while n < 1000
+          |    var a = Tag(str(n))
+          |    if Tag("a") < a < Tag("z") then n += 1 else n += 1
+          |print(n)""".stripMargin
+
+      run(src) shouldBe "1000\n"
     }
   }
 }

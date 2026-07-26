@@ -257,7 +257,7 @@ private class Escape(program: TProgram) {
     case TDeref(v, _)               => List(v)
     case TAddrOf(v, _)              => List(v)
     case TStore(p, v, _)            => List(p, v)
-    case TUpdate(p, _, v, _)        => List(p, v)
+    case TUpdate(p, _, v, _, _)     => List(p, v)
     case TIncDec(p, _, _, _)        => List(p)
     case TBinary(_, l, r, _)        => List(l, r)
     case TUnary(_, v, _)            => List(v)

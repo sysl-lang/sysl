@@ -86,8 +86,11 @@ case class TAddrOf(place: TExpr, ty: Type) extends TExpr
  */
 case class TStore(place: TExpr, value: TExpr, ty: Type) extends TExpr
 
-/** A compound assignment `place op= value`, yielding the updated value. */
-case class TUpdate(place: TExpr, op: String, value: TExpr, ty: Type) extends TExpr
+/** A compound assignment `place op= value`, yielding the updated value. `dispatch` is present when
+ * the operator is a trait method rather than an instruction (`14 §3`).
+ */
+case class TUpdate(place: TExpr, op: String, value: TExpr, ty: Type, dispatch: Option[TDispatch] = None)
+    extends TExpr
 
 /** `++`/`--`, prefix (new value) or postfix (old value). */
 case class TIncDec(place: TExpr, op: String, pre: Boolean, ty: Type) extends TExpr
@@ -98,8 +101,25 @@ case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExp
 /** `&&` / `||` — short-circuit, always boolean. */
 case class TLogical(op: String, left: TExpr, right: TExpr) extends TExpr { def ty: Type = Type.Bool }
 
+/** An operator that a trait supplies rather than the machine (`14 §3`): the function it lowers to,
+ * whether the derivation swaps its operands, and whether it negates the result (`14 §2`).
+ *
+ * It rides on the node the operator already lowers to instead of replacing that node with a `TCall`,
+ * and the reason is the two forms that use one operand **twice from a single evaluation** — a
+ * comparison chain, which compares each middle operand against both its neighbours, and a compound
+ * assignment, which updates the place it read. Codegen holds that operand in a register for the
+ * scalar lowering; naming the method here lets the call read the same register, where a call built
+ * over the operand's own tree would evaluate it a second time.
+ */
+case class TDispatch(name: String, swap: Boolean = false, negate: Boolean = false)
+
+/** One comparison in a chain: the operator, and the method that performs it when the operand type
+ * reaches `Eq`/`Ord` through a trait instead of an instruction.
+ */
+case class TCmp(op: String, dispatch: Option[TDispatch] = None)
+
 /** A comparison chain `a < b < c`, ANDing the pairwise results. */
-case class TCompare(operands: List[TExpr], ops: List[String]) extends TExpr { def ty: Type = Type.Bool }
+case class TCompare(operands: List[TExpr], cmps: List[TCmp]) extends TExpr { def ty: Type = Type.Bool }
 
 /** Several expressions evaluated in order for their effects, yielding nothing. `print(a, b, c)`
  * desugars to one of these — a call per value, with the separators between — which is what lets the

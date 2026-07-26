@@ -829,28 +829,26 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       err("same[T](a: T, b: T) -> bool = a == b") should include("'==' needs 'T: Eq'")
     }
 
-    // A chain compares each middle operand against both neighbours from one evaluation, which a
-    // trait call has nowhere to hold; refused rather than quietly evaluating the operand twice.
-    "a chained comparison of a user type is refused" in {
+    "a chained comparison still needs its operands to agree" in {
       err(
         """struct M
           |    v: int
           |impl Ord for M
           |    lt(self, rhs: Self) -> bool = self.v < rhs.v
           |var a = M(1)
-          |print(a < a < a)""".stripMargin
-      ) should include("cannot share an operand")
+          |print(a < a < 3)""".stripMargin
+      ) should include("'<' needs matching types, got M and int")
     }
 
-    "compound assignment on a user type is refused" in {
+    "compound assignment still needs the right operand to agree" in {
       err(
         """struct M
           |    v: int
           |impl Add for M
           |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
           |var a = M(1)
-          |a += M(2)""".stripMargin
-      ) should include("cannot share an operand")
+          |a += 2""".stripMargin
+      ) should include("'+' needs matching types, got M and int")
     }
 
     "an operator on a user type with no impl is not defined" in {

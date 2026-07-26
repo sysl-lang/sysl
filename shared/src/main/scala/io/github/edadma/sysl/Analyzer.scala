@@ -212,18 +212,21 @@ class Analyzer private (program: Program)
     TFunc(name, tparams, rtype, tbody, f.variadic)
   }
 
-  /** A comparison the machine performs directly: the operands must agree, and the type must have
-   * the comparison being asked of it — equality reaches further than ordering (`01`).
+  /** A comparison chain, checked link by link. A link the machine performs directly needs its
+   * operands to agree and the type to have the comparison being asked of it — equality reaches
+   * further than ordering (`01`); a link a trait supplies had both checked against the trait's own
+   * signature when `compareLink` resolved it.
    */
-  private def scalarCompare(ts: List[TExpr], ops: List[String]): TExpr = {
-    for i <- ops.indices do
+  private def compareChain(ts: List[TExpr], cmps: List[TCmp]): TExpr = {
+    for i <- cmps.indices if cmps(i).dispatch.isEmpty do
+      val op       = cmps(i).op
       val (a, b)   = (ts(i), ts(i + 1))
-      val equality = ops(i) == "==" || ops(i) == "!="
+      val equality = op == "==" || op == "!="
       if a.ty != b.ty then err(s"cannot compare ${show(a.ty)} with ${show(b.ty)}")
       if !(if equality then Type.isEquatable(a.ty) else Type.isOrdered(a.ty)) then
-        err(s"'${ops(i)}' is not defined for ${show(a.ty)}")
+        err(s"'$op' is not defined for ${show(a.ty)}")
 
-    TCompare(ts, ops)
+    TCompare(ts, cmps)
   }
 
   /** Registers an instantiation of a generic function and returns the name codegen will emit.
@@ -369,18 +372,14 @@ class Analyzer private (program: Program)
     case PreIncDec(op, target)  => incDec(op, target, pre = true)
     case PostIncDec(op, target) => incDec(op, target, pre = false)
 
-    // One comparison of a type whose `Eq` or `Ord` is a real implementation is that method's call,
-    // derived where the trait declares no method of its own (`14 §2`). A chain cannot be: it shares
-    // each middle operand between two comparisons, which the scalar lowering does with a register.
-    case Compare(List(l, r), List(op)) =>
-      val ts = analyzeOperands(List(l, r), None)
-      operatorCall(op, ts.head, ts(1)).getOrElse(scalarCompare(ts, List(op)))
-
+    // Each link of the chain is resolved on its own — an instruction where the operand type has
+    // one, the method its `Eq`/`Ord` supplies otherwise (`14 §2`) — so a chain of user types reads
+    // and behaves exactly as a chain of scalars does, sharing each middle operand between the two
+    // comparisons that use it.
     case Compare(operands, ops) =>
       val ts = analyzeOperands(operands, None)
-      for i <- ops.indices do
-        noSharedOperand(ops(i), ts(i).ty, s"'a ${ops(i)} b' on its own, joined with '&&'")
-      scalarCompare(ts, ops)
+
+      compareChain(ts, ops.indices.map(i => compareLink(ops(i), ts(i), ts(i + 1))).toList)
 
     case Assign("=", target, value) =>
       val place = analyzePlace(target, "assignment")
@@ -389,14 +388,19 @@ class Analyzer private (program: Program)
         err(s"cannot assign ${show(tv.ty)} to ${describe(target)} of type ${show(place.ty)}")
       TStore(place, tv, place.ty)
 
+    // `p += q` on a type whose `Add` is a real implementation updates the place from the value it
+    // already read, exactly as the scalar form does — the dispatch travels with the node rather
+    // than becoming a call tree that would read the place twice.
     case Assign(op, target, value) =>
       val place  = analyzePlace(target, s"'$op'")
       val binSym = op.dropRight(1)
       val tv     = analyzeExpr(value, Some(place.ty))
-      noSharedOperand(binSym, place.ty, s"'a = a $binSym b'")
-      if arithType(binSym, place.ty, tv.ty) != place.ty then
+      val d      = updateDispatch(binSym, place, tv)
+
+      if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then
         err(s"'$op' would change the type of ${describe(target)}")
-      TUpdate(place, op, tv, place.ty)
+
+      TUpdate(place, op, tv, place.ty, d)
 
     // The forms the compiler resolves by name rather than by looking a function up: `print` and
     // its two rendering companions, which are temporary and leave once a `Display` trait can carry

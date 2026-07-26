@@ -176,7 +176,7 @@ trait CallAnalysis extends Literals {
 
       kind match
         case CoreTraits.Kind.Arith   => TBinary(op, self, ts.head, arithType(op, self.ty, ts.head.ty))
-        case CoreTraits.Kind.Compare => TCompare(List(self, ts.head), List(op))
+        case CoreTraits.Kind.Compare => TCompare(List(self, ts.head), List(TCmp(op)))
         case CoreTraits.Kind.Prefix  => TUnary(op, self, self.ty)
     }
 
@@ -249,54 +249,87 @@ trait CallAnalysis extends Literals {
     CoreTraits.prefix.get(op).flatMap(trName => traitOperator(trName, op, None, t))
 
   private def traitOperator(trName: String, op: String, rhs: Option[TExpr], recv: TExpr): Option[TExpr] =
-    if CoreTraits.builtin(trName, recv.ty) then None
+    dispatchFor(trName, op, recv.ty).map { d =>
+      val self = selfBinding(recv.ty)
+      val m    = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
+
+      for b <- rhs do checkOperand(op, recv.ty, b, resolveType(m.params.head.typ, self))
+
+      val rty  = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
+      val args = rhs.toList
+      val call = TCall(d.name, if d.swap then args :+ recv else recv :: args, rty)
+
+      if d.negate then TUnary("!", call, Type.Bool) else call
+    }
+
+  /** Which method an operator on `ty` dispatches to, or `None` when the machine has an instruction
+   * for it — the one dispatch rule of `14 §3`, in the form the operand-sharing lowerings need.
+   *
+   * A built-in keeps its instruction. A bounded type parameter answers with the **trait's** own
+   * method: which implementation runs is monomorphization's to decide, and a bound the parameter does
+   * not carry is reported here, at the definition, which is what `14 §4` is for. A user type answers
+   * with the member its `impl` produced. A type with no membership either way answers `None`, so the
+   * diagnostic stays the one the scalar path already gives.
+   */
+  private def dispatchFor(trName: String, op: String, ty: Type): Option[TDispatch] = {
+    val (swap, negate) = CoreTraits.derivation.getOrElse(op, (false, false))
+
+    def named(owner: String) = TDispatch(s"$owner.${CoreTraits.required(trName)._1}", swap, negate)
+
+    if CoreTraits.builtin(trName, ty) then None
     else
-      recv.ty match
-        // At the definition, where `T` stands for itself: the bound is the whole of what licenses
-        // the operator, and saying which bound is missing is the point of checking here at all.
+      ty match
         case a: Type.Abstract =>
           if !a.bounds.contains(trName) then boundErr(s"'$op' needs '${a.name}: $trName'")
-          Some(dispatch(trName, op, s"$trName.${CoreTraits.required(trName)._1}", rhs, recv))
-
-        case ty if satisfies(trName, ty) =>
-          Some(dispatch(trName, op, s"${ownerKey(ty)}.${CoreTraits.required(trName)._1}", rhs, recv))
-
-        case _ => None
-
-  /** Builds the call an operator means, applying the derivation for the four comparisons the
-   * catalog does not declare a method for (`§2`).
-   */
-  private def dispatch(trName: String, op: String, fname: String, rhs: Option[TExpr], recv: TExpr): TExpr = {
-    val self = selfBinding(recv.ty)
-    val m    = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
-    val rty  = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
-
-    for (b, p) <- rhs.zip(m.params.headOption) do
-      val want = resolveType(p.typ, self)
-      at(b.pos)(if disagree(b.ty, want) then err(s"'$op' needs matching types, got ${show(recv.ty)} and ${show(b.ty)}"))
-
-    val (swap, negate) = CoreTraits.derivation.getOrElse(op, (false, false))
-    val args           = rhs.toList
-    val call           = TCall(fname, if swap then args :+ recv else recv :: args, rty)
-
-    if negate then TUnary("!", call, Type.Bool) else call
+          Some(named(trName))
+        case _ => Option.when(satisfies(trName, ty))(named(ownerKey(ty)))
   }
 
-  /** Rejects an operator on a trait-dispatched type in a position whose lowering shares an operand.
-   *
-   * A chained comparison evaluates each operand **once** and compares it against both neighbours,
-   * and `a += b` updates the place it read — both need the operand held between two uses, which the
-   * scalar lowering does with a register and a trait call has nowhere to put. Refused with a
-   * diagnostic that says how to write it, rather than silently evaluating something twice.
+  /** The other operand of a dispatched binary operator, against what the trait's signature asks for
+   * — which for every operator in the catalog is `Self`, so the two sides must be the one type.
    */
-  protected def noSharedOperand(op: String, ty: Type, write: String): Unit =
-    if CoreTraits.infix.get(op).exists(tr => !CoreTraits.builtin(tr, ty) && dispatched(tr, ty)) then
-      err(s"'$op' on ${show(ty)} is a trait method, which this form cannot share an operand with " +
-        s"— write it as $write")
+  private def checkOperand(op: String, recvTy: Type, b: TExpr, want: Type): Unit =
+    at(b.pos):
+      if disagree(b.ty, want) then err(s"'$op' needs matching types, got ${show(recvTy)} and ${show(b.ty)}")
 
-  private def dispatched(trName: String, ty: Type): Boolean = ty match
-    case a: Type.Abstract => a.bounds.contains(trName)
-    case _                => satisfies(trName, ty)
+  /** One link of a comparison chain: the operator, plus the method performing it where the operand
+   * type reaches `Eq`/`Ord` through a trait.
+   *
+   * What this hands codegen is a **name**, not a call tree, and that is the whole reason it exists.
+   * A chain compares each middle operand against both its neighbours from a single evaluation, so a
+   * dispatched comparison has to read the value codegen is already holding; a `TCall` wrapped around
+   * the operand's own tree would evaluate it again.
+   */
+  protected def compareLink(op: String, l: TExpr, r: TExpr): TCmp = {
+    val trName = CoreTraits.infix(op)
+
+    TCmp(
+      op,
+      dispatchFor(trName, op, l.ty).map { d =>
+        val m = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
+        checkOperand(op, l.ty, r, resolveType(m.params.head.typ, selfBinding(l.ty)))
+        d
+      },
+    )
+  }
+
+  /** `place op= value` where `op` is a trait method — the same dispatch `place op value` makes,
+   * handed over as a name so codegen applies it to the value it already loaded from the place
+   * rather than reading the place a second time.
+   *
+   * The result is the place's own type by construction: the catalog declares every arithmetic method
+   * as `(self, rhs: Self) -> Self`, and an `impl` conforms to that exactly, so a compound assignment
+   * through one cannot change the type of what it updates.
+   */
+  protected def updateDispatch(op: String, place: TExpr, value: TExpr): Option[TDispatch] =
+    for
+      trName <- CoreTraits.infix.get(op)
+      d      <- dispatchFor(trName, op, place.ty)
+    yield {
+      val m = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
+      checkOperand(op, place.ty, value, resolveType(m.params.head.typ, selfBinding(place.ty)))
+      d
+    }
 
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
    * The positional constructor `Type(…)` is a different form and is handled elsewhere.
