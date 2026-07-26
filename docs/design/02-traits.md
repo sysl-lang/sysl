@@ -63,6 +63,34 @@ This replaces the old design's split into compile-time `trait`s and structural r
 - **Kills a hidden cost** — the auto-`owns` flag was invisible allocation/copy behavior,
   exactly what the three-mode model forbids.
 
+## Coherence — where an `impl` may live
+
+An `impl` is **unnamed**: nothing at a use site says which one to apply, so resolving `T: Show` or
+`5.show()` means *searching* for an implementation. Once a program is more than one module (`13`),
+that search needs a bound, or it would have to range over every module in the program — which is
+exactly the property that makes separate compilation impossible.
+
+**An `impl Trait for Type` may appear only in the module that declares `Trait`, or the module that
+declares `Type`.** Resolving a bound therefore inspects exactly those two modules, both of which
+any module naming both the trait and the type already depends on. No global search, and no
+dependency edge that the source does not show.
+
+This is Rust's orphan rule, and it costs nothing the chapter already promised:
+
+- **Retrofitting still works.** `impl MyTrait for TheirType` lives with `MyTrait` — the trait's
+  module licenses it. That is the retrofitting kept above, unchanged.
+- **`impl Show for int` still works**, and it is the prelude's `Show` that makes it legal: a
+  built-in has no module of its own, so a built-in type's owner key belongs to the prelude, and
+  every `impl` on one is licensed by its trait's module instead. A trait that could not cover
+  `int` is a trait no library can be written against.
+- What it forbids is the case with no home: **a foreign trait implemented for a foreign type**,
+  where two unrelated modules could each supply a different `impl` and no rule picks one.
+
+An `impl` is part of its module's public surface. Adding, removing, or changing one is an
+interface change to that module, visible to everything downstream — the same reasoning that put
+`given`/`using`-style implicit resolution out of scope (`13` §7): unrestricted search and separate
+compilation are not compatible.
+
 ## Kept / dropped
 
 - **Kept:** static dispatch (monomorphized bounds), dynamic dispatch (boxed trait object),

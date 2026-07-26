@@ -284,6 +284,14 @@ the directory graph, never on how a module's own files refer to one another.
 - **No implicit prelude-style auto-import beyond the language prelude.** The prelude (`Option`,
   `Result`, `print`, the scalar types — `09`, `11`) is in scope everywhere without an import;
   nothing else is. A module earns visibility by being imported or fully qualified.
+- **No implicits — no Scala-style `given`/`using`.** A term-level value selected by *searching* the
+  scope for something of the right type is out of scope, and deliberately. Introducing a given
+  anywhere in scope can change what resolves in a file that did not change and whose dependencies'
+  signatures did not change, so a module's interface would no longer bound its blast radius —
+  making the whole graph, rather than a module's declared surface, the unit of invalidation.
+  (Scala pays for this with per-file used-name tables and API diffing; that machinery is the cost
+  of the feature, not an implementation detail of it.) The one search sysl does perform, for a
+  trait `impl`, is bounded to two modules by the orphan rule (`02`) for the same reason.
 
 ---
 
