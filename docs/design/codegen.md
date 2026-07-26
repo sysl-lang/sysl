@@ -261,13 +261,16 @@ arity.
     whether or not anything instantiates it. Forwarding a parameter to a bounded callee is checked
     the same way: a bound is satisfied by a bound.
 
-    What is still per-instantiation is every *other* use of a parameter — an operator, an index, a
-    field access, a `print`. Those wait on the core trait catalog of `14 §2`: until `Add` and
-    `Display` exist there is no bound an author could write to license one, so reporting them at the
-    definition would reject a body with no way to fix it. The abstract pass therefore reports only
-    what a bound could have licensed, and drops its other complaints; monomorphization catches those
-    at each instantiation exactly as it always did. Lifting the suppression is what `14 §4`'s
-    operator half means, and it lands with the catalog.
+    The catalog of `14 §2` now exists — `Self`, the operator traits, `Eq` and `Ord`, and the
+    compiler-provided scalar memberships of `§5` — so `sum[T: Add](a, b) = a.add(b)` is a bound a
+    program can write and `sum(3, 4)` satisfies it. What has *not* landed is the desugaring that
+    makes `a + b` mean `Add::add(a, b)`: an operator on a parameter is still checked per
+    instantiation, and so is a `print` of one, which additionally waits on `Display` and the `Writer`
+    sink it renders into (`14 §8 d`). Reporting either at the definition today would reject a body
+    with no bound the author could write to fix it, so the abstract pass reports only what a bound
+    could have licensed and drops its other complaints; monomorphization catches those at each
+    instantiation exactly as it always did. Lifting that suppression is what `14 §4`'s operator half
+    means.
 
     **An unbounded parameter stays perfectly legal** — this is not heading for a language where
     every `[T]` needs a bound. An unbounded `T` supports what every type supports: being passed,
@@ -278,7 +281,8 @@ arity.
     One coupling worth knowing: `print(x)` inside a generic body works today because each
     instantiation has a concrete type to pick a renderer for. Under abstract checking it needs
     `T: Display` — the same trait `str` and `format` are waiting on (`04`, *Printing*), so the two
-    arrive together rather than costing separately.
+    arrive together rather than costing separately. `Display` is the one catalog trait the prelude
+    does **not** declare, because its method writes into a `Writer` and that sink is unspecified.
 
 Only the last of these is a divergence from a settled design; the rest are the smallest lowering
 that runs a real program, chosen so the pieces above them (strings, methods, escape analysis) can

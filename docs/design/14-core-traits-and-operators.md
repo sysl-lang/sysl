@@ -1,9 +1,10 @@
 # Core Traits, Operators, and Definition-Checked Bounds
 
-**Status:** decided. **§4's method half is implemented** — a generic body is checked at its
-definition, and a method call on a type parameter resolves through its bounds. Everything else here
-is still unbuilt. This is the concrete spec for three things the earlier
-chapters *decided* but left unbuilt, because all three turn on the same missing layer:
+**Status:** decided. **§1, §2, §4's method half, and §5 are implemented** — `Self`, the catalog
+(minus `Display`), definition-checked method calls on a type parameter, and the compiler-provided
+scalar memberships. What remains is the operator desugaring of §3 and §4, and §6, which waits on
+`Display` and so on the `Writer` sink of `§8 d`. This is the concrete spec for three things the
+earlier chapters *decided* but left unbuilt, because all three turn on the same missing layer:
 
 - **`00 §9` / `01` / `08 §"Interaction with traits"`** — operators are trait methods (`+` is
   `Add`, `<` is `Ord`, `==` is `Eq`), overloaded by `impl Trait for Type`. The *token set* is
@@ -30,11 +31,13 @@ Sections 1–5 are complete and implementable as written. **§6 has one unspecif
 the `Writer` sink that `Display` renders into (`§8 d`).
 
 §4 landed in two parts, and the split is the catalog: a **method** call on a type parameter needs
-only the parameter's own bounds, which are traits a program already writes, so it is built. An
+only the parameter's own bounds, which are traits a program already writes, so it was built first. An
 **operator** on one needs `Add` and friends to exist as traits, and a `print` of one needs
-`Display` — so until §2's catalog is compiler-provided, an operator on a parameter has no bound an
-author *could* write. The definition-time pass therefore reports what a bound could have licensed
-and leaves the rest to monomorphization, which is where those checks have always happened.
+`Display`. The catalog is now here, so `sum[T: Add](a, b) = a.add(b)` is a bound a program can write
+and a scalar satisfies; what is left of §4 is the *desugaring* that lets that body be written
+`a + b`. A `print` of a parameter is further out, because `Display` is the one trait the catalog
+still lacks. Until both land, the definition-time pass reports what a bound could have licensed and
+leaves the rest to monomorphization, which is where those checks have always happened.
 
 ---
 
@@ -140,6 +143,9 @@ treatment of float `<` as the plain IEEE comparison.
 |---|---|
 | `Display` | `display(self, out: *Writer) -> unit` |
 
+`Display` is the one trait in this catalog the prelude does not yet declare, because its signature
+mentions `Writer` and that sink is unspecified (`§8 d`). Everything else in §2 is built.
+
 `Display` is what `str` and `print` require of their argument (`§6`). One method, which **writes
 the value's textual form into a sink** rather than returning a freshly built `string`. It is the
 trait the `tast.scala` note anticipated ("a `Display` trait method replaces it once traits land").
@@ -242,9 +248,12 @@ The built-in scalar and primitive types have no source body to write an `impl` i
 memberships are **provided by the compiler**, exactly as their members already are (`08 §"Built-in
 members"`). The mapping is the existing operator semantics of `01`, restated as trait membership:
 
-- Every numeric type (integers and floats) is `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Eq`, `Ord`,
-  and `Display`. The signed integers and the floats are additionally `Neg`.
-- Every integer type is `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, and `Not`.
+- Every numeric type (integers and floats) is `Add`, `Sub`, `Mul`, `Div`, `Eq`, `Ord`, and
+  `Display`. The signed integers and the floats are additionally `Neg`.
+- Every integer type is `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, and `Not`. `Rem` is here
+  rather than with the numeric types because `%` is integer-only in `01`'s operator table: there is
+  no float remainder to lower, and a membership wider than the table would promise a bounded generic
+  an operation that fails at the instantiation the bound was supposed to have proven.
 - `char` is `Eq`, `Ord`, and `Display`, and has **no** arithmetic or bitwise membership (`01` —
   `char` has equality and ordering only).
 - `bool` is `Eq` and `Display`, and is **not** `Ord` (`01` — `bool` has equality, no ordering).
@@ -308,13 +317,15 @@ prints once it has `impl Display`, which is the capability `08`/`tast.scala` wer
 
 ## 8. Open (not yet decided)
 
-- **a. Whether the core traits are stdlib source or pure compiler intrinsics.** They have
-  compiler-known meaning either way; the question is whether `Add`, `Ord`, `Display`, … are
-  declared in a standard-library prelude that user code can read (and whose method names it can
-  call directly, `x.add(y)`) or exist only as internal trait descriptors the operator desugaring
-  targets. Leaning toward stdlib-declared with compiler-known identity, matching how Swift's
-  `AdditiveArithmetic`/`Comparable` are library protocols the compiler privileges — deferred
-  until the module/prelude surface is settled (`13`).
+- **a. ~~Whether the core traits are stdlib source or pure compiler intrinsics.~~ Settled:
+  prelude-declared, with compiler-known identity.** `Add`, `Ord`, `Eq` and the rest are ordinary
+  trait declarations a program can read, and their methods are callable by name — `5.add(3)` is
+  legal and is the machine's `add`. What the compiler holds is the identity: which operator each
+  trait's one method *is*, and which built-in types are members. The memberships could not have been
+  source `impl`s in any case, because the `iN` / `uN` families are open and have no finite list of
+  types to write one for. This matches Swift's library protocols the compiler privileges. What is
+  still open is the *module* question `13` owns — which module the catalog lives in once there is
+  more than one — not whether it is source.
 - **b. Whether `str`/`print` desugar through the *same* `Display::display` for scalars, or keep
   the scalar fast path and route only user types through the method.** Semantically identical;
   a codegen choice about whether a scalar render is a call or inlined. Default to inlined for

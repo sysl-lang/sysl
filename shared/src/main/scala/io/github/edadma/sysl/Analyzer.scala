@@ -198,7 +198,9 @@ class Analyzer private (program: Program)
       rtype: Type,
   ): TFunc = {
     resetFunction()
-    tsubst = subst
+    // A member's body sees `Self` alongside whatever type parameters it was instantiated with, so
+    // the one substitution answers both questions and nothing downstream has to know the difference.
+    tsubst = subst ++ memberSelf.getOrElse(name, Map.empty)
     retTy = rtype
     variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }

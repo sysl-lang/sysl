@@ -93,8 +93,8 @@ trait CallAnalysis extends Literals {
    * For each bounded parameter, the concrete type must carry an `impl` of every trait the bound
    * names — checked here at the call, so a caller supplying a type that does not implement the
    * trait is told exactly that, rather than meeting a missing-method error deep inside the
-   * monomorphized body. Any type can carry an `impl`, built-ins included, so the bound is decided by
-   * whether one was written for the type's owner key rather than by what kind of type it is.
+   * monomorphized body. A user type conforms by an `impl` written for its owner key, a built-in by
+   * the compiler's own rule (`14 §5`) — which is what lets `sum(3, 4)` instantiate a `[T: Add]`.
    */
   protected def checkBounds(f: FuncDecl, targs: List[Type]): Unit =
     if f.bounds.nonEmpty then
@@ -109,7 +109,7 @@ trait CallAnalysis extends Literals {
               boundErr(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
                 s"but '${a.name}' is not bounded by it")
           case concrete =>
-            if !traitImpls.contains((tr, ownerKey(concrete))) then
+            if !satisfies(tr, concrete) then
               err(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
                 s"but ${show(concrete)} does not")
 
@@ -148,8 +148,37 @@ trait CallAnalysis extends Literals {
             val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
           case Some(_) => err(s"'$mname' is a property of '$base' — read it as 'value.$mname', without '()'")
-          case None    => err(s"type '$base' has no method '$mname'")
+          case None    => builtinMethod(rty, mname, tr, args).getOrElse(err(s"type '$base' has no method '$mname'"))
   }
+
+  /** `5.add(3)`, `x.lt(y)` — a core-trait method on a type whose membership the compiler provides.
+   *
+   * A built-in has no `impl` block and so no lowered `int.add` to call; what it has is the operator
+   * the trait method *means*, and that is what this builds. The result is the same tree the operator
+   * itself would have produced, which is `14 §5`'s promise that a membership changes no codegen —
+   * and it is what a monomorphized `[T: Add]` body lands on once `T` is known to be a scalar.
+   */
+  private def builtinMethod(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
+    for
+      trName <- CoreTraits.declaring(mname)
+      if CoreTraits.builtin(trName, rty)
+      m      <- traitDecls.get(trName).flatMap(_.methods.find(_.name == mname))
+    yield {
+      val params = m.params.map(p => (p.name, resolveType(p.typ, selfBinding(rty))))
+
+      if args.length != params.length then
+        err(s"method '$trName.$mname' takes ${quantity(params.length, "argument")}, " +
+          s"but ${supplied(args.length, "argument")}")
+
+      val self             = buildReceiver(RecvMode.ByValue, recv)
+      val ts               = checkArgs(s"$trName.$mname", params, args, None)
+      val (_, op, kind)    = CoreTraits.required(trName)
+
+      kind match
+        case CoreTraits.Kind.Arith   => TBinary(op, self, ts.head, arithType(op, self.ty, ts.head.ty))
+        case CoreTraits.Kind.Compare => TCompare(List(self, ts.head), List(op))
+        case CoreTraits.Kind.Prefix  => TUnary(op, self, self.ty)
+    }
 
   /** `x.m(…)` where `x` is a type parameter, during the definition-time pass of `14 §4`.
    *
@@ -172,12 +201,16 @@ trait CallAnalysis extends Literals {
           val fname = s"$trName.$mname"
           if m.receiver.isEmpty then
             err(s"'$mname' is a property of '$trName' — read it as 'value.$mname', without '()'")
-          val params = m.params.map(p => (p.name, resolveType(p.typ, Map.empty)))
+          // `Self` in the trait's signature is the parameter itself here, which is what makes
+          // `Add::add` yield a `T` and `Ord::lt` a `bool` inside a body that has not met a concrete
+          // type yet (`14 §4`).
+          val self   = selfBinding(a)
+          val params = m.params.map(p => (p.name, resolveType(p.typ, self)))
           if args.length != params.length then
             err(s"method '$fname' takes ${quantity(params.length, "argument")}, " +
               s"but ${supplied(args.length, "argument")}")
           val ts    = args.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
-          val rtype = m.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
+          val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
           TCall(fname, recv :: checkArgs(fname, params, args, Some(ts)), rtype)
         }
   }

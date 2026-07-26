@@ -556,12 +556,12 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
 
     "an impl method whose parameter type differs from the trait is rejected" in {
       err(
-        """trait Add
-          |    add(self, x: int) -> int
+        """trait Plus
+          |    plus(self, x: int) -> int
           |struct P
           |    v: int
-          |impl Add for P
-          |    add(self, x: string) -> int = self.v""".stripMargin
+          |impl Plus for P
+          |    plus(self, x: string) -> int = self.v""".stripMargin
       ) should include("parameter 'x'")
     }
 
@@ -719,6 +719,116 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |    v: int
           |consume[T: Widget](x: T) -> int = 1""".stripMargin
       ) should include("names 'Widget', which is not a trait")
+    }
+  }
+
+  "the core trait catalog" - {
+    "'Self' outside a trait or an impl names nothing" in {
+      err("var x: Self = 1") should include("only meaningful inside a 'trait' or an 'impl'")
+    }
+
+    // A member of a generic type has no one meaning for `Self` — it would be `Box[T]`, which waits
+    // for an instantiation — so it is left unbound rather than bound to something convenient.
+    "'Self' in a member of a generic type names nothing" in {
+      err(
+        """struct Box[T]
+          |    v: T
+          |    same(self) -> Self = self
+          |var b = Box(1)
+          |print(b.same().v)""".stripMargin
+      ) should include("only meaningful inside a 'trait' or an 'impl'")
+    }
+
+    "a type may not be declared with the name 'Self'" in {
+      err(
+        """struct Self
+          |    v: int""".stripMargin
+      ) should include("already declared")
+    }
+
+    // The catalog traits are prelude declarations, so their names are taken exactly as `Option`'s
+    // is — a program that wants its own addition trait picks another name.
+    "a program cannot redeclare a catalog trait" in {
+      err(
+        """trait Ord
+          |    lt(self, rhs: Self) -> bool""".stripMargin
+      ) should include("already declared")
+    }
+
+    "a built-in's membership cannot be overridden by an impl" in {
+      err(
+        """impl Add for int
+          |    add(self, rhs: Self) -> Self = self""".stripMargin
+      ) should include("the compiler provides it")
+    }
+
+    // `char` has equality and ordering and no arithmetic at all (`01`), so the membership stops
+    // where the operator does — and the diagnostic is the ordinary missing-method one.
+    "a scalar outside a membership has no such method" in {
+      err("print('a'.add('b'))") should include("type 'char' has no method 'add'")
+    }
+
+    "a bool is equatable and not ordered" in {
+      err("print(true.lt(false))") should include("type 'bool' has no method 'lt'")
+    }
+
+    "a float has no remainder" in {
+      err("print(2.5.rem(1.0))") should include("type 'real' has no method 'rem'")
+    }
+
+    "an unsigned integer cannot be negated" in {
+      err("print(7u32.neg())") should include("type 'uint' has no method 'neg'")
+    }
+
+    // The call is checked against the trait's signature, where the argument type is `Self` — which
+    // on this receiver is `int`, so a bool is the wrong thing to hand it.
+    "a built-in trait method checks its argument against 'Self'" in {
+      err("print(3.add(true))") should include("'rhs' of 'Add.add' is int, but bool was given")
+    }
+
+    "a built-in trait method checks its arity" in {
+      err("print(3.add(1, 2))") should include("method 'Add.add' takes 1 argument")
+    }
+
+    "a type outside the bound's membership is rejected at the call" in {
+      err(
+        """sum[T: Add](a: T, b: T) -> T = a.add(b)
+          |print(sum(true, false))""".stripMargin
+      ) should include("requires its type parameter 'T' to implement 'Add', but bool does not")
+    }
+
+    // The payoff of the definition-time pass over the catalog: the body is wrong on its own line,
+    // and the diagnostic names the bound that would license it.
+    "an unbounded parameter cannot call a catalog method" in {
+      err("sum[T](a: T, b: T) -> T = a.add(b)") should include("'add' needs 'T: Add'")
+    }
+
+    "a bound licenses only its own trait's method" in {
+      err("mix[T: Add](a: T, b: T) -> bool = a.lt(b)") should include("'lt' needs 'T: Ord'")
+    }
+
+    // Member lookup finds an inherent member before it asks about a membership, so an `impl` of
+    // some other trait could otherwise take `5.add` over from the `Add` `int` already implements.
+    "a member of a built-in may not hide one of its catalog methods" in {
+      err(
+        """trait Tally
+          |    add(self, k: int) -> int
+          |impl Tally for int
+          |    add(self, k: int) -> int = self + k""".stripMargin
+      ) should include("a member of this name would hide it")
+    }
+
+    // The trait writes `Self` and the impl writes a type that is not the implementing one, so the
+    // two signatures differ — which is the check `Self` exists to make possible.
+    "an impl whose result differs from the trait's 'Self' is rejected" in {
+      err(
+        """trait Doubler
+          |    twice(self) -> Self
+          |struct M
+          |    v: int
+          |impl Doubler for M
+          |    twice(self) -> int = self.v""".stripMargin
+      ) should include("but trait 'Doubler' declares")
     }
   }
 }

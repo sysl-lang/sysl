@@ -68,6 +68,15 @@ trait AnalyzerBase {
    */
   protected val genericMembers = mutable.LinkedHashMap.empty[(String, String), FuncDecl]
 
+  /** What `Self` means inside one lowered member, keyed by the name it was lowered to.
+   *
+   * A member of a concrete type — its own, or one an `impl` gave it — may write `Self` for the type
+   * it belongs to, in its signature and in its body alike (`14 §1`). The binding is recorded at
+   * hoist and folded into the body's substitution, so the body resolves `Self` exactly as it
+   * resolves a type parameter: through the one map that already answers that question.
+   */
+  protected val memberSelf = mutable.LinkedHashMap.empty[String, Map[String, Type]]
+
   /** Instantiated types, keyed by their display name (`Point`, `Option[int]`) and held in
    * dependency order — a type is inserted only after the types it contains.
    */
@@ -254,6 +263,16 @@ trait AnalyzerBase {
 
   /** The key alone — what an `impl` is filed under, and what a trait bound looks up. */
   protected def ownerKey(t: Type): String = memberOwner(t)._1
+
+  /** Whether a type implements a trait, which is the one question a bound asks.
+   *
+   * There are two ways to answer yes and they are not interchangeable. A **user** type opts in with
+   * an explicit `impl`, filed under its owner key — nominal conformance, never structural. A
+   * **built-in** is a member by the compiler's own rule (`14 §5`), because it has no module to write
+   * an `impl` in and the integer family has no finite list of types to write one for.
+   */
+  protected def satisfies(traitName: String, t: Type): Boolean =
+    traitImpls.contains((traitName, ownerKey(t))) || CoreTraits.builtin(traitName, t)
 
   /** The type a member is looked up on, seeing through one level of `*T` / `&T` so a method may be
    * called on a value, a pointer to it, or a reference to it alike.

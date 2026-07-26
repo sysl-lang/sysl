@@ -21,6 +21,12 @@ package io.github.edadma.sysl
  * them in sysl is a small job for the integers and a large one for the floats (correct shortest
  * round-trip), so they wait until there is a reason — a target without a C library.
  *
+ * **The core trait catalog is here too** (`14 §2`): `Add`, `Ord`, `Eq` and the rest are ordinary
+ * trait declarations a program can read and whose methods it can call by name. What the compiler
+ * adds is identity — which operator token means which of them, and which built-in types are members
+ * — and that part lives in `CoreTraits`, because the open `iN` / `uN` families have no finite list
+ * of scalars an `impl` could be written for.
+ *
  * The three `extern`s are the only things here that are not sysl. Two of them are plumbing rather
  * than surface, so they take a link name and leave `putchar` and `snprintf` free for a program to
  * declare itself. `exit` is deliberately not one of those: it is the prelude's offer of the hosted
@@ -65,6 +71,48 @@ object Prelude {
       |    var k = sysl_snprintf(&buf[0], 32usize, c"%g", x)
       |    putbytes(buf[0..<usize(k)])
       |end printr
+      |
+      |trait Add
+      |    add(self, rhs: Self) -> Self
+      |
+      |trait Sub
+      |    sub(self, rhs: Self) -> Self
+      |
+      |trait Mul
+      |    mul(self, rhs: Self) -> Self
+      |
+      |trait Div
+      |    div(self, rhs: Self) -> Self
+      |
+      |trait Rem
+      |    rem(self, rhs: Self) -> Self
+      |
+      |trait BitAnd
+      |    bitand(self, rhs: Self) -> Self
+      |
+      |trait BitOr
+      |    bitor(self, rhs: Self) -> Self
+      |
+      |trait BitXor
+      |    bitxor(self, rhs: Self) -> Self
+      |
+      |trait Shl
+      |    shl(self, rhs: Self) -> Self
+      |
+      |trait Shr
+      |    shr(self, rhs: Self) -> Self
+      |
+      |trait Neg
+      |    neg(self) -> Self
+      |
+      |trait Not
+      |    not(self) -> Self
+      |
+      |trait Eq
+      |    eq(self, rhs: Self) -> bool
+      |
+      |trait Ord
+      |    lt(self, rhs: Self) -> bool
       |
       |printb(b: bool) = prints(if b then "true" else "false")
       |

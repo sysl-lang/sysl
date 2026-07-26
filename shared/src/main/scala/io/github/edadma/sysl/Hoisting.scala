@@ -122,7 +122,7 @@ trait Hoisting extends TypeResolution {
    */
   private def typeNameTaken(name: String): Boolean =
     structDecls.contains(name) || enumDecls.contains(name) || traitDecls.contains(name) ||
-      scalarType(name).isDefined || name == neverName
+      scalarType(name).isDefined || name == neverName || name == selfName
 
   /** Records a type's members and lowers each to a function declaration under the mangled name
    * `Type.member`, whose signature is registered so calls resolve like ordinary ones.
@@ -138,7 +138,12 @@ trait Hoisting extends TypeResolution {
   protected def hoistMembers(tname: String, members: List[MethodDecl], out: mutable.ListBuffer[FuncDecl]): Unit = {
     val (tparams, taken, noun) = nominal(tname).get
 
-    hoistMemberList(tname, tparams, taken, noun, members, out)
+    // A member of a concrete type may write `Self` for the type it is a member of, exactly as an
+    // `impl`'s method may. A member of a *generic* one may not: `Self` there is `Box[T]`, whose
+    // meaning waits for an instantiation, and binding it to anything else would be a lie.
+    val self = if tparams.nonEmpty then Map.empty else concrete(tname).fold(Map.empty)(selfBinding)
+
+    hoistMemberList(tname, tparams, taken, noun, members, out, self)
   }
 
   /** What hoisting a member needs to know about the type it is hoisting into: the type parameters
@@ -148,6 +153,14 @@ trait Hoisting extends TypeResolution {
    * It answers for either kind, which is what lets member hoisting and `impl` conformance be
    * written once — nothing below here knows or cares which it was handed.
    */
+  /** The instantiation of a non-generic struct or enum, which was made before any member was
+   * hoisted. Read from the table rather than resolved again, so a type whose own declaration was
+   * already reported does not report it a second time on the way to its members — the members are
+   * still hoisted, with `Self` simply unbound.
+   */
+  private def concrete(name: String): Option[Type] =
+    structInsts.get(name).orElse(enumInsts.get(name))
+
   private def nominal(name: String): Option[(List[String], Set[String], String)] =
     structDecls
       .get(name)
@@ -166,6 +179,7 @@ trait Hoisting extends TypeResolution {
       noun: String,
       members: List[MethodDecl],
       out: mutable.ListBuffer[FuncDecl],
+      self: Map[String, Type],
   ): Unit = {
     val generic = tparams.nonEmpty
 
@@ -176,6 +190,17 @@ trait Hoisting extends TypeResolution {
       if taken.contains(m.name) then
         err(s"type '$tname' has both a $noun and a member named '${m.name}'")
 
+      // A built-in's catalog methods are the compiler's (`14 §5`), and member lookup would find a
+      // member of the same name first — so an `impl` of some *other* trait may not quietly take
+      // `5.add` over from the `Add` the type is already a member of.
+      for
+        ty <- self.get(selfName)
+        tr <- CoreTraits.declaring(m.name)
+        if CoreTraits.builtin(tr, ty)
+      do
+        err(s"'${m.name}' is how '$tr' is implemented for ${show(ty)}, and the compiler provides " +
+          s"that — a member of this name would hide it")
+
       memberDecls((tname, m.name)) = m
       val fd = synthesize(tname, tparams, m)
 
@@ -185,9 +210,10 @@ trait Hoisting extends TypeResolution {
         genericMembers((tname, m.name)) = fd
       else
         out += fd
+        if self.nonEmpty then memberSelf(fd.name) = self
         funcInsts(fd.name) =
-          (fd.params.map(p => (p.name, resolveType(p.typ, Map.empty))),
-           fd.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit))
+          (fd.params.map(p => (p.name, resolveType(p.typ, self))),
+           fd.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit))
   }
 
   /** Checks an `impl` conforms to its trait and lowers its methods to inherent members of the
@@ -197,8 +223,14 @@ trait Hoisting extends TypeResolution {
    * member path with no dispatch machinery of its own.
    */
   protected def hoistImpl(impl: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
-    val tr           = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
-    val (key, taken, noun) = implTarget(impl.forType)
+    val tr                     = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
+    val (ty, key, taken, noun) = implTarget(impl.forType)
+
+    // A built-in's memberships come from the compiler (`14 §5`), so an `impl` for one is not adding
+    // a capability but competing with the one that is already there — and the operator would keep
+    // lowering to its native instruction whatever this block said.
+    if CoreTraits.builtin(impl.traitName, ty) then
+      err(s"'$key' already implements '${impl.traitName}' — the compiler provides it")
 
     // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
     // are the one implementation they are.
@@ -206,8 +238,10 @@ trait Hoisting extends TypeResolution {
       err(s"'$key' already implements '${impl.traitName}'")
     traitImpls((impl.traitName, key)) = impl
 
-    checkConformance(tr, impl)
-    hoistMemberList(key, Nil, taken, noun, impl.methods, out)
+    val self = selfBinding(ty)
+
+    checkConformance(tr, impl, self)
+    hoistMemberList(key, Nil, taken, noun, impl.methods, out, self)
   }
 
   /** The type an `impl` is for: the key its members are filed under, the names already spoken for
@@ -217,33 +251,35 @@ trait Hoisting extends TypeResolution {
    * cover `int` has a `Show` no library can use. A built-in has no fields or variants for a member to
    * clash with and no type parameters, so it is the simple case; a struct or an enum brings both.
    */
-  private def implTarget(written: String): (String, Set[String], String) =
+  private def implTarget(written: String): (Type, String, Set[String], String) =
     nominal(written) match
       case Some((tparams, taken, noun)) =>
         if tparams.nonEmpty then
           err(s"implementing a trait for a generic type is not supported yet — '$written'")
-        (written, taken, noun)
+        (concrete(written).getOrElse(Type.Unknown), written, taken, noun)
       case None =>
         // Resolved rather than taken as written, so the key is the type's one canonical name.
         val ty = scalarType(written).getOrElse(
           if written == neverName then err("'never' has no values, so nothing can be implemented for it")
+          else if written == selfName then
+            err("'Self' is the type an 'impl' is for, so it cannot also be the type it names")
           else err(s"unknown type '$written'"),
         )
         if ty == Type.Unit then err("'unit' has one value and no behaviour — a trait for it would say nothing")
         if ty == Type.VaList then err("a va_list is an ABI primitive, not something to implement a trait for")
-        (ownerKey(ty), Set.empty, "field")
+        (ty, ownerKey(ty), Set.empty, "field")
 
   /** Verifies that `impl` supplies exactly the methods `tr` declares, each with an identical
    * resolved signature. A missing method, an extra one, or a mismatched receiver, parameter, or
    * result is reported against the trait it fails to satisfy.
    */
-  private def checkConformance(tr: TraitDecl, impl: ImplDecl): Unit = {
+  private def checkConformance(tr: TraitDecl, impl: ImplDecl, self: Map[String, Type]): Unit = {
     val declared = tr.methods.map(_.name).toSet
 
     for tm <- tr.methods do
       impl.methods.find(_.name == tm.name) match
         case None     => err(s"'${impl.forType}' does not implement '${impl.traitName}': method '${tm.name}' is missing")
-        case Some(im) => checkSignature(impl.forType, impl.traitName, tm, im)
+        case Some(im) => checkSignature(impl.forType, impl.traitName, tm, im, self)
 
     for im <- impl.methods do
       if !declared.contains(im.name) then
@@ -251,10 +287,20 @@ trait Hoisting extends TypeResolution {
   }
 
   /** Compares one implementing method against the trait's signature: same receiver mode, same
-   * parameter types in order, and the same result. Types are resolved with the implementing type
-   * substituted for `self`, so `self` on both sides means the same concrete type.
+   * parameter types in order, and the same result.
+   *
+   * Both sides are resolved with `Self` bound to the implementing type, which is what makes a
+   * signature written with `Self` and one written with the concrete name the same signature
+   * (`14 §1`) — the comparison is between *resolved* types, so it does not matter which spelling
+   * either side chose.
    */
-  private def checkSignature(forType: String, traitName: String, tm: MethodDecl, im: MethodDecl): Unit = {
+  private def checkSignature(
+      forType: String,
+      traitName: String,
+      tm: MethodDecl,
+      im: MethodDecl,
+      self: Map[String, Type],
+  ): Unit = {
     if tm.receiver != im.receiver then
       err(s"method '${im.name}' of 'impl $traitName for $forType' takes a different receiver than the trait declares")
     if tm.params.length != im.params.length then
@@ -262,13 +308,13 @@ trait Hoisting extends TypeResolution {
         s"parameters, but the trait declares ${tm.params.length}")
 
     for (tp, ip) <- tm.params.zip(im.params) do
-      val want = resolveType(tp.typ, Map.empty)
-      val got  = resolveType(ip.typ, Map.empty)
+      val want = resolveType(tp.typ, self)
+      val got  = resolveType(ip.typ, self)
       if want != got then
         err(s"parameter '${ip.name}' of method '${im.name}' is ${show(got)}, but trait '$traitName' declares ${show(want)}")
 
-    val want = tm.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
-    val got  = im.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
+    val want = tm.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
+    val got  = im.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
     if want != got then
       err(s"method '${im.name}' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")
   }

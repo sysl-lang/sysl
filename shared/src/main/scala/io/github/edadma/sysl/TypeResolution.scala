@@ -29,6 +29,20 @@ trait TypeResolution extends AnalyzerBase {
    */
   protected val neverName = "never"
 
+  /** The name of the type a trait is being implemented for (`14 §1`).
+   *
+   * It is a substitution key rather than a type of its own: a trait declaration and an `impl` are
+   * both resolved with `Self` bound to the implementing type, so `add(self, rhs: Self) -> Self` and
+   * `add(self, rhs: Point) -> Point` are the one signature conformance compares. Outside those two
+   * places it is bound to nothing and resolving it says so.
+   *
+   * Distinct from the lowercase receiver `self`, which is the *value*; this is its type.
+   */
+  protected val selfName = "Self"
+
+  /** The substitution that gives `Self` its meaning, for the one type it currently stands for. */
+  protected def selfBinding(t: Type): Map[String, Type] = Map(selfName -> t)
+
   /** Resolves a **result** type, which is the one position `never` may appear in — a function's,
    * a member's, or an `extern`'s declared result, saying that it does not return. Everywhere else
    * a type is resolved through `resolveType`, which rejects it.
@@ -61,6 +75,9 @@ trait TypeResolution extends AnalyzerBase {
           case None if enumDecls.contains(n)   => instantiateEnum(n, targs)
           case None if n == neverName =>
             err("'never' is the type of an expression that does not finish, so it can only be a result type")
+          case None if n == selfName =>
+            err("'Self' names the type a trait is implemented for, so it is only meaningful inside " +
+              "a 'trait' or an 'impl'")
           case None                            => err(s"unknown type '$n'")
 
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of

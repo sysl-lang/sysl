@@ -7,9 +7,11 @@ sysl to **bounded, definition-checked** generics, matching `02-traits.md`'s alre
 that by-value polymorphism is "a generic bounded by the trait, monomorphized."
 
 The mechanism is specified in `14 §4`, and its **method half is built**: a body's method calls on a
-type parameter are checked once, at the definition, against the parameter's bounds alone. Operators
-on a parameter are still checked per instantiation, because the traits that would license one do
-not exist yet (`14 §2`); `codegen.md` shortcut 11 holds what is left.
+type parameter are checked once, at the definition, against the parameter's bounds alone. The traits
+those bounds name now include the core catalog (`14 §2`), and every built-in scalar is a member of
+the ones its operators justify (`§5`) — so `sum[T: Add](a, b) = a.add(b)` is a bound a program can
+write and `sum(3, 4)` satisfies. What is left is the *operator* spelling of the same thing: `a + b`
+on a parameter is still checked per instantiation, and `codegen.md` shortcut 11 holds the ledger.
 
 This chapter rests on `02-traits.md` (a bound *is* a trait), `03-memory-model.md` (why every
 value is copyable, which decides what an unbounded parameter may do), and `09-enums-and-
