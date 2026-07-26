@@ -231,8 +231,11 @@ class Analyzer private (program: Program)
    * from one walk would answer the next walk's question with the first one's bounds.
    */
   private def checkAbstractLayouts(): Unit = {
-    def abstracts(tparams: List[String], bounds: Map[String, List[String]]): List[Type] =
-      tparams.map(tp => Type.Abstract(tp, bounds.getOrElse(tp, Nil)))
+    def abstracts(tparams: List[String], bounds: Map[String, List[BoundRef]]): List[Type] = {
+      val subst = abstractSubst(tparams, bounds)
+
+      tparams.map(subst)
+    }
 
     for (n, d) <- structDecls if d.tparams.nonEmpty do
       currentPos = d.pos
@@ -245,8 +248,7 @@ class Analyzer private (program: Program)
 
   /** One generic body, analyzed with each of its type parameters substituted by itself. */
   private def checkAbstractBody(f: FuncDecl): Unit = at(f.pos) {
-    val subst: Map[String, Type] =
-      withSelf(f.name, f.tparams.map(tp => tp -> Type.Abstract(tp, f.bounds.getOrElse(tp, Nil))).toMap)
+    val subst: Map[String, Type] = withSelf(f.name, abstractSubst(f.tparams, f.bounds))
     val params = f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, subst))))
     val rtype  = f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, subst))).getOrElse(Type.Unit)
 

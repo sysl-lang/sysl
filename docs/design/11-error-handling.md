@@ -106,10 +106,13 @@ This is the shipping behavior and the baseline the spec commits to. The known er
 a program with its own `AppError` cannot `?`-propagate a library's `IoError` without a manual
 conversion at each call — is real, and the eventual answer is **`From`-style conversion**: `?`
 inserts a conversion from the callee's `E` to the caller's `E` when a conversion trait connects
-them, exactly as Rust's `?` calls `From::from`. That is **designed but deferred** (`§ Open a`): it
-needs the conversion trait and the stdlib trait layer, and it is additive — turning it on later
-does not invalidate any exact-match `?` written before it. Until then, exact match keeps the
-feature simple and its failures legible.
+them, exactly as Rust's `?` calls `From::from`. That is **designed but deferred** (`§ Open a`), and
+what it waits on is now precise. A `From[E]` is writable — a trait takes type parameters (`02`) — but
+a type implements one trait **once**, so an `AppError` cannot be `From[IoError]` and
+`From[ParseError]` both. Lifting that needs a way for a use to say which implementation it means,
+which is `02`'s own open item. The conversion stays additive either way: turning it on later does
+not invalidate any exact-match `?` written before it, and until then exact match keeps the feature
+simple and its failures legible.
 
 ## 5. `?` and the memory model
 
@@ -220,7 +223,8 @@ where a call asks for one, and an `extern` nothing reaches is not declared in th
 
 - **a. `From`-style error conversion in `?`.** Let `?` convert the callee's `E` to the caller's
   `E` through a conversion trait, so cross-error-type propagation needs no manual step (§4).
-  Additive over the exact-match baseline; waits on the stdlib trait layer.
+  Additive over the exact-match baseline; waits on a way to choose between several implementations
+  of one trait for one type (`02`), which is what a useful `From` needs.
 - **b. `Result`/`Option` combinator library.** `map`, `and_then`, `or_else`, `ok_or`, and the
   rest are stdlib surface, designed when the standard library is (they are not language
   features). The *forcing* ones are settled and shipped (§8); these are the transforming ones.

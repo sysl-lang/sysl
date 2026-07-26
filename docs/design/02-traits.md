@@ -323,6 +323,71 @@ between two implementations cannot be walked back. If a case turns up that genui
 `[]byte` to render differently from every other slice, the language would be adding specialization
 with its eyes open, rather than discovering it had one.
 
+## A trait may take type parameters of its own
+
+A trait declares parameters in the same bracketed list every other generic declaration writes, and
+an implementation says which arguments it supplies them:
+
+```
+trait Sink[T]
+    put(self, x: T) -> int
+
+impl Sink[int] for Buffer
+    put(self, x: int) -> int = …
+```
+
+`Sink` is not one promise but a family of them: `Sink[int]` and `Sink[string]` say different things,
+and which one a `Buffer` makes is the implementation's to state. That is the whole feature, and it
+is what a trait needs before it can describe a relation between two types rather than a property of
+one — what a sink accepts, what a conversion converts from, what an iterator yields.
+
+The arguments are written in the same place in all three positions a trait is named, and they mean
+the same thing in each:
+
+- **a bound** — `f[X: Sink[int]](x: X)`, and the body's `x.put(…)` then takes an `int`;
+- **an implementation** — `impl Sink[int] for Buffer`;
+- **a trait object** — `&Sink[int]`, whose table is `@vt.ref.Sink.int.Buffer`.
+
+A bound's arguments are **types**, so one may name a parameter of the declaration that wrote it:
+`conv[X: Into[Y], Y](x: X) -> Y` is held to a different promise at every call, and the `Y` the call
+solves is what says which. What that parameter can then do is what *its* own bounds promise, so
+`[X: Into[Y], Y: Display]` is a body that may print what the conversion yields.
+
+A trait's own parameters carry bounds too — `trait Get[T: Show]` — and everything applying the trait
+supplies them, exactly as everything applying a bounded struct does (`10 §5`). It is one rule with
+one diagnostic, reached from three places.
+
+Nothing else about a trait changes. Defaults, properties, associated functions, object safety, and
+conformance all read the trait's parameters as ordinary types once the implementation has fixed
+them; a method written in the trait's `T` and one written in the type that `T` is are the same
+signature, which is the same rule that makes `Self` and the concrete name interchangeable (`14 §1`).
+
+### One implementation per type, whatever the arguments
+
+A type may implement a trait **once**, and the trait's arguments do not make a second one a
+different implementation:
+
+```
+impl From[int]  for Celsius        // fine
+impl From[real] for Celsius        // refused
+```
+
+The reason is the rule the rest of this chapter already rests on: **a trait's members become the
+type's members, and a type's members are one namespace** (`08`). Two implementations of `From` would
+give a `Celsius` two members called `from`, and `c.from(x)` would have no way to say which — the
+same collision that stops two traits declaring `show` from both being implemented for one type, and
+the same one that stops a shape and a written type from overlapping.
+
+So the trait's arguments are what an implementation *supplies*, not part of what it is filed under.
+A bound asking for `From[real]` is not met by a type that implements `From[int]`, and the diagnostic
+says so in those words — there is no second `impl` to write, and telling someone to write one would
+be sending them at a block that will be refused.
+
+Relaxing this needs a way to say which implementation a use means: overload resolution on the
+argument types, or a syntax that names the trait at the call. Both are additive, and neither is
+worth guessing at before a program wants one. It is the same conservative choice the overlap rule
+makes, for the same reason — refusing is reversible.
+
 ## Trait objects, as built
 
 A trait object is a **fat pointer** — two words, the method table for the type it forgot and the
@@ -408,7 +473,14 @@ signature, which stands in for every implementation because conformance is exact
 - **Laws / invariants on traits.** The old `trait` could assert invariants ("`Ord` is a total
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
-- **Trait bounds, associated types, generic interaction** — deferred to the generics spec.
+- **Associated types.** A trait's own parameters (above) cover much of what an associated type is
+  for — `Sink[T]`, `Into[T]` — with the difference that an argument is written by everything that
+  names the trait rather than chosen once by the implementation. Which of the two a language wants,
+  and whether it wants both, is a real question and is not answered here.
+- **Choosing between implementations of one trait for one type.** Refused above, because a type's
+  members are one namespace. Allowing `From[int]` and `From[real]` on one type needs a way for a use
+  to say which it means; that is what `11 § Open a`'s `?`-conversion is waiting on, not on generic
+  traits themselves.
 - **A trait method with type parameters of its own.** An inherent member may declare them (`08`,
   `10 §4`); a trait's may not, and so neither may an `impl`'s, which must match what the trait
   declares. Three questions come with allowing it and none is answered here: how a conformance

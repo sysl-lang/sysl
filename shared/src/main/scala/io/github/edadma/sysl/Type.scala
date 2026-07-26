@@ -95,9 +95,24 @@ object Type {
    * never sees this: the pass discards the tree it builds, and `llvm` says so rather than inventing
    * a representation for a type that has none.
    */
-  case class Abstract(name: String, bounds: List[String]) extends Type {
+  case class Abstract(name: String, bounds: List[Bound]) extends Type {
     def llvm: String =
       throw new IllegalStateException(s"the type parameter '$name' reached codegen")
+  }
+
+  /** One trait a parameter is bounded by, or one an implementation supplies, with the arguments the
+   * trait was applied to: `Show`, `From[int]`.
+   *
+   * Two bounds are the same promise exactly when they name the same trait at the same arguments, and
+   * `key` is what says so. It is a *string* rather than structural equality on purpose: an argument
+   * may be a type parameter standing in for itself, whose `Abstract` carries its own bounds along
+   * with it, and two spellings of one parameter must still compare equal. The key is also what
+   * implementations are filed under, so `From[int]` and `From[real]` are two of them for one type.
+   */
+  case class Bound(name: String, args: List[Type]) {
+    def key: String = qualified(name, args)
+
+    override def toString: String = key
   }
 
   /** A trait, in the one position a trait may stand where a type is asked for: behind a memory
@@ -109,7 +124,13 @@ object Type {
    * and the trait-ness is what makes that pointer fat. Resolving a bare trait name says so rather
    * than producing one of these.
    */
-  case class Trait(name: String) extends Type {
+  case class Trait(name: String, args: List[Type] = Nil) extends Type {
+
+    /** The trait as a bound names it, which is what an implementation is filed under: an object over
+     * `From[int]` dispatches through the implementation written for exactly that.
+     */
+    def bound: Bound = Bound(name, args)
+
     def llvm: String =
       throw new IllegalStateException(s"the trait '$name' reached codegen as a type of its own")
   }
@@ -240,7 +261,7 @@ object Type {
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem)              => s"[]${show(elem)}"
     case Abstract(n, _)           => n
-    case Trait(n)                 => n
+    case Trait(n, args)           => qualified(n, args)
     case other                    => other.llvm
 
   /** Whether a type carries no value at run time: `unit`, whose only value is nothing at all, and
@@ -392,6 +413,7 @@ object Type {
     case Ref(inner, true)  => s"sync.${mangleOne(inner)}"
     case Array(n, elem)    => s"arr$n.${mangleOne(elem)}"
     case Slice(elem)       => s"slice.${mangleOne(elem)}"
+    case Trait(n, args)    => mangled(n, args)
     case other            => show(other)
 
   /** How a type is written in a diagnostic: the friendly alias where one exists (`int`,

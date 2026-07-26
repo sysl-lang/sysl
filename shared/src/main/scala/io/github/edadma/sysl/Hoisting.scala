@@ -36,7 +36,7 @@ trait Hoisting extends TypeResolution {
     case t: TraitDecl =>
       if typeNameTaken(t.name) then err(s"the name '${t.name}' is already declared")
       traitDecls(t.name) = t
-      if t.tparams.nonEmpty then err(s"generic traits are not supported yet — '${t.name}'")
+      checkBoundNames(t.name, t.bounds)
       for m <- t.methods do
         // A property carries its receiver without writing one, so the reading below — no receiver
         // and a body, which for a method means a default with nothing to work on — is not what a
@@ -92,17 +92,21 @@ trait Hoisting extends TypeResolution {
 
     case _ =>
 
-  /** Checks that every bound a declaration writes names a trait, whichever declaration form wrote it
-   * — a function, a struct, or an enum. A bound is a trait and nothing else (`10 §5`), so a name
-   * that is a struct, a scalar, or nothing at all is reported here rather than silently promising
-   * something no type could ever be held to.
+  /** Checks that every bound a declaration writes names a trait and applies it to as many arguments
+   * as it declares, whichever declaration form wrote it — a function, a struct, an enum, a trait. A
+   * bound is a trait and nothing else (`10 §5`), so a name that is a struct, a scalar, or nothing at
+   * all is reported here rather than silently promising something no type could ever be held to.
    *
    * It runs in a pass after every type is registered, so a bound may name a trait declared further
-   * down the file.
+   * down the file. What the *arguments* are is left to `resolveBound`, which is reached wherever the
+   * substitution that gives them meaning exists; the arity is answerable here and worth saying at
+   * the declaration rather than at whatever first applied it.
    */
-  protected def checkBoundNames(name: String, bounds: Map[String, List[String]]): Unit =
-    for (tp, traits) <- bounds; tr <- traits if !traitDecls.contains(tr) do
-      err(s"the bound on '$tp' in '$name' names '$tr', which is not a trait")
+  protected def checkBoundNames(name: String, bounds: Map[String, List[BoundRef]]): Unit =
+    for (tp, traits) <- bounds; tr <- traits do
+      traitDecls.get(tr.name) match
+        case None       => err(s"the bound on '$tp' in '$name' names '${tr.name}', which is not a trait")
+        case Some(decl) => at(tr.pos)(checkTraitArity(tr.name, decl.tparams, tr.args.map(_ => Type.Unknown)))
 
   /** The rules a declared signature must satisfy whichever declaration form it came from, checked
    * after the name is registered so a failure reports the mistake without also erasing the
@@ -218,6 +222,10 @@ trait Hoisting extends TypeResolution {
    *     variants), and `noun` what a diagnostic calls one of those.
    *   - `self` is what `Self` means inside these members, empty where the answer waits for an
    *     instantiation (a generic type's members) or means nothing at all.
+   *   - `outer` is what the **trait's** own type parameters mean, for the members an `impl` of a
+   *     generic trait brings. They are fixed by the block rather than by anything a call does, so
+   *     unlike `tparams` they are answers rather than questions, and a member's signature and body
+   *     read them exactly as they read `Self`.
    */
   private case class MemberHome(
       key: String,
@@ -226,11 +234,17 @@ trait Hoisting extends TypeResolution {
       head: Option[String],
       selfRef: TypeRef,
       tparams: List[String],
-      bounds: Map[String, List[String]],
+      bounds: Map[String, List[BoundRef]],
       taken: Set[String],
       noun: String,
       self: Map[String, Type],
+      outer: Map[String, Type] = Map.empty,
   ) {
+
+    /** Everything a member's signature resolves against that a call does not supply: the trait's
+     * arguments, and `Self` where it is already known.
+     */
+    def fixed: Map[String, Type] = outer ++ self
 
     /** Whether this block is the one matching the shape, rather than one of the types it covers.
      * A composed type written out in full is never spelled as its own shape, so the keys settle it.
@@ -333,12 +347,13 @@ trait Hoisting extends TypeResolution {
         // yet. The reference is what waits, and every substitution that fixes the parameters fixes
         // it too; on a concrete type it is already the answer and resolves to the same thing.
         genericSelf(fd.name) = home.selfRef
+        if home.outer.nonEmpty then genericOuter(fd.name) = home.outer
       else
         out += fd
-        if home.self.nonEmpty then memberSelf(fd.name) = home.self
+        if home.fixed.nonEmpty then memberSelf(fd.name) = home.fixed
         funcInsts(fd.name) =
-          (fd.params.map(p => (p.name, resolveType(p.typ, home.self))),
-           fd.retType.map(resolveReturn(_, home.self)).getOrElse(Type.Unit))
+          (fd.params.map(p => (p.name, resolveType(p.typ, home.fixed))),
+           fd.retType.map(resolveReturn(_, home.fixed)).getOrElse(Type.Unit))
 
     lowered.toList
   }
@@ -350,21 +365,28 @@ trait Hoisting extends TypeResolution {
    * member path with no dispatch machinery of its own.
    */
   protected def hoistImpl(impl: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
-    val tr         = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
-    val (ty, home) = implTarget(impl)
+    val tr           = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
+    val (ty, target) = implTarget(impl)
+    val bound        = implBound(impl, tr)
+    val home         = target.copy(outer = tr.tparams.zip(bound.args).toMap)
 
     // A built-in's memberships come from the compiler (`14 §5`), so an `impl` for one is not adding
     // a capability but competing with the one that is already there — and the operator would keep
     // lowering to its native instruction whatever this block said.
-    if CoreTraits.builtin(impl.traitName, ty) then
+    if bound.args.isEmpty && CoreTraits.builtin(impl.traitName, ty) then
       err(s"'${home.label}' already implements '${impl.traitName}' — the compiler provides it")
 
     // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
     // are the one implementation they are, and so are `[]int` and `[]i32`. A generic type has one
     // key for all of its instantiations, which is what makes an implementation cover the type as a
     // whole and two of them for one generic type a collision rather than a choice.
-    if traitImpls.contains((impl.traitName, home.key)) then
-      err(s"'${home.label}' already implements '${impl.traitName}'")
+    //
+    // The trait's arguments are deliberately **not** part of the key. A trait's members become the
+    // type's, and a type's members are one namespace, so `impl From[int] for C` and
+    // `impl From[real] for C` would give a `C` two members called `from` with nothing to say which
+    // one `c.from(x)` meant.
+    for written <- implFor.get((impl.traitName, home.key)) do
+      err(s"'${home.label}' already implements '$written'" + secondImplementation(tr))
 
     // A shape and a type of that shape written out in full would both implement the trait for that
     // type, and sysl has no rule that picks between two implementations — the more specific one does
@@ -382,9 +404,10 @@ trait Hoisting extends TypeResolution {
         writtenShapes((impl.traitName, h)) = home.label
 
     traitImpls((impl.traitName, home.key)) = impl
+    implFor((impl.traitName, home.key)) = bound.key
 
     if home.tparams.nonEmpty && home.bounds.nonEmpty then
-      implBounds((impl.traitName, home.key)) = home.tparams.map(home.bounds.getOrElse(_, Nil))
+      implBounds((impl.traitName, home.key)) = (home.tparams, home.bounds)
 
     // A default the block left out is hoisted for this type exactly as a written method is, from the
     // body the trait supplied — so everything downstream (a call, a vtable slot, the escape summary)
@@ -408,20 +431,75 @@ trait Hoisting extends TypeResolution {
     abstractMembers ++= lowered.filter(_.tparams.nonEmpty).filterNot(f => defaultOrigin.contains(f.name))
   }
 
+  /** Why a *generic* trait is no more implementable twice than any other, said only where the
+   * arguments might have made a reader think otherwise.
+   */
+  private def secondImplementation(tr: TraitDecl): String =
+    if tr.tparams.isEmpty then ""
+    else
+      s" — a trait's members become the type's, so a second '${tr.name}' would give '${tr.methods.head.name}' " +
+        "two meanings and a call no way to say which"
+
+  /** Which promise an `impl` block supplies: the trait, at the arguments this block writes for it.
+   *
+   * The arguments must be types the block fixes outright, not its own parameters. An
+   * `impl[T] From[T] for Wrapper` would be an implementation for every `From` at once, and deciding
+   * which of several such blocks a `From[int]` reaches is the matching problem sysl does not have —
+   * one implementation per (trait-at-arguments, type) is what every table here is keyed by, and a
+   * parameter in the key is a key that matches many things.
+   */
+  private def implBound(impl: ImplDecl, tr: TraitDecl): Type.Bound = {
+    checkTraitArity(impl.traitName, tr.tparams, impl.traitArgs.map(_ => Type.Unknown))
+
+    // The block's parameters resolve to themselves so that naming one here is caught as the thing it
+    // is, rather than reported as an unknown type — which would send the reader looking for a
+    // declaration rather than at the argument they meant to fix.
+    val declared = abstractSubst(impl.tparams, impl.bounds)
+    val args     = impl.traitArgs.map(resolveType(_, declared))
+
+    for a <- args; abs <- mentionedParam(a) do
+      err(s"'${abs.name}' is a type parameter of this 'impl', so it leaves which '${impl.traitName}' " +
+        "this block implements open — write the type the trait is applied to")
+
+    for tp <- impl.tparams if tr.tparams.contains(tp) do
+      err(s"trait '${impl.traitName}' already declares a type parameter '$tp', so this 'impl' " +
+        "cannot declare one of that name")
+
+    deferredBounds(impl.traitName, tr.tparams, tr.bounds, args)
+
+    Type.Bound(impl.traitName, args)
+  }
+
+  /** The first type parameter a type is built out of, if any — what tells a written type from one
+   * that still depends on something a call would fix.
+   */
+  private def mentionedParam(t: Type): Option[Type.Abstract] = t match
+    case a: Type.Abstract    => Some(a)
+    case n: Type.Named       => n.targs.flatMap(mentionedParam).headOption
+    case Type.Ptr(inner)     => mentionedParam(inner)
+    case Type.Ref(inner, _)  => mentionedParam(inner)
+    case Type.Array(_, elem) => mentionedParam(elem)
+    case Type.Slice(elem)    => mentionedParam(elem)
+    case _                   => None
+
   /** What a signature written inside these members resolves under.
    *
    * A concrete `impl` binds only `Self`, to the one type it is for. A generic one binds its own
    * parameters to themselves — the opaque stand-in of `14 §4` — and `Self` to the type applied to
    * them, so `-> Self` and `-> Box[T]` are the one signature conformance compares, exactly as
    * `-> Self` and `-> Point` are on a concrete implementation.
+   *
+   * The trait's own parameters are bound either way, since the block fixed them: a method written in
+   * the trait's `T` and one written in the type that `T` is are the same signature.
    */
   private def signatures(home: MemberHome): Map[String, Type] =
-    if home.tparams.isEmpty then home.self
-    else
-      val abstracts: Map[String, Type] =
-        home.tparams.map(tp => tp -> Type.Abstract(tp, home.bounds.getOrElse(tp, Nil))).toMap
+    home.outer ++ {
+      if home.tparams.isEmpty then home.self
+      else
+        val abstracts = abstractSubst(home.tparams, home.bounds)
 
-      abstracts + (selfName -> resolveType(home.selfRef, abstracts))
+        abstracts + (selfName -> resolveType(home.selfRef, abstracts))
+    }
 
   /** The type an `impl` is for, and where its members belong.
    *
@@ -474,8 +552,7 @@ trait Hoisting extends TypeResolution {
         // The block's parameters stand in for themselves while the subject is resolved, so a shape
         // written with one comes back as the shape it is — `[]T` as a slice of something — rather
         // than through a complaint about a name that means nothing outside this block.
-        val abstracts: Map[String, Type] =
-          impl.tparams.map(tp => tp -> Type.Abstract(tp, impl.bounds.getOrElse(tp, Nil))).toMap
+        val abstracts = abstractSubst(impl.tparams, impl.bounds)
 
         // Resolved rather than taken as written, so the key is the type's one canonical name and
         // two spellings of one type are one implementation.
@@ -747,10 +824,14 @@ trait Hoisting extends TypeResolution {
       m  <- tr.methods if m.body.nonEmpty
     yield FuncDecl(
       s"${tr.name}.${m.name}",
-      List(selfName),
+      selfName :: tr.tparams,
       receiverParam(m, NamedType(selfName, Nil)).toList ::: m.params,
       m.retType,
       m.body,
-      bounds = Map(selfName -> List(tr.name)),
+      // A generic trait's default is generic over the trait's parameters too — they are as unknown
+      // inside the body as `Self` is — and what `Self` promises is the trait *applied* to them,
+      // which is the one promise every implementation of it makes.
+      bounds = tr.bounds +
+        (selfName -> List(BoundRef(tr.name, tr.tparams.map(NamedType(_, Nil))))),
     ).setPos(m.pos)
 }

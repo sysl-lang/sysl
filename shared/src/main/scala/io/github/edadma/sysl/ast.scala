@@ -152,6 +152,18 @@ case class RefType(inner: TypeRef, sync: Boolean) extends TypeRef
 /** `[N]T` — a fixed array — or `[]T`, a slice, when no length is written. */
 case class ArrayType(length: Option[Expr], elem: TypeRef) extends TypeRef
 
+/** A trait as a **bound** names it: `Show`, or `From[int]` where the trait takes parameters of its
+ * own. It is not a `TypeRef` — a trait is not a type, and the one thing that may stand here is a
+ * trait applied to as many arguments as it declares.
+ *
+ * The arguments stay unresolved until something has a substitution to resolve them under, because a
+ * bound may mention the parameters of the declaration that wrote it: `f[T: From[U], U]` is held to
+ * `From[int]` at a call that fixes `U = int`.
+ */
+case class BoundRef(name: String, args: List[TypeRef] = Nil) extends Positioned {
+  def show: String = if args.isEmpty then name else s"$name[${args.map(_.show).mkString(", ")}]"
+}
+
 /** One `name: type` binding, shared by function parameters and struct fields. */
 case class Param(name: String, typ: TypeRef) extends Positioned
 
@@ -187,7 +199,7 @@ case class MethodDecl(
     params: List[Param],
     retType: Option[TypeRef],
     body: List[Stmt],
-    bounds: Map[String, List[String]] = Map.empty,
+    bounds: Map[String, List[BoundRef]] = Map.empty,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the
@@ -255,7 +267,7 @@ case class FuncDecl(
     params: List[Param],
     retType: Option[TypeRef],
     body: List[Stmt],
-    bounds: Map[String, List[String]] = Map.empty,
+    bounds: Map[String, List[BoundRef]] = Map.empty,
     variadic: Boolean = false,
 ) extends Stmt
 
@@ -295,7 +307,7 @@ case class StructDecl(
     tparams: List[String],
     fields: List[Param],
     members: List[MethodDecl] = Nil,
-    bounds: Map[String, List[String]] = Map.empty,
+    bounds: Map[String, List[BoundRef]] = Map.empty,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
@@ -316,7 +328,7 @@ case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param
  */
 case class EnumDecl(name: String, tparams: List[String], underlying: Option[TypeRef],
                     variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil,
-                    bounds: Map[String, List[String]] = Map.empty) extends Stmt
+                    bounds: Map[String, List[BoundRef]] = Map.empty) extends Stmt
 
 /** `trait Name` with indented method declarations — a method with a receiver and a parameter list,
  * written either as a bare **signature** (`show(self) -> string`) or with a body, which makes it a
@@ -325,8 +337,17 @@ case class EnumDecl(name: String, tparams: List[String], underlying: Option[Type
  *
  * A signature is a `MethodDecl` with an empty `body`, and that is the whole of the difference: a
  * method with one is a definition every `impl` inherits unless it writes its own.
+ *
+ * `tparams` makes the trait **generic**: `trait From[T]` is a different promise for every `T`, so a
+ * type may implement it once per argument list and a bound naming it must say which one it means.
+ * `bounds` is what the trait asks of those parameters, exactly as a struct's are.
  */
-case class TraitDecl(name: String, tparams: List[String], methods: List[MethodDecl]) extends Stmt
+case class TraitDecl(
+    name: String,
+    tparams: List[String],
+    methods: List[MethodDecl],
+    bounds: Map[String, List[BoundRef]] = Map.empty,
+) extends Stmt
 
 /** `impl Trait for Type` with indented method **bodies**. Every method the trait declares without a
  * default must be present with a matching signature, and no method the trait does not declare; the
@@ -344,13 +365,18 @@ case class TraitDecl(name: String, tparams: List[String], methods: List[MethodDe
  * block asks of them: `impl[T: Show] Show for Box[T]` is **conditional conformance**, so a
  * `Box[int]` implements `Show` exactly when `int` does. Both are empty for an ordinary `impl`,
  * whose subject is one concrete type.
+ *
+ * `traitArgs` are the arguments the **trait** is applied to, for a trait that takes any:
+ * `impl From[int] for Celsius`. They are what makes one type able to implement a trait more than
+ * once, so they are part of what an implementation is filed under.
  */
 case class ImplDecl(
     traitName: String,
     forType: TypeRef,
     methods: List[MethodDecl],
     tparams: List[String] = Nil,
-    bounds: Map[String, List[String]] = Map.empty,
+    bounds: Map[String, List[BoundRef]] = Map.empty,
+    traitArgs: List[TypeRef] = Nil,
 ) extends Stmt
 
 case class Program(body: List[Stmt])

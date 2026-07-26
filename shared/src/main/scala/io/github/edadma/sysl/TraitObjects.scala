@@ -33,14 +33,20 @@ trait TraitObjects extends TypeResolution {
 
       // A value where a counted object was expected is boxed first, exactly as a plain `&T` context
       // boxes one — the allocation is the construction, and the erasure rides on top of it.
-      case (Type.Ref(_, sync), inner) if implements(tr.name, inner) =>
+      case (Type.Ref(_, sync), inner) if implements(tr.bound, inner) =>
         erase(TBox(t, Type.Ref(inner, sync)).setPos(t.pos), tr, inner, want, boxed = true)
 
       // A concrete value where a *raw* object was expected has no address of its own to hand over,
       // and taking one silently would be putting a pointer to a temporary in a program.
-      case (Type.Ptr(_), inner) if implements(tr.name, inner) =>
+      case (Type.Ptr(_), inner) if implements(tr.bound, inner) =>
         at(t.pos)(err(s"a ${show(want)} points at a value, so it needs an address — write '&' " +
           s"in front of the ${show(inner)} to take one"))
+
+      // A type that implements the trait at *other* arguments looks unrelated to the fall-through
+      // below, and what that would report is two type names with nothing said about why they do not
+      // match. So it is reported here instead, where the arguments can be named.
+      case (_, inner) if implFor.contains((tr.name, ownerKey(inner))) =>
+        erase(t, tr, inner, want, boxed = false)
 
       case _ => t
   }
@@ -53,17 +59,17 @@ trait TraitObjects extends TypeResolution {
    * distinction: object safety already refuses every trait in the catalog, so the only traits that
    * reach here are ones a program declared and implemented itself.
    */
-  private def implements(traitName: String, t: Type): Boolean = conforms(traitName, t)
+  private def implements(tr: Type.Bound, t: Type): Boolean = conforms(tr, t)
 
   private def erase(t: TExpr, tr: Type.Trait, inner: Type, want: Type, boxed: Boolean): TExpr =
-    if !implements(tr.name, inner) then
+    if !implements(tr.bound, inner) then
       // A type an implementation covers is told what that implementation asked of it, since the
       // reason it does not conform is a condition rather than an absence.
-      val why = unmetBound(tr.name, inner).fold("")(reason => s" — $reason")
+      val why = unmetBound(tr.bound, inner).fold("")(reason => s" — $reason")
 
-      at(t.pos)(err(s"a ${show(want)} needs a type that implements '${tr.name}', and " +
+      at(t.pos)(err(s"a ${show(want)} needs a type that implements '${tr.bound.key}', and " +
         s"${show(inner)} does not$why"))
-    else TErase(t, vtableFor(tr.name, inner, boxed), want).setPos(t.pos)
+    else TErase(t, vtableFor(tr, inner, boxed), want).setPos(t.pos)
 
   /** The method table for one type seen as one trait, registered the first time it is needed.
    *
@@ -74,11 +80,11 @@ trait TraitObjects extends TypeResolution {
    * a member of a generic type is instantiated here as it would be at a call site, so erasing a
    * `Box[int]` brings that instantiation into the program.
    */
-  private def vtableFor(traitName: String, ty: Type, boxed: Boolean): String = {
-    val name = s"vt.${if boxed then "ref." else ""}$traitName.${Type.mangle(ty)}"
+  private def vtableFor(tr: Type.Trait, ty: Type, boxed: Boolean): String = {
+    val name = s"vt.${if boxed then "ref." else ""}${Type.mangle(tr)}.${Type.mangle(ty)}"
 
     if !vtables.contains(name) then
-      val slots = traitDecls(traitName).methods.map { m =>
+      val slots = traitDecls(tr.name).methods.map { m =>
         val fname           = memberFuncName(ty, m.name)
         val (params, rtype) = funcInsts(fname)
 
@@ -89,7 +95,7 @@ trait TraitObjects extends TypeResolution {
         TVSlot(fname, m.recvMode.get, params.tail.map(_._2), rtype)
       }
 
-      vtables(name) = TVtable(name, traitName, ty, boxed, slots)
+      vtables(name) = TVtable(name, tr.name, ty, boxed, slots)
 
     name
   }

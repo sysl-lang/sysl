@@ -52,18 +52,44 @@ trait AnalyzerBase {
    *
    * Keying by the owner key rather than by the name as written is what makes `impl Show for int` and
    * `impl Show for i32` the one implementation they are — the same type reached by two spellings.
+   *
+   * Keying by the trait's **name** rather than by the arguments it was applied to is the decision a
+   * generic trait forced. A trait's members become the type's members, and a type's members are one
+   * namespace (`08`), so a second implementation of one trait — however different its arguments —
+   * would give the type two members of each name with no rule for choosing between them. One per
+   * (trait, type) is therefore the rule, and `implFor` is where the arguments that one supplies are
+   * recorded.
    */
   protected val traitImpls = mutable.LinkedHashMap.empty[(String, String), ImplDecl]
 
-  /** What a **generic** `impl` asks of the type arguments its subject is applied to, one entry per
-   * argument position, keyed exactly as `traitImpls` is.
+  /** Which promise each implementation actually makes — the trait at the arguments the block wrote
+   * for it — keyed exactly as `traitImpls` is.
+   *
+   * `impl Sink[int] for Adder` files an `Adder` under `Sink`, and this is what says the `Sink` it
+   * implements is `Sink[int]`: a bound asking for `Sink[string]` is not met by it, and the
+   * diagnostic can say what the type does implement instead of only what it does not.
+   */
+  protected val implFor = mutable.LinkedHashMap.empty[(String, String), String]
+
+  /** What a **generic** `impl` asks of the type arguments its subject is applied to — the block's
+   * own parameters in the subject's argument order, and the bounds it wrote on them — keyed exactly
+   * as `traitImpls` is.
    *
    * `impl[T: Show] Show for Box[T]` is **conditional conformance**: a `Box` implements `Show` when
-   * its element does, and this is the condition, in the order the implementation's subject wrote its
-   * arguments. An unconditional `impl` — generic or not — has no entry, which is what makes the
-   * ordinary case a lookup that asks nothing further.
+   * its element does, and this is the condition. The bounds are kept as written rather than resolved
+   * because one may name another of the block's parameters, and only the arguments a particular
+   * `Box` was made with say what that means. An unconditional `impl` — generic or not — has no
+   * entry, which is what makes the ordinary case a lookup that asks nothing further.
    */
-  protected val implBounds = mutable.LinkedHashMap.empty[(String, String), List[List[String]]]
+  protected val implBounds =
+    mutable.LinkedHashMap.empty[(String, String), (List[String], Map[String, List[BoundRef]])]
+
+  /** Whether an implementation of `tr.name` supplies exactly the promise `tr` asks for. Trivially
+   * true for a trait that takes no arguments, which is why nothing outside a generic trait ever
+   * has to think about it.
+   */
+  protected def suppliesBound(tr: Type.Bound, key: String): Boolean =
+    implFor.get((tr.name, key)).forall(_ == tr.key)
 
   /** The composed types written out in full that implement a trait, keyed by (trait name, the
    * **shape** each one has). It is what a shape-matched `impl` consults to find that the thing it
@@ -94,6 +120,15 @@ trait AnalyzerBase {
    * meaning there — the same answer, one step later.
    */
   protected val genericSelf = mutable.LinkedHashMap.empty[String, TypeRef]
+
+  /** What the **trait's** own type parameters mean inside a member of a generic `impl`, by the name
+   * the member was lowered to.
+   *
+   * `impl[U] From[int] for Box[U]` supplies a member whose signature may be written in the trait's
+   * `T`, and a default it inherits certainly is. `U` is fixed per instantiation and `T` is fixed by
+   * the block, so the two answers come from different places and only this one has anywhere to wait.
+   */
+  protected val genericOuter = mutable.LinkedHashMap.empty[String, Map[String, Type]]
 
   /** The members of a generic `impl`, each as the generic function it was lowered to, for the
    * definition-time pass of `14 §4` to walk.
@@ -296,6 +331,22 @@ trait AnalyzerBase {
         found += ((msg, pos))
         poisoned()
 
+  /** `recover`, for a region whose complaint must survive the abstract pass rather than be dropped
+   * by it.
+   *
+   * It is for the checks that are about a **declaration** rather than about a body: what a bound
+   * names, and what the trait it names asks of the arguments it was applied to. Those are wrong
+   * wherever they are read, so reading them during a walk that discards its tree is no reason to
+   * stay quiet about them — and nothing else will ever read them if no call site turns up.
+   */
+  protected def recorded[T](fallback: => T)(body: => T): T =
+    try body
+    catch
+      case AnalyzerError(msg, pos) =>
+        found += ((msg, pos))
+        fallback
+      case Poisoned() => fallback
+
   /** Whether a value of type `got` genuinely cannot stand where a `want` was asked for — an
    * argument against a parameter, a returned value against a declared result.
    *
@@ -333,7 +384,7 @@ trait AnalyzerBase {
   /** What a nominal type asks of its own parameters, by parameter name. Empty for a type that asks
    * nothing, which is every type that takes no parameters and most of those that do.
    */
-  protected def nominalBounds(base: String): Map[String, List[String]] =
+  protected def nominalBounds(base: String): Map[String, List[BoundRef]] =
     structDecls.get(base).map(_.bounds).orElse(enumDecls.get(base).map(_.bounds)).getOrElse(Map.empty)
 
   /** Whether the `impl` blocks have all been registered, which is what makes a bound answerable.
@@ -349,18 +400,27 @@ trait AnalyzerBase {
    * position to report it against. Drained once, as soon as the answer is available.
    */
   protected val boundChecks =
-    mutable.ListBuffer.empty[(String, List[String], Map[String, List[String]], List[Type], Option[Pos])]
+    mutable.ListBuffer.empty[(String, List[String], Map[String, List[BoundRef]], List[Type], Option[Pos])]
 
   /** Checks the arguments a *type* was applied to against what it asks of its parameters, now if
    * that can be answered and after hoisting if it cannot.
    */
-  protected def checkTypeBounds(name: String, tparams: List[String], targs: List[Type]): Unit = {
-    val bounds = nominalBounds(name)
+  protected def checkTypeBounds(name: String, tparams: List[String], targs: List[Type]): Unit =
+    deferredBounds(name, tparams, nominalBounds(name), targs)
 
+  /** The same, for any generic declaration applied to arguments while the file is still being
+   * hoisted — a type, or a **trait**, which is applied in a bound, in an `impl`, and in a trait
+   * object alike.
+   */
+  protected def deferredBounds(
+      what: String,
+      tparams: List[String],
+      bounds: Map[String, List[BoundRef]],
+      targs: List[Type],
+  ): Unit =
     if bounds.nonEmpty && tparams.length == targs.length then
-      if implsHoisted then checkParamBounds(name, tparams, bounds, targs)
-      else boundChecks += ((name, tparams, bounds, targs, currentPos))
-  }
+      if implsHoisted then checkParamBounds(what, tparams, bounds, targs)
+      else boundChecks += ((what, tparams, bounds, targs, currentPos))
 
   /** Whether the type arguments a generic declaration was applied to implement what it asked of its
    * parameters — the one rule, wherever the parameters came from: a function's, an `impl` block's,
@@ -372,31 +432,38 @@ trait AnalyzerBase {
   protected def checkParamBounds(
       what: String,
       tparams: List[String],
-      bounds: Map[String, List[String]],
+      bounds: Map[String, List[BoundRef]],
       targs: List[Type],
   ): Unit =
     if bounds.nonEmpty then
       val subst = tparams.zip(targs).toMap
 
-      for (tp, traits) <- bounds; tr <- traits do
+      for (tp, traits) <- bounds; ref <- traits do
         subst.get(tp) match
-          // A type parameter standing in for itself, during the definition-time pass. It is not a
-          // type anything has an `impl` for, so what it can promise is exactly what its own bounds
-          // promise: a bound is satisfied by a bound.
-          case Some(a: Type.Abstract) =>
-            if !a.bounds.contains(tr) then
-              boundErr(s"'$what' requires its type parameter '$tp' to implement '$tr', " +
-                s"but '${a.name}' is not bounded by it")
           case Some(Type.Unknown) =>
-          case Some(concrete) =>
-            if !satisfies(tr, concrete) then
-              // A type an implementation covers is told what that implementation asked of it, so the
-              // reader is sent one step in — to the argument that fails — rather than to a block
-              // that is already written.
-              val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
+          case Some(arg) =>
+            // The bound is resolved under the very arguments being checked, since one may name
+            // another of the parameters: `[T: From[U], U]` asks a different thing of `T` at every
+            // call, and `U`'s argument is what says which.
+            val tr = resolveBound(ref, subst)
 
-              err(s"'$what' requires its type parameter '$tp' to implement '$tr', " +
-                s"but ${show(concrete)} does not$why")
+            arg match
+              // A type parameter standing in for itself, during the definition-time pass. It is not
+              // a type anything has an `impl` for, so what it can promise is exactly what its own
+              // bounds promise: a bound is satisfied by a bound.
+              case a: Type.Abstract =>
+                if !a.bounds.exists(_.key == tr.key) then
+                  boundErr(s"'$what' requires its type parameter '$tp' to implement '${tr.key}', " +
+                    s"but '${a.name}' is not bounded by it")
+              case concrete =>
+                if !satisfies(tr, concrete) then
+                  // A type an implementation covers is told what that implementation asked of it, so
+                  // the reader is sent one step in — to the argument that fails — rather than to a
+                  // block that is already written.
+                  val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
+
+                  err(s"'$what' requires its type parameter '$tp' to implement '${tr.key}', " +
+                    s"but ${show(concrete)} does not$why")
           case None =>
 
   /** Where a type's members are registered: the key they are filed under, and the type arguments a
@@ -501,9 +568,16 @@ trait AnalyzerBase {
    * parameter** implements exactly what its own bounds promise, which is what lets a bounded body
    * hand its parameter on to something that asks the same of it.
    */
-  protected def satisfies(traitName: String, t: Type): Boolean = t match
-    case a: Type.Abstract => a.bounds.contains(traitName)
-    case _                => conforms(traitName, t) || CoreTraits.builtin(traitName, t)
+  protected def satisfies(tr: Type.Bound, t: Type): Boolean = t match
+    case a: Type.Abstract => a.bounds.exists(_.key == tr.key)
+    // A compiler-provided membership is a rule about one trait rather than a family of them, so a
+    // trait applied to arguments is never one: `Add` is an instruction, `Add[int]` is not a thing.
+    case _ => conforms(tr, t) || (tr.args.isEmpty && CoreTraits.builtin(tr.name, t))
+
+  /** The same question about a trait that takes no arguments, which is every trait the compiler
+   * knows by name and most of the ones a program declares.
+   */
+  protected def satisfies(traitName: String, t: Type): Boolean = satisfies(Type.Bound(traitName, Nil), t)
 
   /** Whether a type implements a trait **through a source `impl`** — conformance a table can point
    * at, as against a membership the compiler provides by rule.
@@ -514,13 +588,20 @@ trait AnalyzerBase {
    * exactly when `int` does, and a `Box[Point]` over a `Point` with no `Show` does not. A slice
    * covered by `impl[T: Show] Show for []T` is the same question asked of its element.
    */
-  protected def conforms(traitName: String, t: Type): Boolean =
-    implKey(traitName, t).exists { case (key, targs) =>
-      implBounds.get((traitName, key)).forall { required =>
-        targs.length == required.length &&
-        targs.zip(required).forall { case (arg, traits) => traits.forall(satisfies(_, arg)) }
+  protected def conforms(tr: Type.Bound, t: Type): Boolean =
+    implKey(tr, t).exists { case (key, targs) =>
+      implBounds.get((tr.name, key)).forall { case (tps, bounds) =>
+        val subst = tps.zip(targs).toMap
+
+        targs.length == tps.length &&
+        tps.zip(targs).forall { case (tp, arg) =>
+          bounds.getOrElse(tp, Nil).forall(b => satisfies(resolveBound(b, subst), arg))
+        }
       }
     }
+
+  /** The same, for a trait that takes no arguments. */
+  protected def conforms(traitName: String, t: Type): Boolean = conforms(Type.Bound(traitName, Nil), t)
 
   /** Which implementation of a trait a type is covered by, if any: the one written for the type,
    * or the one written for its shape, with the arguments it matched at.
@@ -529,11 +610,12 @@ trait AnalyzerBase {
    * one trait (`hoistImpl`) — so this is a lookup rather than a choice between implementations, and
    * sysl needs no rule saying which of two would be the more specific.
    */
-  protected def implKey(traitName: String, t: Type): Option[(String, List[Type])] = {
-    val own = memberOwner(t)
+  protected def implKey(tr: Type.Bound, t: Type): Option[(String, List[Type])] = {
+    val own    = memberOwner(t)
+    def has(k: String) = traitImpls.contains((tr.name, k)) && suppliesBound(tr, k)
 
-    if traitImpls.contains((traitName, own._1)) then Some(own)
-    else shapeOwner(t).filter(s => traitImpls.contains((traitName, s._1)))
+    if has(own._1) then Some(own)
+    else shapeOwner(t).filter(s => has(s._1))
   }
 
   /** Why a type an implementation *covers* still does not implement the trait — which is a different
@@ -546,13 +628,34 @@ trait AnalyzerBase {
    * argument that does not meet it. `None` where nothing covers the type, leaving the caller's own
    * advice — write one — the right advice.
    */
+  protected def unmetBound(tr: Type.Bound, t: Type): Option[String] =
+    // A type that implements the trait at *other* arguments is a different situation from one that
+    // does not implement it at all, and the advice differs with it: there is no second `impl` to
+    // write, since one trait is implemented once per type.
+    val wrongArgs =
+      for
+        key      <- List(memberOwner(t)._1) ::: shapeOwner(t).map(_._1).toList
+        supplied <- implFor.get((tr.name, key)) if supplied != tr.key
+      yield s"it implements '$supplied', and one trait is implemented once per type"
+
+    val unmetCondition =
+      for
+        (key, targs)  <- implKey(tr, t)
+        (tps, bounds) <- implBounds.get((tr.name, key))
+        if targs.length == tps.length
+        subst = tps.zip(targs).toMap
+        (arg, unmet) <- tps
+          .zip(targs)
+          .flatMap((tp, a) =>
+            bounds.getOrElse(tp, Nil).map(resolveBound(_, subst)).filterNot(satisfies(_, a)).map((a, _)))
+          .headOption
+      yield s"the 'impl' that covers it asks '${unmet.key}' of ${show(arg)}, which does not implement it"
+
+    wrongArgs.headOption.orElse(unmetCondition)
+
+  /** The same, for a trait that takes no arguments. */
   protected def unmetBound(traitName: String, t: Type): Option[String] =
-    for
-      (key, targs) <- implKey(traitName, t)
-      required     <- implBounds.get((traitName, key))
-      if targs.length == required.length
-      (arg, tr) <- targs.zip(required).flatMap((a, trs) => trs.filterNot(satisfies(_, a)).map((a, _))).headOption
-    yield s"the 'impl' that covers it asks '$tr' of ${show(arg)}, which does not implement it"
+    unmetBound(Type.Bound(traitName, Nil), t)
 
   /** The type a member is looked up on, seeing through one level of `*T` / `&T` so a method may be
    * called on a value, a pointer to it, or a reference to it alike.
@@ -685,6 +788,7 @@ trait AnalyzerBase {
   // These recursive entry points live in the class (statements, expressions, places) but are
   // called across the feature traits, so they are declared abstract here for the traits to see.
 
+  protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound
   protected def analyzeExpr(expr: Expr, expected: Option[Type] = None): TExpr
   protected def analyzeBool(e: Expr): TExpr
   protected def analyzePlace(target: Expr, what: String): TExpr

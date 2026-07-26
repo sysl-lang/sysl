@@ -308,33 +308,41 @@ class SyslParser(val source: Source) extends PackratParsers {
         op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
         op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
         (op("[") ~> opt(expression) <~ op("]")) ~ typeRef ^^ { case n ~ t => ArrayType(n, t) } |
-        ident ~ opt(op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")) ^^ { case n ~ args =>
-          NamedType(n, args.getOrElse(Nil))
-        },
+        ident ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
     )
+
+  /** The `[int, string]` argument list of an applied generic name, whether the name is a type's or
+   * a trait's — a trait takes its arguments the same way and in the same place.
+   */
+  private lazy val typeArgs: Parser[List[TypeRef]] =
+    op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")
 
   private lazy val softSync: Parser[Unit] =
     accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
-
-  /** The `[T, U]` type-parameter list of a generic declaration. */
-  private lazy val typeParams: Parser[List[String]] =
-    op("[") ~> rep1sep(ident, op(",")) <~ op("]")
 
   /** A type-parameter list where a parameter may carry a trait bound: `[T, U: Show, V: Ord + Hash]`.
    * It yields the parameter names alongside a name-keyed map of the bounds, so an unbounded
    * parameter is simply absent from the map.
    *
    * Every declaration that may be generic over types it does not know parses this one list — a
-   * function, an `impl` block, a struct, an enum — because a bound means the same thing in each: it
-   * is what the declaration assumes of the parameter, and what everything applying it must supply.
+   * function, an `impl` block, a struct, an enum, a trait — because a bound means the same thing in
+   * each: it is what the declaration assumes of the parameter, and what everything applying it must
+   * supply.
+   *
+   * A bound is a trait **applied**, so it takes type arguments where the trait declares any:
+   * `[E: From[IoError]]`. The arguments are types and parse as such, which is what lets one mention
+   * another of the parameters being declared.
    */
-  private lazy val boundedTypeParams: Parser[(List[String], Map[String, List[String]])] =
+  private lazy val boundedTypeParams: Parser[(List[String], Map[String, List[BoundRef]])] =
     op("[") ~> rep1sep(boundedTypeParam, op(",")) <~ op("]") ^^ { ps =>
       (ps.map(_._1), ps.collect { case (n, bs) if bs.nonEmpty => n -> bs }.toMap)
     }
 
-  private lazy val boundedTypeParam: Parser[(String, List[String])] =
-    ident ~ opt(op(":") ~> rep1sep(ident, op("+"))) ^^ { case n ~ bs => (n, bs.getOrElse(Nil)) }
+  private lazy val boundedTypeParam: Parser[(String, List[BoundRef])] =
+    ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ^^ { case n ~ bs => (n, bs.getOrElse(Nil)) }
+
+  private lazy val boundRef: Parser[BoundRef] =
+    at(ident ~ opt(typeArgs) ^^ { case n ~ args => BoundRef(n, args.getOrElse(Nil)) })
 
   private lazy val varDecl: PackratParser[Stmt] =
     op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
@@ -441,7 +449,7 @@ class SyslParser(val source: Source) extends PackratParsers {
       },
     )
 
-  private def methodTail(name: String, generics: (List[String], Map[String, List[String]])): Parser[MethodDecl] =
+  private def methodTail(name: String, generics: (List[String], Map[String, List[BoundRef]])): Parser[MethodDecl] =
     (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
       case (recv, params) ~ ret ~ body =>
         MethodDecl(name, recv, isProperty = false, generics._1, params, ret, body, generics._2)
@@ -502,9 +510,11 @@ class SyslParser(val source: Source) extends PackratParsers {
    * writes its own.
    */
   private lazy val traitDecl: PackratParser[Stmt] =
-    op("trait") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
+    op("trait") ~> ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
+      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+
       (newline ~> indent ~> opt(newlines) ~> repsep(traitMember, newlines) <~ opt(newlines) <~ dedent) <~
-        endName(name) ^^ { methods => TraitDecl(name, tps.getOrElse(Nil), methods) }
+        endName(name) ^^ { methods => TraitDecl(name, names, methods, bounds) }
     }
 
   /** A line inside a trait body. A **definition** is tried first, since it is a signature with more
@@ -551,12 +561,13 @@ class SyslParser(val source: Source) extends PackratParsers {
    * implementation, and the opt-in it states is the point of writing it.
    */
   private lazy val implDecl: PackratParser[Stmt] =
-    op("impl") ~> opt(boundedTypeParams) ~ ident ~ (op("for") ~> typeRef) >> { case tps ~ tname ~ forType =>
-      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+    op("impl") ~> opt(boundedTypeParams) ~ ident ~ opt(typeArgs) ~ (op("for") ~> typeRef) >> {
+      case tps ~ tname ~ targs ~ forType =>
+        val (names, bounds) = tps.getOrElse((Nil, Map.empty))
 
-      (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
-        ImplDecl(tname, forType, methods, names, bounds)
-      }
+        (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
+          ImplDecl(tname, forType, methods, names, bounds, targs.getOrElse(Nil))
+        }
     }
 
   private lazy val implBody: PackratParser[List[MethodDecl]] =

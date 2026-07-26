@@ -42,10 +42,11 @@ enum Option[T]                           // generic enum (09)
 ```
 
 A parameter name stands for a type not yet known; it may appear anywhere a type may — a
-parameter type, a return type, a field type, a variant payload, a local annotation. Two further
+parameter type, a return type, a field type, a variant payload, a local annotation. Three further
 forms take parameters without declaring a type: an **`impl` block**, whose subject is a generic type
-or a composed shape applied to them (`02`), and a **member**, which may be generic over types of its
-own beyond its type's (`08`, §4 below).
+or a composed shape applied to them (`02`), a **member**, which may be generic over types of its
+own beyond its type's (`08`, §4 below), and a **trait**, which is then a family of promises rather
+than one (`02`) — `trait Sink[T]` is what an implementation applies to `int` to say what it accepts.
 
 ## 2. `[]` means type application in a type, indexing in an expression
 
@@ -163,6 +164,20 @@ Operators are available through bounds because operators *are* trait methods (`0
 Rust-style overloading): `+` is `Add`, `<` is `Ord`, `==` is `Eq`. The exact operator-trait set
 is the standard library's to define; generics only fix that **an operator on a `T` requires the
 bound that supplies it**.
+
+**A bound is the trait *applied***, so it carries the trait's own type arguments where it has any
+(`02`):
+
+```
+take[X: Sink[int]](x: X) -> int = x.put(1)         // x.put takes an int
+conv[X: Into[Y], Y](x: X) -> Y = x.into()          // and Y is solved at the call
+```
+
+The arguments are ordinary types, which is what lets one name another parameter of the same
+declaration — and what a body may then do with that parameter is what *its* bounds promise, so
+`[X: Into[Y], Y: Display]` is a body that may print what the conversion yields. Inference does not
+run backwards through a bound: a parameter that appears only there is solved from the result type or
+annotated, exactly as §4's rule says.
 
 **Multiple bounds** join with `+`: `[T: Ord + Hash]` requires both. The `+` reads unambiguously
 in a bound position (it is between trait names, not values) and matches the Rust spelling that

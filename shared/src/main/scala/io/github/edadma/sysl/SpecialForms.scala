@@ -130,7 +130,7 @@ trait SpecialForms extends CallAnalysis {
    */
   private def displayOf(t: TExpr, op: String): (String, TExpr) = { checkWriterShape(); t.ty } match
     case a: Type.Abstract =>
-      if !a.bounds.contains("Display") then boundErr(s"'$op' needs '${a.name}: Display'")
+      if !a.bounds.exists(_.key == "Display") then boundErr(s"'$op' needs '${a.name}: Display'")
       ("Display.display", t)
 
     case ty =>
@@ -166,7 +166,7 @@ trait SpecialForms extends CallAnalysis {
    * the case `format` hands its specifier on for instead of applying it.
    */
   private def rendersItself(ty: Type): Boolean = ty match
-    case a: Type.Abstract => a.bounds.contains("Display")
+    case a: Type.Abstract => a.bounds.exists(_.key == "Display")
     case _                => conforms("Display", ty)
 
   /** The compiler's own writers are laid out by hand and reached by slot index, so `Writer`'s shape

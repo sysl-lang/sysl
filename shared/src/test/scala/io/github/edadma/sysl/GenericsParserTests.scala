@@ -46,7 +46,7 @@ class GenericsParserTests extends AnyFreeSpec with ParseSupport {
           List("T"),
           List(Param("head", NamedType("T"))),
           Nil,
-          Map("T" -> List("Ord", "Eq")),
+          Map("T" -> List(BoundRef("Ord"), BoundRef("Eq"))),
         )
       )
     }
@@ -59,7 +59,7 @@ class GenericsParserTests extends AnyFreeSpec with ParseSupport {
           None,
           List(EnumVariantDecl("Just", None, List(Param("value", NamedType("T")))), EnumVariantDecl("Nothing", None, Nil)),
           Nil,
-          Map("T" -> List("Show")),
+          Map("T" -> List(BoundRef("Show"))),
         )
       )
     }
@@ -71,7 +71,7 @@ class GenericsParserTests extends AnyFreeSpec with ParseSupport {
           List("A", "B"),
           List(Param("first", NamedType("A")), Param("second", NamedType("B"))),
           Nil,
-          Map("B" -> List("Show")),
+          Map("B" -> List(BoundRef("Show"))),
         )
       )
     }

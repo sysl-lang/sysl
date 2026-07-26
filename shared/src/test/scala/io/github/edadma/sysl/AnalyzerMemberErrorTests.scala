@@ -637,11 +637,15 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("has no method 'show'")
     }
 
-    "a generic trait is rejected for now" in {
+    "a generic trait says which one an 'impl' means" in {
       err(
         """trait Into[T]
-          |    into(self) -> T""".stripMargin
-      ) should include("generic traits are not supported yet")
+          |    into(self) -> T
+          |struct P
+          |    v: int
+          |impl Into for P
+          |    into(self) -> int = self.v""".stripMargin
+      ) should include("trait 'Into' takes 1 type argument, but 0 type arguments were given")
     }
 
     "implementing a trait for a generic struct needs the block's own parameters" in {

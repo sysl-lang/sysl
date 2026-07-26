@@ -257,24 +257,17 @@ trait CallAnalysis extends Literals with TraitObjects {
    * The tree it builds is discarded with the rest of the pass — the name it carries is the trait's,
    * and which implementation runs is monomorphization's to decide once a concrete type is known.
    */
-  private def callBoundMethod(a: Type.Abstract, recv: TExpr, mname: String, args: List[Expr]): TExpr = {
-    val declared =
-      a.bounds.flatMap(traitDecls.get).flatMap(t => t.methods.find(_.name == mname).map((t.name, _)))
-
-    declared.headOption match
+  private def callBoundMethod(a: Type.Abstract, recv: TExpr, mname: String, args: List[Expr]): TExpr =
+    boundMember(a, mname) match
       case None => unlicensed(a, mname)
-      case Some((trName, m)) =>
+      case Some((tr, self, m)) =>
         reported {
-          val fname = s"$trName.$mname"
+          val fname = s"${tr.name}.$mname"
           if m.isProperty then
-            err(s"'$mname' is a property of '$trName' — read it as 'value.$mname', without '()'")
+            err(s"'$mname' is a property of '${tr.key}' — read it as 'value.$mname', without '()'")
           if m.receiver.isEmpty then
-            err(s"'$mname' is an associated function of '$trName', so it has no receiver — a value " +
+            err(s"'$mname' is an associated function of '${tr.key}', so it has no receiver — a value " +
               "cannot be the thing it is called on")
-          // `Self` in the trait's signature is the parameter itself here, which is what makes
-          // `Add::add` yield a `T` and `Ord::lt` a `bool` inside a body that has not met a concrete
-          // type yet (`14 §4`).
-          val self   = selfBinding(a)
           val params = m.params.map(p => (p.name, resolveType(p.typ, self)))
           if args.length != params.length then
             err(s"method '$fname' takes ${quantity(params.length, "argument")}, " +
@@ -283,7 +276,23 @@ trait CallAnalysis extends Literals with TraitObjects {
           val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
           TCall(fname, recv :: checkArgs(fname, params, args, Some(ts)), rtype)
         }
-  }
+
+  /** The first member of that name one of a parameter's bounds declares, with the substitution its
+   * signature is read under.
+   *
+   * That substitution is the whole of what a bound's *arguments* buy. `Self` is the parameter
+   * itself, which is what makes `Add::add` yield a `T` and `Ord::lt` a `bool` inside a body that has
+   * not met a concrete type yet (`14 §4`); the trait's own parameters are the arguments the bound
+   * applied it to, so a `T: From[int]` has a `from` that takes an `int` and one bounded by
+   * `From[U]` has one that takes whatever `U` turns out to be.
+   */
+  private def boundMember(a: Type.Abstract, mname: String): Option[(Type.Bound, Map[String, Type], MethodDecl)] =
+    a.bounds.iterator
+      .flatMap(b => traitDecls.get(b.name).map((b, _)))
+      .flatMap { case (b, decl) =>
+        decl.methods.find(_.name == mname).map(m => (b, selfBinding(a) ++ decl.tparams.zip(b.args), m))
+      }
+      .nextOption()
 
   /** `x.p` where `x` is a type parameter and `p` is a property one of its bounds declares — the read
    * `callBoundMethod` is to a call, checked the same way and for the same reason.
@@ -293,21 +302,16 @@ trait CallAnalysis extends Literals with TraitObjects {
    * happens to be spelled like a field, so a trait can promise it, and a bounded body may read one
    * exactly as it may call a method.
    */
-  protected def readBoundProperty(a: Type.Abstract, recv: TExpr, name: String): TExpr = {
-    val declared =
-      a.bounds.flatMap(traitDecls.get).flatMap(t => t.methods.find(_.name == name).map((t.name, _)))
-
-    declared.headOption match
+  protected def readBoundProperty(a: Type.Abstract, recv: TExpr, name: String): TExpr =
+    boundMember(a, name) match
       case None => unlicensedProperty(a, name)
-      case Some((trName, m)) =>
+      case Some((tr, self, m)) =>
         reported {
           if !m.isProperty then
-            err(s"'$name' is a method of '$trName' — call it with '$name(…)'")
-          val self  = selfBinding(a)
+            err(s"'$name' is a method of '${tr.key}' — call it with '$name(…)'")
           val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
-          TCall(s"$trName.$name", List(recv), rtype)
+          TCall(s"${tr.name}.$name", List(recv), rtype)
         }
-  }
 
   /** The diagnostic for a property read that no bound licenses.
    *
@@ -335,6 +339,11 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   protected def callTraitObject(recv: TExpr, t: Type.Trait, mname: String, args: List[Expr]): TExpr = {
     val decl = traitDecls(t.name)
+    // The trait's own parameters are what the *object's* type fixed — an object over `Sink[int]`
+    // takes an `int` — so they are the whole of the substitution a signature is read under. `Self`
+    // is not in it at all: object safety already refused any trait that mentions one away from its
+    // receiver, so no signature reaching here contains one.
+    val subst: Map[String, Type] = decl.tparams.zip(t.args).toMap
 
     decl.methods.zipWithIndex.find(_._1.name == mname) match
       case None =>
@@ -343,7 +352,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       case Some((m, _)) if m.isProperty =>
         err(s"'$mname' is a property of '${t.name}' — read it as 'value.$mname', without '()'")
       case Some((m, slot)) =>
-        val params = m.params.map(p => (p.name, rt(p.typ)))
+        val params = m.params.map(p => (p.name, resolveType(p.typ, subst)))
         val fname  = s"${t.name}.$mname"
 
         if args.length != params.length then
@@ -351,7 +360,7 @@ trait CallAnalysis extends Literals with TraitObjects {
             s"but ${supplied(args.length, "argument")}")
 
         val ts    = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
-        val rtype = m.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit)
+        val rtype = m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit)
 
         TVCall(recv, slot, checkArgs(fname, params, args, Some(ts)), rtype)
   }
@@ -363,11 +372,12 @@ trait CallAnalysis extends Literals with TraitObjects {
    * one is either a property the trait declares or a mistake, and the second half of this says which.
    */
   protected def readTraitObjectProperty(recv: TExpr, t: Type.Trait, name: String): TExpr = {
-    val decl = traitDecls(t.name)
+    val decl                     = traitDecls(t.name)
+    val subst: Map[String, Type] = decl.tparams.zip(t.args).toMap
 
     decl.methods.zipWithIndex.find(_._1.name == name) match
       case Some((m, slot)) if m.isProperty =>
-        TVCall(recv, slot, Nil, m.retType.map(resolveReturn(_, Map.empty)).getOrElse(Type.Unit))
+        TVCall(recv, slot, Nil, m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit))
       case Some(_) =>
         err(s"'$name' is a method of '${t.name}' — call it with '$name(…)'")
       case None =>
@@ -438,7 +448,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     else
       ty match
         case a: Type.Abstract =>
-          if !a.bounds.contains(trName) then boundErr(s"'$op' needs '${a.name}: $trName'")
+          if !a.bounds.exists(_.key == trName) then boundErr(s"'$op' needs '${a.name}: $trName'")
           Some(TDispatch(s"$trName.$method", swap, negate))
         // The implementation is named by the rule a method call uses, which for a generic type is
         // the instantiation the receiver's own arguments make — `a + b` on a `Box[int]` reaches the

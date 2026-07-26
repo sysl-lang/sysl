@@ -99,7 +99,7 @@ class TraitParserTests extends AnyFreeSpec with ParseSupport {
           )
         ),
         List("T"),
-        Map("T" -> List("Show")),
+        Map("T" -> List(BoundRef("Show"))),
       )
     )
   }
@@ -182,7 +182,54 @@ class TraitParserTests extends AnyFreeSpec with ParseSupport {
         List(Param("x", NamedType("T"))),
         Some(NamedType("string")),
         List(ExprStmt(Call(Field(Ident("x"), "show"), Nil))),
-        Map("T" -> List("Show")),
+        Map("T" -> List(BoundRef("Show"))),
+      )
+    )
+  }
+
+  // A trait's own parameters are the one list every generic declaration writes, and an `impl` names
+  // the arguments it supplies them in the same place a type's arguments go.
+  "a trait declares type parameters, and an 'impl' says which one it means" in {
+    val src =
+      """trait From[T]
+        |    from(x: T) -> Self
+        |impl From[int] for P
+        |    from(x: int) -> Self = P(x)""".stripMargin
+
+    prog(src) shouldBe List(
+      TraitDecl(
+        "From",
+        List("T"),
+        List(
+          MethodDecl("from", None, isProperty = false, Nil, List(Param("x", NamedType("T"))),
+            Some(NamedType("Self")), Nil),
+        ),
+      ),
+      ImplDecl(
+        "From",
+        NamedType("P"),
+        List(
+          MethodDecl("from", None, isProperty = false, Nil, List(Param("x", NamedType("int"))),
+            Some(NamedType("Self")), List(ExprStmt(Call(Ident("P"), List(Ident("x")))))),
+        ),
+        Nil,
+        Map.empty,
+        List(NamedType("int")),
+      ),
+    )
+  }
+
+  // A bound is a trait *applied*, so its arguments parse as types — including one that names
+  // another of the parameters being declared.
+  "a bound carries the trait's own type arguments" in {
+    prog("conv[X: Into[Y], Y](x: X) -> Y = x.into()") shouldBe List(
+      FuncDecl(
+        "conv",
+        List("X", "Y"),
+        List(Param("x", NamedType("X"))),
+        Some(NamedType("Y")),
+        List(ExprStmt(Call(Field(Ident("x"), "into"), Nil))),
+        Map("X" -> List(BoundRef("Into", List(NamedType("Y"))))),
       )
     )
   }
@@ -195,7 +242,7 @@ class TraitParserTests extends AnyFreeSpec with ParseSupport {
         List(Param("x", NamedType("T")), Param("y", NamedType("U"))),
         Some(NamedType("int")),
         List(ExprStmt(i(1))),
-        Map("U" -> List("Ord", "Hash")),
+        Map("U" -> List(BoundRef("Ord"), BoundRef("Hash"))),
       )
     )
   }

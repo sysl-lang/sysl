@@ -53,7 +53,8 @@ trait TypeResolution extends AnalyzerBase {
    * come through here, so `Self` means the same thing in a checked body and in a run one.
    */
   protected def withSelf(fname: String, subst: Map[String, Type]): Map[String, Type] =
-    genericSelf.get(fname).fold(subst)(ref => subst + (selfName -> resolveType(ref, subst)))
+    genericOuter.getOrElse(fname, Map.empty) ++
+      genericSelf.get(fname).fold(subst)(ref => subst + (selfName -> resolveType(ref, subst)))
 
   /** Rewrites `Self` in a written type reference to the reference it stands for.
    *
@@ -68,6 +69,57 @@ trait TypeResolution extends AnalyzerBase {
     case PtrType(inner)                     => PtrType(spellSelf(inner, selfRef))
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
     case ArrayType(len, elem)               => ArrayType(len, spellSelf(elem, selfRef))
+
+  /** Resolves one bound — a trait, with whatever arguments it was applied to — under the
+   * substitution the declaration that wrote it is being read at.
+   *
+   * A bound is resolved late for the same reason a signature is: its arguments may name the
+   * parameters of the declaration it belongs to, so `[T: From[U], U]` is a different promise at
+   * every call, and the substitution that fixes `U` is what says which.
+   *
+   * What the trait asks of its *own* parameters is checked here too, since a bound is one of the
+   * three places a trait is applied — the others being an `impl` and a trait object.
+   */
+  protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound = at(b.pos) {
+    val args = b.args.map(resolveType(_, subst))
+
+    for decl <- traitDecls.get(b.name) do
+      checkTraitArity(b.name, decl.tparams, args)
+      deferredBounds(b.name, decl.tparams, decl.bounds, args)
+
+    Type.Bound(b.name, args)
+  }
+
+  /** A trait applied to the wrong number of arguments, said in the words a trait deserves — the
+   * type-level message would send the reader looking for a struct of that name.
+   */
+  protected def checkTraitArity(name: String, tparams: List[String], targs: List[Type]): Unit =
+    if tparams.length != targs.length then
+      if tparams.isEmpty then err(s"trait '$name' does not take type arguments")
+      else
+        err(s"trait '$name' takes ${quantity(tparams.length, "type argument")}, " +
+          s"but ${supplied(targs.length, "type argument")}")
+
+  /** A declaration's type parameters as its own body sees them: each standing in for itself, and
+   * carrying what the declaration asked of it (`14 §4`).
+   *
+   * The bounds are resolved with the *siblings* standing in for themselves too, which is what lets
+   * `f[T: Iter[U], U: Display]` know that what `T`'s iterator yields is something printable. A bound
+   * that reaches back around to the parameter it belongs to is broken by dropping that parameter's
+   * own bounds one level in — the promise stays, and only the walk stops.
+   */
+  protected def abstractSubst(tparams: List[String], bounds: Map[String, List[BoundRef]]): Map[String, Type] = {
+    def build(tp: String, seen: Set[String]): Type.Abstract =
+      Type.Abstract(
+        tp,
+        if seen(tp) then Nil
+        else
+          val inner: Map[String, Type] = tparams.map(p => p -> build(p, seen + tp)).toMap
+          bounds.getOrElse(tp, Nil).map(b => recorded(Type.Bound(b.name, Nil))(resolveBound(b, inner))),
+      )
+
+    tparams.map(tp => tp -> build(tp, Set.empty)).toMap
+  }
 
   /** Resolves a **result** type, which is the one position `never` may appear in — a function's,
    * a member's, or an `extern`'s declared result, saying that it does not return. Everywhere else
@@ -122,9 +174,16 @@ trait TypeResolution extends AnalyzerBase {
    */
   private def traitObject(inner: TypeRef, subst: Map[String, Type], sigil: String): Option[Type.Trait] =
     inner match
-      case NamedType(n, Nil) if traitDecls.contains(n) && !subst.contains(n) =>
-        at(inner.pos)(checkObjectSafe(n, sigil))
-        Some(Type.Trait(n))
+      case NamedType(n, argRefs) if traitDecls.contains(n) && !(argRefs.isEmpty && subst.contains(n)) =>
+        val decl = traitDecls(n)
+        val args = argRefs.map(resolveType(_, subst))
+
+        at(inner.pos) {
+          checkTraitArity(n, decl.tparams, args)
+          deferredBounds(n, decl.tparams, decl.bounds, args)
+          checkObjectSafe(n, args, sigil)
+        }
+        Some(Type.Trait(n, args))
       case _ => None
 
   /** Whether a trait may be erased into an object at all, and what to say when it may not (`02`).
@@ -141,8 +200,8 @@ trait TypeResolution extends AnalyzerBase {
    * reference-counted box, which only the counted object has: `&Trait` carries one, so it accepts
    * such a method, and `*Trait` points straight at a value and does not.
    */
-  protected def checkObjectSafe(name: String, sigil: String): Unit = {
-    val obj = s"'$sigil$name'"
+  protected def checkObjectSafe(name: String, args: List[Type], sigil: String): Unit = {
+    val obj = s"'$sigil${Type.qualified(name, args)}'"
 
     def mentionsSelf(t: TypeRef): Boolean = t match
       case NamedType(n, args) => n == selfName || args.exists(mentionsSelf)

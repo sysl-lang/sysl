@@ -144,6 +144,17 @@ before they appear and may be mutually recursive).
   list is held to its bounds in the name it was written under, a name collision between the two is
   refused at the declaration, a property may declare none, and — because a trait declares no generic
   method — neither may an `impl`.
+- **Traits with type parameters of their own (`02`).** `trait Sink[T]` is a family of promises, and
+  the arguments are written the same way in all three places a trait is named: a bound
+  (`[X: Sink[int]]`), an implementation (`impl Sink[int] for Buffer`), and a trait object
+  (`&Sink[int]`, whose table is `@vt.ref.Sink.int.Buffer`). A bound's arguments are types, so one may
+  name another parameter of the same declaration and be solved at the call. The trait's parameters
+  are fixed by the implementation, which puts them alongside `Self` in what a member's signature and
+  body resolve under — a method written in the trait's `T` and one written in the type that `T` is
+  are the same signature. A trait may bound its own parameters, and everything applying it is held
+  to them. A type implements a trait **once**: the arguments are what an implementation supplies,
+  not part of what it is filed under, because two of them would give the type two members of each
+  name with no rule for choosing between them.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over
