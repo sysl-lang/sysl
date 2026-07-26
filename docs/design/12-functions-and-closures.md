@@ -46,7 +46,9 @@ written inline.
 
 **A missing `-> type` means the function returns `unit`.** `greet` above runs for its effect and
 yields nothing; there is no `-> unit` to write, though writing it is legal. This mirrors how a
-block whose trailing statement is not an expression has type `unit`.
+block whose trailing statement is not an expression has type `unit`. A result is also the *only*
+position `unit` may be written in — it names the absence of a value, so no parameter, field, or
+element can hold one (`00 §12`).
 
 ### A declaration with no body — `extern`
 

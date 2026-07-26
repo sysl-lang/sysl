@@ -29,6 +29,13 @@ trait TypeResolution extends AnalyzerBase {
    */
   protected val neverName = "never"
 
+  /** The name of the type an expression run only for its effect has. It *is* a scalar, because a
+   * function may declare it as its result and a block may have it, but it is no more a layout than
+   * `never` is: its one value occupies nothing, so there is nothing for a parameter, a field, an
+   * element, or a type argument to hold.
+   */
+  protected val unitName = "unit"
+
   /** The name of the type a trait is being implemented for (`14 §1`).
    *
    * It is a substitution key rather than a type of its own: a trait declaration and an `impl` are
@@ -121,12 +128,14 @@ trait TypeResolution extends AnalyzerBase {
     tparams.map(tp => tp -> build(tp, Set.empty)).toMap
   }
 
-  /** Resolves a **result** type, which is the one position `never` may appear in — a function's,
-   * a member's, or an `extern`'s declared result, saying that it does not return. Everywhere else
-   * a type is resolved through `resolveType`, which rejects it.
+  /** Resolves a **result** type, which is the one position the two valueless types may appear in —
+   * a function's, a member's, or an `extern`'s declared result, saying that it hands back nothing
+   * (`unit`) or does not return at all (`never`). Everywhere else a type is resolved through
+   * `resolveType`, which rejects both.
    */
   protected def resolveReturn(t: TypeRef, subst: Map[String, Type]): Type = t match
     case NamedType(n, Nil) if n == neverName && !subst.contains(n) => Type.Never
+    case NamedType(n, Nil) if n == unitName && !subst.contains(n)  => Type.Unit
     case _                                                         => resolveType(t, subst)
 
   private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
@@ -151,6 +160,11 @@ trait TypeResolution extends AnalyzerBase {
       else
         val targs = argRefs.map(resolveType(_, subst))
         scalarType(n) match
+          // `unit` is a scalar so that a result may be written as one, but it is the absence of a
+          // value, so everything reached from here — a parameter, a field, an element, a type
+          // argument — is asking it for a layout it does not have.
+          case Some(Type.Unit) if argRefs.isEmpty =>
+            err("'unit' is the type of an expression that yields no value, so it can only be a result type")
           case Some(s)                        => plain(n, targs, s)
           case None if structDecls.contains(n) => instantiateStruct(n, targs)
           case None if enumDecls.contains(n)   => instantiateEnum(n, targs)

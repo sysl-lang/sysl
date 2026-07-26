@@ -547,6 +547,11 @@ trait Hoisting extends TypeResolution {
         err("'Self' is the type an 'impl' is for, so it cannot also be the type it names")
       case NamedType(n, Nil) if n == neverName =>
         err("'never' has no values, so nothing can be implemented for it")
+      // Both valueless types are named here rather than left to `resolveType`, which refuses them
+      // for standing anywhere but a result — true, and beside the point when what the block asks
+      // is whether the type can behave.
+      case NamedType(n, Nil) if n == unitName =>
+        err("'unit' has one value and no behaviour — a trait for it would say nothing")
 
       case _ =>
         // The block's parameters stand in for themselves while the subject is resolved, so a shape
@@ -564,7 +569,6 @@ trait Hoisting extends TypeResolution {
               "particular type behaves — so it is written for that type, not for an object over it")
           case Type.Ptr(inner)       => err(modeIsNotAType("*", inner))
           case Type.Ref(inner, sync) => err(modeIsNotAType(if sync then "&sync " else "&", inner))
-          case Type.Unit   => err("'unit' has one value and no behaviour — a trait for it would say nothing")
           case Type.VaList => err("a va_list is an ABI primitive, not something to implement a trait for")
           // The subject is the block's own parameter, which stands for any type at all — so the block
           // would be saying how every type behaves, which is what a trait's own defaults are for.

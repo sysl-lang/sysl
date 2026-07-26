@@ -53,6 +53,10 @@ before they appear and may be mutually recursive).
 - **Functions** are keyword-less, Scala-style: `name(params) -> ret = expr` or an indented
   block whose trailing expression is the implicit return value. A missing `-> ret` means
   `unit`. A block-bodied function may also `return` early.
+- **The two valueless types are result types only** (`00 §11`, `00 §12`). `never` and `unit` both
+  lower to `void`, which is not a layout, so neither may be a parameter, a field, an element, or a
+  type argument — and inference will not put one in a generic slot either, so a unit or diverging
+  argument to `f[T](x: T)` is refused at the call rather than instantiated into a `void` parameter.
 - **Value structs:** `struct Name` with indented `field: type` lines; positional construction
   `Name(a, b)`, field read `p.x`, and in-place field assignment `p.x = v`. Structs pass to and
   from functions by value.

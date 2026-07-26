@@ -461,6 +461,49 @@ invariant, emitted by the compiler around a check it inserted. `never` is the *s
 control does not come back, and the two meet only in that the usual way to reach one is to call
 something that traps or exits.
 
+## 12. `unit` — the type of an expression that yields no value
+
+`unit` is what an expression run only for its effect has. A function with no `-> type` returns it
+(`12 §1`), a block whose last statement is not an expression has it, an `if` with no `else` leaves
+its open branch at it, and a loop that finishes without a value ends at it. Writing `-> unit`
+explicitly is legal and means exactly what leaving the arrow off means.
+
+**It is a scalar, so it can be named; it is not a layout, so it cannot be held.** Its one value
+occupies nothing, and a slot for a value that occupies nothing is not a slot. So `unit` shares
+`never`'s one-position rule, for the neighbouring reason — `never` has no values at all, `unit` has
+one that is nothing at all, and neither leaves a field, a parameter, or an element anything to be:
+
+```
+f(x: unit)                  // no
+struct S
+    x: unit                 // no
+var xs: [4]unit             // no
+Option[unit]                // no
+f() -> unit                 // yes — a result is the one place it stands
+```
+
+**And a unit value cannot arrive anywhere a value has to.** Binding one (`var x = print(1)`),
+assigning one, putting one in an array, comparing two, printing one, or passing one down a variadic
+tail are each an error, for the same reason the type is not a slot: there is nothing to arrive.
+
+**Inference is held to the same rule.** A written parameter of type `unit` is refused where the
+type is resolved, but a *generic* one accepts whatever its argument turns out to be — so
+`f[T](x: T)` handed `print(1)` would otherwise instantiate at `unit` and emit a parameter for a
+value there is none of. Passing a unit value to a generic parameter is therefore an error at the
+call, and so is passing a diverging one, which would bind that parameter to `never` for the same
+empty result. A **written** parameter still takes a diverging argument (§11) — it has a layout, and
+the call is the dead code that rule already accepts.
+
+The result rule is about the *position*, not the syntax, so it extends to wherever a result is
+named. When function types land (`12 §6`), the result in `Fn(Event) -> unit` is a result and stays
+legal; the parameter in `Fn(unit) -> int` is a slot and does not.
+
+The cost of this is that `Result[unit, E]` — a fallible operation that yields nothing on success —
+cannot be written, and the workaround is an error-only channel or a placeholder payload. Making it
+work means zero-sized types (a `unit` field omitted from the layout, with every field index behind
+it shifted), which is a layout feature and not a property of `unit`; it is recorded below rather
+than half-built.
+
 ## Open at the basics level (not yet decided)
 
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
@@ -474,5 +517,10 @@ work:
 - **Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`), and
   the exact trailing-continuation operator set. The *lexing* mechanics are settled by adopting
   `IndentationLexical` (see `front-end.md`); these remaining pieces are grammar decisions.
+- **Zero-sized types** (§12): whether a `unit` field is omitted from a layout rather than refused,
+  which is what would let `Result[unit, E]` be written. It is a layout rule — a field the layout
+  skips, with the indices behind it shifted, and the same question for a parameter dropped from a
+  signature — so it is decided with the layout, not with `unit`. Additive: everything §12 refuses
+  today would start compiling, and nothing written against the current rule would change meaning.
 - ~~Final scalar-type table and operator-precedence table~~ — **done**, see
   `01-scalar-types-and-operators.md`.

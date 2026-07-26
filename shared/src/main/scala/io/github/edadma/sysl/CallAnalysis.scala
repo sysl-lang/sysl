@@ -25,9 +25,19 @@ trait CallAnalysis extends Literals with TraitObjects {
 
     // The complaint is about one argument, so it is reported where that argument is written
     // rather than at the call as a whole.
+    //
+    // A parameter holds a value, so neither valueless type can be what one is. Written, that is
+    // refused where the type is resolved; inferred, this is the only place it can be caught — a
+    // generic parameter accepts whatever the argument's type is, and an argument that yields
+    // nothing or never arrives at all is the one thing inference must not conclude a slot from.
+    // A diverging argument against a *written* parameter is untouched: it is dead code, and the
+    // parameter still has a layout.
     for (t, (pname, pty)) <- ts.zip(params) do
       at(t.pos):
         if disagree(t.ty, pty) then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")
+        else if pty == Type.Unit then err(s"cannot pass a unit value as '$pname' of '$what'")
+        else if pty == Type.Never then
+          err(s"cannot pass an expression that never returns as '$pname' of '$what'")
 
     ts
   }
