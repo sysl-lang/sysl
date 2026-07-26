@@ -38,9 +38,9 @@ enum Option[T]                           // generic enum (09)
 ```
 
 A parameter name stands for a type not yet known; it may appear anywhere a type may — a
-parameter type, a return type, a field type, a variant payload, a local annotation. The three
-declaration forms are the whole of what can be parameterized; a generic type's *own body* may hold
-members, while a generic `impl` block is still open (`§ Open c`).
+parameter type, a return type, a field type, a variant payload, a local annotation. A fourth form
+takes parameters without declaring a type: an **`impl` block**, whose subject is a generic type or a
+composed shape applied to them (`02`). A generic type's *own body* may hold members (`§ Open c`).
 
 ## 2. `[]` means type application in a type, indexing in an expression
 
@@ -219,7 +219,9 @@ never by a covariant container.
 - **e. Const generics.** Parameterizing over a *value* — most importantly an array length,
   `[N: usize]` — so a function can be generic over `[N]T`. Not implemented (array sizes are
   literals today); a clear eventual want for fixed-size numeric and buffer code, deferred until
-  the array story calls for it.
+  the array story calls for it. It is what an `impl` matching an array's **shape** is missing:
+  `impl[T] Total for [3]T` covers every element type at length 3, and each other length needs its
+  own block (`02`).
 - **f. Higher-kinded parameters.** Parameterizing over a *type constructor* (`F[_]`) is
   **excluded**, not merely deferred: it pushes inference toward undecidable, and no target use
   (an OS, drivers, embedded) needs it. Abstraction over containers is served by traits and

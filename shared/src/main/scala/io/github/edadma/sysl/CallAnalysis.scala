@@ -111,8 +111,13 @@ trait CallAnalysis extends Literals with TraitObjects {
                 s"but '${a.name}' is not bounded by it")
           case concrete =>
             if !satisfies(tr, concrete) then
+              // A type an implementation covers is told what that implementation asked of it, so the
+              // reader is sent one step in — to the argument that fails — rather than to a block
+              // that is already written.
+              val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
+
               err(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
-                s"but ${show(concrete)} does not")
+                s"but ${show(concrete)} does not$why")
 
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever
@@ -128,7 +133,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
       case t: Type.Trait    => callTraitObject(tr, t, mname, args)
       case rty =>
-        val (base, _) = memberOwner(rty)
+        val (base, _) = memberKey(rty, mname)
 
         memberDecls.get((base, mname)) match
           case Some(m) if m.receiver.isDefined =>

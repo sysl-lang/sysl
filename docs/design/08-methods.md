@@ -226,6 +226,11 @@ struct's is. The receiver is the composed type itself, so `self` in such a membe
 `*self` a `*[]int`, and the conversions at the call site are the ones the table above already
 describes.
 
+A block may also match the **shape** rather than the type — `impl[T] Total for []T` gives every
+slice a `total` — and such a member is found by the same read, one step later: the receiver's own
+type is asked first, and the shape answers when it has nothing. A name reaches one member either
+way, because a shape and a slice written out in full may not both declare it (`02`).
+
 ## Generics
 
 A member of a generic type is monomorphized with the type, so `Box[T]`'s methods are emitted per
@@ -235,9 +240,10 @@ the type's parameters are in scope, and the receiver's type is the type applied 
 until an instantiation says what the parameters are, so it is resolved alongside them rather than
 ahead of them: `same(self) -> Self` is `same(self) -> Box[int]` at a `Box[int]` receiver.
 
-A trait may also be implemented for a generic type as a whole, with type parameters and bounds on
-the block itself (`02`). Such a member is a member of the type exactly as one written in its body
-is, and is instantiated by the same rule.
+A trait may also be implemented for a generic type as a whole, or for a composed **shape**, with type
+parameters and bounds on the block itself (`02`). Such a member is a member of the type exactly as
+one written in its body is, and is instantiated by the same rule — a shape's from the element type
+the receiver turned out to have.
 
 A **generic method** — one that introduces type parameters of its own, beyond the type's — is
 allowed by the same machinery that makes generic free functions work, and reads with the type

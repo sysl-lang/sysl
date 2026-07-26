@@ -74,6 +74,17 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
       |var t: &Total = a[0..]
       |print(t.total())""".stripMargin
 
+  private val shape =
+    """trait Total
+      |    total(self) -> int
+      |impl[T] Total for []T
+      |    total(self) -> int = 1
+      |var a: &[2]int = [1, 2]
+      |var b: &[3]bool = [true, false, true]
+      |var s: &Total = a[0..]
+      |var t: &Total = b[0..]
+      |print(s.total(), t.total())""".stripMargin
+
   "the table" - {
     // The order is the trait's declaration order, which is what a call site indexes by, and a
     // `*self` method's receiver already is the data word — so that slot names the implementation
@@ -187,6 +198,25 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
 
       out should include("@vt.ref.Total.Box.string = private constant [1 x ptr]")
       out should include("@vt.ref.Total.Box.int = private constant [1 x ptr]")
+    }
+  }
+
+  // A shape's members are emitted under the mangling of the types it covers with the arguments left
+  // off, so an instantiation appends them: `slice.total` at `int` is `slice.total.int`, which the
+  // written `[]int`'s own `slice.int.total` could not be mistaken for.
+  "a shape's table" - {
+    "names the slot as the member instantiated at the element type" in {
+      val out = ir(shape)
+
+      out should include("define i32 @slice.total.int(")
+      defineOf(out, "vt.adapt.ref.slice.total.int") should include("call i32 @slice.total.int(")
+    }
+
+    "gives two element types two tables of their own" in {
+      val out = ir(shape)
+
+      out should include("@vt.ref.Total.slice.int = private constant [1 x ptr]")
+      out should include("@vt.ref.Total.slice.bool = private constant [1 x ptr]")
     }
   }
 

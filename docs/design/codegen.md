@@ -109,8 +109,17 @@ before they appear and may be mutually recursive).
   type, so no overlapping implementations and no specialization rule to need. The bounds decide
   **which instantiations conform**, asked one step in so the answer composes, and they make the
   members checkable at their **definition**: a body using what no bound licenses is reported on its
-  own line with nothing instantiated. Matching a *composed* type by its shape (`[]T`) is not
-  supported — there is no head to file members under.
+  own line with nothing instantiated.
+- **An `impl` for a composed shape (`02`).** `impl[T: Display] Show for []T` is the same block
+  written for a type with no name to be generic over, and everything above holds unchanged. What is
+  its own: a composed type is filed under the whole of itself (`[]int`), so a shape gets a key by
+  dropping the arguments (`[]`, `[3]`) that a member lookup falls back to, and a symbol the same way
+  (`slice.show` instantiated at `int` is `slice.show.int`, which the written `[]int`'s
+  `slice.int.show` cannot be mistaken for). An array's length is part of the shape, since no
+  parameter can stand for it (`10 § Open e`). A `string` is not a slice and is not covered. A shape
+  and a type of that shape written out in full are **two implementations for one type**, so whichever
+  is written second is refused — sysl has no rule that picks between two, and that goes for member
+  *names* across the two as well, since a type's members are one namespace.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over
@@ -313,7 +322,8 @@ arity.
     same way, since a property is behaviour that happens to read like a field. Forwarding a parameter
     to a bounded callee is checked the same way too: a bound is satisfied by a bound. A trait's
     default bodies go through the same pass, bounded by their own trait, and so do the members of a
-    generic `impl`, bounded by what the block declares (`02`). A member of a generic *type* is the
+    generic `impl` — one for a shape included — bounded by what the block declares (`02`). A member
+    of a generic *type* is the
     one thing left out, and for a reason rather than an omission: it inherits the type's parameters,
     which carry no bounds because there is nowhere to write one (`10` open b), so there is nothing to
     hold it to. Those are still checked per instantiation.

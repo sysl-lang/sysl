@@ -155,7 +155,18 @@ trait Hoisting extends TypeResolution {
     val self = if tparams.nonEmpty then Map.empty else concrete(tname).fold(Map.empty[String, Type])(selfBinding)
 
     hoistMemberList(
-      MemberHome(tname, tname, NamedType(tname, tparams.map(NamedType(_, Nil))), tparams, Map.empty, taken, noun, self),
+      MemberHome(
+        tname,
+        tname,
+        tname,
+        None,
+        NamedType(tname, tparams.map(NamedType(_, Nil))),
+        tparams,
+        Map.empty,
+        taken,
+        noun,
+        self,
+      ),
       members,
       out,
     )
@@ -164,10 +175,19 @@ trait Hoisting extends TypeResolution {
   /** Everything hoisting a list of members needs to know about the type they belong to, whichever
    * declaration form brought them — a struct or enum body, or an `impl` block.
    *
-   *   - `key` is what the members are filed under and what a diagnostic calls the type.
+   *   - `key` is what the members are filed under. For a block matching a **shape** it is the shape
+   *     itself (`[]`), which is what a lookup falls back to when the type it is asked about has no
+   *     members of its own.
+   *   - `label` is what a diagnostic calls the type, which is the key everywhere the key is
+   *     something a programmer would recognise — and the subject as written where it is not, since
+   *     `[]` names nothing and `[]T` names what the block covers.
    *   - `symbol` is the same type mangled, which is what the lowered functions are *named*. The two
    *     differ only for a type that has no name of its own: `[]int` is a fine key and an impossible
    *     LLVM symbol, so its members are emitted under `slice.int`.
+   *   - `head` is the shape these members share a namespace with, where they have one — the shape
+   *     itself for a block matching one, and its own shape for a composed type written out in full.
+   *     A type's members are one namespace whatever brought them, and this is what carries that rule
+   *     across the two ways a composed type can come by one.
    *   - `selfRef` is the receiver's type as written, so a `self` parameter needs no reconstructing.
    *   - `tparams` are the parameters a member's signature may mention — a generic type's own, or a
    *     generic `impl`'s, **in the order the implementing type applies them**, so that instantiating
@@ -180,14 +200,22 @@ trait Hoisting extends TypeResolution {
    */
   private case class MemberHome(
       key: String,
+      label: String,
       symbol: String,
+      head: Option[String],
       selfRef: TypeRef,
       tparams: List[String],
       bounds: Map[String, List[String]],
       taken: Set[String],
       noun: String,
       self: Map[String, Type],
-  )
+  ) {
+
+    /** Whether this block is the one matching the shape, rather than one of the types it covers.
+     * A composed type written out in full is never spelled as its own shape, so the keys settle it.
+     */
+    def shaped: Boolean = head.contains(key)
+  }
 
   /** The instantiation of a non-generic struct or enum, which was made before any member was
    * hoisted. Read from the table rather than resolved again, so a type whose own declaration was
@@ -221,11 +249,25 @@ trait Hoisting extends TypeResolution {
 
     for m <- members do
       currentPos = m.pos.orElse(currentPos)
-      if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '${home.key}.${m.name}'")
+      if m.tparams.nonEmpty then err(s"generic methods are not supported yet — '${home.label}.${m.name}'")
       if memberDecls.contains((home.key, m.name)) then
-        err(s"type '${home.key}' already has a member named '${m.name}'")
+        err(s"type '${home.label}' already has a member named '${m.name}'")
       if home.taken.contains(m.name) then
-        err(s"type '${home.key}' has both a ${home.noun} and a member named '${m.name}'")
+        err(s"type '${home.label}' has both a ${home.noun} and a member named '${m.name}'")
+
+      // A composed type's members and its shape's are one namespace, so that a name reaches one
+      // member however the type came by it. Both directions are asked, since a file may write the
+      // shape before the types it covers or after them.
+      for h <- home.head do
+        if home.shaped then
+          for written <- composedMembers.get((h, m.name)) do
+            err(s"'$written' already has a member named '${m.name}', and this 'impl' would give " +
+              s"${everyShape(h)} one — a call on a '$written' could mean either")
+        else
+          if memberDecls.contains((h, m.name)) then
+            err(s"${everyShape(h)} already has a member named '${m.name}', so '${home.label}' " +
+              "cannot declare one of its own")
+          composedMembers((h, m.name)) = home.label
 
       for ty <- home.self.get(selfName) do
         // A built-in's catalog methods are the compiler's (`14 §5`), and member lookup would find a
@@ -248,7 +290,7 @@ trait Hoisting extends TypeResolution {
 
       if generic then
         if m.receiver.isEmpty && !m.isProperty then
-          err(s"associated functions on generic types are not supported yet — '${home.key}.${m.name}'")
+          err(s"associated functions on generic types are not supported yet — '${home.label}.${m.name}'")
         genericMembers((home.key, m.name)) = fd
         // `Self` here is the type applied to its own parameters, which is not a type yet. The
         // reference is what waits, and every substitution that fixes the parameters fixes it too.
@@ -277,14 +319,30 @@ trait Hoisting extends TypeResolution {
     // a capability but competing with the one that is already there — and the operator would keep
     // lowering to its native instruction whatever this block said.
     if CoreTraits.builtin(impl.traitName, ty) then
-      err(s"'${home.key}' already implements '${impl.traitName}' — the compiler provides it")
+      err(s"'${home.label}' already implements '${impl.traitName}' — the compiler provides it")
 
     // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
     // are the one implementation they are, and so are `[]int` and `[]i32`. A generic type has one
     // key for all of its instantiations, which is what makes an implementation cover the type as a
     // whole and two of them for one generic type a collision rather than a choice.
     if traitImpls.contains((impl.traitName, home.key)) then
-      err(s"'${home.key}' already implements '${impl.traitName}'")
+      err(s"'${home.label}' already implements '${impl.traitName}'")
+
+    // A shape and a type of that shape written out in full would both implement the trait for that
+    // type, and sysl has no rule that picks between two implementations — the more specific one does
+    // not win, because nothing here is more specific than anything else. So the second one written is
+    // refused, in whichever order the file put them.
+    for h <- home.head do
+      if home.shaped then
+        for written <- writtenShapes.get((impl.traitName, h)) do
+          err(s"'$written' already implements '${impl.traitName}', and this 'impl' would implement " +
+            s"it for ${everyShape(h)} — including that one")
+      else
+        if traitImpls.contains((impl.traitName, h)) then
+          err(s"${everyShape(h)} already implements '${impl.traitName}', so '${home.label}' has an " +
+            "implementation and cannot be given a second one")
+        writtenShapes((impl.traitName, h)) = home.label
+
     traitImpls((impl.traitName, home.key)) = impl
 
     if home.tparams.nonEmpty && home.bounds.nonEmpty then
@@ -331,9 +389,11 @@ trait Hoisting extends TypeResolution {
    *
    * A trait may be implemented for **any** type it makes sense to name: built-ins included — a
    * language whose `Show` cannot cover `int` has a `Show` no library can use — the composed types
-   * too, so `impl Display for []int` says how a slice of ints renders, and a **generic** struct or
-   * enum as a whole, which is what an `impl` with type parameters of its own is for. A struct or an
-   * enum brings its own fields or variants for a member to collide with; nothing else has any.
+   * too, so `impl Display for []int` says how a slice of ints renders, a **generic** struct or enum
+   * as a whole, which is what an `impl` with type parameters of its own is for, and a composed
+   * **shape**, which is that same block written for a type that has no name to be generic over. A
+   * struct or an enum brings its own fields or variants for a member to collide with; nothing else
+   * has any.
    *
    * Two shapes are refused outright, each because an `impl` for it would be about nothing. A
    * **memory mode** is a way of holding a type rather than a type, and a member call already sees
@@ -358,13 +418,14 @@ trait Hoisting extends TypeResolution {
 
           val ty = concrete(written).getOrElse(Type.Unknown)
 
-          (ty, MemberHome(written, written, ref, Nil, Map.empty, taken, noun, selfBinding(ty)))
+          (ty, MemberHome(written, written, written, None, ref, Nil, Map.empty, taken, noun, selfBinding(ty)))
         else
           val order = implArgs(impl, written, tparams)
 
           // A generic type has no one instantiation to be, and nothing that reaches this needs one:
           // an implementation covers every `Box` at once, and each member is made real per receiver.
-          (Type.Unknown, MemberHome(written, written, ref, order, impl.bounds, taken, noun, Map.empty))
+          (Type.Unknown,
+           MemberHome(written, written, written, None, ref, order, impl.bounds, taken, noun, Map.empty))
 
       case NamedType(n, Nil) if n == selfName =>
         err("'Self' is the type an 'impl' is for, so it cannot also be the type it names")
@@ -372,11 +433,15 @@ trait Hoisting extends TypeResolution {
         err("'never' has no values, so nothing can be implemented for it")
 
       case _ =>
-        if impl.tparams.nonEmpty then notGeneric(ref)
+        // The block's parameters stand in for themselves while the subject is resolved, so a shape
+        // written with one comes back as the shape it is — `[]T` as a slice of something — rather
+        // than through a complaint about a name that means nothing outside this block.
+        val abstracts: Map[String, Type] =
+          impl.tparams.map(tp => tp -> Type.Abstract(tp, impl.bounds.getOrElse(tp, Nil))).toMap
 
         // Resolved rather than taken as written, so the key is the type's one canonical name and
         // two spellings of one type are one implementation.
-        val ty = resolveType(ref, Map.empty)
+        val ty = resolveType(ref, abstracts)
 
         ty match
           case t if Type.erased(t) =>
@@ -386,26 +451,59 @@ trait Hoisting extends TypeResolution {
           case Type.Ref(inner, sync) => err(modeIsNotAType(if sync then "&sync " else "&", inner))
           case Type.Unit   => err("'unit' has one value and no behaviour — a trait for it would say nothing")
           case Type.VaList => err("a va_list is an ABI primitive, not something to implement a trait for")
-          case _           =>
+          // The subject is the block's own parameter, which stands for any type at all — so the block
+          // would be saying how every type behaves, which is what a trait's own defaults are for.
+          case a: Type.Abstract =>
+            err(s"'${a.name}' is a type parameter of this 'impl', so it stands for every type at " +
+              "once — an 'impl' says how one kind of type behaves")
+          case _ =>
 
-        (ty, MemberHome(ownerKey(ty), Type.mangle(ty), ref, Nil, Map.empty, Set.empty, "field", selfBinding(ty)))
+        val head = shapeOwner(ty).map(_._1)
+
+        if impl.tparams.isEmpty then
+          (ty,
+           MemberHome(ownerKey(ty), show(ty), Type.mangle(ty), head, ref, Nil, Map.empty, Set.empty, "field",
+             selfBinding(ty)))
+        else
+          val shape = head.getOrElse(notGeneric(ref))
+          val order = shapeArgs(impl, ty, shape)
+
+          // Like a generic type's, the members are made real per receiver — so there is no one
+          // instantiation to be, and the shape rather than any type of it is what they are filed
+          // under. The symbol drops the arguments the same way: `slice.show` instantiated at `int`
+          // is `slice.show.int`, which the written `[]int`'s `slice.int.show` cannot collide with.
+          (Type.Unknown,
+           MemberHome(shape, ref.show, shapeSymbol(ty), head, ref, order, impl.bounds, Set.empty, "field",
+             Map.empty))
   }
 
-  /** Why a block declaring type parameters has nothing to apply them to.
+  /** What a diagnostic calls every type of a shape at once. */
+  private def everyShape(head: String): String =
+    if head == "[]" then "every slice" else s"every array of ${head.drop(1).dropRight(1)}"
+
+  /** The symbol a shape's members are emitted under, which is the mangling of the types it covers
+   * with the arguments left off — so an instantiation appends them and arrives back where the type
+   * written out in full would have started.
+   */
+  private def shapeSymbol(t: Type): String = t match
+    case _: Type.Slice => "slice"
+    case Type.Array(n, _) => s"arr$n"
+    case other            => Type.mangle(other)
+
+  /** Why a block declaring type parameters has nothing to apply them to: the subject is a type that
+   * takes no arguments and has no shape either, so there is nothing for the parameters to fix.
    *
-   * A **name** is resolved on its own first, so that a type that does not exist, or a trait, is
-   * reported as itself rather than through a complaint about the parameters — which would send the
-   * reader looking at the one part of the line that is written correctly. Everything else is a
-   * composed type, whose members are filed under the whole type (`[]int`, not `[]`), so matching one
-   * by its shape is a key it does not have rather than the same feature one step over.
+   * A composed type does have a shape, and matching it is what `shapeArgs` checks instead. What is
+   * left here is a name — and by the time one reaches this it has already resolved, so a type that
+   * does not exist or a trait was reported as itself rather than through a complaint about the
+   * parameters, which would send the reader looking at the one part of the line written correctly.
    */
   private def notGeneric(ref: TypeRef): Nothing = ref match
     case NamedType(n, _) =>
-      resolveType(NamedType(n, Nil), Map.empty)
       err(s"'$n' takes no type arguments, so an 'impl' for it has nothing to be generic over")
     case _ =>
-      err(s"an 'impl' takes type parameters for a generic struct or enum, whose name is what its " +
-        s"members are filed under — matching '${ref.show}' by its shape is not supported yet")
+      err(s"'${ref.show}' has no shape for an 'impl' to match — a slice and an array do, and a " +
+        "generic struct or enum has a name of its own to be generic over")
 
   /** The block's type parameters **in the order the implementing type applies them**, which is what
    * lets a member be instantiated from a receiver's own type arguments by position.
@@ -446,6 +544,29 @@ trait Hoisting extends TypeResolution {
     names
   }
 
+  /** The same, for a **shape**: the block's parameters in the order the shape applies them, which
+   * for a slice or an array is the one element type.
+   *
+   * The rule is `implArgs`' rule, and it is the same rule because the reason is the same. A shape is
+   * one key, so a block that fixed part of what it matched would be implementing the trait for
+   * *some* of the types the shape covers — a second implementation for a key that holds one.
+   */
+  private def shapeArgs(impl: ImplDecl, ty: Type, shape: String): List[String] = {
+    val declared = impl.tparams.toSet
+    val names    = shapeOwner(ty).get._2.map {
+      case Type.Abstract(n, _) if declared(n) => n
+      case other =>
+        err(s"'${show(other)}' fixes the element type, and an 'impl' with type parameters covers " +
+          s"${everyShape(shape)} — write one of the block's own parameters here")
+    }
+
+    if declared != names.toSet then
+      err(s"'${(declared -- names).mkString("', '")}' is declared by this 'impl' but does not " +
+        s"appear in '${impl.forType.show}', so nothing would ever fix it")
+
+    names
+  }
+
   private def modeIsNotAType(sigil: String, inner: Type): String =
     s"'$sigil${show(inner)}' is a way of holding a ${show(inner)} rather than a type of its own — " +
       s"write the 'impl' for ${show(inner)}, which a member call reaches through one '${sigil.trim}' to find"
@@ -469,10 +590,10 @@ trait Hoisting extends TypeResolution {
 
     for tm <- tr.methods do
       impl.methods.find(_.name == tm.name) match
-        case Some(im) => checkSignature(home.key, impl.traitName, tm, im, sig)
+        case Some(im) => checkSignature(home.label, impl.traitName, tm, im, sig)
         case None if tm.body.nonEmpty => inherited += tm
         case None =>
-          err(s"'${home.key}' does not implement '${impl.traitName}': ${kind(tm)} '${tm.name}' is missing")
+          err(s"'${home.label}' does not implement '${impl.traitName}': ${kind(tm)} '${tm.name}' is missing")
 
     for im <- impl.methods do
       if !declared.contains(im.name) then

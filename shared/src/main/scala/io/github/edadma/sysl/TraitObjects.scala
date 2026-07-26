@@ -57,8 +57,12 @@ trait TraitObjects extends TypeResolution {
 
   private def erase(t: TExpr, tr: Type.Trait, inner: Type, want: Type, boxed: Boolean): TExpr =
     if !implements(tr.name, inner) then
+      // A type an implementation covers is told what that implementation asked of it, since the
+      // reason it does not conform is a condition rather than an absence.
+      val why = unmetBound(tr.name, inner).fold("")(reason => s" — $reason")
+
       at(t.pos)(err(s"a ${show(want)} needs a type that implements '${tr.name}', and " +
-        s"${show(inner)} does not"))
+        s"${show(inner)} does not$why"))
     else TErase(t, vtableFor(tr.name, inner, boxed), want).setPos(t.pos)
 
   /** The method table for one type seen as one trait, registered the first time it is needed.

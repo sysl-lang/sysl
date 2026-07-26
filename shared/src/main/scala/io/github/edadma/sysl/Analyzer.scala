@@ -562,8 +562,8 @@ class Analyzer private (program: Program)
         // Any other type reaches its own members too, since an `impl` may be written for one and a
         // trait may ask for a property. A name none of them supplies is the older complaint, which
         // is the better one there: nothing about `x.foo` on an `int` says a property was meant.
-        case other if memberDecls.contains((ownerKey(other), f)) => readProperty(tr, other, f)
-        case other                                               => err(s"cannot read field '$f' of ${show(other)}")
+        case other if hasMember(other, f) => readProperty(tr, other, f)
+        case other                        => err(s"cannot read field '$f' of ${show(other)}")
 
     case ArrayLit(elems) =>
       val elemExp = expected.collect { case Type.Array(_, e) => e }
@@ -690,7 +690,7 @@ class Analyzer private (program: Program)
    * been either a field or a property, while an enum and a built-in have no fields to have meant.
    */
   private def readProperty(tr: TExpr, ty: Type, f: String): TExpr = {
-    val (base, _) = memberOwner(ty)
+    val (base, _) = memberKey(ty, f)
 
     memberDecls.get((base, f)) match
       case Some(m) if m.isProperty =>

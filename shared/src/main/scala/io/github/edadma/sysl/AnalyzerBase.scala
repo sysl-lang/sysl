@@ -65,6 +65,26 @@ trait AnalyzerBase {
    */
   protected val implBounds = mutable.LinkedHashMap.empty[(String, String), List[List[String]]]
 
+  /** The composed types written out in full that implement a trait, keyed by (trait name, the
+   * **shape** each one has). It is what a shape-matched `impl` consults to find that the thing it
+   * would cover has already been covered one type at a time.
+   *
+   * `impl Display for []int` and `impl[T] Display for []T` are two implementations of `Display` for
+   * a `[]int`, and sysl has no rule that picks between two — so whichever is written second is
+   * refused, and this is how the one written first is found however the file ordered them.
+   */
+  protected val writtenShapes = mutable.LinkedHashMap.empty[(String, String), String]
+
+  /** The members a composed type written out in full was given, keyed by (its shape, the member's
+   * name) and holding the type that was written. A shape-matched block may not give a member of the
+   * same name to every type of that shape.
+   *
+   * A type's members are one namespace whatever trait brought them (`08`), which is why two traits
+   * declaring a `show` cannot both be implemented for one type. A shape covers types that may
+   * already have a member of the name, so the same rule reaches across the two.
+   */
+  protected val composedMembers = mutable.LinkedHashMap.empty[(String, String), String]
+
   /** What `Self` means inside a member of a *generic* type, as the reference it was written from —
    * `Box[T]` for the members of `Box`, whichever declaration form brought them.
    *
@@ -325,6 +345,43 @@ trait AnalyzerBase {
   /** The key alone — what an `impl` is filed under, and what a trait bound looks up. */
   protected def ownerKey(t: Type): String = memberOwner(t)._1
 
+  /** The **shape** of a composed type, where it has one: the key a block matching every type of that
+   * shape is filed under, and the type arguments this particular one matched at.
+   *
+   * A composed type is filed under the whole of itself — `[]int`, not `[]` — because that is the
+   * type a written `impl` is for and the name a diagnostic gives it. A shape-matched block is for
+   * something else, so it needs a key of its own, and dropping the arguments is exactly what makes
+   * one: every slice shares `[]`, and every array shares its length with the arrays of that length,
+   * since without const generics (`10 § Open e`) the length is part of the shape rather than an
+   * argument to it.
+   *
+   * A `string` is not a slice and has no shape here. It is a view of bytes that are valid UTF-8, and
+   * that invariant is the whole difference between it and a `[]u8` — a block written for every slice
+   * has said nothing about it.
+   */
+  protected def shapeOwner(t: Type): Option[(String, List[Type])] = t match
+    case Type.Slice(elem)    => Some(("[]", List(elem)))
+    case Type.Array(n, elem) => Some((s"[$n]", List(elem)))
+    case _                   => None
+
+  /** Where a member of that name is filed for a type: under the type's own key, or — when only a
+   * shape-matched block supplies it — under the shape's, with the arguments this type matched at.
+   *
+   * The type's own key is asked first, and nothing is ever reached both ways: a block covering a
+   * shape and a written implementation may not give one name to one type (`hoistMemberList`), so the
+   * order settles which table holds the member rather than which of two answers wins.
+   */
+  protected def memberKey(t: Type, mname: String): (String, List[Type]) = {
+    val own = memberOwner(t)
+
+    if memberDecls.contains((own._1, mname)) then own
+    else shapeOwner(t).filter(s => memberDecls.contains((s._1, mname))).getOrElse(own)
+  }
+
+  /** Whether a type has a member of that name at all, however it came by it. */
+  protected def hasMember(t: Type, mname: String): Boolean =
+    memberDecls.contains((memberKey(t, mname)._1, mname))
+
   /** The name codegen emits for one of a type's members. A member of a concrete type was hoisted
    * eagerly under `Type.member`; a member of a generic type is instantiated here, from the
    * receiver's own type arguments, and its body queued for analysis — so both answer with a name
@@ -338,10 +395,11 @@ trait AnalyzerBase {
    * does, and a slot naming a member by any other rule is a slot pointing at nothing.
    */
   protected def memberFuncName(ty: Type, mname: String): String = {
-    val (base, targs) = memberOwner(ty)
+    val (base, targs) = memberKey(ty, mname)
 
-    if nominalTparams(base).isEmpty then s"${Type.mangle(ty)}.$mname"
-    else instantiateFunc(genericMembers((base, mname)), targs)
+    genericMembers.get((base, mname)) match
+      case Some(fd) => instantiateFunc(fd, targs)
+      case None     => s"${Type.mangle(ty)}.$mname"
   }
 
   /** Whether a member of that name is one the *compiler* provides for the type (`08`).
@@ -375,16 +433,48 @@ trait AnalyzerBase {
    * A generic `impl` may be conditional, and this is where the condition is answered: the
    * implementing type's own arguments must satisfy what the block asked of them, which is the same
    * question one step in. So `Box[int]` implements `Show` under `impl[T: Show] Show for Box[T]`
-   * exactly when `int` does, and a `Box[Point]` over a `Point` with no `Show` does not.
+   * exactly when `int` does, and a `Box[Point]` over a `Point` with no `Show` does not. A slice
+   * covered by `impl[T: Show] Show for []T` is the same question asked of its element.
    */
-  protected def conforms(traitName: String, t: Type): Boolean = {
-    val (key, targs) = memberOwner(t)
-
-    traitImpls.contains((traitName, key)) && implBounds.get((traitName, key)).forall { required =>
-      targs.length == required.length &&
-      targs.zip(required).forall { case (arg, traits) => traits.forall(satisfies(_, arg)) }
+  protected def conforms(traitName: String, t: Type): Boolean =
+    implKey(traitName, t).exists { case (key, targs) =>
+      implBounds.get((traitName, key)).forall { required =>
+        targs.length == required.length &&
+        targs.zip(required).forall { case (arg, traits) => traits.forall(satisfies(_, arg)) }
+      }
     }
+
+  /** Which implementation of a trait a type is covered by, if any: the one written for the type,
+   * or the one written for its shape, with the arguments it matched at.
+   *
+   * At most one of the two exists — a shape and a type written out in full may not both implement
+   * one trait (`hoistImpl`) — so this is a lookup rather than a choice between implementations, and
+   * sysl needs no rule saying which of two would be the more specific.
+   */
+  protected def implKey(traitName: String, t: Type): Option[(String, List[Type])] = {
+    val own = memberOwner(t)
+
+    if traitImpls.contains((traitName, own._1)) then Some(own)
+    else shapeOwner(t).filter(s => traitImpls.contains((traitName, s._1)))
   }
+
+  /** Why a type an implementation *covers* still does not implement the trait — which is a different
+   * answer from having no implementation at all, and the one a diagnostic should give when there is
+   * one.
+   *
+   * Told to write an `impl Display for []Point`, a programmer would find it refused: an
+   * `impl[T: Display] Display for []T` already covers every slice, and what the slice of points
+   * fails is that block's condition. So the condition is what is worth saying, and this is the first
+   * argument that does not meet it. `None` where nothing covers the type, leaving the caller's own
+   * advice — write one — the right advice.
+   */
+  protected def unmetBound(traitName: String, t: Type): Option[String] =
+    for
+      (key, targs) <- implKey(traitName, t)
+      required     <- implBounds.get((traitName, key))
+      if targs.length == required.length
+      (arg, tr) <- targs.zip(required).flatMap((a, trs) => trs.filterNot(satisfies(_, a)).map((a, _))).headOption
+    yield s"the 'impl' that covers it asks '$tr' of ${show(arg)}, which does not implement it"
 
   /** The type a member is looked up on, seeing through one level of `*T` / `&T` so a method may be
    * called on a value, a pointer to it, or a reference to it alike.

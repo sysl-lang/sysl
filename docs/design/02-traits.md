@@ -2,8 +2,8 @@
 
 **Status:** decided (core model), and **built** — static dispatch through bounds, dynamic dispatch
 through `*Trait` / `&Trait`, **default bodies**, **properties** alongside methods, an `impl` for any
-concrete type (**composed types included**), and an `impl` for a **generic** type, with
-**conditional conformance**. Some surface-syntax details are flagged open at the end. How a
+concrete type (**composed types included**), and an `impl` for a **generic** type or a composed
+**shape**, with **conditional conformance**. Some surface-syntax details are flagged open at the end. How a
 plain method and its receiver are spelled — the hole this doc used to leave open — is settled in
 `08-methods.md`; a trait's methods are declared and called the same way, with the receiver an
 `impl`'s type instead of a concrete one. A signature that has to name the implementing type writes
@@ -276,11 +276,54 @@ instantiation says what they are — so it is resolved alongside them rather tha
 `-> Self` and `-> Box[T]` are the one signature conformance compares. The same now holds inside a
 generic type's *own* body (`08`), which had been the one place `Self` named nothing.
 
-What stays out is matching a **composed** type by its shape: `impl[T] Display for []T` is not
-supported, because a composed type's members are filed under the whole type (`[]int`, not `[]`), so
-there is no head to match and — unlike the nominal case — a shape-matched block and a written
-`impl Display for []int` could both claim one value. That needs an overlap rule the language does
-not have, which is exactly why the nominal case does not need one.
+## An `impl` covers a shape the same way
+
+A composed type has no name to be generic over, but it has a **shape**, and a block with type
+parameters may match that instead:
+
+```
+impl[T: Display] Show for []T
+    show(self) -> string = str(self.len)
+
+impl[T] Total for [3]T
+    total(self) -> int = 3
+```
+
+Everything above holds unchanged. The subject is the shape applied to the block's parameters and
+nothing else, so `impl[T] Show for []int` is refused (the element is fixed) and so is
+`impl[T] Show for [][]T` (the element is a shape rather than a parameter). The members are
+monomorphized per receiver, a bound makes the conformance conditional and composes one step in, and
+the bodies are checked once at their definition against the bounds alone.
+
+Two things are the shape's own. **A composed type is filed under the whole of itself** — `[]int`,
+not `[]` — so a shape needs a key that the types it covers do not have, and dropping the arguments
+is what makes one; a lookup that finds nothing under the type's own key falls back to it. And
+because an **array's length is not something a parameter can stand for** (`10 § Open e` — const
+generics are not in the language), the length stays part of the shape: `[2]T` and `[3]T` are two
+shapes, each covering every element type at its own length.
+
+A `string` is **not** covered by `[]T`. It is a view of bytes that are valid UTF-8, and that
+invariant is the whole difference between it and a `[]u8` — a block written for every slice has said
+nothing about it. `"hi".bytes` is a `[]u8` and is covered.
+
+### One implementation per type, so a shape and a written type may not overlap
+
+`impl Display for []int` and `impl[T] Display for []T` would both say how a `[]int` renders. Neither
+is more specific than the other — being more specific is not something sysl knows how to be, since
+there is no specialization rule and deliberately no place to add one — so **whichever is written
+second is refused**, and the diagnostic names the one already there. The choice is between saying
+how every slice behaves and saying it slice type by slice type; not both.
+
+The same rule reaches member *names*, because a type's members are one namespace whatever trait
+brought them (`08`). A shape may not give a member a name that some slice written out in full
+already has, and vice versa — otherwise one name on one type would mean two different members
+depending on which table was asked, and a trait object's slot would be filled from the wrong one.
+Two traits with distinct member names are unaffected, exactly as they are for a struct.
+
+Refusing the overlap is the conservative choice and can be relaxed; shipping a rule that picks
+between two implementations cannot be walked back. If a case turns up that genuinely wants
+`[]byte` to render differently from every other slice, the language would be adding specialization
+with its eyes open, rather than discovering it had one.
 
 ## Trait objects, as built
 
@@ -357,7 +400,8 @@ signature, which stands in for every implementation because conformance is exact
 
 - **Kept:** static dispatch (monomorphized bounds), dynamic dispatch (boxed trait object),
   retrofitting foreign types (explicit `impl`), default bodies, properties as members, an `impl` for
-  any concrete type — named or composed — and an `impl` for a generic type, conditionally.
+  any concrete type — named or composed — and an `impl` for a generic type or a composed shape,
+  conditionally.
 - **Dropped:** the separate structural `interface`; implicit/structural conformance; the
   invisible `owns` flag (replaced by explicit three-mode ownership).
 
@@ -367,10 +411,11 @@ signature, which stands in for every implementation because conformance is exact
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
 - **Trait bounds, associated types, generic interaction** — deferred to the generics spec.
-- **An `impl` matching a composed type by its shape.** `impl[T] Display for []T` is rejected; a
-  composed type is implemented for whole (`[]int`), as above. What it would need is a *head* to file
-  members under and an overlap rule to choose between a shape-matched block and a written one — the
-  question the nominal case avoids by having exactly one key per generic type.
+- **Specialization.** A shape and a type of that shape written out in full are refused as the two
+  implementations for one type they are, as above. Allowing both and letting the written one win is
+  the one thing here that would be genuinely useful (`[]byte` rendering differently from every other
+  slice) and is deliberately not done: a rule for choosing between two implementations is easy to
+  add later and impossible to remove.
 - **Bounds on a generic type's own parameters.** `struct SortedList[T: Ord]` is `10` open b, and it
   is what would let a generic *type's* members be checked at their definition the way a generic
   `impl`'s now are.

@@ -72,13 +72,6 @@ class ImplGenericErrorTests extends AnyFreeSpec with CodegenSupport {
         include("'P' takes no type arguments, so an 'impl' for it has nothing to be generic over")
     }
 
-    // A composed type's members are filed under the whole type — `[]int`, not `[]` — so matching
-    // one by its shape is a key it does not have, rather than the same feature one step over.
-    "and a composed type is matched whole rather than by its shape" in {
-      err(s"${show}impl[T] Show for []T\n    show(self) -> string = \"b\"") should
-        include("matching '[]T' by its shape is not supported yet")
-    }
-
     "a built-in takes no arguments either" in {
       err(s"${show}impl[T] Show for int\n    show(self) -> string = \"b\"") should
         include("'int' takes no type arguments")
