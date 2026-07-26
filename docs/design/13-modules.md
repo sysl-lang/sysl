@@ -180,6 +180,27 @@ already defined locally or explicitly imported loses to the more specific one, a
 wildcard imports that both offer the same name make an *unqualified* use of it ambiguous (a
 compile error naming both), and the fix is to qualify it or import it selectively.
 
+**A file's imports are not its dependency list.** Because a qualified reference needs no import,
+a file can depend on a module without naming it in any header — the dependency appears only in a
+body. Two consequences follow, and they are the price of the Scala-style convenience above:
+
+- **Building the module graph requires parsing, not a header scan.** Lexing each file's `module`
+  line and imports would be enough to find the edges only in a language where import is the sole
+  path to a foreign name. Here the edges live in bodies, so discovery reads the whole file. This
+  is bounded work — a parse, no name resolution and no typechecking — but it is not the few
+  hundred bytes per file a header-only scan would cost.
+- **The §6 cycle check needs real resolution, not a textual scan.** Since a cycle is an *error*,
+  a spuriously-recorded edge can reject a valid program. Matching every dotted chain against the
+  known module directories (which §1 makes available from `readdir` alone, with zero parsing) is
+  the cheap approximation, but it over-approximates exactly where a local binding shadows a module
+  name — a local named `std` makes `std.fs` a field access, not a module reference. So the edge
+  set has to come from resolution.
+
+Neither is a reason to give up qualified access, and neither affects the parse-only *interface*
+extraction of §2 — a module's exported surface is its signatures, which do not change with what its
+bodies happen to reference. Interface extraction and dependency discovery are separate questions
+with separate costs. What the build driver does with this belongs to open item (d).
+
 ## 4. Capabilities are a module property
 
 `capabilities.md` is the authority on what the capabilities *are* and how the effective set is
@@ -284,7 +305,10 @@ the directory graph, never on how a module's own files refer to one another.
 - **d. Separate compilation and module metadata.** Monomorphization and escape/capability
   propagation need a module's bodies or a summary of them across the boundary (`05`,
   `capabilities.md`); the on-disk form of that metadata, and whether modules compile separately or
-  the whole graph compiles together, is an implementation decision not settled here.
+  the whole graph compiles together, is an implementation decision not settled here. The driver's
+  discovery order is part of this: §3 establishes that the module graph cannot be recovered from
+  file headers alone, so the build has to parse before it can order, and how that interleaves with
+  cycle reporting (§6) and caching is unsettled.
 - **e. `private[M]` and re-export.** §2 settles what `M` may name (the declaring module or an
   ancestor, as a simple name, resolved innermost-outward) and therefore that a visibility scope is
   always a contiguous subtree. What is left open is how scoped-private interacts with re-export
