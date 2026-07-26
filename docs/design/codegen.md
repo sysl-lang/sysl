@@ -254,23 +254,25 @@ arity.
     determines is an error rather than a default. `?` is wired to the prelude's `Option` and
     `Result` **by name**, standing in for the eventual trait that will describe "can be
     short-circuited".
-11. **A generic body's *operators* are checked per instantiation, not at its definition.** The
-    method half of `14 §4` is implemented: a generic function is analyzed once more with each type
-    parameter standing in for itself, a method call on one resolves through the union of its bounds'
-    traits, and an unbounded `loose[T](x: T) -> int = x.show()` is now diagnosed on its own line
-    whether or not anything instantiates it. Forwarding a parameter to a bounded callee is checked
-    the same way: a bound is satisfied by a bound.
+11. **A `print` of a generic parameter is checked per instantiation, not at its definition.** All of
+    `14 §4` is otherwise implemented. A generic function is analyzed once more with each type
+    parameter standing in for itself; a method call and an *operator* on one both resolve through
+    the union of its bounds' traits; and `sum[T](a, b) = a + b` is diagnosed on its own line as
+    needing `T: Add`, whether or not anything instantiates it. Forwarding a parameter to a bounded
+    callee is checked the same way: a bound is satisfied by a bound.
 
-    The catalog of `14 §2` now exists — `Self`, the operator traits, `Eq` and `Ord`, and the
-    compiler-provided scalar memberships of `§5` — so `sum[T: Add](a, b) = a.add(b)` is a bound a
-    program can write and `sum(3, 4)` satisfies it. What has *not* landed is the desugaring that
-    makes `a + b` mean `Add::add(a, b)`: an operator on a parameter is still checked per
-    instantiation, and so is a `print` of one, which additionally waits on `Display` and the `Writer`
-    sink it renders into (`14 §8 d`). Reporting either at the definition today would reject a body
-    with no bound the author could write to fix it, so the abstract pass reports only what a bound
-    could have licensed and drops its other complaints; monomorphization catches those at each
-    instantiation exactly as it always did. Lifting that suppression is what `14 §4`'s operator half
-    means.
+    What is left is a `print` or a `str` of a parameter, which wants `T: Display` — and `Display` is
+    the one catalog trait that does not exist, because its method writes into a `Writer` and that
+    sink is unspecified (`14 §8 d`). Reporting it at the definition today would reject a body with no
+    bound the author could write to fix it, so the abstract pass drops that complaint and
+    monomorphization catches it at each instantiation, exactly as it always did.
+
+    Two lowerings are refused rather than approximated, both for the same reason — they share an
+    operand between two uses, which the scalar lowering does with a register and a trait call has
+    nowhere to hold. A **chained comparison** (`a < b < c`) compares each middle operand against both
+    neighbours from one evaluation; **compound assignment** (`a += b`) updates the place it read.
+    Both are diagnostics on a trait-dispatched type and both are lifted by the same future work: a
+    synthesized temporary binding in the analyzer.
 
     **An unbounded parameter stays perfectly legal** — this is not heading for a language where
     every `[T]` needs a bound. An unbounded `T` supports what every type supports: being passed,

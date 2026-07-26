@@ -228,6 +228,76 @@ trait CallAnalysis extends Literals {
       case many =>
         boundErr(s"'$mname' needs a bound on '${a.name}' — it is declared by ${many.mkString("'", "', '", "'")}")
 
+  // --- operators as trait methods --------------------------------------------------------
+
+  /** `a ⊕ b` where `⊕`'s operands are not something the machine has an instruction for (`14 §3`).
+   *
+   * A built-in keeps its instruction and this yields `None`, leaving the ordinary scalar path to
+   * lower it — that is `§5`'s promise that a membership changes no codegen, and it is also what
+   * keeps a float comparison on IEEE semantics instead of routing it through a negated `lt`.
+   *
+   * Everything else resolves to the one method the operator's trait requires: a bounded type
+   * parameter to the trait's own signature (checked at the definition, then bound by
+   * monomorphization), a user type to the member its `impl` produced. `None` for an operand type
+   * with no membership either way, so the diagnostic stays the one the scalar path already gives.
+   */
+  protected def operatorCall(op: String, l: TExpr, r: TExpr): Option[TExpr] =
+    CoreTraits.infix.get(op).flatMap(trName => traitOperator(trName, op, Some(r), l))
+
+  /** `-a`, `~a` — the same, for the two prefix operators. */
+  protected def prefixCall(op: String, t: TExpr): Option[TExpr] =
+    CoreTraits.prefix.get(op).flatMap(trName => traitOperator(trName, op, None, t))
+
+  private def traitOperator(trName: String, op: String, rhs: Option[TExpr], recv: TExpr): Option[TExpr] =
+    if CoreTraits.builtin(trName, recv.ty) then None
+    else
+      recv.ty match
+        // At the definition, where `T` stands for itself: the bound is the whole of what licenses
+        // the operator, and saying which bound is missing is the point of checking here at all.
+        case a: Type.Abstract =>
+          if !a.bounds.contains(trName) then boundErr(s"'$op' needs '${a.name}: $trName'")
+          Some(dispatch(trName, op, s"$trName.${CoreTraits.required(trName)._1}", rhs, recv))
+
+        case ty if satisfies(trName, ty) =>
+          Some(dispatch(trName, op, s"${ownerKey(ty)}.${CoreTraits.required(trName)._1}", rhs, recv))
+
+        case _ => None
+
+  /** Builds the call an operator means, applying the derivation for the four comparisons the
+   * catalog does not declare a method for (`§2`).
+   */
+  private def dispatch(trName: String, op: String, fname: String, rhs: Option[TExpr], recv: TExpr): TExpr = {
+    val self = selfBinding(recv.ty)
+    val m    = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
+    val rty  = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
+
+    for (b, p) <- rhs.zip(m.params.headOption) do
+      val want = resolveType(p.typ, self)
+      at(b.pos)(if disagree(b.ty, want) then err(s"'$op' needs matching types, got ${show(recv.ty)} and ${show(b.ty)}"))
+
+    val (swap, negate) = CoreTraits.derivation.getOrElse(op, (false, false))
+    val args           = rhs.toList
+    val call           = TCall(fname, if swap then args :+ recv else recv :: args, rty)
+
+    if negate then TUnary("!", call, Type.Bool) else call
+  }
+
+  /** Rejects an operator on a trait-dispatched type in a position whose lowering shares an operand.
+   *
+   * A chained comparison evaluates each operand **once** and compares it against both neighbours,
+   * and `a += b` updates the place it read — both need the operand held between two uses, which the
+   * scalar lowering does with a register and a trait call has nowhere to put. Refused with a
+   * diagnostic that says how to write it, rather than silently evaluating something twice.
+   */
+  protected def noSharedOperand(op: String, ty: Type, write: String): Unit =
+    if CoreTraits.infix.get(op).exists(tr => !CoreTraits.builtin(tr, ty) && dispatched(tr, ty)) then
+      err(s"'$op' on ${show(ty)} is a trait method, which this form cannot share an operand with " +
+        s"— write it as $write")
+
+  private def dispatched(trName: String, ty: Type): Boolean = ty match
+    case a: Type.Abstract => a.bounds.contains(trName)
+    case _                => satisfies(trName, ty)
+
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
    * The positional constructor `Type(…)` is a different form and is handled elsewhere.
    *

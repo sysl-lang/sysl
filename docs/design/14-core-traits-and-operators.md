@@ -1,10 +1,12 @@
 # Core Traits, Operators, and Definition-Checked Bounds
 
-**Status:** decided. **§1, §2, §4's method half, and §5 are implemented** — `Self`, the catalog
-(minus `Display`), definition-checked method calls on a type parameter, and the compiler-provided
-scalar memberships. What remains is the operator desugaring of §3 and §4, and §6, which waits on
-`Display` and so on the `Writer` sink of `§8 d`. This is the concrete spec for three things the
-earlier chapters *decided* but left unbuilt, because all three turn on the same missing layer:
+**Status:** decided. **§1–§5 are implemented** — `Self`, the catalog (minus `Display`), the one
+dispatch rule, definition-checked bounds on both method calls and operators, and the
+compiler-provided scalar memberships. What remains is **§6**, which needs `Display`, which needs the
+`Writer` sink of `§8 d` — and that in turn needs trait objects, which chapter `02` specifies and
+nothing has built. Two lowerings are also refused for now: see `codegen.md` shortcut 11. This is the
+concrete spec for three things the earlier chapters *decided* but left unbuilt, because all three
+turn on the same missing layer:
 
 - **`00 §9` / `01` / `08 §"Interaction with traits"`** — operators are trait methods (`+` is
   `Add`, `<` is `Ord`, `==` is `Eq`), overloaded by `impl Trait for Type`. The *token set* is
@@ -30,14 +32,11 @@ writing to a sink, because Swift has no allocator-free target to answer to (`§2
 Sections 1–5 are complete and implementable as written. **§6 has one unspecified dependency** —
 the `Writer` sink that `Display` renders into (`§8 d`).
 
-§4 landed in two parts, and the split is the catalog: a **method** call on a type parameter needs
-only the parameter's own bounds, which are traits a program already writes, so it was built first. An
-**operator** on one needs `Add` and friends to exist as traits, and a `print` of one needs
-`Display`. The catalog is now here, so `sum[T: Add](a, b) = a.add(b)` is a bound a program can write
-and a scalar satisfies; what is left of §4 is the *desugaring* that lets that body be written
-`a + b`. A `print` of a parameter is further out, because `Display` is the one trait the catalog
-still lacks. Until both land, the definition-time pass reports what a bound could have licensed and
-leaves the rest to monomorphization, which is where those checks have always happened.
+§4 landed in two parts, and the split was the catalog: a **method** call on a type parameter needs
+only the parameter's own bounds, which are traits a program already writes, so it came first; an
+**operator** on one needed `Add` and friends to exist. Both are now built, and `sum[T](a, b) = a + b`
+fails on its own line asking for `T: Add`. A `print` of a parameter is the one use still left to
+monomorphization, because `Display` is the trait the catalog lacks.
 
 ---
 
@@ -118,6 +117,12 @@ compiler:
 - `a > b` is `b < a` — `lt(b, a)`.
 - `a <= b` is `!(b < a)` — `!lt(b, a)`.
 - `a >= b` is `!(a < b)` — `!lt(a, b)`.
+
+Two of the six **swap their operands** — `a > b` is `lt(b, a)`, and `a <= b` is `!lt(b, a)` — so on
+a type whose `lt` is a real call, those two evaluate the right-hand expression first. It is
+invisible on a scalar, which never goes through the derivation, and invisible on operands with no
+side effects, which is nearly all of them. Making it invisible everywhere would mean binding both
+operands to temporaries before the call; whether that is worth doing is `§8 e`.
 
 **These derivations govern a type that implements the trait in source. The scalars do not go
 through them.** §5's compiler-provided impls supply all six comparisons directly, at the IEEE
@@ -342,3 +347,36 @@ prints once it has `impl Display`, which is the capability `08`/`tast.scala` wer
   standard-output one for `print`, a growable-buffer one for `str`, and whatever a freestanding
   target registers. **This is the one dependency blocking implementation of §6**, and it wants the
   prelude surface `13` leaves open. Nothing in §1–§5 waits on it.
+
+  Implementing it needs one thing more than a decision: `*Writer` is a trait object, and **trait
+  objects are not built**. A trait name does not resolve as a type at all today — there is no method
+  table, no fat pointer, no `Type` case for one — so `02`'s dynamic-dispatch half has to land before
+  any signature written here can be typed. That is the real order of work, and it is larger than the
+  three questions above.
+
+  Three notes toward the decision, from Rust:
+
+  - Rust splits the sink in two — `core::fmt::Write` takes a `&str`, `std::io::Write` takes a
+    `&[u8]` with partial writes and a real error. sysl needs only **one, on `[]u8`**: a `string`
+    here *is* a validated byte view of identical layout, so `s.bytes` costs nothing, and the prelude
+    already builds `prints` on `putbytes` for exactly that reason.
+  - Rust's `fmt::Error` carries **no information at all**, because a `Display` impl must compile in
+    `core`, which has no error taxonomy; the real `io::Error` is stashed by an adapter and swapped
+    back at the top. The lesson is that a fallible `Display` taxes every impl for a failure almost
+    no sink has. A **latched** writer — writes return nothing, a `failed` query reports a sticky
+    error — keeps impls straight-line, keeps `print(x)` a statement returning `unit`, and needs no
+    error type designed, which decouples §6 from work that has not started.
+  - Rust's `Display` does not take a bare sink; it takes a `Formatter`, which **also carries the
+    format spec**. That is the only reason `{:>10}` works on a user type. sysl already parses
+    `f"{x:%08d}"` into a real `FormatSpec`, so the same problem is already here: with a bare
+    `*Writer`, a user type could not honour a width without rendering to a temporary and padding it,
+    which allocates — exactly what the sink signature exists to avoid. Passing the spec as a second
+    parameter, rather than conflating it into the sink object, gets Rust's capability without its
+    packaging.
+- **e. Sharing an operand across a trait-dispatched operator.** A chained comparison and a compound
+  assignment both use one operand twice — the chain compares each middle value against both
+  neighbours, `a += b` updates the place it read — and the scalar lowering keeps that value in a
+  register. A trait call has nowhere to hold it, so both are refused on a trait-dispatched type
+  today. The same machinery would fix the evaluation-order swap in `>` and `<=` (§2): a synthesized
+  temporary binding in the analyzer, which is a small piece of work whose only cost is deciding
+  where the bindings live in the tree.

@@ -807,6 +807,71 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       err("mix[T: Add](a: T, b: T) -> bool = a.lt(b)") should include("'lt' needs 'T: Ord'")
     }
 
+    // The whole point of definition-checked bounds, in its operator spelling: the body is wrong on
+    // its own line, and the diagnostic names the bound that would make it right.
+    "an operator on an unbounded parameter names the bound it needs" in {
+      err("sum[T](a: T, b: T) -> T = a + b") should include("'+' needs 'T: Add'")
+    }
+
+    "an ordering operator on an unbounded parameter names 'Ord'" in {
+      err("less[T](a: T, b: T) -> bool = a < b") should include("'<' needs 'T: Ord'")
+    }
+
+    "a bound licenses only its own operator" in {
+      err("less[T: Eq](a: T, b: T) -> bool = a < b") should include("'<' needs 'T: Ord'")
+    }
+
+    "a prefix operator on an unbounded parameter names 'Neg'" in {
+      err("flip[T](a: T) -> T = -a") should include("'-' needs 'T: Neg'")
+    }
+
+    "an equality operator on an unbounded parameter names 'Eq'" in {
+      err("same[T](a: T, b: T) -> bool = a == b") should include("'==' needs 'T: Eq'")
+    }
+
+    // A chain compares each middle operand against both neighbours from one evaluation, which a
+    // trait call has nowhere to hold; refused rather than quietly evaluating the operand twice.
+    "a chained comparison of a user type is refused" in {
+      err(
+        """struct M
+          |    v: int
+          |impl Ord for M
+          |    lt(self, rhs: Self) -> bool = self.v < rhs.v
+          |var a = M(1)
+          |print(a < a < a)""".stripMargin
+      ) should include("cannot share an operand")
+    }
+
+    "compound assignment on a user type is refused" in {
+      err(
+        """struct M
+          |    v: int
+          |impl Add for M
+          |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+          |var a = M(1)
+          |a += M(2)""".stripMargin
+      ) should include("cannot share an operand")
+    }
+
+    "an operator on a user type with no impl is not defined" in {
+      err(
+        """struct M
+          |    v: int
+          |var a = M(1)
+          |var b = a + a""".stripMargin
+      ) should include("'+' is not defined for M")
+    }
+
+    "an operator's operands must be the same type" in {
+      err(
+        """struct M
+          |    v: int
+          |impl Add for M
+          |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+          |var a = M(1) + 2""".stripMargin
+      ) should include("'+' needs matching types")
+    }
+
     // Member lookup finds an inherent member before it asks about a membership, so an `impl` of
     // some other trait could otherwise take `5.add` over from the `Add` `int` already implements.
     "a member of a built-in may not hide one of its catalog methods" in {

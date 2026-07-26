@@ -68,6 +68,44 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe "42\n3.75\n"
     }
 
+    // The payoff of the whole chapter: the operator, not the method name, and the bound is what
+    // licenses it. Two instantiations, so no single specialization could serve both.
+    "an operator on a bounded parameter resolves through its bound" in {
+      val src =
+        """sum[T: Add](a: T, b: T) -> T = a + b
+          |print(sum(19, 23))
+          |print(sum(1.5, 2.25))""".stripMargin
+
+      run(src) shouldBe "42\n3.75\n"
+    }
+
+    "an ordering operator on a bounded parameter yields a bool" in {
+      val src =
+        """smaller[T: Ord](a: T, b: T) -> T = if a < b then a else b
+          |larger[T: Ord](a: T, b: T) -> T = if a > b then a else b
+          |print(smaller(7, 3), larger(7, 3))
+          |print(smaller("beta", "alpha"), larger("beta", "alpha"))""".stripMargin
+
+      run(src) shouldBe "3 7\nalpha beta\n"
+    }
+
+    // `§4`'s invariant: a body the definition accepted cannot fail at an instantiation. The same
+    // `a + b` is a native instruction for `int` and a call to `Point.add` for a user type.
+    "one operator body serves a scalar and a user type" in {
+      val src =
+        """struct Point
+          |    x: int
+          |    y: int
+          |impl Add for Point
+          |    add(self, rhs: Self) -> Self = Point(self.x + rhs.x, self.y + rhs.y)
+          |sum[T: Add](a: T, b: T) -> T = a + b
+          |print(sum(40, 2))
+          |var p = sum(Point(1, 2), Point(30, 9))
+          |print(p.x, p.y)""".stripMargin
+
+      run(src) shouldBe "42\n31 11\n"
+    }
+
     "a string satisfies 'Add', which is concatenation" in {
       val src =
         """sum[T: Add](a: T, b: T) -> T = a.add(b)
@@ -198,6 +236,64 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport {
           |print(same(Point(1, 2), Point(1, 3)))""".stripMargin
 
       run(src) shouldBe "true\nfalse\n"
+    }
+
+    "an operator on a user type is its trait's method" in {
+      val src =
+        """struct Point
+          |    x: int
+          |    y: int
+          |impl Add for Point
+          |    add(self, rhs: Self) -> Self = Point(self.x + rhs.x, self.y + rhs.y)
+          |var p = Point(1, 2) + Point(30, 9)
+          |print(p.x, p.y)""".stripMargin
+
+      run(src) shouldBe "31 11\n"
+    }
+
+    // Four operators from one method. `>` and `<=` swap the operands, `!=`, `<=` and `>=` negate,
+    // so a wrong entry in the derivation table shows up as a flipped answer here.
+    "all four ordering operators derive from one 'lt'" in {
+      val src =
+        """struct Money
+          |    cents: int
+          |impl Ord for Money
+          |    lt(self, rhs: Self) -> bool = self.cents < rhs.cents
+          |var a = Money(1)
+          |var b = Money(2)
+          |print(a < b, b < a, a < a)
+          |print(a > b, b > a, a > a)
+          |print(a <= b, b <= a, a <= a)
+          |print(a >= b, b >= a, a >= a)""".stripMargin
+
+      run(src) shouldBe
+        "true false false\nfalse true false\ntrue false true\nfalse true true\n"
+    }
+
+    "both equality operators derive from one 'eq'" in {
+      val src =
+        """struct Money
+          |    cents: int
+          |impl Eq for Money
+          |    eq(self, rhs: Self) -> bool = self.cents == rhs.cents
+          |var a = Money(1)
+          |print(a == Money(1), a == Money(2))
+          |print(a != Money(1), a != Money(2))""".stripMargin
+
+      run(src) shouldBe "true false\nfalse true\n"
+    }
+
+    "a prefix operator on a user type is its trait's method" in {
+      val src =
+        """struct Point
+          |    x: int
+          |    y: int
+          |impl Neg for Point
+          |    neg(self) -> Self = Point(-self.x, -self.y)
+          |var p = -Point(3, 4)
+          |print(p.x, p.y)""".stripMargin
+
+      run(src) shouldBe "-3 -4\n"
     }
 
     "a catalog method reaches its receiver through a pointer" in {

@@ -55,6 +55,34 @@ object CoreTraits {
     "Ord"    -> ("lt",     "<",  Kind.Compare),
   )
 
+  /** Each infix operator token, and the trait its operands must satisfy (`§3`). The four derived
+   * comparisons name the trait they are derived *from*, not one of their own — there is no `Gt`.
+   */
+  val infix: Map[String, String] =
+    required.collect { case (name, (_, op, Kind.Arith)) => op -> name } ++
+      Map("==" -> "Eq", "!=" -> "Eq", "<" -> "Ord", ">" -> "Ord", "<=" -> "Ord", ">=" -> "Ord")
+
+  /** Each prefix operator token and its trait, kept apart from `infix` because `-` is in both. */
+  val prefix: Map[String, String] =
+    required.collect { case (name, (_, op, Kind.Prefix)) => op -> name }
+
+  /** How each comparison is built from the one method its trait requires (`§2`): whether the
+   * operands are swapped, and whether the result is negated.
+   *
+   * `a > b` is `lt(b, a)` and `a <= b` is `!lt(b, a)`, so two of the six **swap**. On a scalar that
+   * is invisible — `§5`'s memberships keep the built-ins on their native comparisons, which is also
+   * what keeps a float's `NaN` behaviour intact — but on a type whose `lt` is a real call, the
+   * swap is a change in the order the two operand expressions are evaluated.
+   */
+  val derivation: Map[String, (Boolean, Boolean)] = Map(
+    "==" -> (false, false),
+    "!=" -> (false, true),
+    "<"  -> (false, false),
+    ">"  -> (true, false),
+    "<=" -> (true, true),
+    ">=" -> (false, true),
+  )
+
   /** The trait a method name belongs to, which is the direction member lookup needs: a call written
    * `x.add(y)` has to find `Add` before it can ask whether `x`'s type is a member. Method names are
    * distinct across the catalog, so this is unambiguous.

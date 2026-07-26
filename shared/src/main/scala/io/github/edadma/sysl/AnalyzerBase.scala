@@ -178,14 +178,15 @@ trait AnalyzerBase {
    * once with its type parameters standing in for themselves.
    *
    * The pass exists to report what a body does that its bounds do not license, and those
-   * diagnostics go through `boundErr`. Every *other* complaint the walk raises is dropped while it
-   * is set, because the abstract pass is additive: a mistake in the concrete part of a generic body
-   * is found where it always was, at each instantiation, and reporting it from here as well would
-   * report it against a body no call site may ever ask for.
+   * diagnostics go through `boundErr` — a missing bound on a method call or on an operator alike.
+   * Every *other* complaint the walk raises is dropped while it is set, because the abstract pass is
+   * additive: a mistake in the concrete part of a generic body is found where it always was, at each
+   * instantiation, and reporting it from here as well would report it against a body no call site
+   * may ever ask for.
    *
-   * That suppression is what the operator half of `14 §4` lifts. Until the core trait catalog of
-   * `§2` exists there is no `T: Add` to write, and no `T: Display` for a body that prints its
-   * parameter, so an unlicensed operator has no bound the programmer could add to fix it.
+   * What is still dropped rather than reported is a use of a parameter that no bound could license
+   * *yet* — a `print` of one above all, which wants `T: Display`, and `Display` waits on the
+   * `Writer` sink of `14 §8 d`. Reporting those would reject a body with no fix available to write.
    */
   protected var abstractPass: Boolean = false
 

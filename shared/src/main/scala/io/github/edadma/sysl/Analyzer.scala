@@ -212,6 +212,20 @@ class Analyzer private (program: Program)
     TFunc(name, tparams, rtype, tbody, f.variadic)
   }
 
+  /** A comparison the machine performs directly: the operands must agree, and the type must have
+   * the comparison being asked of it — equality reaches further than ordering (`01`).
+   */
+  private def scalarCompare(ts: List[TExpr], ops: List[String]): TExpr = {
+    for i <- ops.indices do
+      val (a, b)   = (ts(i), ts(i + 1))
+      val equality = ops(i) == "==" || ops(i) == "!="
+      if a.ty != b.ty then err(s"cannot compare ${show(a.ty)} with ${show(b.ty)}")
+      if !(if equality then Type.isEquatable(a.ty) else Type.isOrdered(a.ty)) then
+        err(s"'${ops(i)}' is not defined for ${show(a.ty)}")
+
+    TCompare(ts, ops)
+  }
+
   /** Registers an instantiation of a generic function and returns the name codegen will emit.
    * The signature is recorded before the body is queued, so a recursive generic function
    * resolves its own call.
@@ -318,24 +332,24 @@ class Analyzer private (program: Program)
 
     case Binary(op, l, r) =>
       val List(tl, tr) = analyzeOperands(List(l, r), expected.filter(Type.isNumeric))
-      TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty))
+      operatorCall(op, tl, tr).getOrElse(TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty)))
 
     case Unary("-", e) =>
       val t = analyzeExpr(e, expected.filter(Type.isNumeric))
-      t.ty match
+      prefixCall("-", t).getOrElse(t.ty match
         case i: Type.Integer if i.signed => TUnary("-", t, i)
         case f: Type.Floating            => TUnary("-", t, f)
         case i: Type.Integer             => err(s"unary '-' is not defined for the unsigned type ${show(i)}")
-        case other                       => err(s"unary '-' is not defined for ${show(other)}")
+        case other                       => err(s"unary '-' is not defined for ${show(other)}"))
 
     case Unary("!", e) =>
       TUnary("!", analyzeBool(e), Type.Bool)
 
     case Unary("~", e) =>
       val t = analyzeExpr(e, expected.filter(Type.isNumeric))
-      t.ty match
+      prefixCall("~", t).getOrElse(t.ty match
         case i: Type.Integer => TUnary("~", t, i)
-        case other           => err(s"unary '~' is not defined for ${show(other)}")
+        case other           => err(s"unary '~' is not defined for ${show(other)}"))
 
     // Address-of yields a *raw* pointer: a place lives in a frame or inside another object, so
     // there is no refcount to take a share of. Reaching a `&T` means being handed one.
@@ -355,15 +369,18 @@ class Analyzer private (program: Program)
     case PreIncDec(op, target)  => incDec(op, target, pre = true)
     case PostIncDec(op, target) => incDec(op, target, pre = false)
 
+    // One comparison of a type whose `Eq` or `Ord` is a real implementation is that method's call,
+    // derived where the trait declares no method of its own (`14 §2`). A chain cannot be: it shares
+    // each middle operand between two comparisons, which the scalar lowering does with a register.
+    case Compare(List(l, r), List(op)) =>
+      val ts = analyzeOperands(List(l, r), None)
+      operatorCall(op, ts.head, ts(1)).getOrElse(scalarCompare(ts, List(op)))
+
     case Compare(operands, ops) =>
       val ts = analyzeOperands(operands, None)
       for i <- ops.indices do
-        val (a, b)  = (ts(i), ts(i + 1))
-        val equality = ops(i) == "==" || ops(i) == "!="
-        if a.ty != b.ty then err(s"cannot compare ${show(a.ty)} with ${show(b.ty)}")
-        if !(if equality then Type.isEquatable(a.ty) else Type.isOrdered(a.ty)) then
-          err(s"'${ops(i)}' is not defined for ${show(a.ty)}")
-      TCompare(ts, ops)
+        noSharedOperand(ops(i), ts(i).ty, s"'a ${ops(i)} b' on its own, joined with '&&'")
+      scalarCompare(ts, ops)
 
     case Assign("=", target, value) =>
       val place = analyzePlace(target, "assignment")
@@ -376,6 +393,7 @@ class Analyzer private (program: Program)
       val place  = analyzePlace(target, s"'$op'")
       val binSym = op.dropRight(1)
       val tv     = analyzeExpr(value, Some(place.ty))
+      noSharedOperand(binSym, place.ty, s"'a = a $binSym b'")
       if arithType(binSym, place.ty, tv.ty) != place.ty then
         err(s"'$op' would change the type of ${describe(target)}")
       TUpdate(place, op, tv, place.ty)
