@@ -240,6 +240,11 @@ the type's parameters are in scope, and the receiver's type is the type applied 
 until an instantiation says what the parameters are, so it is resolved alongside them rather than
 ahead of them: `same(self) -> Self` is `same(self) -> Box[int]` at a `Box[int]` receiver.
 
+What such a member may *assume* of those parameters is what the type asks of them, and a bound on
+the type's own parameters is where it asks (`struct SortedList[T: Ord]`, `10 §5`). So a member's
+body is checked once, at its definition, against that bound alone — whether or not anything ever
+instantiates the type.
+
 A trait may also be implemented for a generic type as a whole, or for a composed **shape**, with type
 parameters and bounds on the block itself (`02`). Such a member is a member of the type exactly as
 one written in its body is, and is instantiated by the same rule — a shape's from the element type

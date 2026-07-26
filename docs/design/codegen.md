@@ -116,10 +116,18 @@ before they appear and may be mutually recursive).
   dropping the arguments (`[]`, `[3]`) that a member lookup falls back to, and a symbol the same way
   (`slice.show` instantiated at `int` is `slice.show.int`, which the written `[]int`'s
   `slice.int.show` cannot be mistaken for). An array's length is part of the shape, since no
-  parameter can stand for it (`10 § Open e`). A `string` is not a slice and is not covered. A shape
+  parameter can stand for it (`10 § Open d`). A `string` is not a slice and is not covered. A shape
   and a type of that shape written out in full are **two implementations for one type**, so whichever
   is written second is refused — sysl has no rule that picks between two, and that goes for member
   *names* across the two as well, since a type's members are one namespace.
+- **Bounds on a type's own type parameters (`10 §5`).** `struct SortedList[T: Ord]` and
+  `enum Tagged[T: Display]` take the bounded list a function takes, in the same place. Every
+  application of the type is held to it — a declared parameter, a result, a field, a payload, a
+  construction — and where the argument is itself a type parameter the answer is what *its* bounds
+  promise. Because the type now has somewhere to write what it assumes, its members are checked at
+  their definition like a generic `impl`'s, which removes the last asymmetry between the two. The
+  question is answered after every `impl` is hoisted, so a bound may be met by an implementation
+  written further down the file.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over
@@ -323,10 +331,12 @@ arity.
     to a bounded callee is checked the same way too: a bound is satisfied by a bound. A trait's
     default bodies go through the same pass, bounded by their own trait, and so do the members of a
     generic `impl` — one for a shape included — bounded by what the block declares (`02`). A member
-    of a generic *type* is the
-    one thing left out, and for a reason rather than an omission: it inherits the type's parameters,
-    which carry no bounds because there is nowhere to write one (`10` open b), so there is nothing to
-    hold it to. Those are still checked per instantiation.
+    of a generic *type* goes through it too, bounded by what the type asks of its own parameters
+    (`struct SortedList[T: Ord]`, `10 §5`), and a generic type's **fields** are laid out once the
+    same way — which is what catches a field applying another bounded type to this one's parameter.
+    Each of those walks is sandboxed on its own: a parameter standing in for itself is remembered
+    under the name it was written with, and two declarations that both spell theirs `T` bound it to
+    different things.
 
     The pass reaches what a bound could license and no further. A mistake that needs the *concrete*
     type to settle — a result that disagrees with its declared type for reasons `Self` alone cannot

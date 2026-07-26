@@ -395,17 +395,14 @@ exactly (`§5`), one row further down the catalog.
   compiler-provided and unaffected.
 - **Associated types** generally (`02` open item) — deferred, and with them any trait whose
   method mentions a type derived from `Self` rather than `Self` itself.
-- **Default method bodies** (`02` open item). The derived operators (`>` from `lt`, `!=` from
-  `eq`) are **compiler desugaring**, not user-visible default methods, so this feature can stay
-  deferred while the derivations still work. A user still implements the one required method per
-  trait.
+- **Deriving an operator through a default body.** Default method bodies are built (`02`), but the
+  derived operators (`>` from `lt`, `!=` from `eq`) remain **compiler desugaring** rather than
+  defaults a catalog trait writes. A user still implements the one required method per trait, and
+  the derivations work as they always did.
 - **`From`-style `?` conversion** (`11 §4`). Now unblocked in principle — it is a conversion
   trait plus a desugaring in `?` — but it is its own feature and is specified in `11`, not here.
 - **Supertraits / trait hierarchies.** Not needed by anything above (`Eq` and `Ord` are
   deliberately independent), so not introduced.
-- **Operator traits as bounds on struct/enum parameters** (`10` open b/c) — a `struct
-  SortedList[T: Ord]` — waits on the generic-member and type-parameter-bound work; `§4` specifies
-  bounds on **function** parameters, which is where they are exercised.
 
 ## 8. Open (not yet decided)
 

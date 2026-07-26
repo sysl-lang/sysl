@@ -265,11 +265,9 @@ impl[T] Show for Box[T]
     show(self) -> string = self.v.show()    // error: 'show' needs 'T: Show'
 ```
 
-This is the one place a generic `impl` and a generic *type* differ. A type's own members inherit the
-type's parameters, and those carry no bounds — there is nowhere to write one (`10` open b) — so
-holding such a member to its bounds would be holding it to nothing, and it is checked per
-instantiation instead. The block is where a bound can be written, so the block is where the check
-becomes possible.
+A generic *type's* own members are checked the same way and against the same kind of bound, written
+on the type's own parameters instead of on a block's (`10 §5`). The two forms of "what this
+declaration assumes" are one rule reached from two places.
 
 `Self` inside such a block is the subject applied to its parameters, which is not a type until an
 instantiation says what they are — so it is resolved alongside them rather than ahead of them, and
@@ -298,7 +296,7 @@ the bodies are checked once at their definition against the bounds alone.
 Two things are the shape's own. **A composed type is filed under the whole of itself** — `[]int`,
 not `[]` — so a shape needs a key that the types it covers do not have, and dropping the arguments
 is what makes one; a lookup that finds nothing under the type's own key falls back to it. And
-because an **array's length is not something a parameter can stand for** (`10 § Open e` — const
+because an **array's length is not something a parameter can stand for** (`10 § Open d` — const
 generics are not in the language), the length stays part of the shape: `[2]T` and `[3]T` are two
 shapes, each covering every element type at its own length.
 
@@ -416,9 +414,6 @@ signature, which stands in for every implementation because conformance is exact
   the one thing here that would be genuinely useful (`[]byte` rendering differently from every other
   slice) and is deliberately not done: a rule for choosing between two implementations is easy to
   add later and impossible to remove.
-- **Bounds on a generic type's own parameters.** `struct SortedList[T: Ord]` is `10` open b, and it
-  is what would let a generic *type's* members be checked at their definition the way a generic
-  `impl`'s now are.
 - **A property's body must be an expression.** `name -> T = expr` is the only spelling, so a property
   cannot open an indented block the way a method's `= …`-less form can. That is `08`'s grammar rather
   than anything about traits, and it bites a default property the same way it bites an inherent one.

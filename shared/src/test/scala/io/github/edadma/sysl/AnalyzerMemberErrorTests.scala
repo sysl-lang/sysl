@@ -517,17 +517,15 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("both a field and a member")
     }
 
-    // The unbounded model checks a member's body per instantiation, so a numeric operation on the
-    // element is only rejected once a non-numeric element reaches it — at the call, not the
-    // definition. total's type mismatch would never surface without instantiating at a string.
-    "a method body that needs a numeric element is rejected at a non-numeric instantiation" in {
+    // A member of a generic type is checked at its definition against what the type asks of its
+    // parameters, so a body that adds to the element is wrong on its own line unless the type says
+    // its element adds — whether or not anything instantiates it at all.
+    "a method body that needs a numeric element is rejected at the definition" in {
       err(
         """struct Box[T]
           |    value: T
-          |    inc(self) -> T = self.value + 1
-          |var a = Box("s")
-          |print(a.inc())""".stripMargin
-      ) should include("int")
+          |    inc(self) -> T = self.value + 1""".stripMargin
+      ) should include("'+' needs 'T: Add'")
     }
   }
 

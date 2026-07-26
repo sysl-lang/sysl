@@ -96,28 +96,12 @@ trait CallAnalysis extends Literals with TraitObjects {
    * trait is told exactly that, rather than meeting a missing-method error deep inside the
    * monomorphized body. A user type conforms by an `impl` written for its owner key, a built-in by
    * the compiler's own rule (`14 §5`) — which is what lets `sum(3, 4)` instantiate a `[T: Add]`.
+   *
+   * A *type's* parameters are held to their bounds by the same rule, at the point the type is
+   * applied, so the two forms of "what this declaration assumes" are one check.
    */
   protected def checkBounds(f: FuncDecl, targs: List[Type]): Unit =
-    if f.bounds.nonEmpty then
-      val subst = f.tparams.zip(targs).toMap
-      for (tp, traits) <- f.bounds; tr <- traits do
-        subst(tp) match
-          // A type parameter standing in for itself, during the definition-time pass. It is not a
-          // type anything has an `impl` for, so what it can promise a callee is exactly what its
-          // own bounds promise: a bound is satisfied by a bound.
-          case a: Type.Abstract =>
-            if !a.bounds.contains(tr) then
-              boundErr(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
-                s"but '${a.name}' is not bounded by it")
-          case concrete =>
-            if !satisfies(tr, concrete) then
-              // A type an implementation covers is told what that implementation asked of it, so the
-              // reader is sent one step in — to the argument that fails — rather than to a block
-              // that is already written.
-              val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
-
-              err(s"'${f.name}' requires its type parameter '$tp' to implement '$tr', " +
-                s"but ${show(concrete)} does not$why")
+    checkParamBounds(f.name, f.tparams, f.bounds, targs)
 
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever

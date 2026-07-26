@@ -279,9 +279,19 @@ case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef
 
 /** `struct Name[T…]` with `name: type` fields and, intermixed, member declarations (methods,
  * properties, associated functions). Positional construction is `Name(a, b, …)`.
+ *
+ * `bounds` is what the type asks of its own parameters — `struct SortedList[T: Ord]` — keyed by
+ * parameter name, with an unbounded one simply absent. Every application of the type is held to
+ * them, and its members may assume them: they are what makes a member checkable at its definition
+ * rather than once per instantiation (`10 §5`).
  */
-case class StructDecl(name: String, tparams: List[String], fields: List[Param], members: List[MethodDecl] = Nil)
-    extends Stmt
+case class StructDecl(
+    name: String,
+    tparams: List[String],
+    fields: List[Param],
+    members: List[MethodDecl] = Nil,
+    bounds: Map[String, List[String]] = Map.empty,
+) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
  * variant; a variant with an optional `value` and no fields is a simple integer constant.
@@ -296,9 +306,12 @@ case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param
  *
  * `underlying` is the `: iN`/`uN` annotation that pins a non-generic simple enum's storage type;
  * unspecified it is `int`. It is meaningless on a generic or data enum, which the analyzer rejects.
+ *
+ * `bounds` is what the type asks of its own parameters, exactly as a struct's are.
  */
 case class EnumDecl(name: String, tparams: List[String], underlying: Option[TypeRef],
-                    variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil) extends Stmt
+                    variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil,
+                    bounds: Map[String, List[String]] = Map.empty) extends Stmt
 
 /** `trait Name` with indented method declarations — a method with a receiver and a parameter list,
  * written either as a bare **signature** (`show(self) -> string`) or with a body, which makes it a

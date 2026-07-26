@@ -330,6 +330,75 @@ trait AnalyzerBase {
   protected def nominalTparams(base: String): List[String] =
     structDecls.get(base).map(_.tparams).orElse(enumDecls.get(base).map(_.tparams)).getOrElse(Nil)
 
+  /** What a nominal type asks of its own parameters, by parameter name. Empty for a type that asks
+   * nothing, which is every type that takes no parameters and most of those that do.
+   */
+  protected def nominalBounds(base: String): Map[String, List[String]] =
+    structDecls.get(base).map(_.bounds).orElse(enumDecls.get(base).map(_.bounds)).getOrElse(Map.empty)
+
+  /** Whether the `impl` blocks have all been registered, which is what makes a bound answerable.
+   *
+   * A type's bounds are checked wherever it is applied, and the earliest applications — a function's
+   * declared parameters, a field of another type — are resolved while the file is still being
+   * hoisted. Asking then would report a `Point` for not implementing a trait it implements six lines
+   * further down, so the question is held until every `impl` is in.
+   */
+  protected var implsHoisted: Boolean = false
+
+  /** Type applications whose bounds could not be answered where they were written, each with the
+   * position to report it against. Drained once, as soon as the answer is available.
+   */
+  protected val boundChecks =
+    mutable.ListBuffer.empty[(String, List[String], Map[String, List[String]], List[Type], Option[Pos])]
+
+  /** Checks the arguments a *type* was applied to against what it asks of its parameters, now if
+   * that can be answered and after hoisting if it cannot.
+   */
+  protected def checkTypeBounds(name: String, tparams: List[String], targs: List[Type]): Unit = {
+    val bounds = nominalBounds(name)
+
+    if bounds.nonEmpty && tparams.length == targs.length then
+      if implsHoisted then checkParamBounds(name, tparams, bounds, targs)
+      else boundChecks += ((name, tparams, bounds, targs, currentPos))
+  }
+
+  /** Whether the type arguments a generic declaration was applied to implement what it asked of its
+   * parameters — the one rule, wherever the parameters came from: a function's, an `impl` block's,
+   * or a type's own.
+   *
+   * An argument that could not be worked out is passed over. The mistake that produced it has been
+   * reported, and a bound it fails to meet is a consequence of that rather than a second mistake.
+   */
+  protected def checkParamBounds(
+      what: String,
+      tparams: List[String],
+      bounds: Map[String, List[String]],
+      targs: List[Type],
+  ): Unit =
+    if bounds.nonEmpty then
+      val subst = tparams.zip(targs).toMap
+
+      for (tp, traits) <- bounds; tr <- traits do
+        subst.get(tp) match
+          // A type parameter standing in for itself, during the definition-time pass. It is not a
+          // type anything has an `impl` for, so what it can promise is exactly what its own bounds
+          // promise: a bound is satisfied by a bound.
+          case Some(a: Type.Abstract) =>
+            if !a.bounds.contains(tr) then
+              boundErr(s"'$what' requires its type parameter '$tp' to implement '$tr', " +
+                s"but '${a.name}' is not bounded by it")
+          case Some(Type.Unknown) =>
+          case Some(concrete) =>
+            if !satisfies(tr, concrete) then
+              // A type an implementation covers is told what that implementation asked of it, so the
+              // reader is sent one step in — to the argument that fails — rather than to a block
+              // that is already written.
+              val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
+
+              err(s"'$what' requires its type parameter '$tp' to implement '$tr', " +
+                s"but ${show(concrete)} does not$why")
+          case None =>
+
   /** Where a type's members are registered: the key they are filed under, and the type arguments a
    * generic type was instantiated with.
    *
@@ -352,7 +421,7 @@ trait AnalyzerBase {
    * type a written `impl` is for and the name a diagnostic gives it. A shape-matched block is for
    * something else, so it needs a key of its own, and dropping the arguments is exactly what makes
    * one: every slice shares `[]`, and every array shares its length with the arrays of that length,
-   * since without const generics (`10 § Open e`) the length is part of the shape rather than an
+   * since without const generics (`10 § Open d`) the length is part of the shape rather than an
    * argument to it.
    *
    * A `string` is not a slice and has no shape here. It is a view of bytes that are valid UTF-8, and

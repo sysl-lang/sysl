@@ -320,10 +320,13 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val typeParams: Parser[List[String]] =
     op("[") ~> rep1sep(ident, op(",")) <~ op("]")
 
-  /** The type-parameter list of a generic *function*, where a parameter may carry a trait bound:
-   * `[T, U: Show, V: Ord + Hash]`. It yields the parameter names alongside a name-keyed map of the
-   * bounds, so an unbounded parameter is simply absent from the map. Bounds on a type's own
-   * parameters (a struct or enum) are a separate, deferred surface, so only functions parse them.
+  /** A type-parameter list where a parameter may carry a trait bound: `[T, U: Show, V: Ord + Hash]`.
+   * It yields the parameter names alongside a name-keyed map of the bounds, so an unbounded
+   * parameter is simply absent from the map.
+   *
+   * Every declaration that may be generic over types it does not know parses this one list — a
+   * function, an `impl` block, a struct, an enum — because a bound means the same thing in each: it
+   * is what the declaration assumes of the parameter, and what everything applying it must supply.
    */
   private lazy val boundedTypeParams: Parser[(List[String], Map[String, List[String]])] =
     op("[") ~> rep1sep(boundedTypeParam, op(",")) <~ op("]") ^^ { ps =>
@@ -403,12 +406,14 @@ class SyslParser(val source: Source) extends PackratParsers {
     op("=") ~> (suite | expression ^^ (e => List(ExprStmt(e).setPos(e.pos)))) | suite
 
   private lazy val structDecl: PackratParser[Stmt] =
-    op("struct") ~> ident ~ opt(typeParams) >> { case name ~ tps =>
+    op("struct") ~> ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
+      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+
       (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
         items =>
           val fields  = items.collect { case Left(f)  => f }
           val members = items.collect { case Right(m) => m }
-          StructDecl(name, tps.getOrElse(Nil), fields, members)
+          StructDecl(name, names, fields, members, bounds)
       }
     }
 
@@ -460,12 +465,14 @@ class SyslParser(val source: Source) extends PackratParsers {
    * explicit integer value (`Blue = 10`), or a name with a payload (`Circle(radius: int)`).
    */
   private lazy val enumDecl: PackratParser[Stmt] =
-    op("enum") ~> ident ~ opt(typeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
+    op("enum") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
+      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+
       (newline ~> indent ~> opt(newlines) ~> repsep(enumItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
         items =>
           val variants = items.collect { case Left(v)  => v }
           val members  = items.collect { case Right(m) => m }
-          EnumDecl(name, tps.getOrElse(Nil), under, variants, members)
+          EnumDecl(name, names, under, variants, members, bounds)
       }
     }
 

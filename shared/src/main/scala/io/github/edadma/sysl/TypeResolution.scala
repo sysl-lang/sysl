@@ -208,6 +208,7 @@ trait TypeResolution extends AnalyzerBase {
   protected def instantiateStruct(name: String, targs: List[Type]): Type.Struct = {
     val decl = structDecls(name)
     checkArity(name, decl.tparams, targs)
+    checkTypeBounds(name, decl.tparams, targs)
     val key = Type.qualified(name, targs)
 
     structInsts.get(key) match
@@ -246,6 +247,7 @@ trait TypeResolution extends AnalyzerBase {
   protected def instantiateEnum(name: String, targs: List[Type]): Type.Enum = {
     val decl = enumDecls(name)
     checkArity(name, decl.tparams, targs)
+    checkTypeBounds(name, decl.tparams, targs)
     val key = Type.qualified(name, targs)
 
     enumInsts.get(key) match

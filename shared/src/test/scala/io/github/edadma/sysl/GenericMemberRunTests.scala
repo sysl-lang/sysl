@@ -24,7 +24,7 @@ class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
 
   "a method takes a parameter of the element type" in {
     val src =
-      """struct Box[T]
+      """struct Box[T: Add]
         |    value: T
         |    plus(self, other: T) -> T = self.value + other
         |var a = Box(10)
@@ -49,7 +49,7 @@ class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
 
   "a reference-receiver method mutates the shared heap object" in {
     val src =
-      """struct Box[T]
+      """struct Box[T: Add]
         |    value: T
         |    bump(&self, by: T)
         |        self.value = self.value + by
@@ -64,7 +64,7 @@ class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
 
   "a computed property on a generic struct reads with no parentheses" in {
     val src =
-      """struct Box[T]
+      """struct Box[T: Add]
         |    value: T
         |    doubled -> T = self.value + self.value
         |var a = Box(21)
@@ -105,7 +105,7 @@ class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
 
   "a generic method calls another method on self" in {
     val src =
-      """struct Box[T]
+      """struct Box[T: Add]
         |    value: T
         |    raw(self) -> T = self.value
         |    twice(self) -> T = self.raw() + self.raw()
@@ -128,12 +128,13 @@ class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "1 2\n"
   }
 
-  // The unbounded model checks a member's body per instantiation, so a body that needs `T` to be
-  // numeric compiles fine when the receiver is a Box[int] even though it would be rejected at a
-  // Box[string]. Here only the numeric instantiation exists.
+  // A body that adds to the element needs the type to say so, and `T: Add` is where it says it.
+  // The `1` is checked against `T` per instantiation rather than at the definition — a literal is
+  // an `int` and `T` is not one yet — so an instantiation at a type that adds but does not add an
+  // `int` is where that mismatch surfaces.
   "a method whose body needs a numeric element compiles at a numeric instantiation" in {
     val src =
-      """struct Box[T]
+      """struct Box[T: Add]
         |    value: T
         |    inc(self) -> T = self.value + 1
         |var a = Box(41)

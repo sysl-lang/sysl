@@ -77,9 +77,7 @@ trait Hoisting extends TypeResolution {
           (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
-      for (tp, traits) <- f.bounds; tr <- traits do
-        if !traitDecls.contains(tr) then
-          err(s"the bound on '$tp' in '${f.name}' names '$tr', which is not a trait")
+      checkBoundNames(f.name, f.bounds)
 
     case e: ExternDecl =>
       if funcDecls.contains(e.name) then err(s"function '${e.name}' is already declared")
@@ -93,6 +91,18 @@ trait Hoisting extends TypeResolution {
         err(s"'$s' is not a symbol a linker can resolve")
 
     case _ =>
+
+  /** Checks that every bound a declaration writes names a trait, whichever declaration form wrote it
+   * — a function, a struct, or an enum. A bound is a trait and nothing else (`10 §5`), so a name
+   * that is a struct, a scalar, or nothing at all is reported here rather than silently promising
+   * something no type could ever be held to.
+   *
+   * It runs in a pass after every type is registered, so a bound may name a trait declared further
+   * down the file.
+   */
+  protected def checkBoundNames(name: String, bounds: Map[String, List[String]]): Unit =
+    for (tp, traits) <- bounds; tr <- traits if !traitDecls.contains(tr) do
+      err(s"the bound on '$tp' in '$name' names '$tr', which is not a trait")
 
   /** The rules a declared signature must satisfy whichever declaration form it came from, checked
    * after the name is registered so a failure reports the mistake without also erasing the
@@ -144,9 +154,17 @@ trait Hoisting extends TypeResolution {
    * type parameters, and associated functions on a generic type — whose type arguments would have
    * to be inferred rather than read off a receiver — wait on later work and are rejected with a
    * clear diagnostic rather than silently mishandled.
+   *
+   * A generic type's members are handed to the definition-time pass of `14 §4` all the same. What
+   * they may assume of the type's parameters is what the type asks of them — nothing, where it asks
+   * nothing — and that is a rule a body can be held to before anything instantiates it, exactly as
+   * a bounded generic function's body is.
    */
   protected def hoistMembers(tname: String, members: List[MethodDecl], out: mutable.ListBuffer[FuncDecl]): Unit = {
     val (tparams, taken, noun) = nominal(tname).get
+    val bounds                 = nominalBounds(tname)
+
+    checkBoundNames(tname, bounds)
 
     // A member of a concrete type may write `Self` for the type it is a member of, exactly as an
     // `impl`'s method may. A member of a *generic* one has its `Self` bound one step later, at each
@@ -154,7 +172,7 @@ trait Hoisting extends TypeResolution {
     // reference waits for that.
     val self = if tparams.nonEmpty then Map.empty else concrete(tname).fold(Map.empty[String, Type])(selfBinding)
 
-    hoistMemberList(
+    val lowered = hoistMemberList(
       MemberHome(
         tname,
         tname,
@@ -162,7 +180,7 @@ trait Hoisting extends TypeResolution {
         None,
         NamedType(tname, tparams.map(NamedType(_, Nil))),
         tparams,
-        Map.empty,
+        bounds,
         taken,
         noun,
         self,
@@ -170,6 +188,8 @@ trait Hoisting extends TypeResolution {
       members,
       out,
     )
+
+    if tparams.nonEmpty then abstractMembers ++= lowered
   }
 
   /** Everything hoisting a list of members needs to know about the type they belong to, whichever
@@ -192,7 +212,7 @@ trait Hoisting extends TypeResolution {
    *   - `tparams` are the parameters a member's signature may mention — a generic type's own, or a
    *     generic `impl`'s, **in the order the implementing type applies them**, so that instantiating
    *     a member from a receiver's type arguments substitutes them positionally. `bounds` is what
-   *     the block asks of them, which only an `impl` can say.
+   *     was asked of them where they were declared, and it is what the members may assume.
    *   - `taken` are the names already spoken for inside the body (a struct's fields, an enum's
    *     variants), and `noun` what a diagnostic calls one of those.
    *   - `self` is what `Self` means inside these members, empty where the answer waits for an

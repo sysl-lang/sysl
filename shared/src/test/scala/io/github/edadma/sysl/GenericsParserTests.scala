@@ -36,6 +36,45 @@ class GenericsParserTests extends AnyFreeSpec with ParseSupport {
         )
       )
     }
+
+    // A type's parameters take the same bounded list a function's do, in the same place: what the
+    // declaration assumes of the parameter is written where the parameter is.
+    "a struct whose parameter carries bounds" in {
+      prog("struct SortedList[T: Ord + Eq]\n    head: T") shouldBe List(
+        StructDecl(
+          "SortedList",
+          List("T"),
+          List(Param("head", NamedType("T"))),
+          Nil,
+          Map("T" -> List("Ord", "Eq")),
+        )
+      )
+    }
+
+    "an enum whose parameter carries a bound" in {
+      prog("enum Maybe[T: Show]\n    Just(value: T)\n    Nothing") shouldBe List(
+        EnumDecl(
+          "Maybe",
+          List("T"),
+          None,
+          List(EnumVariantDecl("Just", None, List(Param("value", NamedType("T")))), EnumVariantDecl("Nothing", None, Nil)),
+          Nil,
+          Map("T" -> List("Show")),
+        )
+      )
+    }
+
+    "an unbounded parameter is simply absent from the bounds" in {
+      prog("struct Pair[A, B: Show]\n    first: A\n    second: B") shouldBe List(
+        StructDecl(
+          "Pair",
+          List("A", "B"),
+          List(Param("first", NamedType("A")), Param("second", NamedType("B"))),
+          Nil,
+          Map("B" -> List("Show")),
+        )
+      )
+    }
   }
 
   "type arguments" - {

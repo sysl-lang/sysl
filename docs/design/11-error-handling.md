@@ -178,7 +178,7 @@ the same footing as C's `assert` compiled out by `NDEBUG`.
 ## 8. The prelude's combinators, and how `unwrap` stops the program
 
 The conveniences on `Option` and `Result` are **ordinary members in the prelude** (`09 §4`,
-`10 §Open c`), not compiler knowledge. The *total* ones ask a question or supply a fallback:
+`10 §Open b`), not compiler knowledge. The *total* ones ask a question or supply a fallback:
 
 - `Option`: `is_some()`, `is_none()`, `unwrap_or(default)`
 - `Result`: `is_ok()`, `is_err()`, `unwrap_or(default)`

@@ -16,6 +16,10 @@ no bound suggested, because none could license it — see §5.
 The same pass checks a trait's **default bodies** (`02`), each as the generic function it is: one
 parameter, `Self`, bounded by its own trait.
 
+**A type's own parameters carry bounds too**, and that is built as well: `struct SortedList[T: Ord]`
+holds every application of the type to what it asks, and lets its members be checked at their
+definition the way a bounded function's body is — see §5.
+
 This chapter rests on `02-traits.md` (a bound *is* a trait), `03-memory-model.md` (why every
 value is copyable, which decides what an unbounded parameter may do), and `09-enums-and-
 patterns.md` (`Option`/`Result` are generic enums). The `?` operator and the error types are
@@ -40,7 +44,7 @@ enum Option[T]                           // generic enum (09)
 A parameter name stands for a type not yet known; it may appear anywhere a type may — a
 parameter type, a return type, a field type, a variant payload, a local annotation. A fourth form
 takes parameters without declaring a type: an **`impl` block**, whose subject is a generic type or a
-composed shape applied to them (`02`). A generic type's *own body* may hold members (`§ Open c`).
+composed shape applied to them (`02`). A generic type's *own body* may hold members (`§ Open b`).
 
 ## 2. `[]` means type application in a type, indexing in an expression
 
@@ -145,8 +149,50 @@ bound that supplies it**.
 **Multiple bounds** join with `+`: `[T: Ord + Hash]` requires both. The `+` reads unambiguously
 in a bound position (it is between trait names, not values) and matches the Rust spelling that
 sysl's Rust-flavored trait system already implies. A `where`-clause form for long or complex
-bound lists is a possible ergonomic extension (`§ Open d`); the inline `[T: A + B]` form is the
+bound lists is a possible ergonomic extension (`§ Open c`); the inline `[T: A + B]` form is the
 settled baseline.
+
+### A type's own parameters carry bounds too, and that is where the type says what it assumes
+
+The same bracketed list, in the same place, means the same thing on a struct or an enum:
+
+```
+struct SortedList[T: Ord]                 enum Tagged[T: Display]
+    head: T                                   One(value: T)
+    contains(self, x: T) -> bool = …          None
+```
+
+It buys exactly what it buys a function, and the two halves are worth stating separately.
+
+**Everything applying the type must supply it.** `SortedList[Point]` is an error unless `Point`
+implements `Ord`, and it is an error *wherever* the application is written — a declared parameter, a
+result, a field of another type, a variant's payload, a construction. The diagnostic names the
+parameter, the trait, and the argument that fails. Where the argument is itself a type parameter,
+the answer is what its own bounds promise, so a function taking a `SortedList[U]` must bound `U` by
+at least what `SortedList` asks; a bound is satisfied by a bound, one step out.
+
+**And the type's members may assume it, so they are checked at their definition.** This is what
+having somewhere to write the bound is *for*: a member of a generic type is walked once, with the
+parameters standing in for themselves, by the same pass that walks a bounded generic function — so a
+method calling something no bound licenses is reported on its own line whether or not anything
+instantiates the type. A generic type's fields are laid out once the same way, which is what catches
+a field applying another bounded type to this one's parameter (`struct Wrap[T: Show]` holding an
+`Inner[T]` where `Inner` asks `Ord`).
+
+That closes the one asymmetry the implementation used to carry, where a generic `impl`'s members
+were definition-checked and a generic *type's* were not. It also means a member that assumed
+something the type never asked for is a **new error in code that used to compile**, which is the
+migration this rule was always going to require: `struct Box[T]` with an `inc` that adds to its
+element is now `struct Box[T: Add]`, and the line naming the missing bound is where to write it.
+
+An unbounded parameter is unchanged in every respect: `Box[T]` holds and hands along any type at
+all, and asks nothing of it (§5's baseline). A bound is written where a body needs one, and nowhere
+else.
+
+**A bound is declared once, at the type, and is in force everywhere its parameters appear** — a
+member's signature and body, a field's type, a variant's payload. It is not restated per member.
+Restating it is Rust's rule and its own users regret it; declaring once is the Swift/Kotlin
+behaviour and the one that matches how the bound reads.
 
 ## 6. Static dispatch (generic) vs dynamic dispatch (trait object)
 
@@ -200,29 +246,23 @@ never by a covariant container.
   (§2). If explicit arguments prove necessary, they need a disambiguating syntax (a Rust-style
   turbofish marker, or a rule that a type-argument list is only read in a call head). Deferred
   until a real case cannot be served by inference.
-- **b. Bounds on struct/enum parameters.** §5 settles bounds on *function* parameters, which is
-  where the implementation exercises them. Whether a *type's* parameter may carry a bound
-  (`struct SortedList[T: Ord]`) — and whether such a bound is required at the type or re-stated
-  at each method — is open, and ties into (c). A generic **`impl`** block does carry bounds (`02`),
-  which is what makes *its* members checkable at their definition; a type's own members are checked
-  per instantiation precisely because there is nowhere to write the bound.
-- **c. Members on generic types.** Methods and properties on a generic struct *or enum* are
+- **b. Members on generic types.** Methods and properties on a generic struct *or enum* are
   settled and implemented: the member is instantiated from the receiver's own type arguments, so
   `Box[int].get` and `Box[real].get` are two monomorphized functions exactly as two instantiations
   of a free generic function are. The same holds for the members a generic `impl` adds (`02`). What
   remains open is the part with nothing to infer from — an **associated function** on a generic type
   (no receiver to read the arguments off) and a member carrying **its own** type parameters — both
   deferred with a diagnostic.
-- **d. `where` clauses.** An out-of-line bound syntax for readability when the inline `[T: A +
+- **c. `where` clauses.** An out-of-line bound syntax for readability when the inline `[T: A +
   B]` list grows long or involves relations between parameters. All of Rust/Swift/Kotlin have
   one; a candidate ergonomic addition, not a day-one need.
-- **e. Const generics.** Parameterizing over a *value* — most importantly an array length,
+- **d. Const generics.** Parameterizing over a *value* — most importantly an array length,
   `[N: usize]` — so a function can be generic over `[N]T`. Not implemented (array sizes are
   literals today); a clear eventual want for fixed-size numeric and buffer code, deferred until
   the array story calls for it. It is what an `impl` matching an array's **shape** is missing:
   `impl[T] Total for [3]T` covers every element type at length 3, and each other length needs its
   own block (`02`).
-- **f. Higher-kinded parameters.** Parameterizing over a *type constructor* (`F[_]`) is
+- **e. Higher-kinded parameters.** Parameterizing over a *type constructor* (`F[_]`) is
   **excluded**, not merely deferred: it pushes inference toward undecidable, and no target use
   (an OS, drivers, embedded) needs it. Abstraction over containers is served by traits and
   bounds, not by HKT.
