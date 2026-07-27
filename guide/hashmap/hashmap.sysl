@@ -21,18 +21,22 @@
 //     same splitmix64 finalizer this used to carry, in the one place every container can reach it.
 //   * **An enum has no zero value, so an array of them cannot be declared without one.**
 //     `var cells: [16]Option[&Entry[K, V]]` is refused. This one has since been answered: the
-//     repeat form `[None; block_size]` fills the array from a value instead of from a zero, and
-//     `empty_block` below is now one line. It was sixteen `None`s written out.
+//     repeat form `[None; n]` fills the storage from a value instead of from a zero. It was
+//     sixteen `None`s written out.
 //   * **Generically it is worse than that, and still is.** A `[16]K` cannot be declared *whatever*
 //     `K` is: a repeat needs a value in its value position, and a type parameter promises none —
 //     no bound in the catalog promises a value. A generic container therefore cannot make its own
-//     storage unless it already has something to fill it with, which is why the bucket array here
-//     holds `Option[…]` rather than entries.
-//   * **Storage cannot be asked for at a size chosen while running** (`07`, *Not yet*), so the
-//     table is a fixed directory of fixed blocks and its capacity has a ceiling written into the
-//     type. The growth is real — blocks are allocated, the mask changes, every entry is rehashed
-//     into a new bucket — but it stops at `max_blocks`, after which the map keeps working with
-//     longer chains instead.
+//     storage unless it already has something to fill it with, which is why the table here holds
+//     `Option[…]` rather than entries.
+//   * **Storage could not be asked for at a size worked out while running**, so the table was a
+//     fixed directory of fixed blocks and its capacity was a number in its own type: it doubled up
+//     to `max_blocks` and then stopped, staying correct with lengthening chains. Answered: an array
+//     form written where a `[]T` is expected makes storage of its own and the view owns it, so the
+//     table is one flat run of buckets that doubles for as long as there are keys. That deleted a
+//     directory, a block, two constructors, two constants, and the ceiling. The **generic** half
+//     above survives it, and the difference is worth being exact about: `[None; n]` works whatever
+//     `K` and `V` are because `None` is a value that needs nothing of them, while a `[16]K` would
+//     need a value *of* `K`, which no bound promises.
 //   * **A bound is repeated at every declaration that needs it.** `[K: Hash + Eq, V]` is written
 //     on the type and again on each free function over it; there is no `where` clause (`10 § Open
 //     c`) and no name for a set of bounds.
@@ -41,10 +45,10 @@
 //     were refused for disagreeing about a value nobody wanted. Answered: a block whose own value
 //     is unused has none, and the position reaches into an `if`'s branches and a `match`'s arms
 //     alike. `put` below is the shape that asked for it, with the `return` that dodged it gone.
-//   * **Two generics cannot solve each other.** `Map(empty_dir(), …)` asks the constructor to fix
-//     `Map`'s parameters from its arguments while asking `empty_dir` to fix its own from the field
-//     it lands in, and neither can go first — so the binding is annotated. Inference is
-//     bidirectional (`10 §4`) but not simultaneous.
+//   * **Two generics cannot solve each other.** `Map([None; n], 0)` asks the constructor to fix
+//     `Map`'s parameters from its arguments while the bare `None` waits to hear what it is a `None`
+//     *of*, and neither can go first — so the binding is annotated. Inference is bidirectional
+//     (`10 §4`) but not simultaneous.
 //
 // What went in without friction is worth recording too, since the point of the exercise is where
 // the language stops rather than a list of complaints: the definition-time bound check does what
@@ -63,55 +67,27 @@ struct Entry[K, V]
     next: Option[&Entry[K, V]]
 end Entry
 
-struct Block[K, V]
-    cell: [block_size]Option[&Entry[K, V]]
-end Block
-
-struct Dir[K, V]
-    block: [max_blocks]Option[&Block[K, V]]
-end Dir
-
-// How many buckets a block holds, and how many blocks the directory can point at. Between them they
-// fix the capacity ceiling at 256 buckets, and because they are constants rather than the nullary
-// functions this was first written with, the two arrays above are sized by the same names the code
-// below divides by (`13 §7`).
-private const block_size: usize = 16
-
-private const max_blocks: usize = 16
-
-// An `Option` has no zero value, so neither array can be declared and left to start at one — but a
-// repeat fills them from a value that costs nothing to name, and the count is the same constant the
-// rest of the file divides by.
-private empty_block[K, V]() -> &Block[K, V] = Block([None; block_size])
-
-private empty_dir[K, V]() -> &Dir[K, V] = Dir([None; max_blocks])
+// How many buckets a fresh map starts with. Doubling from a power of two keeps every later count
+// one as well, which is what lets an index be a mask rather than a division.
+private const initial_buckets: usize = 16
 
 // ----------------------------------------------------------------------------------- the map
 
-// A map starts with one block and doubles from there. `blocks` is always a power of two, so the
-// bucket count is one as well and an index is a mask rather than a division.
+// The table is one flat run of buckets, sized when the map is made and replaced by a longer one
+// when it fills. `cell` is a `[]T` that owns its elements rather than viewing somebody else's, so
+// the length is a number the program worked out rather than one written into the type.
 struct Map[K: Hash + Eq, V]
-    dir: &Dir[K, V]
-    blocks: usize
+    cell: []Option[&Entry[K, V]]
     count: usize
 
-    buckets(self) -> usize = self.blocks * block_size
-
-    // The block a bucket lives in. Every block below `blocks` is allocated the moment the table
-    // grows to it, so this is the one place the invariant is spelled out.
-    at(self, i: usize) -> &Block[K, V] = self.dir.block[i / block_size].expect("a live block")
-
-    bucket(self, i: usize) -> Option[&Entry[K, V]] = self.at(i).cell[i % block_size]
-
-    set_bucket(*self, i: usize, e: Option[&Entry[K, V]])
-        self.at(i).cell[i % block_size] = e
+    buckets(self) -> usize = self.cell.len
 
     index(self, k: K) -> usize = usize(k.hash()) & (self.buckets() - 1)
 
     // The entry a key names, or `None`. Handing the entry itself back is what lets `get`, `put`,
     // and `has` be three lines each — and it is safe to hand out because the map still holds it.
     find(self, k: K) -> Option[&Entry[K, V]]
-        var at = self.bucket(self.index(k))
+        var at = self.cell[self.index(k)]
 
         loop
             at match
@@ -138,9 +114,9 @@ struct Map[K: Hash + Eq, V]
                 if self.count * 4 >= self.buckets() * 3 then self.grow()
 
                 var i = self.index(k)
-                var e: &Entry[K, V] = Entry(k, v, self.bucket(i))
+                var e: &Entry[K, V] = Entry(k, v, self.cell[i])
 
-                self.set_bucket(i, Some(e))
+                self.cell[i] = Some(e)
                 self.count += 1usize
     end put
 
@@ -148,7 +124,7 @@ struct Map[K: Hash + Eq, V]
     // the one being removed is what has to be made to point past it.
     remove(*self, k: K) -> bool
         var i = self.index(k)
-        var at = self.bucket(i)
+        var at = self.cell[i]
         var prev: Option[&Entry[K, V]] = None
 
         loop
@@ -157,7 +133,7 @@ struct Map[K: Hash + Eq, V]
                 Some(e) ->
                     if e.key == k
                         prev match
-                            None -> self.set_bucket(i, e.next)
+                            None -> self.cell[i] = e.next
                             Some(p) -> p.next = e.next
                         self.count -= 1usize
                         break true
@@ -170,21 +146,17 @@ struct Map[K: Hash + Eq, V]
     // reference, so moving one between buckets is two writes and no allocation, and the keys and
     // values it holds are never copied.
     //
-    // Growth stops at the ceiling rather than failing. A map that has run out of directory keeps
-    // answering every question correctly; the chains simply get longer.
+    // The new table is a `[]T` sized from the old one's length, so the map has no capacity written
+    // into its type and doubles for as long as there are keys to hold. It used to stop at a ceiling
+    // — a fixed directory of fixed blocks, because storage could not be asked for at a size worked
+    // out while running — and past that it kept answering correctly with lengthening chains.
     grow(*self)
-        if self.blocks >= max_blocks then return
+        var old = self.cell
 
-        var old = self.dir
-        var old_buckets = self.buckets()
+        self.cell = [None; old.len * 2]
 
-        self.dir = empty_dir()
-        self.blocks = self.blocks * 2
-        for b in 0usize..<self.blocks
-            self.dir.block[b] = Some(empty_block())
-
-        for i in 0usize..<old_buckets
-            var at = old.block[i / block_size].expect("a live block").cell[i % block_size]
+        for i in 0..<old.len
+            var at = old[i]
 
             loop
                 at match
@@ -195,25 +167,24 @@ struct Map[K: Hash + Eq, V]
                         var rest = e.next
                         var j = self.index(e.key)
 
-                        e.next = self.bucket(j)
-                        self.set_bucket(j, Some(e))
+                        e.next = self.cell[j]
+                        self.cell[j] = Some(e)
                         at = rest
     end grow
 
-    walk(self) -> Cursor[K, V] = Cursor(self.dir, self.buckets(), 0usize, None)
+    walk(self) -> Cursor[K, V] = Cursor(self.cell, 0usize, None)
 end Map
 
-// An empty map, with its first block already under it so that every later question can assume one.
+// An empty map, with its buckets already under it so that every later question can assume some.
 //
 // A nullary generic solves its parameters from what the binding asks for (`10 §4`), which is why
 // the key and value types of a map are written on the `var` that holds it. The annotation on `m`
-// is the same rule biting one level in: `Map(empty_dir(), …)` would have to solve `Map`'s
-// parameters from its arguments and `empty_dir`'s from the field it lands in, and neither can go
-// first.
+// is the same rule biting one level in: without it, `Map`'s parameters would have to come from the
+// arguments while the bare `None` filling the table waits to hear what it is a `None` *of*, and
+// neither can go first.
 map[K: Hash + Eq, V]() -> Map[K, V]
-    var m: Map[K, V] = Map(empty_dir(), 1usize, 0usize)
+    var m: Map[K, V] = Map([None; initial_buckets], 0usize)
 
-    m.dir.block[0] = Some(empty_block())
     m
 end map
 
@@ -222,27 +193,25 @@ end map
 // A position in a table: which bucket to look at next, and where in the current chain.
 //
 // It takes **no bounds**, and that is the point of writing them where they are needed: walking a
-// table hashes nothing and compares nothing, so a cursor asks nothing of a key. It holds the
-// directory rather than the map so that it keeps the storage alive while it walks — but the table
-// it is walking must not grow underneath it, and a cursor is finished with before the next `put`.
+// table hashes nothing and compares nothing, so a cursor asks nothing of a key. It holds the table
+// rather than the map so that it keeps the storage alive while it walks — a view retains what it
+// views, so a `grow` underneath a cursor leaves the cursor reading the table it started on rather
+// than reading freed memory.
 struct Cursor[K, V]
-    dir: &Dir[K, V]
-    buckets: usize
+    cell: []Option[&Entry[K, V]]
     at: usize
-    cell: Option[&Entry[K, V]]
+    entry: Option[&Entry[K, V]]
 
     next(*self) -> Option[&Entry[K, V]]
         loop
-            self.cell match
+            self.entry match
                 Some(e) ->
-                    self.cell = e.next
+                    self.entry = e.next
                     break Some(e)
                 None ->
-                    if self.at >= self.buckets then break None
+                    if self.at >= self.cell.len then break None
 
-                    var b = self.dir.block[self.at / block_size].expect("a live block")
-
-                    self.cell = b.cell[self.at % block_size]
+                    self.entry = self.cell[self.at]
                     self.at += 1usize
     end next
 end Cursor
