@@ -72,12 +72,20 @@ package io.github.edadma.sysl
  * status, which is what `11-error-handling.md` says a trap does under the `os` capability — and it
  * is the reason those two need no compiler support of their own.
  *
+ * **`ByteSink` is the one writer supplied here**, and the reason it is supplied rather than left to
+ * each program is `14 §2`'s rule that a specifier describes the field the *whole* value occupies: an
+ * implementation rendering more than one part has to gather them before it can pad what they came
+ * to, and gathering needs somewhere to put them. It is ordinary sysl over `Buf[u8]`, so it could not
+ * be written at all until a `[]T` could be sized while running. The writer standing for standard
+ * output stays the compiler's, because it holds no state and there is no struct with no fields.
+ *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
- * reaches it, and an `extern` is declared only if something calls it. `FormatSpec` is the one
- * exception, and not one of this file's making — a non-generic type is instantiated eagerly
- * wherever it is declared, so its layout is emitted whether or not anything renders. That is a
- * type declaration with no code behind it, which is why the rule is worth what it saves.
+ * reaches it, a **member of a non-generic type declared here** is held back by that same
+ * reachability, and an `extern` is declared only if something calls it. Layout is the one exception,
+ * and not one of this file's making — a non-generic type is instantiated eagerly wherever it is
+ * declared, so `FormatSpec`'s and `ByteSink`'s are emitted whether or not anything renders. That is
+ * two type declarations with no code behind them, which is why the rule is worth what it saves.
  */
 object Prelude {
 
@@ -350,6 +358,18 @@ object Prelude {
       |        Err(_) ->
       |            print("panic:", msg)
       |            exit(1)
+      |
+      |    unwrap_err(self) -> E = self match
+      |        Err(e) -> e
+      |        Ok(_) ->
+      |            print("panic: unwrap_err of an Ok value")
+      |            exit(1)
+      |
+      |    expect_err(self, msg: string) -> E = self match
+      |        Err(e) -> e
+      |        Ok(_) ->
+      |            print("panic:", msg)
+      |            exit(1)
       |end Result
       |
       |struct Buf[T]
@@ -405,6 +425,18 @@ object Prelude {
       |    var b: Buf[T] = Buf([], 0usize)
       |
       |    b
+      |
+      |struct ByteSink
+      |    bytes: &Buf[u8]
+      |
+      |    text(self) -> []u8 = self.bytes.view()
+      |end ByteSink
+      |
+      |byte_sink() -> ByteSink = ByteSink(buf())
+      |
+      |impl Writer for ByteSink
+      |    write(*self, bytes: []u8)
+      |        for b in bytes do self.bytes.push(b)
       |""".stripMargin
 
   /** The source the prelude's own declarations point into, so a diagnostic against one quotes the

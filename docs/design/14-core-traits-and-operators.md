@@ -248,12 +248,35 @@ Three decisions, each following Rust's experience rather than its packaging:
 `*self` on both methods is what makes a writer stateful — a counter, a latch, a buffer — while
 staying object-safe for a raw object (`02`), so a sink needs no allocator.
 
-**Which writers the prelude supplies: neither, and that is deliberate.** The two that `print` and
-`str` themselves need are the compiler's, because neither has a *type* sysl can give it — a writer
-over standard output holds no state and there is no struct with no fields, and a growable byte
-buffer is `07`'s *Not yet*. What a program writes for itself is an ordinary `impl Writer for
-MyThing`, which is the case the trait exists for. The standard-output writer's `write` is the
-prelude's own `putbytes`, so the one function a freestanding target replaces is still that one.
+**Which writers the prelude supplies: one, `ByteSink`.** The two that `print` and `str` themselves
+use are the compiler's, and the standard-output one has to be — it holds no state, and there is no
+struct with no fields to give it. Its `write` is the prelude's own `putbytes`, so the one function a
+freestanding target replaces is still that one.
+
+The other was `07`'s *Not yet* until a `[]T` could be sized while running, and once `Buf[T]` existed
+it was a dozen lines of ordinary sysl:
+
+```
+struct ByteSink
+    bytes: &Buf[u8]
+
+    text(self) -> []u8 = self.bytes.view()
+```
+
+It is in the prelude rather than left to each program because **an implementation that renders more
+than one part cannot honour its specifier without it**. A specifier describes the field the whole
+value occupies, so a `Complex` rendering `1`, `+`, `2`, `i` must pad what those four came to and not
+each of them; padding needs the finished bytes; and the finished bytes need somewhere to land. Every
+such implementation would write the same dozen lines, which is the definition of something that
+belongs in the prelude. What a program writes for itself is still an ordinary `impl Writer for
+MyThing` — a counter, a device, a bounded buffer that latches — and that remains the case the trait
+exists for.
+
+The reason it was not there sooner is worth keeping, because it was not the design: **a member of a
+non-generic type used to be emitted whether or not anything called it**, so a prelude type with
+three methods put all three, and everything they reached, into every program. Prelude members are
+now held back by the same reachability their module's free functions already were, and a program
+that prints a number carries no more than it did.
 
 ## 3. One dispatch rule for operators
 
@@ -435,6 +458,42 @@ exactly (`§5`), one row further down the catalog.
   type, which differ from `Self` — the one operator that genuinely wants an associated type. It
   waits on associated types (`§1`). Built-in indexing of arrays, slices, and strings is
   compiler-provided and unaffected.
+
+- **A heterogeneous *operand*, which is not the same ask as a heterogeneous result.** `§1` argues
+  that `Self`-homogeneity costs nothing, because the scalars already obey it — `u8 + u8` is a `u8`
+  and no operator promotes. That is true of every pair of scalars and does not reach the shape a
+  vector space is made of: `Complex * f64`. Scaling a complex number by a real one is what an
+  inverse transform does to every sample, what a window function applies, and what a spectrum is
+  normalized by, and it cannot be written as an operator at all — `c * 2.0` is "'\*' needs matching
+  types". `guide/fft` is the first program in the set with a reason to care, and it pays with a
+  `scale` method on the type and a `.scale(k)` at each of those call sites.
+
+  **The mechanism is already there, which is what makes this a decision rather than a project.**
+  Traits take parameters — `trait Scale[R]` with `impl Scale[f64] for Complex` compiles and runs
+  today — so the change is to the *catalog*: `Mul` would become `Mul[Rhs]` with
+  `mul(self, rhs: Rhs) -> Self`, and the operator would dispatch on the pair. Note what is **not**
+  wanted: Rust carries both an `Rhs` parameter and an `Output` associated type, and only the first
+  of those is in question here. The result staying `Self` covers `Complex * f64` and `Vec3 * f64`
+  and deliberately does not cover a dot product, which returns neither operand's type.
+
+  **What it waits on is a default type parameter.** Without `trait Mul[Rhs = Self]`, every
+  `impl Mul for Point` already written becomes `impl Mul[Point] for Point`, and the parameter has to
+  be spelled at every bound — `[T: Mul]` would no longer say what it says now. Defaults are not in
+  the language (`trait Scale[R = Self]` is a parse error), so the honest order is defaults first,
+  then the catalog. Until then the workaround is a named method, which is what `guide/fft` does and
+  what this entry exists to stop being rediscovered.
+- **A bound that promises a *value*.** Every trait in the catalog promises behaviour, which is what
+  a trait is for, and three separate programs have now wanted one that promises a value instead.
+  A generic container cannot declare `[16]K` for any `K` (`07 § Not yet`); a growable one cannot
+  hold capacity that is not yet values, for the same reason; and `total[T: Add](xs: []T) -> T`
+  cannot start its accumulation, so the most ordinary function there is has to seed from `xs[0]`
+  and put an `Option` in its signature to cope with an empty input. The shape wanted is Rust's
+  `Default` or a `Zero`, and what makes it a real decision rather than an obvious addition is that
+  a value is not behaviour: a trait whose one member is an associated *function* returning `Self`
+  is a different kind of promise from every other row of `§2`, and it interacts with the
+  no-associated-types rule of `§1`. Not designed here; recorded with its three customers so the
+  next one does not open it a fourth time.
+
 - **Associated types** generally (`02` open item) — deferred, and with them any trait whose
   method mentions a type derived from `Self` rather than `Self` itself.
 - **Deriving an operator through a default body.** Default method bodies are built (`02`), but the

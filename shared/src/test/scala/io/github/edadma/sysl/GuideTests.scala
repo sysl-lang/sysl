@@ -97,4 +97,28 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- files the reader refuses",
     )
   }
+
+  // The one program in the set that defines what `+` and `*` mean and then leans on the answer a
+  // few hundred thousand times. Nothing it checks was computed by itself: the transforms of an
+  // impulse, a constant and a cosine are known in closed form, four bins can be done on paper, and
+  // the rest came out of numpy.
+  "fft — arithmetic on a type of the program's own, and floats" in {
+    val out = guide("fft")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 101
+    sections(out) shouldBe List(
+      "-- complex arithmetic",
+      "-- a value that renders its own parts",
+      "-- transforms you can do in your head",
+      "-- the fast transform against the definition",
+      "-- bins somebody else computed",
+      "-- a cosine lands in two bins",
+      "-- identities the transform has to obey",
+      "-- there and back again",
+      "-- convolution, two ways",
+      "-- the strongest bins",
+      "-- what the transform refuses",
+    )
+  }
 }

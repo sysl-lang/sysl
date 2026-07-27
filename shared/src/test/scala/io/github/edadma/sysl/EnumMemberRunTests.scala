@@ -328,10 +328,82 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe "false true\n"
     }
 
+    // Reaching the other side. `unwrap`, `expect` and `unwrap_or` are all about the `Ok` half, so a
+    // program interested in *why* something failed had to write the match out — which every guide
+    // program checking what a function refuses did.
+    "Result hands over the error the same way it hands over the value" in {
+      val src =
+        """parse(ok: bool) -> Result[int, string]
+          |    if ok then Ok(7) else Err("not a number")
+          |
+          |print(parse(false).unwrap_err())
+          |print(parse(false).expect_err("a refusal"))""".stripMargin
+
+      run(src) shouldBe "not a number\nnot a number\n"
+    }
+
+    "an error payload of a type of its own comes back whole" in {
+      val src =
+        """enum Fault
+          |    Empty
+          |    TooLong
+          |
+          |    describe(self) -> string = self match
+          |        Empty -> "nothing at all"
+          |        TooLong -> "too long"
+          |end Fault
+          |
+          |check(n: int) -> Result[int, Fault] = if n == 0 then Err(Empty) else Err(TooLong)
+          |
+          |print(check(0).unwrap_err().describe(), check(1).unwrap_err().describe())""".stripMargin
+
+      run(src) shouldBe "nothing at all too long\n"
+    }
+
+    "unwrap_err on a value that succeeded stops the program" in {
+      panics(
+        """var r: Result[int, string] = Ok(1)
+          |print(r.unwrap_err())""".stripMargin,
+        "unwrap_err of an Ok value",
+      )
+    }
+
+    "expect_err says what was expected instead" in {
+      panics(
+        """var r: Result[int, string] = Ok(1)
+          |print(r.expect_err("a refusal"))""".stripMargin,
+        "a refusal",
+      )
+    }
+
+    // The error side owns what it holds exactly as the value side does, so reaching for it in a
+    // loop neither leaks nor frees twice.
+    "an error carrying a reference is reached without disturbing its count" in {
+      val src =
+        """struct Inner
+          |    n: int
+          |
+          |var total = 0
+          |var i = 0
+          |
+          |while i < 20000
+          |    var r: Result[int, &Inner] = Err(Inner(i))
+          |    total += r.unwrap_err().n
+          |    i += 1
+          |
+          |print(total)""".stripMargin
+
+      run(src) shouldBe "199990000\n"
+    }
+
     // Nothing is emitted for a member no program calls: the two prelude enums are generic, so
     // their members exist only once an instantiation asks for one. A top-level prelude *function*
     // is dropped the same way, by reachability — printing an int reaches three of them and none of
     // the rest, so the whole printing surface does not land in every program.
+    //
+    // A **non-generic** prelude type's members are held back by the same reachability, which is
+    // what lets the prelude carry `ByteSink` at all: eager members would have put its three, and
+    // the two `Buf[u8]` members they reach, into every program that prints a number.
     "an unused prelude declaration costs nothing in the output" in {
       val out = Compiler.compileToLlvm("print(1)")
       val defined = out.map(
@@ -341,6 +413,21 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
       )
 
       defined shouldBe Right(Set("@printi", "@printc", "@putbytes", "@main"))
+    }
+
+    // And the other half of that bargain: a member the program *does* reach has to arrive, whether
+    // it is called on a value, read as a property, or found through a trait object.
+    "a prelude member a program calls is emitted" in {
+      val out = Compiler.compileToLlvm(
+        """var g = byte_sink()
+          |var w: *Writer = &g
+          |display_str("x", w, FormatSpec(0, -1, false))
+          |print(g.text().len)""".stripMargin,
+      )
+      val defined = out.map(_.linesIterator.filter(_.startsWith("define")).mkString("\n"))
+
+      defined.getOrElse("") should include("@ByteSink.text")
+      defined.getOrElse("") should include("@ByteSink.write")
     }
   }
 }

@@ -1,0 +1,403 @@
+// Complex numbers and a fast Fourier transform — the checks.
+//
+// The axis this owns is **arithmetic on a type the program defined, and floating point**. Every
+// other program in the set computes with numbers the language already knows how to add. This one
+// defines what `+` and `*` mean for a value of its own, and then leans on those definitions a few
+// hundred thousand times.
+//
+// Nothing here is checked against a value this program produced. The transforms of an impulse, a
+// constant, and a cosine are known in closed form; the four bins of `[1, 2, 3, 4]` can be done on
+// paper; the rest came out of numpy. Where a property is being checked rather than a number —
+// linearity, Parseval, the shift theorem, conjugate symmetry, the convolution theorem — the
+// property *is* the definition of the transform, so an implementation that satisfies all of them
+// and disagrees with numpy would be a surprise worth having.
+//
+// What writing it turned up:
+//
+//   * **An operator trait is `Self`-homogeneous, and a complex number is the type that minds.**
+//     `14 §1` argues the rule is free, because the scalars already obey it — `u8 + u8` is a `u8`
+//     and nothing promotes. That argument holds for every *scalar* pair and does not reach the
+//     case a vector space is made of: multiplying a `Complex` by an `f64`. It is the operation an
+//     inverse transform performs on every sample, a spectrum is scaled by, and a window function
+//     applies, and it cannot be written as an operator at all — `c * 2.0` is "'*' needs matching
+//     types". The workarounds are a method (`c.scale(k)`, which is what this program uses) or
+//     widening the real number into a complex one and paying a full complex multiply for it. This
+//     is not a bug and it is not an argument for associated *output* types, which is a different
+//     and much larger feature; what it is evidence for is that the operand types are what wants
+//     to vary here, not the result. The mechanism turns out to be there already — a trait may take
+//     parameters, so `impl Scale[f64] for Complex` compiles — which makes this a question about
+//     the catalog rather than about the type system, waiting on a default type parameter so that
+//     changing `Mul` to `Mul[Rhs]` does not rewrite every `impl` and every bound. `14 §7`.
+//   * **A bound promises behaviour and never a value, and arithmetic is where that bites.** A
+//     `total[T: Add](xs: []T) -> T` cannot start its accumulation, because `Add` promises how to
+//     add two `T`s and no trait in the catalog promises a zero. The sum has to be seeded from
+//     `xs[0]`, which makes an empty input a different question and puts an `Option` in the
+//     signature of the most ordinary function there is. `dft` and `energy` here are written on
+//     the concrete types and so escape it; a library could not. This is the same shape as the hash
+//     map's "a generic container cannot make its own storage", one layer down — the container
+//     wanted a value of `T` to fill an array with, and this wants one to add to. Three customers
+//     now, so it is recorded with all three in `14 §7`.
+//   * **A `Display` that renders more than one part has to buffer, and the prelude supplied
+//     nothing to buffer into.** `14 §2` is explicit that a specifier describes the field the whole
+//     value occupies, so `f"${c}%12s"` must pad `1+2i` and not each of the three pieces it is made
+//     of — which means gathering the pieces first. The reason given there for shipping no writers
+//     was that neither has a type sysl can give it, and half of that stopped being true when
+//     `Buf[T]` landed. Answered: `ByteSink` is in the prelude, and the twelve lines this program
+//     was first written with are gone. Getting it there turned up the thing that had been keeping
+//     it out — **a member of a non-generic type was emitted whether or not anything called it**,
+//     so a prelude type with three methods put all three into every program that prints. A member
+//     is now held back exactly as a prelude function already was, and four call sites that named a
+//     function without recording that they had are what made that possible.
+//   * **There is no mathematics.** No square root, no sine, no absolute value of a real number —
+//     not in the prelude and nowhere else, because there is no library for them to be in yet.
+//     `complex.sysl` declares the three C functions it needs, `main.sysl` writes its own
+//     `away`, and every float program after this one will do the same. The prelude is not the
+//     place for them — everything in it is carried by every program — so what this wants is a
+//     module to import, which is now `13 § Open h`.
+//   * **`Result` could reach a value but not an error.** `unwrap`, `expect` and `unwrap_or` were
+//     all about the `Ok` side, so getting at a `Fault` to ask what it says meant writing the
+//     `match` out at every call site — and a program whose subject is what a function refuses is
+//     mostly interested in the other side. Answered: `unwrap_err` and `expect_err` are the
+//     mirrors of the two that were there.
+//   * **`Ord` is one method and `Eq` is another, and a type may have either without the other.**
+//     `Complex` implements `Eq` and no ordering, because the complex numbers are not ordered and
+//     `14 §2` deliberately has no hierarchy to opt out of. `Bin` implements `lt` alone and gets
+//     `<`, `>`, `<=` and `>=` from it. Both of those are the design working; they are recorded
+//     because a type that wanted the second and got the first would have been a finding.
+//
+// And the thing that went right, which is worth as much as the friction: **a struct with
+// arithmetic is still just a struct.** A `Complex` copies where it is assigned, sits in an array
+// by value with no indirection, is passed and returned in registers, and needs no annotation
+// anywhere to say any of that. `03`'s rule that a value is a value is what makes an array of them
+// the flat block of memory a transform has to have — an FFT over boxed numbers would not be worth
+// writing.
+
+const eps: f64 = 0.000000001
+
+check(name: string, got: string, want: string)
+    if got == want then print(s"ok    $name = $got")
+    else print(s"FAIL  $name = $got, wanted $want")
+end check
+
+// Six decimals, and anything that rounds to nothing renders as a plain zero: a bin the transform
+// should have cancelled lands on one side of zero or the other, and `-0.000000` is not a different
+// answer from `0.000000`.
+approx(x: f64) -> string
+    var v = x
+
+    if v < 0.0000005 && v > -0.0000005 then v = 0.0
+
+    f"$v%.6f"
+end approx
+
+show(c: Complex) -> string = approx(c.re) + " " + approx(c.im)
+
+bin(xs: []Complex, k: usize) -> string = show(xs[k])
+
+// The distance between two real numbers — an absolute value written out, because there is not one
+// to call.
+away(x: f64, y: f64) -> f64 = if x > y then x - y else y - x
+
+close(x: f64, y: f64) -> bool = away(x, y) < eps
+
+// What a transform said when it refused.
+why[T](r: Result[T, Fault]) -> string = r.expect_err("a transform that was supposed to refuse").describe()
+
+// A transform of a length the caller chose, so it cannot fail.
+transformed(xs: []Complex) -> []Complex
+    var out = copy_of(xs)
+
+    fft(out).expect("a transform of a power-of-two length")
+
+    out
+end transformed
+
+print("-- complex arithmetic")
+
+var a = Complex(1.0, 2.0)
+var b = Complex(3.0, -1.0)
+
+check("a sum", show(a + b), "4.000000 1.000000")
+check("a difference", show(a - b), "-2.000000 3.000000")
+check("a product", show(a * b), "5.000000 5.000000")
+check("a quotient", show(a / b), "0.100000 0.700000")
+check("a negation", show(-a), "-1.000000 -2.000000")
+check("a conjugate", show(a.conj()), "1.000000 -2.000000")
+check("i squared is minus one", show(Complex(0.0, 1.0) * Complex(0.0, 1.0)), "-1.000000 0.000000")
+check("a magnitude", approx(Complex(3.0, 4.0).abs()), "5.000000")
+check("a squared magnitude", approx(a.norm()), "5.000000")
+check("scaling by a real number", show(a.scale(2.5)), "2.500000 5.000000")
+check("equal to itself", str(a == a), "true")
+check("and not to something else", str(a != b), "true")
+check("a quotient multiplied back", str((a / b * b).near(a, eps)), "true")
+
+var running = a
+
+running += b
+
+check("a compound sum is the sum", show(running), "4.000000 1.000000")
+
+running = a
+running *= b
+
+check("and a compound product the product", show(running), "5.000000 5.000000")
+
+check("the exponential of nothing is one", show(expi(0.0)), "1.000000 0.000000")
+check("half a turn is minus one", str(expi(tau / 2.0).near(Complex(-1.0, 0.0), eps)), "true")
+check("a quarter turn is i", str(expi(tau / 4.0).near(Complex(0.0, 1.0), eps)), "true")
+check("a polar value", str(polar(2.0, tau / 4.0).near(Complex(0.0, 2.0), eps)), "true")
+
+print("-- a value that renders its own parts")
+
+check("a positive imaginary part", str(a), "1+2i")
+check("a negative one", str(b), "3-1i")
+check("something that is not an integer", str(Complex(0.5, -0.25)), "0.5-0.25i")
+
+// The specifier describes the field the whole value lands in, which is the property that made the
+// buffering sink necessary: padding each part instead would put spaces inside the number.
+check("in a field of twelve", f"[${a}%12s]", "[        1+2i]")
+check("left justified in one", f"[${b}%-12s]", "[3-1i        ]")
+check("in a field it does not fit", f"[${a}%2s]", "[1+2i]")
+
+print("-- transforms you can do in your head")
+
+var impulse = real_signal([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+check("the transform of an impulse succeeds", str(fft(impulse).is_ok()), "true")
+
+var flat = true
+
+for k in 0..<impulse.len do if !impulse[k].near(one(), eps) then flat = false
+
+check("and puts one in every bin", str(flat), "true")
+
+var level = real_signal([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+
+check("the transform of a constant succeeds", str(fft(level).is_ok()), "true")
+check("its first bin is the sum of the samples", bin(level, 0), "8.000000 0.000000")
+
+var quiet = true
+
+for k in 1..<level.len do if !level[k].near(zero(), eps) then quiet = false
+
+check("and every other bin is empty", str(quiet), "true")
+
+var four = real_signal([1.0, 2.0, 3.0, 4.0])
+
+check("four samples transform", str(fft(four).is_ok()), "true")
+check("bin 0", bin(four, 0), "10.000000 0.000000")
+check("bin 1", bin(four, 1), "-2.000000 2.000000")
+check("bin 2", bin(four, 2), "-2.000000 0.000000")
+check("bin 3", bin(four, 3), "-2.000000 -2.000000")
+
+print("-- the fast transform against the definition")
+
+var digits = real_signal([3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0])
+var slow = dft(digits)
+var fast = transformed(digits)
+
+var agree = true
+
+for k in 0..<fast.len do if !fast[k].near(slow[k], eps) then agree = false
+
+check("every bin of a real signal agrees", str(agree), "true")
+
+var mixed: []Complex = [Complex(1.0, 1.0), Complex(2.0, -3.0), Complex(-1.0, 0.5), Complex(0.0, -2.0)]
+var mixed_slow = dft(mixed)
+var mixed_fast = transformed(mixed)
+
+var mixed_agree = true
+
+for k in 0..<mixed_fast.len do if !mixed_fast[k].near(mixed_slow[k], eps) then mixed_agree = false
+
+check("and every bin of a complex one", str(mixed_agree), "true")
+
+check("a complex signal's bin 0", bin(mixed_fast, 0), "2.000000 -3.500000")
+check("a complex signal's bin 1", bin(mixed_fast, 1), "1.000000 -1.500000")
+check("a complex signal's bin 2", bin(mixed_fast, 2), "-2.000000 6.500000")
+check("a complex signal's bin 3", bin(mixed_fast, 3), "3.000000 2.500000")
+
+print("-- bins somebody else computed")
+
+check("bin 0", bin(fast, 0), "31.000000 0.000000")
+check("bin 1", bin(fast, 1), "-4.121320 7.192388")
+check("bin 2", bin(fast, 2), "2.000000 -3.000000")
+check("bin 3", bin(fast, 3), "0.121320 11.192388")
+check("bin 4", bin(fast, 4), "-3.000000 0.000000")
+check("bin 5", bin(fast, 5), "0.121320 -11.192388")
+check("bin 6", bin(fast, 6), "2.000000 3.000000")
+check("bin 7", bin(fast, 7), "-4.121320 -7.192388")
+
+var mags = magnitudes(fast)
+
+check("magnitude 0", approx(mags[0]), "31.000000")
+check("magnitude 1", approx(mags[1]), "8.289495")
+check("magnitude 3", approx(mags[3]), "11.193046")
+check("magnitude 4", approx(mags[4]), "3.000000")
+
+print("-- a cosine lands in two bins")
+
+var wave: []Complex = [zero(); 16usize]
+
+for t in 0..<wave.len do wave[t] = Complex(expi(tau * 3.0 * f64(t) / 16.0).re, 0.0)
+
+check("a cosine transforms", str(fft(wave).is_ok()), "true")
+check("the bin it was written at", bin(wave, 3), "8.000000 0.000000")
+check("and the mirror of that bin", bin(wave, 13), "8.000000 0.000000")
+
+var elsewhere = true
+
+for k in 0..<wave.len
+    if k != 3usize && k != 13usize && !wave[k].near(zero(), 0.000001) then elsewhere = false
+
+check("with nothing anywhere else", str(elsewhere), "true")
+
+print("-- identities the transform has to obey")
+
+var p = real_signal([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+var q = real_signal([2.0, 0.0, -1.0, 3.0, 0.5, 4.0, -2.0, 1.0])
+var both: []Complex = [zero(); 8usize]
+
+for i in 0..<both.len do both[i] = p[i] + q[i]
+
+var tp = transformed(p)
+var tq = transformed(q)
+var tboth = transformed(both)
+
+var linear = true
+
+for k in 0..<tboth.len do if !(tp[k] + tq[k]).near(tboth[k], eps) then linear = false
+
+check("the transform of a sum is the sum of the transforms", str(linear), "true")
+
+check("the energy in a signal", approx(energy(digits)), "173.000000")
+check("and the energy in its spectrum, over n", approx(energy(fast) / 8.0), "173.000000")
+
+var symmetric = true
+
+for k in 1..<fast.len do if !fast[fast.len - k].near(fast[k].conj(), eps) then symmetric = false
+
+check("a real signal's spectrum is conjugate symmetric", str(symmetric), "true")
+
+var shifted: []Complex = [zero(); 8usize]
+
+for i in 0..<digits.len do shifted[(i + 3usize) % 8usize] = digits[i]
+
+var tshifted = transformed(shifted)
+
+var turned = true
+
+for k in 0..<tshifted.len
+    if !tshifted[k].near(fast[k] * expi(-tau * f64(k) * 3.0 / 8.0), eps) then turned = false
+
+check("shifting the samples turns each bin by its own angle", str(turned), "true")
+
+var shifted_mags = magnitudes(tshifted)
+var unmoved = true
+
+for k in 0..<shifted_mags.len do if !close(shifted_mags[k], mags[k]) then unmoved = false
+
+check("so a shift leaves every magnitude alone", str(unmoved), "true")
+
+print("-- there and back again")
+
+var trip = copy_of(digits)
+
+check("forward", str(fft(trip).is_ok()), "true")
+check("and back", str(ifft(trip).is_ok()), "true")
+
+var survived = true
+
+for i in 0..<trip.len do if !trip[i].near(digits[i], eps) then survived = false
+
+check("every sample survives the round trip", str(survived), "true")
+check("sample 5, exactly", approx(trip[5].re), "9.000000")
+check("and its imaginary part is gone", approx(trip[5].im), "0.000000")
+
+var mixed_trip = copy_of(mixed)
+
+check("a complex signal goes forward", str(fft(mixed_trip).is_ok()), "true")
+check("and comes back", str(ifft(mixed_trip).is_ok()), "true")
+
+var mixed_survived = true
+
+for i in 0..<mixed_trip.len do if !mixed_trip[i].near(mixed[i], eps) then mixed_survived = false
+
+check("with every sample intact", str(mixed_survived), "true")
+
+var single: []Complex = [Complex(7.0, -2.0)]
+
+check("one sample transforms", str(fft(single).is_ok()), "true")
+check("and is left alone by it", show(single[0]), "7.000000 -2.000000")
+
+print("-- convolution, two ways")
+
+var ca = real_signal([1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+var cb = real_signal([0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0])
+
+var through = convolve(ca, cb).expect("two signals of the same power-of-two length")
+var direct = convolve_directly(ca, cb).expect("two signals of the same length")
+
+check("index 0 wraps around", approx(through[0].re), "8.000000")
+check("index 2", approx(through[2].re), "3.000000")
+check("index 3", approx(through[3].re), "6.000000")
+check("index 7", approx(through[7].re), "4.000000")
+
+var identical = true
+
+for i in 0..<through.len do if !through[i].near(direct[i], 0.000001) then identical = false
+
+check("the theorem and the definition agree", str(identical), "true")
+
+var delta = real_signal([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+var unchanged = convolve(digits, delta).expect("two signals of the same power-of-two length")
+var still_itself = true
+
+for i in 0..<unchanged.len do if !unchanged[i].near(digits[i], 0.000001) then still_itself = false
+
+check("convolving with an impulse gives the signal back", str(still_itself), "true")
+
+print("-- the strongest bins")
+
+var ranked = peaks(mixed_fast)
+
+check("the strongest bin of a complex spectrum", str(ranked[0].k), "2")
+check("its magnitude", approx(ranked[0].mag), "6.800735")
+check("the next", str(ranked[1].k), "0")
+check("the one after that", str(ranked[2].k), "3")
+check("and the weakest", str(ranked[3].k), "1")
+
+var ordered = true
+
+for i in 1..<ranked.len do if ranked[i - 1usize] < ranked[i] then ordered = false
+
+check("nothing is out of order", str(ordered), "true")
+
+var real_ranked = peaks(fast)
+
+check("the strongest bin of a real spectrum", str(real_ranked[0].k), "0")
+check("a mirrored pair follows it", approx(real_ranked[1].mag), "11.193046")
+check("both of them", approx(real_ranked[2].mag), "11.193046")
+check("and the weakest bin is the one with no mirror", str(real_ranked[7].k), "4")
+
+print("-- what the transform refuses")
+
+var nothing = real_signal([])
+
+check("no samples at all", str(fft(nothing).is_err()), "true")
+check("and it says so", why(fft(nothing)), "a transform needs at least one sample")
+
+var five = real_signal([1.0, 2.0, 3.0, 4.0, 5.0])
+
+check("a length that is not a power of two", str(fft(five).is_err()), "true")
+check("and it says so", why(fft(five)), "this transform is radix 2, so the length must be a power of two")
+check("the inverse refuses the same lengths", str(ifft(five).is_err()), "true")
+
+check("two is a power of two", str(is_power_of_two(2usize)), "true")
+check("six is not", str(is_power_of_two(6usize)), "false")
+check("nor is nothing", str(is_power_of_two(0usize)), "false")
+
+check("convolving lengths that differ", str(convolve(ca, four).is_err()), "true")
+check("and it says so", why(convolve(ca, four)), "the two signals must have the same length")
+check("the direct sum refuses them too", str(convolve_directly(ca, four).is_err()), "true")
+check("and a length neither of them can transform", str(convolve(five, five).is_err()), "true")

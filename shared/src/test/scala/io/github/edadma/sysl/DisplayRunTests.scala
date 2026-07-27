@@ -217,6 +217,73 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** `ByteSink` — the one writer the prelude does supply.
+   *
+   * It exists because a specifier describes the field the **whole** value occupies (`14 §2`), so an
+   * implementation rendering more than one part has to gather them before it can pad what they came
+   * to. Every such implementation was writing the same dozen lines. It is ordinary sysl over
+   * `Buf[u8]`, which is why it could not be written until a growable array could.
+   */
+  "the sink the prelude supplies" - {
+    "keeps what is written into it" in {
+      run("""var g = byte_sink()
+            |var w: *Writer = &g
+            |display_str("abc", w, FormatSpec(0, -1, false))
+            |display_int(45, w, FormatSpec(0, -1, false))
+            |print(g.text().len, str(g.text()[0]), str(g.text()[4]))""".stripMargin) shouldBe "5 97 53\n"
+    }
+
+    "reports no failure, having nothing to fail at" in {
+      run("""var g = byte_sink()
+            |var w: *Writer = &g
+            |display_str("abc", w, FormatSpec(0, -1, false))
+            |print(w.failed())""".stripMargin) shouldBe "false\n"
+    }
+
+    "starts with nothing and grows to whatever is written" in {
+      run("""var g = byte_sink()
+            |var w: *Writer = &g
+            |print(g.text().len)
+            |for i in 0..<200 do display_str("xy", w, FormatSpec(0, -1, false))
+            |print(g.text().len, str(g.text()[399]))""".stripMargin) shouldBe "0\n400 121\n"
+    }
+
+    // The point of it: the three pieces are rendered plainly and the field applied to the whole,
+    // so `%9s` pads once rather than three times.
+    "lets an implementation put its whole rendering in one field" in {
+      val pair =
+        """struct Pair
+          |    a: int
+          |    b: int
+          |impl Display for Pair
+          |    display(self, out: *Writer, fmt: FormatSpec)
+          |        var g = byte_sink()
+          |        var plain = FormatSpec(0, -1, false)
+          |        display_int(long(self.a), &g, plain)
+          |        display_str(":", &g, plain)
+          |        display_int(long(self.b), &g, plain)
+          |        display_pad(g.text(), out, fmt)
+          |    end display
+          |""".stripMargin
+
+      run(pair + """print(f"[${Pair(1, 2)}%9s]")
+                   |print(f"[${Pair(1, 2)}%-9s]")
+                   |print(f"[${Pair(1, 2)}%2s]")
+                   |print(Pair(30, -4))""".stripMargin) shouldBe
+        "[      1:2]\n[1:2      ]\n[1:2]\n30:-4\n"
+    }
+
+    // A sink written into by two implementations in the same expression keeps them apart, since
+    // each is a value of its own with its own buffer.
+    "two of them do not run into each other" in {
+      run("""var a = byte_sink()
+            |var b = byte_sink()
+            |display_str("left", &a, FormatSpec(0, -1, false))
+            |display_str("right", &b, FormatSpec(0, -1, false))
+            |print(a.text().len, b.text().len)""".stripMargin) shouldBe "4 5\n"
+    }
+  }
+
   "a format specifier reaches the implementation" - {
     // The parts are handed the neutral specifier rather than the one that arrived: `%-12.3s`
     // describes the field this *value* occupies, so applying it to each piece would pad three times.

@@ -159,7 +159,16 @@ class Analyzer private (units: List[Program])
     for f <- ours do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
-    for f <- members if !defaultOrigin.get(f.name).exists(brokenDefaults) do
+    // A member is held back on the same terms a free function is, and for the same reason: a
+    // prelude *type* with members would otherwise put every one of them into every program, which
+    // is the cost the rule above exists to avoid, one declaration form further in. Only the ones
+    // with nothing left to instantiate qualify — a generic member is already reached through the
+    // queue rather than from here.
+    val (preludeMembers, ourMembers) = members.toList
+      .filter(f => !defaultOrigin.get(f.name).exists(brokenDefaults))
+      .partition(f => f.tparams.isEmpty && Prelude.declares(f))
+
+    for f <- ourMembers do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
     val (mainScope, mainStmts) = entryPoint(files)
@@ -188,7 +197,7 @@ class Analyzer private (units: List[Program])
     // A prelude function is analyzed only once something has called it, and analyzing one may call
     // another — `printi` reaches `putbytes`, `printb` reaches `prints` — so this runs to a fixpoint
     // too. Nothing reaches them in a program that never prints, and none of them is emitted.
-    val available = fromPrelude.map(f => f.name -> f).toMap
+    val available = (fromPrelude ::: preludeMembers).map(f => f.name -> f).toMap
     val analyzed  = mutable.HashSet.empty[String]
     var reached   = true
 
@@ -1192,6 +1201,7 @@ class Analyzer private (units: List[Program])
       case Some(m) if m.isProperty =>
         val fname      = memberFuncName(ty, f)
         val (_, rtype) = funcInsts(fname)
+        funcsUsed += fname
         TCall(fname, List(tr), rtype)
       case Some(_) => err(s"'$f' is a method of '${show(ty)}' — call it with '$f(…)'")
       case None =>

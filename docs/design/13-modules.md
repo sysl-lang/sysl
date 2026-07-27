@@ -628,3 +628,14 @@ reaches; a clash is reported at whichever was written second.
   one module for the whole program, so `internal` would be correct but would buy nothing
   measurable. It becomes worth doing exactly when (d) does — separate compilation is what makes an
   external symbol cost something.
+
+- **h. Where a standard library lives, and what is in it rather than in the prelude.** The prelude
+  is everything a program gets for free, and it is deliberately small: the printing surface, the
+  trait catalog, `Option`, `Result`, `Buf`, `ByteSink`. It is not a library — it has no module name,
+  a program cannot import a part of it, and nothing in it can be left out. So the first program to
+  want mathematics found none: `guide/fft` declares `sin`, `cos` and `sqrt` as C externs of its own
+  and writes its own absolute value, and every float program after it would do the same. Growing the
+  prelude is the wrong answer, because a prelude declaration is one every program carries a *layout*
+  for whether or not it is reached (see `14 §2`); what is wanted is a module a program imports, which
+  is this chapter's question rather than `14`'s. It is the same question as `14 §8 a`'s — which module
+  the trait catalog lives in once there is more than one — asked about a second body of code.

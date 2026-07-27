@@ -1,0 +1,92 @@
+// Complex numbers — a value type whose operators are its trait implementations.
+//
+// Everything here is `14` at work. `+` is `Add::add`, `*` is `Mul::mul`, `-` is `Sub::sub` in one
+// position and `Neg::neg` in the other, and `!=` is a derivation over `Eq::eq` that this file never
+// writes. A `Complex` is a plain struct with two fields, so it copies where it is assigned and is
+// passed by value; nothing about giving it arithmetic changes that.
+
+private extern "sin" c_sin(x: f64) -> f64
+private extern "cos" c_cos(x: f64) -> f64
+private extern "sqrt" c_sqrt(x: f64) -> f64
+
+const tau: f64 = 6.283185307179586
+
+struct Complex
+    re: f64
+    im: f64
+
+    conj(self) -> Complex = Complex(self.re, -self.im)
+
+    // The squared magnitude, which is what division and comparison want — taking the root and
+    // squaring it again would lose accuracy for nothing.
+    norm(self) -> f64 = self.re * self.re + self.im * self.im
+
+    abs(self) -> f64 = c_sqrt(self.norm())
+
+    // Scaling by a real number is the operation this type cannot spell as an operator. An operator
+    // trait is `Self`-homogeneous (`14 §1`), so `c * 2.0` has no meaning to write down, and the one
+    // multiplication a transform performs most often is a method call instead. See the findings in
+    // `main.sysl` — this line is the whole of the evidence.
+    scale(self, k: f64) -> Complex = Complex(self.re * k, self.im * k)
+
+    // Floating point makes equality the wrong question almost everywhere, so this is the one the
+    // program actually asks.
+    near(self, rhs: Complex, eps: f64) -> bool = (self - rhs).abs() < eps
+end Complex
+
+zero() -> Complex = Complex(0.0, 0.0)
+
+one() -> Complex = Complex(1.0, 0.0)
+
+// `e^(i*theta)` — the twiddle factor, and the only place trigonometry enters.
+expi(theta: f64) -> Complex = Complex(c_cos(theta), c_sin(theta))
+
+polar(r: f64, theta: f64) -> Complex = expi(theta).scale(r)
+
+impl Add for Complex
+    add(self, rhs: Complex) -> Complex = Complex(self.re + rhs.re, self.im + rhs.im)
+
+impl Sub for Complex
+    sub(self, rhs: Complex) -> Complex = Complex(self.re - rhs.re, self.im - rhs.im)
+
+impl Mul for Complex
+    mul(self, rhs: Complex) -> Complex =
+        Complex(self.re * rhs.re - self.im * rhs.im, self.re * rhs.im + self.im * rhs.re)
+
+impl Div for Complex
+    div(self, rhs: Complex) -> Complex
+        var d = rhs.norm()
+
+        Complex((self.re * rhs.re + self.im * rhs.im) / d, (self.im * rhs.re - self.re * rhs.im) / d)
+    end div
+
+impl Neg for Complex
+    neg(self) -> Complex = Complex(-self.re, -self.im)
+
+// Equality and nothing else. The complex numbers are not ordered, and `14 §2` makes `Eq` and `Ord`
+// independent traits precisely so that a type may say so — there is no hierarchy to opt out of.
+impl Eq for Complex
+    eq(self, rhs: Complex) -> bool = self.re == rhs.re && self.im == rhs.im
+
+// The specifier a part is rendered with: no field of its own, so that the field belongs to the
+// value as a whole.
+private plain() -> FormatSpec = FormatSpec(0, -1, false)
+
+// A specifier describes the field the *whole* value lands in (`14 §2`), so the three pieces are
+// gathered first and the field applied to what they came to. Padding each piece instead would put
+// spaces inside the number. This program was written with its own twelve-line sink; `byte_sink`
+// is that sink, in the prelude, which is where the second type to render more than one part would
+// have wanted it.
+impl Display for Complex
+    display(self, out: *Writer, fmt: FormatSpec)
+        var g = byte_sink()
+        var neutral = plain()
+        var negative = self.im < 0.0
+
+        display_real(self.re, &g, neutral)
+        display_str(if negative then "-" else "+", &g, neutral)
+        display_real(if negative then -self.im else self.im, &g, neutral)
+        display_str("i", &g, neutral)
+
+        display_pad(g.text(), out, fmt)
+    end display

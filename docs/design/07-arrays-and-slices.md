@@ -277,10 +277,15 @@ implementation:
 - **Capacity that is not yet values.** `Buf`'s spare slots hold copies of whatever seeded the last
   growth (`§What it costs`), because every element of a `[]T` is a value and there is no way to have
   storage that is merely reserved. Every container wants that: it is the difference between a
-  capacity and a length. What it needs is either a bound that promises a value (`14`, the same
-  `Default`-shaped decision as the bullet below) or a way to hold storage whose elements are not
+  capacity and a length. What it needs is either a bound that promises a value (`14 §7`) or a way
+  to hold storage whose elements are not
   live yet, which is a question about the view types here — a length and a capacity as two separate
   facts about one allocation.
+- **A generic container still cannot declare storage it has no value for.** `[None; n]` works
+  whatever the parameters are, because `None` needs nothing of them; a `[16]K` cannot be written
+  for any `K`, because a repeat needs a value and no bound promises one. That is `14`'s decision
+  rather than this chapter's — see its `§7` entry on a bound that promises a value, which the
+  bullet above wants for the same reason.
 - **Promotion of an escaping local array** (`05`). The analysis that *finds* the escape is
   implemented; what happens next is not. A view that would outlive its array is a diagnostic
   rather than a silent heap promotion, so a program that means to return one writes `&[64]u8`

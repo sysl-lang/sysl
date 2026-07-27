@@ -147,6 +147,7 @@ trait CallAnalysis extends Literals with TraitObjects {
                 s"but ${supplied(args.length, "argument")}")
             val recvArg  = buildReceiver(m.receiver.get, tr)
             val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+            funcsUsed += fname
             TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
           // Neither of the two remaining kinds takes a receiver, and they are not the same mistake:
           // a property is this call with the parentheses dropped, an associated function is not
@@ -465,6 +466,9 @@ trait CallAnalysis extends Literals with TraitObjects {
 
       val rty  = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
       val args = rhs.toList
+
+      funcsUsed += d.name
+
       val call = TCall(d.name, if d.swap then args :+ recv else recv :: args, rty)
 
       if d.negate then TUnary("!", call, Type.Bool) else call
@@ -559,6 +563,7 @@ trait CallAnalysis extends Literals with TraitObjects {
             if args.length != params.length then
               err(s"associated function '$fname' takes ${quantity(params.length, "argument")}, but ${supplied(args.length, "argument")}")
             val ts = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+            funcsUsed += fname
             TCall(fname, checkArgs(fname, params, args, Some(ts)), rtype)
       case Some(m) if m.isProperty =>
         err(s"'$mname' is a property of '$tname' — read it on a value, as 'value.$mname'")

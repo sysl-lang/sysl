@@ -1,0 +1,226 @@
+// The discrete Fourier transform, twice: the O(n log n) one that everybody uses and the O(n^2)
+// one that is the definition.
+//
+// Having both is the point. The fast transform is a rearrangement of the slow one, and a
+// rearrangement is exactly the kind of thing that can be subtly wrong and still produce plausible
+// numbers, so the slow one is kept as the thing to compare against. The published values in
+// `main.sysl` then anchor the pair, since two implementations by the same author agreeing proves
+// only that they agree.
+
+enum Fault
+    Empty
+    NotPowerOfTwo
+    LengthsDiffer
+
+    describe(self) -> string = self match
+        Empty -> "a transform needs at least one sample"
+        NotPowerOfTwo -> "this transform is radix 2, so the length must be a power of two"
+        LengthsDiffer -> "the two signals must have the same length"
+end Fault
+
+is_power_of_two(n: usize) -> bool = n > 0usize && (n & (n - 1usize)) == 0usize
+
+private bit_width(n: usize) -> usize
+    var bits = 0usize
+    var v = n
+
+    while v > 1usize
+        v >>= 1usize
+        bits += 1usize
+
+    bits
+end bit_width
+
+private reverse_bits(v: usize, bits: usize) -> usize
+    var r = 0usize
+    var x = v
+
+    for i in 0..<bits
+        r = r << 1usize | x & 1usize
+        x >>= 1usize
+
+    r
+end reverse_bits
+
+// Cooley-Tukey, in place, iterative. `sign` is what separates the two directions: -1 for the
+// forward transform's `e^(-2*pi*i*k/n)` and +1 for the inverse's conjugate kernel, which is the
+// whole of the difference between them apart from the final scaling.
+private transform(xs: []Complex, sign: f64) -> Result[unit, Fault]
+    if xs.len == 0usize then return Err(Empty)
+    if !is_power_of_two(xs.len) then return Err(NotPowerOfTwo)
+
+    var n = xs.len
+    var bits = bit_width(n)
+
+    // Sorting the samples into bit-reversed order first is what lets the butterflies run over
+    // contiguous halves afterwards. Swapping only when `j > i` visits each pair once.
+    for i in 0..<n
+        var j = reverse_bits(i, bits)
+
+        if j > i
+            var t = xs[i]
+
+            xs[i] = xs[j]
+            xs[j] = t
+
+    var span = 2usize
+
+    while span <= n
+        var half = span / 2usize
+        var step = sign * tau / f64(span)
+        var start = 0usize
+
+        while start < n
+            for k in 0..<half
+                var w = expi(step * f64(k))
+                var a = xs[start + k]
+                var b = xs[start + k + half] * w
+
+                xs[start + k] = a + b
+                xs[start + k + half] = a - b
+
+            start += span
+
+        span <<= 1usize
+
+    Ok(())
+end transform
+
+fft(xs: []Complex) -> Result[unit, Fault] = transform(xs, -1.0)
+
+// The inverse is the forward transform with the kernel conjugated and everything divided by n.
+// That division is the operation the language has no operator for: a `Complex` scaled by a real
+// number is `Self`-heterogeneous, so it is a method call.
+ifft(xs: []Complex) -> Result[unit, Fault]
+    transform(xs, 1.0)?
+
+    var k = 1.0 / f64(xs.len)
+
+    for i in 0..<xs.len do xs[i] = xs[i].scale(k)
+
+    Ok(())
+end ifft
+
+// The definition, summed term by term. Quadratic and slow, and that is what it is for.
+dft(xs: []Complex) -> []Complex
+    var n = xs.len
+    var out: []Complex = [zero(); n]
+
+    for k in 0..<n
+        var acc = zero()
+
+        for t in 0..<n do acc = acc + xs[t] * expi(-tau * f64(k) * f64(t) / f64(n))
+
+        out[k] = acc
+
+    out
+end dft
+
+magnitudes(xs: []Complex) -> []f64
+    var out: []f64 = [0.0; xs.len]
+
+    for i in 0..<xs.len do out[i] = xs[i].abs()
+
+    out
+end magnitudes
+
+// A copy, since every transform here works in place and a caller usually wants to keep what it
+// started with.
+copy_of(xs: []Complex) -> []Complex
+    var out: []Complex = [zero(); xs.len]
+
+    for i in 0..<xs.len do out[i] = xs[i]
+
+    out
+end copy_of
+
+real_signal(values: []f64) -> []Complex
+    var out: []Complex = [zero(); values.len]
+
+    for i in 0..<values.len do out[i] = Complex(values[i], 0.0)
+
+    out
+end real_signal
+
+// Circular convolution through the transform: multiply the spectra pointwise and come back. The
+// direct sum below computes the same thing by its definition, and the two agreeing is the
+// convolution theorem holding.
+convolve(a: []Complex, b: []Complex) -> Result[[]Complex, Fault]
+    if a.len != b.len then return Err(LengthsDiffer)
+
+    var fa = copy_of(a)
+    var fb = copy_of(b)
+
+    fft(fa)?
+    fft(fb)?
+
+    for i in 0..<fa.len do fa[i] = fa[i] * fb[i]
+
+    ifft(fa)?
+
+    Ok(fa)
+end convolve
+
+convolve_directly(a: []Complex, b: []Complex) -> Result[[]Complex, Fault]
+    if a.len != b.len then return Err(LengthsDiffer)
+
+    var n = a.len
+    var out: []Complex = [zero(); n]
+
+    for i in 0..<n
+        var acc = zero()
+
+        for j in 0..<n do acc = acc + a[j] * b[(i + n - j) % n]
+
+        out[i] = acc
+
+    Ok(out)
+end convolve_directly
+
+// One bin of a spectrum, ordered by how much energy is in it. `Ord` is one method and the other
+// three comparisons come from it (`14 §2`), which is what the sort below leans on.
+struct Bin
+    k: usize
+    mag: f64
+end Bin
+
+impl Ord for Bin
+    lt(self, rhs: Bin) -> bool = self.mag < rhs.mag
+
+impl Eq for Bin
+    eq(self, rhs: Bin) -> bool = self.mag == rhs.mag
+
+// Insertion sort, strongest first, and stable — bins of equal energy keep their frequency order,
+// which is what makes the answer to "which bins" reproducible for a real signal, where every bin
+// has a mirror of exactly the same magnitude.
+private strongest_first[T: Ord](xs: []T)
+    for i in 1..<xs.len
+        var v = xs[i]
+        var j = i
+
+        while j > 0usize && xs[j - 1usize] < v
+            xs[j] = xs[j - 1usize]
+            j -= 1usize
+
+        xs[j] = v
+end strongest_first
+
+peaks(xs: []Complex) -> []Bin
+    var bins: []Bin = [Bin(0usize, 0.0); xs.len]
+
+    for i in 0..<xs.len do bins[i] = Bin(i, xs[i].abs())
+
+    strongest_first(bins)
+
+    bins
+end peaks
+
+// The energy in a signal, which Parseval's theorem says the transform preserves up to the factor
+// n. Summing the squared magnitudes avoids the square roots entirely.
+energy(xs: []Complex) -> f64
+    var total = 0.0
+
+    for i in 0..<xs.len do total += xs[i].norm()
+
+    total
+end energy
