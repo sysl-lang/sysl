@@ -1,8 +1,13 @@
 # Design Decisions: Modules
 
-**Status:** the module system is **not yet implemented** — the parser has no `module`, `import`,
-or visibility production, and a program today is a single flat statement list. But two written
-docs already lean on modules: `capabilities.md` attaches capability narrowing (`no alloc`,
+**Status:** §1's module header, §6's shared module scope, and §7's entry-point rule are **built** —
+a directory of files compiles as the one module they declare, its declarations are visible across
+all of them with no ordering and no forward declaration, and disagreeing about which module they
+are or which of them runs is an error. `import` (§3), the visibility modifiers (§2), the cycle
+check over the module *graph* (§6), and the capability clause (§4) are **not yet implemented**;
+each waits on a program being able to hold more than one module, which is what a driver that walks
+a project rather than a directory would give it, and that in turn waits on open item (a). Two
+written docs already lean on modules: `capabilities.md` attaches capability narrowing (`no alloc`,
 `requires`) and its transitive propagation to *modules*, and `cross-platform.md` fixes that
 "module names follow the directory tree relative to the project root." This chapter defines what
 a module **is** so those have something to name, and consolidates the module-side of the
@@ -52,6 +57,18 @@ capability clause a home (§4). It also **supersedes cleanly** the old compiler'
 relaxation — the "Step 3b" hack that let a file in `oskit/arch/x86_64/` declare the shorter
 `module oskit.arch` — by making the name/location agreement a first-class, checked rule rather
 than a loosened validation.
+
+The **files of one module must all name it the same way**, which is the same rule §4 states for the
+capability clause and for the same reason: the module is the directory, so its name is a property
+of the directory rather than of any file in it, and a file that disagrees is either misplaced or
+was edited without its siblings. This part is checked today. Agreement with the *location* is not,
+because the project root a path would be measured against is what open item (a) settles; until it
+does, the header is the whole of a module's identity.
+
+A file with **no header at all** is in the **anonymous root module**, whose name is the empty path.
+This is what lets a program be one file with no ceremony — the one-file case is not a special form,
+it is a module that happens to be unnamed — and it is also why a file with nothing in it is a file
+that has not said which module it is, and is told so among files that have.
 
 ## 2. Visibility — public by default, and `private` means *this file*
 
@@ -272,7 +289,29 @@ declaration and no ordering: the analyzer collects **every signature in the modu
 any body**, the cross-file extension of the top-level hoisting of `12` §4. The restriction is on
 the directory graph, never on how a module's own files refer to one another.
 
-## 7. What is deliberately absent
+## 7. Where a program starts
+
+A top-level **statement** is not a declaration: a declaration is hoisted and belongs to the module
+as a whole, while a statement runs, and running happens in an order. §6 gives a module's files no
+order at all — they are one unordered scope, and which one the driver read first is an accident of
+`readdir` — so a module whose statements were spread across two files would have no defined
+behaviour to compile.
+
+**One file of a module carries the statements it runs**, and a second that carries any is an error
+naming both. This is not a restriction on where declarations may go, which is the point of §1: a
+module may be split across as many files as it likes, and only the executable part is pinned to one
+of them.
+
+A top-level `var` counts as a statement, because it is exactly that — a local of the entry point,
+scoped to it and initialized in its order, not a member of the module. (A module-level binding
+*visible to other files* is a different thing, and it is what §2's "anything visible outside its
+file states its types" is written about.)
+
+A module in which no file carries a statement is a complete program that does nothing: the entry
+point exists, runs nothing, and succeeds. That is what a module of pure declarations compiles to,
+which is what it should compile to — a library is not an error.
+
+## 8. What is deliberately absent
 
 - **No file-as-module.** The file is a contribution, not a unit; there is no per-file namespace
   and no import of a file. A module is always a directory (§1).

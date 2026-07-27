@@ -22,6 +22,26 @@ trait CodegenSupport extends Matchers { this: Assertions =>
       case Left(e)    => e
     }
 
+  /** The files of one module, named so a diagnostic about one can be told from a diagnostic about
+   * another. `"a.sysl" -> "…"` reads at a call site the way a small directory looks.
+   */
+  protected def files(fs: (String, String)*): List[Source] =
+    fs.toList.map { case (name, text) => Source(name, text) }
+
+  /** The IR for a module of several files, all of which must compile. */
+  protected def irOf(fs: (String, String)*): String =
+    Compiler.compile(files(fs*)) match {
+      case Right(out) => out
+      case Left(e)    => fail(e)
+    }
+
+  /** The error message for a module of several files that must be rejected. */
+  protected def errOf(fs: (String, String)*): String =
+    Compiler.compile(files(fs*)) match {
+      case Right(out) => fail(s"expected an error, got:\n$out")
+      case Left(e)    => e
+    }
+
   /** One emitted function, for a test that counts instructions rather than looking for one.
    *
    * A whole-module count is not what such a test means: the module also holds the ARC runtime and

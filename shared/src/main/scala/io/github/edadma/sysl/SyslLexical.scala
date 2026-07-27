@@ -108,6 +108,7 @@ class SyslLexical
     "trait",
     "impl",
     "extern",
+    "module",
     "return",
     "self",
     "weak",

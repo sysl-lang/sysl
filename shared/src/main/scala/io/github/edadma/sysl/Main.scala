@@ -4,15 +4,19 @@ import io.github.edadma.cross_platform.*
 
 import scopt.OParser
 
-/** The sysl command-line driver. It reads a source file, runs the pure front end and codegen
- * from the shared module, and drives an LLVM toolchain to link and run the result. Filesystem
+/** The sysl command-line driver. It reads a module's source files, runs the pure front end and
+ * codegen from the shared module, and drives an LLVM toolchain to link and run the result. Filesystem
  * and process access go through `cross_platform`, so the same driver ships as a native binary
  * and as a Node CLI (the JVM build is for a fast development loop).
  *
+ * Each subcommand takes a **path**, which is a directory or a single file: a module is a directory
+ * (`13 §1`), so naming one compiles the `.sysl` files it holds as the one module they make up, and
+ * naming a file compiles that file alone.
+ *
  * Subcommands:
- *   - `sysl run <file>`        compile and execute
- *   - `sysl build <file> -o x` compile to a native executable
- *   - `sysl emit-llvm <file>`  print the generated LLVM IR
+ *   - `sysl run <path>`        compile and execute
+ *   - `sysl build <path> -o x` compile to a native executable
+ *   - `sysl emit-llvm <path>`  print the generated LLVM IR
  */
 case class Config(
     command: String = "",
@@ -28,19 +32,19 @@ case class Config(
       programName("sysl"),
       cmd("run")
         .action((_, c) => c.copy(command = "run"))
-        .text("compile and run a sysl program")
-        .children(arg[String]("<file>").required().action((f, c) => c.copy(file = f))),
+        .text("compile and run a sysl module, given its directory or a single file")
+        .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
       cmd("build")
         .action((_, c) => c.copy(command = "build"))
-        .text("compile a sysl program to a native executable")
+        .text("compile a sysl module to a native executable")
         .children(
-          arg[String]("<file>").required().action((f, c) => c.copy(file = f)),
+          arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
           opt[String]('o', "output").action((o, c) => c.copy(output = Some(o))).text("output executable path"),
         ),
       cmd("emit-llvm")
         .action((_, c) => c.copy(command = "emit-llvm"))
         .text("print the generated LLVM IR")
-        .children(arg[String]("<file>").required().action((f, c) => c.copy(file = f))),
+        .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
@@ -51,18 +55,20 @@ case class Config(
 }
 
 private def execute(cfg: Config): Int = {
-  val source =
-    try readFile(cfg.file)
+  val sources =
+    try collect(cfg.file)
     catch case e: Exception => return fail(s"cannot read ${cfg.file}: ${e.getMessage}")
+
+  if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
 
   cfg.command match
     case "emit-llvm" =>
-      Compiler.compileToLlvm(source, cfg.file) match
+      Compiler.compile(sources) match
         case Left(err) => report(err)
         case Right(ir) => stdout(ir); 0
 
     case "build" =>
-      Compiler.compileToLlvm(source, cfg.file) match
+      Compiler.compile(sources) match
         case Left(err) => report(err)
         case Right(ir) =>
           val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
@@ -71,7 +77,7 @@ private def execute(cfg: Config): Int = {
             case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
-      Compiler.compileToLlvm(source, cfg.file) match
+      Compiler.compile(sources) match
         case Left(err) => report(err)
         case Right(ir) =>
           val exe = createTempFile("sysl-", "")
@@ -87,6 +93,17 @@ private def execute(cfg: Config): Int = {
     case other =>
       fail(s"unknown command '$other'")
 }
+
+/** The source files one invocation compiles.
+ *
+ * A module is a directory (`13 §1`), so pointing the driver at one compiles the `.sysl` files it
+ * holds as the one module they make up. Sub-directories are *other* modules and are left alone.
+ * Naming a single file is the same thing with one contribution.
+ */
+private def collect(path: String): List[Source] =
+  if isDirectory(path) then
+    listFiles(path).filter(f => isFile(f) && f.endsWith(".sysl")).toList.map(f => Source(f, readFile(f)))
+  else List(Source(path, readFile(path)))
 
 private def defaultOutputName(file: String): String = {
   val slash = math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))

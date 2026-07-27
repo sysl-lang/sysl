@@ -462,15 +462,20 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
   }
 
   "positions and structural equality" - {
+    // A position is metadata a node carries, not part of what the node *is*, so the same text
+    // parses to the same tree wherever it was read from. The `Program` around it is the one thing
+    // that does differ: a file is a file, and which one it is is exactly what it records.
     "two parses of the same text from different files compare equal" in {
-      SyslParser.parse("var x = 1 + 2", "a.sysl") shouldBe SyslParser.parse("var x = 1 + 2", "b.sysl")
+      def bodyOf(name: String) = SyslParser.parse("var x = 1 + 2", name).map(_.body)
+
+      bodyOf("a.sysl") shouldBe bodyOf("b.sysl")
     }
 
     "even though each tree really does carry its own file's positions" in {
       def sourceOf(name: String): Option[String] =
         SyslParser.parse("var x = 1 + 2", name) match {
-          case Right(Program(List(VarDecl(_, _, Some(init))))) => init.pos.map(_.source.name)
-          case other                                           => fail(s"unexpected parse: $other")
+          case Right(Program(List(VarDecl(_, _, Some(init))), _, _)) => init.pos.map(_.source.name)
+          case other                                                 => fail(s"unexpected parse: $other")
         }
 
       sourceOf("a.sysl") shouldBe Some("a.sysl")

@@ -28,7 +28,7 @@ import scala.collection.mutable
  * *expected* type when the arguments alone do not determine them — which is what lets `None`
  * and `Ok(5)` take their type from the context they appear in.
  */
-class Analyzer private (program: Program)
+class Analyzer private (units: List[Program])
     extends CallAnalysis
     with PatternAnalysis
     with Literals
@@ -42,7 +42,10 @@ class Analyzer private (program: Program)
   // --- program -------------------------------------------------------------------------
 
   private def analyze(): TProgram = {
-    val body = Prelude.decls ::: program.body
+    checkOneModule()
+
+    val written = units.flatMap(_.body)
+    val body    = Prelude.decls ::: written
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -100,10 +103,7 @@ class Analyzer private (program: Program)
     for f <- members if !defaultOrigin.get(f.name).exists(brokenDefaults) do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
-    val mainStmts = program.body.filter {
-      case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl => false
-      case _                                                                                      => true
-    }
+    val mainStmts = entryPoint()
 
     resetFunction()
     tsubst = Map.empty
@@ -152,6 +152,54 @@ class Analyzer private (program: Program)
       tfuncs.toList,
       tmain,
     )
+  }
+
+  // --- the files of a module -----------------------------------------------------------
+
+  /** A module is a directory and its name is that directory's path (`13 §1`), so every file handed
+   * to one compilation contributes to the same module and every one of them must say so the same
+   * way. A file with no header is in the anonymous root module, which is a name like any other here
+   * — so a headerless file among headed ones disagrees, and is told so.
+   *
+   * The first file's header is taken as the module's, and each later one is compared against it, so
+   * a directory where one file was missed reports once per stray file rather than once per pair.
+   */
+  private def checkOneModule(): Unit =
+    units match
+      case Nil => ()
+      case first :: rest =>
+        val name = first.module.map(_.show)
+
+        for u <- rest if u.module.map(_.show) != name do
+          val theirs = u.module.map(m => s"'${m.show}'").getOrElse("no module at all")
+          val ours   = name.map(n => s"'$n'").getOrElse("no module at all")
+
+          recover(())(at(u.module.flatMap(_.pos).orElse(u.body.headOption.flatMap(_.pos))) {
+            err(s"${u.source.name} declares $theirs, but ${first.source.name} declares $ours")
+          })
+
+  /** The statements that become the program's entry point.
+   *
+   * A declaration is hoisted and belongs to the module as a whole, but an executable statement runs
+   * in an order, and files have none: the module's members are one unordered set (`13 §6`), so
+   * nothing says which file's statements would come first. **One file carries them**, and a second
+   * that does is a mistake rather than an ordering to be guessed at.
+   */
+  private def entryPoint(): List[Stmt] = {
+    def executable(u: Program) = u.body.filter {
+      case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl => false
+      case _                                                                                      => true
+    }
+
+    units.map(u => u -> executable(u)).filter(_._2.nonEmpty) match
+      case Nil                => Nil
+      case (_, stmts) :: Nil  => stmts
+      case (first, stmts) :: others =>
+        for (u, rest) <- others do
+          recover(())(at(rest.head.pos) {
+            err(s"${first.source.name} already carries the statements this module runs, so ${u.source.name} may hold declarations only")
+          })
+        stmts
   }
 
   // --- definition-checked bounds -------------------------------------------------------
@@ -834,8 +882,15 @@ object Analyzer {
    * escaping the regions entirely is still caught here, since a diagnostic that reaches the user
    * beats a stack trace.
    */
-  def analyze(program: Program): Either[String, TProgram] = {
-    val analyzer = new Analyzer(program)
+  def analyze(program: Program): Either[String, TProgram] = analyze(List(program))
+
+  /** Analyzes the files of one module together. They share a single scope, so a declaration in one
+   * is visible to all of them with no ordering and no forward declaration (`13 §6`) — which falls
+   * out of hoisting, since the pass that registers every signature already runs over the whole set
+   * before any body is checked.
+   */
+  def analyze(units: List[Program]): Either[String, TProgram] = {
+    val analyzer = new Analyzer(units)
 
     val outcome =
       try Right(analyzer.analyze())

@@ -379,4 +379,22 @@ case class ImplDecl(
     traitArgs: List[TypeRef] = Nil,
 ) extends Stmt
 
-case class Program(body: List[Stmt])
+/** The `module a.b.c` header a file carries, naming the module the file contributes to. The name is
+ * a directory path with the separators read as dots (`13 §1`), so it is kept as its segments rather
+ * than as one string — the segments are what a visibility scope and a platform layout are written
+ * against, and the dotted spelling is recovered by `show`.
+ */
+case class ModuleName(parts: List[String]) extends Positioned {
+  def show: String = parts.mkString(".")
+}
+
+/** One file's parse: the module it contributes to, its statements, and the source it came from.
+ *
+ * `module` is absent for a file that declares no header, which puts it in the **anonymous root
+ * module** — the module whose name is the empty path. A single-file program is exactly that case,
+ * which is why one needs no header to compile.
+ *
+ * `source` is carried because a file is the unit several module rules are stated over, and a
+ * diagnostic about one has to name it even where the file holds nothing to point at.
+ */
+case class Program(body: List[Stmt], module: Option[ModuleName], source: Source)

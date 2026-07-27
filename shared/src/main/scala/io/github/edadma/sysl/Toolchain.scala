@@ -31,7 +31,14 @@ object Toolchain {
    * stdout — the end-to-end path the run-it test tier exercises.
    */
   def compileAndRun(source: String, name: String = "<input>"): Either[String, (Int, String)] =
-    Compiler.compileToLlvm(source, name).flatMap { ir =>
+    runIr(Compiler.compileToLlvm(source, name))
+
+  /** The same, for the files of one module. */
+  def compileAndRun(sources: List[Source]): Either[String, (Int, String)] =
+    runIr(Compiler.compile(sources))
+
+  private def runIr(compiled: Either[String, String]): Either[String, (Int, String)] =
+    compiled.flatMap { ir =>
       val exe = createTempFile("sysl-", "")
 
       build(ir, exe).map { _ =>

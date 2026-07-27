@@ -30,6 +30,14 @@ A program is a sequence of statements and declarations. Non-declaration statemen
 body of `main`; function, struct, and enum declarations are hoisted (so they may be used
 before they appear and may be mutually recursive).
 
+- **A module may be written across as many files as it likes** (`13 §1`, `13 §6`). The driver
+  compiles a directory as the one module its files declare with a `module a.b` header, and they
+  share one scope: hoisting registers every signature in the module before any body is checked, so
+  a call, a type, a trait, its `impl`, and a generic's instantiation may each sit in a different
+  file with no ordering and no forward declaration. What the files may not disagree about is which
+  module they are, and which one of them carries the statements the program runs (`13 §7`). A file
+  with no header is in the anonymous root module, which is why a single-file program needs none.
+
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
   compound assignment), `return [expr]`, and `break [expr]` / `continue`. Loop and branch bodies
   follow Scala-3 style: `then`/`do` is **required for a one-line body** and **optional before an

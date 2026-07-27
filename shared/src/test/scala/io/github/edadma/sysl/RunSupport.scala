@@ -19,6 +19,17 @@ trait RunSupport extends Matchers { this: Assertions =>
     }
   }
 
+  /** The same, for a module written as several files. */
+  protected def runOf(fs: (String, String)*): String = {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    Toolchain.compileAndRun(fs.toList.map { case (name, text) => Source(name, text) }) match {
+      case Right((0, out))    => out
+      case Right((code, out)) => fail(s"program exited with $code:\n$out")
+      case Left(err)          => fail(err)
+    }
+  }
+
   /** Asserts that a program stops itself rather than running past a failed check. Every runtime
    * check traps, so what is observable is the exit status, not the output.
    */

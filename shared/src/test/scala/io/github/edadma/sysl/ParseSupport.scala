@@ -24,6 +24,13 @@ trait ParseSupport extends Matchers { this: Assertions =>
       case Left(e)  => fail(e)
     }
 
+  /** The module a file declares, as written, or `None` where it declares no header. */
+  protected def moduleOf(src: String): Option[String] =
+    SyslParser.parse(src) match {
+      case Right(p) => p.module.map(_.show)
+      case Left(e)  => fail(e)
+    }
+
   /** Asserts a program does *not* parse, returning the error message for further checks. */
   protected def progError(src: String): String =
     SyslParser.parse(src) match {

@@ -297,6 +297,16 @@ class SyslParser(val source: Source) extends PackratParsers {
         continueStmt | exprStmt,
     )
 
+  /** A dotted name — a module path. */
+  private lazy val dottedName: Parser[List[String]] = rep1sep(ident, op("."))
+
+  /** `module a.b.c`, the header naming the module this file contributes to. It is not a statement:
+   * it may appear once, and only before everything else, so it is a prefix of the program rather
+   * than an alternative within it.
+   */
+  private lazy val moduleHeader: Parser[ModuleName] =
+    at(op("module") ~> dottedName ^^ ModuleName.apply)
+
   /** A type: a memory-mode sigil applied to a type, or a name optionally applied to type
    * arguments (`Box[int]`, `Result[T, string]`). `sync` stays a soft keyword — it is only
    * special immediately after `&`, and the `&sync T` alternative is tried first so that a
@@ -712,7 +722,11 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val statements: PackratParser[List[Stmt]] =
     opt(newlines) ~> repsep(statement, newlines) <~ opt(newlines)
 
-  private lazy val program: PackratParser[Program] = statements ^^ Program.apply
+  /** A file: an optional module header, then its statements. A file with no header contributes to
+   * the anonymous root module, which is what lets a one-file program be written with no ceremony.
+   */
+  private lazy val program: PackratParser[Program] =
+    opt(newlines) ~> opt(moduleHeader) ~ statements ^^ { case m ~ body => Program(body, m, source) }
 
   // --- entry points --------------------------------------------------------------------
 
