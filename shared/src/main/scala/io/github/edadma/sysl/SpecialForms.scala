@@ -128,7 +128,11 @@ trait SpecialForms extends CallAnalysis {
    * `op` is the form that asked, so a type that renders no way at all is complained about in the
    * words the programmer wrote rather than in the machinery underneath them.
    */
-  private def displayOf(t: TExpr, op: String): (String, TExpr) = { checkWriterShape(); t.ty } match
+  private def displayOf(t: TExpr, op: String): (String, TExpr) = {
+    // A constrained subtype renders exactly as its base does — a number or a character — so it
+    // reaches the base's renderer rather than asking for a `Display` impl of its own.
+    checkWriterShape(); Type.underlying(t.ty)
+  } match
     case a: Type.Abstract =>
       if !a.bounds.exists(_.key == "Display") then boundErr(s"'$op' needs '${a.name}: Display'")
       ("Display.display", t)

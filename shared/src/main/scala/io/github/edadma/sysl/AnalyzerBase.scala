@@ -249,9 +249,9 @@ trait AnalyzerBase {
     if importStack.isEmpty && currentImports.isEmpty then None
     else importStack.iterator.map(ask).collectFirst { case Some(t) => t }.orElse(ask(currentImports))
 
-  /** The key a written **type** name resolves to: a struct's or an enum's. */
+  /** The key a written **type** name resolves to: a struct's, an enum's, or a constrained subtype's. */
   protected def typeKey(written: String): Option[String] =
-    resolveName(written)(n => structDecls.contains(n) || enumDecls.contains(n))
+    resolveName(written)(n => structDecls.contains(n) || enumDecls.contains(n) || constrainedDecls.contains(n))
 
   /** The key a written **trait** name resolves to. */
   protected def traitKey(written: String): Option[String] = resolveName(written)(traitDecls.contains)
@@ -327,6 +327,16 @@ trait AnalyzerBase {
   protected val structDecls = mutable.LinkedHashMap.empty[String, StructDecl]
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
+
+  /** Declared constrained subtypes by key (`03`). Each `type Name = Base …` is registered here; the
+   * resolved `Type.Constrained` it stands for is built and cached the first time the name is used.
+   */
+  protected val constrainedDecls = mutable.LinkedHashMap.empty[String, TypeDecl]
+
+  /** The resolved constrained subtype for a key, built once and reused so every reference to a name
+   * is the same `Type.Constrained` — and so its bounds are validated a single time.
+   */
+  protected val constrainedInsts = mutable.LinkedHashMap.empty[String, Type.Constrained]
 
   /** Declared constants by key (`13 §7`). A constant is folded into each use and has no storage, so
    * this table is read by the analyzer and never by codegen — there is nothing downstream to emit.
@@ -687,7 +697,7 @@ trait AnalyzerBase {
    * does not reach the place the value would have been used, but nothing may stand for it.
    */
   protected def disagree(got: Type, want: Type): Boolean =
-    got != want && got != Type.Unknown && want != Type.Unknown && got != Type.Never
+    Type.repr(got) != Type.repr(want) && got != Type.Unknown && want != Type.Unknown && got != Type.Never
 
   /** The one type two alternatives meet at — the branches of an `if`, the arms of a `match`, a
    * loop's `break` values and its `else` — or `None` when they have no common type.
@@ -700,6 +710,9 @@ trait AnalyzerBase {
     if a == b then Some(a)
     else if a == Type.Never then Some(b)
     else if b == Type.Never then Some(a)
+    // Two transparent-compatible types — a subtype and its base, or two subtypes over one base —
+    // meet at that base, since either may stand where the base is asked for.
+    else if Type.repr(a) == Type.repr(b) then Some(Type.repr(a))
     else None
 
   protected def show(t: Type): String = Type.show(t)

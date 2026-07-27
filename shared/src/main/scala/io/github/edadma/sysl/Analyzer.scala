@@ -85,6 +85,12 @@ class Analyzer private (units: List[Program])
     for (n, d) <- enumDecls if d.tparams.isEmpty do recover(())(instantiateEnum(n, Nil))
     for (n, d) <- structDecls if d.tparams.isEmpty do recover(())(instantiateStruct(n, Nil))
 
+    // Every constrained subtype is resolved now, whether or not anything uses it — so an out-of-range
+    // or inverted bound is a mistake reported at the declaration, exactly as a constant's is.
+    for (key, d) <- constrainedDecls do
+      currentPos = d.pos
+      inScope(declScope(key))(recover(())(resolveConstrained(key)))
+
     for (scope, stmt) <- body do
       currentPos = stmt.pos
       inScope(scope)(recover(())(hoistFunc(stmt)))
@@ -294,7 +300,7 @@ class Analyzer private (units: List[Program])
     val ty   = valType(key)
     val init = analyzeExpr(decl.value, Some(ty))
 
-    if init.ty != ty then
+    if disagree(init.ty, ty) then
       err(s"cannot initialize '${qn(key)}': declared ${show(ty)} but the value is ${show(init.ty)}")
     checkStatic(init, key)
     TVal(key, ty, init)
@@ -649,7 +655,33 @@ class Analyzer private (units: List[Program])
       expr match
         case NullLit() => err(s"a ${show(r)} always points at a live object — an absent one is Option[${show(r)}]")
         case _         => coerce(analyzeValue(expr, Some(r.inner)), r)
+
+    // A value produced into a transparent constrained subtype is analyzed at the subtype's base — so
+    // a literal and arithmetic type as that base — and then checked into the subtype. A value that
+    // does not agree with the base is left unwrapped for the caller to diagnose, and one that already
+    // has this exact subtype is not re-checked.
+    case Some(c: Type.Constrained) if !c.derived =>
+      val v = analyzeValue(expr, Some(c.base))
+      if disagree(v.ty, c.base) then v
+      else if v.ty == c then v
+      else checkInto(v, c)
+
     case _ => analyzeValue(expr, expected)
+
+  /** Wraps a base-typed value in the run-time check for a constrained subtype. */
+  private def checkInto(v: TExpr, c: Type.Constrained): TExpr = TConstrainedCheck(v, c).setPos(v.pos)
+
+  /** `Name(value)` — an explicit cast into a constrained subtype. The operand is taken at the
+   * subtype's base and checked; a value whose base does not agree is a mistake the message names.
+   */
+  private def constrainedCast(key: String, args: List[Expr]): TExpr = {
+    val c = resolveConstrained(key)
+
+    if args.length != 1 then err(s"a '${qn(key)}' conversion takes exactly one value")
+    val v = analyzeExpr(args.head, Some(c.base))
+    if disagree(v.ty, c.base) then err(s"cannot make ${show(c)} from ${show(v.ty)}")
+    checkInto(v, c)
+  }
 
   /** Whether a context of this type converts what it is given rather than simply requiring it. */
   private def converts(want: Type): Boolean = Type.erased(want) || want.isInstanceOf[Type.Ref]
@@ -784,7 +816,9 @@ class Analyzer private (units: List[Program])
     case Assign("=", target, value) =>
       val place = analyzePlace(target, "assignment")
       val tv    = analyzeExpr(value, Some(place.ty))
-      if tv.ty != place.ty then
+      // A diverging value is no value to store, so it is rejected here rather than agreeing the way
+      // a `never` does where one really may stand — as the value a `return` or a branch yields.
+      if tv.ty == Type.Never || disagree(tv.ty, place.ty) then
         err(s"cannot assign ${show(tv.ty)} to ${describe(target)} of type ${show(place.ty)}")
       TStore(place, tv, place.ty)
 
@@ -821,6 +855,12 @@ class Analyzer private (units: List[Program])
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && scalarType(name).isDefined =>
       if args.length != 1 then err(s"a '$name' conversion takes exactly one value")
       convert(analyzeExpr(args.head), scalarType(name).get)
+
+    // A constrained subtype's name in call position wraps a base value into the subtype, checking it
+    // — `Age(n)`, `Meters(3.0)`. Unlike an implicit produce site, the cast is written, so it applies
+    // even where the base would not flow in on its own.
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(constrainedDecls.contains) =>
+      constrainedCast(typeKey(name).get, args)
 
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && variantKey(name).isDefined =>
       constructVariant(variantKey(name).get, args, expected)

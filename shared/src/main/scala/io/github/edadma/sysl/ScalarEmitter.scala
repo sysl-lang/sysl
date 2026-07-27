@@ -165,7 +165,7 @@ trait ScalarEmitter extends StringEmitter {
    * the enclosing statement releases. A `bool` renders to one of two immortal literals and needs
    * no allocation at all.
    */
-  protected def genStr(arg: TExpr): String = arg.ty match
+  protected def genStr(arg: TExpr): String = Type.underlying(arg.ty) match
     case Type.Str =>
       // Identity: the same value, its count already the argument's to manage.
       genExpr(arg)
@@ -227,14 +227,14 @@ trait ScalarEmitter extends StringEmitter {
       emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, ptr $p, i64 $n)")
     else if FormatSpec.isFloat(c) then
       val fn = request("sysl.str.fmt_f")(StringEmitter.fmtFloat)
-      val v  = convert(arg.ty.asInstanceOf[Type.Floating], Type.Real, genExpr(arg))
+      val v  = convert(Type.underlying(arg.ty).asInstanceOf[Type.Floating], Type.Real, genExpr(arg))
       emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $fmt, double $v)")
     else
       // A signed conversion widens by the value's own signedness, so a decimal keeps its value; an
       // unsigned one reads the bits as unsigned, so `%x` shows exactly the value's own width. Both
       // end at 64 bits and print through a `%ll…`.
       val fn = request("sysl.str.fmt_i")(StringEmitter.fmtInt)
-      val i  = arg.ty.asInstanceOf[Type.Integer]
+      val i  = Type.underlying(arg.ty).asInstanceOf[Type.Integer]
       val v =
         if FormatSpec.isSignedInt(c) then convert(i, Type.Integer(64, i.signed), genExpr(arg))
         else

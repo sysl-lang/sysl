@@ -176,6 +176,9 @@ trait TypeResolution extends ImportResolution {
           case None =>
             typeKey(n) match
               case Some(key) if structDecls.contains(key) => instantiateStruct(key, targs)
+              case Some(key) if constrainedDecls.contains(key) =>
+                if targs.nonEmpty then err(s"'$n' is a constrained subtype and takes no type arguments")
+                resolveConstrained(key)
               case Some(key)                              => instantiateEnum(key, targs)
               case None if n == neverName =>
                 err("'never' is the type of an expression that does not finish, so it can only be a result type")
@@ -189,6 +192,79 @@ trait TypeResolution extends ImportResolution {
                 err(s"'$n' is a trait, so it describes behaviour rather than a layout — write '*$n' or " +
                   s"'&$n' for a trait object, or bound a type parameter with '[T: $n]'")
               case None => err(s"unknown type '$n'")
+
+  /** The `Type.Constrained` a subtype name stands for, built once and cached. Building resolves the
+   * base, evaluates the `within` bounds to constants, and validates them — an out-of-range or
+   * inverted bound is caught here, at the declaration, rather than at any use.
+   */
+  protected def resolveConstrained(key: String): Type.Constrained =
+    constrainedInsts.getOrElseUpdate(key, buildConstrained(key))
+
+  private def buildConstrained(key: String): Type.Constrained = {
+    val d = constrainedDecls(key)
+
+    at(d.pos) {
+      val base = resolveType(d.base, Map.empty)
+
+      val scalar = Type.underlying(base) match
+        case _: Type.Integer | _: Type.Floating | Type.Char => true
+        case _                                              => false
+      if !scalar then
+        err(s"a constrained subtype's base must be an integer, a float, or 'char', not ${show(base)}")
+
+      val (lo, hi) = d.range match
+        case Some(r) =>
+          val loV = boundValue(r.lo, base)
+          val hiV = boundValue(r.hi, base)
+          val ordered = if r.exclusiveHi then loV < hiV else loV <= hiV
+          if !ordered then
+            err(s"the lower bound of '${qn(key)}' is above its upper bound")
+          (Some(loV), Some(hiV))
+        case None => (None, None)
+
+      // A transparent subtype with neither a range nor a predicate would be a plain alias, which is
+      // not a form this cut accepts; `new` alone is enough, since it still changes the type's identity.
+      if lo.isEmpty && d.pred.isEmpty && !d.derived then
+        err(s"'${qn(key)}' has no constraint — add a 'within' range or a 'where' predicate, or 'new' to " +
+          "make it a distinct type")
+
+      if d.pred.isDefined then err("'where' predicates are not supported yet")
+      if d.derived then err("'new' derived types are not supported yet")
+
+      Type.Constrained(key, base, d.derived, lo, hi, d.range.exists(_.exclusiveHi), predFn = None)
+    }
+  }
+
+  /** One `within` bound as a constant, checked against the base's kind: a `char` base takes a
+   * character literal, an integer base an integer literal that fits its width, a float base any
+   * numeric literal. A literal of the wrong kind, or an integer out of the base's range, is an error.
+   */
+  private def boundValue(e: Expr, base: Type): BigDecimal =
+    Type.underlying(base) match
+      case Type.Char =>
+        e match
+          case CharLit(cp) => BigDecimal(cp)
+          case _           => err(s"a 'char' subtype needs character-literal bounds, not ${boundKind(e)}")
+      case i: Type.Integer =>
+        val v = e match
+          case IntLit(n, _)             => n
+          case Unary("-", IntLit(n, _)) => -n
+          case _                        => err(s"an integer subtype needs integer-literal bounds, not ${boundKind(e)}")
+        if !Type.fits(v, i) then err(s"the bound $v does not fit ${show(base)}")
+        BigDecimal(v)
+      case _ =>
+        e match
+          case IntLit(n, _)               => BigDecimal(n)
+          case Unary("-", IntLit(n, _))   => BigDecimal(-n)
+          case FloatLit(t, _)             => BigDecimal(t)
+          case Unary("-", FloatLit(t, _)) => -BigDecimal(t)
+          case _                          => err(s"a floating-point subtype needs numeric-literal bounds, not ${boundKind(e)}")
+
+  private def boundKind(e: Expr): String = e match
+    case _: CharLit                      => "a character"
+    case _: FloatLit                     => "a floating-point literal"
+    case Unary("-", _: FloatLit)         => "a floating-point literal"
+    case _                               => "an integer"
 
   /** A trait named behind a memory-mode sigil, which is what makes the pointer a trait object
    * (`02`): `*Trait` raw and unmanaged, `&Trait` reference-counted. `None` for everything else,
