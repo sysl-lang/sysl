@@ -526,6 +526,22 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       // `Meters` is, `int(age)` the i32 an `Age` is.
       convert(Type.underlying(operand.ty), ty, genExpr(operand))
 
+    case TConstrainedValid(value, c) =>
+      val v    = genExpr(value)
+      val base = Type.underlying(c.base)
+      val geLo = compareValue(">=", base, v, c.lo.get.toBigInt.toString)
+      val leHi = compareValue(if c.exclusiveHi then "<" else "<=", base, v, c.hi.get.toBigInt.toString)
+      val r = freshTemp(); emit(s"$r = and i1 $geLo, $leHi"); r
+
+    case TConstrainedStep(value, c, up, _) =>
+      val v    = genExpr(value)
+      val base = Type.underlying(c.base)
+      val last = if c.exclusiveHi then c.hi.get - 1 else c.hi.get
+      // `Succ` traps at `Last`, `Pred` at `First`; the value is otherwise one step along the base.
+      if up then trapUnless(compareValue("<", base, v, last.toBigInt.toString), "succ")
+      else trapUnless(compareValue(">", base, v, c.lo.get.toBigInt.toString), "pred")
+      val r = freshTemp(); emit(s"$r = ${if up then "add" else "sub"} ${base.llvm} $v, 1"); r
+
     case TConstrainedCheck(value, target) =>
       val v = genExpr(value)
       emitRangeChecks(v, target)

@@ -88,6 +88,16 @@ case class TCast(operand: TExpr, ty: Type) extends TExpr
  */
 case class TConstrainedCheck(value: TExpr, target: Type.Constrained) extends TExpr { def ty: Type = target }
 
+/** `T::Valid(x)` — whether `x` satisfies `target`'s `within` range, as a `bool`. Never traps; it is
+ * the total test a checked cast is the trapping form of.
+ */
+case class TConstrainedValid(value: TExpr, target: Type.Constrained) extends TExpr { def ty: Type = Type.Bool }
+
+/** `T::Succ(x)` / `T::Pred(x)` — the next (`up`) or previous value in `target`'s range, trapping at
+ * the far end (`Succ` at `Last`, `Pred` at `First`). Yields the base integer.
+ */
+case class TConstrainedStep(value: TExpr, target: Type.Constrained, up: Boolean, ty: Type) extends TExpr
+
 /** Reads a local variable (or parameter) by its unique name. */
 case class TLoad(name: String, ty: Type) extends TExpr
 

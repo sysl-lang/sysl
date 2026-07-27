@@ -139,7 +139,7 @@ class SyslLexical
     "+", "-", "*", "/", "%", "<<", ">>",
     "++", "--",
     "(", ")", "[", "]", "{", "}", ".", "?",
-    ",", ":", "->",
+    ",", "::", ":", "->",
     // Only ever a separator inside a three-clause `for` header (`00` §10). It is deliberately not a
     // statement terminator: a line ends a statement, and a token that could also end one would give
     // the language two answers to the same question.
