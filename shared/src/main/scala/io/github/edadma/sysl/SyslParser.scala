@@ -536,24 +536,40 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val funcBody: PackratParser[List[Stmt]] =
     op("=") ~> (suite | expression ^^ (e => List(ExprStmt(e).setPos(e.pos)))) | suite
 
+  /** One parsed line of a struct body, before the three kinds are sorted into their own lists. */
+  private enum StructPart:
+    case Fld(f: Param)
+    case Mem(m: MethodDecl)
+    case Inv(e: Expr)
+
   private lazy val structDecl: PackratParser[Stmt] =
     op("struct") ~> ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
       val (names, bounds) = tps.getOrElse((Nil, Map.empty))
 
       (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
         items =>
-          val fields  = items.collect { case Left(f)  => f }
-          val members = items.collect { case Right(m) => m }
-          StructDecl(name, names, fields, members, bounds)
+          val fields     = items.collect { case StructPart.Fld(f)  => f }
+          val members    = items.collect { case StructPart.Mem(m)  => m }
+          val invariants = items.collect { case StructPart.Inv(e)  => e }
+          StructDecl(name, names, fields, members, bounds, invariants)
       }
     }
 
-  /** A line inside a struct body is either a `name: type` field or a member declaration. A member
-   * is tried first: it needs a `(` (a method or associated function) or a `->` (a property) after
-   * the name, so a bare field falls through to `param`.
+  /** A line inside a struct body is a member declaration, an `invariant <bool>` clause, or a
+   * `name: type` field. A member is tried first — it needs a `(` (a method or associated function)
+   * or a `->` (a property) after the name; an `invariant` clause next — it is the contextual word
+   * `invariant` followed by an expression; and a bare field falls through to `param` (so a field
+   * may still be named `invariant`, since `invariant: type` matches neither of the first two).
    */
-  private lazy val structItem: Parser[Either[Param, MethodDecl]] =
-    member ^^ (Right(_)) | param ^^ (Left(_))
+  private lazy val structItem: Parser[StructPart] =
+    member ^^ (StructPart.Mem(_)) | invariantClause ^^ (StructPart.Inv(_)) | param ^^ (StructPart.Fld(_))
+
+  /** `invariant <bool>` among a struct's fields: a condition every value of the struct must satisfy,
+   * re-checked whenever the struct is built or one of its fields is written. Bare field names are in
+   * scope. `invariant` is contextual — an ordinary identifier everywhere else. */
+  private lazy val invariantClause: Parser[Expr] = invariantKw ~> expression
+
+  private lazy val invariantKw: Parser[Unit] = softWord("invariant")
 
   /** A member of a type's body. What follows the name decides the kind: `(params)` is a method
    * (or, with no `self`, an associated function), and `-> type = body` with no parameter list is

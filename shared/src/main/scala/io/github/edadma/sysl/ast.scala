@@ -436,6 +436,7 @@ case class StructDecl(
     fields: List[Param],
     members: List[MethodDecl] = Nil,
     bounds: Map[String, List[BoundRef]] = Map.empty,
+    invariants: List[Expr] = Nil,
     vis: Visibility = Visibility.Public,
 ) extends Stmt
 
