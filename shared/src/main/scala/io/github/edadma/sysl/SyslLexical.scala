@@ -109,6 +109,8 @@ class SyslLexical
     "impl",
     "extern",
     "module",
+    "import",
+    "as",
     "return",
     "self",
     "weak",

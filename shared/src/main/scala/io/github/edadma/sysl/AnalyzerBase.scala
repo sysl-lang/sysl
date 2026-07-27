@@ -44,6 +44,21 @@ trait AnalyzerBase {
    */
   protected var currentModule: String = Modules.root
 
+  /** What the file being read has imported. It travels with `currentModule` because both are
+   * properties of where a declaration was *written*: a body means what it meant there, and its
+   * file's imports are half of what that sentence says (`13 §3`).
+   */
+  protected var currentImports: Imports = Imports.empty
+
+  /** The imports of the blocks currently open, innermost first. An import inside a block is scoped
+   * to it, so these are pushed and popped with the local bindings they sit beside — and searched
+   * before the file's, which is what makes an inner import shadow an outer one.
+   */
+  protected var importStack: List[Imports] = Nil
+
+  /** The terms names are currently being read in. */
+  protected def currentScope: Scope = Scope(currentModule, currentImports)
+
   /** The names the prelude declares, which are in scope everywhere with no import (`13 §8`). They
    * are keyed under the root module like any other rootless declaration, and this is what tells
    * them from a *program's* root-module declarations — which are a module's like any other, and so
@@ -58,10 +73,11 @@ trait AnalyzerBase {
    * spelling may name a type in one module and a function in another, and which one is in scope is
    * a question that can only be answered against the table the use site is looking in.
    *
-   * The order is `13 §3`'s, minus the imports that do not exist yet: **this module**, then the
-   * **prelude**, and a **fully-qualified path** reaches anything at all. A sibling module's names
-   * are deliberately not in it — a module earns visibility by being named (`13 §8`), and the root
-   * module has no name, so its declarations are its own files' to use.
+   * The order is `13 §3`'s: **this module**, then what the file (or the block) has **imported**,
+   * then the **prelude**, and a **fully-qualified path** reaches anything at all. A sibling
+   * module's names are deliberately not in it — a module earns visibility by being named or
+   * imported (`13 §8`), and the root module has no name, so its declarations are its own files' to
+   * use.
    */
   protected def resolveName(written: String)(declared: String => Boolean): Option[String] = {
     val dot = written.lastIndexOf('.')
@@ -74,13 +90,63 @@ trait AnalyzerBase {
       val own = Modules.qualify(currentModule, written)
 
       if declared(own) then Some(own)
-      else Option.when(preludeNames(written) && declared(written))(written)
+      else
+        importedName(written)(declared)
+          .orElse(Option.when(preludeNames(written) && declared(written))(written))
     else
-      val module = written.take(dot)
+      val module = modulePath(written.take(dot))
       val name   = Modules.qualify(module, written.drop(dot + 1))
 
       Option.when(moduleNames(module) && declared(name))(name)
   }
+
+  /** Whether `name` is a module, or the first segment of one — everything a dotted reference could
+   * read as the start of a module path.
+   */
+  protected def namesModule(name: String): Boolean =
+    moduleNames(name) || moduleNames.exists(_.startsWith(s"$name."))
+
+  /** A written module path with its leading segment read through the imports, so that the `fs` of
+   * `import std.fs` names `std.fs` wherever a path can be written.
+   *
+   * A path whose head already begins a real module is left alone, and an import may not bind a
+   * name that does (`checkImportName`) — so the two can never both apply, and which is tried first
+   * decides nothing.
+   */
+  protected def modulePath(written: String): String = {
+    val head = written.takeWhile(_ != '.')
+
+    if namesModule(head) then written
+    else importedModule(head).map(_ + written.drop(head.length)).getOrElse(written)
+  }
+
+  /** The module a name was imported as, searching the open blocks before the file. */
+  protected def importedModule(name: String): Option[String] = searchImports(_.moduleAs(name))
+
+  /** The key an **imported** name stands for, or `None` where nothing imported answers to it in the
+   * table being asked.
+   *
+   * The two forms are asked in `13 §3`'s order. A name brought in by a selector is a deliberate
+   * act and wins outright; a name merely *offered* by a wildcard is taken only if nothing more
+   * specific claimed it, and two wildcards offering the same name make an unqualified use of it
+   * ambiguous rather than silently picking one.
+   */
+  protected def importedName(written: String)(declared: String => Boolean): Option[String] =
+    searchImports { imports =>
+      imports.names.get(written).filter(declared).orElse {
+        imports.wildcards.map(Modules.qualify(_, written)).filter(declared).distinct match
+          case Nil         => None
+          case key :: Nil  => Some(key)
+          case keys        =>
+            err(s"'$written' is offered by ${keys.map(k => s"'${Modules.moduleOf(k)}.*'").mkString(" and ")} " +
+              "— import it selectively, or write the module it comes from")
+      }
+    }
+
+  /** Asks each open import scope in turn, innermost first, and the file's last. */
+  private def searchImports[T](ask: Imports => Option[T]): Option[T] =
+    if importStack.isEmpty && currentImports.isEmpty then None
+    else importStack.iterator.map(ask).collectFirst { case Some(t) => t }.orElse(ask(currentImports))
 
   /** The key a written **type** name resolves to: a struct's or an enum's. */
   protected def typeKey(written: String): Option[String] =
@@ -98,33 +164,55 @@ trait AnalyzerBase {
    */
   protected def variantKey(written: String): Option[String] = resolveName(written)(variantOwner.contains)
 
-  /** Where a lowered function's **body** was written, for the two cases in which that is not the
-   * module its name is keyed under.
+  /** Where each declaration was **written** — the module its file contributes to, and what that
+   * file imported.
    *
-   * A member is filed under the type it belongs to, and an `impl` in one module may be written for
-   * a type in another; a trait's default is copied into every implementing type, wherever those
-   * are. Both bodies mean what they meant where they were written, so the module they resolve
-   * their names in travels with them rather than being read back off the key.
+   * The module is usually readable off the key, but not always: a member is filed under the type it
+   * belongs to and an `impl` in one module may be written for a type in another, and a trait's
+   * default is copied into every implementing type, wherever those are. The imports are never
+   * readable off a key at all. Both travel with the declaration, so its signature, its fields, and
+   * its body mean what they meant where they were written.
    */
-  protected val bodyModule = mutable.HashMap.empty[String, String]
+  protected val declScope = mutable.HashMap.empty[String, Scope]
 
-  /** The module a declaration's signature and body are read in. */
-  protected def moduleFor(name: String): String = bodyModule.getOrElse(name, Modules.moduleOf(name))
+  /** The terms a declaration's signature and body are read in. A declaration with no file behind it
+   * — the prelude's, or one the compiler synthesized — imports nothing and is read in the module its
+   * key names.
+   */
+  protected def scopeFor(name: String): Scope =
+    declScope.getOrElse(name, Scope(Modules.moduleOf(name), Imports.empty))
 
-  /** Runs `body` reading names in `module`, restoring the enclosing one after.
+  /** Runs `body` reading names as `scope` does, restoring the enclosing terms after.
    *
-   * Everything that belongs to a declaration — its signature, its fields, its body — resolves in
-   * the module it was **written** in, whatever module the walk arrived from. A call in one module
-   * to a generic function in another instantiates that function's signature, and a `Point` in it
-   * is the declaring module's `Point`.
+   * Everything that belongs to a declaration — its signature, its fields, its body — resolves where
+   * it was **written**, whatever module the walk arrived from. A call in one module to a generic
+   * function in another instantiates that function's signature, and a `Point` in it is the
+   * declaring module's `Point`.
    */
-  protected def inModule[T](module: String)(body: => T): T = {
-    val saved = currentModule
+  protected def inScope[T](scope: Scope)(body: => T): T = {
+    val savedModule  = currentModule
+    val savedImports = currentImports
+    val savedStack   = importStack
 
-    currentModule = module
+    currentModule = scope.module
+    currentImports = scope.imports
+    // A declaration's own file is where its names are read, so whatever blocks the walk arrived
+    // through are not in scope inside it.
+    importStack = Nil
     try body
-    finally currentModule = saved
+    finally
+      currentModule = savedModule
+      currentImports = savedImports
+      importStack = savedStack
   }
+
+  /** Runs `body` in the terms the declaration `name` was written in. */
+  protected def inDecl[T](name: String)(body: => T): T = inScope(scopeFor(name))(body)
+
+  /** Runs `body` in `module` with nothing imported — for the compiler's own declarations, which
+   * name everything they use in full.
+   */
+  protected def inModule[T](module: String)(body: => T): T = inScope(Scope(module, Imports.empty))(body)
 
   /** A key as a diagnostic spells it — the module separator read back as a dot (`Modules.show`).
    * Every message that names a declaration by the key a table holds it under goes through here, so
@@ -145,7 +233,7 @@ trait AnalyzerBase {
    * names may be declared further down the file; `hoistImpl` resolves each one after every type is
    * registered, and that is where `traitImpls` gets filled.
    */
-  protected val implDecls = mutable.ListBuffer.empty[(String, ImplDecl)]
+  protected val implDecls = mutable.ListBuffer.empty[(Scope, ImplDecl)]
 
   /** Every `impl Trait for Type`, keyed by (trait name, the implementing type's **owner key**). The
    * key catches a duplicate implementation, and it is what a trait bound consults to decide whether
@@ -853,12 +941,25 @@ trait AnalyzerBase {
 
   // --- scopes and unique naming --------------------------------------------------------
 
-  protected def pushScope(): Unit = scopes = mutable.LinkedHashMap.empty[String, (String, Type)] :: scopes
-  protected def popScope(): Unit  = scopes = scopes.tail
+  // An import inside a block lasts exactly as long as the block's bindings do, so the two stacks
+  // are pushed and popped together — including by the unwinding a failed statement does.
+  protected def pushScope(): Unit = {
+    scopes = mutable.LinkedHashMap.empty[String, (String, Type)] :: scopes
+    importStack = Imports.empty :: importStack
+  }
+
+  protected def popScope(): Unit = {
+    scopes = scopes.tail
+    importStack = importStack.tail
+  }
+
+  /** Adds what an `import` inside a block brings in to the innermost open block. */
+  protected def importHere(imports: Imports): Unit = importStack = imports :: importStack.tail
 
   protected def resetFunction(): Unit = {
     used.clear()
     scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
+    importStack = List(Imports.empty)
     loops = Nil
   }
 

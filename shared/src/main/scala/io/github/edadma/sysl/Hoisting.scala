@@ -33,6 +33,7 @@ trait Hoisting extends TypeResolution {
       if typeNameTaken(key, s.name) then err(s"type '${s.name}' is already declared")
       checkNoModuleOfThatName(key, s.name, "member")
       structDecls(key) = s.copy(name = key).setPos(s.pos)
+      declScope(key) = currentScope
       if Prelude.declares(s) then preludeNames += key
     case e: EnumDecl =>
       val key = Modules.qualify(currentModule, e.name)
@@ -44,6 +45,7 @@ trait Hoisting extends TypeResolution {
       if e.underlying.isDefined && e.tparams.nonEmpty then
         err(s"a generic enum cannot pin an underlying type — '${e.name}' takes type parameters")
       enumDecls(key) = e.copy(name = key).setPos(e.pos)
+      declScope(key) = currentScope
       if Prelude.declares(e) then preludeNames += key
       // Variant names are unique **within a module** rather than across the program: a bare
       // `Circle(5)` resolves against the module it is written in, so two modules may each name a
@@ -60,6 +62,7 @@ trait Hoisting extends TypeResolution {
 
       if typeNameTaken(key, t.name) then err(s"the name '${t.name}' is already declared")
       traitDecls(key) = t.copy(name = key).setPos(t.pos)
+      declScope(key) = currentScope
       if Prelude.declares(t) then preludeNames += key
       checkBoundNames(t.name, t.bounds)
       for m <- t.methods do
@@ -75,7 +78,7 @@ trait Hoisting extends TypeResolution {
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
     // — the duplicate check goes with the resolution, in `hoistImpl`. The module it was written in
     // travels with it, since that is what the trait it names and the type it is for resolve under.
-    case i: ImplDecl => implDecls += ((currentModule, i))
+    case i: ImplDecl => implDecls += ((currentScope, i))
     case _ =>
 
   /** Registers one function's name and signature.
@@ -100,6 +103,7 @@ trait Hoisting extends TypeResolution {
 
       if funcDecls.contains(key) then err(s"function '${f.name}' is already declared")
       funcDecls(key) = f.copy(name = key).setPos(f.pos)
+      declScope(key) = currentScope
       if Prelude.declares(f) then preludeNames += key
       if f.tparams.isEmpty then
         funcInsts(key) =
@@ -117,6 +121,7 @@ trait Hoisting extends TypeResolution {
       if funcDecls.contains(key) then err(s"function '${e.name}' is already declared")
       funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
       externDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
+      declScope(key) = currentScope
       if Prelude.declares(e) then preludeNames += key
       funcInsts(key) =
         (e.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
@@ -396,7 +401,7 @@ trait Hoisting extends TypeResolution {
       // A member is filed under the type it belongs to, which an `impl` in another module may have
       // named — and an inherited default's body is the trait's source, wherever the trait is. Both
       // resolve their names where they were written, so that is what is recorded here.
-      bodyModule(fd.name) = defaultOrigin.get(fd.name).map(Modules.moduleOf).getOrElse(currentModule)
+      declScope(fd.name) = defaultHome(fd.name).getOrElse(currentScope)
 
       lowered += fd
 
@@ -496,6 +501,15 @@ trait Hoisting extends TypeResolution {
     // which is the whole of what its body may assume wherever it is copied to.
     abstractMembers ++= lowered.filter(_.tparams.nonEmpty).filterNot(f => defaultOrigin.contains(f.name))
   }
+
+  /** Where a copied default's body was written, for a member that is one.
+   *
+   * `defaultOrigin` records the trait method a copy came from, as the trait's key and the method's
+   * name — so the trait itself is everything left of the last dot, a member name having none and a
+   * key's module separator not being one.
+   */
+  private def defaultHome(member: String): Option[Scope] =
+    defaultOrigin.get(member).map(origin => scopeFor(origin.take(origin.lastIndexOf('.'))))
 
   /** Why a *generic* trait is no more implementable twice than any other, said only where the
    * arguments might have made a reader think otherwise.
@@ -776,7 +790,7 @@ trait Hoisting extends TypeResolution {
 
     for tm <- tr.methods do
       impl.methods.find(_.name == tm.name) match
-        case Some(im) => checkSignature(home.label, qn(impl.traitName), tm, im, sig, Modules.moduleOf(tr.name))
+        case Some(im) => checkSignature(home.label, qn(impl.traitName), tm, im, sig, scopeFor(tr.name))
         case None if tm.body.nonEmpty => inherited += tm
         case None =>
           err(s"'${home.label}' does not implement '${qn(impl.traitName)}': ${kind(tm)} '${tm.name}' is missing")
@@ -809,7 +823,7 @@ trait Hoisting extends TypeResolution {
       tm: MethodDecl,
       im: MethodDecl,
       self: Map[String, Type],
-      traitModule: String,
+      traitScope: Scope,
   ): Unit = {
     // Which *kind* of member it is comes first, because two of the three kinds have no receiver
     // between them: a property and an associated function both answer `None`, so the receiver
@@ -834,16 +848,17 @@ trait Hoisting extends TypeResolution {
       err(s"method '${im.name}' of 'impl $traitName for $forType' takes ${im.params.length} " +
         s"parameters, but the trait declares ${tm.params.length}")
 
-    // The two signatures were written in two modules — the trait's and the block's — so each side
-    // is resolved where it was written. A `Point` in the trait's `-> Point` is the trait module's
-    // `Point`, whether or not the implementing module has one of its own.
+    // The two signatures were written in two files — the trait's and the block's — so each side is
+    // resolved where it was written, under that file's module and its imports. A `Point` in the
+    // trait's `-> Point` is the trait module's `Point`, whether or not the implementing module has
+    // one of its own.
     for (tp, ip) <- tm.params.zip(im.params) do
-      val want = inModule(traitModule)(resolveType(tp.typ, self))
+      val want = inScope(traitScope)(resolveType(tp.typ, self))
       val got  = resolveType(ip.typ, self)
       if want != got then
         err(s"parameter '${ip.name}' of method '${im.name}' is ${show(got)}, but trait '$traitName' declares ${show(want)}")
 
-    val want = inModule(traitModule)(tm.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit))
+    val want = inScope(traitScope)(tm.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit))
     val got  = im.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
     if want != got then
       err(s"method '${im.name}' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")

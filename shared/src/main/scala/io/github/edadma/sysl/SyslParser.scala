@@ -293,8 +293,8 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      structDecl | enumDecl | traitDecl | implDecl | externDecl | funcDecl | varDecl | returnStmt | breakStmt |
-        continueStmt | exprStmt,
+      importDecl | structDecl | enumDecl | traitDecl | implDecl | externDecl | funcDecl | varDecl | returnStmt |
+        breakStmt | continueStmt | exprStmt,
     )
 
   /** A dotted name — a module path. */
@@ -315,6 +315,30 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val moduleHeader: Parser[ModuleName] =
     at(op("module") ~> dottedName ^^ ModuleName.apply)
+
+  /** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — the Scala forms (`13 §3`).
+   *
+   * The path is the greedy dotted name, so the tail forms are read off what is left after it: a
+   * `.` followed by something that is not an identifier is not part of the path, which is what
+   * lets one rule cover all three without lookahead. Which part of the path is the module is not
+   * decided here — it is a question about the program, not about the text.
+   *
+   * It is a **statement** rather than a header, because an import may also appear inside a block,
+   * scoped to it, for a name wanted in one function only.
+   */
+  private lazy val importDecl: Parser[ImportDecl] =
+    op("import") ~> dottedName ~ opt(op(".") ~> importTail) ^^ {
+      case path ~ None                => ImportDecl(path)
+      case path ~ Some(Left(_))       => ImportDecl(path, wildcard = true)
+      case path ~ Some(Right(sels))   => ImportDecl(path, sels)
+    }
+
+  private lazy val importTail: Parser[Either[Unit, List[ImportSelector]]] =
+    op("*") ^^^ Left(()) |
+      (op("{") ~> rep1sep(importSelector, op(",")) <~ op("}")) ^^ (Right(_))
+
+  private lazy val importSelector: Parser[ImportSelector] =
+    at(ident ~ opt(op("as") ~> ident) ^^ { case n ~ a => ImportSelector(n, a) })
 
   /** A type: a memory-mode sigil applied to a type, or a name optionally applied to type
    * arguments (`Box[int]`, `Result[T, string]`). `sync` stays a soft keyword — it is only

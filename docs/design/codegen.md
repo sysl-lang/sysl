@@ -41,14 +41,24 @@ before they appear and may be mutually recursive).
   what the root declares.
 
 - **A module reaches another's members by naming them in full** (`13 §3`): `std.fs.read(p)`,
-  `geom.Point`, `geom.Shape.Round(7)`. `import` does not exist yet and is only a shortening of
-  this. An unqualified name is looked for in the module it is written in and then in the prelude,
-  so two modules may each declare a `Point`, a `size`, or a variant `Round`. Every table is keyed
-  by the **qualified** name (`Modules`), with `$` between the module and the declaration so the
-  prefix can never be confused with a member (`Point.dist`) or an instantiation (`f.int`); `$` is
-  legal in an LLVM symbol, so the key is still the emitted name and diagnostics read it back with
-  dots. One file of the program carries the statements it runs (`13 §7`), and they are read in the
-  module of the file that wrote them.
+  `geom.Point`, `geom.Shape.Round(7)`. An unqualified name is looked for in the module it is
+  written in, then among the file's imports, then in the prelude, so two modules may each declare a
+  `Point`, a `size`, or a variant `Round`. Every table is keyed by the **qualified** name
+  (`Modules`), with `$` between the module and the declaration so the prefix can never be confused
+  with a member (`Point.dist`) or an instantiation (`f.int`); `$` is legal in an LLVM symbol, so
+  the key is still the emitted name and diagnostics read it back with dots. One file of the program
+  carries the statements it runs (`13 §7`), and they are read in the module of the file that wrote
+  them.
+
+- **`import` shortens that path and grants nothing** (`13 §3`), in the five Scala forms:
+  `import a.b.c`, `{c, d}`, `{c as e}`, `.*`, and `import a.b` for the module itself. A binding
+  belongs to the **file** that wrote it — a sibling file of the same module does not get it — or to
+  the **block**, where an import may also be written and where it lasts as long as the block's local
+  bindings do. What travels with every declaration is therefore a `Scope` (its module *and* its
+  imports), because a body means what it meant where it was written. A selector binds a name and a
+  wildcard merely offers one, which is what makes an explicit import win over a wildcard, two
+  wildcards offering one name an ambiguity at the use, and a name bound twice an error at the
+  second import. An import may not be given a name that a module path already begins with.
 
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
   compound assignment), `return [expr]`, and `break [expr]` / `continue`. Loop and branch bodies

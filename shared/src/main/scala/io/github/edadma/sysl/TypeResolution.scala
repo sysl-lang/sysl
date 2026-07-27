@@ -10,7 +10,7 @@ import scala.collection.mutable
  * in-progress object and the recursion terminates; `cycleCheck` is what rejects a cycle that has
  * no indirection to break it.
  */
-trait TypeResolution extends AnalyzerBase {
+trait TypeResolution extends ImportResolution {
 
   /** Resolves a type in the current function's substitution — the identity map outside a
    * generic instantiation.
@@ -302,7 +302,7 @@ trait TypeResolution extends AnalyzerBase {
    * that has no indirection to break it.
    */
   protected def instantiateStruct(name: String, targs: List[Type]): Type.Struct =
-    inModule(Modules.moduleOf(name))(instantiateStructIn(name, targs))
+    inDecl(name)(instantiateStructIn(name, targs))
 
   private def instantiateStructIn(name: String, targs: List[Type]): Type.Struct = {
     val decl = structDecls(name)
@@ -344,7 +344,7 @@ trait TypeResolution extends AnalyzerBase {
    * payload-bearing variants each claim a slot in the aggregate.
    */
   protected def instantiateEnum(name: String, targs: List[Type]): Type.Enum =
-    inModule(Modules.moduleOf(name))(instantiateEnumIn(name, targs))
+    inDecl(name)(instantiateEnumIn(name, targs))
 
   private def instantiateEnumIn(name: String, targs: List[Type]): Type.Enum = {
     val decl = enumDecls(name)

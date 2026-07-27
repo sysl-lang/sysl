@@ -43,13 +43,15 @@ class Analyzer private (units: List[Program])
 
   private def analyze(): TProgram = {
     checkLocations()
-
-    // Every declaration is read in the module its file contributes to, so each one is carried
-    // alongside that module rather than flattened into one list — the module is what a name in its
-    // signature, its fields, and its body is resolved against (`13 §3`).
-    val body = Prelude.decls.map((Modules.root, _)) ::: units.flatMap(u => u.body.map((moduleOf(u), _)))
-
     moduleNames ++= units.map(moduleOf)
+
+    // Every declaration is read in the terms its file set up — the module it contributes to and
+    // what it imported — so each one is carried alongside those rather than flattened into one
+    // list. They are what a name in its signature, its fields, and its body resolves against
+    // (`13 §3`), and the imports can be read now because which module a path names is settled by
+    // the headers alone.
+    val files = units.map(u => u -> Scope(moduleOf(u), gatherImports(u.body, Imports.empty)))
+    val body  = Prelude.decls.map((Scope.root, _)) ::: files.flatMap((u, s) => u.body.map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -57,28 +59,32 @@ class Analyzer private (units: List[Program])
     //
     // Hoisting runs at the top level, where there is no enclosing position to return to, so each
     // pass simply moves the cursor to the declaration it is registering.
-    for (module, stmt) <- body do
+    for (scope, stmt) <- body do
       currentPos = stmt.pos
-      inModule(module)(recover(())(hoistType(stmt)))
+      inScope(scope)(recover(())(hoistType(stmt)))
 
     // A non-generic type is instantiated eagerly, so it is emitted whether or not it is used;
     // a generic one only exists once something asks for a concrete instantiation.
     for (n, d) <- enumDecls if d.tparams.isEmpty do recover(())(instantiateEnum(n, Nil))
     for (n, d) <- structDecls if d.tparams.isEmpty do recover(())(instantiateStruct(n, Nil))
 
-    for (module, stmt) <- body do
+    for (scope, stmt) <- body do
       currentPos = stmt.pos
-      inModule(module)(recover(())(hoistFunc(stmt)))
+      inScope(scope)(recover(())(hoistFunc(stmt)))
+
+    // Every declaration exists now, so what an `import` claimed a module declares can be looked up
+    // — and every import from here on, a block's, is checked as it is read.
+    checkImportTargets()
 
     // A type's members lower to ordinary functions under mangled names, registered here so a
     // method call and an associated-function call resolve exactly as a free call does.
     val members = mutable.ListBuffer.empty[FuncDecl]
     for (tname, sdecl) <- structDecls do
-      at(sdecl.pos)(inModule(Modules.moduleOf(tname))(recover(())(hoistMembers(tname, sdecl.members, members))))
+      at(sdecl.pos)(inDecl(tname)(recover(())(hoistMembers(tname, sdecl.members, members))))
     for (tname, edecl) <- enumDecls do
-      at(edecl.pos)(inModule(Modules.moduleOf(tname))(recover(())(hoistMembers(tname, edecl.members, members))))
-    for (module, impl) <- implDecls.toList do
-      at(impl.pos)(inModule(module)(recover(())(hoistImpl(impl, members))))
+      at(edecl.pos)(inDecl(tname)(recover(())(hoistMembers(tname, edecl.members, members))))
+    for (scope, impl) <- implDecls.toList do
+      at(impl.pos)(inScope(scope)(recover(())(hoistImpl(impl, members))))
 
     // Whether a type argument implements what the type asked of it is answerable only now: the
     // signatures resolved above were read before the `impl` blocks below them were registered, so
@@ -115,12 +121,13 @@ class Analyzer private (units: List[Program])
     for f <- members if !defaultOrigin.get(f.name).exists(brokenDefaults) do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
-    val (mainModule, mainStmts) = entryPoint()
+    val (mainScope, mainStmts) = entryPoint(files)
 
     resetFunction()
     tsubst = Map.empty
     retTy = Type.Int
-    currentModule = mainModule
+    currentModule = mainScope.module
+    currentImports = mainScope.imports
     val tmain = mainStmts.map(recoverStmt)
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An
@@ -208,22 +215,26 @@ class Analyzer private (units: List[Program])
    * **one file of the program carries the statements it runs**, and a second that carries any is a
    * mistake rather than an ordering to be guessed at.
    */
-  private def entryPoint(): (String, List[Stmt]) = {
+  private def entryPoint(files: List[(Program, Scope)]): (Scope, List[Stmt]) = {
+    // An `import` is not one: it binds a name for the file that wrote it and runs nothing, so a
+    // file may import whatever it likes without becoming the file the program starts in.
     def executable(u: Program) = u.body.filter {
-      case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl => false
-      case _                                                                                      => true
+      case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
+          _: ImportDecl =>
+        false
+      case _ => true
     }
 
-    units.map(u => u -> executable(u)).filter(_._2.nonEmpty) match
-      case Nil               => (Modules.root, Nil)
-      case (u, stmts) :: Nil => (moduleOf(u), stmts)
-      case (first, stmts) :: others =>
-        for (u, rest) <- others do
+    files.map((u, s) => (u, s, executable(u))).filter(_._3.nonEmpty) match
+      case Nil                  => (Scope.root, Nil)
+      case (_, s, stmts) :: Nil => (s, stmts)
+      case (first, s, stmts) :: others =>
+        for (u, _, rest) <- others do
           recover(())(at(rest.head.pos) {
             err(s"${first.source.name} already carries the statements this program runs, so " +
               s"${u.source.name} may hold declarations only")
           })
-        (moduleOf(first), stmts)
+        (s, stmts)
   }
 
   // --- names reached through a module ---------------------------------------------------
@@ -249,11 +260,16 @@ class Analyzer private (units: List[Program])
    * chain whose head is bound to a value is a field read and nothing else — which is why this
    * cannot be a pre-pass over the tree and has to be asked where the scopes are. And the
    * **longest** module prefix wins, so a module `a.b` is reached as one rather than as `a`'s `b`.
+   *
+   * A head that names no module is read as an import of one, which is what makes the `fs` of
+   * `import std.fs` a prefix everywhere a written path is.
    */
   private def throughModule(e: Expr): Option[Expr] =
     for
-      path <- chain(e) if path.length > 1 && lookupOpt(path.head).isEmpty
-      k    <- (path.length - 1).to(1, -1).find(n => moduleNames(path.take(n).mkString(".")))
+      written <- chain(e) if written.length > 1 && lookupOpt(written.head).isEmpty
+      path = if namesModule(written.head) then written
+             else importedModule(written.head).fold(written)(_.split('.').toList ::: written.tail)
+      k <- (path.length - 1).to(1, -1).find(n => moduleNames(path.take(n).mkString(".")))
     yield
       val module = path.take(k).mkString(".")
       val rest   = path.drop(k)
@@ -299,7 +315,7 @@ class Analyzer private (units: List[Program])
 
           for f <- generics do
             currentPos = f.pos
-            inModule(moduleFor(f.name))(recover(())(sandboxed(checkAbstractBody(f))))
+            inDecl(f.name)(recover(())(sandboxed(checkAbstractBody(f))))
 
           // A member reported here has been reported against the body as written, naming the bound
           // that would license what it does. Every instantiation would fail the same way and say so
@@ -308,7 +324,7 @@ class Analyzer private (units: List[Program])
           for f <- members do
             currentPos = f.pos
             val before = diagnosticCount
-            inModule(moduleFor(f.name))(recover(())(sandboxed(checkAbstractBody(f))))
+            inDecl(f.name)(recover(())(sandboxed(checkAbstractBody(f))))
             if diagnosticCount > before then brokenMembers += f.name
 
           // A default that fails here has been reported, at the trait, against the body a
@@ -318,7 +334,7 @@ class Analyzer private (units: List[Program])
           for f <- defaults do
             currentPos = f.pos
             val before = diagnosticCount
-            inModule(moduleFor(f.name))(recover(())(sandboxed(checkAbstractBody(f))))
+            inDecl(f.name)(recover(())(sandboxed(checkAbstractBody(f))))
             if diagnosticCount > before then brokenDefaults += f.name
         finally abstractPass = false
       }
@@ -368,7 +384,7 @@ class Analyzer private (units: List[Program])
     // A body means what it meant where it was written: an `impl` in one module for a type in
     // another lowers members keyed under the type, and a trait's default is copied into every
     // implementing type, so which module a name in it resolves against travels with the body.
-    inModule(moduleFor(f.name))(at(f.pos)(analyzeFuncBodyAt(name, f, subst)))
+    inDecl(f.name)(at(f.pos)(analyzeFuncBodyAt(name, f, subst)))
 
   private def analyzeFuncBodyAt(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
     val (params, rtype) = funcInsts(name)
@@ -429,7 +445,7 @@ class Analyzer private (units: List[Program])
     // The signature being made real is the declaration's, so it is resolved in the declaration's
     // module however far from it the call that asked for this instantiation was written.
     if !funcInsts.contains(name) then
-      inModule(moduleFor(f.name)) {
+      inDecl(f.name) {
         val subst = withSelf(f.name, f.tparams.zip(targs).toMap)
         funcInsts(name) =
           (f.params.map(p => (p.name, resolveType(p.typ, subst))),

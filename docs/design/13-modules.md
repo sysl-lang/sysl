@@ -1,13 +1,13 @@
 # Design Decisions: Modules
 
-**Status:** §1, §3's **fully-qualified path**, §6's shared module scope, and §7's entry-point rule
-are **built** — a project is a tree of directories, each one a module named by its path from the
-root and holding its files to that name, their declarations visible across all of them with no
-ordering and no forward declaration, and a member of one module reached from another by naming it
-in full. The **`import` statement** (§3), the visibility modifiers (§2), the cycle check over the
-module *graph* (§6), and the capability clause (§4) are **not yet implemented**. `import` is
-purely a shortening of what already works and waits on nothing; the other three wait on open item
-(a), the project-config doc. Two written docs already lean on modules: `capabilities.md` attaches
+**Status:** §1, the whole of §3, §6's shared module scope, and §7's entry-point rule are **built** —
+a project is a tree of directories, each one a module named by its path from the root and holding
+its files to that name, their declarations visible across all of them with no ordering and no
+forward declaration, a member of one module reached from another by naming it in full, and the
+`import` statement in all five of its forms shortening that path for the file or the block that
+writes it. The visibility modifiers (§2), the cycle check over the module *graph* (§6), and the
+capability clause (§4) are **not yet implemented**; they wait on open item (a), the project-config
+doc. Two written docs already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
 `cross-platform.md` fixes that "module names follow the directory tree relative to the project
 root." This chapter defines what a module **is** so those have something to name, and consolidates
@@ -212,14 +212,43 @@ already defined locally or explicitly imported loses to the more specific one, a
 wildcard imports that both offer the same name make an *unqualified* use of it ambiguous (a
 compile error naming both), and the fix is to qualify it or import it selectively.
 
-The qualified half of that is what is built. An unqualified name is looked for **in the module it
-is written in, then in the prelude**, and nowhere else — a sibling module's names are not in scope
-unqualified, and neither are the root module's, which have no path to be reached by at all (§1). A
-**dotted** reference names a module by the **longest prefix of it that is one**: a program holding
-both `a` and `a.b` reads `a.b.f` as `a.b`'s `f` rather than as `a`'s `b`, and §1's refusal of a
-module named for a type of its parent is what keeps that from silently hiding a member. Everything
-left of the module prefix is the ordinary form — `read(…)`, `Point(…)`, `Shape.Circle(…)` — which
-is why qualified access needed no second resolution path beside the unqualified one.
+An unqualified name is looked for **in the module it is written in, then among the file's imports,
+then in the prelude**, and nowhere else — a sibling module's names are not in scope unqualified,
+and neither are the root module's, which have no path to be reached by at all (§1). A **dotted**
+reference names a module by the **longest prefix of it that is one**: a program holding both `a`
+and `a.b` reads `a.b.f` as `a.b`'s `f` rather than as `a`'s `b`, and §1's refusal of a module named
+for a type of its parent is what keeps that from silently hiding a member. Everything left of the
+module prefix is the ordinary form — `read(…)`, `Point(…)`, `Shape.Circle(…)` — which is why
+qualified access needed no second resolution path beside the unqualified one.
+
+**An import binds a name, not a kind.** The same spelling may be a type in one module and a
+function in another, so what an import records is which path a name stands for; which of them a
+particular use meant is settled by what that position asks for, exactly as it is for a name the
+module declares itself. One import therefore serves a type, a function, a trait, and an enum
+variant without saying which it expected to be.
+
+**A module brought in by name is a prefix wherever a written path is** — `import std.fs` makes
+`fs.read(p)`, `fs.File`, and `[T: fs.Seekable]` all work, because the leading segment of a dotted
+reference is read through the imports where it is not already a module. Two rules keep those from
+ever both applying: a module reached by the name it already has (`import geom`, where `geom` is a
+top-level module) asks for what is already true and binds nothing, and an import may **not** be
+given a name that a module path already begins with. The second is a refusal rather than a
+precedence rule on purpose — a binding that is both would make `fs.read` mean one thing in a file
+that imported `fs` and another in the file beside it, and `as` costs one word.
+
+**A wildcard offers a name; a selector binds one.** That is the whole of the difference in the
+rules above: a wildcard neither collides with a selective import of a name it also offers nor with
+a second wildcard over the same module, because it has claimed nothing. Binding one name twice —
+by two selectors, or by two statements — is a mistake, and is reported at the second import rather
+than at whichever use first found two answers.
+
+An **import inside a block** is added to that block's scope, so it lasts as long as the block's
+local bindings do and shadows whatever the file imported under the same name. It takes effect
+where it is written: the statements above it have imported nothing.
+
+An import is **not** an executable statement, whatever it looks like — it binds a name and runs
+nothing, so a file may import freely without becoming the one file of the program that carries its
+statements (§7).
 
 **A file's imports are not its dependency list.** Because a qualified reference needs no import,
 a file can depend on a module without naming it in any header — the dependency appears only in a

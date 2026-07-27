@@ -67,7 +67,7 @@ trait CallAnalysis extends Literals with TraitObjects {
         // The parameter types being matched against are the declaration's, written in the
         // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the
         // call was written in.
-        val targs = inModule(moduleFor(f.name))(
+        val targs = inDecl(f.name)(
           solve(shown, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected))
         checkBounds(f, targs)
         (instantiateFunc(f, targs), Some(provisional))
@@ -116,7 +116,7 @@ trait CallAnalysis extends Literals with TraitObjects {
    * applied, so the two forms of "what this declaration assumes" are one check.
    */
   protected def checkBounds(f: FuncDecl, targs: List[Type]): Unit =
-    inModule(moduleFor(f.name))(checkParamBounds(qn(f.name), f.tparams, f.bounds, targs))
+    inDecl(f.name)(checkParamBounds(qn(f.name), f.tparams, f.bounds, targs))
 
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever
@@ -191,7 +191,7 @@ trait CallAnalysis extends Literals with TraitObjects {
 
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)(ref => spellSelf(_, ref))
     val provisional = args.map(analyzeExpr(_))
-    val own = inModule(moduleFor(fd.name))(solve(
+    val own = inDecl(fd.name)(solve(
       shown,
       m.tparams,
       fd.params.tail.map(p => spell(p.typ)),
@@ -200,7 +200,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       expected,
     ))
 
-    inModule(moduleFor(fd.name))(checkParamBounds(shown, m.tparams, fd.bounds, own))
+    inDecl(fd.name)(checkParamBounds(shown, m.tparams, fd.bounds, own))
 
     val name            = instantiateFunc(fd, ownerArgs ::: own)
     val (params, rtype) = funcInsts(name)
@@ -571,7 +571,7 @@ trait CallAnalysis extends Literals with TraitObjects {
 
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)(ref => spellSelf(_, ref))
     val provisional = args.map(analyzeExpr(_))
-    val targs = inModule(moduleFor(fd.name))(solve(
+    val targs = inDecl(fd.name)(solve(
       shown,
       fd.tparams,
       fd.params.map(p => spell(p.typ)),
@@ -583,7 +583,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     val (ownerTps, ownTps)   = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)
     val (ownerArgs, ownArgs) = targs.splitAt(ownerTps.length)
 
-    inModule(moduleFor(fd.name)) {
+    inDecl(fd.name) {
       checkParamBounds(qn(owner), ownerTps, fd.bounds, ownerArgs)
       checkParamBounds(shown, ownTps, fd.bounds, ownArgs)
     }
@@ -637,7 +637,7 @@ trait CallAnalysis extends Literals with TraitObjects {
           case _ =>
             val provisional = args.map(analyzeExpr(_))
             val targs =
-              inModule(Modules.moduleOf(name))(
+              inDecl(name)(
                 solve(qn(name), decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected))
             (targs, Some(provisional))
 
@@ -668,7 +668,7 @@ trait CallAnalysis extends Literals with TraitObjects {
           case _ =>
             val provisional = args.map(analyzeExpr(_))
             val targs =
-              inModule(Modules.moduleOf(ename))(
+              inDecl(ename)(
                 solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected))
             (targs, Some(provisional))
 

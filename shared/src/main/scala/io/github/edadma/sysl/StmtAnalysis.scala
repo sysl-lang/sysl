@@ -131,6 +131,13 @@ trait StmtAnalysis extends TypeResolution {
   private def analyzeStmt(stmt: Stmt): TStmt = at(stmt.pos)(analyzeStmtAt(stmt))
 
   private def analyzeStmtAt(stmt: Stmt): TStmt = stmt match
+    // An import binds a name for the statements after it and emits nothing. It is read here rather
+    // than gathered ahead of the block because it takes effect where it is written, as Scala's
+    // does — the code above it has not imported anything.
+    case i: ImportDecl =>
+      importInBlock(i)
+      TExprStmt(TUnitLit())
+
     case VarDecl(name, typOpt, Some(init)) =>
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)

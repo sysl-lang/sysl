@@ -215,6 +215,36 @@ case class MethodDecl(
 
 sealed trait Stmt extends Positioned
 
+/** One name an `import` brings in, and what it is to be called here: `read`, or `read as rd`.
+ *
+ * The alias is what a reader of the importing file sees, and the name is what the imported module
+ * calls it — which is the direction that matters, since the two differ only where a name would
+ * otherwise collide or read badly out of its home module.
+ */
+case class ImportSelector(name: String, alias: Option[String]) extends Positioned {
+
+  /** The name this selector binds here. */
+  def bound: String = alias.getOrElse(name)
+}
+
+/** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — a shorter spelling for names that
+ * are already reachable by their full path (`13 §3`).
+ *
+ * The path is kept **as written**, undivided, because which part of `a.b.c` is the module and
+ * which the member is a question only the analyzer can answer: `a.b.c` names a member `c` of
+ * module `a.b` where that is the module, and the module `a.b.c` itself where *that* is. The
+ * longest prefix that names a module wins, the same rule a qualified reference is read by.
+ *
+ * `selectors` is empty for the bare-path form, and `wildcard` marks the `.*` form; the two are
+ * mutually exclusive by the grammar.
+ */
+case class ImportDecl(path: List[String], selectors: List[ImportSelector] = Nil, wildcard: Boolean = false)
+    extends Stmt {
+
+  /** The path as a programmer wrote it, for a diagnostic. */
+  def show: String = path.mkString(".")
+}
+
 /** `var name [: type] [= init]`. A declaration with a type and no initializer starts at that
  * type's zero value, which is how a scratch buffer is written; a type that has no zero value
  * (one containing a `&T`, which always points at a live object) must be initialized.
