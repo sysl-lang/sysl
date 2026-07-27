@@ -1,13 +1,14 @@
 # Design Decisions: Modules
 
-**Status:** §1, the whole of §3, §6's shared module scope, and §7's entry-point rule are **built** —
-a project is a tree of directories, each one a module named by its path from the root and holding
-its files to that name, their declarations visible across all of them with no ordering and no
-forward declaration, a member of one module reached from another by naming it in full, and the
-`import` statement in all five of its forms shortening that path for the file or the block that
-writes it. The visibility modifiers (§2), the cycle check over the module *graph* (§6), and the
-capability clause (§4) are **not yet implemented**; they wait on open item (a), the project-config
-doc. Two written docs already lean on modules: `capabilities.md` attaches
+**Status:** §1, §2's visibility modifiers, the whole of §3, §6's shared module scope, and §7's
+entry-point rule are **built** — a project is a tree of directories, each one a module named by its
+path from the root and holding its files to that name, their declarations visible across all of them
+with no ordering and no forward declaration, a member of one module reached from another by naming
+it in full, the `import` statement in all five of its forms shortening that path for the file or the
+block that writes it, and `private` / `private[M]` deciding which of those spellings a given file is
+allowed to write at all. The cycle check over the module *graph* (§6) and the capability clause (§4)
+are **not yet implemented**; they wait on open item (a), the project-config doc. Two written docs
+already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
 `cross-platform.md` fixes that "module names follow the directory tree relative to the project
 root." This chapter defines what a module **is** so those have something to name, and consolidates
@@ -140,6 +141,28 @@ rather than a bare `private`, so the common case is the wordier one. The alterna
 keyword whose only job is the module level — spends a keyword to save a bracket, and leaves the
 file level either unspellable or spelled by something even less obvious.
 
+### A restriction is about naming, not about existence
+
+**A modifier decides who may write a name; it never makes a second namespace.** A file-private
+declaration still belongs to its module and still spends its name there, so a sibling file cannot
+declare something else of that name — the file is a contribution rather than a unit (§8), and that
+is what makes the two rules one rather than two. The five declaration forms take a modifier; an
+`impl` takes none, having no name for one to restrict, and an **enum's variants carry the enum's
+own**, since a type nobody outside may name is not one whose variants they may construct.
+
+**A name a file may not reach is not a candidate for it.** Resolution passes over one and goes on
+through the file's imports and the prelude, rather than stopping there — a file that wrote
+`import util.width` said which `width` it meant, and a sibling file's private helper of that name is
+not an answer to it. Where nothing else answers at all, the restriction is then reported, because at
+that point it is the whole story and a better one than an undefined name. The two halves of that
+rule are what keeps adding a private helper from changing what its module's other files mean.
+
+**A wildcard offers only what is visible; a selector is refused where it is not.** That follows from
+§3's "a wildcard offers a name, a selector binds one": a wildcard has claimed nothing, so a name it
+cannot see is simply not among what it brings in — and therefore cannot make another module's name
+ambiguous either. Naming something deliberately is the opposite case, and being told at the import
+that it is private is more use than an undefined name at every shorter spelling it would have bound.
+
 ### Anything visible outside its file states its types
 
 **A declaration visible beyond the file that declares it carries explicit types.** Inference is
@@ -154,14 +177,14 @@ Most of this the existing syntax already enforces, and nothing changes:
   inference: the signature is complete as written either way, and a reader never has to consult a
   body to learn what a function returns.
 
-So the rule binds in exactly one place today — a **top-level `var`**, whose annotation is optional
-and whose type otherwise comes from its initializer. Such a declaration must be annotated unless it
-is file-`private`:
-
-```
-var counter: int = 0             // visible past this file: annotated
-private var scratch = 0          // file-private: inferred, as a local is
-```
+So the rule **binds nowhere today**, and that is worth saying plainly rather than leaving as an
+apparent gap. The one declaration whose type could be inferred is a top-level `var`, and §7 settles
+what one of those is: a local of the program's entry point, scoped to it and initialized in its
+order, not a member of the module its file contributes to. It is therefore not visible outside its
+file to begin with, carries no visibility modifier, and has nothing for this rule to hold it to. The
+rule binds the moment a **module-level binding** exists — a `var` that is a member of its module,
+which is a different declaration from the one written today — and it is stated here so that the
+question is already settled when that arrives.
 
 **Why: it makes interface extraction parse-only.** A file's exported surface can then be read off
 its syntax tree — without resolving a name, checking a body, or having compiled anything the file
@@ -419,3 +442,21 @@ which is what it should compile to — a library is not an error.
   always a contiguous subtree. What is left open is how scoped-private interacts with re-export
   (b) — whether a facade module may forward a name it can see but its own importers cannot — which
   cannot be pinned before (b) is.
+- **f. A restricted type in an unrestricted signature.** Nothing yet stops a public function from
+  taking or returning a `private` type: an importer cannot *name* the type, but it can hold a value
+  of it, pass it back, and read its fields. Rust refuses this outright (a private type in a public
+  interface); Scala allows it and lets the type be unnameable. The refusal is a real rule — a
+  declaration's signature may not be less visible than the declaration — and it is not hard to
+  check, but it is a decision about how strong encapsulation should be rather than a gap in what §2
+  says, so it is recorded rather than guessed at. Whichever way it goes is additive: allowing it
+  today refuses nothing that a later rule would have to keep allowing.
+- **g. Visibility below the top level.** §2 governs a *top-level* declaration. Whether a type's
+  **member** can be restricted — a helper method that is not part of what the type offers — is
+  open, and is the same question as (c) one level down: both are about a boundary that is not the
+  file or the module. A member written with a modifier is a parse error today, which is the right
+  refusal for something not yet designed but a poor way to say so.
+- **h. What the file level buys the backend.** §2 notes that a bare `private` is the level at which
+  mangling can be skipped and LLVM `internal` linkage applies. Neither is done: the compiler emits
+  one module for the whole program, so `internal` would be correct but would buy nothing
+  measurable. It becomes worth doing exactly when (d) does — separate compilation is what makes an
+  external symbol cost something.

@@ -215,6 +215,22 @@ case class MethodDecl(
 
 sealed trait Stmt extends Positioned
 
+/** How far a top-level declaration is visible (`13 §2`), as the modifier before it was written.
+ *
+ * Public is the unmarked default, so `Public` is what every declaration carries until one says
+ * otherwise and what every declaration the compiler synthesizes carries outright. `private` names
+ * the **file**, which is the one level that provably never crosses a file boundary; `private[M]`
+ * widens that to a module and everything beneath it.
+ *
+ * `Scoped` holds the name **as written**, which is a simple name rather than a path: which module
+ * it means is settled against the enclosing ones where the declaration sits, so the answer belongs
+ * to hoisting rather than to the grammar.
+ */
+enum Visibility:
+  case Public
+  case File
+  case Scoped(module: String)
+
 /** One name an `import` brings in, and what it is to be called here: `read`, or `read as rd`.
  *
  * The alias is what a reader of the importing file sees, and the name is what the imported module
@@ -299,6 +315,7 @@ case class FuncDecl(
     body: List[Stmt],
     bounds: Map[String, List[BoundRef]] = Map.empty,
     variadic: Boolean = false,
+    vis: Visibility = Visibility.Public,
 ) extends Stmt
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
@@ -320,7 +337,8 @@ case class FuncDecl(
  * the tail may hold.
  */
 case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef],
-                      variadic: Boolean = false, link: Option[String] = None) extends Stmt:
+                      variadic: Boolean = false, link: Option[String] = None,
+                      vis: Visibility = Visibility.Public) extends Stmt:
   /** The symbol the linker resolves this to. */
   def symbol: String = link.getOrElse(name)
 
@@ -338,6 +356,7 @@ case class StructDecl(
     fields: List[Param],
     members: List[MethodDecl] = Nil,
     bounds: Map[String, List[BoundRef]] = Map.empty,
+    vis: Visibility = Visibility.Public,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
@@ -358,7 +377,8 @@ case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param
  */
 case class EnumDecl(name: String, tparams: List[String], underlying: Option[TypeRef],
                     variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil,
-                    bounds: Map[String, List[BoundRef]] = Map.empty) extends Stmt
+                    bounds: Map[String, List[BoundRef]] = Map.empty,
+                    vis: Visibility = Visibility.Public) extends Stmt
 
 /** `trait Name` with indented method declarations — a method with a receiver and a parameter list,
  * written either as a bare **signature** (`show(self) -> string`) or with a body, which makes it a
@@ -377,6 +397,7 @@ case class TraitDecl(
     tparams: List[String],
     methods: List[MethodDecl],
     bounds: Map[String, List[BoundRef]] = Map.empty,
+    vis: Visibility = Visibility.Public,
 ) extends Stmt
 
 /** `impl Trait for Type` with indented method **bodies**. Every method the trait declares without a

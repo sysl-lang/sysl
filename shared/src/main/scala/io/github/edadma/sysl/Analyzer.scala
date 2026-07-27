@@ -50,8 +50,14 @@ class Analyzer private (units: List[Program])
     // list. They are what a name in its signature, its fields, and its body resolves against
     // (`13 §3`), and the imports can be read now because which module a path names is settled by
     // the headers alone.
-    val files = units.map(u => u -> Scope(moduleOf(u), gatherImports(u.body, Imports.empty)))
-    val body  = Prelude.decls.map((Scope.root, _)) ::: files.flatMap((u, s) => u.body.map((s, _)))
+    // The imports are gathered in the file's own terms, since what an import may reach is a
+    // question about where it was written (`13 §2`) as much as about what it names.
+    val files = units.map { u =>
+      val base = Scope(moduleOf(u), Imports.empty, Some(u.source))
+
+      u -> base.copy(imports = inScope(base)(gatherImports(u.body, Imports.empty)))
+    }
+    val body = Prelude.decls.map((Scope.root, _)) ::: files.flatMap((u, s) => u.body.map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -128,6 +134,7 @@ class Analyzer private (units: List[Program])
     retTy = Type.Int
     currentModule = mainScope.module
     currentImports = mainScope.imports
+    currentFile = mainScope.file
     val tmain = mainStmts.map(recoverStmt)
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An

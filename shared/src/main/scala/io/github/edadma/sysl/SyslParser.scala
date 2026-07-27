@@ -293,9 +293,38 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      importDecl | structDecl | enumDecl | traitDecl | implDecl | externDecl | funcDecl | varDecl | returnStmt |
+      importDecl | implDecl | declaration | varDecl | returnStmt |
         breakStmt | continueStmt | exprStmt,
     )
+
+  /** A declaration that may carry a visibility modifier (`13 §2`).
+   *
+   * The five forms are grouped so the modifier is written once, before whichever of them follows,
+   * rather than threaded through five rules that would each have to remember it. An `impl` is not
+   * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
+   */
+  private lazy val declaration: PackratParser[Stmt] =
+    visibility ~ (structDecl | enumDecl | traitDecl | externDecl | funcDecl) ^^ {
+      case Visibility.Public ~ d => d
+      case v ~ d                 => restrict(v, d)
+    }
+
+  /** `private`, `private[M]`, or nothing at all — which is public (`13 §2`). There is no `pub`
+   * keyword; its absence *is* public, so the unmarked case is the one that writes nothing.
+   */
+  private lazy val visibility: Parser[Visibility] =
+    op("private") ~> opt(op("[") ~> ident <~ op("]")) ^^ {
+      case Some(m) => Visibility.Scoped(m)
+      case None    => Visibility.File
+    } | success(Visibility.Public)
+
+  private def restrict(v: Visibility, d: Stmt): Stmt = d match
+    case s: StructDecl => s.copy(vis = v).setPos(s.pos)
+    case e: EnumDecl   => e.copy(vis = v).setPos(e.pos)
+    case t: TraitDecl  => t.copy(vis = v).setPos(t.pos)
+    case e: ExternDecl => e.copy(vis = v).setPos(e.pos)
+    case f: FuncDecl   => f.copy(vis = v).setPos(f.pos)
+    case other         => other
 
   /** A dotted name — a module path. */
   private lazy val dottedName: Parser[List[String]] = rep1sep(ident, op("."))

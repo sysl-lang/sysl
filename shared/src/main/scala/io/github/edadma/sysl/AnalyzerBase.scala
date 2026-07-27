@@ -56,8 +56,14 @@ trait AnalyzerBase {
    */
   protected var importStack: List[Imports] = Nil
 
+  /** The file whose text is currently being read. It travels with the module and the imports for
+   * the same reason they travel together, and it is what a bare `private` is measured against
+   * (`13 §2`) — the one visibility level that never crosses a file boundary.
+   */
+  protected var currentFile: Option[Source] = None
+
   /** The terms names are currently being read in. */
-  protected def currentScope: Scope = Scope(currentModule, currentImports)
+  protected def currentScope: Scope = Scope(currentModule, currentImports, currentFile)
 
   /** The names the prelude declares, which are in scope everywhere with no import (`13 §8`). They
    * are keyed under the root module like any other rootless declaration, and this is what tells
@@ -85,20 +91,68 @@ trait AnalyzerBase {
     // A name carrying the module separator is one the compiler built rather than one a file wrote
     // — a synthesized `Self` reference, a default's bound on its own trait — and is already the key
     // it names. Nothing in source can be spelled this way, so passing it through is unambiguous.
-    if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written)
+    if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written).map(reachable)
     else if dot < 0 then
       val own = Modules.qualify(currentModule, written)
 
-      if declared(own) then Some(own)
+      if declared(own) && visible(own) then Some(own)
       else
+        // A declaration this file may not name is not a candidate, so the search goes on rather
+        // than stopping at it: a file that imported a `width` said which one it meant, and a
+        // sibling file's private helper is not an answer to that. Only where nothing else answers
+        // at all is the restriction worth reporting — at which point it is the whole story, and a
+        // better one than an undefined name.
         importedName(written)(declared)
           .orElse(Option.when(preludeNames(written) && declared(written))(written))
+          .orElse(Option.when(declared(own))(reachable(own)))
     else
       val module = modulePath(written.take(dot))
       val name   = Modules.qualify(module, written.drop(dot + 1))
 
-      Option.when(moduleNames(module) && declared(name))(name)
+      Option.when(moduleNames(module) && declared(name))(name).map(reachable)
   }
+
+  // --- visibility -----------------------------------------------------------------------
+
+  /** Where a **restricted** declaration may be named from (`13 §2`): the file that wrote it, and —
+   * for a scoped-private one — the module subtree its `private[M]` widened to.
+   *
+   * A public declaration has no entry at all, which is what makes the unmarked default cost a
+   * lookup that finds nothing rather than an entry per declaration in every program.
+   */
+  protected case class Access(file: Option[Source], subtree: Option[String])
+
+  protected val declAccess = mutable.HashMap.empty[String, Access]
+
+  /** Whether a declaration may be named from where the analyzer currently is.
+   *
+   * A **file**-private one is compared by source identity rather than by name, since two files of
+   * one project may be called the same thing. A **scoped** one is visible across the named module
+   * and everything beneath it, which is a contiguous subtree because `private[M]` can only name an
+   * enclosing module (`13 §2`) — so containment is the whole of the test.
+   */
+  protected def visible(key: String): Boolean = declAccess.get(key).forall {
+    case Access(file, None)    => file.isEmpty || file.exists(f => currentFile.exists(_ eq f))
+    case Access(_, Some(m))    => currentModule == m || currentModule.startsWith(s"$m.")
+  }
+
+  /** A resolved key, or a diagnostic where what it names is not visible here.
+   *
+   * A name the current module declares but may not use is **reported** rather than passed over, so
+   * that resolution does not quietly fall through to an import or the prelude and answer with
+   * something else. The name was found; what is wrong is that it is not for this file to write, and
+   * that is what a reader needs told.
+   */
+  protected def reachable(key: String): String = {
+    if !visible(key) then err(s"'${qn(key)}' is ${restriction(key)}")
+    key
+  }
+
+  /** Why a declaration cannot be named here, as a diagnostic says it. */
+  protected def restriction(key: String): String = declAccess.get(key) match
+    case Some(Access(Some(f), None)) => s"private to '${f.name}', the file that declares it"
+    case Some(Access(_, Some(m)))    => s"private to module '$m'"
+    case _                           => "private"
 
   /** Whether `name` is a module, or the first segment of one — everything a dotted reference could
    * read as the start of a module path.
@@ -130,11 +184,17 @@ trait AnalyzerBase {
    * act and wins outright; a name merely *offered* by a wildcard is taken only if nothing more
    * specific claimed it, and two wildcards offering the same name make an unqualified use of it
    * ambiguous rather than silently picking one.
+   *
+   * A **wildcard offers only what is visible here** (`13 §2`), which is what keeps a module's
+   * private helper from either answering to its name or making a name from elsewhere ambiguous. A
+   * selector is not filtered the same way: naming something deliberately and being told it cannot
+   * be reached is the more useful answer than being told nothing is there, so that one is reported
+   * at the import itself.
    */
   protected def importedName(written: String)(declared: String => Boolean): Option[String] =
     searchImports { imports =>
       imports.names.get(written).filter(declared).orElse {
-        imports.wildcards.map(Modules.qualify(_, written)).filter(declared).distinct match
+        imports.wildcards.map(Modules.qualify(_, written)).filter(k => declared(k) && visible(k)).distinct match
           case Nil         => None
           case key :: Nil  => Some(key)
           case keys        =>
@@ -193,9 +253,11 @@ trait AnalyzerBase {
     val savedModule  = currentModule
     val savedImports = currentImports
     val savedStack   = importStack
+    val savedFile    = currentFile
 
     currentModule = scope.module
     currentImports = scope.imports
+    currentFile = scope.file
     // A declaration's own file is where its names are read, so whatever blocks the walk arrived
     // through are not in scope inside it.
     importStack = Nil
@@ -204,6 +266,7 @@ trait AnalyzerBase {
       currentModule = savedModule
       currentImports = savedImports
       importStack = savedStack
+      currentFile = savedFile
   }
 
   /** Runs `body` in the terms the declaration `name` was written in. */

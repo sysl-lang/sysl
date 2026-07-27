@@ -111,6 +111,7 @@ class SyslLexical
     "module",
     "import",
     "as",
+    "private",
     "return",
     "self",
     "weak",

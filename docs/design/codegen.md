@@ -58,7 +58,23 @@ before they appear and may be mutually recursive).
   imports), because a body means what it meant where it was written. A selector binds a name and a
   wildcard merely offers one, which is what makes an explicit import win over a wildcard, two
   wildcards offering one name an ambiguity at the use, and a name bound twice an error at the
-  second import. An import may not be given a name that a module path already begins with.
+  second import. An import may not be given a name that a module path already begins with. What a
+  `Scope` carries alongside those is the **file**, which is what the visibility rule below is
+  measured against.
+
+- **`private` is the file and `private[M]` is a module subtree** (`13 §2`). Public is the unmarked
+  default and records nothing; a restricted declaration records where it may be named from, and
+  every resolved key is checked against where the analyzer currently is. `M` is a simple name
+  matched against the enclosing modules from the declaring one outward, first hit winning, so
+  `private[geom]` in `geom.mesh.geom.tri` is the nearer `geom`; a name matching none of them is
+  reported at the declaration, which then stays public so one mistake stays one diagnostic. A
+  restriction decides who may write a name and makes no second namespace — a private declaration
+  still spends its name in its module, and an enum's variants carry its own. A name a file may not
+  reach is **not a candidate**: resolution goes on through the file's imports and the prelude, and
+  reports the restriction only where nothing else answers. A wildcard offers only what is visible;
+  a selector naming something private is refused at the import. Nothing yet refuses a private type
+  in a public signature (`13 § Open f`), and file-private functions are not emitted `internal`
+  (`13 § Open h`) — one LLVM module means it would buy nothing until separate compilation.
 
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
   compound assignment), `return [expr]`, and `break [expr]` / `continue`. Loop and branch bodies

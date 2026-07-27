@@ -19,9 +19,10 @@ import scala.collection.mutable
 trait ImportResolution extends AnalyzerBase {
 
   /** Selectors whose module is known but whose target cannot be looked up yet: the key each one
-   * stands for, the path as written, and where to point if nothing answers to it.
+   * stands for, the path as written, where to point if nothing answers to it, and the terms the
+   * import was written in — which is what says whether what it names is visible from there.
    */
-  private val importChecks = mutable.ListBuffer.empty[(String, String, Option[Pos])]
+  private val importChecks = mutable.ListBuffer.empty[(String, String, Option[Pos], Scope)]
 
   /** Whether every declaration has been registered, and so whether an import's target can be
    * looked up as it is read rather than queued.
@@ -51,8 +52,8 @@ trait ImportResolution extends AnalyzerBase {
    * path. Called once, after hoisting.
    */
   protected def checkImportTargets(): Unit = {
-    for (key, written, pos) <- importChecks.toList do
-      at(pos)(recover(())(checkDeclared(key, written)))
+    for (key, written, pos, scope) <- importChecks.toList do
+      at(pos)(inScope(scope)(recover(())(checkDeclared(key, written))))
 
     importChecks.clear()
     declsRegistered = true
@@ -112,7 +113,7 @@ trait ImportResolution extends AnalyzerBase {
     checkImportName(bound, acc)
 
     if declsRegistered then checkDeclared(key, s"$module.$name")
-    else importChecks += ((key, s"$module.$name", currentPos))
+    else importChecks += ((key, s"$module.$name", currentPos, currentScope))
 
     acc.copy(names = acc.names + (bound -> key))
   }
@@ -135,9 +136,15 @@ trait ImportResolution extends AnalyzerBase {
     if acc.binds(bound) then err(s"'$bound' is already imported")
   }
 
+  /** Whether the module named declares what the selector asked for, and whether the importing file
+   * may name it (`13 §2`). Naming something deliberately is reported where it was named: being told
+   * a helper is private is a more useful answer at the import than an undefined name at every use
+   * of the shorter spelling it would have bound.
+   */
   private def checkDeclared(key: String, written: String): Unit =
     if !declaresAnything(key) then
       err(s"'${Modules.moduleOf(key)}' declares no '${Modules.split(key)._2}' — there is no '$written'")
+    else if !visible(key) then err(s"'$written' is ${restriction(key)}")
 
   /** Whether anything at all is declared under a key. An import binds a *name*, and which of the
    * tables answers to it is the use site's question — the same spelling may be a type in one module

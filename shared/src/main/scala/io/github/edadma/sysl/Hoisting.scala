@@ -34,6 +34,7 @@ trait Hoisting extends TypeResolution {
       checkNoModuleOfThatName(key, s.name, "member")
       structDecls(key) = s.copy(name = key).setPos(s.pos)
       declScope(key) = currentScope
+      recordAccess(key, s.vis)
       if Prelude.declares(s) then preludeNames += key
     case e: EnumDecl =>
       val key = Modules.qualify(currentModule, e.name)
@@ -46,6 +47,7 @@ trait Hoisting extends TypeResolution {
         err(s"a generic enum cannot pin an underlying type — '${e.name}' takes type parameters")
       enumDecls(key) = e.copy(name = key).setPos(e.pos)
       declScope(key) = currentScope
+      recordAccess(key, e.vis)
       if Prelude.declares(e) then preludeNames += key
       // Variant names are unique **within a module** rather than across the program: a bare
       // `Circle(5)` resolves against the module it is written in, so two modules may each name a
@@ -56,6 +58,10 @@ trait Hoisting extends TypeResolution {
         if variantOwner.contains(vkey) then
           err(s"variant name '${v.name}' is already used by enum '${qn(variantOwner(vkey))}'")
         variantOwner(vkey) = key
+        // A variant is reached unqualified, so it is a name of the module in its own right — and it
+        // carries its enum's visibility, since an enum nobody outside may name is not one whose
+        // variants they may construct.
+        recordAccess(vkey, e.vis)
         if Prelude.declares(e) then preludeNames += vkey
     case t: TraitDecl =>
       val key = Modules.qualify(currentModule, t.name)
@@ -63,6 +69,7 @@ trait Hoisting extends TypeResolution {
       if typeNameTaken(key, t.name) then err(s"the name '${t.name}' is already declared")
       traitDecls(key) = t.copy(name = key).setPos(t.pos)
       declScope(key) = currentScope
+      recordAccess(key, t.vis)
       if Prelude.declares(t) then preludeNames += key
       checkBoundNames(t.name, t.bounds)
       for m <- t.methods do
@@ -104,6 +111,7 @@ trait Hoisting extends TypeResolution {
       if funcDecls.contains(key) then err(s"function '${f.name}' is already declared")
       funcDecls(key) = f.copy(name = key).setPos(f.pos)
       declScope(key) = currentScope
+      recordAccess(key, f.vis)
       if Prelude.declares(f) then preludeNames += key
       if f.tparams.isEmpty then
         funcInsts(key) =
@@ -122,6 +130,7 @@ trait Hoisting extends TypeResolution {
       funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
       externDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
       declScope(key) = currentScope
+      recordAccess(key, e.vis)
       if Prelude.declares(e) then preludeNames += key
       funcInsts(key) =
         (e.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
@@ -131,6 +140,43 @@ trait Hoisting extends TypeResolution {
         err(s"'$s' is not a symbol a linker can resolve")
 
     case _ =>
+
+  /** Records how far a declaration is visible, for the modifier it was written with (`13 §2`).
+   *
+   * A public declaration records nothing: the unmarked default is the common case, and a table that
+   * held an entry for it would be a table with an entry per declaration in every program. What is
+   * stored is the answer rather than the modifier — the file, and the module a `private[M]` resolved
+   * to — because the question is asked at every use and the modifier alone cannot answer it.
+   *
+   * A `private[M]` naming no enclosing module is reported and then left public, so the mistake is
+   * one diagnostic at the declaration rather than one at every use of it.
+   */
+  protected def recordAccess(key: String, vis: Visibility): Unit = vis match
+    case Visibility.Public    => ()
+    case Visibility.File      => declAccess(key) = Access(currentFile, None)
+    case Visibility.Scoped(m) => recover(())(declAccess(key) = Access(currentFile, Some(enclosing(m))))
+
+  /** Which module a `private[M]` names: the **innermost** enclosing one whose last segment is `M`,
+   * counting the declaring module itself (`13 §2`).
+   *
+   * Reading outward from the declaration is what disambiguates a repeated segment — `private[geom]`
+   * inside `geom.mesh.geom.tri` is the nearer `geom` — and taking the answer from where the
+   * declaration sits is what keeps moving a subtree elsewhere from changing what its own
+   * annotations mean. There is deliberately no way to name an unrelated module, so a visibility
+   * scope is always a contiguous subtree containing the declaration.
+   */
+  private def enclosing(m: String): String = {
+    val parts = if currentModule.isEmpty then Nil else currentModule.split('.').toList
+
+    parts.lastIndexOf(m) match
+      case -1 if parts.isEmpty =>
+        err(s"this file is at the project root, whose module has no name, so there is no '$m' " +
+          "to widen to — 'private' on its own is this file")
+      case -1 =>
+        err(s"'$m' is not '$currentModule' or one of its ancestors, and 'private[M]' widens to a " +
+          "module the declaration is already inside")
+      case i => parts.take(i + 1).mkString(".")
+  }
 
   /** Checks that every bound a declaration writes names a trait and applies it to as many arguments
    * as it declares, whichever declaration form wrote it — a function, a struct, an enum, a trait. A
@@ -144,9 +190,15 @@ trait Hoisting extends TypeResolution {
    */
   protected def checkBoundNames(name: String, bounds: Map[String, List[BoundRef]]): Unit =
     for (tp, traits) <- bounds; tr <- traits do
-      traitKey(tr.name).map(traitDecls) match
-        case None       => err(s"the bound on '$tp' in '$name' names '${tr.name}', which is not a trait")
-        case Some(decl) => at(tr.pos)(checkTraitArity(tr.name, decl.tparams, tr.args.map(_ => Type.Unknown)))
+      // The whole check points at the bound rather than at the declaration carrying it, because
+      // that is the text that is wrong. It also means a bound naming something the file may not
+      // reach is reported at one place — this and the definition-time walk both resolve the name,
+      // and two identical complaints about one bound are one mistake reported twice.
+      at(tr.pos) {
+        traitKey(tr.name).map(traitDecls) match
+          case None       => err(s"the bound on '$tp' in '$name' names '${tr.name}', which is not a trait")
+          case Some(decl) => checkTraitArity(tr.name, decl.tparams, tr.args.map(_ => Type.Unknown))
+      }
 
   /** The rules a declared signature must satisfy whichever declaration form it came from, checked
    * after the name is registered so a failure reports the mistake without also erasing the

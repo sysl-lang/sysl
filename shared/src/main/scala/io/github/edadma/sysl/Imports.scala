@@ -41,12 +41,16 @@ object Imports {
   val empty: Imports = Imports()
 }
 
-/** The terms a name is read in: the module it is written in, and what that file (or block) has
- * imported. The two travel together everywhere a declaration's signature, fields, or body is
- * resolved, because both are properties of *where it was written* rather than of where the walk
- * arrived from (`13 §3`).
+/** The terms a name is read in: the module it is written in, what that file (or block) has
+ * imported, and which file it is. All three travel together everywhere a declaration's signature,
+ * fields, or body is resolved, because each is a property of *where it was written* rather than of
+ * where the walk arrived from (`13 §3`).
+ *
+ * The file is what a bare `private` is measured against (`13 §2`), and it is the `Source` itself
+ * rather than its name because sources compare by identity — two files of one project may be
+ * called the same thing, and a name they share must not make one visible to the other.
  */
-case class Scope(module: String, imports: Imports)
+case class Scope(module: String, imports: Imports, file: Option[Source] = None)
 
 object Scope {
 
