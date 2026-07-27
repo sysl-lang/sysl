@@ -157,6 +157,7 @@ trait CallAnalysis extends Literals with TraitObjects {
           case None =>
             builtinMethod(rty, mname, tr, args)
               .orElse(builtinDisplay(rty, mname, tr, args))
+              .orElse(builtinHash(rty, mname, tr, args))
               .getOrElse(err(s"type '$base' has no method '$mname'"))
   }
 
@@ -232,6 +233,28 @@ trait CallAnalysis extends Literals with TraitObjects {
 
       funcsUsed += fname
       TCall(fname, self :: checkArgs("Display.display", params, args, None), Type.Unit)
+    }
+
+  /** `k.hash()` — the mixing a built-in's `Hash` membership provides (`14 §5`).
+   *
+   * `builtinDisplay`'s sibling, and built the same way for the same reason: a built-in has no
+   * `impl` block, so the lowering is a prelude function named here. Where `Display` writes into a
+   * sink this returns a number, so what the widening is for is the law rather than the signature —
+   * every integer, `char`, and `bool` reaches one mixer at 64 bits, so two values that compare
+   * equal across widths hash equal too.
+   */
+  private def builtinHash(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
+    for
+      _           <- Option.when(mname == "hash")(traitDecls.get("Hash")).flatten
+      (fname, to) <- CoreTraits.hash(rty)
+    yield {
+      if args.nonEmpty then
+        err(s"method 'Hash.hash' takes no arguments, but ${supplied(args.length, "argument")}")
+
+      val self = widen(buildReceiver(RecvMode.ByValue, recv), to)
+
+      funcsUsed += fname
+      TCall(fname, List(self), Type.Integer(64, signed = false))
     }
 
   /** `5.add(3)`, `x.lt(y)` — a core-trait method on a type whose membership the compiler provides.

@@ -155,6 +155,23 @@ object Prelude {
       |trait Ord
       |    lt(self, rhs: Self) -> bool
       |
+      |trait Hash
+      |    hash(self) -> u64
+      |
+      |hash_u64(v: u64) -> u64
+      |    var h = v + 0x9e3779b97f4a7c15u64
+      |    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64
+      |    h = (h ^ (h >> 27u64)) * 0x94d049bb133111ebu64
+      |    h ^ (h >> 31u64)
+      |
+      |hash_bool(b: bool) -> u64 = hash_u64(if b then 1u64 else 0u64)
+      |
+      |hash_str(s: string) -> u64
+      |    var h = 0xcbf29ce484222325u64
+      |    for b in s.bytes
+      |        h = (h ^ u64(b)) * 0x100000001b3u64
+      |    h
+      |
       |trait Writer
       |    write(*self, bytes: []u8)
       |    failed(*self) -> bool = false

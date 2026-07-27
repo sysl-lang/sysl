@@ -118,6 +118,19 @@ object CoreTraits {
     case "Eq"  => Type.isEquatable(t)
     case "Ord" => Type.isOrdered(t)
 
+    // A hash only means anything beside an equality it agrees with — `a == b` must imply that the
+    // two hash alike — so membership here is `Eq`'s, minus the two places that law is not free.
+    //
+    // A **float** is left out for the reason Rust leaves it out: `NaN != NaN` breaks the
+    // reflexivity a table lookup assumes, and `-0.0 == 0.0` holds between two different bit
+    // patterns, so a hash over the bits contradicts the equality unless it normalizes first. A
+    // program that means to key on a float writes the normalization it means.
+    //
+    // A **pointer or reference** is left out because its `==` is address equality, so a hash of one
+    // would be a hash of where the allocator happened to put something — and an address is not a
+    // number this language lets a program compute with, which is where the matter rests.
+    case "Hash" => t.isInstanceOf[Type.Integer] || t == Type.Char || t == Type.Bool || t == Type.Str
+
     // Everything with one textual form worth printing. A pointer is deliberately left out: an
     // address renders differently on every run, so a program that wants one in its output asks for
     // it rather than getting it from `print(p)`.
@@ -125,6 +138,21 @@ object CoreTraits {
 
     case _ => false
   }
+
+  /** The prelude function a built-in's `Hash` goes through, and the type its receiver widens to.
+   *
+   * Everything whose value is one whole number arrives at the same mixer, widened to 64 bits, which
+   * is what makes `1u8` and `1i64` hash alike — they compare alike, and the law is that they must.
+   * The mix is splitmix64's finalizer: a hash table indexes by the *low* bits of what it is given,
+   * and consecutive keys have none worth indexing by until they have been spread.
+   */
+  def hash(t: Type): Option[(String, Type)] = t match
+    case _: Type.Integer | Type.Char => Some(("hash_u64", Type.Integer(64, signed = false)))
+    // A `bool` is one bit, and one bit does not widen to a number in this language — the same
+    // reason `display_bool` exists rather than a widening into the integer renderer.
+    case Type.Bool => Some(("hash_bool", Type.Bool))
+    case Type.Str  => Some(("hash_str", Type.Str))
+    case _         => None
 
   /** The prelude function a built-in's `Display` renders through (`14 §5`), which is the sink
    * counterpart of the one `print` reaches for the same type.

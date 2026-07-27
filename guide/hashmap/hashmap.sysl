@@ -11,11 +11,14 @@
 //
 // What writing it turned up, in the order it bit:
 //
-//   * **There is no `Hash` in the core catalog.** The prelude has `Eq` and `Ord` — enough to sort
-//     with, not enough to key on — so a map declares its own, as this one does. That is not a
-//     style problem: `02`'s coherence rule lets an `impl` live only with its trait or with its
-//     type, so two libraries that each declare a `Hash` can never share a key type's
-//     implementation, and a program using both writes the same hash twice.
+//   * **There was no `Hash` in the core catalog.** The prelude had `Eq` and `Ord` — enough to sort
+//     with, not enough to key on — so a map had to declare its own, as this one did, along with an
+//     `impl` for every key type it wanted to support. That was never a style problem: `02`'s
+//     coherence rule lets an `impl` live only with its trait or with its type, so two libraries
+//     that each declare a `Hash` can never share a key type's implementation, and a program using
+//     both writes the same hash twice. `Hash` is now a catalog trait (`14 §2`), which deleted a
+//     trait, two `impl`s, and the avalanche function from this file — the built-in mixing is the
+//     same splitmix64 finalizer this used to carry, in the one place every container can reach it.
 //   * **An enum has no zero value, so an array of them cannot be declared without one.**
 //     `var cells: [16]Option[&Entry[K, V]]` is refused. This one has since been answered: the
 //     repeat form `[None; block_size]` fills the array from a value instead of from a zero, and
@@ -47,36 +50,9 @@
 // What went in without friction is worth recording too, since the point of the exercise is where
 // the language stops rather than a list of complaints: the definition-time bound check does what
 // `10 §5` promises, so `k.hash()` is refused at the line that writes it when `K: Hash` is missing
-// rather than at some instantiation; `impl Hash for string` and `impl Hash for int` are as
-// ordinary as one for a struct; and `Cursor` below takes no bounds at all, because walking a table
-// asks nothing of a key — which is what having the bound on the declaration that needs it means.
-
-trait Hash
-    hash(self) -> u64
-
-impl Hash for string
-    hash(self) -> u64
-        var h = 0xcbf29ce484222325u64
-
-        for b in self.bytes
-            h = (h ^ u64(b)) * 0x100000001b3u64
-        h
-    end hash
-
-// An integer is its own hash in the sense that matters — it is already spread over 64 bits — but
-// the low bits are what a power-of-two table indexes by, and consecutive keys have none. So the
-// value is avalanched first, which is what keeps `0, 1, 2, …` from landing in a handful of
-// buckets.
-impl Hash for int
-    hash(self) -> u64 = mix(u64(self))
-
-private mix(x: u64) -> u64
-    var h = x
-
-    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64
-    h = (h ^ (h >> 27u64)) * 0x94d049bb133111ebu64
-    h ^ (h >> 31u64)
-end mix
+// rather than at some instantiation; a user type joins the bound with an ordinary `impl Hash`,
+// exactly as it joins `Eq`; and `Cursor` below takes no bounds at all, because walking a table asks
+// nothing of a key — which is what having the bound on the declaration that needs it means.
 
 // ------------------------------------------------------------------------------------- storage
 

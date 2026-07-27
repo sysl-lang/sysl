@@ -142,6 +142,38 @@ introduce, and no four-way Rust `PartialEq`/`Eq`/`PartialOrd`/`Ord` tower — th
 distinction Rust draws for `NaN` is not modelled at the type level here, matching sysl's existing
 treatment of float `<` as the plain IEEE comparison.
 
+### Hashing — `Hash`
+
+| Trait | Method |
+|---|---|
+| `Hash` | `hash(self) -> u64` |
+
+It is in the catalog because its absence was **structural, not stylistic**. `02`'s coherence rule
+lets an `impl` live only with its trait's module or its type's, so two libraries that each declared
+their own `Hash` could never share a key type's implementation — a program using both would write
+the same hash twice, and no amount of care by either author could fix it. One trait in the catalog
+is what makes a key type's `impl` mean the same thing to every container. `guide/hashmap` is the
+program that found this: it had to declare the trait *and* an `impl` for every key type it wanted
+to support.
+
+**The law is `a == b` ⟹ `hash(a) == hash(b)`**, and that law is what picks the memberships in `§5`:
+`Eq`'s, minus the two places it is not free. A `Hash` without an `Eq` that agrees with it is not
+wrong so much as useless, but the two stay **independent traits** for the reason `Eq` and `Ord` do
+— there is no supertrait relation anywhere in this catalog, and a container asks for `[K: Hash +
+Eq]`, which says what it needs and reads as what it needs.
+
+**One method returning a number, not a `Hasher` sink.** The obvious alternative is Rust's:
+`hash(self, out: *Hasher)`, streaming bytes into a hasher the *container* chose, which composes
+better (a string feeds its bytes rather than pre-mixing them) and lets a map pick its algorithm.
+The `Display` sink two rows down is the precedent for the shape, and it would work here. It was not
+taken because a hash is the inner loop of a container in a way rendering never is: every lookup
+would pay a dynamic dispatch per key, and `Display` pays that only when something is printed. The
+cost of the choice, recorded so it is not rediscovered: a composite type combines its fields by
+mixing already-mixed numbers rather than by streaming, and the algorithm is the *type's* choice
+rather than the container's — so a map cannot switch to a keyed hash for denial-of-service
+resistance without every key type agreeing. Moving to a sink later is a breaking change to the one
+required method, which is the honest statement of what is being committed to.
+
 ### Rendering — `Display`
 
 | Trait | Method |
@@ -325,15 +357,25 @@ memberships are **provided by the compiler**, exactly as their members already a
 members"`). The mapping is the existing operator semantics of `01`, restated as trait membership:
 
 - Every numeric type (integers and floats) is `Add`, `Sub`, `Mul`, `Div`, `Eq`, `Ord`, and
-  `Display`. The signed integers and the floats are additionally `Neg`.
+  `Display`. The signed integers and the floats are additionally `Neg`. Every **integer** is also
+  `Hash`; a **float** deliberately is not, for the reason Rust leaves it out — `NaN != NaN` breaks
+  the reflexivity a table lookup assumes, and `-0.0 == 0.0` holds between two different bit
+  patterns, so a hash over the bits would contradict the equality unless it normalized first. A
+  program that means to key on a float writes the normalization it means.
+- The pointer modes are **not** `Hash`, though they are `Eq`. Their equality is address equality,
+  so a hash of one would be a hash of where the allocator happened to put something — and an
+  address is not a number this language lets a program compute with, which is where the matter
+  rests until something asks.
 - Every integer type is `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, and `Not`. `Rem` is here
   rather than with the numeric types because `%` is integer-only in `01`'s operator table: there is
   no float remainder to lower, and a membership wider than the table would promise a bounded generic
   an operation that fails at the instantiation the bound was supposed to have proven.
-- `char` is `Eq`, `Ord`, and `Display`, and has **no** arithmetic or bitwise membership (`01` —
-  `char` has equality and ordering only).
-- `bool` is `Eq` and `Display`, and is **not** `Ord` (`01` — `bool` has equality, no ordering).
-- `string` is `Add` (concatenation, the one string operator — `04`), `Eq`, `Ord`, and `Display`.
+- `char` is `Eq`, `Ord`, `Hash`, and `Display`, and has **no** arithmetic or bitwise membership
+  (`01` — `char` has equality and ordering only).
+- `bool` is `Eq`, `Hash`, and `Display`, and is **not** `Ord` (`01` — `bool` has equality, no
+  ordering).
+- `string` is `Add` (concatenation, the one string operator — `04`), `Eq`, `Ord`, `Hash`, and
+  `Display`.
 - The pointer modes `*T`/`&T` are `Eq` only (address equality; no ordering — `01`), and
   deliberately **not `Display`**: an address renders differently on every run, so a program that
   wants one in its output asks for it explicitly rather than getting it from `print(p)`. This is a
@@ -401,7 +443,10 @@ exactly (`§5`), one row further down the catalog.
   the derivations work as they always did.
 - **`From`-style `?` conversion** (`11 §4`). Now unblocked in principle — it is a conversion
   trait plus a desugaring in `?` — but it is its own feature and is specified in `11`, not here.
-- **Supertraits / trait hierarchies.** Not needed by anything above (`Eq` and `Ord` are
+- **A `Hasher` sink for `Hash`.** The streaming form (`§2`) composes better and would let a
+  container pick its own algorithm, at the cost of a dynamic dispatch on every lookup. Recorded
+  there with what taking it later would break.
+- **Supertraits / trait hierarchies.** Not needed by anything above (`Eq`, `Ord` and `Hash` are
   deliberately independent), so not introduced.
 
 ## 8. Open (not yet decided)
