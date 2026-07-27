@@ -38,3 +38,10 @@ a variation, and belongs in the test suite instead.
 
 Findings go in the program's own header comment, where the code that provoked them is. They are the
 output of the exercise; the program passing is only the evidence that the finding is real.
+
+**A finding must be discharged before the next program is written.** Every language or compiler
+issue one of these raises is either fixed, or investigated and decided — and "deferred, for this
+reason, waiting on that" is a decision. Writing it down is not. The rule exists because findings
+compound: two of these programs independently paid the same cost for the same missing feature, and
+the second one taught us nothing the first had not, because nothing had been settled in between. A
+program written on top of an undecided finding spends its budget rediscovering it.
