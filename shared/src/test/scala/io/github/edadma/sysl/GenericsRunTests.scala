@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * arguments is monomorphized into its own function or aggregate, so these check that the
  * instantiations really are independent — and that the type arguments are inferred.
  */
-class GenericsRunTests extends AnyFreeSpec with RunSupport {
+class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "a generic function instantiated at three types" in {
     run("""id[T](x: T) -> T = x
@@ -128,5 +128,118 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport {
           |end countdown
           |countdown(3, "go")
           |""".stripMargin) shouldBe "3 go\n2 go\n1 go\n"
+  }
+
+  /** `01` lists the parameter type at a call among the positions that fix an unsuffixed literal,
+   * and says nothing about the callee being generic — so a parameter written `usize` fixes one
+   * whether or not the declaration beside it also has a `T` to solve. What makes this its own group
+   * is that inference analyzes the arguments before any parameter type is known, so the ones that
+   * *are* known have to be handed over anyway.
+   */
+  "the literal rule at a generic callee" - {
+    "a parameter naming no type parameter fixes a literal" in {
+      run("""at[T](xs: []T, i: usize) -> T = xs[i]
+            |var ns: [3]int = [10, 20, 30]
+            |print(at(ns[..], 2))
+            |""".stripMargin) shouldBe "30\n"
+    }
+
+    "the same parameter fixes it at every width, and the argument is not merely truncated" in {
+      run("""wide[T](x: T, a: u8, b: i16, c: u64) -> u64 = u64(a) + u64(b) + c
+            |print(wide("ignored", 200, 30000, 5000000000))
+            |""".stripMargin) shouldBe "5000030200\n"
+    }
+
+    "a parameter that does name one still takes the literal's own default" in {
+      run("""twice[T: Add](x: T) -> T = x + x
+            |print(twice(21))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    "a generic struct's field fixes one" in {
+      run("""struct Slot[T]
+            |    v: T
+            |    at: usize
+            |end Slot
+            |var s = Slot("here", 7)
+            |print(s.v, s.at)
+            |""".stripMargin) shouldBe "here 7\n"
+    }
+
+    "a generic variant's field fixes one" in {
+      run("""enum Tagged[T]
+            |    Absent
+            |    Held(v: T, n: u8)
+            |end Tagged
+            |var t = Tagged.Held("x", 250)
+            |var n: u8 = t match
+            |    Held(_, k) -> k
+            |    Absent -> 0
+            |print(n)
+            |""".stripMargin) shouldBe "250\n"
+    }
+
+    "a generic method's own parameter fixes one" in {
+      run("""struct Box[T]
+            |    v: T
+            |
+            |    pick[U](self, other: U, n: u16) -> u16 = n
+            |end Box
+            |var b = Box(1)
+            |print(b.pick("s", 60000))
+            |""".stripMargin) shouldBe "60000\n"
+    }
+
+    "a generic associated function's parameter fixes one" in {
+      run("""struct Box[T]
+            |    v: T
+            |
+            |    of(x: T, n: u8) -> Box[T] = if n > 0 then Box(x) else Box(x)
+            |end Box
+            |print(Box.of("held", 200).v)
+            |""".stripMargin) shouldBe "held\n"
+    }
+
+    // The two coercions an expected type drives now happen at the argument's own analysis rather
+    // than after inference, so both are checked at a generic callee: a bare construction headed for
+    // a `&T` is boxed, and a value headed for a trait object is erased.
+    "a bare construction at a concrete reference parameter is still boxed" in {
+      run("""struct Node
+            |    v: int
+            |end Node
+            |held[T](x: T, n: &Node) -> int = n.v
+            |print(held("ignored", Node(5)))
+            |""".stripMargin) shouldBe "5\n"
+    }
+
+    "a value at a concrete trait-object parameter is still erased" in {
+      run("""struct Node
+            |    v: int
+            |end Node
+            |trait Show
+            |    show(self) -> string
+            |impl Show for Node
+            |    show(self) -> string = "node"
+            |named[T](x: T, s: *Show) -> string = s.show()
+            |var n = Node(9)
+            |print(named("ignored", &n))
+            |""".stripMargin) shouldBe "node\n"
+    }
+
+    // The literal is that type from the start rather than promoted into it (`01`), so a value the
+    // parameter cannot hold is refused at the argument — the same complaint a plain callee makes.
+    "a literal too wide for the parameter is still refused" in {
+      err("""at[T](x: T, i: u8) -> u8 = i
+            |print(at("s", 300))
+            |""".stripMargin) should include("300 does not fit")
+    }
+
+    // Nothing is inferred *from* an argument whose parameter is already known, so a call that
+    // leaves the type parameter unreached is an inference failure rather than a silent default.
+    "an argument at a known parameter settles nothing about the unknown one" in {
+      err("""only[T](n: usize) -> usize = n
+            |print(only(3))
+            |""".stripMargin) should include("cannot infer the type argument 'T'")
+    }
   }
 }

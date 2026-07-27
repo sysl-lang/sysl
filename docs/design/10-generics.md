@@ -89,6 +89,14 @@ undetermined by **both** directions, that is a compile error asking for an annot
 binding (`var e: Option[real] = …`) — never a silent default and never a stuck inference
 variable.
 
+**A parameter that names no type parameter is not part of the question**, and its argument is
+checked against it exactly as a plain callee's is. This is worth saying because inference has to
+look at the arguments before it knows what anything is, which would otherwise cost a generic callee
+the rules that need an expected type: `01`'s literal rule — the parameter's type at a call fixes an
+unsuffixed literal — and the coercions to `&T` and to a trait object. A declaration having a `T`
+somewhere does not make its `usize` any less a `usize`, so `f[T](x: T, n: usize)` takes `f(v, 7)`
+with no suffix, and only a parameter that mentions what is being solved waits for the solution.
+
 **An associated function on a generic type is inferred by exactly this rule**, and that is the whole
 reason it needs no machinery of its own (`08`). A *method* never asks the question — its receiver
 already is a `Box[int]`, so the arguments are read rather than solved. An associated function has no

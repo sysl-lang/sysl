@@ -41,6 +41,31 @@ trait CallAnalysis extends Literals with TraitObjects {
     ts
   }
 
+  /** The arguments of a generic call, analyzed once for the inference that follows — each against
+   * its parameter's type wherever that type is already known.
+   *
+   * A parameter naming none of the parameters being solved has nothing to contribute to the
+   * solution and nothing left to wait for, so its argument is analyzed exactly as a non-generic
+   * call's is. That is what keeps `01`'s rule — a parameter's type at a call fixes an unsuffixed
+   * literal — true of a generic callee: `f[T](x: T, n: usize)` has no more to work out from the `7`
+   * in `f(1u32, 7)` than a plain function has. A parameter that *does* name one is analyzed bare,
+   * because the type it would be checked against is the thing being solved.
+   *
+   * The parameter types are the declaration's, so they are resolved where it was written; the
+   * arguments are the caller's, and are analyzed where *they* were written.
+   */
+  protected def provisionalArgs(
+      decl: String,
+      tparams: List[String],
+      ptypes: List[TypeRef],
+      args: List[Expr],
+  ): List[TExpr] = {
+    val tps  = tparams.toSet
+    val want = inDecl(decl)(ptypes.map(r => Option.unless(mentions(r, tps))(resolveType(r, Map.empty))))
+
+    args.zip(want.padTo(args.length, None)).map((a, e) => analyzeExpr(a, e))
+  }
+
   protected def callFunction(f: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
     // A variadic callee — foreign or sysl's own — fixes only where its declared parameters stop;
     // everything after them is the tail, checked by the rule below rather than against a parameter.
@@ -62,7 +87,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     val (name, pre) =
       if f.tparams.isEmpty then (f.name, None)
       else
-        val provisional = args.map(analyzeExpr(_))
+        val provisional = provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args)
         // The parameter types being matched against are the declaration's, written in the
         // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the
         // call was written in.
@@ -191,11 +216,12 @@ trait CallAnalysis extends Literals with TraitObjects {
         s"but ${supplied(args.length, "argument")}")
 
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
-    val provisional = args.map(analyzeExpr(_))
+    val ptypes      = fd.params.tail.map(p => spell(p.typ))
+    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, args)
     val own = inDecl(fd.name)(solve(
       shown,
       m.tparams,
-      fd.params.tail.map(p => spell(p.typ)),
+      ptypes,
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
@@ -597,11 +623,12 @@ trait CallAnalysis extends Literals with TraitObjects {
         s"but ${supplied(args.length, "argument")}")
 
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
-    val provisional = args.map(analyzeExpr(_))
+    val ptypes      = fd.params.map(p => spell(p.typ))
+    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, args)
     val targs = inDecl(fd.name)(solve(
       shown,
       fd.tparams,
-      fd.params.map(p => spell(p.typ)),
+      ptypes,
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
@@ -662,7 +689,7 @@ trait CallAnalysis extends Literals with TraitObjects {
         expected match
           case Some(s: Type.Struct) if s.base == name => (s.targs, None)
           case _ =>
-            val provisional = args.map(analyzeExpr(_))
+            val provisional = provisionalArgs(name, decl.tparams, decl.fields.map(_.typ), args)
             val targs =
               inDecl(name)(
                 solve(qn(name), decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected))
@@ -693,7 +720,7 @@ trait CallAnalysis extends Literals with TraitObjects {
         expected match
           case Some(e: Type.Enum) if e.base == ename => (e.targs, None)
           case _ =>
-            val provisional = args.map(analyzeExpr(_))
+            val provisional = provisionalArgs(ename, decl.tparams, vdecl.fields.map(_.typ), args)
             val targs =
               inDecl(ename)(
                 solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected))

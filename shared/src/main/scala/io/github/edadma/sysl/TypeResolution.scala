@@ -82,6 +82,16 @@ trait TypeResolution extends ImportResolution {
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
     case ArrayType(len, elem)               => ArrayType(len, spellSelf(elem, selfRef))
 
+  /** Whether a written type names any of the parameters being solved, and so is not yet a type.
+   *
+   * An array's length is an expression rather than a type, so nothing in it can name one.
+   */
+  protected def mentions(ref: TypeRef, tps: Set[String]): Boolean = ref match
+    case NamedType(n, args) => tps(n) || args.exists(mentions(_, tps))
+    case PtrType(inner)     => mentions(inner, tps)
+    case RefType(inner, _)  => mentions(inner, tps)
+    case ArrayType(_, elem) => mentions(elem, tps)
+
   /** Resolves one bound — a trait, with whatever arguments it was applied to — under the
    * substitution the declaration that wrote it is being read at.
    *
