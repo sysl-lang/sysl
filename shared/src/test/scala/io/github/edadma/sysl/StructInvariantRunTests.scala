@@ -111,6 +111,15 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
     exits(Account + "var a = Account(5)\nvar p = &a\n(*p).balance = -2")
   }
 
+  "a field write into an array element is checked" - {
+    "an in-range write proceeds" in {
+      run(Account + "var xs = [Account(1), Account(2)]\nxs[0].balance = 5\nprint(xs[0].balance)") shouldBe "5\n"
+    }
+    "an out-of-range write traps" in {
+      exits(Account + "var xs = [Account(1), Account(2)]\nxs[1].balance = -1")
+    }
+  }
+
   // Every field write is its own checkpoint: a sequence in which each intermediate state holds
   // proceeds, but a single write that breaks the invariant traps even if a later write would mend it.
   "each field write is checked as it happens" - {

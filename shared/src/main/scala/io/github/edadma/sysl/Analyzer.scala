@@ -518,7 +518,15 @@ class Analyzer private (units: List[Program])
       else analyzeValueBlock(rest, Some(rtype))
 
     if rtype != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, rtype) then
-      err(s"function '${f.name}' should return ${show(rtype)}, but its body yields ${show(tbody.ty)}")
+      // A `where` predicate and a struct `invariant` lower to synthesised `-> bool` functions, so a
+      // non-bool clause surfaces here. Their names are internal, so the mistake is reported as what
+      // the user wrote — a condition that is not a `bool` — rather than as a return-type mismatch.
+      if f.name.endsWith("$pred") then
+        err(s"a 'where' predicate must be a 'bool', but this one is ${show(tbody.ty)}")
+      else if f.name.endsWith("$inv") then
+        err(s"an 'invariant' must be a 'bool', but this one is ${show(tbody.ty)}")
+      else
+        err(s"function '${f.name}' should return ${show(rtype)}, but its body yields ${show(tbody.ty)}")
 
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds)
   }

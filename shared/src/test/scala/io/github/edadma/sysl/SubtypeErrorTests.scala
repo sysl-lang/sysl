@@ -48,6 +48,12 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
     err("type T = int\nvar x: T = 1\nprint(int(x))") should include("has no constraint")
   }
 
+  "a non-bool where predicate is rejected without leaking the synthesised function's name" in {
+    val e = err("type T = int where value + 1\nvar x: T = 1\nprint(int(x))")
+    e should include("a 'where' predicate must be a 'bool'")
+    e should not include "$pred"
+  }
+
   "a derived type is nominally distinct" - {
     val Meters = "type Meters = new f64\n"
 
