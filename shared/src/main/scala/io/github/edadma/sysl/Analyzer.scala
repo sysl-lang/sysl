@@ -265,7 +265,7 @@ class Analyzer private (units: List[Program])
     // written at the top of a file never reach it.
     def executable(u: Program) = u.body.filter {
       case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-          _: ImportDecl | _: ConstDecl | _: ValDecl =>
+          _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl =>
         false
       case _ => true
     }

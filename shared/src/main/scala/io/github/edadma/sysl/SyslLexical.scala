@@ -124,6 +124,7 @@ class SyslLexical
     "sizeof",
     "require",
     "ensure",
+    "type",
   )
 
   /** The operator set is closed, so operators are a fixed list tokenized by longest
