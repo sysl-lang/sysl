@@ -73,7 +73,10 @@ trait Literals extends TypeResolution {
    * narrows, or changes representation without being written.
    */
   protected def convert(t: TExpr, to: Type): TExpr = {
-    val allowed = (t.ty, to) match
+    // A written conversion is licensed to reach a constrained value's base representation, so the
+    // source kind is read through `underlying`: `f64(m)` unwraps a derived `Meters`, `int(age)` an
+    // `Age`. The target of a scalar conversion is always a plain scalar, so only the source strips.
+    val allowed = (Type.underlying(t.ty), to) match
       case (_: Type.Integer, _: Type.Integer)   => true
       case (_: Type.Integer, _: Type.Floating)  => true
       case (_: Type.Floating, _: Type.Integer)  => true
@@ -106,11 +109,19 @@ trait Literals extends TypeResolution {
    * interpolation rather than a silent `str(5)`.
    */
   protected def arithType(op: String, a: Type, b: Type): Type = {
-    if a != b then err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}")
-    (a, op) match
-      case (_: Type.Integer, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^") => a
-      case (_: Type.Floating, "+" | "-" | "*" | "/")                                      => a
-      case (Type.Str, "+")                                                                => a
+    // Operands must agree on their *representation*: a transparent subtype meets its base and other
+    // subtypes over it, while a derived type meets only itself (`repr` keeps it distinct). The
+    // result is that shared representation — except two values of one derived type stay in it, since
+    // arithmetic on a derived numeric yields the same derived numeric.
+    val ra = Type.repr(a)
+    if ra != Type.repr(b) then err(s"'$op' needs matching types, got ${show(a)} and ${show(b)}")
+    val result = a match
+      case c: Type.Constrained if c.derived && a == b => a
+      case _                                          => ra
+    (Type.underlying(a), op) match
+      case (_: Type.Integer, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^") => result
+      case (_: Type.Floating, "+" | "-" | "*" | "/")                                      => result
+      case (Type.Str, "+")                                                                => result
       case _ => err(s"operator '$op' is not defined for ${show(a)}")
   }
 

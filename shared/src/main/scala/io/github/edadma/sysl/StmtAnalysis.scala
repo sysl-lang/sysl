@@ -171,7 +171,7 @@ trait StmtAnalysis extends TypeResolution {
       // clever way to spell divergence.
       if ti.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
       val declTy = declared.getOrElse(ti.ty)
-      if declared.isDefined && declTy != ti.ty then
+      if declared.isDefined && disagree(ti.ty, declTy) then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
       TVarDecl(declare(name, declTy), declTy, ti)
 
@@ -183,7 +183,7 @@ trait StmtAnalysis extends TypeResolution {
       val ti       = analyzeExpr(init, declared)
       if ti.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
       val declTy = declared.getOrElse(ti.ty)
-      if declared.isDefined && declTy != ti.ty then
+      if declared.isDefined && disagree(ti.ty, declTy) then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
       TVarDecl(declareReadOnly(name, declTy), declTy, ti)
 

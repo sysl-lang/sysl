@@ -94,6 +94,16 @@ trait Hoisting extends TypeResolution {
         // No implementation could supply one either, so the trait is where it is worth saying so.
         if m.tparams.nonEmpty then
           at(m.pos)(err(s"generic methods are not supported yet — '${t.name}.${m.name}'"))
+    // A constrained subtype shares the type namespace, so a name clash is caught here; the base and
+    // bounds are resolved and validated lazily, the first time the name is used as a type.
+    case t: TypeDecl =>
+      val key = Modules.qualify(currentModule, t.name)
+
+      if typeNameTaken(key, t.name) then err(s"type '${t.name}' is already declared")
+      checkNoModuleOfThatName(key, t.name, "member")
+      constrainedDecls(key) = t.copy(name = key).setPos(t.pos)
+      declScope(key) = currentScope
+      recordAccess(key, t.vis)
     // A constant is registered with the types rather than with the functions, because an array
     // bound and an enum discriminant may both name one and both are resolved between the two passes
     // (`13 §7`). Its *value* is not evaluated here — a constant may be written in terms of one
@@ -306,7 +316,8 @@ trait Hoisting extends TypeResolution {
 
   private def typeNameTaken(key: String, written: String): Boolean =
     structDecls.contains(key) || enumDecls.contains(key) || traitDecls.contains(key) ||
-      scalarType(written).isDefined || written == neverName || written == selfName
+      constrainedDecls.contains(key) || scalarType(written).isDefined ||
+      written == neverName || written == selfName
 
   /** Records a type's members and lowers each to a function declaration under the mangled name
    * `Type.member`, whose signature is registered so calls resolve like ordinary ones.

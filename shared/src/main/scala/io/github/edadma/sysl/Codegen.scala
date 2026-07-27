@@ -236,6 +236,30 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     trapUnless(ok, kind)
   }
 
+  /** Emits the `within`-range checks for a value produced into a constrained subtype: a lower- and
+   * upper-bound compare, each trapping on violation. Integer and `char` bounds compare at the base
+   * width (unsigned for `char` and the unsigned integers, which `compareValue` reads off the type);
+   * float bounds compare in double precision, widening a narrower value so one rendering of the
+   * bound serves every float width.
+   */
+  private def emitRangeChecks(v: String, c: Type.Constrained): Unit =
+    Type.underlying(c.base) match
+      case f: Type.Floating =>
+        val wide =
+          if f.bits == 64 then v
+          else { val r = freshTemp(); emit(s"$r = fpext ${f.llvm} $v to double"); r }
+        for lo <- c.lo do trapUnless(fcmpConst("oge", wide, lo), "within")
+        for hi <- c.hi do trapUnless(fcmpConst(if c.exclusiveHi then "olt" else "ole", wide, hi), "within")
+      case base =>
+        for lo <- c.lo do trapUnless(compareValue(">=", base, v, lo.toBigInt.toString), "within")
+        for hi <- c.hi do
+          trapUnless(compareValue(if c.exclusiveHi then "<" else "<=", base, v, hi.toBigInt.toString), "within")
+
+  private def fcmpConst(pred: String, wide: String, bound: BigDecimal): String = {
+    val c = f"0x${java.lang.Double.doubleToLongBits(bound.toDouble)}%016X"
+    val r = freshTemp(); emit(s"$r = fcmp $pred double $wide, $c"); r
+  }
+
   /** Runs every postcondition with `result` bound to the value about to be returned. */
   private def emitEnsures(result: Option[String]): Unit =
     if ensures.nonEmpty then
@@ -298,6 +322,8 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     // Nothing is stored for a zero-sized value, so its zero is nothing at all — the same empty
     // register every other read of one yields.
     case t if Type.zeroSized(t) => ""
+    // A constrained subtype is laid out as its base, so its zero is the base's zero.
+    case c: Type.Constrained => zero(Type.underlying(c))
     case _: Type.Integer  => "0"
     case _: Type.Floating => "0.0"
     case Type.Char        => "0"
@@ -494,7 +520,14 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       else { val r = freshTemp(); emit(s"$r = fptrunc double $bits to ${ty.llvm}"); r }
 
     case TCast(operand, ty) =>
-      convert(operand.ty, ty, genExpr(operand))
+      // A constrained operand converts from its base representation — `f64(m)` reaches the double a
+      // `Meters` is, `int(age)` the i32 an `Age` is.
+      convert(Type.underlying(operand.ty), ty, genExpr(operand))
+
+    case TConstrainedCheck(value, target) =>
+      val v = genExpr(value)
+      emitRangeChecks(v, target)
+      v
 
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.
     case TLoad(_, ty) if Type.zeroSized(ty) => ""

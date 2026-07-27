@@ -287,14 +287,15 @@ object Type {
    */
   def zeroSized(t: Type): Boolean = t == Unit
 
-  def isNumeric(t: Type): Boolean = t match
+  def isNumeric(t: Type): Boolean = underlying(t) match
     case _: Integer | _: Floating => true
     case _                        => false
 
   /** Whether `<`, `<=`, `>`, `>=` are defined — the numeric types, `char`, and `string`, which
-   * orders by its bytes and so, being well-formed UTF-8, by codepoint.
+   * orders by its bytes and so, being well-formed UTF-8, by codepoint. A constrained subtype
+   * inherits the ordering of its base, so it is ordered exactly when its base is.
    */
-  def isOrdered(t: Type): Boolean = isNumeric(t) || t == Char || t == Str
+  def isOrdered(t: Type): Boolean = { val u = underlying(t); isNumeric(u) || u == Char || u == Str }
 
   /** Whether `==` and `!=` are defined. Everything ordered, plus the types that have equality
    * without an ordering: `bool`, and the two pointer-shaped modes, which compare by address.
@@ -446,6 +447,44 @@ object Type {
     override def toString: String = s"Enum($name)"
   }
 
+  /** A named scalar carrying runtime constraints (`03`): an integer, float, or `char` `base` given
+   * a name, with an optional `within` range (`lo`/`hi`, `exclusiveHi` for `..<`) and an optional
+   * `where` predicate (the synthetic function `predFn` checks). It lowers exactly to its base, so
+   * `llvm` delegates and a constrained value costs nothing beyond the check at the point it is made.
+   *
+   * `derived` is the `new` modifier. A transparent subtype (`derived = false`) is interchangeable
+   * with its base; a derived one is nominally distinct and mixes with the base only through an
+   * explicit cast. Identity is the whole tuple, but `name` alone already separates two declarations,
+   * so a derived type is distinct from its base and from every other derived type over it.
+   */
+  case class Constrained(
+      name: String,
+      base: Type,
+      derived: Boolean,
+      lo: Option[BigDecimal],
+      hi: Option[BigDecimal],
+      exclusiveHi: Boolean,
+      predFn: Option[String],
+  ) extends Type {
+    def llvm: String = base.llvm
+  }
+
+  /** A transparent constrained subtype seen as its base — the identity for type *agreement*, so a
+   * transparent `Age` stands where an `int` is asked for and the reverse. A derived type keeps its
+   * own identity here (it agrees only with itself), which is what makes `new` nominal.
+   */
+  def repr(t: Type): Type = t match
+    case c: Constrained if !c.derived => repr(c.base)
+    case _                            => t
+
+  /** Every constrained subtype seen as its ultimate base representation — the identity for explicit
+   * conversions and for the scalar operations codegen lowers. Unlike `repr`, this strips a derived
+   * type too, since a written conversion (`f64(m)`) is exactly the licence to reach the base.
+   */
+  def underlying(t: Type): Type = t match
+    case c: Constrained => underlying(c.base)
+    case _              => t
+
   /** The source-level spelling of an instantiated named type: `Box`, `Result[int, string]`. */
   def qualified(base: String, targs: List[Type]): String =
     if targs.isEmpty then base else s"$base[${targs.map(show).mkString(", ")}]"
@@ -473,6 +512,9 @@ object Type {
     case Array(n, elem)    => s"arr$n.${mangleOne(elem)}"
     case Slice(elem)       => s"slice.${mangleOne(elem)}"
     case Trait(n, args)    => mangled(n, args)
+    // A transparent subtype shares its base's representation, so it mangles as the base; a derived
+    // one is its own type and mangles under its name, keeping `Vec[Meters]` and `Vec[f64]` apart.
+    case c: Constrained    => if c.derived then mangled(c.name, Nil) else mangleOne(c.base)
     case other            => show(other)
 
   /** How a type is written in a diagnostic: the friendly alias where one exists (`int`,
@@ -483,6 +525,7 @@ object Type {
    * `geom$Point` is shown as the `geom.Point` a program would write.
    */
   def show(t: Type): String = t match
-    case n: Named => qualified(Modules.show(n.base), n.targs)
-    case other    => friendly.getOrElse(other, canonicalName(other))
+    case n: Named       => qualified(Modules.show(n.base), n.targs)
+    case c: Constrained => Modules.show(c.name)
+    case other          => friendly.getOrElse(other, canonicalName(other))
 }

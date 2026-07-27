@@ -81,6 +81,13 @@ case class TSlice(base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: 
  */
 case class TCast(operand: TExpr, ty: Type) extends TExpr
 
+/** A value produced into a constrained subtype (`03`): `value` is the base-typed value, and
+ * `target` names the subtype whose `within` range and `where` predicate it must satisfy. Codegen
+ * emits `value`, checks it, and yields the same value — the representation is unchanged, so the
+ * only run-time effect is a trap when a constraint is violated.
+ */
+case class TConstrainedCheck(value: TExpr, target: Type.Constrained) extends TExpr { def ty: Type = target }
+
 /** Reads a local variable (or parameter) by its unique name. */
 case class TLoad(name: String, ty: Type) extends TExpr
 
