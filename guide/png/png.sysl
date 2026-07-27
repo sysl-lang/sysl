@@ -89,20 +89,20 @@ struct Image
     // raster format written down.
     //
     // It would be `private` if a member could say so, this being nobody's business but `at`'s.
-    index(self, x: usize, y: usize) -> usize = y * self.stride() + 1usize + x * self.channels()
+    index(self, x: usize, y: usize) -> usize = y * self.stride() + 1 + x * self.channels()
 
     at(self, x: usize, y: usize) -> Rgba
         var i = self.index(x, y)
 
         self.kind match
             0u8 -> Rgba(self.raw[i], self.raw[i], self.raw[i], 255u8)
-            2u8 -> Rgba(self.raw[i], self.raw[i + 1usize], self.raw[i + 2usize], 255u8)
+            2u8 -> Rgba(self.raw[i], self.raw[i + 1], self.raw[i + 2], 255u8)
             3u8 ->
-                var p = usize(self.raw[i]) * 3usize
+                var p = usize(self.raw[i]) * 3
 
-                Rgba(self.palette[p], self.palette[p + 1usize], self.palette[p + 2usize], 255u8)
-            4u8 -> Rgba(self.raw[i], self.raw[i], self.raw[i], self.raw[i + 1usize])
-            else -> Rgba(self.raw[i], self.raw[i + 1usize], self.raw[i + 2usize], self.raw[i + 3usize])
+                Rgba(self.palette[p], self.palette[p + 1], self.palette[p + 2], 255u8)
+            4u8 -> Rgba(self.raw[i], self.raw[i], self.raw[i], self.raw[i + 1])
+            else -> Rgba(self.raw[i], self.raw[i + 1], self.raw[i + 2], self.raw[i + 3])
     end at
 end Image
 
@@ -110,11 +110,11 @@ end Image
 // alpha, and truecolour with alpha. Every length in the format is counted in these.
 private channels_of(kind: u8) -> usize
     kind match
-        0u8 -> 1usize
-        2u8 -> 3usize
-        3u8 -> 1usize
-        4u8 -> 2usize
-        else -> 4usize
+        0u8 -> 1
+        2u8 -> 3
+        3u8 -> 1
+        4u8 -> 2
+        else -> 4
 end channels_of
 
 // The checksum every chunk carries, computed a bit at a time rather than through a table — a
@@ -136,7 +136,7 @@ crc32(data: []u8) -> u32
 end crc32
 
 private be32(b: []u8, i: usize) -> u32
-    u32(b[i]) << 24u32 | u32(b[i + 1usize]) << 16u32 | u32(b[i + 2usize]) << 8u32 | u32(b[i + 3usize])
+    u32(b[i]) << 24u32 | u32(b[i + 1]) << 16u32 | u32(b[i + 2]) << 8u32 | u32(b[i + 3])
 
 private named(b: []u8, at: usize, name: string) -> bool
     for i in 0usize..<4usize
@@ -165,11 +165,11 @@ end name_of
 decode(src: []u8, zbuf: []u8, raw: []u8) -> Result[Image, Fault]
     var signature = [137u8, 80u8, 78u8, 71u8, 13u8, 10u8, 26u8, 10u8]
 
-    if src.len < 8usize then return Err(NotPng)
+    if src.len < 8 then return Err(NotPng)
 
     var i = 0usize
 
-    while i < 8usize
+    while i < 8
         if src[i] != signature[i] then return Err(NotPng)
 
         i += 1usize
@@ -183,19 +183,19 @@ decode(src: []u8, zbuf: []u8, raw: []u8) -> Result[Image, Fault]
 
     loop
         if at == src.len then return Err(NoEnd)
-        if at + 12usize > src.len then return Err(Truncated(at))
+        if at + 12 > src.len then return Err(Truncated(at))
 
         var len = usize(be32(src, at))
 
-        if at + 12usize + len > src.len then return Err(Truncated(at))
+        if at + 12 + len > src.len then return Err(Truncated(at))
 
         // The checksum covers the name and the data but not the length, so a chunk whose length
         // was corrupted is caught by the *next* chunk failing to be where it should be.
-        if crc32(src[at + 4usize..<at + 8usize + len]) != be32(src, at + 8usize + len) then return Err(BadCrc(at))
+        if crc32(src[at + 4..<at + 8 + len]) != be32(src, at + 8 + len) then return Err(BadCrc(at))
 
-        var body = src[at + 8usize..<at + 8usize + len]
+        var body = src[at + 8..<at + 8 + len]
 
-        if named(src, at + 4usize, "IHDR")
+        if named(src, at + 4, "IHDR")
             if at != 8usize || len != 13usize then return Err(NoHeader)
 
             width = usize(be32(body, 0usize))
@@ -210,9 +210,9 @@ decode(src: []u8, zbuf: []u8, raw: []u8) -> Result[Image, Fault]
             if body[12] != 0u8 then return Err(Interlaced)
         else if at == 8usize
             return Err(NoHeader)
-        else if named(src, at + 4usize, "PLTE")
+        else if named(src, at + 4, "PLTE")
             palette = body
-        else if named(src, at + 4usize, "IDAT")
+        else if named(src, at + 4, "IDAT")
             if zn + len > zbuf.len then return Err(NoRoom)
 
             i = 0usize
@@ -222,14 +222,14 @@ decode(src: []u8, zbuf: []u8, raw: []u8) -> Result[Image, Fault]
                 i += 1usize
 
             zn += len
-        else if named(src, at + 4usize, "IEND")
+        else if named(src, at + 4, "IEND")
             break
-        else if src[at + 4usize] & 32u8 == 0u8
+        else if src[at + 4] & 32u8 == 0u8
             // The fifth bit of the first letter is its case, and its case is the rule: a name
             // beginning with a capital is a chunk a reader must understand to be reading the file
             // at all. Everything else may be skipped, which is how a format stays extensible
             // without a version number.
-            return Err(Unknown(name_of(src, at + 4usize)))
+            return Err(Unknown(name_of(src, at + 4)))
 
         at += 12usize + len
 
@@ -266,11 +266,11 @@ private unfilter(raw: []u8, stride: usize, height: usize, channels: usize) -> Re
 
         if kind > 4u8 then return Err(BadFilter(kind, y))
 
-        for i in 0usize..<stride - 1usize
-            var x = int(raw[row + 1usize + i])
-            var a = if i >= channels then int(raw[row + 1usize + i - channels]) else 0
-            var b = if y > 0usize then int(raw[row + 1usize + i - stride]) else 0
-            var c = if i >= channels && y > 0usize then int(raw[row + 1usize + i - stride - channels]) else 0
+        for i in 0usize..<stride - 1
+            var x = int(raw[row + 1 + i])
+            var a = if i >= channels then int(raw[row + 1 + i - channels]) else 0
+            var b = if y > 0 then int(raw[row + 1 + i - stride]) else 0
+            var c = if i >= channels && y > 0 then int(raw[row + 1 + i - stride - channels]) else 0
 
             var predicted = kind match
                 0u8 -> 0
@@ -279,7 +279,7 @@ private unfilter(raw: []u8, stride: usize, height: usize, channels: usize) -> Re
                 3u8 -> (a + b) >> 1
                 else -> paeth(a, b, c)
 
-            raw[row + 1usize + i] = u8(x + predicted & 255)
+            raw[row + 1 + i] = u8(x + predicted & 255)
 
     Ok(true)
 end unfilter
