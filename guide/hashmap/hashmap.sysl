@@ -26,7 +26,7 @@
 //   * **Storage cannot be asked for at a size chosen while running** (`07`, *Not yet*), so the
 //     table is a fixed directory of fixed blocks and its capacity has a ceiling written into the
 //     type. The growth is real — blocks are allocated, the mask changes, every entry is rehashed
-//     into a new bucket — but it stops at `max_blocks()`, after which the map keeps working with
+//     into a new bucket — but it stops at `max_blocks`, after which the map keeps working with
 //     longer chains instead.
 //   * **A bound is repeated at every declaration that needs it.** `[K: Hash + Eq, V]` is written
 //     on the type and again on each free function over it; there is no `where` clause (`10 § Open
@@ -87,19 +87,20 @@ struct Entry[K, V]
 end Entry
 
 struct Block[K, V]
-    cell: [16]Option[&Entry[K, V]]
+    cell: [block_size]Option[&Entry[K, V]]
 end Block
 
 struct Dir[K, V]
-    block: [16]Option[&Block[K, V]]
+    block: [max_blocks]Option[&Block[K, V]]
 end Dir
 
-// How many buckets a block holds, and how many blocks the directory can point at. Nullary
-// functions because a module has no constants (`13 §7`), and the two of them fix the capacity
-// ceiling at 256 buckets.
-private block_size() -> usize = 16usize
+// How many buckets a block holds, and how many blocks the directory can point at. Between them they
+// fix the capacity ceiling at 256 buckets, and because they are constants rather than the nullary
+// functions this was first written with, the two arrays above are sized by the same names the code
+// below divides by (`13 §7`).
+private const block_size: usize = 16
 
-private max_blocks() -> usize = 16usize
+private const max_blocks: usize = 16
 
 // Sixteen `None`s, because a fixed array has no repeat literal and an `Option` has no zero value
 // to fill one with. Written once so the rest of the file does not have to look at it.
@@ -120,16 +121,16 @@ struct Map[K: Hash + Eq, V]
     blocks: usize
     count: usize
 
-    buckets(self) -> usize = self.blocks * block_size()
+    buckets(self) -> usize = self.blocks * block_size
 
     // The block a bucket lives in. Every block below `blocks` is allocated the moment the table
     // grows to it, so this is the one place the invariant is spelled out.
-    at(self, i: usize) -> &Block[K, V] = self.dir.block[i / block_size()].expect("a live block")
+    at(self, i: usize) -> &Block[K, V] = self.dir.block[i / block_size].expect("a live block")
 
-    bucket(self, i: usize) -> Option[&Entry[K, V]] = self.at(i).cell[i % block_size()]
+    bucket(self, i: usize) -> Option[&Entry[K, V]] = self.at(i).cell[i % block_size]
 
     set_bucket(*self, i: usize, e: Option[&Entry[K, V]])
-        self.at(i).cell[i % block_size()] = e
+        self.at(i).cell[i % block_size] = e
 
     index(self, k: K) -> usize = usize(k.hash()) & (self.buckets() - 1usize)
 
@@ -204,7 +205,7 @@ struct Map[K: Hash + Eq, V]
     // Growth stops at the ceiling rather than failing. A map that has run out of directory keeps
     // answering every question correctly; the chains simply get longer.
     grow(*self)
-        if self.blocks >= max_blocks() then return
+        if self.blocks >= max_blocks then return
 
         var old = self.dir
         var old_buckets = self.buckets()
@@ -215,7 +216,7 @@ struct Map[K: Hash + Eq, V]
             self.dir.block[b] = Some(empty_block())
 
         for i in 0usize..<old_buckets
-            var at = old.block[i / block_size()].expect("a live block").cell[i % block_size()]
+            var at = old.block[i / block_size].expect("a live block").cell[i % block_size]
 
             loop
                 at match
@@ -271,9 +272,9 @@ struct Cursor[K, V]
                 None ->
                     if self.at >= self.buckets then break None
 
-                    var b = self.dir.block[self.at / block_size()].expect("a live block")
+                    var b = self.dir.block[self.at / block_size].expect("a live block")
 
-                    self.cell = b.cell[self.at % block_size()]
+                    self.cell = b.cell[self.at % block_size]
                     self.at += 1usize
     end next
 end Cursor

@@ -199,6 +199,10 @@ trait StmtAnalysis extends TypeResolution {
       val (_, depth) = resolveLoop("continue", label)
       TContinue(depth)
 
+    // A constant is a declaration that was hoisted and folded into its uses (`13 §7`), so where the
+    // walk meets one among the entry point's statements there is nothing left to run.
+    case _: ConstDecl => TExprStmt(TUnitLit())
+
     case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl =>
       err("functions, structs, enums, traits, impls, and externs may only be declared at the top level")
 

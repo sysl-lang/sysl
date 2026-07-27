@@ -92,6 +92,7 @@ class SyslLexical
     "false",
     "null",
     "var",
+    "const",
     "if",
     "then",
     "elif",

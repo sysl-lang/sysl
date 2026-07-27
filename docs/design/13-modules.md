@@ -441,19 +441,77 @@ scoped to it and initialized in its order, not a member of the module. (A module
 *visible to other files* is a different thing, and it is what §2's "anything visible outside its
 file states its types" is written about.)
 
-**What the absence of that binding costs, so far.** A value two functions share is written as a
-nullary function, which reads well enough (`guide/json`'s `max_depth()`). Two consequences are less
-comfortable, both from `guide/`: an **array bound cannot name one**, because a bound is a
-compile-time constant and a call is not, so a buffer's size is a literal repeated wherever it is
-mentioned and kept in step by a comment (`guide/bytecode`'s `[512]u8` beside its `capacity()`); and
-a **lookup table has nowhere to live**, since rebuilding one per call defeats it, which is why
-`guide/png` computes its CRC a bit at a time instead of through the 256-entry table every other
-implementation of that function uses. Neither is an argument for a mutable module-level `var` — a
-module-level *constant* is what both want.
-
 A program in which no file carries a statement is a complete program that does nothing: the entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,
 which is what it should compile to — a library is not an error.
+
+### Constants
+
+A **`const` is a module member**, and the one kind of module-level binding there is:
+
+```
+const capacity: usize = 512
+const max_slots: usize = 32
+private const window: int = 1 << 15
+```
+
+It is a declaration, not a statement — hoisted, order-free, visible to the whole module and beyond
+it under the ordinary rules — and it is what a top-level `var` is not. The two are told apart by
+the keyword rather than by immutability: a `var` at the top of a file is a local of the entry point
+(above), and a `const` never runs at all.
+
+**Why it exists at all**, when a nullary function already serves every use in an expression. Three
+of the guide programs wanted a name for a number and could only get one that a *type* cannot read.
+An array bound is a compile-time constant and a call is not, so `guide/bytecode` carried `[512]u8`
+next to `capacity() -> usize = 512usize` with a comment asking the reader to keep the two in step,
+and `guide/png` wrote `[320]u8` where it meant `286 + 30`. All four now name what they mean. That
+is the case a function cannot cover, and it is the whole reason for the declaration.
+
+**The type is always written.** Not because it could not be inferred from the initializer — it
+plainly could — but because §2's rule that anything visible outside its file states its types is
+what keeps interface extraction parse-only, and a constant is the first declaration that rule has
+ever had to bind. One rule for every visibility is worth more than the four characters a `private`
+one would save, and writing it is what fixes the literal's type: `const capacity: usize = 512`
+needs no suffix on the 512, by the ordinary rule that a literal takes its type from where it sits
+(`01`).
+
+**A constant expression** is a literal; a `const`; a conversion (`u8(x)`); a unary `-`, `!` or `~`;
+or a binary arithmetic, bitwise, shift, or comparison operator applied to constant expressions.
+Integers, floats, `bool` and `char` fold; a `string` constant may be declared but its initializer
+must be a literal, since `+` on strings allocates and a compile-time concatenation would be a
+different operation wearing the same spelling. There are no calls: a function call in a constant
+expression is a request for compile-time evaluation of arbitrary code, which is a language of its
+own and not one this needs.
+
+**Where a constant may stand:** anywhere an expression may, plus the three places a literal was
+previously the only thing accepted — an **array bound** (`[capacity]u8`), an **enum discriminant**
+(`Halt = base`), and a **pattern** (`n match { limit -> … }`). That last one is the one worth
+saying out loud, because it is where other languages have come to grief: a name in a pattern binds
+unless it resolves to something, and Rust's rule that a lowercase `const` in a pattern *binds*
+instead of matching is a documented trap. Here it cannot arise — a pattern name already resolves
+against the enum variants in scope before it is taken as a binding, and a constant joins that same
+resolution rather than adding a second one.
+
+**A constant has no address.** It is folded into each use and occupies no storage, which is why it
+needs no initialization order, why a `no alloc` module may hold one, and why `&capacity` is not a
+thing to write. What that rules out is the *other* half of what the guide programs asked for: a
+**table** — `guide/png`'s 256-entry CRC array — is static storage with a computed initializer, and
+that is a different feature with different questions (const-evaluated or run once at startup, and
+if the latter, in what order across a module graph that deliberately has none). It waits for a
+second customer, and the answer is not "make `const` bigger".
+
+Two things a constant is **not**, so the boundaries stay where the rest of the design put them:
+
+- **Not an enumeration.** A set of related named values is a simple enum, which `09` argues for at
+  length as the type-safe replacement for a pile of `const`s. A constant is one dimension, not a
+  family of them; if a second constant would be the obvious neighbour of the first, the declaration
+  wanted was an `enum`.
+- **Not const generics.** Parameterizing over a length is `10 § Open d` and stays deferred — but it
+  is worth recording that this is its prerequisite, since a value cannot be passed as an argument
+  before it can be named.
+
+A cycle between constants (`const a: int = b`, `const b: int = a`) is reported at the declaration,
+naming the loop, in the same way §6 reports one between modules.
 
 ## 8. What is deliberately absent
 

@@ -303,6 +303,18 @@ object Type {
       value >= -limit && value < limit
     else value >= 0 && value < (BigInt(1) << t.bits)
 
+  /** A value reduced to what an integer type can hold, as a **written** conversion does it: the low
+   * bits are kept and the rest discarded, with the result read back signed where the target is
+   * (`01`). This is the truncation `u8(300)` performs at run time, done at compile time so that a
+   * constant means the same thing as the expression it stands for.
+   */
+  def wrap(value: BigInt, t: Integer): BigInt = {
+    val span = BigInt(1) << t.bits
+    val low  = value.mod(span)
+
+    if t.signed && low >= (span >> 1) then low - span else low
+  }
+
   /** A type the programmer declared and may hang members off: a struct or an enum.
    *
    * Both are *nominal* — identified by the name they were declared under together with the type

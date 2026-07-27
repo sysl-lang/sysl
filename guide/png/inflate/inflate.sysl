@@ -15,6 +15,16 @@
 
 module inflate
 
+// The sizes the format fixes. Every one of them is a number the specification chose, and naming
+// them is what lets an array's bound and the loop that fills it be the same word rather than two
+// literals a reader has to check against each other.
+const max_bits: usize = 15         // the longest a Huffman code may be
+const max_lit: usize = 286         // literal and length codes a block may declare
+const max_dist: usize = 30         // distance codes
+const max_code: usize = 19         // the code-length alphabet the other two arrive under
+const fixed_lit: usize = 288       // the fixed table is declared over two more than are used
+const max_lengths: usize = max_lit + max_dist
+
 // What can be wrong with a stream. Every one of these is a property of bytes somebody else wrote,
 // which is why they are values and not traps.
 enum Fault
@@ -112,7 +122,7 @@ private be32(b: []u8, i: usize) -> u32
 private table(counts: []u16, symbols: []u16, lengths: []u8, n: usize) -> Result[bool, Fault]
     var i = 0usize
 
-    while i < 16usize
+    while i <= max_bits
         counts[i] = 0u16
         i += 1usize
 
@@ -125,18 +135,18 @@ private table(counts: []u16, symbols: []u16, lengths: []u8, n: usize) -> Result[
     var left = 1
     var len = 1
 
-    while len <= 15
+    while len <= int(max_bits)
         left = left << 1 - int(counts[len])
 
         if left < 0 then return Err(BadTable)
 
         len += 1
 
-    var offset: [16]usize
+    var offset: [max_bits + 1]usize
 
     len = 1
 
-    while len < 15
+    while len < int(max_bits)
         offset[len + 1] = offset[len] + usize(counts[len])
         len += 1
 
@@ -199,7 +209,7 @@ private struct Inf
         var index = 0
         var len = 1
 
-        while len <= 15
+        while len <= int(max_bits)
             code |= int(self.bits(1u32)?)
 
             var count = int(counts[len])
@@ -243,27 +253,27 @@ private struct Inf
     // The block every small stream uses: a code table the format itself specifies, so the block
     // carries no table of its own.
     fixed(*self) -> Result[bool, Fault]
-        var lengths: [288]u8
+        var lengths: [fixed_lit]u8
         var i = 0usize
 
-        while i < 288usize
+        while i < fixed_lit
             lengths[i] = if i < 144usize then 8u8 else if i < 256usize then 9u8 else if i < 280usize then 7u8 else 8u8
             i += 1usize
 
-        var lcounts: [16]u16
-        var lsymbols: [288]u16
-        var dcounts: [16]u16
-        var dsymbols: [30]u16
+        var lcounts: [max_bits + 1]u16
+        var lsymbols: [fixed_lit]u16
+        var dcounts: [max_bits + 1]u16
+        var dsymbols: [max_dist]u16
 
-        table(lcounts[..], lsymbols[..], lengths[..], 288usize)?
+        table(lcounts[..], lsymbols[..], lengths[..], fixed_lit)?
 
         i = 0usize
 
-        while i < 30usize
+        while i < max_dist
             lengths[i] = 5u8
             i += 1usize
 
-        table(dcounts[..], dsymbols[..], lengths[..], 30usize)?
+        table(dcounts[..], dsymbols[..], lengths[..], max_dist)?
         self.codes(lcounts[..], lsymbols[..], dcounts[..], dsymbols[..])
     end fixed
 
@@ -275,19 +285,19 @@ private struct Inf
         var ndist = usize(self.bits(5u32)?) + 1usize
         var ncode = usize(self.bits(4u32)?) + 4usize
 
-        if nlen > 286usize || ndist > 30usize then return Err(BadTable)
+        if nlen > max_lit || ndist > max_dist then return Err(BadTable)
 
-        var lengths: [320]u8
+        var lengths: [max_lengths]u8
         var i = 0usize
 
         while i < ncode
             lengths[usize(order[i])] = u8(self.bits(3u32)?)
             i += 1usize
 
-        var ccounts: [16]u16
-        var csymbols: [19]u16
+        var ccounts: [max_bits + 1]u16
+        var csymbols: [max_code]u16
 
-        table(ccounts[..], csymbols[..], lengths[..], 19usize)?
+        table(ccounts[..], csymbols[..], lengths[..], max_code)?
 
         // The lengths of the two real tables, run-length coded: 16 repeats the previous length,
         // 17 and 18 are runs of zeroes of two different sizes.
@@ -323,10 +333,10 @@ private struct Inf
 
                 i += count
 
-        var lcounts: [16]u16
-        var lsymbols: [286]u16
-        var dcounts: [16]u16
-        var dsymbols: [30]u16
+        var lcounts: [max_bits + 1]u16
+        var lsymbols: [max_lit]u16
+        var dcounts: [max_bits + 1]u16
+        var dsymbols: [max_dist]u16
 
         table(lcounts[..], lsymbols[..], lengths[..], nlen)?
         table(dcounts[..], dsymbols[..], lengths[nlen..<nlen + ndist], ndist)?
@@ -351,12 +361,12 @@ private struct Inf
             else
                 sym -= 257
 
-                if sym >= 29 then return Err(BadLength(sym + 257))
+                if sym >= int(max_lit) - 257 then return Err(BadLength(sym + 257))
 
                 var len = usize(lbase[sym]) + usize(self.bits(u32(lextra[sym]))?)
                 var dsym = self.symbol(dcounts, dsymbols)?
 
-                if dsym >= 30 then return Err(BadLength(dsym + 257))
+                if dsym >= int(max_dist) then return Err(BadLength(dsym + 257))
 
                 var dist = usize(dbase[dsym]) + usize(self.bits(u32(dextra[dsym]))?)
 

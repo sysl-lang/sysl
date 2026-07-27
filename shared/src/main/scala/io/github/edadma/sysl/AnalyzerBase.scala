@@ -328,6 +328,11 @@ trait AnalyzerBase {
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
+  /** Declared constants by key (`13 §7`). A constant is folded into each use and has no storage, so
+   * this table is read by the analyzer and never by codegen — there is nothing downstream to emit.
+   */
+  protected val constDecls = mutable.LinkedHashMap.empty[String, ConstDecl]
+
   /** Declared traits by name. A trait is a set of method signatures a type opts into through an
    * explicit `impl`; nothing conforms structurally.
    */

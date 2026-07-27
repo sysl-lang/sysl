@@ -266,6 +266,21 @@ case class ImportDecl(path: List[String], selectors: List[ImportSelector] = Nil,
  * (one containing a `&T`, which always points at a live object) must be initialized.
  */
 case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr]) extends Stmt
+
+/** `const name: type = value` — a **module member**, and the one kind of module-level binding there
+ * is (`13 §7`). It is what a top-level `var` is not: hoisted, order-free, and visible beyond its
+ * file under the ordinary rules, where a `var` at the top of a file is a local of the entry point.
+ *
+ * The type is written rather than inferred because `13 §2`'s "anything visible outside its file
+ * states its types" is what keeps interface extraction parse-only, and this is the first
+ * declaration that rule has ever had to bind. Writing it is also what fixes the initializer's type,
+ * so `const capacity: usize = 512` needs no suffix on the literal.
+ *
+ * It has no address and no storage: every use is folded to the value, which is why it needs no
+ * initialization order and why an array bound may name one.
+ */
+case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = Visibility.Public) extends Stmt
+
 case class ExprStmt(expr: Expr)                                    extends Stmt
 
 /** `['label] while cond body [else elseBody]` as an **expression**. A `break expr` in the body

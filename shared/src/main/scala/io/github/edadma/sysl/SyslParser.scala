@@ -312,7 +312,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
   private lazy val declaration: PackratParser[Stmt] =
-    visibility ~ (structDecl | enumDecl | traitDecl | externDecl | funcDecl) ^^ {
+    visibility ~ (structDecl | enumDecl | traitDecl | externDecl | constDecl | funcDecl) ^^ {
       case Visibility.Public ~ d => d
       case v ~ d                 => restrict(v, d)
     }
@@ -331,6 +331,7 @@ class SyslParser(val source: Source) extends PackratParsers {
     case e: EnumDecl   => e.copy(vis = v).setPos(e.pos)
     case t: TraitDecl  => t.copy(vis = v).setPos(t.pos)
     case e: ExternDecl => e.copy(vis = v).setPos(e.pos)
+    case c: ConstDecl  => c.copy(vis = v).setPos(c.pos)
     case f: FuncDecl   => f.copy(vis = v).setPos(f.pos)
     case other         => other
 
@@ -427,6 +428,16 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val varDecl: PackratParser[Stmt] =
     op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
       case n ~ t ~ e => VarDecl(n, t, e)
+    }
+
+  /** `const name: type = value` (`13 §7`). Both halves are mandatory, which is what tells it apart
+   * from a `var` at a glance as well as to the parser: a constant with no value is not a
+   * declaration of anything, and a type left off would be the one declaration in the language whose
+   * interface could not be read off its syntax.
+   */
+  private lazy val constDecl: PackratParser[Stmt] =
+    op("const") ~> ident ~ (op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
+      case n ~ t ~ v => ConstDecl(n, t, v)
     }
 
   private lazy val exprStmt: PackratParser[Stmt] = expression ^^ (e => ExprStmt(e).setPos(e.pos))

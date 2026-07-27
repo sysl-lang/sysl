@@ -51,6 +51,10 @@ trait PatternAnalysis extends TypeResolution {
       if tl.ty != ty || th.ty != ty then err(s"range pattern must match the ${show(ty)} value")
       TRangePattern(tl, th, inclusive)
 
+    // A name in a pattern binds only where nothing answers to it. A variant is asked for first, then
+    // a constant — which is what keeps `13 §7`'s constant patterns off the trap Rust documents,
+    // where a `const` in a pattern quietly binds instead of matching. There is no second resolution
+    // here to disagree with the first: a constant joins the one a variant already went through.
     case IdentPattern(name) =>
       ty match
         case en: Type.Enum if en.variant(name).exists(_.fields.isEmpty) =>
@@ -58,7 +62,9 @@ trait PatternAnalysis extends TypeResolution {
         case en: Type.Enum if en.variant(name).isDefined =>
           err(s"variant '$name' carries data — match it as '$name(…)'")
         case _ =>
-          TBindPattern(declare(name, ty), ty)
+          constKey(name) match
+            case Some(key) => analyzePattern(LitPattern(constLiteral(key)), ty)
+            case None      => TBindPattern(declare(name, ty), ty)
 
     // A variant is named within the scrutinee's own enum, so a module prefix on the pattern is
     // repeating what the value already settled — it is dropped, and the type is what decides.

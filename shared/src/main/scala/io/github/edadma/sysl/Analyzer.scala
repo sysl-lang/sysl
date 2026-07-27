@@ -71,6 +71,15 @@ class Analyzer private (units: List[Program])
       currentPos = stmt.pos
       inScope(scope)(recover(())(hoistType(stmt)))
 
+    // Every constant is folded now, whether or not anything reads it. Folding is lazy so that one
+    // may be written in terms of another declared below it, and an unused constant would otherwise
+    // never be looked at — leaving a value that does not fit its type, or is not constant at all, as
+    // a mistake nobody is told about. It is the declaration that is wrong, so the declaration is
+    // where it is reported, and each one is its own recovery region.
+    for (key, _) <- constDecls do
+      currentPos = constDecls(key).pos
+      recover(())(constLiteral(key))
+
     // A non-generic type is instantiated eagerly, so it is emitted whether or not it is used;
     // a generic one only exists once something asks for a concrete instantiation.
     for (n, d) <- enumDecls if d.tparams.isEmpty do recover(())(instantiateEnum(n, Nil))
@@ -236,9 +245,11 @@ class Analyzer private (units: List[Program])
   private def entryPoint(files: List[(Program, Scope)]): (Scope, List[Stmt]) = {
     // An `import` is not one: it binds a name for the file that wrote it and runs nothing, so a
     // file may import whatever it likes without becoming the file the program starts in.
+    // Neither is a `const`: it is a declaration, hoisted and folded into its uses, and a module that
+    // names a dimension must not thereby become the file the program starts in.
     def executable(u: Program) = u.body.filter {
       case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-          _: ImportDecl =>
+          _: ImportDecl | _: ConstDecl =>
         false
       case _ => true
     }
@@ -584,7 +595,14 @@ class Analyzer private (units: List[Program])
         case None =>
           variantKey(name) match
             case Some(key) => constructVariant(key, Nil, expected)
-            case None      => err(s"undefined name '${qn(name)}'")
+            case None =>
+              // A constant is folded into its use and analyzed as the literal it stands for, at the
+              // type it was declared with rather than the one the context asked for. That is what
+              // makes it behave like the value it names: `const n: usize = 5` used where an `int`
+              // belongs is the same mismatch a `usize` variable would be, not a silent adaptation.
+              constKey(name) match
+                case Some(key) => analyzeExpr(constLiteral(key), Some(constType(key)))
+                case None      => err(s"undefined name '${qn(name)}'")
 
     case Binary(op @ ("&&" | "||"), l, r) =>
       TLogical(op, analyzeBool(l), analyzeBool(r))

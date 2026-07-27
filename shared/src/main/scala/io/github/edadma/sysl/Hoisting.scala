@@ -57,6 +57,8 @@ trait Hoisting extends TypeResolution {
 
         if variantOwner.contains(vkey) then
           err(s"variant name '${v.name}' is already used by enum '${qn(variantOwner(vkey))}'")
+        else if constDecls.contains(vkey) then
+          err(s"variant name '${v.name}' is already used by a constant")
         variantOwner(vkey) = key
         // A variant is reached unqualified, so it is a name of the module in its own right — and it
         // carries its enum's visibility, since an enum nobody outside may name is not one whose
@@ -82,6 +84,22 @@ trait Hoisting extends TypeResolution {
         // No implementation could supply one either, so the trait is where it is worth saying so.
         if m.tparams.nonEmpty then
           at(m.pos)(err(s"generic methods are not supported yet — '${t.name}.${m.name}'"))
+    // A constant is registered with the types rather than with the functions, because an array
+    // bound and an enum discriminant may both name one and both are resolved between the two passes
+    // (`13 §7`). Its *value* is not evaluated here — a constant may be written in terms of one
+    // declared below it, so folding waits until something asks.
+    case c: ConstDecl =>
+      val key = Modules.qualify(currentModule, c.name)
+
+      // A constant, a function, and an enum variant are all *values* a bare name can reach, so the
+      // three share one namespace and each pass checks the tables filled before it.
+      if constDecls.contains(key) then err(s"constant '${c.name}' is already declared")
+      else if variantOwner.contains(key) then
+        err(s"'${c.name}' is already used by enum '${qn(variantOwner(key))}'")
+      constDecls(key) = c.copy(name = key).setPos(c.pos)
+      declScope(key) = currentScope
+      recordAccess(key, c.vis)
+
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
     // — the duplicate check goes with the resolution, in `hoistImpl`. The module it was written in
     // travels with it, since that is what the trait it names and the type it is for resolve under.
@@ -109,6 +127,7 @@ trait Hoisting extends TypeResolution {
       val key = Modules.qualify(currentModule, f.name)
 
       if funcDecls.contains(key) then err(s"function '${f.name}' is already declared")
+      else if constDecls.contains(key) then err(s"'${f.name}' is already declared as a constant")
       funcDecls(key) = f.copy(name = key).setPos(f.pos)
       declScope(key) = currentScope
       recordAccess(key, f.vis)
