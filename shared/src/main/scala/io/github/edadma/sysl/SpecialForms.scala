@@ -150,8 +150,8 @@ trait SpecialForms extends CallAnalysis {
             val fix = unmetBound("Display", ty).getOrElse(ty match
               case n: Type.Named if n.targs.nonEmpty =>
                 val tps = nominalTparams(n.base).mkString(", ")
-                s"write an 'impl[$tps] Display for ${n.base}[$tps]' to say how it renders"
-              case n: Type.Named                 => s"write an 'impl Display for ${n.name}' to say how it renders"
+                s"write an 'impl[$tps] Display for ${qn(n.base)}[$tps]' to say how it renders"
+              case n: Type.Named                 => s"write an 'impl Display for ${show(n)}' to say how it renders"
               case _: Type.Array | _: Type.Slice => s"write an 'impl Display for ${show(ty)}' to say how it renders"
               case _                             => "it does not implement 'Display'")
             val asked = if op == "print" then "cannot print" else "cannot make a string of"

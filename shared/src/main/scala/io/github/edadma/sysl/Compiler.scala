@@ -1,6 +1,6 @@
 package io.github.edadma.sysl
 
-/** The pure front-to-IR pipeline: a module's source to an LLVM IR module, or the first error.
+/** The pure front-to-IR pipeline: a program's source to an LLVM IR module, or the first error.
  *
  * Everything here is platform-independent and cross-compiles to JVM, JS, and Native — the
  * parts that touch the filesystem and invoke a toolchain live in the JVM CLI.
@@ -14,8 +14,10 @@ object Compiler {
   def compileToLlvm(source: String, name: String = "<input>"): Either[String, String] =
     compile(List(Source(name, source)))
 
-  /** Compiles the files of one module. They are analyzed together and share one scope, so the order
-   * they are handed over in decides nothing but which file a diagnostic is reported against first.
+  /** Compiles the files of one program, however many modules they make up. Each file says which
+   * module it contributes to, the files of one module share a single scope (`13 §1`), and a module
+   * reaches another's members by naming them in full (`13 §3`) — so the order the files are handed
+   * over in decides nothing but which one a diagnostic is reported against first.
    */
   def compile(sources: List[Source]): Either[String, String] = {
     val parsed = sources.map(SyslParser.parse)

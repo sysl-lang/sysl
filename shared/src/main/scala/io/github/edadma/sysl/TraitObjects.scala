@@ -67,7 +67,7 @@ trait TraitObjects extends TypeResolution {
       // reason it does not conform is a condition rather than an absence.
       val why = unmetBound(tr.bound, inner).fold("")(reason => s" — $reason")
 
-      at(t.pos)(err(s"a ${show(want)} needs a type that implements '${tr.bound.key}', and " +
+      at(t.pos)(err(s"a ${show(want)} needs a type that implements '${tr.bound.show}', and " +
         s"${show(inner)} does not$why"))
     else TErase(t, vtableFor(tr, inner, boxed), want).setPos(t.pos)
 

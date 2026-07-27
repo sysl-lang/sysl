@@ -300,6 +300,15 @@ class SyslParser(val source: Source) extends PackratParsers {
   /** A dotted name — a module path. */
   private lazy val dottedName: Parser[List[String]] = rep1sep(ident, op("."))
 
+  /** A name that may be reached through the module it belongs to: `File`, `std.fs.File`.
+   *
+   * A public member is always reachable fully-qualified, with no import (`13 §3`), so every
+   * position that names a declaration takes this rather than a bare identifier. The dots are kept
+   * in the name as written — which module the prefix is and which part of it is the declaration's
+   * own name is a question only the analyzer, holding the program's module names, can answer.
+   */
+  private lazy val qualifiedName: Parser[String] = dottedName ^^ (_.mkString("."))
+
   /** `module a.b.c`, the header naming the module this file contributes to. It is not a statement:
    * it may appear once, and only before everything else, so it is a prefix of the program rather
    * than an alternative within it.
@@ -318,7 +327,7 @@ class SyslParser(val source: Source) extends PackratParsers {
         op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
         op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
         (op("[") ~> opt(expression) <~ op("]")) ~ typeRef ^^ { case n ~ t => ArrayType(n, t) } |
-        ident ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
+        qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
     )
 
   /** The `[int, string]` argument list of an applied generic name, whether the name is a type's or
@@ -352,7 +361,7 @@ class SyslParser(val source: Source) extends PackratParsers {
     ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ^^ { case n ~ bs => (n, bs.getOrElse(Nil)) }
 
   private lazy val boundRef: Parser[BoundRef] =
-    at(ident ~ opt(typeArgs) ^^ { case n ~ args => BoundRef(n, args.getOrElse(Nil)) })
+    at(qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => BoundRef(n, args.getOrElse(Nil)) })
 
   private lazy val varDecl: PackratParser[Stmt] =
     op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
@@ -571,7 +580,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * implementation, and the opt-in it states is the point of writing it.
    */
   private lazy val implDecl: PackratParser[Stmt] =
-    op("impl") ~> opt(boundedTypeParams) ~ ident ~ opt(typeArgs) ~ (op("for") ~> typeRef) >> {
+    op("impl") ~> opt(boundedTypeParams) ~ qualifiedName ~ opt(typeArgs) ~ (op("for") ~> typeRef) >> {
       case tps ~ tname ~ targs ~ forType =>
         val (names, bounds) = tps.getOrElse((Nil, Map.empty))
 
@@ -700,13 +709,13 @@ class SyslParser(val source: Source) extends PackratParsers {
       patternLit ^^ LitPattern.apply
 
   private lazy val variantPattern: Parser[Pattern] =
-    ident ~ (op("(") ~> repsep(pattern, op(",")) <~ op(")")) ^^ { case n ~ ps => VariantPattern(n, ps) }
+    qualifiedName ~ (op("(") ~> repsep(pattern, op(",")) <~ op(")")) ^^ { case n ~ ps => VariantPattern(n, ps) }
 
   /** `S{field: sub, other}` — a named struct pattern. A bare `field` is shorthand for
    * `field: field`, binding the field to a variable of the same name.
    */
   private lazy val structPattern: Parser[Pattern] =
-    ident ~ (op("{") ~> repsep(fieldPattern, op(",")) <~ op("}")) ^^ { case n ~ fs => StructPattern(n, fs) }
+    qualifiedName ~ (op("{") ~> repsep(fieldPattern, op(",")) <~ op("}")) ^^ { case n ~ fs => StructPattern(n, fs) }
 
   private lazy val fieldPattern: Parser[(String, Pattern)] =
     ident ~ opt(op(":") ~> pattern) ^^ { case n ~ p => (n, p.getOrElse(IdentPattern(n))) }

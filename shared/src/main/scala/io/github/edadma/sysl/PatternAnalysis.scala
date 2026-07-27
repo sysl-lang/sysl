@@ -60,7 +60,11 @@ trait PatternAnalysis extends TypeResolution {
         case _ =>
           TBindPattern(declare(name, ty), ty)
 
-    case VariantPattern(name, args) =>
+    // A variant is named within the scrutinee's own enum, so a module prefix on the pattern is
+    // repeating what the value already settled — it is dropped, and the type is what decides.
+    case VariantPattern(written, args) =>
+      val name = written.substring(written.lastIndexOf('.') + 1)
+
       ty match
         case en: Type.Enum =>
           en.variant(name) match
@@ -77,9 +81,10 @@ trait PatternAnalysis extends TypeResolution {
         // every field — adding one to the struct then turns each positional match into a checked
         // to-do, the way a new enum variant does.
         case s: Type.Struct =>
-          if name != s.base then err(s"'$name(…)' does not match a ${show(s)} value")
+          if !typeKey(written).contains(s.base) then
+            err(s"'$written(…)' does not match a ${show(s)} value")
           if args.length != s.fields.length then
-            err(s"struct '${s.base}' has ${quantity(s.fields.length, "field")}, " +
+            err(s"struct '${qn(s.base)}' has ${quantity(s.fields.length, "field")}, " +
               s"but ${supplied(args.length, "sub-pattern")}")
           TStructPattern(s, args.zip(s.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
         case other =>
@@ -91,12 +96,12 @@ trait PatternAnalysis extends TypeResolution {
     case StructPattern(name, fieldPats) =>
       ty match
         case s: Type.Struct =>
-          if name != s.base then err(s"'$name{…}' does not match a ${show(s)} value")
+          if !typeKey(name).contains(s.base) then err(s"'$name{…}' does not match a ${show(s)} value")
           fieldPats.map(_._1).groupBy(identity).collectFirst { case (n, xs) if xs.size > 1 => n }.foreach { n =>
             err(s"field '$n' is matched more than once")
           }
           for (fname, _) <- fieldPats do
-            if !s.fields.exists(_._1 == fname) then err(s"struct '${s.base}' has no field '$fname'")
+            if !s.fields.exists(_._1 == fname) then err(s"struct '${qn(s.base)}' has no field '$fname'")
           val byName = fieldPats.toMap
           TStructPattern(
             s,
@@ -157,7 +162,7 @@ trait PatternAnalysis extends TypeResolution {
           .toSet
         if !hasCatchAll && !en.variants.map(_.tag).toSet.subsetOf(covered) then
           val missing = en.variants.filterNot(v => covered(v.tag)).map(_.name)
-          err(s"match on '${en.name}' is not exhaustive; missing ${missing.mkString(", ")} (add an 'else' arm)")
+          err(s"match on '${show(en)}' is not exhaustive; missing ${missing.mkString(", ")} (add an 'else' arm)")
 
       // `bool` is a closed two-value type, so covering both `true` and `false` with unguarded arms
       // is exhaustive on its own — no `else` needed, exactly as for a two-variant enum.

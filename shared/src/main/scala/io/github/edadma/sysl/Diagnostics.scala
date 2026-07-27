@@ -11,8 +11,14 @@ package io.github.edadma.sysl
 /** A named source text: the unit a `Pos` points into. Sources are compared by identity, so the
  * prelude and the user's file stay distinct even though a program is made of both, and a
  * diagnostic against a prelude declaration quotes the prelude rather than the wrong file.
+ *
+ * `dir` is where the file sits, as the directory segments between the project root and it — so a
+ * file at `std/fs/read.sysl` carries `["std", "fs"]` and one at the root carries `Nil`. A module
+ * is a directory (`13 §1`), which makes this the module the file's header has to agree with, and
+ * it is the driver that knows it: `None` says the file was handed over with no project around it,
+ * and the header is then the whole of what says which module the file is in.
  */
-final class Source(val name: String, val text: String) {
+final class Source(val name: String, val text: String, val dir: Option[List[String]] = None) {
 
   /** The text split into lines, kept for the one line a diagnostic quotes. Splitting with a
    * negative limit keeps a trailing empty line, so line numbers stay 1:1 with the file.
@@ -30,6 +36,9 @@ final class Source(val name: String, val text: String) {
 
 object Source {
   def apply(name: String, text: String): Source = new Source(name, text)
+
+  /** A file the driver read out of a project, carrying the directory it was found in. */
+  def apply(name: String, text: String, dir: List[String]): Source = new Source(name, text, Some(dir))
 }
 
 /** A place in a source file: 1-based line and column, as the lexer counts them. */

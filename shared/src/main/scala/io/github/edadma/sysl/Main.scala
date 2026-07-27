@@ -9,9 +9,10 @@ import scopt.OParser
  * and process access go through `cross_platform`, so the same driver ships as a native binary
  * and as a Node CLI (the JVM build is for a fast development loop).
  *
- * Each subcommand takes a **path**, which is a directory or a single file: a module is a directory
- * (`13 §1`), so naming one compiles the `.sysl` files it holds as the one module they make up, and
- * naming a file compiles that file alone.
+ * Each subcommand takes a **path**, which is a **project root** or a single file. A module is a
+ * directory and its name is that directory's path relative to the root (`13 §1`), so naming a
+ * directory compiles the whole tree under it — one module per directory, each holding its files to
+ * the name its location gives it — and naming a file compiles that file alone.
  *
  * Subcommands:
  *   - `sysl run <path>`        compile and execute
@@ -96,14 +97,34 @@ private def execute(cfg: Config): Int = {
 
 /** The source files one invocation compiles.
  *
- * A module is a directory (`13 §1`), so pointing the driver at one compiles the `.sysl` files it
- * holds as the one module they make up. Sub-directories are *other* modules and are left alone.
- * Naming a single file is the same thing with one contribution.
+ * A module is a directory and its name is that directory's path **relative to the project root**
+ * (`13 §1`), so pointing the driver at a directory makes it the root and compiles the whole tree
+ * beneath it: the files directly in it are the anonymous root module, and each sub-directory is a
+ * module named by the path down to it. Each file carries the segments it was found under, which is
+ * what the compiler holds its `module` header to.
+ *
+ * Naming a single file compiles that file alone, as the root module with nothing else in it.
  */
 private def collect(path: String): List[Source] =
-  if isDirectory(path) then
-    listFiles(path).filter(f => isFile(f) && f.endsWith(".sysl")).toList.map(f => Source(f, readFile(f)))
-  else List(Source(path, readFile(path)))
+  if isDirectory(path) then walk(path, Nil)
+  else List(Source(path, readFile(path), Nil))
+
+/** One directory of the project: its own `.sysl` files, then the sub-directories under it. A
+ * directory holding no source is not a module and contributes nothing; it is still walked, since
+ * modules further down are reached through it.
+ */
+private def walk(path: String, dir: List[String]): List[Source] = {
+  val entries = listFiles(path).toList.sorted
+  val here    = entries.filter(f => isFile(f) && f.endsWith(".sysl")).map(f => Source(f, readFile(f), dir))
+
+  here ::: entries.filter(isDirectory).flatMap(sub => walk(sub, dir :+ basename(sub)))
+}
+
+private def basename(path: String): String = {
+  val slash = math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+
+  if slash >= 0 then path.substring(slash + 1) else path
+}
 
 private def defaultOutputName(file: String): String = {
   val slash = math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))

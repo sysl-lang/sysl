@@ -42,10 +42,14 @@ class Analyzer private (units: List[Program])
   // --- program -------------------------------------------------------------------------
 
   private def analyze(): TProgram = {
-    checkOneModule()
+    checkLocations()
 
-    val written = units.flatMap(_.body)
-    val body    = Prelude.decls ::: written
+    // Every declaration is read in the module its file contributes to, so each one is carried
+    // alongside that module rather than flattened into one list — the module is what a name in its
+    // signature, its fields, and its body is resolved against (`13 §3`).
+    val body = Prelude.decls.map((Modules.root, _)) ::: units.flatMap(u => u.body.map((moduleOf(u), _)))
+
+    moduleNames ++= units.map(moduleOf)
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -53,25 +57,28 @@ class Analyzer private (units: List[Program])
     //
     // Hoisting runs at the top level, where there is no enclosing position to return to, so each
     // pass simply moves the cursor to the declaration it is registering.
-    for stmt <- body do
+    for (module, stmt) <- body do
       currentPos = stmt.pos
-      recover(())(hoistType(stmt))
+      inModule(module)(recover(())(hoistType(stmt)))
 
     // A non-generic type is instantiated eagerly, so it is emitted whether or not it is used;
     // a generic one only exists once something asks for a concrete instantiation.
     for (n, d) <- enumDecls if d.tparams.isEmpty do recover(())(instantiateEnum(n, Nil))
     for (n, d) <- structDecls if d.tparams.isEmpty do recover(())(instantiateStruct(n, Nil))
 
-    for stmt <- body do
+    for (module, stmt) <- body do
       currentPos = stmt.pos
-      recover(())(hoistFunc(stmt))
+      inModule(module)(recover(())(hoistFunc(stmt)))
 
     // A type's members lower to ordinary functions under mangled names, registered here so a
     // method call and an associated-function call resolve exactly as a free call does.
     val members = mutable.ListBuffer.empty[FuncDecl]
-    for (tname, sdecl) <- structDecls do at(sdecl.pos)(recover(())(hoistMembers(tname, sdecl.members, members)))
-    for (tname, edecl) <- enumDecls do at(edecl.pos)(recover(())(hoistMembers(tname, edecl.members, members)))
-    for impl <- implDecls do at(impl.pos)(recover(())(hoistImpl(impl, members)))
+    for (tname, sdecl) <- structDecls do
+      at(sdecl.pos)(inModule(Modules.moduleOf(tname))(recover(())(hoistMembers(tname, sdecl.members, members))))
+    for (tname, edecl) <- enumDecls do
+      at(edecl.pos)(inModule(Modules.moduleOf(tname))(recover(())(hoistMembers(tname, edecl.members, members))))
+    for (module, impl) <- implDecls.toList do
+      at(impl.pos)(inModule(module)(recover(())(hoistImpl(impl, members))))
 
     // Whether a type argument implements what the type asked of it is answerable only now: the
     // signatures resolved above were read before the `impl` blocks below them were registered, so
@@ -85,7 +92,7 @@ class Analyzer private (units: List[Program])
     // Every generic body is checked once here, against its bounds alone, before any instantiation
     // is looked at. That is what makes `sum[T](a: T, b: T) = a.plus(b)` fail on its own line
     // instead of at whichever call site first supplied a type without a `plus`.
-    checkAbstractBodies(body)
+    checkAbstractBodies()
 
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 
@@ -94,8 +101,13 @@ class Analyzer private (units: List[Program])
     //
     // The prelude's own functions are held back: they are analyzed below, and only if something
     // reaches them. That keeps a program that never prints from carrying the printing surface.
-    val (fromPrelude, ours) =
-      body.collect { case f: FuncDecl if f.tparams.isEmpty => f }.partition(Prelude.declares)
+    //
+    // The hoisted declarations are what is walked, rather than the source statements, because
+    // hoisting is where each one was renamed to the key its module gives it — an `extern` is left
+    // out by the table that says which names have no body rather than by its declaration form.
+    val (fromPrelude, ours) = funcDecls.values.toList
+      .filter(f => f.tparams.isEmpty && !externDecls.contains(f.name))
+      .partition(Prelude.declares)
 
     for f <- ours do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
@@ -103,11 +115,12 @@ class Analyzer private (units: List[Program])
     for f <- members if !defaultOrigin.get(f.name).exists(brokenDefaults) do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
-    val mainStmts = entryPoint()
+    val (mainModule, mainStmts) = entryPoint()
 
     resetFunction()
     tsubst = Map.empty
     retTy = Type.Int
+    currentModule = mainModule
     val tmain = mainStmts.map(recoverStmt)
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An
@@ -156,51 +169,97 @@ class Analyzer private (units: List[Program])
 
   // --- the files of a module -----------------------------------------------------------
 
-  /** A module is a directory and its name is that directory's path (`13 §1`), so every file handed
-   * to one compilation contributes to the same module and every one of them must say so the same
-   * way. A file with no header is in the anonymous root module, which is a name like any other here
-   * — so a headerless file among headed ones disagrees, and is told so.
-   *
-   * The first file's header is taken as the module's, and each later one is compared against it, so
-   * a directory where one file was missed reports once per stray file rather than once per pair.
+  /** The module a file contributes to: what its header says, or the **anonymous root module** when
+   * it declares none (`13 §1`).
    */
-  private def checkOneModule(): Unit =
-    units match
-      case Nil => ()
-      case first :: rest =>
-        val name = first.module.map(_.show)
+  private def moduleOf(u: Program): String = u.module.map(_.show).getOrElse(Modules.root)
 
-        for u <- rest if u.module.map(_.show) != name do
-          val theirs = u.module.map(m => s"'${m.show}'").getOrElse("no module at all")
-          val ours   = name.map(n => s"'$n'").getOrElse("no module at all")
-
-          recover(())(at(u.module.flatMap(_.pos).orElse(u.body.headOption.flatMap(_.pos))) {
-            err(s"${u.source.name} declares $theirs, but ${first.source.name} declares $ours")
-          })
-
-  /** The statements that become the program's entry point.
+  /** A module is a directory, and its name is that directory's path relative to the project root
+   * (`13 §1`), so a file's header has to agree with where the file sits.
    *
-   * A declaration is hoisted and belongs to the module as a whole, but an executable statement runs
-   * in an order, and files have none: the module's members are one unordered set (`13 §6`), so
-   * nothing says which file's statements would come first. **One file carries them**, and a second
-   * that does is a mistake rather than an ordering to be guessed at.
+   * The location is the driver's to know, and it hands it over on the `Source`. A file handed to
+   * the compiler with no project around it carries none, and its header is then the whole of what
+   * says which module it is in — which is how a single file, and the tests that compile a handful
+   * of them directly, go on working with no project to be measured against.
+   *
+   * Checking the header against the *location* subsumes checking the files of a directory against
+   * each other: they are each held to the same derived name, so a file that was edited without its
+   * siblings is reported on its own line rather than as a disagreement with whichever sibling
+   * happened to be read first.
    */
-  private def entryPoint(): List[Stmt] = {
+  private def checkLocations(): Unit =
+    for u <- units; dir <- u.source.dir do
+      val expected = dir.mkString(".")
+      val declared = moduleOf(u)
+
+      if declared != expected then
+        val theirs = if declared.isEmpty then "declares no module" else s"declares '$declared'"
+        val here   = if expected.isEmpty then "sits at the project root" else s"sits in '$expected'"
+
+        recover(())(at(u.module.flatMap(_.pos).orElse(u.body.headOption.flatMap(_.pos))) {
+          err(s"${u.source.name} $theirs, but it $here — a module is a directory, so the two must agree")
+        })
+
+  /** The statements that become the program's entry point, and the module they are read in.
+   *
+   * A declaration is hoisted and belongs to the module it was written in, but an executable
+   * statement runs, and running happens in an order. Files have none — a module's members are one
+   * unordered set (`13 §6`) — and neither do modules, which are a graph rather than a sequence. So
+   * **one file of the program carries the statements it runs**, and a second that carries any is a
+   * mistake rather than an ordering to be guessed at.
+   */
+  private def entryPoint(): (String, List[Stmt]) = {
     def executable(u: Program) = u.body.filter {
       case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl => false
       case _                                                                                      => true
     }
 
     units.map(u => u -> executable(u)).filter(_._2.nonEmpty) match
-      case Nil                => Nil
-      case (_, stmts) :: Nil  => stmts
+      case Nil               => (Modules.root, Nil)
+      case (u, stmts) :: Nil => (moduleOf(u), stmts)
       case (first, stmts) :: others =>
         for (u, rest) <- others do
           recover(())(at(rest.head.pos) {
-            err(s"${first.source.name} already carries the statements this module runs, so ${u.source.name} may hold declarations only")
+            err(s"${first.source.name} already carries the statements this program runs, so " +
+              s"${u.source.name} may hold declarations only")
           })
-        stmts
+        (moduleOf(first), stmts)
   }
+
+  // --- names reached through a module ---------------------------------------------------
+
+  /** A reference written as a chain of plain names: `std.fs.read` is `["std", "fs", "read"]`.
+   * `None` for anything else, since a chain interrupted by a call or a subscript is a value being
+   * read from rather than a path being named.
+   */
+  private def chain(e: Expr): Option[List[String]] = e match
+    case Ident(n)    => Some(List(n))
+    case Field(r, f) => chain(r).map(_ :+ f)
+    case _           => None
+
+  /** A reference reaching into a module, rewritten with the module folded into the name it
+   * qualifies — `std.fs.read` becomes the one name `std.fs`'s `read` is keyed under — or `None`
+   * where the chain names no module.
+   *
+   * That rewrite is the whole of what qualified access needs: what is left is `read(…)`,
+   * `Point(…)`, `Shape.Circle(…)` — the ordinary forms, resolved by the cases that already handle
+   * them, against tables that were keyed this way to begin with.
+   *
+   * Two rules decide it, and both are `13 §3`'s. **A local binding shadows a module name**, so a
+   * chain whose head is bound to a value is a field read and nothing else — which is why this
+   * cannot be a pre-pass over the tree and has to be asked where the scopes are. And the
+   * **longest** module prefix wins, so a module `a.b` is reached as one rather than as `a`'s `b`.
+   */
+  private def throughModule(e: Expr): Option[Expr] =
+    for
+      path <- chain(e) if path.length > 1 && lookupOpt(path.head).isEmpty
+      k    <- (path.length - 1).to(1, -1).find(n => moduleNames(path.take(n).mkString(".")))
+    yield
+      val module = path.take(k).mkString(".")
+      val rest   = path.drop(k)
+
+      rest.tail.foldLeft[Expr](Ident(Modules.qualify(module, rest.head)))((acc, n) => Field(acc, n))
+        .setPos(e.pos)
 
   // --- definition-checked bounds -------------------------------------------------------
 
@@ -226,8 +285,8 @@ class Analyzer private (units: List[Program])
    * parameter is wrong at the declaration, and saying so per instantiation would blame whatever type
    * turned up for something the line never mentioned.
    */
-  private def checkAbstractBodies(body: List[Stmt]): Unit = {
-    val generics = body.collect { case f: FuncDecl if f.tparams.nonEmpty => f }
+  private def checkAbstractBodies(): Unit = {
+    val generics = funcDecls.values.toList.filter(_.tparams.nonEmpty)
     val members  = abstractMembers.toList
     val defaults = traitDefaults
 
@@ -240,7 +299,7 @@ class Analyzer private (units: List[Program])
 
           for f <- generics do
             currentPos = f.pos
-            recover(())(sandboxed(checkAbstractBody(f)))
+            inModule(moduleFor(f.name))(recover(())(sandboxed(checkAbstractBody(f))))
 
           // A member reported here has been reported against the body as written, naming the bound
           // that would license what it does. Every instantiation would fail the same way and say so
@@ -249,7 +308,7 @@ class Analyzer private (units: List[Program])
           for f <- members do
             currentPos = f.pos
             val before = diagnosticCount
-            recover(())(sandboxed(checkAbstractBody(f)))
+            inModule(moduleFor(f.name))(recover(())(sandboxed(checkAbstractBody(f))))
             if diagnosticCount > before then brokenMembers += f.name
 
           // A default that fails here has been reported, at the trait, against the body a
@@ -259,7 +318,7 @@ class Analyzer private (units: List[Program])
           for f <- defaults do
             currentPos = f.pos
             val before = diagnosticCount
-            recover(())(sandboxed(checkAbstractBody(f)))
+            inModule(moduleFor(f.name))(recover(())(sandboxed(checkAbstractBody(f))))
             if diagnosticCount > before then brokenDefaults += f.name
         finally abstractPass = false
       }
@@ -306,7 +365,10 @@ class Analyzer private (units: List[Program])
   // --- function bodies -----------------------------------------------------------------
 
   private def analyzeFuncBody(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc =
-    at(f.pos)(analyzeFuncBodyAt(name, f, subst))
+    // A body means what it meant where it was written: an `impl` in one module for a type in
+    // another lowers members keyed under the type, and a trait's default is copied into every
+    // implementing type, so which module a name in it resolves against travels with the body.
+    inModule(moduleFor(f.name))(at(f.pos)(analyzeFuncBodyAt(name, f, subst)))
 
   private def analyzeFuncBodyAt(name: String, f: FuncDecl, subst: Map[String, Type]): TFunc = {
     val (params, rtype) = funcInsts(name)
@@ -364,12 +426,16 @@ class Analyzer private (units: List[Program])
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String = {
     val name = Type.mangled(f.name, targs)
 
+    // The signature being made real is the declaration's, so it is resolved in the declaration's
+    // module however far from it the call that asked for this instantiation was written.
     if !funcInsts.contains(name) then
-      val subst = withSelf(f.name, f.tparams.zip(targs).toMap)
-      funcInsts(name) =
-        (f.params.map(p => (p.name, resolveType(p.typ, subst))),
-         f.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit))
-      pending.enqueue((name, f, subst))
+      inModule(moduleFor(f.name)) {
+        val subst = withSelf(f.name, f.tparams.zip(targs).toMap)
+        funcInsts(name) =
+          (f.params.map(p => (p.name, resolveType(p.typ, subst))),
+           f.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit))
+        pending.enqueue((name, f, subst))
+      }
 
     name
   }
@@ -476,9 +542,11 @@ class Analyzer private (units: List[Program])
 
     case Ident(name) =>
       lookupOpt(name) match
-        case Some((u, ty))                       => TLoad(u, ty)
-        case None if variantOwner.contains(name) => constructVariant(name, Nil, expected)
-        case None                                => err(s"undefined name '$name'")
+        case Some((u, ty)) => TLoad(u, ty)
+        case None =>
+          variantKey(name) match
+            case Some(key) => constructVariant(key, Nil, expected)
+            case None      => err(s"undefined name '${qn(name)}'")
 
     case Binary(op @ ("&&" | "||"), l, r) =>
       TLogical(op, analyzeBool(l), analyzeBool(r))
@@ -573,37 +641,48 @@ class Analyzer private (units: List[Program])
       if args.length != 1 then err(s"a '$name' conversion takes exactly one value")
       convert(analyzeExpr(args.head), scalarType(name).get)
 
-    case Call(Ident(name), args) if lookupOpt(name).isEmpty && variantOwner.contains(name) =>
-      constructVariant(name, args, expected)
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty && variantKey(name).isDefined =>
+      constructVariant(variantKey(name).get, args, expected)
 
-    case Call(Ident(name), args) if lookupOpt(name).isEmpty && structDecls.contains(name) =>
-      constructStruct(name, args, expected)
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(structDecls.contains) =>
+      constructStruct(typeKey(name).get, args, expected)
 
     // A simple enum's name in call position is a checked cast from an integer — `Color(n)` traps
     // on a value that is not a declared discriminant. Told from a data enum, which has no integer
     // to reinterpret, and from a struct constructor, which line 479 already claimed.
-    case Call(Ident(name), args) if lookupOpt(name).isEmpty && enumDecls.contains(name) =>
-      enumFromInt(name, args)
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(enumDecls.contains) =>
+      enumFromInt(typeKey(name).get, args)
 
-    case Call(Ident(name), args) if funcDecls.contains(name) =>
-      callFunction(funcDecls(name), args, expected)
+    case Call(Ident(name), args) if funcKey(name).isDefined =>
+      callFunction(funcDecls(funcKey(name).get), args, expected)
 
     case Call(Ident(name), _) =>
       err(s"undefined function '$name'")
 
+    // A member reached through the module it belongs to (`13 §3`): the chain is rewritten with the
+    // module folded into the name it qualifies, and what is left is the ordinary form — a call, a
+    // construction, an associated function — resolved exactly as one written unqualified is.
+    case Call(callee, args) if throughModule(callee).isDefined =>
+      analyzeValueAt(Call(throughModule(callee).get, args).setPos(expr.pos), expected)
+
     // Reached through the enum name: `Color.try(n)` is the fallible constructor; otherwise a
     // data-carrying variant `Shape.Circle(5)`, the qualified form of the bare `Circle(5)`, or an
     // associated function the enum declares, which resolves exactly as a struct's does.
-    case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && enumDecls.contains(tname) =>
+    case Call(Field(Ident(written), mname), args)
+        if lookupOpt(written).isEmpty && typeKey(written).exists(enumDecls.contains) =>
+      val tname = typeKey(written).get
+
       if mname == "try" then enumTry(tname, args)
-      else if enumDecls(tname).variants.exists(_.name == mname) then constructVariant(mname, args, expected)
+      else if enumDecls(tname).variants.exists(_.name == mname) then
+        constructVariant(Modules.qualify(Modules.moduleOf(tname), mname), args, expected)
       else if memberDecls.contains((tname, mname)) then callAssociated(tname, mname, args, expected)
-      else err(s"enum '$tname' has no variant or associated function '$mname'")
+      else err(s"enum '${qn(tname)}' has no variant or associated function '$mname'")
 
     // `Type.name(…)` — an associated function, told from the positional constructor `Type(…)` by
     // the member selected from the type name rather than the bare name applied.
-    case Call(Field(Ident(tname), mname), args) if lookupOpt(tname).isEmpty && structDecls.contains(tname) =>
-      callAssociated(tname, mname, args, expected)
+    case Call(Field(Ident(written), mname), args)
+        if lookupOpt(written).isEmpty && typeKey(written).exists(structDecls.contains) =>
+      callAssociated(typeKey(written).get, mname, args, expected)
 
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args, expected)
@@ -611,26 +690,36 @@ class Analyzer private (units: List[Program])
     case Call(_, _) =>
       err("the thing being called must be a name")
 
-    case Field(Ident(n), f) if lookupOpt(n).isEmpty && enumDecls.contains(n) =>
-      if enumDecls(n).variants.exists(_.name == f) then constructVariant(f, Nil, expected)
+    case f: Field if throughModule(f).isDefined =>
+      analyzeValueAt(throughModule(f).get, expected)
+
+    case Field(Ident(written), f) if lookupOpt(written).isEmpty && typeKey(written).exists(enumDecls.contains) =>
+      val n = typeKey(written).get
+
+      if enumDecls(n).variants.exists(_.name == f) then
+        constructVariant(Modules.qualify(Modules.moduleOf(n), f), Nil, expected)
       else
         memberDecls.get((n, f)) match
-          case Some(m) if m.isProperty        => err(s"'$f' is a property of '$n' — read it on a value, as 'value.$f'")
+          case Some(m) if m.isProperty =>
+            err(s"'$f' is a property of '${qn(n)}' — read it on a value, as 'value.$f'")
           case Some(m) if m.receiver.isDefined =>
-            err(s"'$f' is a method of '$n' — call it on a value, as 'value.$f(…)'")
-          case Some(_) => err(s"'$f' is an associated function of '$n' — call it with '$n.$f(…)'")
-          case None    => err(s"enum '$n' has no variant '$f'")
+            err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
+          case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
+          case None    => err(s"enum '${qn(n)}' has no variant '$f'")
 
     // A struct name is not a value, so a member selected from it is one of the three that could
     // have been meant rather than a field read — which is what the name would otherwise be reported
     // as, in an undefined-name message naming the type instead of the member.
-    case Field(Ident(n), f) if lookupOpt(n).isEmpty && structDecls.contains(n) =>
+    case Field(Ident(written), f) if lookupOpt(written).isEmpty && typeKey(written).exists(structDecls.contains) =>
+      val n = typeKey(written).get
+
       memberDecls.get((n, f)) match
-        case Some(m) if m.isProperty => err(s"'$f' is a property of '$n' — read it on a value, as 'value.$f'")
+        case Some(m) if m.isProperty =>
+          err(s"'$f' is a property of '${qn(n)}' — read it on a value, as 'value.$f'")
         case Some(m) if m.receiver.isDefined =>
-          err(s"'$f' is a method of '$n' — call it on a value, as 'value.$f(…)'")
-        case Some(_) => err(s"'$f' is an associated function of '$n' — call it with '$n.$f(…)'")
-        case None    => err(s"type '$n' has no member '$f' — and '$n' is a type, not a value")
+          err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
+        case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
+        case None    => err(s"type '${qn(n)}' has no member '$f' — and '${qn(n)}' is a type, not a value")
 
     case Field(receiver, f) =>
       val tr = autoDeref(analyzeExpr(receiver))

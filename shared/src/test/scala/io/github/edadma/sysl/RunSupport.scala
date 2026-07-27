@@ -19,11 +19,22 @@ trait RunSupport extends Matchers { this: Assertions =>
     }
   }
 
-  /** The same, for a module written as several files. */
-  protected def runOf(fs: (String, String)*): String = {
+  /** The same, for a program written as several files. */
+  protected def runOf(fs: (String, String)*): String =
+    ran(fs.toList.map { case (name, text) => Source(name, text) })
+
+  /** The same, for a project whose files sit in directories — each one written as the dotted path
+   * the driver derives from where the file was found, with `""` for the project root.
+   */
+  protected def runIn(fs: (String, String, String)*): String =
+    ran(fs.toList.map { case (dir, name, text) =>
+      Source(name, text, if dir.isEmpty then Nil else dir.split('.').toList)
+    })
+
+  private def ran(sources: List[Source]): String = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    Toolchain.compileAndRun(fs.toList.map { case (name, text) => Source(name, text) }) match {
+    Toolchain.compileAndRun(sources) match {
       case Right((0, out))    => out
       case Right((code, out)) => fail(s"program exited with $code:\n$out")
       case Left(err)          => fail(err)

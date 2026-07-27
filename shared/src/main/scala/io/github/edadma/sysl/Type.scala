@@ -112,6 +112,9 @@ object Type {
   case class Bound(name: String, args: List[Type]) {
     def key: String = qualified(name, args)
 
+    /** The promise as a diagnostic spells it, with the trait's module read back as a dotted path. */
+    def show: String = qualified(Modules.show(name), args)
+
     override def toString: String = key
   }
 
@@ -261,7 +264,7 @@ object Type {
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem)              => s"[]${show(elem)}"
     case Abstract(n, _)           => n
-    case Trait(n, args)           => qualified(n, args)
+    case Trait(n, args)           => qualified(Modules.show(n), args)
     case other                    => other.llvm
 
   /** Whether a type carries no value at run time: `unit`, whose only value is nothing at all, and
@@ -418,8 +421,12 @@ object Type {
 
   /** How a type is written in a diagnostic: the friendly alias where one exists (`int`,
    * `byte`, `real`), the canonical width spelling otherwise (`i5`, `u12`, `f32`).
+   *
+   * A declared type is named by the key its module gives it (`Modules`), which a reader spells
+   * with a dot rather than the separator that keeps it apart from a member's name — so a
+   * `geom$Point` is shown as the `geom.Point` a program would write.
    */
   def show(t: Type): String = t match
-    case n: Named => n.name
+    case n: Named => qualified(Modules.show(n.base), n.targs)
     case other    => friendly.getOrElse(other, canonicalName(other))
 }

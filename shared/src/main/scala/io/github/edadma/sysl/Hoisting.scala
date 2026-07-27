@@ -17,25 +17,50 @@ import scala.collection.mutable
  */
 trait Hoisting extends TypeResolution {
 
-  /** Registers one type-shaped declaration: a struct, an enum, a trait, or an `impl`. */
+  /** Registers one type-shaped declaration: a struct, an enum, a trait, or an `impl`.
+   *
+   * A declaration belongs to the module its file contributes to, so what every table holds it
+   * under is the **qualified** name (`Modules.qualify`) and the declaration is renamed to it. That
+   * is what makes two modules able to declare a `Point` at all, and it is done once here rather
+   * than at each lookup: everything downstream reads a name that already says which module it is.
+   * Diagnostics keep naming the declaration as it was *written*, since that is the line the reader
+   * is looking at.
+   */
   protected def hoistType(stmt: Stmt): Unit = stmt match
     case s: StructDecl =>
-      if typeNameTaken(s.name) then err(s"type '${s.name}' is already declared")
-      structDecls(s.name) = s
+      val key = Modules.qualify(currentModule, s.name)
+
+      if typeNameTaken(key, s.name) then err(s"type '${s.name}' is already declared")
+      checkNoModuleOfThatName(key, s.name, "member")
+      structDecls(key) = s.copy(name = key).setPos(s.pos)
+      if Prelude.declares(s) then preludeNames += key
     case e: EnumDecl =>
-      if typeNameTaken(e.name) then err(s"type '${e.name}' is already declared")
+      val key = Modules.qualify(currentModule, e.name)
+
+      if typeNameTaken(key, e.name) then err(s"type '${e.name}' is already declared")
+      checkNoModuleOfThatName(key, e.name, "variant")
       // A generic enum has no single storage type to pin, and it is never instantiated
       // eagerly, so the annotation is rejected here at the declaration rather than on use.
       if e.underlying.isDefined && e.tparams.nonEmpty then
         err(s"a generic enum cannot pin an underlying type — '${e.name}' takes type parameters")
-      enumDecls(e.name) = e
+      enumDecls(key) = e.copy(name = key).setPos(e.pos)
+      if Prelude.declares(e) then preludeNames += key
+      // Variant names are unique **within a module** rather than across the program: a bare
+      // `Circle(5)` resolves against the module it is written in, so two modules may each name a
+      // variant `Circle` without either use site becoming ambiguous.
       for v <- e.variants do
-        if variantOwner.contains(v.name) then
-          err(s"variant name '${v.name}' is already used by enum '${variantOwner(v.name)}'")
-        variantOwner(v.name) = e.name
+        val vkey = Modules.qualify(currentModule, v.name)
+
+        if variantOwner.contains(vkey) then
+          err(s"variant name '${v.name}' is already used by enum '${qn(variantOwner(vkey))}'")
+        variantOwner(vkey) = key
+        if Prelude.declares(e) then preludeNames += vkey
     case t: TraitDecl =>
-      if typeNameTaken(t.name) then err(s"the name '${t.name}' is already declared")
-      traitDecls(t.name) = t
+      val key = Modules.qualify(currentModule, t.name)
+
+      if typeNameTaken(key, t.name) then err(s"the name '${t.name}' is already declared")
+      traitDecls(key) = t.copy(name = key).setPos(t.pos)
+      if Prelude.declares(t) then preludeNames += key
       checkBoundNames(t.name, t.bounds)
       for m <- t.methods do
         // A property carries its receiver without writing one, so the reading below — no receiver
@@ -48,8 +73,9 @@ trait Hoisting extends TypeResolution {
         if m.tparams.nonEmpty then
           at(m.pos)(err(s"generic methods are not supported yet — '${t.name}.${m.name}'"))
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
-    // — the duplicate check goes with the resolution, in `hoistImpl`.
-    case i: ImplDecl => implDecls += i
+    // — the duplicate check goes with the resolution, in `hoistImpl`. The module it was written in
+    // travels with it, since that is what the trait it names and the type it is for resolve under.
+    case i: ImplDecl => implDecls += ((currentModule, i))
     case _ =>
 
   /** Registers one function's name and signature.
@@ -70,20 +96,29 @@ trait Hoisting extends TypeResolution {
    */
   protected def hoistFunc(stmt: Stmt): Unit = stmt match
     case f: FuncDecl =>
-      if funcDecls.contains(f.name) then err(s"function '${f.name}' is already declared")
-      funcDecls(f.name) = f
+      val key = Modules.qualify(currentModule, f.name)
+
+      if funcDecls.contains(key) then err(s"function '${f.name}' is already declared")
+      funcDecls(key) = f.copy(name = key).setPos(f.pos)
+      if Prelude.declares(f) then preludeNames += key
       if f.tparams.isEmpty then
-        funcInsts(f.name) =
+        funcInsts(key) =
           (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkBoundNames(f.name, f.bounds)
 
+    // An `extern`'s **symbol** is not qualified, and cannot be: it names something the linker
+    // already has, which knows nothing about sysl's modules. So the key the program calls it by
+    // carries the module like any other name, and the symbol is pinned to what was written.
     case e: ExternDecl =>
-      if funcDecls.contains(e.name) then err(s"function '${e.name}' is already declared")
-      funcDecls(e.name) = FuncDecl(e.name, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
-      externDecls(e.name) = e
-      funcInsts(e.name) =
+      val key = Modules.qualify(currentModule, e.name)
+
+      if funcDecls.contains(key) then err(s"function '${e.name}' is already declared")
+      funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
+      externDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
+      if Prelude.declares(e) then preludeNames += key
+      funcInsts(key) =
         (e.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
          e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       checkSignatureRules(e.name, e.params, e.retType, e.variadic)
@@ -104,7 +139,7 @@ trait Hoisting extends TypeResolution {
    */
   protected def checkBoundNames(name: String, bounds: Map[String, List[BoundRef]]): Unit =
     for (tp, traits) <- bounds; tr <- traits do
-      traitDecls.get(tr.name) match
+      traitKey(tr.name).map(traitDecls) match
         case None       => err(s"the bound on '$tp' in '$name' names '${tr.name}', which is not a trait")
         case Some(decl) => at(tr.pos)(checkTraitArity(tr.name, decl.tparams, tr.args.map(_ => Type.Unknown)))
 
@@ -143,10 +178,31 @@ trait Hoisting extends TypeResolution {
 
   /** Structs, enums, and the built-in scalars share one type namespace, so a name may name at
    * most one of them. `never` is in it too: it names a type, so nothing else may.
+   *
+   * The declared names are asked about by the **key** the module gives them, and the built-in
+   * spellings by the name as **written** — a scalar is not a member of any module, so `Point` in
+   * `geom` and `Point` at the root are two types while `int` is one everywhere.
    */
-  private def typeNameTaken(name: String): Boolean =
-    structDecls.contains(name) || enumDecls.contains(name) || traitDecls.contains(name) ||
-      scalarType(name).isDefined || name == neverName || name == selfName
+  /** Refuses a struct or an enum whose module and name spell a module the program also has.
+   *
+   * `geom.Point.dist` would then name both `geom`'s `Point.dist` and `geom.Point`'s `dist`, and a
+   * dotted reference takes the **longest** prefix that names a module (`13 §3`) — so the module
+   * would win and the type's member would have no spelling left at all. The keys stay distinct
+   * either way (`Modules`); what collides is the path a program writes, which is exactly the thing
+   * a diagnostic can fix and a silent choice cannot.
+   *
+   * Only a struct and an enum are asked, because they are what a dotted chain reaches *into*. A
+   * trait is named in a bound or behind a sigil and never has a member selected off its name, so a
+   * module sharing its name takes nothing away from it.
+   */
+  private def checkNoModuleOfThatName(key: String, written: String, reachable: String): Unit =
+    if moduleNames(Modules.show(key)) then
+      err(s"'${qn(key)}' is also a module, so '${qn(key)}.<$reachable>' would name two things — " +
+        s"rename the module or '$written'")
+
+  private def typeNameTaken(key: String, written: String): Boolean =
+    structDecls.contains(key) || enumDecls.contains(key) || traitDecls.contains(key) ||
+      scalarType(written).isDefined || written == neverName || written == selfName
 
   /** Records a type's members and lowers each to a function declaration under the mangled name
    * `Type.member`, whose signature is registered so calls resolve like ordinary ones.
@@ -180,7 +236,7 @@ trait Hoisting extends TypeResolution {
     val lowered = hoistMemberList(
       MemberHome(
         tname,
-        tname,
+        qn(tname),
         tname,
         None,
         NamedType(tname, tparams.map(NamedType(_, Nil))),
@@ -337,6 +393,11 @@ trait Hoisting extends TypeResolution {
       memberDecls((home.key, m.name)) = m
       val fd = synthesize(home, m)
 
+      // A member is filed under the type it belongs to, which an `impl` in another module may have
+      // named — and an inherited default's body is the trait's source, wherever the trait is. Both
+      // resolve their names where they were written, so that is what is recorded here.
+      bodyModule(fd.name) = defaultOrigin.get(fd.name).map(Modules.moduleOf).getOrElse(currentModule)
+
       lowered += fd
 
       // A signature mentioning a type parameter — the type's own, or the member's — has no meaning
@@ -364,8 +425,13 @@ trait Hoisting extends TypeResolution {
    * hoisted exactly as a type's own members are, so a call on a value resolves through the ordinary
    * member path with no dispatch machinery of its own.
    */
-  protected def hoistImpl(impl: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
-    val tr           = traitDecls.getOrElse(impl.traitName, err(s"unknown trait '${impl.traitName}'"))
+  protected def hoistImpl(block: ImplDecl, out: mutable.ListBuffer[FuncDecl]): Unit = {
+    // The trait is named in the module the block was written in, and everything filed below is
+    // filed under the key that names — so the block carries the resolved name from here on and
+    // nothing downstream has to resolve it a second time.
+    val tr   = traitKey(block.traitName).map(traitDecls).getOrElse(err(s"unknown trait '${block.traitName}'"))
+    val impl = block.copy(traitName = tr.name).setPos(block.pos)
+
     val (ty, target) = implTarget(impl)
     val bound        = implBound(impl, tr)
     val home         = target.copy(outer = tr.tparams.zip(bound.args).toMap)
@@ -374,7 +440,7 @@ trait Hoisting extends TypeResolution {
     // a capability but competing with the one that is already there — and the operator would keep
     // lowering to its native instruction whatever this block said.
     if bound.args.isEmpty && CoreTraits.builtin(impl.traitName, ty) then
-      err(s"'${home.label}' already implements '${impl.traitName}' — the compiler provides it")
+      err(s"'${home.label}' already implements '${qn(impl.traitName)}' — the compiler provides it")
 
     // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
     // are the one implementation they are, and so are `[]int` and `[]i32`. A generic type has one
@@ -385,8 +451,8 @@ trait Hoisting extends TypeResolution {
     // type's, and a type's members are one namespace, so `impl From[int] for C` and
     // `impl From[real] for C` would give a `C` two members called `from` with nothing to say which
     // one `c.from(x)` meant.
-    for written <- implFor.get((impl.traitName, home.key)) do
-      err(s"'${home.label}' already implements '$written'" + secondImplementation(tr))
+    for supplied <- implFor.get((impl.traitName, home.key)) do
+      err(s"'${home.label}' already implements '${qn(supplied)}'" + secondImplementation(tr))
 
     // A shape and a type of that shape written out in full would both implement the trait for that
     // type, and sysl has no rule that picks between two implementations — the more specific one does
@@ -394,12 +460,12 @@ trait Hoisting extends TypeResolution {
     // refused, in whichever order the file put them.
     for h <- home.head do
       if home.shaped then
-        for written <- writtenShapes.get((impl.traitName, h)) do
-          err(s"'$written' already implements '${impl.traitName}', and this 'impl' would implement " +
+        for one <- writtenShapes.get((impl.traitName, h)) do
+          err(s"'$one' already implements '${qn(impl.traitName)}', and this 'impl' would implement " +
             s"it for ${everyShape(h)} — including that one")
       else
         if traitImpls.contains((impl.traitName, h)) then
-          err(s"${everyShape(h)} already implements '${impl.traitName}', so '${home.label}' has an " +
+          err(s"${everyShape(h)} already implements '${qn(impl.traitName)}', so '${home.label}' has an " +
             "implementation and cannot be given a second one")
         writtenShapes((impl.traitName, h)) = home.label
 
@@ -437,7 +503,7 @@ trait Hoisting extends TypeResolution {
   private def secondImplementation(tr: TraitDecl): String =
     if tr.tparams.isEmpty then ""
     else
-      s" — a trait's members become the type's, so a second '${tr.name}' would give '${tr.methods.head.name}' " +
+      s" — a trait's members become the type's, so a second '${qn(tr.name)}' would give '${tr.methods.head.name}' " +
         "two meanings and a call no way to say which"
 
   /** Which promise an `impl` block supplies: the trait, at the arguments this block writes for it.
@@ -449,7 +515,7 @@ trait Hoisting extends TypeResolution {
    * parameter in the key is a key that matches many things.
    */
   private def implBound(impl: ImplDecl, tr: TraitDecl): Type.Bound = {
-    checkTraitArity(impl.traitName, tr.tparams, impl.traitArgs.map(_ => Type.Unknown))
+    checkTraitArity(qn(impl.traitName), tr.tparams, impl.traitArgs.map(_ => Type.Unknown))
 
     // The block's parameters resolve to themselves so that naming one here is caught as the thing it
     // is, rather than reported as an unknown type — which would send the reader looking for a
@@ -458,11 +524,11 @@ trait Hoisting extends TypeResolution {
     val args     = impl.traitArgs.map(resolveType(_, declared))
 
     for a <- args; abs <- mentionedParam(a) do
-      err(s"'${abs.name}' is a type parameter of this 'impl', so it leaves which '${impl.traitName}' " +
+      err(s"'${abs.name}' is a type parameter of this 'impl', so it leaves which '${qn(impl.traitName)}' " +
         "this block implements open — write the type the trait is applied to")
 
     for tp <- impl.tparams if tr.tparams.contains(tp) do
-      err(s"trait '${impl.traitName}' already declares a type parameter '$tp', so this 'impl' " +
+      err(s"trait '${qn(impl.traitName)}' already declares a type parameter '$tp', so this 'impl' " +
         "cannot declare one of that name")
 
     deferredBounds(impl.traitName, tr.tparams, tr.bounds, args)
@@ -524,24 +590,25 @@ trait Hoisting extends TypeResolution {
       // here rather than by resolving a reference whose arguments are the block's own parameters.
       // Its key is the name it was declared under, which stands even where the declaration itself
       // failed to resolve and there is no instantiation to read one off.
-      case NamedType(written, argRefs) if nominal(written).isDefined =>
-        val (tparams, taken, noun) = nominal(written).get
+      case NamedType(written, argRefs) if typeKey(written).exists(k => nominal(k).isDefined) =>
+        val key                    = typeKey(written).get
+        val (tparams, taken, noun) = nominal(key).get
 
         if tparams.isEmpty then
           if impl.tparams.nonEmpty then
             err(s"'$written' takes no type arguments, so an 'impl' for it has nothing to be generic over")
           if argRefs.nonEmpty then err(s"type '$written' does not take type arguments")
 
-          val ty = concrete(written).getOrElse(Type.Unknown)
+          val ty = concrete(key).getOrElse(Type.Unknown)
 
-          (ty, MemberHome(written, written, written, None, ref, Nil, Map.empty, taken, noun, selfBinding(ty)))
+          (ty, MemberHome(key, qn(key), key, None, ref, Nil, Map.empty, taken, noun, selfBinding(ty)))
         else
           val order = implArgs(impl, written, tparams)
 
           // A generic type has no one instantiation to be, and nothing that reaches this needs one:
           // an implementation covers every `Box` at once, and each member is made real per receiver.
           (Type.Unknown,
-           MemberHome(written, written, written, None, ref, order, impl.bounds, taken, noun, Map.empty))
+           MemberHome(key, qn(key), key, None, ref, order, impl.bounds, taken, noun, Map.empty))
 
       case NamedType(n, Nil) if n == selfName =>
         err("'Self' is the type an 'impl' is for, so it cannot also be the type it names")
@@ -709,14 +776,14 @@ trait Hoisting extends TypeResolution {
 
     for tm <- tr.methods do
       impl.methods.find(_.name == tm.name) match
-        case Some(im) => checkSignature(home.label, impl.traitName, tm, im, sig)
+        case Some(im) => checkSignature(home.label, qn(impl.traitName), tm, im, sig, Modules.moduleOf(tr.name))
         case None if tm.body.nonEmpty => inherited += tm
         case None =>
-          err(s"'${home.label}' does not implement '${impl.traitName}': ${kind(tm)} '${tm.name}' is missing")
+          err(s"'${home.label}' does not implement '${qn(impl.traitName)}': ${kind(tm)} '${tm.name}' is missing")
 
     for im <- impl.methods do
       if !declared.contains(im.name) then
-        err(s"trait '${impl.traitName}' declares no ${kind(im)} '${im.name}', so this 'impl' cannot define it")
+        err(s"trait '${qn(impl.traitName)}' declares no ${kind(im)} '${im.name}', so this 'impl' cannot define it")
 
     inherited.toList
   }
@@ -742,6 +809,7 @@ trait Hoisting extends TypeResolution {
       tm: MethodDecl,
       im: MethodDecl,
       self: Map[String, Type],
+      traitModule: String,
   ): Unit = {
     // Which *kind* of member it is comes first, because two of the three kinds have no receiver
     // between them: a property and an associated function both answer `None`, so the receiver
@@ -766,13 +834,16 @@ trait Hoisting extends TypeResolution {
       err(s"method '${im.name}' of 'impl $traitName for $forType' takes ${im.params.length} " +
         s"parameters, but the trait declares ${tm.params.length}")
 
+    // The two signatures were written in two modules — the trait's and the block's — so each side
+    // is resolved where it was written. A `Point` in the trait's `-> Point` is the trait module's
+    // `Point`, whether or not the implementing module has one of its own.
     for (tp, ip) <- tm.params.zip(im.params) do
-      val want = resolveType(tp.typ, self)
+      val want = inModule(traitModule)(resolveType(tp.typ, self))
       val got  = resolveType(ip.typ, self)
       if want != got then
         err(s"parameter '${ip.name}' of method '${im.name}' is ${show(got)}, but trait '$traitName' declares ${show(want)}")
 
-    val want = tm.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
+    val want = inModule(traitModule)(tm.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit))
     val got  = im.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
     if want != got then
       err(s"method '${im.name}' returns ${show(got)}, but trait '$traitName' declares ${show(want)}")

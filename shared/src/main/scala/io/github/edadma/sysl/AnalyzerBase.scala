@@ -31,6 +31,107 @@ case class Poisoned() extends RuntimeException
  */
 trait AnalyzerBase {
 
+  /** Every module the program is made of, by name, including the anonymous root one when a file
+   * declared no header. It is what tells a dotted reference that names a module from one that
+   * reads a field off a value (`13 §3`), and it is known before any name is resolved because a
+   * file's header is the whole of what says which module it is in.
+   */
+  protected val moduleNames = mutable.LinkedHashSet.empty[String]
+
+  /** The module whose terms a name is currently being read in: the module of the declaration
+   * being hoisted, of the body being analyzed, or of the file that carries the statements the
+   * program runs. An unqualified name is looked for here first (`13 §3`).
+   */
+  protected var currentModule: String = Modules.root
+
+  /** The names the prelude declares, which are in scope everywhere with no import (`13 §8`). They
+   * are keyed under the root module like any other rootless declaration, and this is what tells
+   * them from a *program's* root-module declarations — which are a module's like any other, and so
+   * are not visible from a named module that did not name them.
+   */
+  protected val preludeNames = mutable.HashSet.empty[String]
+
+  /** The key a name written in the current module resolves to, or `None` where nothing of that
+   * name is declared anywhere it may be read from.
+   *
+   * `declared` is the table being asked — a type's, a function's, a variant's — because the same
+   * spelling may name a type in one module and a function in another, and which one is in scope is
+   * a question that can only be answered against the table the use site is looking in.
+   *
+   * The order is `13 §3`'s, minus the imports that do not exist yet: **this module**, then the
+   * **prelude**, and a **fully-qualified path** reaches anything at all. A sibling module's names
+   * are deliberately not in it — a module earns visibility by being named (`13 §8`), and the root
+   * module has no name, so its declarations are its own files' to use.
+   */
+  protected def resolveName(written: String)(declared: String => Boolean): Option[String] = {
+    val dot = written.lastIndexOf('.')
+
+    // A name carrying the module separator is one the compiler built rather than one a file wrote
+    // — a synthesized `Self` reference, a default's bound on its own trait — and is already the key
+    // it names. Nothing in source can be spelled this way, so passing it through is unambiguous.
+    if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written)
+    else if dot < 0 then
+      val own = Modules.qualify(currentModule, written)
+
+      if declared(own) then Some(own)
+      else Option.when(preludeNames(written) && declared(written))(written)
+    else
+      val module = written.take(dot)
+      val name   = Modules.qualify(module, written.drop(dot + 1))
+
+      Option.when(moduleNames(module) && declared(name))(name)
+  }
+
+  /** The key a written **type** name resolves to: a struct's or an enum's. */
+  protected def typeKey(written: String): Option[String] =
+    resolveName(written)(n => structDecls.contains(n) || enumDecls.contains(n))
+
+  /** The key a written **trait** name resolves to. */
+  protected def traitKey(written: String): Option[String] = resolveName(written)(traitDecls.contains)
+
+  /** The key a written **function** name resolves to. */
+  protected def funcKey(written: String): Option[String] = resolveName(written)(funcDecls.contains)
+
+  /** The key a written **enum variant** name resolves to. A variant is reachable unqualified — a
+   * bare `Circle(5)` — so it is a name of the module its enum was declared in, which is why two
+   * modules may each have a `Circle` where one program could not have two.
+   */
+  protected def variantKey(written: String): Option[String] = resolveName(written)(variantOwner.contains)
+
+  /** Where a lowered function's **body** was written, for the two cases in which that is not the
+   * module its name is keyed under.
+   *
+   * A member is filed under the type it belongs to, and an `impl` in one module may be written for
+   * a type in another; a trait's default is copied into every implementing type, wherever those
+   * are. Both bodies mean what they meant where they were written, so the module they resolve
+   * their names in travels with them rather than being read back off the key.
+   */
+  protected val bodyModule = mutable.HashMap.empty[String, String]
+
+  /** The module a declaration's signature and body are read in. */
+  protected def moduleFor(name: String): String = bodyModule.getOrElse(name, Modules.moduleOf(name))
+
+  /** Runs `body` reading names in `module`, restoring the enclosing one after.
+   *
+   * Everything that belongs to a declaration — its signature, its fields, its body — resolves in
+   * the module it was **written** in, whatever module the walk arrived from. A call in one module
+   * to a generic function in another instantiates that function's signature, and a `Point` in it
+   * is the declaring module's `Point`.
+   */
+  protected def inModule[T](module: String)(body: => T): T = {
+    val saved = currentModule
+
+    currentModule = module
+    try body
+    finally currentModule = saved
+  }
+
+  /** A key as a diagnostic spells it — the module separator read back as a dot (`Modules.show`).
+   * Every message that names a declaration by the key a table holds it under goes through here, so
+   * that a reader is shown the path they would write rather than the compiler's spelling of it.
+   */
+  protected def qn(key: String): String = Modules.show(key)
+
   protected val structDecls = mutable.LinkedHashMap.empty[String, StructDecl]
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
@@ -44,7 +145,7 @@ trait AnalyzerBase {
    * names may be declared further down the file; `hoistImpl` resolves each one after every type is
    * registered, and that is where `traitImpls` gets filled.
    */
-  protected val implDecls = mutable.ListBuffer.empty[ImplDecl]
+  protected val implDecls = mutable.ListBuffer.empty[(String, ImplDecl)]
 
   /** Every `impl Trait for Type`, keyed by (trait name, the implementing type's **owner key**). The
    * key catches a duplicate implementation, and it is what a trait bound consults to decide whether
@@ -453,7 +554,7 @@ trait AnalyzerBase {
               // bounds promise: a bound is satisfied by a bound.
               case a: Type.Abstract =>
                 if !a.bounds.exists(_.key == tr.key) then
-                  boundErr(s"'$what' requires its type parameter '$tp' to implement '${tr.key}', " +
+                  boundErr(s"'$what' requires its type parameter '$tp' to implement '${tr.show}', " +
                     s"but '${a.name}' is not bounded by it")
               case concrete =>
                 if !satisfies(tr, concrete) then
@@ -462,7 +563,7 @@ trait AnalyzerBase {
                   // block that is already written.
                   val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
 
-                  err(s"'$what' requires its type parameter '$tp' to implement '${tr.key}', " +
+                  err(s"'$what' requires its type parameter '$tp' to implement '${tr.show}', " +
                     s"but ${show(concrete)} does not$why")
           case None =>
 
@@ -649,7 +750,7 @@ trait AnalyzerBase {
           .flatMap((tp, a) =>
             bounds.getOrElse(tp, Nil).map(resolveBound(_, subst)).filterNot(satisfies(_, a)).map((a, _)))
           .headOption
-      yield s"the 'impl' that covers it asks '${unmet.key}' of ${show(arg)}, which does not implement it"
+      yield s"the 'impl' that covers it asks '${unmet.show}' of ${show(arg)}, which does not implement it"
 
     wrongArgs.headOption.orElse(unmetCondition)
 

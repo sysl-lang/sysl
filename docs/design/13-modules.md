@@ -1,18 +1,18 @@
 # Design Decisions: Modules
 
-**Status:** §1's module header, §6's shared module scope, and §7's entry-point rule are **built** —
-a directory of files compiles as the one module they declare, its declarations are visible across
-all of them with no ordering and no forward declaration, and disagreeing about which module they
-are or which of them runs is an error. `import` (§3), the visibility modifiers (§2), the cycle
-check over the module *graph* (§6), and the capability clause (§4) are **not yet implemented**;
-each waits on a program being able to hold more than one module, which is what a driver that walks
-a project rather than a directory would give it, and that in turn waits on open item (a). Two
-written docs already lean on modules: `capabilities.md` attaches capability narrowing (`no alloc`,
-`requires`) and its transitive propagation to *modules*, and `cross-platform.md` fixes that
-"module names follow the directory tree relative to the project root." This chapter defines what
-a module **is** so those have something to name, and consolidates the module-side of the
-capability machinery `capabilities.md` specifies. Where it commits a spelling it says so; the
-*open* list records what waits for the project-config doc.
+**Status:** §1, §3's **fully-qualified path**, §6's shared module scope, and §7's entry-point rule
+are **built** — a project is a tree of directories, each one a module named by its path from the
+root and holding its files to that name, their declarations visible across all of them with no
+ordering and no forward declaration, and a member of one module reached from another by naming it
+in full. The **`import` statement** (§3), the visibility modifiers (§2), the cycle check over the
+module *graph* (§6), and the capability clause (§4) are **not yet implemented**. `import` is
+purely a shortening of what already works and waits on nothing; the other three wait on open item
+(a), the project-config doc. Two written docs already lean on modules: `capabilities.md` attaches
+capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
+`cross-platform.md` fixes that "module names follow the directory tree relative to the project
+root." This chapter defines what a module **is** so those have something to name, and consolidates
+the module-side of the capability machinery `capabilities.md` specifies. Where it commits a
+spelling it says so; the *open* list records what waits for the project-config doc.
 
 This chapter rests on `capabilities.md` (capabilities are a per-module property that propagates
 through imports — this chapter is the module half of that contract), `cross-platform.md` (the
@@ -61,14 +61,29 @@ than a loosened validation.
 The **files of one module must all name it the same way**, which is the same rule §4 states for the
 capability clause and for the same reason: the module is the directory, so its name is a property
 of the directory rather than of any file in it, and a file that disagrees is either misplaced or
-was edited without its siblings. This part is checked today. Agreement with the *location* is not,
-because the project root a path would be measured against is what open item (a) settles; until it
-does, the header is the whole of a module's identity.
+was edited without its siblings. Holding each file to the name its **location** gives it is what
+enforces that, and it is the stronger rule: two files of one directory are each held to the same
+derived name, so the one that strayed is reported on its own line rather than as a disagreement
+with whichever sibling happened to be read first. The location is the *driver's* to know — it is
+what walks the tree — so a file handed to the compiler with no project around it carries none, and
+its header is then the whole of what says which module it is in.
 
 A file with **no header at all** is in the **anonymous root module**, whose name is the empty path.
 This is what lets a program be one file with no ceremony — the one-file case is not a special form,
 it is a module that happens to be unnamed — and it is also why a file with nothing in it is a file
-that has not said which module it is, and is told so among files that have.
+that has not said which module it is, and is told so wherever it sits below the root.
+
+The root module's name being empty has one consequence worth stating outright: **nothing can name
+it**, so its declarations are visible to its own files and to nothing else. That is the right way
+round for the place a program starts — the root reaches down into the modules it is built out of,
+and they do not reach back up into it — and it is also what keeps a single-file program's names
+exactly where they were before modules existed.
+
+**A module and a type of its parent may not spell one path.** A dotted reference takes the longest
+prefix that names a module (§3), so a module `geom.Point` alongside a type `Point` in `geom` would
+take `geom.Point.dist` outright and leave the type's member no spelling at all. The two stay
+distinct *declarations* either way — what collides is the path a program writes — so the second one
+is refused with a diagnostic rather than settled by a silent choice.
 
 ## 2. Visibility — public by default, and `private` means *this file*
 
@@ -197,6 +212,15 @@ already defined locally or explicitly imported loses to the more specific one, a
 wildcard imports that both offer the same name make an *unqualified* use of it ambiguous (a
 compile error naming both), and the fix is to qualify it or import it selectively.
 
+The qualified half of that is what is built. An unqualified name is looked for **in the module it
+is written in, then in the prelude**, and nowhere else — a sibling module's names are not in scope
+unqualified, and neither are the root module's, which have no path to be reached by at all (§1). A
+**dotted** reference names a module by the **longest prefix of it that is one**: a program holding
+both `a` and `a.b` reads `a.b.f` as `a.b`'s `f` rather than as `a`'s `b`, and §1's refusal of a
+module named for a type of its parent is what keeps that from silently hiding a member. Everything
+left of the module prefix is the ordinary form — `read(…)`, `Point(…)`, `Shape.Circle(…)` — which
+is why qualified access needed no second resolution path beside the unqualified one.
+
 **A file's imports are not its dependency list.** Because a qualified reference needs no import,
 a file can depend on a module without naming it in any header — the dependency appears only in a
 body. Two consequences follow, and they are the price of the Scala-style convenience above:
@@ -295,20 +319,22 @@ A top-level **statement** is not a declaration: a declaration is hoisted and bel
 as a whole, while a statement runs, and running happens in an order. §6 gives a module's files no
 order at all — they are one unordered scope, and which one the driver read first is an accident of
 `readdir` — so a module whose statements were spread across two files would have no defined
-behaviour to compile.
+behaviour to compile. Modules have no order either: §6 makes them a graph, which says what may
+depend on what and nothing about what runs first.
 
-**One file of a module carries the statements it runs**, and a second that carries any is an error
+**One file of a program carries the statements it runs**, and a second that carries any is an error
 naming both. This is not a restriction on where declarations may go, which is the point of §1: a
-module may be split across as many files as it likes, and only the executable part is pinned to one
-of them.
+module may be split across as many files as it likes, a program across as many modules, and only
+the executable part is pinned to one file. Those statements are a body like any other in one
+respect — an unqualified name in them is read in the module of the file that wrote them.
 
 A top-level `var` counts as a statement, because it is exactly that — a local of the entry point,
 scoped to it and initialized in its order, not a member of the module. (A module-level binding
 *visible to other files* is a different thing, and it is what §2's "anything visible outside its
 file states its types" is written about.)
 
-A module in which no file carries a statement is a complete program that does nothing: the entry
-point exists, runs nothing, and succeeds. That is what a module of pure declarations compiles to,
+A program in which no file carries a statement is a complete program that does nothing: the entry
+point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,
 which is what it should compile to — a library is not an error.
 
 ## 8. What is deliberately absent
@@ -336,11 +362,14 @@ which is what it should compile to — a library is not an error.
 
 ## Open (not yet decided)
 
-- **a. The project-config doc.** The `sysl.conf` (HOCON) schema, the target registry, the
-  platform-file suffix grammar and resolution (§5), and how the project root is located are a
-  separate doc `capabilities.md` already defers. Design the minimum that unblocks multi-file
-  builds — root, active target, capabilities, platform-file selection — and let real needs drive
-  dependency resolution, workspaces, and publishing rather than guessing them now.
+- **a. The project-config doc.** The `sysl.conf` (HOCON) schema, the target registry, and the
+  platform-file suffix grammar and resolution (§5) are a separate doc `capabilities.md` already
+  defers. **The project root is no longer part of it**: the driver takes one, as the path it is
+  given — `sysl run <dir>` makes that directory the root and compiles the tree beneath it. That is
+  the minimum that unblocks multi-module builds, and it costs nothing to keep when a config file
+  arrives, since a file only ever *names* a root the driver would otherwise be told. What is left
+  is the active target, the capability declarations, and platform-file selection; let real needs
+  drive dependency resolution, workspaces, and publishing rather than guessing them now.
 - **b. Re-export / facade modules.** Whether a module can re-export another's names (a `pub
   import`-style forwarding, so `std` can surface `std.fs.read`) is a real ergonomic want for
   building a curated public surface over sub-modules, and is left until the standard library's

@@ -47,12 +47,14 @@ trait CallAnalysis extends Literals with TraitObjects {
     // everything after them is the tail, checked by the rule below rather than against a parameter.
     val variadic = f.variadic
 
+    val shown = qn(f.name)
+
     if variadic then
       if args.length < f.params.length then
-        err(s"function '${f.name}' takes at least ${quantity(f.params.length, "argument")}, " +
+        err(s"function '$shown' takes at least ${quantity(f.params.length, "argument")}, " +
           s"but ${supplied(args.length, "argument")}")
     else if args.length != f.params.length then
-      err(s"function '${f.name}' takes ${quantity(f.params.length, "argument")}, but ${supplied(args.length, "argument")}")
+      err(s"function '$shown' takes ${quantity(f.params.length, "argument")}, but ${supplied(args.length, "argument")}")
 
     // An extern is declared in the output only if something reaches it, which is what keeps an
     // unused one — the prelude's `exit`, in a program that never panics — out of the module.
@@ -62,13 +64,16 @@ trait CallAnalysis extends Literals with TraitObjects {
       if f.tparams.isEmpty then (f.name, None)
       else
         val provisional = args.map(analyzeExpr(_))
-        val targs =
-          solve(f.name, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected)
+        // The parameter types being matched against are the declaration's, written in the
+        // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the
+        // call was written in.
+        val targs = inModule(moduleFor(f.name))(
+          solve(shown, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected))
         checkBounds(f, targs)
         (instantiateFunc(f, targs), Some(provisional))
 
     val (params, rtype) = funcInsts(name)
-    val declared        = checkArgs(f.name, params, args.take(params.length), pre)
+    val declared        = checkArgs(shown, params, args.take(params.length), pre)
 
     funcsUsed += name
     TCall(name, declared ::: args.drop(params.length).map(variadicArg), rtype)
@@ -111,7 +116,7 @@ trait CallAnalysis extends Literals with TraitObjects {
    * applied, so the two forms of "what this declaration assumes" are one check.
    */
   protected def checkBounds(f: FuncDecl, targs: List[Type]): Unit =
-    checkParamBounds(f.name, f.tparams, f.bounds, targs)
+    inModule(moduleFor(f.name))(checkParamBounds(qn(f.name), f.tparams, f.bounds, targs))
 
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever
@@ -178,28 +183,30 @@ trait CallAnalysis extends Literals with TraitObjects {
       args: List[Expr],
       expected: Option[Type],
   ): TExpr = {
+    val shown = qn(fd.name)
+
     if args.length != fd.params.length - 1 then
-      err(s"method '${fd.name}' takes ${quantity(fd.params.length - 1, "argument")}, " +
+      err(s"method '$shown' takes ${quantity(fd.params.length - 1, "argument")}, " +
         s"but ${supplied(args.length, "argument")}")
 
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)(ref => spellSelf(_, ref))
     val provisional = args.map(analyzeExpr(_))
-    val own = solve(
-      fd.name,
+    val own = inModule(moduleFor(fd.name))(solve(
+      shown,
       m.tparams,
       fd.params.tail.map(p => spell(p.typ)),
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
-    )
+    ))
 
-    checkParamBounds(fd.name, m.tparams, fd.bounds, own)
+    inModule(moduleFor(fd.name))(checkParamBounds(shown, m.tparams, fd.bounds, own))
 
     val name            = instantiateFunc(fd, ownerArgs ::: own)
     val (params, rtype) = funcInsts(name)
     val recvArg         = buildReceiver(m.receiver.get, recv)
 
-    TCall(name, checkArgs(fd.name, params, args, Some(recvArg :: provisional)), rtype)
+    TCall(name, checkArgs(shown, params, args, Some(recvArg :: provisional)), rtype)
   }
 
   /** `5.display(out, fmt)` — the rendering a built-in's `Display` membership provides (`14 §5`).
@@ -274,9 +281,9 @@ trait CallAnalysis extends Literals with TraitObjects {
         reported {
           val fname = s"${tr.name}.$mname"
           if m.isProperty then
-            err(s"'$mname' is a property of '${tr.key}' — read it as 'value.$mname', without '()'")
+            err(s"'$mname' is a property of '${tr.show}' — read it as 'value.$mname', without '()'")
           if m.receiver.isEmpty then
-            err(s"'$mname' is an associated function of '${tr.key}', so it has no receiver — a value " +
+            err(s"'$mname' is an associated function of '${tr.show}', so it has no receiver — a value " +
               "cannot be the thing it is called on")
           val params = m.params.map(p => (p.name, resolveType(p.typ, self)))
           if args.length != params.length then
@@ -318,7 +325,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       case Some((tr, self, m)) =>
         reported {
           if !m.isProperty then
-            err(s"'$name' is a method of '${tr.key}' — call it with '$name(…)'")
+            err(s"'$name' is a method of '${tr.show}' — call it with '$name(…)'")
           val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
           TCall(s"${tr.name}.$name", List(recv), rtype)
         }
@@ -556,26 +563,30 @@ trait CallAnalysis extends Literals with TraitObjects {
       args: List[Expr],
       expected: Option[Type],
   ): TExpr = {
+    val shown = qn(fd.name)
+
     if args.length != fd.params.length then
-      err(s"associated function '${fd.name}' takes ${quantity(fd.params.length, "argument")}, " +
+      err(s"associated function '$shown' takes ${quantity(fd.params.length, "argument")}, " +
         s"but ${supplied(args.length, "argument")}")
 
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)(ref => spellSelf(_, ref))
     val provisional = args.map(analyzeExpr(_))
-    val targs = solve(
-      fd.name,
+    val targs = inModule(moduleFor(fd.name))(solve(
+      shown,
       fd.tparams,
       fd.params.map(p => spell(p.typ)),
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
-    )
+    ))
 
     val (ownerTps, ownTps)   = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)
     val (ownerArgs, ownArgs) = targs.splitAt(ownerTps.length)
 
-    checkParamBounds(owner, ownerTps, fd.bounds, ownerArgs)
-    checkParamBounds(fd.name, ownTps, fd.bounds, ownArgs)
+    inModule(moduleFor(fd.name)) {
+      checkParamBounds(qn(owner), ownerTps, fd.bounds, ownerArgs)
+      checkParamBounds(shown, ownTps, fd.bounds, ownArgs)
+    }
 
     val name            = instantiateFunc(fd, targs)
     val (params, rtype) = funcInsts(name)
@@ -616,7 +627,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     val decl = structDecls(name)
 
     if args.length != decl.fields.length then
-      err(s"struct '$name' has ${quantity(decl.fields.length, "field")}, but ${supplied(args.length, "value")}")
+      err(s"struct '${qn(name)}' has ${quantity(decl.fields.length, "field")}, but ${supplied(args.length, "value")}")
 
     val (targs, pre) =
       if decl.tparams.isEmpty then (Nil, None)
@@ -626,15 +637,19 @@ trait CallAnalysis extends Literals with TraitObjects {
           case _ =>
             val provisional = args.map(analyzeExpr(_))
             val targs =
-              solve(name, decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected)
+              inModule(Modules.moduleOf(name))(
+                solve(qn(name), decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected))
             (targs, Some(provisional))
 
     val s = instantiateStruct(name, targs)
     TStructNew(s, checkArgs(s.name, s.fields, args, pre))
   }
 
-  protected def constructVariant(name: String, args: List[Expr], expected: Option[Type]): TExpr = {
-    val ename = variantOwner(name)
+  protected def constructVariant(key: String, args: List[Expr], expected: Option[Type]): TExpr = {
+    // The key says which module's variant this is; the name inside the enum is what the enum's own
+    // declaration and its instantiation both know it by.
+    val name  = Modules.split(key)._2
+    val ename = variantOwner(key)
     val decl  = enumDecls(ename)
     val vdecl = decl.variants.find(_.name == name).get
 
@@ -653,7 +668,8 @@ trait CallAnalysis extends Literals with TraitObjects {
           case _ =>
             val provisional = args.map(analyzeExpr(_))
             val targs =
-              solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected)
+              inModule(Modules.moduleOf(ename))(
+                solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected))
             (targs, Some(provisional))
 
     val en = instantiateEnum(ename, targs)
@@ -666,17 +682,18 @@ trait CallAnalysis extends Literals with TraitObjects {
    * live here so `Color(n)` and `Color.try(n)` reject the same shapes the same way.
    */
   private def simpleEnumArg(name: String, args: List[Expr]): (Type.Enum, TExpr) = {
-    val decl = enumDecls(name)
+    val decl  = enumDecls(name)
+    val shown = qn(name)
     if decl.tparams.nonEmpty then
-      err(s"'$name' is generic, so it has no single underlying integer type to convert")
+      err(s"'$shown' is generic, so it has no single underlying integer type to convert")
     val en = instantiateEnum(name, Nil)
     if !en.simple then
-      err(s"'$name' carries data, so only a simple enum converts to and from an integer")
+      err(s"'$shown' carries data, so only a simple enum converts to and from an integer")
     if args.length != 1 then
-      err(s"'$name' takes exactly one integer argument")
+      err(s"'$shown' takes exactly one integer argument")
     val t = analyzeExpr(args.head, Some(en.underlying))
     if !t.ty.isInstanceOf[Type.Integer] then
-      err(s"'$name' converts an integer, but the value has type ${show(t.ty)}")
+      err(s"'$shown' converts an integer, but the value has type ${show(t.ty)}")
     (en, t)
   }
 

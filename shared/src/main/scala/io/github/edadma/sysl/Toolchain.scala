@@ -33,7 +33,7 @@ object Toolchain {
   def compileAndRun(source: String, name: String = "<input>"): Either[String, (Int, String)] =
     runIr(Compiler.compileToLlvm(source, name))
 
-  /** The same, for the files of one module. */
+  /** The same, for the files of one program. */
   def compileAndRun(sources: List[Source]): Either[String, (Int, String)] =
     runIr(Compiler.compile(sources))
 

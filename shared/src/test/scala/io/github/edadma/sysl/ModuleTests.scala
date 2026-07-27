@@ -4,10 +4,10 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** A module is a directory, so its files are one scope (`13 §1`, `13 §6`).
  *
- * These are that claim from three sides: the header a file writes to say which module it
- * contributes to, the fact that splitting a module across files changes nothing about what its
- * declarations can see, and the two things a set of files can disagree about — which module they
- * are, and which of them the program starts in.
+ * These are that claim from four sides: the header a file writes to say which module it contributes
+ * to, the fact that splitting a module across files changes nothing about what its declarations can
+ * see, the agreement between a header and the directory the file was found in, and which one file of
+ * a program carries the statements it runs (`13 §7`).
  */
 class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with RunSupport {
 
@@ -128,46 +128,96 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     }
   }
 
-  "what a set of files may not disagree about" - {
-    "which module they are" in {
-      errOf(
-        "a.sysl" -> "module oskit.arch\nf() -> int = 1",
-        "b.sysl" -> "module oskit.vm\ng() -> int = 2",
-      ) should include("b.sysl declares 'oskit.vm', but a.sysl declares 'oskit.arch'")
+  "a header and the directory it was found in" - {
+    // The header is checked against where the file sits, which is what makes the name a property of
+    // the directory rather than of any file in it. It is the driver that knows the location, and it
+    // hands it over on the source.
+    "must agree" in {
+      errIn(
+        ("geom", "point.sysl", "module oskit\nf() -> int = 1"),
+      ) should include("point.sysl declares 'oskit', but it sits in 'geom'")
     }
 
-    "including a file that writes no header at all" in {
-      errOf(
-        "a.sysl" -> "module oskit.arch\nf() -> int = 1",
-        "b.sysl" -> "g() -> int = 2",
-      ) should include("b.sysl declares no module at all, but a.sysl declares 'oskit.arch'")
+    "so a file at the root writes no header" in {
+      errIn(
+        ("", "main.sysl", "module geom\nf() -> int = 1"),
+      ) should include("main.sysl declares 'geom', but it sits at the project root")
     }
 
-    "reported the other way round just as plainly" in {
-      errOf(
-        "a.sysl" -> "f() -> int = 1",
-        "b.sysl" -> "module oskit.arch\ng() -> int = 2",
-      ) should include("b.sysl declares 'oskit.arch', but a.sysl declares no module at all")
+    "and a file in a directory writes one" in {
+      errIn(
+        ("geom", "point.sysl", "f() -> int = 1"),
+      ) should include("point.sysl declares no module, but it sits in 'geom'")
     }
 
-    // The first file's header is the module's, so a directory where one file was missed reports
-    // once per stray file rather than once per pair of them.
-    "with one report per stray file" in {
-      val out = errOf(
-        "a.sysl" -> "module m\nf() -> int = 1",
-        "b.sysl" -> "module n\ng() -> int = 2",
-        "c.sysl" -> "module o\nh() -> int = 3",
+    "however deep the directory is" in {
+      runIn(
+        ("", "main.sysl", "print(text.util.wrap(1))"),
+        ("text.util", "pad.sysl", "module text.util\nwrap(n: int) -> int = n + 1"),
+      ) shouldBe "2\n"
+    }
+
+    // Holding every file to the name its own location gives it is what replaces comparing the files
+    // of a directory against each other: a file edited without its siblings is reported on its own
+    // line rather than as a disagreement with whichever sibling happened to be read first.
+    "with one report per file that strayed" in {
+      val out = errIn(
+        ("m", "a.sysl", "module m\nf() -> int = 1"),
+        ("m", "b.sysl", "module n\ng() -> int = 2"),
+        ("m", "c.sysl", "module o\nh() -> int = 3"),
       )
 
       out should include("b.sysl declares 'n'")
       out should include("c.sysl declares 'o'")
+      out should not include "a.sysl declares"
     }
 
-    "which of them the program runs" in {
+    // Requiring the header rather than inferring it from the path is what keeps a file
+    // self-describing (`13 §1`), and a file with nothing in it has not written one. There is
+    // nothing to point at, so the diagnostic names the file and carries no caret.
+    "and a file with nothing in it has not said which module it is" in {
+      errIn(
+        ("m", "a.sysl", "module m\nf() -> int = 1"),
+        ("m", "empty.sysl", ""),
+      ) should include("empty.sysl declares no module")
+    }
+
+    "which is no complaint at all at the root, where the empty path is what it says" in {
+      runIn(
+        ("", "a.sysl", "print(1)"),
+        ("", "empty.sysl", ""),
+      ) shouldBe "1\n"
+    }
+
+    // Files handed over with no project around them carry no location, so their headers are the
+    // whole of what says which module each is in — which is how a test compiles a handful of them
+    // directly, and how a single file compiles with nothing to be measured against.
+    "with no project around them, the headers are the whole of it" in {
+      val out = irOf(
+        "a.sysl" -> "module oskit.arch\nf() -> int = 1",
+        "b.sysl" -> "module oskit.vm\ng() -> int = 2",
+      )
+
+      out should include("define i32 @oskit.arch$f()")
+      out should include("define i32 @oskit.vm$g()")
+    }
+  }
+
+  "which one file of a program runs" - {
+    // A declaration is hoisted and belongs to its module; a statement runs, and running has an
+    // order that neither files nor modules have. So one file carries them (`13 §7`).
+    "is a question with one answer" in {
       errOf(
         "a.sysl" -> "print(1)",
         "b.sysl" -> "print(2)",
-      ) should include("a.sysl already carries the statements this module runs, so b.sysl may hold declarations only")
+      ) should include("a.sysl already carries the statements this program runs, so b.sysl may hold declarations only")
+    }
+
+    "across modules just as within one" in {
+      errIn(
+        ("", "a.sysl", "print(1)"),
+        ("m", "b.sysl", "module m\nprint(2)"),
+      ) should include("may hold declarations only")
     }
 
     // A top-level `var` is a statement — it is a local of the entry point, not a member of the
@@ -179,30 +229,20 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) should include("may hold declarations only")
     }
 
-    // Requiring the header rather than inferring it from the path is what keeps a file
-    // self-describing (`13 §1`), and a file with nothing in it has not written one — so it is in
-    // the root module, and among files that are not it says so. There is nothing to point at, so
-    // the diagnostic names the file and carries no caret.
-    "and a file with nothing in it has not said which module it is" in {
-      errOf(
-        "a.sysl"     -> "module m\nf() -> int = 1",
-        "empty.sysl" -> "",
-      ) should include("empty.sysl declares no module at all")
-    }
-
-    "which is no complaint at all when nothing else claimed one" in {
-      runOf(
-        "a.sysl"     -> "print(1)",
-        "empty.sysl" -> "",
-      ) shouldBe "1\n"
-    }
-
     "though a file of nothing but declarations is never the one that runs" in {
       runOf(
         "a.sysl" -> "f() -> int = 1",
         "b.sysl" -> "g() -> int = 2",
         "c.sysl" -> "print(f() + g())",
       ) shouldBe "3\n"
+    }
+
+    // The statements run in the module that carried them, so an unqualified name in them is that
+    // module's — the entry point is a body like any other in that respect.
+    "and the statements read their names in the module that wrote them" in {
+      runIn(
+        ("m", "a.sysl", "module m\nf() -> int = 4\nprint(f())"),
+      ) shouldBe "4\n"
     }
   }
 

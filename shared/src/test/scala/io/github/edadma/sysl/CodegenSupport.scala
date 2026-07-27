@@ -22,22 +22,44 @@ trait CodegenSupport extends Matchers { this: Assertions =>
       case Left(e)    => e
     }
 
-  /** The files of one module, named so a diagnostic about one can be told from a diagnostic about
-   * another. `"a.sysl" -> "…"` reads at a call site the way a small directory looks.
+  /** Several files, named so a diagnostic about one can be told from a diagnostic about another.
+   * `"a.sysl" -> "…"` reads at a call site the way a small directory looks.
+   *
+   * They carry no location, which is what a file handed to the compiler with no project around it
+   * has: the module each contributes to is whatever its header says, and there is nothing for that
+   * header to be held against.
    */
   protected def files(fs: (String, String)*): List[Source] =
     fs.toList.map { case (name, text) => Source(name, text) }
 
-  /** The IR for a module of several files, all of which must compile. */
-  protected def irOf(fs: (String, String)*): String =
-    Compiler.compile(files(fs*)) match {
+  /** The same files as a **project**: each one paired with the directory it sits in, written as the
+   * dotted path a driver walking the tree would have derived. `""` is the project root.
+   */
+  protected def project(fs: (String, String, String)*): List[Source] =
+    fs.toList.map { case (dir, name, text) =>
+      Source(name, text, if dir.isEmpty then Nil else dir.split('.').toList)
+    }
+
+  /** The IR for a program of several files, all of which must compile. */
+  protected def irOf(fs: (String, String)*): String = compiled(files(fs*))
+
+  /** The error message for a program of several files that must be rejected. */
+  protected def errOf(fs: (String, String)*): String = rejected(files(fs*))
+
+  /** The IR for a project laid out across directories. */
+  protected def irIn(fs: (String, String, String)*): String = compiled(project(fs*))
+
+  /** The error message for a project laid out across directories that must be rejected. */
+  protected def errIn(fs: (String, String, String)*): String = rejected(project(fs*))
+
+  private def compiled(sources: List[Source]): String =
+    Compiler.compile(sources) match {
       case Right(out) => out
       case Left(e)    => fail(e)
     }
 
-  /** The error message for a module of several files that must be rejected. */
-  protected def errOf(fs: (String, String)*): String =
-    Compiler.compile(files(fs*)) match {
+  private def rejected(sources: List[Source]): String =
+    Compiler.compile(sources) match {
       case Right(out) => fail(s"expected an error, got:\n$out")
       case Left(e)    => e
     }

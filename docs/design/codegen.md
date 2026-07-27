@@ -30,13 +30,25 @@ A program is a sequence of statements and declarations. Non-declaration statemen
 body of `main`; function, struct, and enum declarations are hoisted (so they may be used
 before they appear and may be mutually recursive).
 
-- **A module may be written across as many files as it likes** (`13 §1`, `13 §6`). The driver
-  compiles a directory as the one module its files declare with a `module a.b` header, and they
-  share one scope: hoisting registers every signature in the module before any body is checked, so
-  a call, a type, a trait, its `impl`, and a generic's instantiation may each sit in a different
-  file with no ordering and no forward declaration. What the files may not disagree about is which
-  module they are, and which one of them carries the statements the program runs (`13 §7`). A file
-  with no header is in the anonymous root module, which is why a single-file program needs none.
+- **A program is a tree of modules, and a module a directory of files** (`13 §1`, `13 §6`). The
+  driver takes a **project root** and walks it: each directory is a module named by its path from
+  the root, each file declares that name in a `module a.b` header, and a header that disagrees with
+  where the file sits is an error. The files of one module share one scope — hoisting registers
+  every signature before any body is checked — so a call, a type, a trait, its `impl`, and a
+  generic's instantiation may each sit in a different file with no ordering and no forward
+  declaration. A file with no header is in the **anonymous root module**, whose name is the empty
+  path, which is why a single-file program needs none and why nothing outside the root can name
+  what the root declares.
+
+- **A module reaches another's members by naming them in full** (`13 §3`): `std.fs.read(p)`,
+  `geom.Point`, `geom.Shape.Round(7)`. `import` does not exist yet and is only a shortening of
+  this. An unqualified name is looked for in the module it is written in and then in the prelude,
+  so two modules may each declare a `Point`, a `size`, or a variant `Round`. Every table is keyed
+  by the **qualified** name (`Modules`), with `$` between the module and the declaration so the
+  prefix can never be confused with a member (`Point.dist`) or an instantiation (`f.int`); `$` is
+  legal in an LLVM symbol, so the key is still the emitted name and diagnostics read it back with
+  dots. One file of the program carries the statements it runs (`13 §7`), and they are read in the
+  module of the file that wrote them.
 
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
   compound assignment), `return [expr]`, and `break [expr]` / `continue`. Loop and branch bodies

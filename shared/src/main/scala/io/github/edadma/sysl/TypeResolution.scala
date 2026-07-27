@@ -89,12 +89,15 @@ trait TypeResolution extends AnalyzerBase {
    */
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound = at(b.pos) {
     val args = b.args.map(resolveType(_, subst))
+    val key  = traitKey(b.name)
 
-    for decl <- traitDecls.get(b.name) do
+    for k <- key; decl <- traitDecls.get(k) do
       checkTraitArity(b.name, decl.tparams, args)
-      deferredBounds(b.name, decl.tparams, decl.bounds, args)
+      deferredBounds(k, decl.tparams, decl.bounds, args)
 
-    Type.Bound(b.name, args)
+    // A bound naming no trait at all keeps the name as written, so `checkBoundNames` reports it in
+    // the words it was spelled with rather than this producing a second complaint about a key.
+    Type.Bound(key.getOrElse(b.name), args)
   }
 
   /** A trait applied to the wrong number of arguments, said in the words a trait deserves — the
@@ -165,21 +168,25 @@ trait TypeResolution extends AnalyzerBase {
           // argument — is asking it for a layout it does not have.
           case Some(Type.Unit) if argRefs.isEmpty =>
             err("'unit' is the type of an expression that yields no value, so it can only be a result type")
-          case Some(s)                        => plain(n, targs, s)
-          case None if structDecls.contains(n) => instantiateStruct(n, targs)
-          case None if enumDecls.contains(n)   => instantiateEnum(n, targs)
-          case None if n == neverName =>
-            err("'never' is the type of an expression that does not finish, so it can only be a result type")
-          case None if n == selfName =>
-            err("'Self' names the type a trait is implemented for, so it is only meaningful inside " +
-              "a 'trait' or an 'impl'")
-          // A trait describes what a value can do, not how one is laid out, so it stands where a
-          // type is asked for only behind a sigil — and the two ways of reaching it are named here,
-          // since which one a program wants is the whole of the choice it has to make.
-          case None if traitDecls.contains(n) =>
-            err(s"'$n' is a trait, so it describes behaviour rather than a layout — write '*$n' or " +
-              s"'&$n' for a trait object, or bound a type parameter with '[T: $n]'")
-          case None                            => err(s"unknown type '$n'")
+          case Some(s) => plain(n, targs, s)
+          // A declared type is named in this module's terms — its own, or a module's it names in
+          // full (`13 §3`) — so what the tables are asked for is the key that resolves to.
+          case None =>
+            typeKey(n) match
+              case Some(key) if structDecls.contains(key) => instantiateStruct(key, targs)
+              case Some(key)                              => instantiateEnum(key, targs)
+              case None if n == neverName =>
+                err("'never' is the type of an expression that does not finish, so it can only be a result type")
+              case None if n == selfName =>
+                err("'Self' names the type a trait is implemented for, so it is only meaningful inside " +
+                  "a 'trait' or an 'impl'")
+              // A trait describes what a value can do, not how one is laid out, so it stands where a
+              // type is asked for only behind a sigil — and the two ways of reaching it are named here,
+              // since which one a program wants is the whole of the choice it has to make.
+              case None if traitKey(n).isDefined =>
+                err(s"'$n' is a trait, so it describes behaviour rather than a layout — write '*$n' or " +
+                  s"'&$n' for a trait object, or bound a type parameter with '[T: $n]'")
+              case None => err(s"unknown type '$n'")
 
   /** A trait named behind a memory-mode sigil, which is what makes the pointer a trait object
    * (`02`): `*Trait` raw and unmanaged, `&Trait` reference-counted. `None` for everything else,
@@ -188,16 +195,17 @@ trait TypeResolution extends AnalyzerBase {
    */
   private def traitObject(inner: TypeRef, subst: Map[String, Type], sigil: String): Option[Type.Trait] =
     inner match
-      case NamedType(n, argRefs) if traitDecls.contains(n) && !(argRefs.isEmpty && subst.contains(n)) =>
-        val decl = traitDecls(n)
+      case NamedType(n, argRefs) if traitKey(n).isDefined && !(argRefs.isEmpty && subst.contains(n)) =>
+        val key  = traitKey(n).get
+        val decl = traitDecls(key)
         val args = argRefs.map(resolveType(_, subst))
 
         at(inner.pos) {
           checkTraitArity(n, decl.tparams, args)
-          deferredBounds(n, decl.tparams, decl.bounds, args)
-          checkObjectSafe(n, args, sigil)
+          deferredBounds(key, decl.tparams, decl.bounds, args)
+          checkObjectSafe(key, args, sigil)
         }
-        Some(Type.Trait(n, args))
+        Some(Type.Trait(key, args))
       case _ => None
 
   /** Whether a trait may be erased into an object at all, and what to say when it may not (`02`).
@@ -215,7 +223,8 @@ trait TypeResolution extends AnalyzerBase {
    * such a method, and `*Trait` points straight at a value and does not.
    */
   protected def checkObjectSafe(name: String, args: List[Type], sigil: String): Unit = {
-    val obj = s"'$sigil${Type.qualified(name, args)}'"
+    val shown = qn(name)
+    val obj   = s"'$sigil${Type.qualified(shown, args)}'"
 
     def mentionsSelf(t: TypeRef): Boolean = t match
       case NamedType(n, args) => n == selfName || args.exists(mentionsSelf)
@@ -225,13 +234,13 @@ trait TypeResolution extends AnalyzerBase {
 
     for m <- traitDecls(name).methods do
       if m.recvMode.isEmpty then
-        err(s"'$name' declares the associated function '${m.name}', which has no receiver to " +
+        err(s"'$shown' declares the associated function '${m.name}', which has no receiver to " +
           s"dispatch on — so there is no $obj to form")
       if m.receiver.exists(_.isInstanceOf[RecvMode.ByRef]) && sigil == "*" then
-        err(s"'${m.name}' of '$name' takes '&self', so it needs its receiver inside a " +
-          s"reference-counted box — $obj points straight at a value, so write '&$name' instead")
+        err(s"'${m.name}' of '$shown' takes '&self', so it needs its receiver inside a " +
+          s"reference-counted box — $obj points straight at a value, so write '&$shown' instead")
       if m.params.exists(p => mentionsSelf(p.typ)) || m.retType.exists(mentionsSelf) then
-        err(s"'${m.name}' of '$name' mentions 'Self' away from its receiver, and an erased value " +
+        err(s"'${m.name}' of '$shown' mentions 'Self' away from its receiver, and an erased value " +
           s"has forgotten which type that is — so there is no $obj to form")
   }
 
@@ -249,7 +258,7 @@ trait TypeResolution extends AnalyzerBase {
    * pointer-sized, while a `Node` holding a `Node` by value has no finite size.
    */
   protected def cycleCheck(key: String): Unit =
-    if indirection <= resolving(key) then err(s"type '$key' contains itself, so it has no finite size")
+    if indirection <= resolving(key) then err(s"type '${qn(key)}' contains itself, so it has no finite size")
 
   /** Resolves a scalar type name: the named primitives and friendly aliases, or one of the
    * systematic `iN` / `uN` / `fN` width spellings.
@@ -282,9 +291,9 @@ trait TypeResolution extends AnalyzerBase {
 
   protected def checkArity(name: String, tparams: List[String], targs: List[Type]): Unit =
     if tparams.length != targs.length then
-      if tparams.isEmpty then err(s"type '$name' does not take type arguments")
+      if tparams.isEmpty then err(s"type '${qn(name)}' does not take type arguments")
       else
-        err(s"type '$name' takes ${quantity(tparams.length, "type argument")}, " +
+        err(s"type '${qn(name)}' takes ${quantity(tparams.length, "type argument")}, " +
           s"but ${supplied(targs.length, "type argument")}")
 
   /** Instantiates a struct for one set of type arguments, memoized on the display name. The
@@ -292,7 +301,10 @@ trait TypeResolution extends AnalyzerBase {
    * at the struct finds it and the recursion terminates; `cycleCheck` is what rejects the cycle
    * that has no indirection to break it.
    */
-  protected def instantiateStruct(name: String, targs: List[Type]): Type.Struct = {
+  protected def instantiateStruct(name: String, targs: List[Type]): Type.Struct =
+    inModule(Modules.moduleOf(name))(instantiateStructIn(name, targs))
+
+  private def instantiateStructIn(name: String, targs: List[Type]): Type.Struct = {
     val decl = structDecls(name)
     checkArity(name, decl.tparams, targs)
     checkTypeBounds(name, decl.tparams, targs)
@@ -331,7 +343,10 @@ trait TypeResolution extends AnalyzerBase {
    * data-carrying variant makes a *data* enum, whose variants take sequential tags and whose
    * payload-bearing variants each claim a slot in the aggregate.
    */
-  protected def instantiateEnum(name: String, targs: List[Type]): Type.Enum = {
+  protected def instantiateEnum(name: String, targs: List[Type]): Type.Enum =
+    inModule(Modules.moduleOf(name))(instantiateEnumIn(name, targs))
+
+  private def instantiateEnumIn(name: String, targs: List[Type]): Type.Enum = {
     val decl = enumDecls(name)
     checkArity(name, decl.tparams, targs)
     checkTypeBounds(name, decl.tparams, targs)
@@ -355,7 +370,7 @@ trait TypeResolution extends AnalyzerBase {
           case None => Type.Int
           case Some(ref) =>
             if !en.simple then
-              err(s"only a simple enum has an underlying integer type — '$name' carries data")
+              err(s"only a simple enum has an underlying integer type — '${qn(name)}' carries data")
             resolveType(ref, Map.empty) match
               case i: Type.Integer => i
               case other           => err(s"an enum's underlying type must be an integer, not ${show(other)}")
@@ -429,11 +444,16 @@ trait TypeResolution extends AnalyzerBase {
     // that cannot exist; leaving it unsolved reports the inference failure instead.
     case NamedType(n, Nil) if tparams(n) =>
       if !sub.contains(n) && !actual.isInstanceOf[Type.Trait] then sub(n) = actual
+    // The reference is the declaration's, written in the declaration's terms, so the name it uses
+    // is matched against the resolved type by the key it names here — a `Pair[T]` parameter is its
+    // own module's `Pair`, whichever module the call that supplied the argument was written in.
     case NamedType(n, argRefs) =>
+      val key = typeKey(n)
+
       actual match
-        case s: Type.Struct if s.base == n && s.targs.length == argRefs.length =>
+        case s: Type.Struct if key.contains(s.base) && s.targs.length == argRefs.length =>
           argRefs.zip(s.targs).foreach { case (r, t) => unify(r, t, tparams, sub) }
-        case e: Type.Enum if e.base == n && e.targs.length == argRefs.length =>
+        case e: Type.Enum if key.contains(e.base) && e.targs.length == argRefs.length =>
           argRefs.zip(e.targs).foreach { case (r, t) => unify(r, t, tparams, sub) }
         case _ => ()
 
