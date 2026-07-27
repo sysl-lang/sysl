@@ -78,6 +78,18 @@ than shorthand for writing the value out `count` times. Where the elements conta
 copy is a share of its own: an array of `n` copies of a `&T` holds `n` counts, released as the array
 is (`§Ownership`).
 
+**A `val`** is the same three forms written at the top of a file rather than inside one, and it is
+what a table of numbers somebody else fixed wants:
+
+```
+val order: [19]usize = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+```
+
+The difference from a `const` is an **address** (`13 §7`): a constant is folded into every use and
+has none, so it can size an array but cannot *be* one; a `val` is storage, so it may be indexed at a
+value only known while running, iterated, and reached into. What it may not be is written — see
+`§Ownership` below for the one thing that costs today.
+
 ## Indexing
 
 `a[i]` reads the element, and it is a **place** — so `a[i] = v`, `a[i] += 1`, `a[i]++`, and
@@ -188,6 +200,12 @@ implementation:
 - **Slicing a `&sync` buffer.** A `[]T` does not record whether its owner's count is atomic, so
   it cannot carry an owner that needs the atomic path. Rejected with a diagnostic until slices
   distinguish the two.
+- **Slicing a `val`.** The same gap seen from the other side: a `[]T` permits writes and records
+  nothing about whose elements it views, so a view of read-only storage would be a way of writing
+  it — and the view outlives the expression that made it, so there is nowhere to catch that later.
+  Rejected with a diagnostic. What this wants is a **read-only view type**, which is a decision
+  about the view types here rather than about `val`, and it is additive: every program that can be
+  written today keeps its meaning when one arrives.
 - **An unchecked-index escape hatch** for hot loops, listed as likely-yes and deferred in `03`.
 - **Multi-dimensional shorthand.** `[3][3]f64` already works as an array of arrays; a distinct
   rectangular type is not planned.

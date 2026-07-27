@@ -441,13 +441,23 @@ scoped to it and initialized in its order, not a member of the module. (A module
 *visible to other files* is a different thing, and it is what §2's "anything visible outside its
 file states its types" is written about.)
 
+**Why there is no module-level `var`, when there is a module-level `val`.** The reason above is
+about *initialization order*, and it does not by itself rule one out: a mutable global with a
+**constant** initializer runs nothing, so it has no order to have. The real answer is that the
+keyword is taken. Every program that writes statements at the top of a file already uses `var`
+there to mean "a local of the entry point", and redefining it as a module member would not fail to
+compile — it would silently change name resolution, those bindings becoming visible to every
+function in the module. That is a breaking change that still builds, which is the worst kind. So
+mutable module-level state waits for a customer that asks for it by name; nothing yet has. What
+programs actually wanted was a **table**, which is read-only, and that is `val`.
+
 A program in which no file carries a statement is a complete program that does nothing: the entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,
 which is what it should compile to — a library is not an error.
 
 ### Constants
 
-A **`const` is a module member**, and the one kind of module-level binding there is:
+A **`const` is a module member**:
 
 ```
 const capacity: usize = 512
@@ -456,9 +466,10 @@ private const window: int = 1 << 15
 ```
 
 It is a declaration, not a statement — hoisted, order-free, visible to the whole module and beyond
-it under the ordinary rules — and it is what a top-level `var` is not. The two are told apart by
+it under the ordinary rules — and it is what a top-level `var` is not. The three are told apart by
 the keyword rather than by immutability: a `var` at the top of a file is a local of the entry point
-(above), and a `const` never runs at all.
+(above), a `const` never runs at all, and a `val` (below) is storage laid down before anything
+runs.
 
 **Why it exists at all**, when a nullary function already serves every use in an expression. Three
 of the guide programs wanted a name for a number and could only get one that a *type* cannot read.
@@ -490,15 +501,16 @@ saying out loud, because it is where other languages have come to grief: a name 
 unless it resolves to something, and Rust's rule that a lowercase `const` in a pattern *binds*
 instead of matching is a documented trap. Here it cannot arise — a pattern name already resolves
 against the enum variants in scope before it is taken as a binding, and a constant joins that same
-resolution rather than adding a second one.
+resolution rather than adding a second one. A **`val`** is the one module-level name that could
+have brought the trap back, since it is read while running and so has no value for a pattern to
+compare against; naming one in a pattern is therefore an error rather than a quiet binding.
 
 **A constant has no address.** It is folded into each use and occupies no storage, which is why it
 needs no initialization order, why a `no alloc` module may hold one, and why `&capacity` is not a
-thing to write. What that rules out is the *other* half of what the guide programs asked for: a
-**table** — `guide/png`'s 256-entry CRC array — is static storage with a computed initializer, and
-that is a different feature with different questions (const-evaluated or run once at startup, and
-if the latter, in what order across a module graph that deliberately has none). It waits for a
-second customer, and the answer is not "make `const` bigger".
+thing to write. That is also exactly what rules it out for the *other* half of what the guide
+programs asked for — a **table**, which is indexed at a value only known while running and
+therefore has to be somewhere. The answer to that is not "make `const` bigger"; it is a second
+declaration, below.
 
 Two things a constant is **not**, so the boundaries stay where the rest of the design put them:
 
@@ -512,6 +524,46 @@ Two things a constant is **not**, so the boundaries stay where the rest of the d
 
 A cycle between constants (`const a: int = b`, `const b: int = a`) is reported at the declaration,
 naming the loop, in the same way §6 reports one between modules.
+
+### `val` — a binding written once
+
+A **`val` is a thing**, where a `const` is a value:
+
+```
+private val order: [19]usize = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+```
+
+Written at the top of a file it is a module member — read-only storage that exists for the whole
+run — and written inside a block it is a local, the immutable counterpart of `var`, in the same
+frame with the same lifetime. One keyword at both levels, because it is one idea at both: a name
+bound once and never assigned to again.
+
+**The whole difference from a `const` is an address.** A constant is folded into every use, which
+is what lets it size an array and what stops it from being one. A `val` sits somewhere, so it may
+be indexed at a value only known while running, iterated, and reached into. The rule for a reader
+is short: *if it has to be indexed or pointed at, it is a `val`.*
+
+**Read-only means read-only at every depth.** `k = …`, `k[0] = …`, `k[0] += 1`, and `k[0]++` are
+all refused, and so is `&k[0]` — a `*T` is a licence to write, and handing one out would move the
+mistake one step away from where it could still be reported. Slicing is refused for the same
+reason and is the one thing this costs today: a `[]T` permits writes and does not record whose
+elements it views, so it cannot carry the property. That wants a read-only view type, which is
+`07`'s decision to make, and it is additive.
+
+**Its initializer must be a constant** — a number, or an array of them, or a repeat `[v; n]`
+(`07`). That is what lets it be written straight into the object file: no code runs before `main`,
+nothing has to be ordered, and a `no alloc` module may hold one. **A computed initializer is a
+further feature**, and the one `guide/png`'s CRC table still waits for. It is the harder half,
+because it needs an answer to *in what order* such initializers run across a module graph that
+deliberately has none — and keeping it separate is what lets the constant-initializer case ship
+without prejudging that.
+
+**The type is written at module level and inferred inside a block.** Not two rules but one: §2 says
+anything visible outside its file states its types, and a module member always could be. A local
+states nothing to anyone, so it infers exactly as a `var` does.
+
+A `const`, a `val`, and an enum variant share one namespace, since all three are values a bare name
+reaches; a clash is reported at whichever was written second.
 
 ## 8. What is deliberately absent
 

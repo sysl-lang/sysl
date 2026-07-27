@@ -314,7 +314,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
   private lazy val declaration: PackratParser[Stmt] =
-    visibility ~ (structDecl | enumDecl | traitDecl | externDecl | constDecl | funcDecl) ^^ {
+    visibility ~ (structDecl | enumDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
       case Visibility.Public ~ d => d
       case v ~ d                 => restrict(v, d)
     }
@@ -334,6 +334,7 @@ class SyslParser(val source: Source) extends PackratParsers {
     case t: TraitDecl  => t.copy(vis = v).setPos(t.pos)
     case e: ExternDecl => e.copy(vis = v).setPos(e.pos)
     case c: ConstDecl  => c.copy(vis = v).setPos(c.pos)
+    case l: ValDecl    => l.copy(vis = v).setPos(l.pos)
     case f: FuncDecl   => f.copy(vis = v).setPos(f.pos)
     case other         => other
 
@@ -440,6 +441,20 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val constDecl: PackratParser[Stmt] =
     op("const") ~> ident ~ (op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
       case n ~ t ~ v => ConstDecl(n, t, v)
+    }
+
+  /** `val name [: type] = value` — a binding that is written once (`07`, `13 §7`).
+   *
+   * The **value is mandatory** and the type is not, which is the opposite arrangement from `const`
+   * and for the opposite reason: a `val` with nothing to hold is not a declaration of anything,
+   * while its type is readable off the value it was given. Whether a type may be left off is
+   * nevertheless a question about *where* it was written — a module member states its interface —
+   * and where is something only the analyzer knows, so the syntax accepts either and the rule is
+   * applied there.
+   */
+  private lazy val valDecl: PackratParser[Stmt] =
+    op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
+      case n ~ t ~ v => ValDecl(n, t, v)
     }
 
   private lazy val exprStmt: PackratParser[Stmt] = expression ^^ (e => ExprStmt(e).setPos(e.pos))

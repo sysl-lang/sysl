@@ -17,6 +17,19 @@ import scala.collection.mutable
  */
 trait Hoisting extends TypeResolution {
 
+  /** What already holds the value name `key`, named as a diagnostic would say it, or `None` where
+   * nothing does.
+   *
+   * A constant, a `val`, and an enum variant are all *values* a bare name can reach, so the three
+   * share one namespace — and every registration asks this rather than the one table it is about,
+   * which is what makes the clash reported at whichever of them was written second.
+   */
+  protected def valueNameHolder(key: String): Option[String] =
+    if constDecls.contains(key) then Some("a constant")
+    else if valDecls.contains(key) then Some("a 'val'")
+    else if variantOwner.contains(key) then Some(s"enum '${qn(variantOwner(key))}'")
+    else None
+
   /** Registers one type-shaped declaration: a struct, an enum, a trait, or an `impl`.
    *
    * A declaration belongs to the module its file contributes to, so what every table holds it
@@ -55,10 +68,7 @@ trait Hoisting extends TypeResolution {
       for v <- e.variants do
         val vkey = Modules.qualify(currentModule, v.name)
 
-        if variantOwner.contains(vkey) then
-          err(s"variant name '${v.name}' is already used by enum '${qn(variantOwner(vkey))}'")
-        else if constDecls.contains(vkey) then
-          err(s"variant name '${v.name}' is already used by a constant")
+        for what <- valueNameHolder(vkey) do err(s"variant name '${v.name}' is already used by $what")
         variantOwner(vkey) = key
         // A variant is reached unqualified, so it is a name of the module in its own right — and it
         // carries its enum's visibility, since an enum nobody outside may name is not one whose
@@ -94,11 +104,28 @@ trait Hoisting extends TypeResolution {
       // A constant, a function, and an enum variant are all *values* a bare name can reach, so the
       // three share one namespace and each pass checks the tables filled before it.
       if constDecls.contains(key) then err(s"constant '${c.name}' is already declared")
-      else if variantOwner.contains(key) then
-        err(s"'${c.name}' is already used by enum '${qn(variantOwner(key))}'")
+      else for what <- valueNameHolder(key) do err(s"'${c.name}' is already used by $what")
       constDecls(key) = c.copy(name = key).setPos(c.pos)
       declScope(key) = currentScope
       recordAccess(key, c.vis)
+
+    // A `val` is registered beside the constants and for the same reason: it is a value a bare name
+    // reaches, and an array bound may not name one — but an enum discriminant and a later `val`'s
+    // initializer are resolved in the same window, so the table has to be full before either is
+    // read. Its type and its value wait, exactly as a constant's do: one `val` may be written in
+    // terms of a `const` declared below it.
+    case v: ValDecl =>
+      val key = Modules.qualify(currentModule, v.name)
+
+      if valDecls.contains(key) then err(s"'${v.name}' is already declared")
+      else for what <- valueNameHolder(key) do err(s"'${v.name}' is already used by $what")
+      // `13 §2` — what is visible outside its file states its types, and a module member always
+      // could be. A local `val` states nothing to anyone and infers like a `var`.
+      if v.typ.isEmpty then
+        err(s"a module-level 'val' states its type, so '${v.name}' needs one — 'val ${v.name}: T = …'")
+      valDecls(key) = v.copy(name = key).setPos(v.pos)
+      declScope(key) = currentScope
+      recordAccess(key, v.vis)
 
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
     // — the duplicate check goes with the resolution, in `hoistImpl`. The module it was written in
@@ -128,6 +155,7 @@ trait Hoisting extends TypeResolution {
 
       if funcDecls.contains(key) then err(s"function '${f.name}' is already declared")
       else if constDecls.contains(key) then err(s"'${f.name}' is already declared as a constant")
+      else if valDecls.contains(key) then err(s"'${f.name}' is already declared as a 'val'")
       funcDecls(key) = f.copy(name = key).setPos(f.pos)
       declScope(key) = currentScope
       recordAccess(key, f.vis)

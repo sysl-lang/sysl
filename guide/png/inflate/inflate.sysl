@@ -24,6 +24,27 @@ const max_dist: usize = 30         // distance codes
 const max_code: usize = 19         // the code-length alphabet the other two arrive under
 const fixed_lit: usize = 288       // the fixed table is declared over two more than are used
 const max_lengths: usize = max_lit + max_dist
+const max_length_codes: usize = max_lit - 257
+
+// The tables the format itself fixes. They are `val`s rather than constants because a constant is
+// folded into its uses and has no address, and these are indexed by a symbol that is only known
+// while running; and they are module members rather than locals because they are the same numbers
+// on every call, which is what static storage means.
+
+// The order the code-length alphabet's lengths arrive in — chosen so the rarely-used ones cluster
+// at the end and a block can leave them out.
+private val order: [max_code]usize = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+// What a length symbol and a distance symbol are worth: a base, plus that many further bits read
+// from the stream. Each pair is one line because a literal may not be continued onto the next —
+// the same missing continuation the compiler program reported from its lexer.
+private val lbase: [max_length_codes]usize = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+
+private val lextra: [max_length_codes]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+
+private val dbase: [max_dist]usize = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+
+private val dextra: [max_dist]u32 = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
 
 // What can be wrong with a stream. Every one of these is a property of bytes somebody else wrote,
 // which is why they are values and not traps.
@@ -252,9 +273,8 @@ private struct Inf
     end fixed
 
     // A block carrying its own two tables, themselves Huffman-coded by a third table whose lengths
-    // arrive in an order chosen so that the rarely-used ones cluster at the end and can be left out.
+    // arrive in the `order` above.
     dynamic(*self) -> Result[bool, Fault]
-        var order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
         var nlen = usize(self.bits(5u32)?) + 257
         var ndist = usize(self.bits(5u32)?) + 1
         var ncode = usize(self.bits(4u32)?) + 4
@@ -264,7 +284,7 @@ private struct Inf
         var lengths: [max_lengths]u8
 
         for i in 0..<ncode
-            lengths[usize(order[i])] = u8(self.bits(3u32)?)
+            lengths[order[i]] = u8(self.bits(3u32)?)
 
         var ccounts: [max_bits + 1]u16
         var csymbols: [max_code]u16
@@ -318,11 +338,6 @@ private struct Inf
     // The loop both coded block kinds share: literals go straight out, and a length symbol is
     // followed by a distance, naming a run of bytes already written to copy again.
     codes(*self, lcounts: []u16, lsymbols: []u16, dcounts: []u16, dsymbols: []u16) -> Result[bool, Fault]
-        var lbase = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
-        var lextra = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
-        var dbase = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
-        var dextra = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
-
         loop
             var sym = self.symbol(lcounts, lsymbols)?
 
@@ -333,14 +348,14 @@ private struct Inf
             else
                 sym -= 257
 
-                if sym >= int(max_lit) - 257 then return Err(BadLength(sym + 257))
+                if sym >= int(max_length_codes) then return Err(BadLength(sym + 257))
 
-                var len = usize(lbase[sym]) + usize(self.bits(u32(lextra[sym]))?)
+                var len = lbase[sym] + usize(self.bits(lextra[sym])?)
                 var dsym = self.symbol(dcounts, dsymbols)?
 
                 if dsym >= int(max_dist) then return Err(BadLength(dsym + 257))
 
-                var dist = usize(dbase[dsym]) + usize(self.bits(u32(dextra[dsym]))?)
+                var dist = dbase[dsym] + usize(self.bits(dextra[dsym])?)
 
                 if dist > self.n then return Err(BadDistance(dist))
 

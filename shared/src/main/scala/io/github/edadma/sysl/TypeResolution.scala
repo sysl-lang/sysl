@@ -338,6 +338,23 @@ trait TypeResolution extends ImportResolution {
    */
   protected def constInt(e: Expr): Option[BigInt] = fold(e).collect { case IntLit(v, _) => v }
 
+  // --- module-level `val`s ---------------------------------------------------------------
+
+  /** The key a written module-level **`val`** name resolves to. */
+  protected def valKey(written: String): Option[String] = resolveName(written)(valDecls.contains)
+
+  /** The type a module-level `val` was declared with.
+   *
+   * Written rather than inferred (`13 §2`), which is what lets this be answered without looking at
+   * the initializer — so one `val` may be read from another's neighbourhood with no ordering
+   * between them, exactly as two functions may call each other.
+   */
+  protected def valType(key: String): Type = valTypes.getOrElseUpdate(key, {
+    val decl = valDecls(key)
+
+    inDecl(key)(decl.typ.map(resolveType(_, Map.empty)).getOrElse(Type.Unknown))
+  })
+
   /** Folds a constant expression to the literal it denotes, or `None` where it is not one.
    *
    * The set is deliberately small and closed: literals, other constants, conversions, and the
@@ -440,6 +457,7 @@ trait TypeResolution extends ImportResolution {
     case ">=" => Some(BoolLit(sign >= 0))
     case _    => None
 
+  private val valTypes         = mutable.HashMap.empty[String, Type]
   private val constTypes       = mutable.HashMap.empty[String, Type]
   private val constLits        = mutable.HashMap.empty[String, Expr]
   private val constsInProgress = mutable.LinkedHashSet.empty[String]

@@ -64,7 +64,14 @@ trait PatternAnalysis extends TypeResolution {
         case _ =>
           constKey(name) match
             case Some(key) => analyzePattern(LitPattern(constLiteral(key)), ty)
-            case None      => TBindPattern(declare(name, ty), ty)
+            // A `val` is storage read while running, so there is no value here to compare against —
+            // and letting the name bind instead is precisely the trap the paragraph above says
+            // cannot arise. It is refused rather than quietly shadowed, which leaves the reader the
+            // choice of a different name or an equality test.
+            case None if valKey(name).isDefined =>
+              err(s"'$name' is a 'val', which is read while the program runs, so a pattern cannot " +
+                s"match against it — compare it in a guard, or bind a different name")
+            case None => TBindPattern(declare(name, ty), ty)
 
     // A variant is named within the scrutinee's own enum, so a module prefix on the pattern is
     // repeating what the value already settled — it is dropped, and the type is what decides.

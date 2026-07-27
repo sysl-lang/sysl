@@ -139,11 +139,11 @@ class MethodRunTests extends AnyFreeSpec with RunSupport {
         |    inner: &Inner
         |    replace(&self, x: &Inner)
         |        self.inner = x
-        |    val(&self) -> int = self.inner.v
+        |    get(&self) -> int = self.inner.v
         |mk(seed: int) -> int
         |    var o: &Outer = Outer(Inner(seed))
         |    o.replace(Inner(seed + 1))
-        |    o.val()
+        |    o.get()
         |var i = 0
         |var total = 0
         |while i < 500000
@@ -183,11 +183,11 @@ class MethodRunTests extends AnyFreeSpec with RunSupport {
         |    inner: &Inner
         |    swap(*self, x: &Inner)
         |        self.inner = x
-        |    val(*self) -> int = self.inner.v
+        |    get(*self) -> int = self.inner.v
         |mk(seed: int) -> int
         |    var o = Outer(Inner(seed))
         |    o.swap(Inner(seed + 10))
-        |    o.val()
+        |    o.get()
         |var i = 0
         |var total = 0
         |while i < 500000

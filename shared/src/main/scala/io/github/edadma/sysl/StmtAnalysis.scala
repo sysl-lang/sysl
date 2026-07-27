@@ -142,8 +142,9 @@ trait StmtAnalysis extends TypeResolution {
    * the name into an "undefined name" of its own, and the real mistake is lost among them.
    */
   private def bindFailed(stmt: Stmt): Unit = stmt match
-    case VarDecl(name, _, _) => declare(name, Type.Unknown)
-    case _                   =>
+    case VarDecl(name, _, _)    => declare(name, Type.Unknown)
+    case ValDecl(name, _, _, _) => declareReadOnly(name, Type.Unknown)
+    case _                      =>
 
   private def analyzeStmt(stmt: Stmt): TStmt = at(stmt.pos)(analyzeStmtAt(stmt))
 
@@ -167,6 +168,19 @@ trait StmtAnalysis extends TypeResolution {
       if declared.isDefined && declTy != ti.ty then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
       TVarDecl(declare(name, declTy), declTy, ti)
+
+    // A local `val` is a `var` that may not be assigned to again — same frame, same lifetime, same
+    // code. Only the binding differs, so the two share everything below this line, and the read-only
+    // half of the rule is enforced where an assignment target is checked rather than here.
+    case ValDecl(name, typOpt, init, _) =>
+      val declared = typOpt.map(rt)
+      val ti       = analyzeExpr(init, declared)
+      if ti.ty == Type.Unit then err(s"cannot bind '$name' to a unit value")
+      if ti.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
+      val declTy = declared.getOrElse(ti.ty)
+      if declared.isDefined && declTy != ti.ty then
+        err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
+      TVarDecl(declareReadOnly(name, declTy), declTy, ti)
 
     case VarDecl(name, typOpt, None) =>
       val ty = typOpt.map(rt).getOrElse(err(s"'$name' needs either a type or an initial value"))

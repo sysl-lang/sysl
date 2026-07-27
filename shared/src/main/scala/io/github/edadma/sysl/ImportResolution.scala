@@ -162,5 +162,6 @@ trait ImportResolution extends AnalyzerBase {
    */
   private def declaresAnything(key: String): Boolean =
     structDecls.contains(key) || enumDecls.contains(key) || traitDecls.contains(key) ||
-      funcDecls.contains(key) || variantOwner.contains(key) || constDecls.contains(key)
+      funcDecls.contains(key) || variantOwner.contains(key) || constDecls.contains(key) ||
+      valDecls.contains(key)
 }

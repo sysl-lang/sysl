@@ -76,6 +76,12 @@ case class TCast(operand: TExpr, ty: Type) extends TExpr
 /** Reads a local variable (or parameter) by its unique name. */
 case class TLoad(name: String, ty: Type) extends TExpr
 
+/** Names a module-level `val` — storage that exists for the whole run, under the key its module
+ * gives it. It is a *place*, so indexing and iterating reach into it without copying the whole
+ * thing out; what it is not is a writable one, which the analyzer enforces rather than the type.
+ */
+case class TGlobal(symbol: String, ty: Type) extends TExpr
+
 /** `*p` — reads through a pointer or reference. */
 case class TDeref(operand: TExpr, ty: Type) extends TExpr
 
@@ -363,16 +369,23 @@ case class TVtable(name: String, traitName: String, forType: Type, boxed: Boolea
  */
 case class TVSlot(target: String, recv: RecvMode, params: List[Type], retTy: Type)
 
+/** One module-level `val`: read-only storage laid down whole, under the key its module gives it.
+ * The initializer is a constant tree, so it is written into the object file rather than computed —
+ * there is no code to run before `main` and nothing to order.
+ */
+case class TVal(symbol: String, ty: Type, init: TExpr)
+
 /** A whole program: hoisted struct, enum, and function declarations, the method tables its trait
- * objects dispatch through, the externs it calls, plus the top-level statements that make up
- * `main`. Only data enums appear in `enums` — a simple enum lowers to `i32` and needs no type
- * declaration.
+ * objects dispatch through, the externs it calls, the module-level `val`s it reads, plus the
+ * top-level statements that make up `main`. Only data enums appear in `enums` — a simple enum
+ * lowers to `i32` and needs no type declaration.
  */
 case class TProgram(
     structs: List[Type.Struct],
     enums: List[Type.Enum],
     vtables: List[TVtable],
     externs: List[TExtern],
+    vals: List[TVal],
     funcs: List[TFunc],
     main: List[TStmt],
 )

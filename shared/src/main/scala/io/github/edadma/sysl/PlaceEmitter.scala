@@ -19,6 +19,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    */
   protected def address(place: TExpr): String = place match
     case TLoad(name, _)     => s"%$name.addr"
+    // A `val`'s storage is the global itself, so its address needs no instruction to compute — it
+    // is what makes indexing one reach into the table rather than copy it out first.
+    case TGlobal(symbol, _) => s"@$symbol"
     case TDeref(operand, _) => payloadAddr(operand)
     case TField(receiver, index, _) =>
       val base = address(receiver)

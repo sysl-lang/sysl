@@ -122,6 +122,19 @@ class Analyzer private (units: List[Program])
     // instead of at whichever call site first supplied a type without a `plus`.
     checkAbstractBodies()
 
+    // Every `val` is laid down here, before the first body that might read one and in a state
+    // belonging to no function — which is the point. A `val`'s initializer is a *module member's*
+    // expression, so the locals of whichever function first mentioned it must not be in scope while
+    // it is read, and analyzing them all in one place ahead of time is what guarantees they are not.
+    // Like a constant's, an unused one is still checked: it is the declaration that is wrong.
+    val tvals = mutable.ListBuffer.empty[TVal]
+
+    resetFunction()
+    tsubst = Map.empty
+    for (key, decl) <- valDecls do
+      currentPos = decl.pos
+      tvals ++= recoverOpt(analyzeVal(key))
+
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 
     // A function whose body did not analyze is left out of the program rather than stood in for:
@@ -196,6 +209,7 @@ class Analyzer private (units: List[Program])
       enumInsts.values.filterNot(_.simple).toList,
       vtables.values.toList,
       externs,
+      tvals.toList,
       tfuncs.toList,
       tmain,
     )
@@ -245,11 +259,13 @@ class Analyzer private (units: List[Program])
   private def entryPoint(files: List[(Program, Scope)]): (Scope, List[Stmt]) = {
     // An `import` is not one: it binds a name for the file that wrote it and runs nothing, so a
     // file may import whatever it likes without becoming the file the program starts in.
-    // Neither is a `const`: it is a declaration, hoisted and folded into its uses, and a module that
-    // names a dimension must not thereby become the file the program starts in.
+    // Neither is a `const` or a `val`: both are declarations, hoisted, and a module that names a
+    // dimension or carries a table must not thereby become the file the program starts in. That is
+    // also what makes every `ValDecl` the statement walk goes on to meet a **local** — the ones
+    // written at the top of a file never reach it.
     def executable(u: Program) = u.body.filter {
       case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-          _: ImportDecl | _: ConstDecl =>
+          _: ImportDecl | _: ConstDecl | _: ValDecl =>
         false
       case _ => true
     }
@@ -265,6 +281,40 @@ class Analyzer private (units: List[Program])
           })
         (s, stmts)
   }
+
+  // --- module-level `val`s --------------------------------------------------------------
+
+  /** Analyzes one module-level `val` to the storage it lays down.
+   *
+   * The initializer is read at the declared type, so an element written `0x428a2f98` in a `[64]u32`
+   * needs no suffix — the same courtesy a `const` gets from writing its type, for the same reason.
+   */
+  private def analyzeVal(key: String): TVal = inDecl(key)(at(valDecls(key).pos) {
+    val decl = valDecls(key)
+    val ty   = valType(key)
+    val init = analyzeExpr(decl.value, Some(ty))
+
+    if init.ty != ty then
+      err(s"cannot initialize '${qn(key)}': declared ${show(ty)} but the value is ${show(init.ty)}")
+    checkStatic(init, key)
+    TVal(key, ty, init)
+  })
+
+  /** Holds a `val`'s initializer to being a value the object file can carry as it stands.
+   *
+   * Storage that exists before anything runs must have something to be laid down *as*, and a
+   * constant tree is the only thing that qualifies: numbers, and arrays built from them. Everything
+   * outside that set needs code to run before `main` and a rule for what order those run in, which
+   * is the extension a computed table will ask for and not a gap in this one.
+   */
+  private def checkStatic(t: TExpr, key: String): Unit = t match
+    case _: TIntLit | _: TFloatLit | _: TBoolLit => ()
+    case TArrayLit(elems, _)                     => elems.foreach(checkStatic(_, key))
+    case TArrayFill(value, _)                    => checkStatic(value, key)
+    case other =>
+      at(other.pos.orElse(valDecls(key).pos))(err(
+        s"the value of '${qn(key)}' is not a constant: a 'val' is laid down before anything runs, " +
+          "so its value must be a number, or an array of them"))
 
   // --- names reached through a module ---------------------------------------------------
 
@@ -602,7 +652,12 @@ class Analyzer private (units: List[Program])
               // belongs is the same mismatch a `usize` variable would be, not a silent adaptation.
               constKey(name) match
                 case Some(key) => analyzeExpr(constLiteral(key), Some(constType(key)))
-                case None      => err(s"undefined name '${qn(name)}'")
+                // A `val` is the other half of that: nothing is folded, because it is storage. The
+                // name reaches the storage itself, which is why it can be indexed and iterated.
+                case None =>
+                  valKey(name) match
+                    case Some(key) => TGlobal(key, valType(key))
+                    case None      => err(s"undefined name '${qn(name)}'")
 
     case Binary(op @ ("&&" | "||"), l, r) =>
       TLogical(op, analyzeBool(l), analyzeBool(r))
@@ -848,6 +903,15 @@ class Analyzer private (units: List[Program])
       if !inclusive && hi.isEmpty then err("an open-ended slice is written 'a[lo..]'")
 
       val tr = analyzeExpr(receiver)
+
+      // A `[]T` permits writes and records nothing about where its elements came from, so a view of
+      // a `val` would be a way of writing one. Refused outright rather than allowed and policed,
+      // since the view outlives the expression that made it: what this wants is a read-only slice
+      // type, and that is a decision about `07`'s view types rather than about `val`.
+      if readOnly(tr) then
+        err("a 'val' cannot be sliced: a slice permits writes and does not record whose elements it " +
+          "views, so the view would be a way of writing one")
+
       val elem = tr.ty match
         case Type.Ref(Type.Array(_, e), false) => e
         case Type.Ref(Type.Array(_, _), true) =>
@@ -1012,6 +1076,7 @@ class Analyzer private (units: List[Program])
    */
   protected def isPlace(t: TExpr): Boolean = t match
     case _: TLoad           => true
+    case _: TGlobal         => true
     case _: TDeref          => true
     case TField(recv, _, _) => isPlace(recv)
     // A slice's elements live wherever its owner keeps them, so they have an address even when
@@ -1034,9 +1099,30 @@ class Analyzer private (units: List[Program])
         err("a string is immutable, so its bytes have no address to write through")
       case _ =>
         if !isPlace(t) then err(s"$what needs a variable, a field, or a dereference — something with an address")
+        // A `val` has an address, which is the whole difference between it and a `const` — what it
+        // does not have is a writable one. `&` is refused along with assignment because a `*T` is a
+        // licence to write, and handing one out would make the promise unkeepable one step away
+        // from where it was written.
+        if readOnly(t) then err(s"a 'val' is written once, so $what has nothing to write through")
 
     t
   }
+
+  /** Whether a place bottoms out in something bound by a `val` — either a module-level one or a
+   * local. Reaching *into* one keeps the property: an element of a read-only array is read-only,
+   * and so is a field of a read-only struct.
+   */
+  protected def readOnly(t: TExpr): Boolean = t match
+    case _: TGlobal         => true
+    case TLoad(name, _)     => readOnlyLocals(name)
+    case TField(recv, _, _) => readOnly(recv)
+    // Only where the elements are the receiver's own storage. A slice's are somebody else's, and
+    // whose they are is exactly what a slice does not record.
+    case TIndex(recv, _, _) =>
+      recv.ty match
+        case _: Type.View => false
+        case _            => readOnly(recv)
+    case _ => false
 
   /** One level of automatic dereference, so a field is selected through a `*T` or a `&T`
    * exactly as it is on the value itself. One level only: reaching through a `**T` is written.

@@ -268,9 +268,9 @@ case class ImportDecl(path: List[String], selectors: List[ImportSelector] = Nil,
  */
 case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr]) extends Stmt
 
-/** `const name: type = value` — a **module member**, and the one kind of module-level binding there
- * is (`13 §7`). It is what a top-level `var` is not: hoisted, order-free, and visible beyond its
- * file under the ordinary rules, where a `var` at the top of a file is a local of the entry point.
+/** `const name: type = value` — a **module member** (`13 §7`). It is what a top-level `var` is not:
+ * hoisted, order-free, and visible beyond its file under the ordinary rules, where a `var` at the
+ * top of a file is a local of the entry point.
  *
  * The type is written rather than inferred because `13 §2`'s "anything visible outside its file
  * states its types" is what keeps interface extraction parse-only, and this is the first
@@ -281,6 +281,27 @@ case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr]) exten
  * initialization order and why an array bound may name one.
  */
 case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = Visibility.Public) extends Stmt
+
+/** `val name [: type] = value` — a binding written once and never assigned to.
+ *
+ * One keyword, read at two levels, because it is one idea at both. Written at the top of a file it
+ * is a **module member**: storage the program owns for its whole run, initialized before anything
+ * runs, and read-only. Written inside a block it is a **local** — the immutable counterpart of
+ * `var`, in the same frame with the same lifetime, differing only in that it may not be assigned
+ * to again.
+ *
+ * What separates it from a `const` is an **address**. A constant is folded into every use and has
+ * no storage at all, which is what lets an array bound name one; a `val` is a thing that sits
+ * somewhere, so it may be indexed, iterated, and — once the type system can say "read-only view" —
+ * sliced. The rule for a reader is short: if it has to be indexed, pointed at, or is bigger than a
+ * scalar, it is a `val`.
+ *
+ * The type is optional in the syntax and required by the analyzer at module level, where `13 §2`'s
+ * "anything visible outside its file states its types" applies. A local states nothing to anyone,
+ * so it infers exactly as a `var` does.
+ */
+case class ValDecl(name: String, typ: Option[TypeRef], value: Expr, vis: Visibility = Visibility.Public)
+    extends Stmt
 
 case class ExprStmt(expr: Expr)                                    extends Stmt
 

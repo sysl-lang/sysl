@@ -333,6 +333,19 @@ trait AnalyzerBase {
    */
   protected val constDecls = mutable.LinkedHashMap.empty[String, ConstDecl]
 
+  /** Declared module-level `val`s by key (`13 §7`). Unlike a constant, this one reaches codegen: it
+   * is storage, and every use of it is a read through an address rather than a copy of a literal.
+   */
+  protected val valDecls = mutable.LinkedHashMap.empty[String, ValDecl]
+
+  /** The unique names of locals that were bound by a `val`, so an assignment to one can be refused.
+   *
+   * A set of the names codegen uses rather than a flag on the scope entry, because the check has to
+   * run on an already-analyzed `TLoad`, which carries the unique name and not the source one. It is
+   * cleared with the rest of a function's naming state.
+   */
+  protected val readOnlyLocals = mutable.HashSet.empty[String]
+
   /** Declared traits by name. A trait is a set of method signatures a type opts into through an
    * explicit `impl`; nothing conforms structurally.
    */
@@ -1073,6 +1086,7 @@ trait AnalyzerBase {
 
   protected def resetFunction(): Unit = {
     used.clear()
+    readOnlyLocals.clear()
     scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
     importStack = List(Imports.empty)
     loops = Nil
@@ -1091,6 +1105,13 @@ trait AnalyzerBase {
   protected def declare(name: String, ty: Type): String = {
     val unique = freshName(name)
     scopes.head(name) = (unique, ty)
+    unique
+  }
+
+  /** Binds a name that may not be assigned to again — what a local `val` declares. */
+  protected def declareReadOnly(name: String, ty: Type): String = {
+    val unique = declare(name, ty)
+    readOnlyLocals += unique
     unique
   }
 
