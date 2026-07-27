@@ -1,0 +1,342 @@
+// A compiler for a small language and a machine that runs what it emits, over one shared
+// instruction set.
+//
+// The axis this owns is **the module system**, and it is the only program in the set with an
+// **end-to-end assertion**: source text goes in, the compiler emits bytecode, the machine runs it,
+// and what it printed is compared against what the program should print. No golden file stands in
+// the middle, and the one place an intermediate form is inspected is the section that is about the
+// intermediate form.
+//
+// Three modules, and the shape of them is the point. `isa` is what the other two agree on — the
+// opcodes, the buffer a program is emitted into, and how to read one back. `compiler` and `vm` each
+// depend on it and neither depends on the other, which is a DAG rather than a rule anybody had to
+// remember. `compiler` is two files because it grew to two, and nothing about either of them says
+// so: they name each other's declarations with no ordering and no forward declaration, which is
+// what a module being a *directory* buys.
+//
+// What writing it turned up, in the order it bit:
+//
+//   * **A simple enum narrower than `int` could not be matched at all.** `enum Op: u8` is the
+//     natural way to write an instruction set — the opcode *is* a byte — and every `match` on one
+//     emitted a comparison at the wrong width, which the assembler refused. A compiler bug rather
+//     than a language one, found by the first program that wanted a narrow enum for the reason
+//     narrow enums exist, fixed at the source, and now covered by tests at `i8`, `u8`, and `u16`.
+//   * **`Result[unit, E]` cannot be written**, and a compiler front end is *all* valueless fallible
+//     steps. Every parse step here emits code and yields nothing, so every one of them says
+//     `Result[bool, Fault]` with a `bool` that means nothing — the placeholder payload that keeps
+//     `?` working. The alternative, an `Option[Fault]` error-only channel, is three lines at every
+//     call site instead of a `?`. `00 §12` names the cost; this is what it costs.
+//   * **An assignment is an expression, so a two-branch `if` whose branches each end in one is
+//     checked as though those were its result.** The `unit`-branch rule saves the case where one
+//     side is a statement, and saves nothing where both sides assign — `full = true` against
+//     `len += 1` is a `bool` against a `usize`. This sharpens what the hash map found about
+//     `match`: the trouble is not that `match` lacks a rule `if` has, it is that assignment is an
+//     expression and any two-armed form inherits that.
+//   * **A line cannot be continued.** There is no trailing-operator continuation, so a condition
+//     that outgrows its line becomes a sequence of early returns rather than one expression — see
+//     the lexer's table of single-character symbols.
+//   * **The machine cannot say the one thing it was written to be.** `run` allocates nothing, on
+//     purpose, and `no alloc` under a `module` header is a parse error: the capability clause is
+//     specified and unbuilt. The property holds by construction and by reading, and nothing checks
+//     it — which is exactly the gap a capability is for.
+//   * **Coverage is not computed through a nested pattern.** `Some(Halt)` and `Some(Push)` and
+//     `None` cover an `Option[Op]` between them, and the analyzer asks for an `else` anyway.
+//
+// What went in without friction, which is worth as much: every import form works and none of them
+// was needed to *reach* anything — a fully-qualified path already does, so an import is only ever
+// shortening. `private` for a file's own helpers and `private[compiler]` for what its sibling file
+// needs are the two levels this program actually wanted, and they were the two on offer.
+
+// The checks. Every line of output begins `ok`, so the whole of stdout is the assertion.
+
+// A program that runs to a halt, and the values it printed in order.
+runs(label: string, src: string, want: string)
+    var out: [32]int
+
+    compiler.compile(src) match
+        Err(f) -> print(s"FAIL  $label -> ${compiler.describe(f)}")
+        Ok(c) ->
+            vm.run(c, out[..]) match
+                Err(t) -> print(s"FAIL  $label -> ${vm.describe(t)}")
+                Ok(n) ->
+                    var got = joined(out[..], n)
+
+                    if got == want then print(s"ok    $label -> $got")
+                    else print(s"FAIL  $label -> $got")
+end runs
+
+// A program the compiler will not accept, and what it says about it.
+refuses(label: string, src: string, want: string)
+    compiler.compile(src) match
+        Ok(c) -> print(s"FAIL  $label compiled")
+        Err(f) ->
+            var got = compiler.describe(f)
+
+            if got == want then print(s"ok    $label -> $got")
+            else print(s"FAIL  $label -> $got")
+end refuses
+
+// A program the compiler accepts and the machine stops.
+stops(label: string, src: string, want: string)
+    var out: [32]int
+
+    compiler.compile(src) match
+        Err(f) -> print(s"FAIL  $label -> ${compiler.describe(f)}")
+        Ok(c) ->
+            vm.run(c, out[..]) match
+                Ok(n) -> print(s"FAIL  $label ran to a halt")
+                Err(t) ->
+                    var got = vm.describe(t)
+
+                    if got == want then print(s"ok    $label -> $got")
+                    else print(s"FAIL  $label -> $got")
+end stops
+
+// Bytecode written by hand rather than compiled — which is the only way to ask what the machine
+// does with a program no compiler would have produced.
+rejects(label: string, c: &isa.Chunk, want: string)
+    var out: [8]int
+
+    vm.run(c, out[..]) match
+        Ok(n) -> print(s"FAIL  $label ran to a halt")
+        Err(t) ->
+            var got = vm.describe(t)
+
+            if got == want then print(s"ok    $label -> $got")
+            else print(s"FAIL  $label -> $got")
+end rejects
+
+listing(label: string, src: string, want: string)
+    compiler.compile(src) match
+        Err(f) -> print(s"FAIL  $label -> ${compiler.describe(f)}")
+        Ok(c) ->
+            var got = isa.disassemble(c)
+
+            if got == want then print(s"ok    $label")
+            else print(s"FAIL  $label\n$got")
+end listing
+
+same(label: string, got: string, want: string)
+    if got == want then print(s"ok    $label -> $got")
+    else print(s"FAIL  $label -> $got")
+end same
+
+// A four-byte immediate is written and read back by two different pieces of code, so a program
+// that means one number and runs another would go unnoticed anywhere except here.
+immediate(n: int)
+    var c = isa.Chunk.empty()
+
+    c.op(isa.Op.Push)
+    c.imm(n)
+
+    var got = c.imm_at(1usize)
+
+    if got == n then print(s"ok    an immediate survives the code stream: $n")
+    else print(s"FAIL  an immediate survives the code stream: $n -> $got")
+end immediate
+
+private joined(out: []int, n: usize) -> string
+    var s = ""
+    var i = 0usize
+
+    while i < n
+        if i > 0usize then s += " "
+        s += str(out[i])
+        i += 1usize
+
+    s
+end joined
+
+print("-- expressions")
+runs("multiplication binds tighter than addition", "print 2 + 3 * 4;", "14")
+runs("and than subtraction", "print 20 - 2 * 3;", "14")
+runs("addition associates to the left", "print 20 - 4 - 3;", "13")
+runs("division associates to the left", "print 100 / 5 / 2;", "10")
+runs("parentheses override precedence", "print (2 + 3) * 4;", "20")
+runs("the remainder operator", "print 17 % 5;", "2")
+runs("division truncates toward zero", "print -7 / 2;", "-3")
+runs("unary minus binds tighter than addition", "print -3 + 1;", "-2")
+runs("and applies to itself", "print - -3;", "3")
+runs("comparison binds loosest of all", "print 1 + 2 < 4;", "1")
+runs("a comparison answers one or zero", "print 3 < 2;", "0")
+runs("every comparison the machine has", "print 1 < 2; print 2 <= 2; print 3 > 4; print 4 >= 4; print 5 == 5; print 5 != 5;", "1 1 0 1 1 0")
+
+print("-- variables")
+runs("a name reads back what it was given", "var x = 5;\nprint x;", "5")
+runs("and can be assigned again", "var x = 5;\nx = x + 1;\nprint x;", "6")
+runs("several names live at once", "var a = 1;\nvar b = 2;\nprint a + b;\nprint a * b;", "3 2")
+runs("a comment and the whitespace around it carry nothing", "# a program\nvar x = 1; # a name\nprint x;\n", "1")
+
+print("-- control flow")
+runs("a taken branch", "var x = 3;\nif x > 2 { print 1; }\n", "1")
+runs("an untaken branch falls through", "var x = 1;\nif x > 2 { print 1; }\nprint 9;\n", "9")
+runs("an else runs when the condition is false", "var x = 1;\nif x > 2 { print 1; } else { print 2; }\n", "2")
+runs("an else is skipped when it is true", "var x = 3;\nif x > 2 { print 1; } else { print 2; }\n", "1")
+runs("a loop runs until its condition fails", "var i = 0;\nwhile i < 3 { print i; i = i + 1; }\n", "0 1 2")
+runs("a loop whose condition starts false runs not at all", "var i = 5;\nwhile i < 3 { print i; }\nprint 8;\n", "8")
+
+print("-- programs")
+runs("the first ten Fibonacci numbers",
+     "var n = 10;\nvar a = 0;\nvar b = 1;\nwhile n > 0 {\n  print a;\n  var t = a + b;\n  a = b;\n  b = t;\n  n = n - 1;\n}\n",
+     "0 1 1 2 3 5 8 13 21 34")
+runs("the greatest common divisor of 84 and 36",
+     "var a = 84;\nvar b = 36;\nwhile b != 0 {\n  var t = b;\n  b = a % b;\n  a = t;\n}\nprint a;\n",
+     "12")
+runs("ten factorial",
+     "var n = 1;\nvar i = 1;\nwhile i <= 10 {\n  n = n * i;\n  i = i + 1;\n}\nprint n;\n",
+     "3628800")
+runs("every prime below twenty",
+     "var n = 2;\nwhile n < 20 {\n  var d = 2;\n  var prime = 1;\n  while d * d <= n {\n    if n % d == 0 { prime = 0; }\n    d = d + 1;\n  }\n  if prime == 1 { print n; }\n  n = n + 1;\n}\n",
+     "2 3 5 7 11 13 17 19")
+runs("the length of the Collatz sequence from 27",
+     "var n = 27;\nvar steps = 0;\nwhile n != 1 {\n  if n % 2 == 0 { n = n / 2; } else { n = 3 * n + 1; }\n  steps = steps + 1;\n}\nprint steps;\n",
+     "111")
+runs("a loop inside a loop",
+     "var i = 1;\nvar total = 0;\nwhile i <= 3 {\n  var j = 1;\n  while j <= 3 {\n    total = total + i * j;\n    j = j + 1;\n  }\n  i = i + 1;\n}\nprint total;\n",
+     "36")
+
+print("-- the instruction set")
+immediate(0)
+immediate(1)
+immediate(-1)
+immediate(127)
+immediate(128)
+immediate(-128)
+immediate(65535)
+immediate(2147483647)
+immediate(-2147483647)
+same("an instruction with an immediate is five bytes", str(isa.width(isa.Op.Push)), "5")
+same("one with a slot is two", str(isa.width(isa.Op.Store)), "2")
+same("one with a jump target is three", str(isa.width(isa.Op.Jz)), "3")
+same("one with no operand is one", str(isa.width(isa.Op.Add)), "1")
+same("and every opcode has a mnemonic", isa.name(isa.Op.Jmp) + " " + isa.name(isa.Op.Neg), "jmp neg")
+
+print("-- what the compiler emits")
+listing("a straight-line program",
+        "var x = 2;\nprint x * 3;\n",
+        "0000  push  2\n0005  store 0\n0007  load  0\n0009  push  3\n0014  mul\n0015  print\n0016  halt\n")
+listing("a loop, whose jumps are patched once their targets exist",
+        "var i = 0;\nwhile i < 2 { print i; i = i + 1; }\n",
+        "0000  push  0\n0005  store 0\n0007  load  0\n0009  push  2\n0014  lt\n0015  jz    0034\n0018  load  0\n0020  print\n0021  load  0\n0023  push  1\n0028  add\n0029  store 0\n0031  jmp   0007\n0034  halt\n")
+listing("a branch, where the consequence jumps over the alternative",
+        "var x = 1;\nif x { print 2; } else { print 3; }\n",
+        "0000  push  1\n0005  store 0\n0007  load  0\n0009  jz    0021\n0012  push  2\n0017  print\n0018  jmp   0027\n0021  push  3\n0026  print\n0027  halt\n")
+
+print("-- source the compiler refuses")
+refuses("a name that was never declared", "print x;", "undefined 'x' at 6")
+refuses("a name declared twice", "var x = 1; var x = 2;", "'x' declared twice at 15")
+refuses("a name read by its own initializer", "var x = x;", "undefined 'x' at 8")
+refuses("an assignment to a name that does not exist", "x = 1;", "undefined 'x' at 0")
+refuses("a statement with no semicolon", "print 1", "';' expected at 7")
+refuses("a value that is not there", "print ;", "a value expected at 6")
+refuses("an assignment with nothing on the right", "var x = 1; x = ;", "a value expected at 15")
+refuses("a declaration of something that is not a name", "var 1 = 2;", "a name expected at 4")
+refuses("a keyword used as a name", "var if = 1;", "a name expected at 4")
+refuses("a chained comparison", "print 1 < 2 < 3;", "';' expected at 12")
+refuses("an unclosed parenthesis", "print (1;", "')' expected at 8")
+refuses("an unclosed block", "while 1 { print 1;", "'}' expected at 18")
+refuses("a character the language has no use for", "@", "an unexpected character '@' at 0")
+refuses("a number the machine could not hold", "print 1234567890123;", "a number too large for the machine at 6")
+
+print("-- bytecode the machine refuses")
+rejects("a byte that is no opcode", junk(), "no such opcode at 0")
+rejects("an instruction that runs off the end", truncated(), "an instruction runs past the end at 0")
+rejects("a jump to nowhere", wild_jump(), "a jump out of the program at 0")
+rejects("a slot the program never declared", wild_slot(), "no such variable at 0")
+rejects("an operator with nothing under it", bare_add(), "the stack is empty at 0")
+rejects("more values than the stack holds", too_deep(), "the stack is full at 320")
+rejects("a program with no halt in it", no_halt(), "the program ran off the end at 6")
+
+print("-- programs the machine stops")
+stops("a division by zero", "print 1 / 0;", "a division by zero at 10")
+stops("a remainder by zero", "print 5 % 0;", "a division by zero at 10")
+stops("a loop that never ends", "while 1 { }", "the program did not finish")
+stops("more output than there is room for", "var i = 0;\nwhile i < 40 { print i; i = i + 1; }\n", "no room left for output at 20")
+
+print("-- limits")
+refuses("more names than the machine has slots", many_names(), "too many variables at 452")
+refuses("more code than the chunk holds", long_program(), "the program is longer than the machine will hold")
+
+// The hand-written programs. Each one is a chunk the compiler would never emit, built through the
+// same interface the compiler uses.
+junk() -> &isa.Chunk
+    var c = isa.Chunk.empty()
+
+    c.byte(200u8)
+    c
+end junk
+
+truncated() -> &isa.Chunk
+    var c = isa.Chunk.empty()
+
+    c.op(isa.Op.Push)
+    c
+end truncated
+
+wild_jump() -> &isa.Chunk
+    var c = isa.Chunk.empty()
+
+    c.op(isa.Op.Jmp)
+    c.target(400usize)
+    c
+end wild_jump
+
+wild_slot() -> &isa.Chunk
+    var c = isa.Chunk.empty()
+
+    c.op(isa.Op.Load)
+    c.slot(0usize)
+    c
+end wild_slot
+
+bare_add() -> &isa.Chunk
+    var c = isa.Chunk.empty()
+
+    c.op(isa.Op.Add)
+    c
+end bare_add
+
+too_deep() -> &isa.Chunk
+    var c = isa.Chunk.empty()
+    var i = 0
+
+    while i < 65
+        c.op(isa.Op.Push)
+        c.imm(1)
+        i += 1
+
+    c
+end too_deep
+
+no_halt() -> &isa.Chunk
+    var c = isa.Chunk.empty()
+
+    c.op(isa.Op.Push)
+    c.imm(1)
+    c.op(isa.Op.Print)
+    c
+end no_halt
+
+// Every name is the same length, so the position the diagnostic reports is arithmetic rather than
+// a guess.
+many_names() -> string
+    var src = ""
+    var i = 100
+
+    while i < 133
+        src += s"var a$i = 0;\n"
+        i += 1
+
+    src
+end many_names
+
+long_program() -> string
+    var src = ""
+    var i = 0
+
+    while i < 100
+        src += "print 1;\n"
+        i += 1
+
+    src
+end long_program

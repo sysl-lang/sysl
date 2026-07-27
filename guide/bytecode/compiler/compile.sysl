@@ -1,0 +1,379 @@
+// A compiler for a small imperative language, emitting the bytecode `isa` defines.
+//
+// The language is deliberately not a second parser exercise. It has integer arithmetic with
+// precedence, a `var` declaration, assignment, `print`, `if`/`else`, and `while` — enough that the
+// interesting parts are **precedence, a symbol table, and code generation**, and no more:
+//
+//     var n = 10;
+//     var a = 0;
+//     var b = 1;
+//     while n > 0 {
+//         print a;
+//         var t = a + b;      # a name is declared once and lives for the whole program
+//         a = b;
+//         b = t;
+//         n = n - 1;
+//     }
+//
+// Parsing and emitting happen in one pass. There is no tree: a `sum` emits its left operand, then
+// its right, then the opcode that combines them, which is the shape a stack machine wants anyway.
+// The one thing a single pass cannot know is where a jump lands, so a jump is emitted with a zero
+// target and patched once the code it skips exists.
+
+module compiler
+import isa.{Chunk, Op}
+
+// What can go wrong before the program runs.
+enum Fault
+    Bad(at: usize, why: string)
+    Expected(at: usize, what: string)
+    Undefined(at: usize, name: string)
+    Redefined(at: usize, name: string)
+    TooManyNames(at: usize)
+    TooLong
+end Fault
+
+describe(f: Fault) -> string
+    f match
+        Bad(at, why) -> s"$why at $at"
+        Expected(at, what) -> s"$what expected at $at"
+        Undefined(at, name) -> s"undefined '$name' at $at"
+        Redefined(at, name) -> s"'$name' declared twice at $at"
+        TooManyNames(at) -> s"too many variables at $at"
+        TooLong -> "the program is longer than the machine will hold"
+end describe
+
+compile(src: string) -> Result[&Chunk, Fault]
+    var p = Parser(Lexer.of(src), End, 0usize, Chunk.empty(), None, 0usize)
+
+    p.advance()
+    p.program()?
+
+    // Emitting never fails a statement at a time; a chunk that filled up says so once, here.
+    if p.chunk.full then return Err(TooLong)
+    Ok(p.chunk)
+end compile
+
+// A name and the machine slot it stands for, held as a list because a table that grew would need a
+// growable collection to grow into. For a program that may name thirty-two variables a walk is
+// also the right implementation, which is the happier reason.
+private struct Slot
+    name: string
+    at: usize
+    rest: Option[&Slot]
+end Slot
+
+private keyword(w: string) -> bool =
+    w == "var" || w == "print" || w == "if" || w == "else" || w == "while"
+
+// The parser is file-private: it is how this file does its work, not part of what the module
+// offers. `Lexer` beside it is `private[compiler]`, which is the module-wide level — the one the
+// other file needs and importers still do not get.
+//
+// **Every step below returns `Result[bool, Fault]`, and the `bool` means nothing.** A parse step
+// emits code and yields no value, so what it wants to say is `Result[unit, Fault]` — which cannot
+// be written, because `unit` is not a layout and so is not a type argument (`00 §12`). The choice
+// is a placeholder payload, kept here so that `?` still chains the failures, or an `Option[Fault]`
+// error-only channel, which `?` does not reach and which turns every one of these call sites into
+// three lines. This is the program in the set where that gap is felt on every line.
+private struct Parser
+    lex: Lexer
+    tok: Tok
+    at: usize
+    chunk: &Chunk
+    names: Option[&Slot]
+    nslots: usize
+
+    advance(*self)
+        self.tok = self.lex.next()
+        self.at = self.lex.start
+    end advance
+
+    at_end(self) -> bool
+        self.tok match
+            End -> true
+            else -> false
+    end at_end
+
+    at_sym(self, s: string) -> bool
+        self.tok match
+            Sym(x) -> x == s
+            else -> false
+    end at_sym
+
+    at_word(self, w: string) -> bool
+        self.tok match
+            Word(x) -> x == w
+            else -> false
+    end at_word
+
+    eat_sym(*self, s: string) -> bool
+        if !self.at_sym(s) then return false
+        self.advance()
+        true
+    end eat_sym
+
+    eat_word(*self, w: string) -> bool
+        if !self.at_word(w) then return false
+        self.advance()
+        true
+    end eat_word
+
+    need_sym(*self, s: string) -> Result[bool, Fault]
+        if self.eat_sym(s) then Ok(true)
+        else Err(self.fault(s"'$s'"))
+    end need_sym
+
+    // A token the lexer already had an opinion about reports the lexer's complaint. Saying "a
+    // value expected" about a character that is not in the language would be true and useless.
+    fault(self, what: string) -> Fault
+        self.tok match
+            Junk(why) -> Bad(self.at, why)
+            else -> Expected(self.at, what)
+    end fault
+
+    // ------------------------------------------------------------------------- the symbol table
+
+    lookup(self, n: string) -> Option[usize]
+        var at = self.names
+
+        loop
+            at match
+                None -> break None
+                Some(s) ->
+                    if s.name == n then break Some(s.at)
+                    at = s.rest
+    end lookup
+
+    declare(*self, n: string, where: usize) -> Result[usize, Fault]
+        if self.lookup(n).is_some() then return Err(Redefined(where, n))
+        if self.nslots >= isa.max_slots() then return Err(TooManyNames(where))
+
+        var s: &Slot = Slot(n, self.nslots, self.names)
+
+        self.names = Some(s)
+        self.nslots += 1usize
+        self.chunk.slots = self.nslots
+        Ok(self.nslots - 1usize)
+    end declare
+
+    // ---------------------------------------------------------------------------- the statements
+
+    program(*self) -> Result[bool, Fault]
+        while !self.at_end()
+            self.statement()?
+
+        self.chunk.op(Op.Halt)
+        Ok(true)
+    end program
+
+    statement(*self) -> Result[bool, Fault]
+        if self.eat_word("var") then self.declaration()
+        else if self.eat_word("print") then self.print_stmt()
+        else if self.eat_word("if") then self.if_stmt()
+        else if self.eat_word("while") then self.while_stmt()
+        else self.assignment()
+    end statement
+
+    // The name is declared **after** its initializer is compiled, so `var x = x;` is the
+    // undefined name it reads as rather than a variable quietly initialized from itself.
+    declaration(*self) -> Result[bool, Fault]
+        var where = self.at
+        var n = self.need_name()?
+
+        self.need_sym("=")?
+        self.expr()?
+        self.need_sym(";")?
+
+        var slot = self.declare(n, where)?
+
+        self.chunk.op(Op.Store)
+        self.chunk.slot(slot)
+        Ok(true)
+    end declaration
+
+    assignment(*self) -> Result[bool, Fault]
+        var where = self.at
+        var n = self.need_name()?
+
+        self.need_sym("=")?
+        self.expr()?
+        self.need_sym(";")?
+
+        self.lookup(n) match
+            None -> Err(Undefined(where, n))
+            Some(slot) ->
+                self.chunk.op(Op.Store)
+                self.chunk.slot(slot)
+                Ok(true)
+    end assignment
+
+    print_stmt(*self) -> Result[bool, Fault]
+        self.expr()?
+        self.need_sym(";")?
+        self.chunk.op(Op.Print)
+        Ok(true)
+    end print_stmt
+
+    // The conditional jump over the consequence is emitted before the consequence exists, so its
+    // target is written as a zero and corrected once there is somewhere to land. An `else` needs a
+    // second jump, over the alternative, for the consequence to leave by.
+    if_stmt(*self) -> Result[bool, Fault]
+        self.expr()?
+        self.chunk.op(Op.Jz)
+
+        var over_then = self.chunk.here()
+
+        self.chunk.target(0usize)
+        self.block()?
+
+        if self.eat_word("else")
+            self.chunk.op(Op.Jmp)
+
+            var over_else = self.chunk.here()
+
+            self.chunk.target(0usize)
+            self.chunk.patch(over_then, self.chunk.here())
+            self.block()?
+            self.chunk.patch(over_else, self.chunk.here())
+        else
+            self.chunk.patch(over_then, self.chunk.here())
+
+        Ok(true)
+    end if_stmt
+
+    // A loop tests at the top and jumps back to the test, so the condition is compiled where it
+    // will be re-entered and its address is the only one known before the body exists.
+    while_stmt(*self) -> Result[bool, Fault]
+        var top = self.chunk.here()
+
+        self.expr()?
+        self.chunk.op(Op.Jz)
+
+        var out = self.chunk.here()
+
+        self.chunk.target(0usize)
+        self.block()?
+        self.chunk.op(Op.Jmp)
+        self.chunk.target(top)
+        self.chunk.patch(out, self.chunk.here())
+        Ok(true)
+    end while_stmt
+
+    block(*self) -> Result[bool, Fault]
+        self.need_sym("{")?
+        while !self.at_sym("}")
+            if self.at_end() then return Err(Expected(self.at, "'}'"))
+            self.statement()?
+
+        self.advance()
+        Ok(true)
+    end block
+
+    need_name(*self) -> Result[string, Fault]
+        var where = self.at
+
+        self.tok match
+            Word(w) ->
+                if keyword(w) then return Err(Expected(where, "a name"))
+                self.advance()
+                Ok(w)
+            else -> Err(self.fault("a name"))
+    end need_name
+
+    // -------------------------------------------------------------------------- the expressions
+
+    // Comparison binds loosest and does not chain: `a < b < c` is a mistake caught here rather
+    // than a pair of comparisons whose middle operand means something surprising.
+    expr(*self) -> Result[bool, Fault]
+        self.sum()?
+
+        self.compare_op() match
+            None -> Ok(true)
+            Some(code) ->
+                self.advance()
+                self.sum()?
+                self.chunk.op(code)
+                Ok(true)
+    end expr
+
+    compare_op(self) -> Option[Op]
+        self.tok match
+            Sym(s) ->
+                if s == "<" then Some(Op.Lt)
+                else if s == "<=" then Some(Op.Le)
+                else if s == ">" then Some(Op.Gt)
+                else if s == ">=" then Some(Op.Ge)
+                else if s == "==" then Some(Op.Eq)
+                else if s == "!=" then Some(Op.Ne)
+                else None
+            else -> None
+    end compare_op
+
+    sum(*self) -> Result[bool, Fault]
+        self.term()?
+
+        loop
+            if self.eat_sym("+")
+                self.term()?
+                self.chunk.op(Op.Add)
+            else if self.eat_sym("-")
+                self.term()?
+                self.chunk.op(Op.Sub)
+            else break
+
+        Ok(true)
+    end sum
+
+    term(*self) -> Result[bool, Fault]
+        self.unary()?
+
+        loop
+            if self.eat_sym("*")
+                self.unary()?
+                self.chunk.op(Op.Mul)
+            else if self.eat_sym("/")
+                self.unary()?
+                self.chunk.op(Op.Div)
+            else if self.eat_sym("%")
+                self.unary()?
+                self.chunk.op(Op.Mod)
+            else break
+
+        Ok(true)
+    end term
+
+    unary(*self) -> Result[bool, Fault]
+        if !self.eat_sym("-") then return self.primary()
+        self.unary()?
+        self.chunk.op(Op.Neg)
+        Ok(true)
+    end unary
+
+    primary(*self) -> Result[bool, Fault]
+        var where = self.at
+
+        self.tok match
+            Num(v) ->
+                self.advance()
+                self.chunk.op(Op.Push)
+                self.chunk.imm(v)
+                Ok(true)
+            Word(w) ->
+                if keyword(w) then return Err(Expected(where, "a value"))
+                self.advance()
+                self.lookup(w) match
+                    None -> Err(Undefined(where, w))
+                    Some(slot) ->
+                        self.chunk.op(Op.Load)
+                        self.chunk.slot(slot)
+                        Ok(true)
+            Sym(s) ->
+                if s != "(" then return Err(self.fault("a value"))
+                self.advance()
+                self.expr()?
+                self.need_sym(")")?
+                Ok(true)
+            else -> Err(self.fault("a value"))
+    end primary
+end Parser

@@ -532,6 +532,12 @@ work means zero-sized types (a `unit` field omitted from the layout, with every 
 it shifted), which is a layout feature and not a property of `unit`; it is recorded below rather
 than half-built.
 
+That cost is not evenly spread. A parser is the shape that pays it in full: every step consumes
+input and emits code, none of them yields a value, and all of them can fail — so `guide/bytecode`'s
+compiler writes `Result[bool, Fault]` throughout with a `bool` that means nothing, because the
+placeholder payload is what keeps `?` chaining the failures. An error-only `Option[Fault]` is the
+honest alternative and turns each of those call sites into three lines.
+
 ## Open at the basics level (not yet decided)
 
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
@@ -544,7 +550,10 @@ work:
   register payoff).
 - **Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`), and
   the exact trailing-continuation operator set. The *lexing* mechanics are settled by adopting
-  `IndentationLexical` (see `front-end.md`); these remaining pieces are grammar decisions.
+  `IndentationLexical` (see `front-end.md`); these remaining pieces are grammar decisions. Nothing
+  continues a line today, so an expression that outgrows its line has to become statements — see
+  the table of single-character symbols in `guide/bytecode`'s lexer, written as three early
+  returns for exactly that reason.
 - **Zero-sized types** (§12): whether a `unit` field is omitted from a layout rather than refused,
   which is what would let `Result[unit, E]` be written. It is a layout rule — a field the layout
   skips, with the indices behind it shifted, and the same question for a parameter dropped from a

@@ -1,0 +1,159 @@
+// The machine the compiler is aimed at: a stack of integers, a frame of variable slots, and a loop
+// that reads one byte and does what it says.
+//
+// **Nothing here allocates.** The stack, the frame, and the decoder's working values are locals of
+// `run`, and the one thing that would otherwise have to grow — the list of values the program
+// printed — is a buffer the caller supplies. That shape is not decoration: a dispatch loop is the
+// place where an allocator is least welcome, and writing the machine to need none is what the
+// module is chosen to demonstrate.
+//
+// What it cannot do is **say so**. A module's capability clause is where `no alloc` would be
+// written, and the clause is not yet built — a `no alloc` line under the `module` header is a
+// parse error today. So the property holds by construction and by reading, and nothing checks it.
+//
+// The machine does not trust the bytes it is given. Every opcode is decoded through the fallible
+// constructor, every operand is checked to lie inside the chunk, every push is checked against the
+// stack's height and every pop against its depth, and the whole run is bounded by a step budget so
+// that a program that loops forever ends as an error rather than as a hang. That is what makes a
+// hand-written chunk a thing this program can test rather than a way to crash it.
+
+module vm
+import isa
+
+enum Trap
+    BadOpcode(at: usize)
+    Truncated(at: usize)
+    BadJump(at: usize)
+    BadSlot(at: usize)
+    Overflow(at: usize)
+    Underflow(at: usize)
+    DivideByZero(at: usize)
+    Overrun(at: usize)
+    NoRoom(at: usize)
+    Runaway
+end Trap
+
+describe(t: Trap) -> string
+    t match
+        BadOpcode(at) -> s"no such opcode at $at"
+        Truncated(at) -> s"an instruction runs past the end at $at"
+        BadJump(at) -> s"a jump out of the program at $at"
+        BadSlot(at) -> s"no such variable at $at"
+        Overflow(at) -> s"the stack is full at $at"
+        Underflow(at) -> s"the stack is empty at $at"
+        DivideByZero(at) -> s"a division by zero at $at"
+        Overrun(at) -> s"the program ran off the end at $at"
+        NoRoom(at) -> s"no room left for output at $at"
+        Runaway -> "the program did not finish"
+end describe
+
+// How tall the stack is and how many steps a program may take. The stack's bound has to be written
+// as a literal where the array is declared, so these two say the same number twice — a module has
+// no constants for them to say it once.
+depth() -> usize = 64usize
+
+budget() -> int = 2000000
+
+// Runs a program, writing what it prints into `out` and answering with how many values that was.
+//
+// The output buffer is the caller's, which is what keeps the machine free of an allocator: a
+// program that prints more than the buffer holds is an error the caller can see and size for,
+// rather than a growable list the machine would have to own.
+run(c: &isa.Chunk, out: []int) -> Result[usize, Trap]
+    var stack: [64]int
+    var slots: [32]int
+    var sp = 0usize
+    var pc = 0usize
+    var n = 0usize
+    var fuel = budget()
+
+    loop
+        if fuel <= 0 then return Err(Runaway)
+        fuel -= 1
+        if pc >= c.len then return Err(Overrun(pc))
+
+        c.op_at(pc) match
+            None -> return Err(BadOpcode(pc))
+            Some(o) ->
+                if pc + isa.width(o) > c.len then return Err(Truncated(pc))
+
+                o match
+                    Halt -> return Ok(n)
+                    Push ->
+                        if sp >= depth() then return Err(Overflow(pc))
+                        stack[sp] = c.imm_at(pc + 1usize)
+                        sp += 1usize
+                        pc += 5usize
+                    Load ->
+                        if sp >= depth() then return Err(Overflow(pc))
+
+                        var i = c.slot_at(pc + 1usize)
+
+                        if i >= c.slots then return Err(BadSlot(pc))
+                        stack[sp] = slots[i]
+                        sp += 1usize
+                        pc += 2usize
+                    Store ->
+                        if sp < 1usize then return Err(Underflow(pc))
+
+                        var i = c.slot_at(pc + 1usize)
+
+                        if i >= c.slots then return Err(BadSlot(pc))
+                        sp -= 1usize
+                        slots[i] = stack[sp]
+                        pc += 2usize
+                    Print ->
+                        if sp < 1usize then return Err(Underflow(pc))
+                        if n >= out.len then return Err(NoRoom(pc))
+                        sp -= 1usize
+                        out[n] = stack[sp]
+                        n += 1usize
+                        pc += 1usize
+                    Neg ->
+                        if sp < 1usize then return Err(Underflow(pc))
+                        stack[sp - 1usize] = -stack[sp - 1usize]
+                        pc += 1usize
+                    Jmp ->
+                        var t = c.target_at(pc + 1usize)
+
+                        if t >= c.len then return Err(BadJump(pc))
+                        pc = t
+                    Jz ->
+                        if sp < 1usize then return Err(Underflow(pc))
+
+                        var t = c.target_at(pc + 1usize)
+
+                        if t >= c.len then return Err(BadJump(pc))
+                        sp -= 1usize
+                        if stack[sp] == 0 then pc = t
+                        else pc += 3usize
+
+                    // Everything left takes two values and leaves one, so the stack discipline is
+                    // written once here and the opcode only says what to compute.
+                    else ->
+                        if sp < 2usize then return Err(Underflow(pc))
+
+                        var v = apply(o, stack[sp - 2usize], stack[sp - 1usize], pc)?
+
+                        sp -= 1usize
+                        stack[sp - 1usize] = v
+                        pc += 1usize
+end run
+
+// A comparison answers 1 or 0, because the machine has one kind of value and `jz` is what reads
+// the answer.
+private apply(o: isa.Op, a: int, b: int, at: usize) -> Result[int, Trap]
+    o match
+        Add -> Ok(a + b)
+        Sub -> Ok(a - b)
+        Mul -> Ok(a * b)
+        Div -> if b == 0 then Err(DivideByZero(at)) else Ok(a / b)
+        Mod -> if b == 0 then Err(DivideByZero(at)) else Ok(a % b)
+        Lt -> Ok(if a < b then 1 else 0)
+        Le -> Ok(if a <= b then 1 else 0)
+        Gt -> Ok(if a > b then 1 else 0)
+        Ge -> Ok(if a >= b then 1 else 0)
+        Eq -> Ok(if a == b then 1 else 0)
+        Ne -> Ok(if a != b then 1 else 0)
+        else -> Err(BadOpcode(at))
+end apply

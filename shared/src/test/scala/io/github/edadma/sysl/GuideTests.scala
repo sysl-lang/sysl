@@ -54,4 +54,25 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- emptying",
     )
   }
+
+  // The only guide program of more than one module, and the only one whose assertion is end to
+  // end: source text in, bytecode out, the machine runs it, and what it printed is compared.
+  "bytecode — a compiler and a machine over one instruction set" in {
+    val out = guide("bytecode")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 72
+    sections(out) shouldBe List(
+      "-- expressions",
+      "-- variables",
+      "-- control flow",
+      "-- programs",
+      "-- the instruction set",
+      "-- what the compiler emits",
+      "-- source the compiler refuses",
+      "-- bytecode the machine refuses",
+      "-- programs the machine stops",
+      "-- limits",
+    )
+  }
 }
