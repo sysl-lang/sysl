@@ -231,6 +231,19 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // The expected type is a written type and a literal is not, so it outranks one here for the
     // same reason a suffixed argument does — which is what lets a binding say what a call of
     // nothing but literals should have been.
+    "a negated literal adapts like the one it negates" in {
+      run("""pair[T: Add](a: T, b: T) -> T = a + b
+            |print(pair(-5, 100i8), pair(-2.5, 1.0f32))
+            |""".stripMargin) shouldBe "95 -1.5\n"
+    }
+
+    "the type may come from inside another parameter's" in {
+      run("""nth[T](xs: []T, i: usize, fallback: T) -> T = if i < xs.len then xs[i] else fallback
+            |var ns: [3]u16 = [10, 20, 30]
+            |print(nth(ns[..], 1, 99), nth(ns[..], 7, 99))
+            |""".stripMargin) shouldBe "20 99\n"
+    }
+
     "the expected type outranks a literal" in {
       run("""id[T](x: T) -> T = x
             |var b: u8 = id(200)

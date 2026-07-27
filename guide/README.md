@@ -30,6 +30,7 @@ that quietly stopped running would otherwise look like a check that passed.
 | `bytecode` | the module system, and the set's one end-to-end assertion — source in, bytecode out, run it |
 | `png` | the byte level — endianness, bit streams, checksums, a format someone else defined |
 | `fft` | arithmetic on a type the program defined, and floating point |
+| `sha2` | generic arithmetic — one algorithm at two widths — and static tables |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

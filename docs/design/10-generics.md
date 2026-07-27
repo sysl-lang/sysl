@@ -315,3 +315,12 @@ never by a covariant container.
   **excluded**, not merely deferred: it pushes inference toward undecidable, and no target use
   (an OS, drivers, embedded) needs it. Abstraction over containers is served by traits and
   bounds, not by HKT.
+- **f. A conversion into a type parameter.** `u8(x)` where `x: T` is ordinary code, because `u8` is
+  a type that exists; `T(b)` is "undefined function 'T'", because a parameter is not a name a call
+  can be written through. So a generic function can take a value apart and not put one together,
+  and a symmetric pair of operations ends up half generic: `guide/sha2` writes `top_byte` once and
+  its mirror — building a word out of a byte — twice, as a trait member, where the width is
+  concrete. What this wants is either the conversion forms reaching a parameter of known layout, or
+  the trait-level member `02 § Reaching a trait's members without a value` wants, since a `T.of(b)`
+  would answer it too. The second is the better bet: a conversion into a parameter cannot mean
+  anything for a `T` that turns out to be a struct, and a trait member says which types offer it.

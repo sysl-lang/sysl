@@ -491,8 +491,16 @@ exactly (`§5`), one row further down the catalog.
   `Default` or a `Zero`, and what makes it a real decision rather than an obvious addition is that
   a value is not behaviour: a trait whose one member is an associated *function* returning `Self`
   is a different kind of promise from every other row of `§2`, and it interacts with the
-  no-associated-types rule of `§1`. Not designed here; recorded with its three customers so the
-  next one does not open it a fourth time.
+  no-associated-types rule of `§1`. Not designed here; recorded with its customers so the next one
+  does not open it again.
+
+  **A fourth customer sharpened it into two asks rather than one.** `guide/sha2` wants a width, a
+  round count and a table of constants from the *type* it was instantiated at, and gets them
+  through members carrying a receiver they do not read — because a type parameter is not a name a
+  call can be written through at all. So there is the value a bound cannot promise, and separately
+  there is having nowhere to ask for it from. `02 § Reaching a trait's members without a value`
+  records the second half, and the two want deciding together: a member with no receiver, reachable
+  as `T.zero` through a bound, answers both.
 
 - **Associated types** generally (`02` open item) — deferred, and with them any trait whose
   method mentions a type derived from `Self` rather than `Self` itself.
@@ -505,8 +513,11 @@ exactly (`§5`), one row further down the catalog.
 - **A `Hasher` sink for `Hash`.** The streaming form (`§2`) composes better and would let a
   container pick its own algorithm, at the cost of a dynamic dispatch on every lookup. Recorded
   there with what taking it later would break.
-- **Supertraits / trait hierarchies.** Not needed by anything above (`Eq`, `Ord` and `Hash` are
-  deliberately independent), so not introduced.
+- **Supertraits / trait hierarchies.** Nothing in the catalog needs one — `Eq`, `Ord` and `Hash`
+  are deliberately independent — but a trait *outside* it now does: a `Word` that means "an integer
+  the SHA-2 compression can use" has to be spelled as nine traits at every declaration that wants
+  one, because a trait cannot require another. Recorded in `02 § Details still to settle` as the
+  trait-side question it is; the catalog stays flat either way.
 
 ## 8. Open (not yet decided)
 

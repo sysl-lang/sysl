@@ -468,11 +468,57 @@ signature, which stands in for every implementation because conformance is exact
 - **Dropped:** the separate structural `interface`; implicit/structural conformance; the
   invisible `owns` flag (replaced by explicit three-mode ownership).
 
+## Reaching a trait's members without a value
+
+**A type parameter is not a name a call can be written through**, so everything a bound licenses is
+reached through a *value* of the parameter. `T.bits()` is "undefined name 'T'"; and on the other
+side an associated function on a built-in cannot even be declared, since only a struct or an enum
+has a name in call position (`08`). Between them there is no way at all to ask a bound for something
+about the type rather than about a value of it.
+
+That is a real gap and `guide/sha2` is what makes it plain. SHA-256 and SHA-512 are one body at two
+widths, and the differences between them — the width, the round count, the table of constants, the
+four mixing functions — are facts about `u32` and `u64` rather than about any particular word. All
+of them have to be trait members carrying a receiver they do not read, and the compression asks
+`self.h[0].bits` for the width of the type it was instantiated at. It works, and it costs nothing at
+run time, and it reads like a workaround because it is one.
+
+What this wants is a trait member with **no receiver** — an associated function, or the type-level
+constant `08 § Not yet` defers — reachable as `T.bits` where `T` is a bounded parameter. Three
+things have to be decided with it, and none is decided here:
+
+- **A built-in has to be able to carry one.** The declaration rule above exists because a call needs
+  a name; through a bound the name is the *parameter*, which every type has whether or not it has
+  one of its own. So the rule that refuses `impl Word for u32`'s associated function is about the
+  call site rather than about the `impl`, and reaching it through a bound removes the objection.
+- **It is static dispatch only.** Object safety (§ Object safety) excludes a member with no receiver
+  from a trait object, and that does not change: `*Word` cannot have a slot for something no value
+  selects. A trait that declares one is usable as a bound and not as an object, exactly as one that
+  mentions `Self` twice already is.
+- **It is the same shortfall as "a bound promises behaviour, never a value"** (`14 §7`), one step
+  further along. That entry's three customers want a *value* of `T`; this wants a value **and** a
+  way to ask for it without having one first. Whatever answers this answers that, so they should be
+  decided together.
+
+Until then, a receiver that goes unread is the workaround, and it is a small one — but it is the
+reason a generic numeric routine in sysl reads worse than the same routine written twice.
+
 ## Details still to settle
 
 - **Laws / invariants on traits.** The old `trait` could assert invariants ("`Ord` is a total
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
+- **A trait cannot require another trait.** `trait Word: Add + BitXor` is a parse error, so a bound
+  that means "a word" has to be spelled as everything a word can do, at every declaration that
+  wants one: `guide/sha2` writes `[T: Word + Add + BitAnd + BitOr + BitXor + Not + Shl + Shr + Sub]`
+  on each of its generic functions. This is *not* the `where` clause `10 § Open c` defers, and it is
+  not the "no bound alias" the hash map raised and this document settled — a supertrait is a
+  promise the **trait** makes, so `[T: Word]` would then license the arithmetic, and a default body
+  could use it. Cheap to add and additive; what it needs deciding is whether an `impl Word for X`
+  then checks that `X` implements the required traits at the `impl` or at the bound. Worth knowing
+  in the meantime: a bound written on a **struct** is inherited by every one of its members, which
+  is why the same program writes the nine traits once for a ten-method type and once per free
+  function beside it.
 - **Associated types.** A trait's own parameters (above) cover much of what an associated type is
   for — `Sink[T]`, `Into[T]` — with the difference that an argument is written by everything that
   names the trait rather than chosen once by the implementation. Which of the two a language wants,

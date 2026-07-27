@@ -1,0 +1,219 @@
+// The half of SHA-2 that does not care how wide a word is.
+//
+// The message schedule, the eighty-line round, the padding, the streaming buffer and the digest
+// are one implementation serving four functions. What varies is reached through the `Word` bound:
+// the width, the round count, the constant table and the four mixing functions. What varies per
+// *digest* rather than per width — the initial values, and how much of the state to publish — is
+// an argument, because SHA-224 and SHA-256 are the same word type and a type may implement a trait
+// once.
+
+enum Fault
+    NotStarted
+    DigestTooSmall
+
+    describe(self) -> string = self match
+        NotStarted -> "this hasher was never given its initial values"
+        DigestTooSmall -> "the digest does not fit in the space provided"
+end Fault
+
+// Rotate right. The `n` is a `T` rather than a count because a shift is `Self`-homogeneous
+// (`14 §1`), and the width comes off the value for want of anywhere else to ask for it.
+rotr[T: Word + BitOr + Shl + Shr + Sub](x: T, n: T) -> T = (x >> n) | (x << (x.bits - n))
+
+// The other direction of `Word.shift_in`, and generic where that one could not be: a conversion
+// *out* of a type parameter names a type that exists, so `u8(x)` is ordinary code.
+top_byte[T: Word + Shr + Sub](x: T) -> u8 = u8(x >> (x.bits - 8))
+
+// Choose: wherever `x` has a one bit take `y`'s bit, elsewhere take `z`'s.
+ch[T: BitAnd + BitXor + Not](x: T, y: T, z: T) -> T = (x & y) ^ (~x & z)
+
+// Majority: each output bit is whichever value at least two of the three inputs agree on.
+maj[T: BitAnd + BitXor](x: T, y: T, z: T) -> T = (x & y) ^ (x & z) ^ (y & z)
+
+// A hash in progress. The bound is written once, here, and every member inherits it — which is the
+// answer to the repetition the free functions above show, and the reason a container is a better
+// place to put a bound than a pile of functions is.
+struct Sha[T: Word + Add + BitAnd + BitOr + BitXor + Not + Shl + Shr + Sub]
+    h: [8]T
+    block: [128]u8
+    used: usize
+    total: u64
+    dlen: usize
+
+    // Three sizes, all of them the width in disguise: sixteen words to a block, a length field of
+    // two words, and a digest of eight. Reading the width off `h[0]` is what a trait that could
+    // promise a *type-level* constant would let us write as `T.bits`.
+    block_len(self) -> usize = 2 * usize(self.h[0].bits)
+    word_len(self) -> usize = usize(self.h[0].bits) / 8
+    len_bytes(self) -> usize = usize(self.h[0].bits) / 4
+
+    start(*self, iv: [8]T, dlen: usize)
+        for i in 0..<8 do self.h[i] = iv[i]
+
+        self.used = 0
+        self.total = 0
+        self.dlen = dlen
+    end start
+
+    update(*self, data: []u8)
+        var bs = self.block_len()
+
+        for i in 0..<data.len
+            self.block[self.used] = data[i]
+            self.used += 1
+            self.total += 1
+
+            if self.used == bs
+                self.compress()
+                self.used = 0
+    end update
+
+    // One block, in place. The schedule is sized for the longer of the two round counts and only
+    // the first `rounds` entries are ever read.
+    compress(*self)
+        var wl = self.word_len()
+        var n = self.h[0].rounds
+        var w = [self.h[0].zero; 80]
+
+        for i in 0usize..<16
+            var v = self.h[0].zero
+
+            for j in 0..<wl do v = v.shift_in(self.block[i * wl + j])
+
+            w[i] = v
+
+        for i in 16..<n
+            w[i] = w[i - 16] + w[i - 15].ssig0() + w[i - 7] + w[i - 2].ssig1()
+
+        var a = self.h[0]
+        var b = self.h[1]
+        var c = self.h[2]
+        var d = self.h[3]
+        var e = self.h[4]
+        var f = self.h[5]
+        var g = self.h[6]
+        var t = self.h[7]
+
+        for i in 0..<n
+            var t1 = t + e.bsig1() + ch(e, f, g) + a.k(i) + w[i]
+            var t2 = a.bsig0() + maj(a, b, c)
+
+            t = g
+            g = f
+            f = e
+            e = d + t1
+            d = c
+            c = b
+            b = a
+            a = t1 + t2
+
+        self.h[0] += a
+        self.h[1] += b
+        self.h[2] += c
+        self.h[3] += d
+        self.h[4] += e
+        self.h[5] += f
+        self.h[6] += g
+        self.h[7] += t
+    end compress
+
+    // Appends the one bit, the zeroes, and the message length in bits, then publishes as much of
+    // the state as this digest is defined to publish. The length field is two words wide but never
+    // needs more than eight bytes of it, so the high half is left at the zero the padding wrote.
+    finish(*self, digest: []u8) -> Result[unit, Fault]
+        if self.dlen == 0 then return Err(NotStarted)
+        if digest.len < self.dlen then return Err(DigestTooSmall)
+
+        var bs = self.block_len()
+        var lb = self.len_bytes()
+        var nbits = self.total * 8
+
+        self.block[self.used] = 0x80
+        self.used += 1
+
+        if self.used + lb > bs
+            while self.used < bs
+                self.block[self.used] = 0
+                self.used += 1
+
+            self.compress()
+            self.used = 0
+
+        while self.used < bs - 8
+            self.block[self.used] = 0
+            self.used += 1
+
+        for i in 0usize..<8
+            self.block[bs - 1 - i] = u8(nbits >> u64(i * 8))
+
+        self.compress()
+
+        var wl = self.word_len()
+
+        for i in 0usize..<8
+            var v = self.h[i]
+
+            for j in 0..<wl
+                var at = i * wl + j
+
+                if at < self.dlen then digest[at] = top_byte(v)
+
+                v = v << 8
+
+        Ok(())
+    end finish
+end Sha
+
+new_sha224() -> Sha[u32]
+    var s: Sha[u32]
+    s.start(iv224, 28)
+    s
+end new_sha224
+
+new_sha256() -> Sha[u32]
+    var s: Sha[u32]
+    s.start(iv256, 32)
+    s
+end new_sha256
+
+new_sha384() -> Sha[u64]
+    var s: Sha[u64]
+    s.start(iv384, 48)
+    s
+end new_sha384
+
+new_sha512() -> Sha[u64]
+    var s: Sha[u64]
+    s.start(iv512, 64)
+    s
+end new_sha512
+
+val hexdigits: [16]u8 = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102]
+
+// A byte is not a character, so each nibble reaches text through `str(char(…))` — there is still
+// no way to build a string out of bytes a program computed.
+hex(d: []u8) -> string
+    var s = ""
+
+    for i in 0..<d.len
+        s += str(char(hexdigits[usize(d[i] >> 4)]))
+        s += str(char(hexdigits[usize(d[i] & 15)]))
+
+    s
+end hex
+
+digest_of[T: Word + Add + BitAnd + BitOr + BitXor + Not + Shl + Shr + Sub](s: Sha[T], data: []u8) -> string
+    var h = s
+    // Storage the *buffer* owns rather than the frame, because the rendered digest is what leaves:
+    // a slice of a local array cannot outlive it, and `05` has no way to know that `hex` copies.
+    var out: []u8 = [0u8; 64]
+
+    h.update(data)
+    h.finish(out[0..<h.dlen]).expect("a digest buffer sized from the hasher itself")
+    hex(out[0..<h.dlen])
+end digest_of
+
+sha224(data: []u8) -> string = digest_of(new_sha224(), data)
+sha256(data: []u8) -> string = digest_of(new_sha256(), data)
+sha384(data: []u8) -> string = digest_of(new_sha384(), data)
+sha512(data: []u8) -> string = digest_of(new_sha512(), data)

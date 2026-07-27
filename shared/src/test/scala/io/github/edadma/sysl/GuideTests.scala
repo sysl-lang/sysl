@@ -121,4 +121,26 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- what the transform refuses",
     )
   }
+
+  // Four digests out of one body, so the assertions are the published ones twice over: NIST's
+  // examples and hashlib for the digests, RFC 4231 for the tags. The fifteen message lengths are
+  // the ones an implementation that is wrong is wrong at — either side of both widths' points where
+  // the length field stops fitting in the last block.
+  "sha2 — one algorithm at two widths, and static tables" in {
+    val out = guide("sha2")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 161
+    sections(out) shouldBe List(
+      "-- the four digests of one message",
+      "-- the messages the standard uses",
+      "-- padding at every boundary",
+      "-- the same bytes, differently divided",
+      "-- a million bytes in a thousand pieces",
+      "-- the pieces both widths are built from",
+      "-- what the four do not share",
+      "-- keyed hashing",
+      "-- what a hasher refuses",
+    )
+  }
 }

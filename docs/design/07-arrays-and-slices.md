@@ -299,7 +299,12 @@ implementation:
   it — and the view outlives the expression that made it, so there is nowhere to catch that later.
   Rejected with a diagnostic. What this wants is a **read-only view type**, which is a decision
   about the view types here rather than about `val`, and it is additive: every program that can be
-  written today keeps its meaning when one arrives.
+  written today keeps its meaning when one arrives. The cost has a name now: **a static table can
+  be read and not passed.** `guide/sha2` has eighty round constants per width, and the generic
+  compression reaches them only through a trait method whose whole body is one index, because the
+  alternative — a `[80]T` parameter — copies the table at every call. A table small enough to copy
+  escapes it, which is why the same program hands its eight initial values over as a `[8]T` and
+  thinks nothing of it.
 - **An unchecked-index escape hatch** for hot loops, listed as likely-yes and deferred in `03`.
 - **Multi-dimensional shorthand.** `[3][3]f64` already works as an array of arrays; a distinct
   rectangular type is not planned.
