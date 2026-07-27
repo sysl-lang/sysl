@@ -1,0 +1,396 @@
+// A JSON reader and writer.
+//
+// The axis this owns is **recursive ownership** — a value that contains itself through `&T`. A
+// JSON document is the smallest honest example of one: an array holds values, and a value may be
+// an array, so the type cannot be written at all without an indirection, and every walk over it
+// has to take the reference apart.
+//
+// Numbers are integers. That is a deliberate narrowing rather than a shortcut: a round-trip is
+// the assertion this program is checked by, and a float would make the check about the renderer's
+// digits instead of about the tree. Floats are another problem's axis.
+//
+// What writing it turned up, in the order it bit:
+//
+//   * **A pattern does not reach through a reference.** Selection does (`p.x` on a `&T`), so the
+//     asymmetry is a thing to learn rather than to guess; every walk here starts `*j match`.
+//   * **There is no way to build a `string` out of bytes a program computed.** The only sources of
+//     one are a literal, a slice of an existing string, concatenation, and `str`. So unescaping is
+//     written as "copy the source between the escapes, and append a literal for each" — which is
+//     the fast way to write it anyway, but it is not a choice here. `\uXXXX` reaches a string only
+//     through `str(char(n))`, a *rendering* path, because no construction path exists.
+//   * **There are no constants.** A module-level `var` is a local of the entry point (`13 §7`), so
+//     a value shared by several functions is a nullary function — see `max_depth` below.
+//   * **There is no growable collection**, so an array and an object are each a linked list built
+//     by appending through the tail reference. That is honest for a tree of references and would
+//     not be for a `[]T` of them.
+
+enum Json
+    Null
+    Bool(b: bool)
+    Num(n: long)
+    Str(s: string)
+    Arr(items: Option[&Items])
+    Obj(fields: Option[&Fields])
+end Json
+
+// The list cell an array is made of. `Json` reaches itself through here, and `&` on both edges is
+// what makes the cycle finite.
+struct Items
+    value: &Json
+    rest: Option[&Items]
+end Items
+
+struct Fields
+    key: string
+    value: &Json
+    rest: Option[&Fields]
+end Fields
+
+// ---------------------------------------------------------------------------- what can go wrong
+
+enum Fault
+    Expected(at: usize, what: string)
+    BadEscape(at: usize)
+    BadNumber(at: usize)
+    TooDeep(at: usize)
+    Trailing(at: usize)
+    Unterminated(at: usize)
+end Fault
+
+describe(f: Fault) -> string
+    f match
+        Expected(at, what) -> s"$what expected at $at"
+        BadEscape(at) -> s"bad escape at $at"
+        BadNumber(at) -> s"bad number at $at"
+        TooDeep(at) -> s"nested too deeply at $at"
+        Trailing(at) -> s"trailing input at $at"
+        Unterminated(at) -> s"unterminated string at $at"
+end describe
+
+// ------------------------------------------------------------------------------------- reading
+
+parse(text: string) -> Result[&Json, Fault]
+    var r = Reader(text, text.bytes, 0usize)
+    var v = r.parse_value(0)?
+
+    r.skip_ws()
+    if !r.done() then return Err(Trailing(r.at))
+    Ok(v)
+end parse
+
+// How deep a document may nest before the reader gives up. A nullary function because a module has
+// no constants: a top-level `var` belongs to the entry point, not to the module.
+private max_depth() -> int = 64
+
+// The reader is a position in a source text, and both spellings of the text are kept: the bytes to
+// decide by, and the `string` to cut pieces out of. Nothing here can turn the one back into the
+// other, which is why both are carried.
+private struct Reader
+    text: string
+    src: []u8
+    at: usize
+
+    done(*self) -> bool = self.at >= self.src.len
+
+    bump(*self)
+        self.at += 1usize
+
+    at_byte(*self, b: u8) -> bool = !self.done() && self.src[self.at] == b
+
+    skip_ws(*self)
+        while !self.done()
+            var c = self.src[self.at]
+
+            if c == 32u8 || c == 9u8 || c == 10u8 || c == 13u8 then self.bump()
+            else break
+    end skip_ws
+
+    parse_value(*self, depth: int) -> Result[&Json, Fault]
+        if depth > max_depth() then return Err(TooDeep(self.at))
+        self.skip_ws()
+        if self.done() then return Err(Expected(self.at, "a value"))
+
+        var c = self.src[self.at]
+
+        char(c) match
+            '{' -> self.parse_object(depth)
+            '[' -> self.parse_array(depth)
+            '"' ->
+                var s = self.parse_string()?
+                Ok(Str(s))
+            't' -> self.parse_word("true", Bool(true))
+            'f' -> self.parse_word("false", Bool(false))
+            'n' -> self.parse_word("null", Null)
+            else ->
+                if c == u8('-') || digit(c) then self.parse_number()
+                else Err(Expected(self.at, "a value"))
+    end parse_value
+
+    parse_word(*self, word: string, v: Json) -> Result[&Json, Fault]
+        var stop = self.at + word.len
+
+        if stop > self.src.len || self.text[self.at..<stop] != word then
+            return Err(Expected(self.at, s"'$word'"))
+        self.at = stop
+        Ok(v)
+    end parse_word
+
+    parse_number(*self) -> Result[&Json, Fault]
+        var start = self.at
+
+        if self.at_byte(u8('-')) then self.bump()
+        if self.done() || !digit(self.src[self.at]) then return Err(BadNumber(start))
+
+        // A leading zero is a number of its own in JSON, so `01` is two of them where one was
+        // expected rather than the eleventh integer.
+        var leading = self.src[self.at] == u8('0')
+        var n: long = 0
+        var digits = 0
+
+        while !self.done() && digit(self.src[self.at])
+            n = n * 10 + long(int(self.src[self.at]) - 48)
+            digits += 1
+            if digits > 18 then return Err(BadNumber(start))
+            self.bump()
+
+        if leading && digits > 1 then return Err(BadNumber(start))
+
+        // A fraction or an exponent is well-formed JSON that this reader does not keep, so it is
+        // refused outright rather than silently truncated.
+        if !self.done()
+            var c = char(self.src[self.at])
+
+            if c == '.' || c == 'e' || c == 'E' then return Err(BadNumber(start))
+
+        Ok(Num(if self.src[start] == u8('-') then -n else n))
+    end parse_number
+
+    // Everything between two escapes is copied out of the source as a substring; the escapes
+    // themselves are the only bytes this can name a replacement for, because a `string` cannot be
+    // built out of bytes a program has in hand.
+    parse_string(*self) -> Result[string, Fault]
+        var opened = self.at
+
+        self.bump()
+        var out = ""
+        var start = self.at
+
+        while true
+            if self.done() then return Err(Unterminated(opened))
+            var c = self.src[self.at]
+
+            if c == u8('"')
+                out += self.text[start..<self.at]
+                self.bump()
+                break
+            else if c == u8('\\')
+                out += self.text[start..<self.at]
+                self.bump()
+                out += self.unescape()?
+                start = self.at
+            else if c < 32u8
+                return Err(Expected(self.at, "a character"))
+            else
+                self.bump()
+
+        Ok(out)
+    end parse_string
+
+    unescape(*self) -> Result[string, Fault]
+        if self.done() then return Err(BadEscape(self.at))
+        var c = char(self.src[self.at])
+
+        self.bump()
+        c match
+            '"' -> Ok("\"")
+            '\\' -> Ok("\\")
+            '/' -> Ok("/")
+            'b' -> Ok(str(char(8)))
+            'f' -> Ok(str(char(12)))
+            'n' -> Ok("\n")
+            'r' -> Ok("\r")
+            't' -> Ok("\t")
+            'u' -> self.unescape_hex()
+            else -> Err(BadEscape(self.at - 1usize))
+    end unescape
+
+    // `str(char(n))` is the whole of the route from a code point to text. It is a rendering
+    // function standing in for a constructor, because there is no constructor.
+    unescape_hex(*self) -> Result[string, Fault]
+        var hi = self.hex4()?
+
+        if hi < 0xD800 || hi > 0xDFFF then return Ok(str(char(hi)))
+        if hi > 0xDBFF then return Err(BadEscape(self.at))
+        if !self.at_byte(u8('\\')) then return Err(BadEscape(self.at))
+        self.bump()
+        if !self.at_byte(u8('u')) then return Err(BadEscape(self.at))
+        self.bump()
+
+        var lo = self.hex4()?
+
+        if lo < 0xDC00 || lo > 0xDFFF then return Err(BadEscape(self.at))
+        Ok(str(char(0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00))))
+    end unescape_hex
+
+    hex4(*self) -> Result[int, Fault]
+        var n = 0
+        var k = 0
+
+        while k < 4
+            if self.done() then return Err(BadEscape(self.at))
+            var d = hex_digit(self.src[self.at])
+
+            if d < 0 then return Err(BadEscape(self.at))
+            n = n * 16 + d
+            self.bump()
+            k += 1
+
+        Ok(n)
+    end hex4
+
+    // Built by appending through the tail, since a linked list is what a tree of references has
+    // instead of a growable array.
+    parse_array(*self, depth: int) -> Result[&Json, Fault]
+        self.bump()
+        self.skip_ws()
+        if self.at_byte(u8(']'))
+            self.bump()
+            return Ok(Arr(None))
+
+        var head: Option[&Items] = None
+        var tail: Option[&Items] = None
+
+        while true
+            var v = self.parse_value(depth + 1)?
+            var cell: &Items = Items(v, None)
+
+            tail match
+                None -> head = Some(cell)
+                Some(t) -> t.rest = Some(cell)
+            tail = Some(cell)
+
+            self.skip_ws()
+            if self.at_byte(u8(',')) then self.bump()
+            else if self.at_byte(u8(']'))
+                self.bump()
+                break
+            else return Err(Expected(self.at, "',' or ']'"))
+
+        Ok(Arr(head))
+    end parse_array
+
+    parse_object(*self, depth: int) -> Result[&Json, Fault]
+        self.bump()
+        self.skip_ws()
+        if self.at_byte(u8('}'))
+            self.bump()
+            return Ok(Obj(None))
+
+        var head: Option[&Fields] = None
+        var tail: Option[&Fields] = None
+
+        while true
+            self.skip_ws()
+            if !self.at_byte(u8('"')) then return Err(Expected(self.at, "a key"))
+            var key = self.parse_string()?
+
+            self.skip_ws()
+            if !self.at_byte(u8(':')) then return Err(Expected(self.at, "':'"))
+            self.bump()
+
+            var v = self.parse_value(depth + 1)?
+            var cell: &Fields = Fields(key, v, None)
+
+            tail match
+                None -> head = Some(cell)
+                Some(t) -> t.rest = Some(cell)
+            tail = Some(cell)
+
+            self.skip_ws()
+            if self.at_byte(u8(',')) then self.bump()
+            else if self.at_byte(u8('}'))
+                self.bump()
+                break
+            else return Err(Expected(self.at, "',' or '}'"))
+
+        Ok(Obj(head))
+    end parse_object
+end Reader
+
+private digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
+
+private hex_digit(b: u8) -> int
+    if digit(b) then int(b) - 48
+    else if b >= u8('a') && b <= u8('f') then int(b) - 87
+    else if b >= u8('A') && b <= u8('F') then int(b) - 55
+    else -1
+end hex_digit
+
+// ------------------------------------------------------------------------------------- writing
+
+render(j: &Json) -> string
+    *j match
+        Null -> "null"
+        Bool(b) -> if b then "true" else "false"
+        Num(n) -> str(n)
+        Str(s) -> quote(s)
+        Arr(items) -> "[" + render_items(items) + "]"
+        Obj(fields) -> "{" + render_fields(fields) + "}"
+end render
+
+private render_items(items: Option[&Items]) -> string
+    items match
+        None -> ""
+        Some(cell) ->
+            cell.rest match
+                None -> render(cell.value)
+                Some(_) -> render(cell.value) + "," + render_items(cell.rest)
+end render_items
+
+private render_fields(fields: Option[&Fields]) -> string
+    fields match
+        None -> ""
+        Some(cell) ->
+            var one = quote(cell.key) + ":" + render(cell.value)
+
+            cell.rest match
+                None -> one
+                Some(_) -> one + "," + render_fields(cell.rest)
+end render_fields
+
+// The mirror of `parse_string`: the source is copied between the bytes that need replacing, since
+// the bytes that do not need replacing cannot be appended one at a time.
+private quote(s: string) -> string
+    var out = "\""
+    var bs = s.bytes
+    var start = 0usize
+    var i = 0usize
+
+    while i < bs.len
+        var rep = escape_of(bs[i])
+
+        if rep != ""
+            out += s[start..<i]
+            out += rep
+            start = i + 1usize
+        i += 1usize
+
+    out += s[start..]
+    out + "\""
+end quote
+
+private escape_of(b: u8) -> string
+    if b == u8('"') then "\\\""
+    else if b == u8('\\') then "\\\\"
+    else if b == 8u8 then "\\b"
+    else if b == 12u8 then "\\f"
+    else if b == 10u8 then "\\n"
+    else if b == 13u8 then "\\r"
+    else if b == 9u8 then "\\t"
+    else if b < 32u8 then "\\u00" + hex_of(b >> 4) + hex_of(b & 15u8)
+    else ""
+end escape_of
+
+// Indexing a string yields a **byte**, so the character has to be asked for: `str` of the byte
+// renders the number it is, which is a wrong answer that looks like a right one.
+private hex_of(n: u8) -> string = str(char("0123456789abcdef"[usize(n)]))

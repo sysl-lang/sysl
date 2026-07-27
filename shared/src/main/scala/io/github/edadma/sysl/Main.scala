@@ -57,7 +57,7 @@ case class Config(
 
 private def execute(cfg: Config): Int = {
   val sources =
-    try collect(cfg.file)
+    try Project.collect(cfg.file)
     catch case e: Exception => return fail(s"cannot read ${cfg.file}: ${e.getMessage}")
 
   if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
@@ -93,37 +93,6 @@ private def execute(cfg: Config): Int = {
 
     case other =>
       fail(s"unknown command '$other'")
-}
-
-/** The source files one invocation compiles.
- *
- * A module is a directory and its name is that directory's path **relative to the project root**
- * (`13 §1`), so pointing the driver at a directory makes it the root and compiles the whole tree
- * beneath it: the files directly in it are the anonymous root module, and each sub-directory is a
- * module named by the path down to it. Each file carries the segments it was found under, which is
- * what the compiler holds its `module` header to.
- *
- * Naming a single file compiles that file alone, as the root module with nothing else in it.
- */
-private def collect(path: String): List[Source] =
-  if isDirectory(path) then walk(path, Nil)
-  else List(Source(path, readFile(path), Nil))
-
-/** One directory of the project: its own `.sysl` files, then the sub-directories under it. A
- * directory holding no source is not a module and contributes nothing; it is still walked, since
- * modules further down are reached through it.
- */
-private def walk(path: String, dir: List[String]): List[Source] = {
-  val entries = listFiles(path).toList.sorted
-  val here    = entries.filter(f => isFile(f) && f.endsWith(".sysl")).map(f => Source(f, readFile(f), dir))
-
-  here ::: entries.filter(isDirectory).flatMap(sub => walk(sub, dir :+ basename(sub)))
-}
-
-private def basename(path: String): String = {
-  val slash = math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
-
-  if slash >= 0 then path.substring(slash + 1) else path
 }
 
 private def defaultOutputName(file: String): String = {
