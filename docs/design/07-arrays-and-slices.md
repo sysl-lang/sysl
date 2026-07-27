@@ -57,6 +57,27 @@ a bare `None` does:
 var empty: [0]int = []
 ```
 
+**A repeat** `[value; count]` fills every element with one value, and is the form for an array whose
+element type has no zero, or has one that is not the wanted starting value:
+
+```
+var slots: [16]Slot = [Empty; 16]      // an enum has no zero at all
+var ones = [1; 8]                      // [8]int
+var grid = [[0; 3]; 3]                 // [3][3]int
+const n: usize = 64
+var window = [0u8; n]                  // a const may give the count
+```
+
+The **count is a compile-time constant** — a literal, a `const`, or an expression over those — for
+the same reason an array bound is one: it *is* the array's bound, and the type is not known without
+it. The element type comes from the value, or from the context where the value is a bare literal.
+
+The **value is evaluated once** and copied into every element. `[tick(); 3]` is one call whose
+result lands in three places, not three calls, which is what makes the form a construction rather
+than shorthand for writing the value out `count` times. Where the elements contain references, each
+copy is a share of its own: an array of `n` copies of a `&T` holds `n` counts, released as the array
+is (`§Ownership`).
+
 ## Indexing
 
 `a[i]` reads the element, and it is a **place** — so `a[i] = v`, `a[i] += 1`, `a[i]++`, and
@@ -152,15 +173,13 @@ implementation:
   somewhere to unpack it to — because it cannot make either for itself. The caller must therefore
   size both, and the sizes are not knowable until the file's header has been read, which happens
   inside. A decoder that could grow its own buffers would take one slice and return an image.
-- **An array filled with a value, rather than with zeroes or with a literal.** There is no repeat
-  form — `[None; 16]`, or whatever it would be spelled — so an array of a type with no zero value
-  is written out element by element. The types that bite are the ones a container needs: an `enum`
-  has no zero at all (an `Option[&T]` would want `None` to be one, but `Option`'s first variant is
-  `Some`, so "the zero is variant 0" is not the rule that gives it), and a **type parameter** can
-  have none whatever it is bound by, since a bound promises behaviour and no trait in the catalog
-  promises a value. So a generic container cannot make its own storage unless it already holds
-  something to fill it with — see `guide/hashmap`, whose bucket array is `Option[&Entry]` for
-  exactly this reason and whose empty block is sixteen `None`s.
+- **A generic container making its own storage.** The repeat form `[v; n]` (`§Writing one down`)
+  settles the concrete half of this: an `enum` has no zero value, but `[Empty; 16]` needs none. What
+  is left is the generic half — a `[16]K` still cannot be declared *whatever* `K` is, because a
+  bound promises behaviour and no trait in the catalog promises a value, so there is nothing to
+  write in the repeat's value position. A generic container can therefore make its own storage only
+  once it already holds something to fill it with. A `Default`-style bound is the obvious answer and
+  is not in the catalog (`14`); whether it should be is that document's decision.
 - **Promotion of an escaping local array** (`05`). The analysis that *finds* the escape is
   implemented; what happens next is not. A view that would outlive its array is a diagnostic
   rather than a silent heap promotion, so a program that means to return one writes `&[64]u8`

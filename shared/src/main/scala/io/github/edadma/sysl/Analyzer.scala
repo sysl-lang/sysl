@@ -824,6 +824,23 @@ class Analyzer private (units: List[Program])
       )
       TArrayLit(ts, Type.Array(ts.length, elemTy))
 
+    // `[v; n]` — the form for an array whose element type has no zero, or has one that is not the
+    // wanted starting value. The count is a compile-time constant for the same reason an array
+    // bound is: it is part of the type. The value is evaluated **once** and copied into every
+    // element, which is what makes `[f(); 8]` mean one call rather than eight.
+    case ArrayFill(value, count) =>
+      val elemExp = expected.collect { case Type.Array(_, e) => e }
+      val tv      = analyzeExpr(value, elemExp)
+
+      if Type.noValue(tv.ty) then err(s"an array cannot hold ${show(tv.ty)} values")
+
+      val n = constInt(count) match
+        case Some(v) if v >= 0 && v.isValidInt => v.toInt
+        case Some(v)                           => err(s"an array cannot have $v elements")
+        case None => err("an array's repeat count must be a constant — a literal, or a 'const' naming one")
+
+      TArrayFill(tv, Type.Array(n, tv.ty))
+
     // A range subscript takes a view. The receiver is left *undereferenced* on purpose: for a
     // heap array the reference is both where the elements are and what keeps them alive, and
     // evaluating it once is what makes those the same object.

@@ -299,6 +299,38 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
         acc = r
       acc
 
+    // Built through memory with a loop rather than as an `insertvalue` chain, for the reason the
+    // ARC walk gives: the count is a compile-time constant but it can be very large, and a repeat
+    // count is where someone writes a large one on purpose. The value is generated once, above the
+    // loop — every element is a copy of that one evaluation. Its references are borrowed here and
+    // retained by whatever binds the array, whose ARC walk visits all n elements.
+    case TArrayFill(value, arrayTy) =>
+      val v = genExpr(value)
+
+      if arrayTy.length == 0 then "zeroinitializer"
+      else
+        val buf   = emitAlloca(freshTemp(), arrayTy.llvm)
+        val i     = emitAlloca(freshTemp(), "i64")
+        val condL = freshLabel("fill.test")
+        val bodyL = freshLabel("fill.elem")
+        val endL  = freshLabel("fill.done")
+
+        emit(s"store i64 0, ptr $i")
+        emitTerm(s"br label %$condL")
+        emitLabel(condL)
+        val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
+        val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, ${arrayTy.length}")
+        emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+        emitLabel(bodyL)
+        val ep = freshTemp(); emit(s"$ep = getelementptr ${arrayTy.elem.llvm}, ptr $buf, i64 $iv")
+        emit(s"store ${arrayTy.elem.llvm} $v, ptr $ep")
+        val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
+        emit(s"store i64 $nxt, ptr $i")
+        emitTerm(s"br label %$condL")
+        emitLabel(endL)
+
+        val r = freshTemp(); emit(s"$r = load ${arrayTy.llvm}, ptr $buf"); r
+
     case TIndex(receiver, index, ty) =>
       val p = elementAddr(receiver, index)
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r

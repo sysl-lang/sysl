@@ -144,6 +144,7 @@ private class Escape(program: TProgram) {
       case TStructNew(_, args)  => args.exists(viewsFrame)
       case TEnumNew(_, _, args) => args.exists(viewsFrame)
       case TArrayLit(elems, _)  => elems.exists(viewsFrame)
+      case TArrayFill(v, _)     => viewsFrame(v)
       case TField(r, _, _)      => viewsFrame(r)
       case TIndex(r, _, _)      => viewsFrame(r)
       case TBytes(r)            => viewsFrame(r)
@@ -322,6 +323,7 @@ private class Escape(program: TProgram) {
     case TEnumFromInt(v, _)         => List(v)
     case TEnumTry(v, _, _, _, _)    => List(v)
     case TArrayLit(elems, _)        => elems
+    case TArrayFill(v, _)           => List(v)
     case TIndex(r, i, _)            => List(r, i)
     case TLen(r)                    => List(r)
     case TBytes(r)                  => List(r)

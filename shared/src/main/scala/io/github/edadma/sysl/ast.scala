@@ -71,6 +71,7 @@ case class Tuple(elements: List[Expr]) extends Expr
  * one has no element type of its own and takes it from the context.
  */
 case class ArrayLit(elements: List[Expr]) extends Expr
+case class ArrayFill(value: Expr, count: Expr) extends Expr
 
 /** `if cond then a else b` as an **expression**: it yields the value of the taken branch.
  * In statement position the `else` may be omitted and the whole thing has type `unit`.

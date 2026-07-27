@@ -42,6 +42,7 @@ case class TZero(ty: Type) extends TExpr
 
 /** `[a, b, c]` — an array value built from its elements. */
 case class TArrayLit(elems: List[TExpr], arrayTy: Type.Array) extends TExpr { def ty: Type = arrayTy }
+case class TArrayFill(value: TExpr, arrayTy: Type.Array)      extends TExpr { def ty: Type = arrayTy }
 
 /** `a[i]` — one element of an array, slice, or string, checked against the length. It is a
  * *place* when its receiver is one, which is what makes `a[i] = v` and `&a[i]` ordinary.

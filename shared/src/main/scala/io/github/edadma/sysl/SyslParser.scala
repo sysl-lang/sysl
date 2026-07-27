@@ -197,11 +197,13 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val selfExpr: Parser[Expr] = op("self") ^^^ Ident("self")
 
-  /** `[a, b, c]` — an array literal. A leading `[` is unambiguous in operand position, since a
-   * subscript is a postfix tail on something already parsed.
+  /** `[a, b, c]` — an array literal, or `[v; n]` — an array of `n` copies of one value. A leading
+   * `[` is unambiguous in operand position, since a subscript is a postfix tail on something
+   * already parsed, and the two forms separate on the token after the first expression.
    */
   private lazy val arrayLit: PackratParser[Expr] =
-    op("[") ~> repsep(expression, op(",")) <~ op("]") ^^ ArrayLit.apply
+    op("[") ~> expression ~ (op(";") ~> expression) <~ op("]") ^^ { case v ~ n => ArrayFill(v, n) } |
+      op("[") ~> repsep(expression, op(",")) <~ op("]") ^^ ArrayLit.apply
 
   /** After `(`: `)` is unit, one expression is a grouping, more are a tuple. */
   private lazy val parenTail: PackratParser[Expr] =
