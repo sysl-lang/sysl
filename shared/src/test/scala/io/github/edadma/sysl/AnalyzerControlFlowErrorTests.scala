@@ -112,7 +112,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
       err(
         """f(s: string) -> int = s match
           |    "a".."z" -> 1
-          |    else -> 0""".stripMargin
+          |    else 0""".stripMargin
       ) should include("a range pattern needs a numeric or char value, not string")
     }
 
@@ -122,7 +122,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
       err(
         """var x = 3 match
           |    1 -> 10
-          |    else -> "big"""".stripMargin
+          |    else "big"""".stripMargin
       ) should include("match arms have different types: int and string")
     }
 
@@ -135,7 +135,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |end Point
           |f(p: Point) -> int = p match
           |    Point(x) -> x
-          |    else -> 0""".stripMargin
+          |    else 0""".stripMargin
       ) should include("struct 'Point' has 2 fields, but 1 sub-pattern was given")
     }
 
@@ -149,7 +149,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |end Shape
           |f(s: &Shape) -> int = s match
           |    Round(r) -> r
-          |    else -> 0""".stripMargin
+          |    else 0""".stripMargin
       )
 
       e should include("but the value is &Shape")
@@ -164,7 +164,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |end Point
           |f(p: *Point) -> int = p match
           |    Point{x: n} -> n
-          |    else -> 0""".stripMargin
+          |    else 0""".stripMargin
       ) should include("'*x match'")
     }
 
@@ -177,7 +177,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |end Point
           |f(n: int) -> int = n match
           |    Point(x) -> x
-          |    else -> 0""".stripMargin
+          |    else 0""".stripMargin
       )
 
       e should include("but the value is int")
@@ -192,7 +192,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |end Point
           |f(p: Point) -> int = p match
           |    Point{z} -> z
-          |    else -> 0""".stripMargin
+          |    else 0""".stripMargin
       ) should include("struct 'Point' has no field 'z'")
     }
 
@@ -204,7 +204,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |end Point
           |f(p: Point) -> int = p match
           |    Point{x, x} -> x
-          |    else -> 0""".stripMargin
+          |    else 0""".stripMargin
       ) should include("field 'x' is matched more than once")
     }
 
@@ -217,7 +217,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |end Point
           |f(p: Point) -> int = p match
           |    Other(x, y) -> x
-          |    else -> 0""".stripMargin
+          |    else 0""".stripMargin
       ) should include("'Other(…)' does not match a Point value")
     }
 

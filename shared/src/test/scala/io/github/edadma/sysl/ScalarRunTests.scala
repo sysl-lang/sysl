@@ -112,7 +112,7 @@ class ScalarRunTests extends AnyFreeSpec with RunSupport {
             |    c match
             |        'a'..'z' -> "lower"
             |        ' ' -> "space"
-            |        else -> "other"
+            |        else "other"
             |end kind
             |print(kind('m'), kind(' '), kind('7'))
             |""".stripMargin) shouldBe "lower space other\n"

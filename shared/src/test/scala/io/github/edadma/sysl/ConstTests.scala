@@ -192,7 +192,7 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
           |describe(n: int) -> string =
           |    n match
           |        limit -> "at the limit"
-          |        else -> "somewhere else"
+          |        else "somewhere else"
           |print(s"${describe(3)} ${describe(4)}")
           |""".stripMargin,
       ) shouldBe "at the limit somewhere else\n"

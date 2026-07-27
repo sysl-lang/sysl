@@ -1127,10 +1127,10 @@ trait AnalyzerBase {
   // called across the feature traits, so they are declared abstract here for the traits to see.
 
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound
-  protected def analyzeExpr(expr: Expr, expected: Option[Type] = None): TExpr
+  protected def analyzeExpr(expr: Expr, expected: Option[Type] = None, discarded: Boolean = false): TExpr
   protected def analyzeBool(e: Expr): TExpr
   protected def analyzePlace(target: Expr, what: String): TExpr
-  protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock
+  protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type], discarded: Boolean = false): TBlock
   protected def coerce(t: TExpr, expected: Type): TExpr
   protected def autoDeref(t: TExpr): TExpr
   protected def isPlace(t: TExpr): Boolean

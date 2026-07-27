@@ -288,7 +288,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // `13 §7` argues that sysl cannot have Rust's trap where a name in a pattern quietly binds
     // instead of matching. A `val` is the one thing that could have reintroduced it.
     "matching against one, which would bind instead of compare" in {
-      err("val n: int = 1\nvar x = 2\nx match\n    n -> print(1)\n    else -> print(2)") should
+      err("val n: int = 1\nvar x = 2\nx match\n    n -> print(1)\n    else print(2)") should
         include("cannot match against it")
     }
   }

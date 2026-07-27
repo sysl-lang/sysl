@@ -14,7 +14,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |        0 -> "zero"
         |        1 | 2 | 3 -> "small"
         |        4..10 -> "medium"
-        |        else -> "large"
+        |        else "large"
         |print(classify(0), classify(2), classify(7), classify(99))""".stripMargin
 
     run(src) shouldBe "zero small medium large\n"
@@ -48,7 +48,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
       """flag(b: bool) -> int
         |    b match
         |        true -> 1
-        |        else -> 0
+        |        else 0
         |print(flag(true), flag(false))""".stripMargin
 
     run(src) shouldBe "1 0\n"
@@ -65,7 +65,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |        Point(0, 0) -> "origin"
         |        Point(x, 0) -> "x-axis"
         |        Point(0, y) -> "y-axis"
-        |        else -> "elsewhere"
+        |        else "elsewhere"
         |print(classify(Point(0, 0)), classify(Point(5, 0)), classify(Point(0, 3)), classify(Point(1, 2)))""".stripMargin
 
     run(src) shouldBe "origin x-axis y-axis elsewhere\n"
@@ -130,7 +130,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |describe(l: Line) -> string
         |    l match
         |        Line(Point(0, 0), b) -> "from origin"
-        |        else -> "other"
+        |        else "other"
         |print(describe(Line(Point(0, 0), Point(3, 4))), describe(Line(Point(1, 1), Point(2, 2))))""".stripMargin
 
     run(src) shouldBe "from origin other\n"
@@ -161,7 +161,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
       """band(n: int) -> string
         |    n match
         |        0..<10 -> "low"
-        |        else -> "high"
+        |        else "high"
         |print(band(9), band(10))""".stripMargin
 
     run(src) shouldBe "low high\n"
@@ -173,7 +173,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    x match
         |        _ if x > 0 -> 1
         |        _ if x < 0 -> -1
-        |        else -> 0
+        |        else 0
         |print(sign(5), sign(-3), sign(0))""".stripMargin
 
     run(src) shouldBe "1 -1 0\n"
@@ -185,7 +185,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |n match
         |    1 -> print("one")
         |    2 -> print("two")
-        |    else -> print("many")""".stripMargin
+        |    else print("many")""".stripMargin
 
     run(src) shouldBe "two\n"
   }
@@ -198,7 +198,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    n match
         |        1..10 if n > 5 -> "high"
         |        1..10 -> "low"
-        |        else -> "other"
+        |        else "other"
         |print(classify(3), classify(7), classify(50))""".stripMargin
 
     run(src) shouldBe "low high other\n"
@@ -210,7 +210,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
       """band(n: int) -> string
         |    n match
         |        3..7 -> "in"
-        |        else -> "out"
+        |        else "out"
         |print(band(2), band(3), band(7), band(8))""".stripMargin
 
     run(src) shouldBe "out in in out\n"
@@ -243,7 +243,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    o match
         |        Wrap(Val(n)) -> n
         |        Wrap(Nought) -> -1
-        |        else -> -2
+        |        else -2
         |print(peek(Wrap(Val(42))), peek(Wrap(Nought)), peek(Bare))""".stripMargin
 
     run(src) shouldBe "42 -1 -2\n"
@@ -260,7 +260,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |check(n: int) -> int
         |    n match
         |        5 if noisy() -> 1
-        |        else -> 0
+        |        else 0
         |print(check(3))
         |print(check(5))""".stripMargin
 
@@ -278,7 +278,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |src() match
         |    1 -> print("one")
         |    2 -> print("two")
-        |    else -> print("other")""".stripMargin
+        |    else print("other")""".stripMargin
 
     run(src) shouldBe "eval\ntwo\n"
   }
@@ -442,7 +442,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
           |    o match
           |        Some(Halt) -> 0
           |        Some(Push) -> 1
-          |        else -> -1
+          |        else -1
           |var some: Option[Op] = Some(Push)
           |var gone: Option[Op] = None
           |print(read(some), read(gone))""".stripMargin
@@ -461,7 +461,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
           |    Op.try(b) match
           |        Some(Halt) -> "halt"
           |        Some(Push) -> "push"
-          |        else -> "?"
+          |        else "?"
           |print(decode(0u8), decode(9u8), decode(4u8))""".stripMargin
 
       run(src) shouldBe "halt push ?\n"

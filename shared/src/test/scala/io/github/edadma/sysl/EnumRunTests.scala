@@ -71,7 +71,7 @@ class EnumRunTests extends AnyFreeSpec with RunSupport {
         |    o match
         |        Wrap(Val(v)) -> v
         |        Wrap(Nil) -> -1
-        |        else -> -2
+        |        else -2
         |print(unwrap(Wrap(Val(42))), unwrap(Wrap(Nil)), unwrap(Nothing))""".stripMargin
 
     run(src) shouldBe "42 -1 -2\n"

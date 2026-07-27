@@ -10,16 +10,16 @@ trait PatternAnalysis extends TypeResolution {
   /** Analyzes one arm in its own scope so pattern bindings are visible to the guard and body.
    * Alternatives (`a | b`) may not bind, since the body cannot know which alternative matched.
    */
-  protected def analyzeArm(scrutTy: Type, arm: MatchArm, expected: Option[Type]): TArm =
-    at(arm.pos)(analyzeArmAt(scrutTy, arm, expected))
+  protected def analyzeArm(scrutTy: Type, arm: MatchArm, expected: Option[Type], discarded: Boolean = false): TArm =
+    at(arm.pos)(analyzeArmAt(scrutTy, arm, expected, discarded))
 
-  private def analyzeArmAt(scrutTy: Type, arm: MatchArm, expected: Option[Type]): TArm = {
+  private def analyzeArmAt(scrutTy: Type, arm: MatchArm, expected: Option[Type], discarded: Boolean): TArm = {
     pushScope()
     val tpats = arm.patterns.map(analyzePattern(_, scrutTy))
     if tpats.length > 1 && tpats.exists(binds) then
       err("alternative patterns joined by '|' cannot bind a name")
     val tguard = arm.guard.map(analyzeBool)
-    val tbody  = analyzeBlockBody(arm.body, expected)
+    val tbody  = analyzeBlockBody(arm.body, expected, discarded)
     popScope()
     TArm(tpats, tguard, tbody)
   }

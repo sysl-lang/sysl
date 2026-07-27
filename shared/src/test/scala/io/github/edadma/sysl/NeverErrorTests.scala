@@ -98,7 +98,7 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
         """f(n: int) -> int = n match
           |    1 -> 1
           |    2 -> exit(1)
-          |    else -> "no"
+          |    else "no"
           |print(f(1))""".stripMargin
 
       err(src) should include("match arms have different types: int and string")

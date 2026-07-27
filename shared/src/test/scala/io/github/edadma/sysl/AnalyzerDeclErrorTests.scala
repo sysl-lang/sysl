@@ -41,7 +41,7 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "matching an unknown variant" in {
-      val src = "enum Shape\n    Circle(r: int)\n    Empty\nf(s: Shape) -> int\n    s match\n        Square(x) -> 0\n        else -> 1"
+      val src = "enum Shape\n    Circle(r: int)\n    Empty\nf(s: Shape) -> int\n    s match\n        Square(x) -> 0\n        else 1"
       err(src) should include("no variant 'Square'")
     }
 

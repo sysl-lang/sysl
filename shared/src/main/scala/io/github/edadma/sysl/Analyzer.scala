@@ -493,7 +493,11 @@ class Analyzer private (units: List[Program])
     retTy = rtype
     variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
-    val tbody   = analyzeValueBlock(f.body, if rtype == Type.Unit then None else Some(rtype))
+    // A function owing no value is where statement position starts: its body block is the outermost
+    // one written for effect, and every `if` and `match` that ends it inherits that.
+    val tbody =
+      if rtype == Type.Unit then analyzeValueBlock(f.body, None, discarded = true)
+      else analyzeValueBlock(f.body, Some(rtype))
 
     if rtype != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, rtype) then
       err(s"function '${f.name}' should return ${show(rtype)}, but its body yields ${show(tbody.ty)}")
@@ -556,8 +560,13 @@ class Analyzer private (units: List[Program])
    * writing the ordinary construction is the whole spelling of an allocation. An expression
    * that is already a `&T` passes through untouched.
    */
-  protected def analyzeExpr(expr: Expr, expected: Option[Type]): TExpr = {
-    val t = at(expr.pos)(analyzeExpected(expr, expected)).setPos(expr.pos)
+  protected def analyzeExpr(expr: Expr, expected: Option[Type], discarded: Boolean): TExpr = {
+    // A discarded expression is by definition one nothing was expected of, so there is no context
+    // to push down and the conversion cases below have nothing to say — what the flag carries is
+    // the *absence* of a consumer, which only the branching forms act on.
+    val t = at(expr.pos)(
+      if discarded then analyzeValue(expr, None, discarded = true) else analyzeExpected(expr, expected),
+    ).setPos(expr.pos)
 
     // A value whose type could not be worked out — a name whose declaration failed, a field of a
     // type that did not resolve, a call to a function with an unusable signature — abandons this
@@ -610,10 +619,10 @@ class Analyzer private (units: List[Program])
     case r: Type.Ref if t.ty == r.inner => TBox(t, r).setPos(t.pos)
     case _                              => t
 
-  private def analyzeValue(expr: Expr, expected: Option[Type]): TExpr =
-    at(expr.pos)(analyzeValueAt(expr, expected)).setPos(expr.pos)
+  private def analyzeValue(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr =
+    at(expr.pos)(analyzeValueAt(expr, expected, discarded)).setPos(expr.pos)
 
-  private def analyzeValueAt(expr: Expr, expected: Option[Type]): TExpr = expr match
+  private def analyzeValueAt(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr = expr match
     case IntLit(v, suffix)   => intLiteral(v, suffix, expected)
     case FloatLit(t, suffix) => floatLiteral(t, suffix, expected)
     case CharLit(cp)         => TIntLit(cp, Type.Char)
@@ -936,10 +945,12 @@ class Analyzer private (units: List[Program])
         case _: Type.Integer => TIndex(tr, ti, elem)
         case other           => err(s"an index must be an integer, not ${show(other)}")
 
+    // An `if` whose own value is unused hands that down: each branch is a block in statement
+    // position, so neither is asked what it yields and the two have nothing to disagree about.
     case IfExpr(cond, thenBody, elseOpt) =>
       val tc    = analyzeBool(cond)
-      val tThen = analyzeValueBlock(thenBody, expected)
-      val tElse = elseOpt.map(analyzeValueBlock(_, expected))
+      val tThen = analyzeValueBlock(thenBody, expected, discarded)
+      val tElse = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       // The branches meet at one type, and a branch that does not finish takes the other's. A
       // branch used only for its effect is a different thing: one `unit` branch makes the whole
       // `if` a statement, whose value is nobody's, exactly as a missing `else` does.
@@ -954,13 +965,16 @@ class Analyzer private (units: List[Program])
 
     case MatchExpr(scrut, arms) =>
       val ts    = analyzeExpr(scrut)
-      val tarms = arms.map(analyzeArm(ts.ty, _, expected))
+      val tarms = arms.map(analyzeArm(ts.ty, _, expected, discarded))
       TMatch(ts, tarms, matchResultType(ts.ty, tarms))
 
+    // A loop's `else` is a block like any other, so a loop in statement position discards it too.
+    // Without that, Python's own idiom — walk, `break` on a hit, set a flag in the `else` when
+    // nothing hit — would be refused for a disagreement between the flag and a bare `break`.
     case While(label, cond, body, elseOpt) =>
       val tc            = analyzeBool(cond)
       val (tbody, ctx)  = analyzeLoopBody(expected, label)(analyzeStmts(body))
-      val telse         = elseOpt.map(analyzeValueBlock(_, expected))
+      val telse         = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       TWhile(tc, tbody, telse, loopResultType(ctx, telse))
 
     case Loop(label, body) =>
@@ -975,7 +989,7 @@ class Analyzer private (units: List[Program])
       val tcond        = cond.map(analyzeBool)
       val (tbody, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
       val tstep        = step.map(recoverStmt)
-      val telse        = elseOpt.map(analyzeValueBlock(_, expected))
+      val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       popScope()
       // With no condition the loop cannot finish on its own, so its type is what its `break`s
       // carry, exactly as `loop`'s is — and an `else` that can never run is a mistake worth saying.
@@ -997,7 +1011,7 @@ class Analyzer private (units: List[Program])
           val u            = declare(name, vty)
           val (tb, ctx)    = analyzeLoopBody(expected, label)(body.map(recoverStmt))
           popScope()
-          val telse        = elseOpt.map(analyzeValueBlock(_, expected))
+          val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
           TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
 
         case _ =>
@@ -1015,7 +1029,7 @@ class Analyzer private (units: List[Program])
           val u         = declare(name, elem)
           val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
           popScope()
-          val telse     = elseOpt.map(analyzeValueBlock(_, expected))
+          val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
           TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
 
     case TryExpr(e) =>

@@ -149,8 +149,14 @@ classify(n: int) -> string
         0            -> "zero"
         1 | 2 | 3    -> "small"
         4..10        -> "medium"
-        else         -> "large"
+        else            "large"
 ```
+
+**The `else` arm carries no `->`.** The arrow separates a *pattern* from what to do when it
+matches, and `else` is not a pattern — it is the fallback the arms above did not cover, and it
+takes its body the way an `if`'s `else` takes one. Writing `else -> …` would be putting a
+separator between a body and nothing, so it is refused by name rather than left to fail as a body
+that happens to start with an arrow.
 
 **The keyword goes after the value, as Scala's does.** A match is a transformation of the thing
 to its left, and writing it there is what lets one feed another: `x match … match …` reads in the
@@ -178,7 +184,7 @@ The pattern forms the implementation accepts, each a decision this chapter ratif
 | Pattern | Example | Matches |
 |---|---|---|
 | Wildcard | `_` | anything, binds nothing |
-| `else` arm | `else -> …` | anything; the catch-all spelling in tail position |
+| `else` arm | `else …` | anything; the catch-all spelling in tail position |
 | Literal | `0`, `'a'`, `"hi"`, `true` | a value equal to the literal (see the type rule below) |
 | Range | `3..7`, `0..<10`, `'a'..'z'` | a value in the range, inclusive `..` / exclusive `..<` per `00` |
 | Bind | `r`, `other` | anything, and binds the value to the name |

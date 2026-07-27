@@ -461,7 +461,7 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
           |    s match
           |        "yes" -> 1
           |        "no" -> 0
-          |        else -> -1
+          |        else -1
           |end kind
           |print(kind("yes"), kind("no"), kind("maybe"))
           |""".stripMargin

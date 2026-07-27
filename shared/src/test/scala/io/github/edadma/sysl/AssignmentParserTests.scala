@@ -76,7 +76,7 @@ class AssignmentParserTests extends AnyFreeSpec with ParseSupport {
         Assign("=", Field(Ident("obj"), "field"), ifE(Ident("c"), i(1), i(2)))
     }
     "a block match under a plain assignment" in {
-      prog("x = y match\n    1 -> 10\n    else -> 20") shouldBe List(
+      prog("x = y match\n    1 -> 10\n    else 20") shouldBe List(
         ExprStmt(
           Assign(
             "=",
@@ -93,7 +93,7 @@ class AssignmentParserTests extends AnyFreeSpec with ParseSupport {
       )
     }
     "a block match under a compound assignment" in {
-      prog("total += y match\n    1 -> 10\n    else -> 20") shouldBe List(
+      prog("total += y match\n    1 -> 10\n    else 20") shouldBe List(
         ExprStmt(
           Assign(
             "+=",

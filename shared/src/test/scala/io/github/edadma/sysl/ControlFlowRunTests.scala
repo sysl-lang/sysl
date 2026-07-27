@@ -575,7 +575,7 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
         """var y = 0
           |y = 5 match
           |    5 -> 50
-          |    else -> 0
+          |    else 0
           |print(y)""".stripMargin
 
       run(src) shouldBe "50\n"

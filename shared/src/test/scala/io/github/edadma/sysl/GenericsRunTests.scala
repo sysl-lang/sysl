@@ -67,10 +67,10 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport {
           |var y: Result[Option[int], string] = Ok(Some(5))
           |var a = x match
           |    Some(Ok(n)) -> n
-          |    else -> -1
+          |    else -1
           |var b = y match
           |    Ok(Some(n)) -> n
-          |    else -> -1
+          |    else -1
           |print(a, b)
           |""".stripMargin) shouldBe "99 5\n"
   }

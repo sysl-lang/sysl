@@ -819,9 +819,17 @@ class SyslParser(val source: Source) extends PackratParsers {
       case scrut ~ chain => chain.foldLeft(scrut)((e, arms) => MatchExpr(e, arms).setPos(e.pos))
     }
 
+  /** One arm. The `->` separates a *pattern* from what to do when it matches, and `else` is not a
+   * pattern — it is the fallback, and it takes its body directly, exactly as an `if`'s `else` does.
+   *
+   * The arrow after `else` is called out by name rather than left to fail as an expression, since
+   * what it fails as is a body that does not start with a `->` and the position that reports is
+   * the `match` several lines above.
+   */
   private lazy val matchArm: Parser[MatchArm] =
     at(
-      op("else") ~> (op("->") ~> (suite | inlineBody)) ^^ (b => MatchArm(List(WildcardPattern), None, b)) |
+      op("else") ~> op("->") ~> err("the 'else' arm takes its body directly, with no '->' — 'else' names no pattern to separate one from") |
+        op("else") ~> (suite | inlineBody) ^^ (b => MatchArm(List(WildcardPattern), None, b)) |
         rep1sep(pattern, op("|")) ~ opt(op("if") ~> expression) ~ (op("->") ~> (suite | inlineBody)) ^^ {
           case pats ~ guard ~ b => MatchArm(pats, guard, b)
         },

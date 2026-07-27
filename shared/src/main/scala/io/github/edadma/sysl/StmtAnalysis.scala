@@ -15,9 +15,9 @@ trait StmtAnalysis extends TypeResolution {
   /** A block whose trailing expression (if any) is its value — a function body or an if/match
    * branch. Statements share one lexical scope with the result expression.
    */
-  protected def analyzeValueBlock(stmts: List[Stmt], expected: Option[Type]): TBlock = {
+  protected def analyzeValueBlock(stmts: List[Stmt], expected: Option[Type], discarded: Boolean = false): TBlock = {
     pushScope()
-    val tb = analyzeBlockBody(stmts, expected)
+    val tb = analyzeBlockBody(stmts, expected, discarded)
     popScope()
     tb
   }
@@ -29,13 +29,20 @@ trait StmtAnalysis extends TypeResolution {
    * be the value of, and it does not fall out the bottom either, so its type is `never` rather than
    * `unit`. That is what lets `if c then 1 else return 0` be an `int`: the jump is still not an
    * expression (`12 §3`), but the block around it is one, and its type says control does not arrive.
+   *
+   * **A block in statement position has no value, whatever its last expression yields** (`00 §2`).
+   * There is no statement terminator to write "and throw this away" with, so a trailing call, an
+   * assignment, or an `i++` would otherwise make a block that was plainly written for its effect
+   * claim a value nobody asked for — and two such blocks under one `if` or `match` would then be
+   * made to agree on it. A block that does not *arrive* keeps `never`: that is reachability rather
+   * than a value, and the code around it is still entitled to know.
    */
-  protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type]): TBlock =
+  protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type], discarded: Boolean = false): TBlock =
     stmts.reverse match
       case ExprStmt(e) :: initRev =>
         val init = initRev.reverse.map(recoverStmt)
-        val tr   = analyzeExpr(e, expected)
-        TBlock(init, Some(tr), tr.ty)
+        val tr   = analyzeExpr(e, expected, discarded)
+        TBlock(init, Some(tr), if discarded && tr.ty != Type.Never then Type.Unit else tr.ty)
       case (_: Return | _: Break | _: Continue) :: _ =>
         TBlock(stmts.map(recoverStmt), None, Type.Never)
       case _ =>
@@ -185,8 +192,9 @@ trait StmtAnalysis extends TypeResolution {
       if !hasZero(ty) then err(s"${show(ty)} has no zero value, so '$name' needs an initial value")
       TVarDecl(declare(name, ty), ty, TZero(ty))
 
+    // A statement's value is nobody's, so whatever branching it contains is analyzed knowing that.
     case ExprStmt(e) =>
-      TExprStmt(analyzeExpr(e))
+      TExprStmt(analyzeExpr(e, None, discarded = true))
 
     case Return(opt) =>
       val tv = opt.map(analyzeExpr(_, Some(retTy)))

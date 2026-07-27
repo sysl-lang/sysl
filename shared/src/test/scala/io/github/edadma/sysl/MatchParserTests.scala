@@ -18,7 +18,7 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
         |    0 -> print(1)
         |    1 | 2 -> print(2)
         |    3..5 -> print(3)
-        |    else -> print(4)""".stripMargin
+        |    else print(4)""".stripMargin
 
     matchExpr(src) shouldBe MatchExpr(
       Ident("n"),
@@ -29,6 +29,35 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
         MatchArm(List(WildcardPattern), None, List(printStmt(i(4)))),
       ),
     )
+  }
+
+  // The `->` separates a pattern from its body, and `else` is not a pattern — it is the fallback,
+  // and takes its body the way an `if`'s `else` takes one. An arrow after it is named rather than
+  // left to fail as a body, since what it fails as reports the position of the `match` above.
+  "the 'else' arm takes an indented body as readily as an inline one" in {
+    val src =
+      """n match
+        |    0 -> print(1)
+        |    else
+        |        print(2)
+        |        print(3)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("n"),
+      List(
+        MatchArm(List(LitPattern(i(0))), None, List(printStmt(i(1)))),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(2)), printStmt(i(3)))),
+      ),
+    )
+  }
+
+  "and an arrow after it is refused by name" in {
+    val src =
+      """n match
+        |    0 -> print(1)
+        |    else -> print(2)""".stripMargin
+
+    progError(src) should include("takes its body directly, with no '->'")
   }
 
   // `match` is postfix and binds looser than any operator, so the scrutinee is the whole expression
@@ -48,10 +77,10 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
     val src =
       """n match
         |    0 -> "zero"
-        |    else -> "other"
+        |    else "other"
         |match
         |    "zero" -> print(1)
-        |    else -> print(2)""".stripMargin
+        |    else print(2)""".stripMargin
 
     matchExpr(src).scrutinee shouldBe MatchExpr(
       Ident("n"),
@@ -66,7 +95,7 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
     val src =
       """x match
         |    _ if x > 0 -> print(1)
-        |    else -> print(2)""".stripMargin
+        |    else print(2)""".stripMargin
 
     matchExpr(src) shouldBe MatchExpr(
       Ident("x"),
@@ -81,7 +110,7 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
     val src =
       """p match
         |    Point(0, y) -> print(y)
-        |    else -> print(0)""".stripMargin
+        |    else print(0)""".stripMargin
 
     matchExpr(src) shouldBe MatchExpr(
       Ident("p"),
@@ -96,7 +125,7 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
     val src =
       """p match
         |    Point{x: 0, y} -> print(y)
-        |    else -> print(0)""".stripMargin
+        |    else print(0)""".stripMargin
 
     matchExpr(src) shouldBe MatchExpr(
       Ident("p"),

@@ -128,6 +128,55 @@ the assignment yields `int`). The compiler catches it with no grammar ban needed
 assignment-expressions would only cost the useful capture idioms — Python did exactly that
 and had to reintroduce them via the `:=` walrus operator.
 
+### Statement position discards a block's value
+
+Every capture idiom the rule above exists for has the assignment **inside a larger expression**:
+`a = b = c = 0`, `while (c = next()) != 0`, `if (p = find(k)) != null`. What the rule must not do
+is leak out of that setting and into the *end of a block*, because that is where an assignment is
+written for no reason but its effect:
+
+```
+if c
+    full = true          // bool
+else
+    len += 1             // usize
+```
+
+A block's value is its trailing expression (§10), so without a further rule these two branches
+would be made to agree on a value nobody asked for, and the `if` refused for `bool` and `usize`
+having nothing to meet at. The same shape reaches a `match` whose arms merely each do something,
+and it is not confined to assignment: a trailing `i++` yields the old value, and a trailing call
+yields whatever the callee returns.
+
+**The rule is therefore about the position and not about the operator.** Where a block's own value
+is unused, the block has none — its type is `unit` whatever its last expression yields — and that
+propagates inward: into the branches of an `if`, the arms of a `match`, and the `else` of a loop,
+each of which is a block in the same position as the one around it. Statement position starts at a
+statement, at a loop body, and at the body of a function that returns nothing.
+
+**Why the position rather than a discard marker.** Rust reaches the same place from the other side:
+assignment is `()` there, and an effectful last line is discarded by writing `;`. Sysl has no
+statement terminator — nothing separates statements but the line they are on — so there is no `;`
+to write, and requiring a discarded block to end at `unit` would mean wrapping every effectful last
+line in something. Taking the position instead costs nothing a program wanted: where the value is
+genuinely used, it is genuinely there.
+
+Three consequences worth stating, because each is a case that came up:
+
+- **A value position is unchanged.** `var x = if c then a = 1 else b = 2` is an `int`, and two
+  branches that disagree about a value are still a diagnostic. So is an assignment ending the body
+  of a function that returns something — the rule follows what is asking, not what is written.
+- **Exhaustiveness follows the same line** (`09 §7`): a `match` need only be exhaustive when it
+  yields a value, so one written for effect does not acquire an `else` requirement by having arms
+  that end in assignments. An enum's coverage is not about the value and is unaffected.
+- **A block that does not *arrive* keeps `never`** (§11) rather than collapsing to `unit`. That is
+  reachability and not a value, and the code around it is entitled to know: an `if` in statement
+  position whose branches both diverge still ends nowhere.
+
+A **`break` that carries a value is not discarded** along with the block it sits in. It is an
+explicit request for one, so a loop written for effect that nonetheless breaks with something is a
+mistake and is reported — which is the whole reason a value-carrying `break` requires an `else`.
+
 ---
 
 ## 3. Increment/decrement are expressions, with defined evaluation order
@@ -339,7 +388,8 @@ fee(t: Tier) -> int = t match
 ```
 
 In statement position the value is simply unused, so the same forms read as ordinary control
-flow. A branch or arm yields its block's **trailing expression**; a branch that only performs
+flow — and a block whose value is unused *has* none, whatever its last expression yields (§2).
+A branch or arm otherwise yields its block's **trailing expression**; a branch that only performs
 effects yields `unit`. An `if` used for a value needs an `else` (a missing one leaves the
 open branch at `unit`); a `match` used for a value must be exhaustive. A branch that does not
 finish at all is the one alternative that constrains nothing — see `never` (§11).
