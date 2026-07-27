@@ -886,6 +886,23 @@ class Analyzer private (units: List[Program])
       val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))
       TLoop(tbody, endlessResultType(ctx))
 
+    // The init's binding belongs to the loop and to nothing outside it, so the scope opens before
+    // the condition — which reads that binding — and closes after the `else`, which may too.
+    case CFor(label, init, cond, step, body, elseOpt) =>
+      pushScope()
+      val tinit        = init.map(recoverStmt)
+      val tcond        = cond.map(analyzeBool)
+      val (tbody, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
+      val tstep        = step.map(recoverStmt)
+      val telse        = elseOpt.map(analyzeValueBlock(_, expected))
+      popScope()
+      // With no condition the loop cannot finish on its own, so its type is what its `break`s
+      // carry, exactly as `loop`'s is — and an `else` that can never run is a mistake worth saying.
+      if tcond.isEmpty && telse.isDefined then
+        err("this 'for' has no condition, so it never finishes on its own and its 'else' cannot run")
+      TCFor(tinit, tcond, tstep, tbody, telse,
+            if tcond.isEmpty then endlessResultType(ctx) else loopResultType(ctx, telse))
+
     case For(label, name, iter, body, elseOpt) =>
       iter match
         case RangeExpr(Some(lo), Some(hi), inclusive) =>

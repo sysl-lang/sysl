@@ -277,7 +277,7 @@ private class Escape(program: TProgram) {
   }
 
   private def ownBreaksInExpr(e: TExpr): List[TExpr] = e match
-    case _: TWhile | _: TLoop | _: TFor | _: TForEach => Nil
+    case _: TWhile | _: TLoop | _: TFor | _: TForEach | _: TCFor => Nil
     case TIf(_, t, el, _)   => ownBreakValues(t.stmts) ::: el.toList.flatMap(b => ownBreakValues(b.stmts))
     case TMatch(_, arms, _) => arms.flatMap(a => ownBreakValues(a.body.stmts))
     case _                  => Nil
@@ -290,6 +290,10 @@ private class Escape(program: TProgram) {
     case TMatch(_, arms, _) => arms.map(_.body) ::: children(e).flatMap(blocks)
     case TWhile(_, body, el, _)           => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TLoop(body, _)                   => TBlock(body, None, Type.Unit) :: children(e).flatMap(blocks)
+    // The init and the step are statements of the loop's own scope, so they are walked as part of
+    // the block its body makes rather than as expressions beside it.
+    case TCFor(init, _, step, body, el, _) =>
+      TBlock(init.toList ::: body ::: step.toList, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TFor(_, _, _, _, _, body, el, _) => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TForEach(_, _, _, body, el, _)   => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case _                  => children(e).flatMap(blocks)

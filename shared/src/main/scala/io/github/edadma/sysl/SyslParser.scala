@@ -751,12 +751,35 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val loopExpr: PackratParser[Expr] =
     opt(labelRef) ~ (op("loop") ~> body("do")) ~ opt(endMarker("loop")) ^^ { case lbl ~ b ~ _ => Loop(lbl, b) }
 
-  private lazy val forExpr: PackratParser[Expr] =
+  private lazy val forExpr: PackratParser[Expr] = cForExpr | forInExpr
+
+  private lazy val forInExpr: PackratParser[Expr] =
     opt(labelRef) ~ (op("for") ~> ident) ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(
       endMarker("for"),
     ) ^^ {
       case lbl ~ n ~ it ~ b ~ e ~ _ => For(lbl, n, it, b, e)
     }
+
+  /** `for init; cond; step` — the three-clause loop (`00` §10).
+   *
+   * Tried before `for x in …`, and unambiguous against it: this one needs two `;` in its header and
+   * that one has none, so whichever the reader wrote is the one that parses. No parentheses, as in
+   * Go — every other header in the language is without them, and a parenthesized one here would be
+   * the only place they were structure rather than grouping.
+   *
+   * Each clause may be empty. An absent condition is `true`, which makes `for ; ;` a `loop` spelled
+   * the long way; `loop` says it better and this does not forbid it.
+   */
+  private lazy val cForExpr: PackratParser[Expr] =
+    opt(labelRef) ~ (op("for") ~> opt(forClause) <~ op(";")) ~ (opt(expression) <~ op(";")) ~ opt(forClause) ~
+      body("do") ~ opt(elseClause) ~ opt(endMarker("for")) ^^ {
+        case lbl ~ init ~ cond ~ step ~ b ~ e ~ _ => CFor(lbl, init, cond, step, b, e)
+      }
+
+  /** One clause of a three-clause `for` header: a `var` declaration or a bare expression, which for
+   * the step is the assignment or increment that advances the loop.
+   */
+  private lazy val forClause: PackratParser[Stmt] = at(varDecl | exprStmt)
 
   // --- match ---------------------------------------------------------------------------
 

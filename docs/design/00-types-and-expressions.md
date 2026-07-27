@@ -389,6 +389,32 @@ its type for the same reason.
 
 `continue` starts the next iteration as it does in any loop, and a label works unchanged.
 
+**A counted loop that a range cannot describe is written with three clauses.** `for init; cond;
+step` is C's loop without the parentheses, as Go writes it — every other header in the language is
+parenthesis-free, and parentheses here would be structure rather than grouping:
+
+```
+for var i = 0; i < n; i += 1
+    total += a[i]
+
+for var i = n - 1; i >= 0; i -= 1      // downward, which a range does not say
+    print(a[i])
+```
+
+Each clause may be left out. An absent condition never turns false, so such a loop ends only
+through a `break` and takes no `else`, exactly as `loop` does — and `loop` says that better.
+
+**The step is why the form exists**, and it is not sugar for a `while`. `continue` runs the step
+before testing again, so an iteration that is skipped still advances. The same loop written as a
+`while` puts its increment at the foot of the body, where the first `continue` anybody adds later
+walks straight past it — a bug the shape of the code invites and nothing about it warns of. This is
+also why the three-clause form is not simply `{ init; while cond { body; step } }`: those two
+differ precisely on `continue`.
+
+`for x in 0..<n` remains the way to write the ordinary ascending walk, and is preferred where it
+fits: it names one thing instead of three, and cannot get any of them wrong. The three-clause form
+is for a stride, a descent, a compound test, or several variables advancing together.
+
 **A loop may be labeled, so `break` and `continue` can reach an outer one.** A `'label` written
 before the loop keyword names that loop, and `break 'label` / `continue 'label` then act on it
 rather than on the nearest enclosing loop — the one way to leave or restart an outer loop from

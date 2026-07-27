@@ -309,6 +309,12 @@ case class TLoop(body: List[TStmt], ty: Type) extends TExpr
 case class TFor(name: String, varTy: Type, lo: TExpr, hi: TExpr, inclusive: Boolean,
                 body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
 
+/** `for init; cond; step [else …]` — the three-clause loop. An absent condition is `true`, and the
+ * step is what `continue` runs before the next test.
+ */
+case class TCFor(init: Option[TStmt], cond: Option[TExpr], step: Option[TStmt], body: List[TStmt],
+                 elseBlock: Option[TBlock], ty: Type) extends TExpr
+
 /** `for name in seq [else …]` over an array or a slice. The loop variable is a *copy* of each
  * element, and the sequence is evaluated once.
  */

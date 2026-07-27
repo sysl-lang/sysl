@@ -293,6 +293,52 @@ trait ControlFlowEmitter extends PlaceEmitter {
     genLoopResult(slot, ty, elseL, endL, elseBlock)
   }
 
+  /** The three-clause loop. It is `genFor`'s shape with both fixed parts opened up: the test is
+   * whatever was written (absent ⇒ always taken, so the `else` target is unreachable and the loop
+   * ends only through a `break`), and the step is whatever was written rather than an increment.
+   *
+   * `continue` targets the **step** block, which is the whole point of the form: a counted loop
+   * written as a `while` skips its increment on the first `continue` somebody adds.
+   */
+  protected def genCFor(f: TCFor): String = {
+    val TCFor(init, cond, step, body, elseBlock, ty) = f
+    val condL = freshLabel("cfor.cond")
+    val bodyL = freshLabel("cfor.body")
+    val stepL = freshLabel("cfor.step")
+    val endL  = freshLabel("cfor.end")
+    val elseL = if elseBlock.isDefined then freshLabel("cfor.else") else endL
+    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+
+    init.foreach(genStmt)
+    genLoops = GenLoop(endL, stepL, slot, ty, owned.length, tempStack.length) :: genLoops
+
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    cond match
+      case Some(c) =>
+        // Re-evaluated every iteration, so what it borrows is let go before the branch rather than
+        // accumulating in the enclosing statement's region.
+        pushTemps()
+        val v = genExpr(c)
+        popTemps()
+        emitTerm(s"br i1 $v, label %$bodyL, label %$elseL")
+      case None => emitTerm(s"br label %$bodyL")
+
+    emitLabel(bodyL)
+    pushOwned()
+    body.foreach(genStmt)
+    popOwned()
+    emitTerm(s"br label %$stepL")
+    emitLabel(stepL)
+    pushTemps()
+    step.foreach(genStmt)
+    popTemps()
+    emitTerm(s"br label %$condL")
+
+    genLoops = genLoops.tail
+    genLoopResult(slot, ty, if cond.isDefined then elseL else endL, endL, elseBlock)
+  }
+
   // The sequence is evaluated once, into the statement's own region, so a slice temporary stays
   // alive for the whole loop; the loop variable is a copy, released each iteration.
   protected def genForEach(e: TForEach): String = {

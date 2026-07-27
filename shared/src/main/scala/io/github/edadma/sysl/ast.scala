@@ -308,6 +308,24 @@ case class Loop(label: Option[String], body: List[Stmt]) extends Expr
 case class For(label: Option[String], name: String, iter: Expr, body: List[Stmt], elseBody: Option[List[Stmt]])
     extends Expr
 
+/** `['label] for init; cond; step` — the three-clause loop, written without parentheses as Go
+ * writes it, since every other header in the language is parenthesis-free.
+ *
+ * Each clause may be empty. It is an **expression** with the same `break`/`else` rules as `while`,
+ * whose `else` runs when the condition turns false. What it carries that `while` cannot is the
+ * **step**: `continue` runs it before testing again, which is the whole reason a counted loop
+ * written as a `while` is a bug waiting for its first `continue`. A binding introduced by the init
+ * is scoped to the loop — the condition, the step, the body, and the `else`.
+ */
+case class CFor(
+    label: Option[String],
+    init: Option[Stmt],
+    cond: Option[Expr],
+    step: Option[Stmt],
+    body: List[Stmt],
+    elseBody: Option[List[Stmt]],
+) extends Expr
+
 /** `return` / `return expr` inside a function body. */
 case class Return(value: Option[Expr]) extends Stmt
 
