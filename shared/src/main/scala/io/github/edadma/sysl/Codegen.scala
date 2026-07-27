@@ -153,6 +153,19 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       Option.unless(Type.zeroSized(a.ty))(s"${a.ty.llvm} $v")
     }
 
+  /** Checks a struct value against its `invariant` function: read each stored field out of the
+   * aggregate `v`, call `invFn`, and trap on a false result. The fields are handed over exactly as
+   * an ordinary call's arguments are — the callee borrows, so no count is taken here.
+   */
+  private def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit =
+    val args = struct.fields.zipWithIndex.collect {
+      case ((_, ft), i) if !Type.zeroSized(ft) =>
+        val r = freshTemp(); emit(s"$r = extractvalue ${struct.llvm} $v, ${struct.slot(i)}")
+        s"${ft.llvm} $r"
+    }
+    val ok = freshTemp(); emit(s"$ok = call i1 @$invFn(${args.mkString(", ")})")
+    trapUnless(ok, "invariant")
+
   /** Every callee declared with a `...`, foreign or sysl's own, mapped to the LLVM function type a
    * call to it must name: result type, declared parameter types, ellipsis.
    */
@@ -633,15 +646,14 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
 
     case TStructInvCheck(value, struct, invFn) =>
       val v = genExpr(value)
-      // Read each stored field back out of the value and hand it to the invariant function, exactly
-      // as an ordinary call passes its arguments — the callee borrows, so no count is taken here.
-      val args = struct.fields.zipWithIndex.collect {
-        case ((_, ft), i) if !Type.zeroSized(ft) =>
-          val r = freshTemp(); emit(s"$r = extractvalue ${struct.llvm} $v, ${struct.slot(i)}")
-          s"${ft.llvm} $r"
-      }
-      val ok = freshTemp(); emit(s"$ok = call i1 @$invFn(${args.mkString(", ")})")
-      trapUnless(ok, "invariant")
+      emitInvCheck(v, struct, invFn)
+      v
+
+    case TCheckedStore(store, recv, struct, invFn) =>
+      // The store runs first (yielding the value the assignment expression is), then the mutated
+      // struct is re-read so the invariant sees the new field.
+      val v = genExpr(store)
+      emitInvCheck(genExpr(recv), struct, invFn)
       v
 
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.

@@ -88,4 +88,43 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
     run(src + "var x = Prob(0.5)\nprint(x.p)") shouldBe "0.5\n"
     exits(src + "var x = Prob(1.5)")
   }
+
+  "a field assignment re-checks the invariant" - {
+    "an in-range write proceeds" in {
+      run(Account + "var a = Account(5)\na.balance = 8\nprint(a.balance)") shouldBe "8\n"
+    }
+    "an out-of-range write traps" in {
+      exits(Account + "var a = Account(5)\na.balance = -1")
+    }
+  }
+
+  "a compound field assignment re-checks the invariant" - {
+    "an in-range update proceeds" in {
+      run(Account + "var a = Account(5)\na.balance += 3\nprint(a.balance)") shouldBe "8\n"
+    }
+    "an update that drops below the bound traps" in {
+      exits(Account + "var a = Account(5)\na.balance -= 9")
+    }
+  }
+
+  "a field write through a pointer is checked" in {
+    exits(Account + "var a = Account(5)\nvar p = &a\n(*p).balance = -2")
+  }
+
+  // Every field write is its own checkpoint: a sequence in which each intermediate state holds
+  // proceeds, but a single write that breaks the invariant traps even if a later write would mend it.
+  "each field write is checked as it happens" - {
+    val span =
+      """|struct Span
+         |    lo: int
+         |    hi: int
+         |    invariant lo <= hi
+         |""".stripMargin
+    "a sequence whose every step holds proceeds" in {
+      run(span + "var s = Span(2, 8)\ns.hi = 5\ns.lo = 4\nprint(s.lo, s.hi)") shouldBe "4 5\n"
+    }
+    "an intermediate write that breaks the invariant traps at that write" in {
+      exits(span + "var s = Span(2, 8)\ns.lo = 10\ns.hi = 12")
+    }
+  }
 }

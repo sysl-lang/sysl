@@ -680,6 +680,19 @@ class Analyzer private (units: List[Program])
   /** Wraps a base-typed value in the run-time check for a constrained subtype. */
   private def checkInto(v: TExpr, c: Type.Constrained): TExpr = TConstrainedCheck(v, c).setPos(v.pos)
 
+  /** If `place` is a field of a struct that carries `invariant` clauses, wrap the write so the
+   * struct's invariant is re-checked the moment the field changes; otherwise the write stands as it
+   * is. The receiver of the field is the struct to re-read — the same node covers `s.f = v`, a
+   * compound `s.f op= v`, and a through-pointer `(*p).f = v`, since each analyses to a field place.
+   */
+  private def withInvCheck(place: TExpr, store: TExpr): TExpr = place match
+    case TField(recv, _, _) =>
+      recv.ty match
+        case s: Type.Struct if structDecls.get(s.base).exists(d => d.invariants.nonEmpty && d.tparams.isEmpty) =>
+          TCheckedStore(store, recv, s, invKey(s.base)).setPos(store.pos)
+        case _ => store
+    case _ => store
+
   /** `Name(value)` — an explicit cast into a constrained subtype. The operand is taken at the
    * subtype's base and checked; a value whose base does not agree is a mistake the message names.
    */
@@ -908,7 +921,7 @@ class Analyzer private (units: List[Program])
       // a `never` does where one really may stand — as the value a `return` or a branch yields.
       if tv.ty == Type.Never || disagree(tv.ty, place.ty) then
         err(s"cannot assign ${show(tv.ty)} to ${describe(target)} of type ${show(place.ty)}")
-      TStore(place, tv, place.ty)
+      withInvCheck(place, TStore(place, tv, place.ty))
 
     // `p += q` on a type whose `Add` is a real implementation updates the place from the value it
     // already read, exactly as the scalar form does — the dispatch travels with the node rather
@@ -922,7 +935,7 @@ class Analyzer private (units: List[Program])
       if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then
         err(s"'$op' would change the type of ${describe(target)}")
 
-      TUpdate(place, op, tv, place.ty, d)
+      withInvCheck(place, TUpdate(place, op, tv, place.ty, d))
 
     // The forms the compiler resolves by name rather than by looking a function up: `print` and
     // its two rendering companions, which are temporary and leave once a `Display` trait can carry
