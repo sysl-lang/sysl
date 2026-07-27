@@ -28,6 +28,7 @@ that quietly stopped running would otherwise look like a check that passed.
 | `json` | recursive ownership — a value that contains itself through `&T` |
 | `hashmap` | the trait system under load — bounds, the behaviour they promise, and ownership at once |
 | `bytecode` | the module system, and the set's one end-to-end assertion — source in, bytecode out, run it |
+| `png` | the byte level — endianness, bit streams, checksums, a format someone else defined |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

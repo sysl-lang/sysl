@@ -441,6 +441,16 @@ scoped to it and initialized in its order, not a member of the module. (A module
 *visible to other files* is a different thing, and it is what §2's "anything visible outside its
 file states its types" is written about.)
 
+**What the absence of that binding costs, so far.** A value two functions share is written as a
+nullary function, which reads well enough (`guide/json`'s `max_depth()`). Two consequences are less
+comfortable, both from `guide/`: an **array bound cannot name one**, because a bound is a
+compile-time constant and a call is not, so a buffer's size is a literal repeated wherever it is
+mentioned and kept in step by a comment (`guide/bytecode`'s `[512]u8` beside its `capacity()`); and
+a **lookup table has nowhere to live**, since rebuilding one per call defeats it, which is why
+`guide/png` computes its CRC a bit at a time instead of through the 256-entry table every other
+implementation of that function uses. Neither is an argument for a mutable module-level `var` — a
+module-level *constant* is what both want.
+
 A program in which no file carries a statement is a complete program that does nothing: the entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,
 which is what it should compile to — a library is not an error.

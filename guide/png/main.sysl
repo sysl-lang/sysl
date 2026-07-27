@@ -1,0 +1,500 @@
+// A PNG reader — the container, the deflate stream inside it, the filters under that, and the
+// pixels under those.
+//
+// The axis this owns is **the byte level**: a format somebody else defined, where being wrong by
+// one byte is silent. Nothing here is a design of ours to get right. The signature is eight
+// specific bytes, the chunk lengths are big-endian, the bit stream inside them is little-endian,
+// the Huffman codes inside *that* are packed the other way up again, the filters are modulo 256,
+// and the two checksums are computed by two unrelated methods. A reader that gets any of it wrong
+// still produces an image; it just produces the wrong one. That is why every check here compares a
+// value somebody else computed — the fixtures came out of a different encoder, and the checksum
+// vectors are the published ones.
+//
+// What writing it turned up:
+//
+//   * **There is no multi-line or raw string literal, and embedded binary data is what wants one.**
+//     A literal may not span a line and no operator continues one, so the ten files this program
+//     reads are hex strings assembled with `+=` and unpacked at run time. An array literal would be
+//     one line of two hundred numbers. `01` lists the multi-line form as unspecified; this is the
+//     first program in the set with a reason to care which way it is specified.
+//   * **No constants means no tables.** A CRC is a table lookup in every implementation ever
+//     written, and a module has no constants, so the table would have to be rebuilt by whoever
+//     wanted one. Here it is computed a bit at a time instead — eight times the work, chosen
+//     because the alternative is worse to read. The same absence sets every array bound in this
+//     program: `[320]u8` for the code lengths is `286 + 30` rounded up and written as a literal,
+//     because a bound cannot name anything.
+//   * **A decoder's intermediate storage is in its signature.** `decode` takes three buffers,
+//     and two of them are its own internals: somewhere to gather the compressed data, somewhere to
+//     unpack it to. With no growable collection the caller supplies both, in sizes it cannot work
+//     out without reading the header, which is inside. This is the JSON program's missing `[]T`
+//     again, but the consequence is new — it is not awkward *inside* a function, it is visible in
+//     the API.
+//   * **`Result[unit, E]` is missing here too**, in a program with nothing else in common with a
+//     parser. Eight functions across the two modules return `Result[bool, Fault]` with a `bool`
+//     nobody reads. The compiler front end that found this first made it look like a property of
+//     parsers; a bit-stream decoder finding the same thing makes it structural.
+//   * **A struct member cannot say `private`.** `Image.index` is nobody's business but `at`'s, and
+//     there is no way to write that down — the same gap the compiler's lexer hit, from the other
+//     side.
+//
+// And the thing that went *right*, which for this program is the finding that matters most:
+// **the corrected operator precedence is worth what it cost.** `c & 1u32 != 0u32`,
+// `1u32 << k - 1u32`, `x + predicted & 255`, `u32(b) << 24u32 | u32(b) << 16u32` — every one of
+// those reads as intended with no parentheses, and every one of them needs them in C. This is the
+// first program in the set that is nothing *but* bit manipulation, so it is the first one in a
+// position to say so. The trade is real and shows up once: shifts binding like multiplication
+// means `first + count << 1` is `first + (count << 1)`, so the canonical-Huffman step that wants
+// the other grouping is the one place here that had to say which.
+
+// The checks. Every line of output begins `ok`, so the whole of stdout is the assertion.
+
+private read32(b: []u8, at: usize) -> u32
+    u32(b[at]) << 24u32 | u32(b[at + 1usize]) << 16u32 | u32(b[at + 2usize]) << 8u32 | u32(b[at + 3usize])
+
+private write32(b: []u8, at: usize, v: u32)
+    b[at] = u8(v >> 24u32)
+    b[at + 1usize] = u8(v >> 16u32 & 255u32)
+    b[at + 2usize] = u8(v >> 8u32 & 255u32)
+    b[at + 3usize] = u8(v & 255u32)
+end write32
+
+// Put a chunk's checksum back after tampering with it, so that a test of what the *reader* makes
+// of a changed header is not answered by the checksum first.
+private reseal(b: []u8, at: usize)
+    var len = usize(read32(b, at))
+
+    write32(b, at + 8usize + len, crc32(b[at + 4usize..<at + 8usize + len]))
+end reseal
+
+private matches(out: []u8, n: usize, want: string) -> bool
+    if n != want.len then return false
+
+    var i = 0usize
+
+    while i < n
+        if out[i] != want[i] then return false
+
+        i += 1usize
+
+    true
+end matches
+
+same(label: string, got: string, want: string)
+    if got == want then print(s"ok    $label -> $got")
+    else print(s"FAIL  $label -> $got (wanted $want)")
+end same
+
+// ------------------------------------------------------------------------------------- checksums
+
+// `s.bytes` is the seam between the two halves of this program: text on one side, the byte view a
+// checksum works over on the other, no copy in between.
+crc(label: string, text: string, want: string)
+    same(label, f"${crc32(text.bytes)}%08x", want)
+
+adler(label: string, text: string, want: string)
+    same(label, f"${inflate.adler32(text.bytes)}%08x", want)
+
+// ---------------------------------------------------------------------------------------- inflate
+
+unpacks(label: string, hex: string, want: string)
+    var src: [256]u8
+    var out: [512]u8
+    var n = unhex(hex, src[..])
+
+    inflate.zlib(src[..<n], out[..]) match
+        Err(f) -> print(s"FAIL  $label -> ${inflate.describe(f)}")
+        Ok(k) ->
+            if matches(out[..], k, want) then print(s"ok    $label -> ${str(k)} bytes")
+            else print(s"FAIL  $label -> ${str(k)} bytes")
+end unpacks
+
+// A stream with one byte changed, which is how a decoder finds out whether it is checking or
+// merely reading.
+mangles(label: string, hex: string, at: usize, value: u8, want: string)
+    var src: [256]u8
+    var out: [512]u8
+    var n = unhex(hex, src[..])
+
+    src[at] = value
+
+    inflate.zlib(src[..<n], out[..]) match
+        Ok(k) -> print(s"FAIL  $label unpacked ${str(k)} bytes")
+        Err(f) -> same(label, inflate.describe(f), want)
+end mangles
+
+chopped(label: string, hex: string, keep: usize, want: string)
+    var src: [256]u8
+    var out: [512]u8
+
+    unhex(hex, src[..])
+
+    inflate.zlib(src[..<keep], out[..]) match
+        Ok(k) -> print(s"FAIL  $label unpacked ${str(k)} bytes")
+        Err(f) -> same(label, inflate.describe(f), want)
+end chopped
+
+// A bare deflate stream, with no wrapper to check it, which is the only way to ask what the
+// decoder does with bits no encoder would have written.
+refuses(label: string, hex: string, want: string)
+    var src: [256]u8
+    var out: [512]u8
+    var n = unhex(hex, src[..])
+
+    inflate.raw(src[..<n], out[..]) match
+        Ok(k) -> print(s"FAIL  $label unpacked ${str(k)} bytes")
+        Err(f) -> same(label, inflate.describe(f), want)
+end refuses
+
+crowded(label: string, hex: string, room: usize, want: string)
+    var src: [256]u8
+    var out: [512]u8
+    var n = unhex(hex, src[..])
+
+    inflate.zlib(src[..<n], out[..<room]) match
+        Ok(k) -> print(s"FAIL  $label unpacked ${str(k)} bytes")
+        Err(f) -> same(label, inflate.describe(f), want)
+end crowded
+
+// ---------------------------------------------------------------------------------------- images
+
+header(label: string, file: string, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
+        Ok(img) -> same(label, f"${img.width}%dx${img.height}%d type ${img.kind}%d", want)
+end header
+
+pixel(label: string, file: string, x: usize, y: usize, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
+        Ok(img) ->
+            var p = img.at(x, y)
+
+            same(label, f"${p.r}%d ${p.g}%d ${p.b}%d ${p.a}%d", want)
+end pixel
+
+// Every sample of the five-row image, against the arithmetic that generated it. One check rather
+// than sixty, because sixty checks of the same shape say nothing sixty times.
+sweep(label: string, file: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
+        Ok(img) ->
+            var wrong = 0
+            var y = 0usize
+
+            while y < img.height
+                var x = 0usize
+
+                while x < img.width
+                    var p = img.at(x, y)
+                    var base = int(y * 4usize + x) * 3
+
+                    if int(p.r) != base || int(p.g) != base + 7 || int(p.b) != base + 14 then wrong += 1
+
+                    x += 1usize
+
+                y += 1usize
+
+            same(label, s"${str(wrong)} wrong", "0 wrong")
+end sweep
+
+// An image small enough to print, which is the most direct check there is: if a filter were undone
+// wrongly, or a row were read at the wrong offset, the picture would say so.
+art(label: string, file: string, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
+        Ok(img) ->
+            var out = ""
+            var y = 0usize
+
+            while y < img.height
+                var x = 0usize
+
+                while x < img.width
+                    out += if img.at(x, y).r > 127u8 then "#" else "."
+                    x += 1usize
+
+                out += "\n"
+                y += 1usize
+
+            if out == want then print(s"ok    $label")
+            else print(s"FAIL  $label\n$out")
+end art
+
+// ------------------------------------------------------------------------------- broken images
+
+broken(label: string, file: string, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Ok(img) -> print(s"FAIL  $label decoded")
+        Err(f) -> same(label, describe(f), want)
+end broken
+
+cut(label: string, file: string, keep: usize, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+
+    unhex(file, src[..])
+
+    decode(src[..<keep], zbuf[..], raw[..]) match
+        Ok(img) -> print(s"FAIL  $label decoded")
+        Err(f) -> same(label, describe(f), want)
+end cut
+
+// One byte changed and nothing else, so the checksum notices.
+scratched(label: string, file: string, at: usize, value: u8, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    src[at] = value
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Ok(img) -> print(s"FAIL  $label decoded")
+        Err(f) -> same(label, describe(f), want)
+end scratched
+
+// One byte changed and the checksum put back, so the reader has to be the one that objects.
+edited(label: string, file: string, at: usize, value: u8, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    src[at] = value
+    reseal(src[..], 8usize)
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Ok(img) -> print(s"FAIL  $label decoded")
+        Err(f) -> same(label, describe(f), want)
+end edited
+
+// A byte of the compressed pixel data changed, its chunk resealed. Nothing in the container layer
+// can object, so whatever objects does so from inside the deflate stream.
+spoiled(label: string, file: string, chunk: usize, at: usize, value: u8, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    src[at] = value
+    reseal(src[..], chunk)
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Ok(img) -> print(s"FAIL  $label decoded")
+        Err(f) -> same(label, describe(f), want)
+end spoiled
+
+// A chunk given a different name, its checksum recomputed to match. The case of the first letter
+// is the only difference between a chunk a reader may skip and one it may not.
+renamed(label: string, file: string, at: usize, name: string, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+    var i = 0usize
+
+    while i < 4usize
+        src[at + 4usize + i] = name[i]
+        i += 1usize
+
+    reseal(src[..], at)
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Ok(img) -> print(s"FAIL  $label decoded")
+        Err(f) -> same(label, describe(f), want)
+end renamed
+
+// The same tampering, where the new name is one a reader is allowed to walk past.
+tolerated(label: string, file: string, at: usize, name: string, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+    var i = 0usize
+
+    while i < 4usize
+        src[at + 4usize + i] = name[i]
+        i += 1usize
+
+    reseal(src[..], at)
+
+    decode(src[..<n], zbuf[..], raw[..]) match
+        Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
+        Ok(img) -> same(label, f"${img.width}%dx${img.height}%d type ${img.kind}%d", want)
+end tolerated
+
+cramped(label: string, file: string, zroom: usize, rroom: usize, want: string)
+    var src: [256]u8
+    var zbuf: [256]u8
+    var raw: [256]u8
+    var n = unhex(file, src[..])
+
+    decode(src[..<n], zbuf[..<zroom], raw[..<rroom]) match
+        Ok(img) -> print(s"FAIL  $label decoded")
+        Err(f) -> same(label, describe(f), want)
+end cramped
+
+// ------------------------------------------------------------------------------ what to expect
+
+squares() -> string
+    var s = ""
+    var i = 0
+
+    while i < 60
+        if i > 0 then s += " "
+
+        s += str(i * i)
+        i += 1
+
+    s
+end squares
+
+repeated(c: string, n: int) -> string
+    var s = ""
+    var i = 0
+
+    while i < n
+        s += c
+        i += 1
+
+    s
+end repeated
+
+checkerboard() -> string
+    var s = ""
+    var y = 0
+
+    while y < 8
+        s += if y % 2 == 0 then "#.#.#.#.\n" else ".#.#.#.#\n"
+        y += 1
+
+    s
+end checkerboard
+
+// -------------------------------------------------------------------------------------- the runs
+
+print("-- checksums")
+crc("the checksum of nothing at all", "", "00000000")
+crc("of one letter", "a", "e8b7be43")
+crc("of three", "abc", "352441c2")
+crc("of a sentence", "The quick brown fox jumps over the lazy dog", "414fa339")
+adler("the other checksum of nothing", "", "00000001")
+adler("of three letters", "abc", "024d0127")
+adler("of the same sentence", "The quick brown fox jumps over the lazy dog", "5bdc0fda")
+
+print("-- deflate")
+unpacks("a stored block", zstored(), "hello, world")
+unpacks("a fixed-code block", zfixed(), "abracadabra abracadabra")
+unpacks("a dynamic-code block", zdyn(), squares())
+unpacks("a match that reads what it is writing", zrun(), repeated("z", 300))
+
+print("-- streams the decoder refuses")
+mangles("a compression method that is not deflate", zstored(), 0usize, 0x79u8, "compression method 9 is not deflate")
+mangles("header bits that do not check out", zstored(), 1usize, 0x00u8, "the header's check bits do not agree")
+mangles("a window wider than any encoder uses", zstored(), 0usize, 0x88u8, "a window wider than the format allows")
+mangles("a stream that wants a dictionary", zstored(), 1usize, 0x20u8, "a stream wanting a dictionary it was not given")
+mangles("a byte of the payload changed", zstored(), 7usize, 0x69u8, "the checksum says 1d540489 and the bytes say 1d60048a")
+chopped("a stream that stops in the middle", zfixed(), 8usize, "the stream ends in the middle of something")
+crowded("more output than there is room for", zrun(), 100usize, "no room left for what the stream unpacks to")
+refuses("a block of a kind the format reserves", "07", "a block of no known kind")
+refuses("a stored length that disagrees with its complement", "0105000000", "a stored block whose length and complement disagree")
+refuses("a stored block longer than what is left", "010500faff", "the stream ends in the middle of something")
+refuses("a match reaching before the start", faraway(), "a match reaching 5 bytes back, before anything was written")
+refuses("a code the fixed table leaves undefined", nosuchcode(), "a code that stands for nothing")
+refuses("a length symbol past the end of the table", toolong(), "length symbol 286 is past the end of the table")
+refuses("a table claiming more codes than there are", toomany(), "a code table claiming more codes than its lengths leave room for")
+
+print("-- headers")
+header("a truecolour image", rgb(), "2x2 type 2")
+header("a greyscale one", gray(), "4x4 type 0")
+header("a paletted one", paletted(), "4x4 type 3")
+header("one with an alpha channel", rgba(), "2x2 type 6")
+header("greyscale with alpha", grayalpha(), "2x2 type 4")
+header("and one big enough to look at", checker(), "8x8 type 0")
+
+print("-- pixels")
+pixel("red, at the top left", rgb(), 0usize, 0usize, "255 0 0 255")
+pixel("green beside it", rgb(), 1usize, 0usize, "0 255 0 255")
+pixel("blue below", rgb(), 0usize, 1usize, "0 0 255 255")
+pixel("yellow in the corner", rgb(), 1usize, 1usize, "255 255 0 255")
+pixel("the darkest grey", gray(), 0usize, 0usize, "0 0 0 255")
+pixel("the end of the first row", gray(), 3usize, 0usize, "51 51 51 255")
+pixel("the start of the second", gray(), 0usize, 1usize, "68 68 68 255")
+pixel("the lightest grey", gray(), 3usize, 3usize, "255 255 255 255")
+pixel("a palette entry", paletted(), 1usize, 0usize, "255 0 0 255")
+pixel("the entry after it", paletted(), 2usize, 0usize, "0 255 0 255")
+pixel("the last entry", paletted(), 3usize, 0usize, "0 0 255 255")
+pixel("an index that wrapped around", paletted(), 3usize, 3usize, "0 255 0 255")
+pixel("a transparent pixel", rgba(), 0usize, 0usize, "255 0 0 0")
+pixel("a third of the way opaque", rgba(), 1usize, 0usize, "0 255 0 85")
+pixel("two thirds", rgba(), 0usize, 1usize, "0 0 255 170")
+pixel("and solid", rgba(), 1usize, 1usize, "255 255 255 255")
+pixel("grey with an alpha of its own", grayalpha(), 1usize, 0usize, "85 85 85 170")
+pixel("and the one that vanishes", grayalpha(), 1usize, 1usize, "255 255 255 0")
+pixel("a row stored rather than compressed", stored(), 0usize, 0usize, "0 0 0 255")
+pixel("further along the same row", stored(), 5usize, 0usize, "80 80 80 255")
+
+print("-- filters")
+pixel("a row filtered by nothing at all", filtered(), 0usize, 0usize, "0 7 14 255")
+pixel("a row filtered against the pixel to its left", filtered(), 3usize, 1usize, "21 28 35 255")
+pixel("a row filtered against the row above", filtered(), 0usize, 2usize, "24 31 38 255")
+pixel("a row filtered against the average of both", filtered(), 2usize, 3usize, "42 49 56 255")
+pixel("a row filtered by the Paeth predictor", filtered(), 3usize, 4usize, "57 64 71 255")
+sweep("every sample of all five rows", filtered())
+art("a picture, as the surest check of all", checker(), checkerboard())
+
+print("-- chunks")
+header("ancillary chunks are skipped", extra(), "2x2 type 2")
+pixel("and the image around them survives", extra(), 1usize, 1usize, "255 255 0 255")
+header("image data split across three chunks", split(), "2x2 type 2")
+pixel("reads as one stream", split(), 0usize, 1usize, "0 0 255 255")
+renamed("a critical chunk nobody knows", extra(), 33usize, "ZZZZ", "a chunk named 'ZZZZ' that must be understood and is not")
+tolerated("the same chunk, its name made lowercase", extra(), 33usize, "zZZZ", "2x2 type 2")
+
+print("-- files the reader refuses")
+scratched("something that is not a PNG", rgb(), 1usize, 0x00u8, "not a PNG at all")
+scratched("a chunk that does not match its checksum", rgb(), 19usize, 0x03u8, "the chunk at 8 does not match its checksum")
+cut("a file that stops inside a chunk", rgb(), 40usize, "the file ends inside the chunk at 33")
+cut("a file with nothing to end it", rgb(), 65usize, "the last chunk is not the end chunk")
+edited("sixteen bits a sample", rgb(), 24usize, 16u8, "16 bits a sample, and this reader knows only 8")
+edited("a colour type that does not exist", rgb(), 25usize, 5u8, "colour type 5 is not one of the five")
+edited("compressed by something else", rgb(), 26usize, 1u8, "compressed by something other than deflate")
+edited("filtered by something else", rgb(), 27usize, 1u8, "filtered by a method this format does not have")
+edited("an interlaced image", rgb(), 28usize, 1u8, "interlaced, and this reader reads rows in order")
+edited("an image no pixels wide", rgb(), 19usize, 0u8, "an image with no pixels in it")
+edited("a height the pixels do not fill", rgb(), 23usize, 3u8, "the rows need 21 bytes and the data unpacks to 14")
+renamed("a header that is not the first chunk", rgb(), 8usize, "iHDR", "the header is not the first chunk")
+renamed("a second header, further in", extra(), 33usize, "IHDR", "the header is not the first chunk")
+renamed("an image whose pixels were skipped", rgb(), 33usize, "zdat", "no image data")
+renamed("a paletted image with no palette", paletted(), 33usize, "pLTE", "a paletted image with no palette")
+broken("a row filtered by a rule that does not exist", badfilter(), "row 0 claims filter 5")
+spoiled("a byte of the pixel data changed", rgb(), 33usize, 45usize, 0x00u8, "the checksum says 1eef04fc and the bytes say 00f200f1")
+spoiled("the byte before it, where the codes are", rgb(), 33usize, 44usize, 0x00u8, "a match reaching 6530 bytes back, before anything was written")
+cramped("no room for the compressed data", rgb(), 4usize, 256usize, "no room left for the image")
+cramped("no room for the image", rgb(), 256usize, 4usize, "no room left for the image")

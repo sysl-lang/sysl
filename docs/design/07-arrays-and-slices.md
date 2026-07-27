@@ -146,7 +146,12 @@ implementation:
 ## Not yet
 
 - **Growable arrays** — `append`, capacity, a `[]T` that owns rather than views. Needs an
-  allocator and a decision about whether growth is a library type or a language one.
+  allocator and a decision about whether growth is a library type or a language one. The cost is
+  not only inside a function: it reaches the **signature**. `guide/png`'s `decode` takes three
+  slices, and two of them are its own intermediate stages — somewhere to gather compressed data,
+  somewhere to unpack it to — because it cannot make either for itself. The caller must therefore
+  size both, and the sizes are not knowable until the file's header has been read, which happens
+  inside. A decoder that could grow its own buffers would take one slice and return an image.
 - **An array filled with a value, rather than with zeroes or with a literal.** There is no repeat
   form — `[None; 16]`, or whatever it would be spelled — so an array of a type with no zero value
   is written out element by element. The types that bite are the ones a container needs: an `enum`

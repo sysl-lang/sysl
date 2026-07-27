@@ -123,8 +123,15 @@ error. A character literal may not span a line break.
 Double-quoted, UTF-8, the escape table above: `"héllo ☃"`. The value is a sequence of bytes
 with a known length, so an embedded `\0` is an ordinary byte rather than a terminator. A
 string literal may not span a line break, and `//` or `/*` inside one is ordinary text.
-Concatenation, interpolation, and raw/multi-line forms are not yet specified. A literal's
-bytes are immortal, which is what lets allocator-free code use one (`04`).
+Concatenation and interpolation are settled (`00` §7); **raw and multi-line forms are not**.
+A literal's bytes are immortal, which is what lets allocator-free code use one (`04`).
+
+The case that wants a multi-line form is **data rather than prose**. A program with a file
+embedded in it — `guide/png` carries ten of them — writes the bytes as hex, and with no
+line-spanning literal and no line continuation the choice is one unreadable line or a chain of
+`+=`. An array literal is no better: two hundred numbers on one line. Whatever the eventual
+spelling, this is the shape it has to serve, and prose that happens to be long is the easier
+half of the problem.
 
 ## Conversions between scalar types
 

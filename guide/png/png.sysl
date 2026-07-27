@@ -1,0 +1,317 @@
+// A PNG reader: the chunk layer, the checksum, the filters, and the pixels underneath them.
+//
+// Everything here is arithmetic on bytes somebody else laid out. A PNG is a signature, then a
+// sequence of chunks, each one a big-endian length, a four-letter name, that many bytes, and a
+// CRC of the name and the bytes together. The pixels are in the chunks named `IDAT`, concatenated
+// and then deflated; what comes out is not the image but one *filter byte* per row followed by a
+// row of differences, and the image is what is left after each row is reconstructed from the row
+// above it and the pixel to its left.
+//
+// Which is to say: three separate byte orders, four separate length units — bytes, samples,
+// pixels, rows — and a checksum over each of the two layers. Being wrong by one anywhere in that
+// produces an image, just not the right one. That is what this problem is for.
+
+// What a file can be wrong about. A reader of somebody else's format needs a lot of these, and
+// naming them individually is the difference between "this file is broken" and a report that says
+// where and what.
+enum Fault
+    NotPng
+    Truncated(at: usize)
+    BadCrc(at: usize)
+    NoHeader
+    BadSize
+    BadDepth(d: u8)
+    BadColour(c: u8)
+    BadCompression
+    BadFilterMethod
+    Interlaced
+    Unknown(name: string)
+    NoPalette
+    NoPixels
+    NoEnd
+    BadFilter(f: u8, row: usize)
+    Squashed(f: inflate.Fault)
+    NoRoom
+    WrongSize(want: usize, got: usize)
+end Fault
+
+describe(f: Fault) -> string
+    f match
+        NotPng -> "not a PNG at all"
+        Truncated(at) -> s"the file ends inside the chunk at ${str(at)}"
+        BadCrc(at) -> s"the chunk at ${str(at)} does not match its checksum"
+        NoHeader -> "the header is not the first chunk"
+        BadSize -> "an image with no pixels in it"
+        BadDepth(d) -> s"${str(d)} bits a sample, and this reader knows only 8"
+        BadColour(c) -> s"colour type ${str(c)} is not one of the five"
+        BadCompression -> "compressed by something other than deflate"
+        BadFilterMethod -> "filtered by a method this format does not have"
+        Interlaced -> "interlaced, and this reader reads rows in order"
+        Unknown(name) -> s"a chunk named '$name' that must be understood and is not"
+        NoPalette -> "a paletted image with no palette"
+        NoPixels -> "no image data"
+        NoEnd -> "the last chunk is not the end chunk"
+        BadFilter(f, row) -> s"row ${str(row)} claims filter ${str(f)}"
+        Squashed(e) -> inflate.describe(e)
+        NoRoom -> "no room left for the image"
+        WrongSize(want, got) -> s"the rows need ${str(want)} bytes and the data unpacks to ${str(got)}"
+end describe
+
+// One pixel, as every colour type is understood once it has been read.
+struct Rgba
+    r: u8
+    g: u8
+    b: u8
+    a: u8
+end Rgba
+
+// A decoded image. `raw` is the unpacked pixel data *after* the filters have been undone, still
+// carrying the spent filter byte at the head of each row — leaving it there costs one addition per
+// row and saves copying the whole image to remove it.
+//
+// `palette` views the source buffer rather than copying it, which is the one place this program
+// keeps a view of somebody else's storage rather than storage of its own. It is also why an `Image`
+// may not outlive the bytes it was decoded from, and why nothing here has to say so: a slice
+// retains what it views.
+struct Image
+    width: usize
+    height: usize
+    kind: u8
+    raw: []u8
+    palette: []u8
+
+    channels(self) -> usize = channels_of(self.kind)
+
+    stride(self) -> usize = 1usize + self.width * self.channels()
+
+    // Where one pixel's samples begin: past the rows above it, past this row's filter byte, past
+    // the pixels to its left. Three units in one expression, which is the whole difficulty of a
+    // raster format written down.
+    //
+    // It would be `private` if a member could say so, this being nobody's business but `at`'s.
+    index(self, x: usize, y: usize) -> usize = y * self.stride() + 1usize + x * self.channels()
+
+    at(self, x: usize, y: usize) -> Rgba
+        var i = self.index(x, y)
+
+        self.kind match
+            0u8 -> Rgba(self.raw[i], self.raw[i], self.raw[i], 255u8)
+            2u8 -> Rgba(self.raw[i], self.raw[i + 1usize], self.raw[i + 2usize], 255u8)
+            3u8 ->
+                var p = usize(self.raw[i]) * 3usize
+
+                Rgba(self.palette[p], self.palette[p + 1usize], self.palette[p + 2usize], 255u8)
+            4u8 -> Rgba(self.raw[i], self.raw[i], self.raw[i], self.raw[i + 1usize])
+            else -> Rgba(self.raw[i], self.raw[i + 1usize], self.raw[i + 2usize], self.raw[i + 3usize])
+    end at
+end Image
+
+// How many samples a pixel of each colour type has: grey, truecolour, a palette index, grey with
+// alpha, and truecolour with alpha. Every length in the format is counted in these.
+private channels_of(kind: u8) -> usize
+    kind match
+        0u8 -> 1usize
+        2u8 -> 3usize
+        3u8 -> 1usize
+        4u8 -> 2usize
+        else -> 4usize
+end channels_of
+
+// The checksum every chunk carries, computed a bit at a time rather than through a table — a
+// module has no constants, so a 256-entry table would have to be rebuilt by whoever wanted one.
+//
+// Note what needs no parentheses: `c & 1u32 != 0u32` is `(c & 1) != 0`, because bitwise binds
+// tighter than comparison here. That is one of the two places this language corrects C's
+// precedence, and this function is exactly the code that gets it wrong in C.
+crc32(data: []u8) -> u32
+    var c = 0xFFFFFFFFu32
+
+    for x in data
+        c ^= u32(x)
+
+        var k = 0
+
+        while k < 8
+            c = if c & 1u32 != 0u32 then c >> 1u32 ^ 0xEDB88320u32 else c >> 1u32
+            k += 1
+
+    c ^ 0xFFFFFFFFu32
+end crc32
+
+private be32(b: []u8, i: usize) -> u32
+    u32(b[i]) << 24u32 | u32(b[i + 1usize]) << 16u32 | u32(b[i + 2usize]) << 8u32 | u32(b[i + 3usize])
+
+private named(b: []u8, at: usize, name: string) -> bool
+    var i = 0usize
+
+    while i < 4usize
+        if b[at + i] != name[i] then return false
+
+        i += 1usize
+
+    true
+end named
+
+// A chunk name, as text. Four bytes that are known to be letters, and the only way to get from
+// bytes to a `string` is one character at a time through the rendering of a `char`.
+private name_of(b: []u8, at: usize) -> string
+    var s = ""
+    var i = 0usize
+
+    while i < 4usize
+        s += str(char(u32(b[at + i])))
+        i += 1usize
+
+    s
+end name_of
+
+// Read a file. `zbuf` collects the compressed data, which arrives in as many pieces as the encoder
+// felt like using; `raw` receives what it unpacks to, and the returned image views it.
+//
+// Three buffers in a signature is what a language with no growable collection looks like from the
+// outside. The decoder's two intermediate stages are the caller's problem, in the caller's frame,
+// and the sizes it needs are not knowable until the header has been read — which is inside.
+decode(src: []u8, zbuf: []u8, raw: []u8) -> Result[Image, Fault]
+    var signature = [137u8, 80u8, 78u8, 71u8, 13u8, 10u8, 26u8, 10u8]
+
+    if src.len < 8usize then return Err(NotPng)
+
+    var i = 0usize
+
+    while i < 8usize
+        if src[i] != signature[i] then return Err(NotPng)
+
+        i += 1usize
+
+    var width = 0usize
+    var height = 0usize
+    var kind = 0u8
+    var palette = src[0usize..<0usize]
+    var zn = 0usize
+    var at = 8usize
+
+    loop
+        if at == src.len then return Err(NoEnd)
+        if at + 12usize > src.len then return Err(Truncated(at))
+
+        var len = usize(be32(src, at))
+
+        if at + 12usize + len > src.len then return Err(Truncated(at))
+
+        // The checksum covers the name and the data but not the length, so a chunk whose length
+        // was corrupted is caught by the *next* chunk failing to be where it should be.
+        if crc32(src[at + 4usize..<at + 8usize + len]) != be32(src, at + 8usize + len) then return Err(BadCrc(at))
+
+        var body = src[at + 8usize..<at + 8usize + len]
+
+        if named(src, at + 4usize, "IHDR")
+            if at != 8usize || len != 13usize then return Err(NoHeader)
+
+            width = usize(be32(body, 0usize))
+            height = usize(be32(body, 4usize))
+            kind = body[9]
+
+            if width == 0usize || height == 0usize then return Err(BadSize)
+            if body[8] != 8u8 then return Err(BadDepth(body[8]))
+            if kind != 0u8 && kind != 2u8 && kind != 3u8 && kind != 4u8 && kind != 6u8 then return Err(BadColour(kind))
+            if body[10] != 0u8 then return Err(BadCompression)
+            if body[11] != 0u8 then return Err(BadFilterMethod)
+            if body[12] != 0u8 then return Err(Interlaced)
+        else if at == 8usize
+            return Err(NoHeader)
+        else if named(src, at + 4usize, "PLTE")
+            palette = body
+        else if named(src, at + 4usize, "IDAT")
+            if zn + len > zbuf.len then return Err(NoRoom)
+
+            i = 0usize
+
+            while i < len
+                zbuf[zn + i] = body[i]
+                i += 1usize
+
+            zn += len
+        else if named(src, at + 4usize, "IEND")
+            break
+        else if src[at + 4usize] & 32u8 == 0u8
+            // The fifth bit of the first letter is its case, and its case is the rule: a name
+            // beginning with a capital is a chunk a reader must understand to be reading the file
+            // at all. Everything else may be skipped, which is how a format stays extensible
+            // without a version number.
+            return Err(Unknown(name_of(src, at + 4usize)))
+
+        at += 12usize + len
+
+    if zn == 0usize then return Err(NoPixels)
+    if kind == 3u8 && palette.len == 0usize then return Err(NoPalette)
+
+    var channels = channels_of(kind)
+    var stride = 1usize + width * channels
+    var need = stride * height
+
+    if need > raw.len then return Err(NoRoom)
+
+    inflate.zlib(zbuf[..<zn], raw[..<need]) match
+        Err(e) -> return Err(Squashed(e))
+        Ok(n) ->
+            if n != need then return Err(WrongSize(need, n))
+
+    unfilter(raw[..<need], stride, height, channels)?
+
+    Ok(Image(width, height, kind, raw[..<need], palette))
+end decode
+
+// Undo the per-row filters, in place. Each row was encoded as the difference between its samples
+// and a prediction made from the sample to the left (`a`), the one above (`b`), and the one above
+// and to the left (`c`), so decoding walks forward and reads the answers it has already written.
+//
+// All of it is modulo 256 by definition — the encoder subtracted in a byte and the decoder adds in
+// one. Paeth is the exception that has to leave: its choice between the three neighbours is made in
+// arithmetic wide enough to hold `a + b - c` and the three distances, and only the answer narrows.
+private unfilter(raw: []u8, stride: usize, height: usize, channels: usize) -> Result[bool, Fault]
+    var y = 0usize
+
+    while y < height
+        var row = y * stride
+        var kind = raw[row]
+
+        if kind > 4u8 then return Err(BadFilter(kind, y))
+
+        var i = 0usize
+
+        while i + 1usize < stride
+            var x = int(raw[row + 1usize + i])
+            var a = if i >= channels then int(raw[row + 1usize + i - channels]) else 0
+            var b = if y > 0usize then int(raw[row + 1usize + i - stride]) else 0
+            var c = if i >= channels && y > 0usize then int(raw[row + 1usize + i - stride - channels]) else 0
+
+            var predicted = kind match
+                0u8 -> 0
+                1u8 -> a
+                2u8 -> b
+                3u8 -> (a + b) >> 1
+                else -> paeth(a, b, c)
+
+            raw[row + 1usize + i] = u8(x + predicted & 255)
+            i += 1usize
+
+        y += 1usize
+
+    Ok(true)
+end unfilter
+
+// The predictor that made PNG compress as well as it does: of the three neighbours, the one closest
+// to the plane they define between them.
+private paeth(a: int, b: int, c: int) -> int
+    var p = a + b - c
+    var da = abs(p - a)
+    var db = abs(p - b)
+    var dc = abs(p - c)
+
+    if da <= db && da <= dc then return a
+    if db <= dc then return b
+
+    c
+end paeth
+
+private abs(n: int) -> int = if n < 0 then -n else n

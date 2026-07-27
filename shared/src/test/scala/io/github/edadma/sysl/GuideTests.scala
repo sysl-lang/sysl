@@ -75,4 +75,24 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- limits",
     )
   }
+
+  // Everything this one checks was computed by somebody else: the fixtures came out of a different
+  // encoder and the checksum vectors are the published ones, which is the only way a decoder's
+  // tests mean anything.
+  "png — the byte level" in {
+    val out = guide("png")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 84
+    sections(out) shouldBe List(
+      "-- checksums",
+      "-- deflate",
+      "-- streams the decoder refuses",
+      "-- headers",
+      "-- pixels",
+      "-- filters",
+      "-- chunks",
+      "-- files the reader refuses",
+    )
+  }
 }
