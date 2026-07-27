@@ -692,6 +692,76 @@ class Analyzer private (units: List[Program])
     checkInto(v, c)
   }
 
+  /** A type attribute `T::Attr` (`03`), with the arguments a call form supplied (empty for the
+   * bare form). Dispatched on the kind of type `T` is — a constrained subtype for now.
+   */
+  private def typeAttr(key: String, attr: String, args: List[Expr]): TExpr =
+    if constrainedDecls.contains(key) then constrainedAttr(resolveConstrained(key), key, attr, args)
+    else if enumDecls.contains(key) then
+      if enumDecls(key).tparams.nonEmpty then
+        err(s"'${qn(key)}' is generic, so '${qn(key)}::$attr' has no single enum to read")
+      enumAttr(instantiateEnum(key, Nil), key, attr, args)
+    else err(s"'${qn(key)}' has no type attributes")
+
+  /** The attributes a constrained integer subtype exposes: its bounds (`First`/`Last`), the total
+   * membership test (`Valid`), and the trapping steps (`Succ`/`Pred`).
+   */
+  private def constrainedAttr(c: Type.Constrained, key: String, attr: String, args: List[Expr]): TExpr = {
+    val base = c.base match
+      case i: Type.Integer => i
+      case other           => err(s"'${qn(key)}::$attr' needs an integer subtype, not ${show(other)}")
+
+    def ranged: (BigDecimal, BigDecimal) = (c.lo, c.hi) match
+      case (Some(lo), Some(hi)) => (lo, hi)
+      case _                    => err(s"'${qn(key)}::$attr' needs a 'within' range")
+
+    def noArgs(): Unit = if args.nonEmpty then err(s"'${qn(key)}::$attr' takes no arguments")
+
+    def oneArg(): TExpr =
+      if args.length != 1 then err(s"'${qn(key)}::$attr' takes exactly one argument")
+      val x = analyzeExpr(args.head, Some(base))
+      if disagree(x.ty, base) then err(s"'${qn(key)}::$attr' takes a ${show(base)}, not ${show(x.ty)}")
+      x
+
+    attr match
+      case "First" => noArgs(); TIntLit(ranged._1.toBigInt, base)
+      case "Last"  => noArgs(); val (_, hi) = ranged; TIntLit((if c.exclusiveHi then hi - 1 else hi).toBigInt, base)
+      case "Valid" => val x = oneArg(); ranged; TConstrainedValid(x, c)
+      case "Succ"  => val x = oneArg(); ranged; TConstrainedStep(x, c, up = true, base)
+      case "Pred"  => val x = oneArg(); ranged; TConstrainedStep(x, c, up = false, base)
+      case "Range" => err(s"'${qn(key)}::Range' is only meaningful as the iterable of a 'for' loop")
+      case _       => err(s"'${qn(key)}' has no attribute '$attr'")
+  }
+
+  /** The attributes a simple enum exposes: its endpoints (`First`/`Last`), the ordinal maps
+   * (`Pos` a value to its 0-based position, `Val` a position back to its value), the neighbouring
+   * values (`Succ`/`Pred`), and the name maps (`Image` a value to its name, `Value` a name to its
+   * value). All but `First`/`Last` carry an operand, and the ones that could be handed something
+   * out of range (`Val`, `Succ` at the end, `Pred` at the start, `Value` with no such name) trap.
+   */
+  private def enumAttr(en: Type.Enum, key: String, attr: String, args: List[Expr]): TExpr = {
+    if !en.simple then err(s"'${qn(key)}::$attr' needs a simple enum, and '${qn(key)}' carries data")
+
+    def noArgs(): Unit = if args.nonEmpty then err(s"'${qn(key)}::$attr' takes no arguments")
+
+    def oneArg(want: Type): TExpr =
+      if args.length != 1 then err(s"'${qn(key)}::$attr' takes exactly one argument")
+      val x = analyzeExpr(args.head, Some(want))
+      if disagree(x.ty, want) then err(s"'${qn(key)}::$attr' takes a ${show(want)}, not ${show(x.ty)}")
+      x
+
+    attr match
+      case "First" => noArgs(); TIntLit(BigInt(en.variants.head.tag), en)
+      case "Last"  => noArgs(); TIntLit(BigInt(en.variants.last.tag), en)
+      case "Pos"   => TEnumAttr("Pos", en, oneArg(en), Type.Int)
+      case "Val"   => TEnumAttr("Val", en, oneArg(Type.Int), en)
+      case "Succ"  => TEnumAttr("Succ", en, oneArg(en), en)
+      case "Pred"  => TEnumAttr("Pred", en, oneArg(en), en)
+      case "Image" => TEnumAttr("Image", en, oneArg(en), Type.Str)
+      case "Value" => TEnumAttr("Value", en, oneArg(Type.Str), en)
+      case _       => err(s"'${qn(key)}' has no attribute '$attr'")
+  }
+
   /** Whether a context of this type converts what it is given rather than simply requiring it. */
   private def converts(want: Type): Boolean = Type.erased(want) || want.isInstanceOf[Type.Ref]
 
@@ -880,6 +950,10 @@ class Analyzer private (units: List[Program])
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(constrainedDecls.contains) =>
       constrainedCast(typeKey(name).get, args)
 
+    // `T::Attr(x)` — a type attribute that takes an argument (`Valid`, `Succ`, `Pred`).
+    case Call(TypeAttr(Ident(name), attr), args) if lookupOpt(name).isEmpty && typeKey(name).isDefined =>
+      typeAttr(typeKey(name).get, attr, args)
+
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && variantKey(name).isDefined =>
       constructVariant(variantKey(name).get, args, expected)
 
@@ -959,6 +1033,14 @@ class Analyzer private (units: List[Program])
           err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
         case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
         case None    => err(s"type '${qn(n)}' has no member '$f' — and '${qn(n)}' is a type, not a value")
+
+    // `T::Attr` — a type attribute read with no argument (`First`, `Last`). `T::Attr(x)` is a
+    // `Call` over this node, handled beside the other call forms.
+    case TypeAttr(Ident(name), attr) if lookupOpt(name).isEmpty && typeKey(name).isDefined =>
+      typeAttr(typeKey(name).get, attr, Nil)
+
+    case TypeAttr(_, attr) =>
+      err(s"'::$attr' is a type attribute, so its left side must be a type name")
 
     case Field(receiver, f) =>
       val tr = autoDeref(analyzeExpr(receiver))
@@ -1144,6 +1226,25 @@ class Analyzer private (units: List[Program])
 
     case For(label, name, iter, body, elseOpt) =>
       iter match
+        // `for i in T::Range` iterates a constrained integer subtype's range, `First` through `Last`
+        // inclusive — the one place `::Range` is meaningful.
+        case TypeAttr(Ident(tn), "Range") if lookupOpt(tn).isEmpty && typeKey(tn).exists(constrainedDecls.contains) =>
+          val c = resolveConstrained(typeKey(tn).get)
+          val i = c.base match
+            case i: Type.Integer => i
+            case other           => err(s"'${qn(typeKey(tn).get)}::Range' iterates an integer subtype, not ${show(other)}")
+          val (lo, hi) = (c.lo, c.hi) match
+            case (Some(l), Some(h)) => (l, h)
+            case _                  => err(s"'${qn(typeKey(tn).get)}::Range' needs a 'within' range")
+          val last      = if c.exclusiveHi then hi - 1 else hi
+          pushScope()
+          val u         = declare(name, i)
+          val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
+          popScope()
+          val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
+          TFor(u, i, TIntLit(lo.toBigInt, i), TIntLit(last.toBigInt, i), inclusive = true, tb, telse,
+               loopResultType(ctx, telse))
+
         case RangeExpr(Some(lo), Some(hi), inclusive) =>
           val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
           if tlo.ty != thi.ty then

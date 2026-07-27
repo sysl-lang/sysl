@@ -175,6 +175,7 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val postfixTail: PackratParser[Expr => Expr] =
     here ~ (op("[") ~> expression <~ op("]")) ^^ { case p ~ idx => (e: Expr) => Index(e, idx).setPos(p) } |
       here ~ (op(".") ~> ident) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
+      here ~ (op("::") ~> ident) ^^ { case p ~ n => (e: Expr) => TypeAttr(e, n).setPos(p) } |
       // A call is the exception: what is wrong with `foo(…)` is nearly always `foo` — it does not
       // exist, or it does not take these arguments — so the callee's own position wins, and the
       // `(` is only the fallback for a callee that somehow has none.

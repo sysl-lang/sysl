@@ -88,6 +88,16 @@ case class TCast(operand: TExpr, ty: Type) extends TExpr
  */
 case class TConstrainedCheck(value: TExpr, target: Type.Constrained) extends TExpr { def ty: Type = target }
 
+/** `T::Valid(x)` — whether `x` satisfies `target`'s `within` range, as a `bool`. Never traps; it is
+ * the total test a checked cast is the trapping form of.
+ */
+case class TConstrainedValid(value: TExpr, target: Type.Constrained) extends TExpr { def ty: Type = Type.Bool }
+
+/** `T::Succ(x)` / `T::Pred(x)` — the next (`up`) or previous value in `target`'s range, trapping at
+ * the far end (`Succ` at `Last`, `Pred` at `First`). Yields the base integer.
+ */
+case class TConstrainedStep(value: TExpr, target: Type.Constrained, up: Boolean, ty: Type) extends TExpr
+
 /** Reads a local variable (or parameter) by its unique name. */
 case class TLoad(name: String, ty: Type) extends TExpr
 
@@ -244,6 +254,14 @@ case class TEnumFromInt(value: TExpr, en: Type.Enum) extends TExpr { def ty: Typ
  */
 case class TEnumTry(value: TExpr, en: Type.Enum, optTy: Type.Enum,
                     some: Type.EnumVariant, none: Type.EnumVariant) extends TExpr { def ty: Type = optTy }
+
+/** A simple enum's type attribute with a runtime argument (`04`): `kind` names which one —
+ * `Pos` (a value's 0-based position), `Val` (the value at a position, trapping out of range),
+ * `Succ`/`Pred` (the neighbouring value, trapping at the end), `Image` (a value's name as a
+ * string), or `Value` (the value named by a string, trapping on no match). `arg` is the one
+ * operand. The bare `First`/`Last` are compile-time constants and need no node of their own.
+ */
+case class TEnumAttr(kind: String, en: Type.Enum, arg: TExpr, ty: Type) extends TExpr
 
 /** The postfix `?` on an `Option`/`Result` value: yields the success payload, or returns the
  * enclosing function early with the failure re-wrapped in *its* return type.
