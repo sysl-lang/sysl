@@ -16,12 +16,28 @@ trait CallAnalysis extends Literals with TraitObjects {
       args: List[Expr],
       pre: Option[List[TExpr]],
   ): List[TExpr] = {
-    // An argument analyzed during inference was analyzed without an expected type, so a value
-    // headed for a `&T` parameter is boxed here instead of at its own analysis, and one headed for
-    // a trait object is erased here.
+    // An argument analyzed against a parameter that was still being solved was analyzed without an
+    // expected type, so a value headed for a `&T` parameter is boxed here instead of at its own
+    // analysis, and one headed for a trait object is erased here.
+    //
+    // A bare literal is the one case a coercion cannot repair, because a literal does not convert —
+    // it *is* the type its position gives it (`01`). Where that position is a parameter mentioning
+    // what was being solved, the type was not known until the solution was, so every literal
+    // argument is analyzed **here**, against the parameter it turned out to have: `rotr(x, 7)` on
+    // `rotr[T](x: T, n: T)` gives the `7` the `T` that the `x` settled. What inference held is a
+    // stand-in carrying the literal's default type and nothing else, which is why this is
+    // unconditional rather than a repair applied where the two disagree.
+    //
+    // `pre` may carry a receiver the argument list does not, so the two are aligned from the right.
     val ts = pre match
-      case Some(provisional) => provisional.zip(params).map { case (t, (_, pty)) => coerce(t, pty) }
-      case None              => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+      case Some(provisional) =>
+        val srcs = List.fill(provisional.length - args.length)(None) ::: args.map(Some(_))
+
+        provisional.zip(srcs.padTo(provisional.length, None)).zip(params).map {
+          case ((t, src), (_, pty)) =>
+            if src.exists(isLiteral) then analyzeExpr(src.get, Some(pty)) else coerce(t, pty)
+        }
+      case None => args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
 
     // The complaint is about one argument, so it is reported where that argument is written
     // rather than at the call as a whole.
@@ -48,8 +64,13 @@ trait CallAnalysis extends Literals with TraitObjects {
    * solution and nothing left to wait for, so its argument is analyzed exactly as a non-generic
    * call's is. That is what keeps `01`'s rule — a parameter's type at a call fixes an unsuffixed
    * literal — true of a generic callee: `f[T](x: T, n: usize)` has no more to work out from the `7`
-   * in `f(1u32, 7)` than a plain function has. A parameter that *does* name one is analyzed bare,
-   * because the type it would be checked against is the thing being solved.
+   * in `f(1u32, 7)` than a plain function has.
+   *
+   * A literal at a parameter that *does* name one is not analyzed at all: it stands in for its own
+   * default type, `solve` consults it last, and `checkArgs` analyzes it once the parameter is a
+   * type. The stand-in is a node for its type and nothing else, and never reaches the output.
+   * Anything else at such a parameter is analyzed bare, because the type it would be checked
+   * against is the thing being solved.
    *
    * The parameter types are the declaration's, so they are resolved where it was written; the
    * arguments are the caller's, and are analyzed where *they* were written.
@@ -63,8 +84,22 @@ trait CallAnalysis extends Literals with TraitObjects {
     val tps  = tparams.toSet
     val want = inDecl(decl)(ptypes.map(r => Option.unless(mentions(r, tps))(resolveType(r, Map.empty))))
 
-    args.zip(want.padTo(args.length, None)).map((a, e) => analyzeExpr(a, e))
+    args.zip(want.padTo(args.length, None)).map { (a, e) =>
+      e match
+        case Some(_) => analyzeExpr(a, e)
+        case None =>
+          literalDefault(a) match
+            case Some(ty) => standIn(ty).setPos(a.pos)
+            case None     => analyzeExpr(a)
+    }
   }
+
+  /** A node that carries a type and no value, for a literal inference reads before anything has
+   * analyzed it. `checkArgs` replaces every one of them.
+   */
+  private def standIn(ty: Type): TExpr = ty match
+    case _: Type.Floating => TFloatLit("0x0p+0", ty)
+    case _                => TIntLit(0, ty)
 
   protected def callFunction(f: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
     // A variadic callee — foreign or sysl's own — fixes only where its declared parameters stop;
@@ -92,12 +127,15 @@ trait CallAnalysis extends Literals with TraitObjects {
         // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the
         // call was written in.
         val targs = inDecl(f.name)(
-          solve(shown, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected))
+          solve(shown, f.tparams, f.params.map(_.typ), provisional.map(_.ty), f.retType, expected,
+            args.map(isLiteral)))
         checkBounds(f, targs)
         (instantiateFunc(f, targs), Some(provisional))
 
     val (params, rtype) = funcInsts(name)
-    val declared        = checkArgs(shown, params, args.take(params.length), pre)
+    // A variadic's tail has no declared parameter to be checked against and is analyzed below, so
+    // both lists are cut to the parameters — which is also what keeps them aligned.
+    val declared = checkArgs(shown, params, args.take(params.length), pre.map(_.take(params.length)))
 
     funcsUsed += name
     TCall(name, declared ::: args.drop(params.length).map(variadicArg), rtype)
@@ -225,6 +263,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
+      args.map(isLiteral),
     ))
 
     inDecl(fd.name)(checkParamBounds(shown, m.tparams, fd.bounds, own))
@@ -632,6 +671,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
+      args.map(isLiteral),
     ))
 
     val (ownerTps, ownTps)   = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)
@@ -692,7 +732,8 @@ trait CallAnalysis extends Literals with TraitObjects {
             val provisional = provisionalArgs(name, decl.tparams, decl.fields.map(_.typ), args)
             val targs =
               inDecl(name)(
-                solve(qn(name), decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected))
+                solve(qn(name), decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected,
+                  args.map(isLiteral)))
             (targs, Some(provisional))
 
     val s   = instantiateStruct(name, targs)
@@ -730,7 +771,8 @@ trait CallAnalysis extends Literals with TraitObjects {
             val provisional = provisionalArgs(ename, decl.tparams, vdecl.fields.map(_.typ), args)
             val targs =
               inDecl(ename)(
-                solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected))
+                solve(name, decl.tparams, vdecl.fields.map(_.typ), provisional.map(_.ty), None, expected,
+                  args.map(isLiteral)))
             (targs, Some(provisional))
 
     val en = instantiateEnum(ename, targs)

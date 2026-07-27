@@ -754,6 +754,14 @@ trait TypeResolution extends ImportResolution {
 
   /** Solves a generic declaration's type arguments from the argument types, falling back to
    * the expected type of the whole expression for parameters the arguments do not determine.
+   *
+   * `soft` marks the arguments that are bare literals, and they are consulted **last**. A literal
+   * has no type of its own (`01`) — it takes one from where it appears — so it is the weakest thing
+   * in the room to conclude a type parameter from, and letting it go first is what made
+   * `pick(1, 2, 250u8)` fix `T = int` and then reject the argument that actually knew. The order is
+   * the operand rule's, one level up: what is already a type settles the parameter, and the
+   * literals take what it settled to. They are still consulted, because with nothing else to go on
+   * `id(7)` must remain an `int` rather than an inference failure.
    */
   protected def solve(
       what: String,
@@ -762,13 +770,17 @@ trait TypeResolution extends ImportResolution {
       argTys: List[Type],
       resultRef: Option[TypeRef],
       expected: Option[Type],
+      soft: List[Boolean] = Nil,
   ): List[Type] = {
-    val sub = mutable.LinkedHashMap.empty[String, Type]
-    val tps = tparams.toSet
+    val sub   = mutable.LinkedHashMap.empty[String, Type]
+    val tps   = tparams.toSet
+    val pairs = paramRefs.zip(argTys).zip(soft.padTo(paramRefs.length, false))
 
-    for (r, t) <- paramRefs.zip(argTys) do unify(r, t, tps, sub)
+    for ((r, t), adaptable) <- pairs if !adaptable do unify(r, t, tps, sub)
     if sub.size < tparams.length then
       for r <- resultRef; e <- expected do unify(r, e, tps, sub)
+    if sub.size < tparams.length then
+      for ((r, t), adaptable) <- pairs if adaptable do unify(r, t, tps, sub)
 
     tparams.map(tp =>
       sub.getOrElse(tp, err(s"cannot infer the type argument '$tp' of '$what' here — annotate the expected type")),

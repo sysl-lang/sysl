@@ -68,10 +68,13 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
       err("var x = None") should include("cannot infer the type argument")
     }
 
+    // The `"two"` is what the parameter turned out to be, since a written type outranks a literal
+    // in inference; so the complaint is about the `1`, which is the argument that could have been
+    // anything and was not.
     "an argument that does not match the instantiated parameter" in {
       err("""pair[T](a: T, b: T) -> T = a
             |var x = pair(1, "two")
-            |""".stripMargin) should include("is int, but string was given")
+            |""".stripMargin) should include("'a' of 'pair' is string, but int was given")
     }
 
     "a type that contains itself has no finite size" in {

@@ -69,6 +69,22 @@ trait Literals extends TypeResolution {
     case Unary("-", operand)                 => isLiteral(operand)
     case _                                   => false
 
+  /** The type an adaptable literal falls back to, worked out from how it is written rather than
+   * by analyzing it.
+   *
+   * Inference needs a type for every argument before it can decide what any parameter is, and a
+   * literal at a parameter still being solved has nothing to give it but this default — while
+   * *analyzing* the literal against that default is a range check it should not have to pass. A
+   * `5000000000` headed for a `u64` is a fine argument, and asking it to be an `int` first is how
+   * it would be refused for being one. So the fallback is read off the spelling, and the literal
+   * is analyzed once, later, against the parameter the solution gave it.
+   */
+  protected def literalDefault(e: Expr): Option[Type] = e match
+    case IntLit(_, None)     => Some(Type.Int)
+    case FloatLit(_, None)   => Some(Type.Real)
+    case Unary("-", operand) => literalDefault(operand)
+    case _                   => None
+
   /** An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens,
    * narrows, or changes representation without being written.
    */

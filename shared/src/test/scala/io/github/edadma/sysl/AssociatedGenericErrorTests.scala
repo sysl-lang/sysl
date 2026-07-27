@@ -75,7 +75,7 @@ class AssociatedGenericErrorTests extends AnyFreeSpec with CodegenSupport {
           |    b: A
           |    of(x: A, y: A) -> Pair[A] = Pair(x, y)
           |var p = Pair.of(1, "two")""".stripMargin,
-      ) should include("'y' of 'Pair.of' is int, but string was given")
+      ) should include("'x' of 'Pair.of' is string, but int was given")
     }
 
     "a result disagreeing with the annotated type is reported as the mismatch it is" in {

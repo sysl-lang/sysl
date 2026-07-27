@@ -89,6 +89,13 @@ undetermined by **both** directions, that is a compile error asking for an annot
 binding (`var e: Option[real] = …`) — never a silent default and never a stuck inference
 variable.
 
+**A literal is consulted last**, because a literal has no type of its own to offer (`01`) — it takes
+one from where it appears, and a parameter still being solved is not yet a place that can give it
+one. So what is already a type settles the parameter first, then the expected type, and a literal's
+default only where nothing else reached it: `pick(1, 2, 250u8)` is a `u8` because one argument knew
+and two did not, while `id(7)` is still an `int` because none did. Once the parameter is a type the
+literals are read against it, which is the same order the operand rule uses inside an expression.
+
 **A parameter that names no type parameter is not part of the question**, and its argument is
 checked against it exactly as a plain callee's is. This is worth saying because inference has to
 look at the arguments before it knows what anything is, which would otherwise cost a generic callee

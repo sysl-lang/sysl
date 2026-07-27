@@ -98,7 +98,7 @@ class GenericMethodErrorTests extends AnyFreeSpec with CodegenSupport {
           |    two[U](self, x: U, y: U) -> U = x
           |var b = Box(1)
           |print(b.two(1, "s"))""".stripMargin,
-      ) should include("'y' of 'Box.two' is int, but string was given")
+      ) should include("'x' of 'Box.two' is string, but int was given")
     }
 
     "a result the arguments already fixed is not bent to the annotation" in {

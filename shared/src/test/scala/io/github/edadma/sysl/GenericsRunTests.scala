@@ -200,6 +200,60 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "held\n"
     }
 
+    // A parameter that *is* the type parameter knows what it wants only once the solution is in, so
+    // a literal there is analyzed a second time — against the type its position turned out to have.
+    "a literal at a parameter still being solved takes the type it solved to" in {
+      run("""rotr[T: BitOr + Shl + Shr + Sub](x: T, n: T) -> T = (x >> n) | (x << (32 - n))
+            |print(rotr(0x80000001u32, 4))
+            |""".stripMargin) shouldBe "402653184\n"
+    }
+
+    "which one settled it does not matter, only that something did" in {
+      run("""pick[T: Ord](a: T, b: T, c: T) -> T = if a > b then a else if b > c then b else c
+            |print(pick(1, 2, 250u8))
+            |""".stripMargin) shouldBe "250\n"
+    }
+
+    // Nothing else fixing the type is still the literal's own default, which is what keeps `id(7)`
+    // an `int` rather than an inference failure.
+    "literals alone still settle it at their default" in {
+      run("""id[T](x: T) -> T = x
+            |print(id(7), id(2.5))
+            |""".stripMargin) shouldBe "7 2.5\n"
+    }
+
+    "a literal too wide for the type it solved to is refused" in {
+      err("""pair[T](a: T, b: T) -> T = a
+            |print(pair(1u8, 300))
+            |""".stripMargin) should include("300 does not fit")
+    }
+
+    // The expected type is a written type and a literal is not, so it outranks one here for the
+    // same reason a suffixed argument does — which is what lets a binding say what a call of
+    // nothing but literals should have been.
+    "the expected type outranks a literal" in {
+      run("""id[T](x: T) -> T = x
+            |var b: u8 = id(200)
+            |var big: u64 = id(5000000000)
+            |print(b, big)
+            |""".stripMargin) shouldBe "200 5000000000\n"
+    }
+
+    "a literal against an argument of a type it cannot be names both" in {
+      err("""pair[T](a: T, b: T) -> T = a
+            |print(pair("s", 1))
+            |""".stripMargin) should include("string")
+    }
+
+    // A variadic's tail has no declared parameter, so it is checked by the rule the tail imposes
+    // rather than against one — which makes it the case where the arguments and what inference
+    // held could come apart.
+    "a generic variadic checks its parameters and its tail apart" in {
+      run("""tagged[T](tag: T, n: u8, ...) -> u8 = n
+            |print(tagged("t", 250, 1, 2), tagged(2.5, 7, 3))
+            |""".stripMargin) shouldBe "250 7\n"
+    }
+
     // The two coercions an expected type drives now happen at the argument's own analysis rather
     // than after inference, so both are checked at a generic callee: a bare construction headed for
     // a `&T` is boxed, and a value headed for a trait object is erased.
