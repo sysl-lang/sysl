@@ -115,7 +115,7 @@ case class StructPattern(name: String, fields: List[(String, Pattern)]) extends 
  */
 case class MatchArm(patterns: List[Pattern], guard: Option[Expr], body: List[Stmt]) extends Positioned
 
-/** `match scrutinee` with indented arms — an **expression** yielding the taken arm's value
+/** `scrutinee match` with indented arms — an **expression** yielding the taken arm's value
  * (or `unit` in statement position). Arms are tried top to bottom.
  */
 case class MatchExpr(scrutinee: Expr, arms: List[MatchArm]) extends Expr

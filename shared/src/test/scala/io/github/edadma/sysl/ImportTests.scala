@@ -123,7 +123,7 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     "an enum, reached by name" in {
       runIn(
         ("", "main.sysl",
-         "import geom.Shape\nvar s: Shape = Shape.Round(7)\nmatch s\n    Dot -> print(0)\n    Round(r) -> print(r)"),
+         "import geom.Shape\nvar s: Shape = Shape.Round(7)\ns match\n    Dot -> print(0)\n    Round(r) -> print(r)"),
         geom,
       ) shouldBe "7\n"
     }
@@ -131,7 +131,7 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     "a variant, constructed unqualified" in {
       runIn(
         ("", "main.sysl",
-         "import geom.{Shape, Round}\nvar s: Shape = Round(7)\nmatch s\n    Dot -> print(0)\n    Round(r) -> print(r)"),
+         "import geom.{Shape, Round}\nvar s: Shape = Round(7)\ns match\n    Dot -> print(0)\n    Round(r) -> print(r)"),
         geom,
       ) shouldBe "7\n"
     }
@@ -366,7 +366,7 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
     "reaching a variant through its enum" in {
       runIn(
         ("", "main.sysl",
-         "import text.util\nvar s: util.Shape = util.Shape.Round(7)\nmatch s\n    Dot -> print(0)\n" +
+         "import text.util\nvar s: util.Shape = util.Shape.Round(7)\ns match\n    Dot -> print(0)\n" +
            "    Round(r) -> print(r)"),
         ("text.util", "u.sysl", "module text.util\nenum Shape\n    Dot\n    Round(r: int)"),
       ) shouldBe "7\n"
@@ -418,7 +418,7 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
 
     "an imported type used in a struct pattern" in {
       runIn(
-        ("", "main.sysl", "import geom.Point\nvar p: Point = Point(3, 4)\nmatch p\n    Point{x, y} -> print(x + y)"),
+        ("", "main.sysl", "import geom.Point\nvar p: Point = Point(3, 4)\np match\n    Point{x, y} -> print(x + y)"),
         geom,
       ) shouldBe "7\n"
     }

@@ -204,14 +204,14 @@ class EnumParserTests extends AnyFreeSpec with ParseSupport {
 
   "patterns" - {
     "a variant pattern binds its fields" in {
-      arms("match s\n    Circle(r) -> print(r)\n    Empty -> print(0)").map(_.patterns) shouldBe List(
+      arms("s match\n    Circle(r) -> print(r)\n    Empty -> print(0)").map(_.patterns) shouldBe List(
         List(VariantPattern("Circle", List(IdentPattern("r")))),
         List(IdentPattern("Empty")),
       )
     }
 
     "nested variant patterns and a bare binding" in {
-      arms("match o\n    Wrap(Val(v)) -> print(v)\n    other -> print(0)").map(_.patterns) shouldBe List(
+      arms("o match\n    Wrap(Val(v)) -> print(v)\n    other -> print(0)").map(_.patterns) shouldBe List(
         List(VariantPattern("Wrap", List(VariantPattern("Val", List(IdentPattern("v")))))),
         List(IdentPattern("other")),
       )

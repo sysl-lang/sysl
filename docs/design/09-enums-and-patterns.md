@@ -145,12 +145,23 @@ each an ordered list of patterns, an optional guard, and a body:
 
 ```
 classify(n: int) -> string
-    match n
+    n match
         0            -> "zero"
         1 | 2 | 3    -> "small"
         4..10        -> "medium"
         else         -> "large"
 ```
+
+**The keyword goes after the value, as Scala's does.** A match is a transformation of the thing
+to its left, and writing it there is what lets one feed another: `x match … match …` reads in the
+order the values flow, where a prefix `match` would have made the second wrap the first and put
+each block of arms at a different distance from the value it chooses between. The same reasoning
+covers the ordinary case with one match in it — a long scrutinee is read once, left to right,
+rather than after jumping back over the keyword to find where it starts.
+
+It binds **looser than every operator**, so the scrutinee is the whole expression written before
+it: `a < b match` chooses on the comparison, and `x = y match` is an assignment whose right side is
+a match. Parentheses are what narrow it, as everywhere else.
 
 Two evaluation guarantees, both settled and tested:
 
@@ -208,7 +219,7 @@ two gates are deliberately different:
 ways, and both are supported:
 
 ```
-match p
+p match
     Point(a, b)   -> …        // positional: bind every field, in declaration order
     Point{x, y}   -> …        // named, shorthand: field x → x, field y → y
     Point{x: a}   -> …        // named, renamed + partial: field x → a, other fields unconstrained
@@ -290,7 +301,7 @@ reads inside a `|` or a nested pattern.
 
 **Disagreeing arm types are a diagnostic, not a silent `unit`.** When the arms yield *different*
 non-unit types and no `&T` context unifies them, the match is a type error reported at the
-match itself — not a silent fallback to `unit` that surfaces later as a confusing error at the
+itself — not a silent fallback to `unit` that surfaces later as a confusing error at the match
 use site. The only way distinct arm types are legal is when a common expectation (a `&T`
 context, §above) reaches each arm and boxes them to meet.
 

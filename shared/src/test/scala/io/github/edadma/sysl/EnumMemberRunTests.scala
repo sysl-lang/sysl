@@ -17,7 +17,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
       """enum Shape
         |    Circle(r: int)
         |    Square(side: int)
-        |    area(self) -> int = match self
+        |    area(self) -> int = self match
         |        Circle(r) -> 3 * r * r
         |        Square(s) -> s * s
         |var c = Circle(2)
@@ -48,7 +48,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
         |    One
         |    advance(*self)
         |        *self = One
-        |    n(self) -> int = match self
+        |    n(self) -> int = self match
         |        Zero -> 0
         |        One -> 1
         |var s = Zero
@@ -66,7 +66,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
       """enum Box
         |    Full(name: string)
         |    Empty
-        |    label(self) -> string = match self
+        |    label(self) -> string = self match
         |        Full(n) -> n
         |        Empty -> "empty"
         |    clear(*self)
@@ -84,7 +84,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
       """enum Box
         |    Full(name: string)
         |    Empty
-        |    peek(&self) -> string = match *self
+        |    peek(&self) -> string = *self match
         |        Full(n) -> n
         |        Empty -> "none"
         |var h: &Box = Full("heaped")
@@ -98,7 +98,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
       """enum Shape
         |    Circle(r: int)
         |    Square(side: int)
-        |    area(self) -> int = match self
+        |    area(self) -> int = self match
         |        Circle(r) -> 3 * r * r
         |        Square(s) -> s * s
         |    doubled -> int = self.area() * 2
@@ -114,7 +114,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
         |    Circle(r: int)
         |    Square(side: int)
         |    unit() -> Shape = Square(1)
-        |    area(self) -> int = match self
+        |    area(self) -> int = self match
         |        Circle(r) -> 3 * r * r
         |        Square(s) -> s * s
         |print(Shape.unit().area())""".stripMargin
@@ -128,7 +128,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
     val src =
       """enum Nat
         |    Lit(n: int)
-        |    countdown(self) -> int = match self
+        |    countdown(self) -> int = self match
         |        Lit(n) -> if n <= 0 then 0 else Lit(n - 1).countdown() + n
         |print(Lit(4).countdown())""".stripMargin
 
@@ -141,7 +141,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
         """enum Maybe[T]
           |    Just(value: T)
           |    Nothing
-          |    or_else(self, d: T) -> T = match self
+          |    or_else(self, d: T) -> T = self match
           |        Just(v) -> v
           |        Nothing -> d
           |var a: Maybe[int] = Just(7)
@@ -159,7 +159,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
         """enum Maybe[T]
           |    Just(value: T)
           |    Nothing
-          |    tag -> int = match self
+          |    tag -> int = self match
           |        Just(_) -> 1
           |        Nothing -> 0
           |var a: Maybe[real] = Just(1.5)
@@ -177,7 +177,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
         """enum Maybe[T]
           |    Just(value: T)
           |    Nothing
-          |    get(self, d: T) -> T = match self
+          |    get(self, d: T) -> T = self match
           |        Just(v) -> v
           |        Nothing -> d
           |var a: Maybe[int] = Just(1)
@@ -198,7 +198,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
           |    Small
           |    Large
           |impl Show for Dim
-          |    show(self) -> int = match self
+          |    show(self) -> int = self match
           |        Small -> 1
           |        Large -> 100
           |var d = Large
@@ -219,7 +219,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
           |struct Fixed
           |    v: int
           |impl Show for Dim
-          |    show(self) -> int = match self
+          |    show(self) -> int = self match
           |        Small -> 1
           |        Large -> 100
           |impl Show for Fixed

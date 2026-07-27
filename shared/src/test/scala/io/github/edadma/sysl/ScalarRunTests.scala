@@ -109,7 +109,7 @@ class ScalarRunTests extends AnyFreeSpec with RunSupport {
 
     "matches literals and ranges" in {
       run("""kind(c: char) -> string
-            |    match c
+            |    c match
             |        'a'..'z' -> "lower"
             |        ' ' -> "space"
             |        else -> "other"

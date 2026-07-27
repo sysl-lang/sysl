@@ -71,7 +71,7 @@ class EnumConversionRunTests extends AnyFreeSpec with RunSupport {
 
   "the fallible constructor returns Some for a declared discriminant" in {
     val src = color +
-      """match Color.try(11)
+      """Color.try(11) match
         |    Some(c) -> print(int(c))
         |    None -> print(-1)""".stripMargin
     run(src) shouldBe "11\n"
@@ -79,7 +79,7 @@ class EnumConversionRunTests extends AnyFreeSpec with RunSupport {
 
   "the fallible constructor returns None for an undeclared value" in {
     val src = color +
-      """match Color.try(7)
+      """Color.try(7) match
         |    Some(c) -> print(int(c))
         |    None -> print(-1)""".stripMargin
     run(src) shouldBe "-1\n"
@@ -89,7 +89,7 @@ class EnumConversionRunTests extends AnyFreeSpec with RunSupport {
     // Every value 0..12 is tried; only the four declared discriminants round-trip, the rest miss.
     val src = color +
       """decode(n: u8) -> int
-        |    match Color.try(n)
+        |    Color.try(n) match
         |        Some(c) -> int(c)
         |        None -> -1
         |var i: u8 = 0
@@ -108,7 +108,7 @@ class EnumConversionRunTests extends AnyFreeSpec with RunSupport {
         |    West
         |var d = Dir(2)
         |print(int(d))
-        |match Dir.try(9)
+        |Dir.try(9) match
         |    Some(x) -> print(int(x))
         |    None -> print(-1)""".stripMargin
     run(src) shouldBe "2\n-1\n"
@@ -123,7 +123,7 @@ class EnumConversionRunTests extends AnyFreeSpec with RunSupport {
         |print(int(Down))
         |var t = Trend(-1)
         |print(int(t))
-        |match Trend.try(5)
+        |Trend.try(5) match
         |    Some(x) -> print(int(x))
         |    None -> print(99)""".stripMargin
     run(src) shouldBe "-1\n-1\n99\n"

@@ -10,7 +10,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "literal, alternative, range, and else arms" in {
     val src =
       """classify(n: int) -> string
-        |    match n
+        |    n match
         |        0 -> "zero"
         |        1 | 2 | 3 -> "small"
         |        4..10 -> "medium"
@@ -24,7 +24,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "a bool matches its two literal values without an else" in {
     val src =
       """word(b: bool) -> string
-        |    match b
+        |    b match
         |        true -> "yes"
         |        false -> "no"
         |print(word(true), word(false))""".stripMargin
@@ -35,7 +35,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "a bool match reads a computed condition" in {
     val src =
       """parity(n: int) -> string
-        |    match n % 2 == 0
+        |    n % 2 == 0 match
         |        true -> "even"
         |        false -> "odd"
         |print(parity(4), parity(7))""".stripMargin
@@ -46,7 +46,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "a bool match may cover one value and fall through to else" in {
     val src =
       """flag(b: bool) -> int
-        |    match b
+        |    b match
         |        true -> 1
         |        else -> 0
         |print(flag(true), flag(false))""".stripMargin
@@ -61,7 +61,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    y: int
         |end Point
         |classify(p: Point) -> string
-        |    match p
+        |    p match
         |        Point(0, 0) -> "origin"
         |        Point(x, 0) -> "x-axis"
         |        Point(0, y) -> "y-axis"
@@ -80,7 +80,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    y: int
         |end Point
         |sum(p: Point) -> int
-        |    match p
+        |    p match
         |        Point(x, y) -> x + y
         |print(sum(Point(3, 4)))""".stripMargin
 
@@ -94,7 +94,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    y: int
         |end Point
         |where(p: Point) -> string
-        |    match p
+        |    p match
         |        Point{x: 0} -> "y-axis"
         |        Point{y: 0} -> "x-axis"
         |        Point{x, y} -> "elsewhere"
@@ -110,7 +110,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    y: int
         |end Point
         |swapSum(p: Point) -> int
-        |    match p
+        |    p match
         |        Point{y, x} -> x * 10 + y
         |print(swapSum(Point(3, 4)))""".stripMargin
 
@@ -128,7 +128,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    b: Point
         |end Line
         |describe(l: Line) -> string
-        |    match l
+        |    l match
         |        Line(Point(0, 0), b) -> "from origin"
         |        else -> "other"
         |print(describe(Line(Point(0, 0), Point(3, 4))), describe(Line(Point(1, 1), Point(2, 2))))""".stripMargin
@@ -147,7 +147,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |var total = 0
         |for i in 1..5000
         |    var nm = Named("ab" + "cd", i)
-        |    var got = match nm
+        |    var got = nm match
         |        Named{tag: t, n} -> int(t[0]) + n
         |    total += got
         |print(total)""".stripMargin
@@ -159,7 +159,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "an exclusive range pattern excludes its upper bound" in {
     val src =
       """band(n: int) -> string
-        |    match n
+        |    n match
         |        0..<10 -> "low"
         |        else -> "high"
         |print(band(9), band(10))""".stripMargin
@@ -170,7 +170,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "guards select among wildcard arms" in {
     val src =
       """sign(x: int) -> int
-        |    match x
+        |    x match
         |        _ if x > 0 -> 1
         |        _ if x < 0 -> -1
         |        else -> 0
@@ -182,7 +182,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "match runs as a statement for its effect" in {
     val src =
       """var n = 2
-        |match n
+        |n match
         |    1 -> print("one")
         |    2 -> print("two")
         |    else -> print("many")""".stripMargin
@@ -195,7 +195,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "a failed guard falls through to a later overlapping arm" in {
     val src =
       """classify(n: int) -> string
-        |    match n
+        |    n match
         |        1..10 if n > 5 -> "high"
         |        1..10 -> "low"
         |        else -> "other"
@@ -208,7 +208,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
   "an inclusive range pattern includes both bounds" in {
     val src =
       """band(n: int) -> string
-        |    match n
+        |    n match
         |        3..7 -> "in"
         |        else -> "out"
         |print(band(2), band(3), band(7), band(8))""".stripMargin
@@ -222,7 +222,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    Leaf(v: int)
         |    Node(l: int, r: int)
         |sum(t: Tree) -> int
-        |    match t
+        |    t match
         |        Leaf(v) if v < 0 -> 0
         |        Leaf(v) -> v
         |        Node(a, b) -> a + b
@@ -240,7 +240,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    Wrap(i: Inner)
         |    Bare
         |peek(o: Outer) -> int
-        |    match o
+        |    o match
         |        Wrap(Val(n)) -> n
         |        Wrap(Nought) -> -1
         |        else -> -2
@@ -258,7 +258,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    true
         |end noisy
         |check(n: int) -> int
-        |    match n
+        |    n match
         |        5 if noisy() -> 1
         |        else -> 0
         |print(check(3))
@@ -275,7 +275,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    print("eval")
         |    2
         |end src
-        |match src()
+        |src() match
         |    1 -> print("one")
         |    2 -> print("two")
         |    else -> print("other")""".stripMargin
@@ -296,7 +296,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    Full(p: &Point)
         |    Empty
         |extract(b: Box) -> &Point
-        |    match b
+        |    b match
         |        Full(p) -> p
         |        Empty -> Point(0, 0)
         |var got = extract(Full(Point(11, 22)))
@@ -318,7 +318,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    Full(p: &Point)
         |    Empty
         |extract(b: Box) -> &Point
-        |    match b
+        |    b match
         |        Full(p) -> p
         |        Empty -> Point(0, 0)
         |var i = 0
@@ -344,7 +344,7 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
         |    Full(p: &Point)
         |    Empty
         |score(c: Cell) -> int
-        |    match c
+        |    c match
         |        Full(p) if p.x > 100 -> 1
         |        Full(p) -> p.x
         |        Empty -> 0

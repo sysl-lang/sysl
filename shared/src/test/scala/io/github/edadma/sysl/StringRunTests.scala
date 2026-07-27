@@ -458,7 +458,7 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
     "a literal is matched like any other value" in {
       val src =
         """kind(s: string) -> int
-          |    match s
+          |    s match
           |        "yes" -> 1
           |        "no" -> 0
           |        else -> -1
@@ -522,7 +522,7 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
           |    Nothing
           |end Answer
           |say(a: Answer) -> string
-          |    match a
+          |    a match
           |        Word(w) -> w
           |        Nothing -> "-"
           |end say

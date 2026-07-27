@@ -332,7 +332,7 @@ it can initialize a binding, be a function's body, or feed a branch of another:
 
 ```
 var label = if n % 2 == 0 then "even" else "odd"
-fee(t: Tier) -> int = match t
+fee(t: Tier) -> int = t match
     Bronze -> 0
     Silver -> 10
     Gold   -> 25
@@ -408,7 +408,7 @@ producing a value. It is what a call to something declared not to return has, an
 one reason — so that a branch which aborts can sit beside one that yields:
 
 ```
-unwrap(self) -> T = match self
+unwrap(self) -> T = self match
     Some(v) -> v
     None ->
         print("panic: unwrap of a None value")

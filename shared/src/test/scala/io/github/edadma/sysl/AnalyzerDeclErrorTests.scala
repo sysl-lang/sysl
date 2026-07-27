@@ -26,7 +26,7 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "enums" - {
     "a match on a data enum must cover every variant" in {
-      val src = "enum Shape\n    Circle(r: int)\n    Empty\nf(s: Shape) -> int\n    match s\n        Empty -> 0"
+      val src = "enum Shape\n    Circle(r: int)\n    Empty\nf(s: Shape) -> int\n    s match\n        Empty -> 0"
       err(src) should include("not exhaustive")
       err(src) should include("Circle")
     }
@@ -41,7 +41,7 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "matching an unknown variant" in {
-      val src = "enum Shape\n    Circle(r: int)\n    Empty\nf(s: Shape) -> int\n    match s\n        Square(x) -> 0\n        else -> 1"
+      val src = "enum Shape\n    Circle(r: int)\n    Empty\nf(s: Shape) -> int\n    s match\n        Square(x) -> 0\n        else -> 1"
       err(src) should include("no variant 'Square'")
     }
 

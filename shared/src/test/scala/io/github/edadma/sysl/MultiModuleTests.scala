@@ -44,7 +44,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "an enum variant, through its enum" in {
       runIn(
         ("", "main.sysl",
-         "var s: geom.Shape = geom.Shape.Round(7)\nmatch s\n    Dot -> print(0)\n    Round(r) -> print(r)"),
+         "var s: geom.Shape = geom.Shape.Round(7)\ns match\n    Dot -> print(0)\n    Round(r) -> print(r)"),
         ("geom", "g.sysl", "module geom\nenum Shape\n    Dot\n    Round(r: int)"),
       ) shouldBe "7\n"
     }
@@ -52,7 +52,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "a nullary variant just as directly" in {
       runIn(
         ("", "main.sysl",
-         "var s: geom.Shape = geom.Shape.Dot\nmatch s\n    Dot -> print(0)\n    Round(r) -> print(r)"),
+         "var s: geom.Shape = geom.Shape.Dot\ns match\n    Dot -> print(0)\n    Round(r) -> print(r)"),
         ("geom", "g.sysl", "module geom\nenum Shape\n    Dot\n    Round(r: int)"),
       ) shouldBe "0\n"
     }
@@ -62,7 +62,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "and a match on one names its variants unqualified" in {
       runIn(
         ("", "main.sysl",
-         "var s: geom.Shape = geom.Shape.Round(7)\nmatch s\n    Dot -> print(0)\n    Round(r) -> print(r)"),
+         "var s: geom.Shape = geom.Shape.Round(7)\ns match\n    Dot -> print(0)\n    Round(r) -> print(r)"),
         ("geom", "g.sysl", "module geom\nenum Shape\n    Dot\n    Round(r: int)"),
       ) shouldBe "7\n"
     }
@@ -136,7 +136,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       runIn(
         ("", "main.sysl",
          "var a: geom.Shape = geom.Shape.Round(1)\nvar b: text.Glyph = text.Glyph.Round(2)\n" +
-           "match a\n    Round(r) -> print(r)\nmatch b\n    Round(r) -> print(r)"),
+           "a match\n    Round(r) -> print(r)\nb match\n    Round(r) -> print(r)"),
         ("geom", "g.sysl", "module geom\nenum Shape\n    Round(r: int)"),
         ("text", "t.sysl", "module text\nenum Glyph\n    Round(r: int)"),
       ) shouldBe "1\n2\n"
@@ -158,7 +158,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         ("", "main.sysl", "print(m.label(2))"),
         ("m", "a.sysl",
          "module m\nlabel(n: int) -> string =\n    var o: Option[int] = Some(n)\n" +
-           "    match o\n        Some(v) -> str(v)\n        None -> \"-\""),
+           "    o match\n        Some(v) -> str(v)\n        None -> \"-\""),
       ) shouldBe "2\n"
     }
 
@@ -295,21 +295,21 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   "a pattern names a foreign type" - {
     "by its path, in the named form" in {
       runIn(
-        ("", "main.sysl", "var p: geom.Point = geom.Point(3, 4)\nmatch p\n    geom.Point{x} -> print(x)"),
+        ("", "main.sysl", "var p: geom.Point = geom.Point(3, 4)\np match\n    geom.Point{x} -> print(x)"),
         ("geom", "g.sysl", "module geom\nstruct Point\n    x: int\n    y: int"),
       ) shouldBe "3\n"
     }
 
     "and in the positional form" in {
       runIn(
-        ("", "main.sysl", "var p: geom.Point = geom.Point(3, 4)\nmatch p\n    geom.Point(x, y) -> print(x + y)"),
+        ("", "main.sysl", "var p: geom.Point = geom.Point(3, 4)\np match\n    geom.Point(x, y) -> print(x + y)"),
         ("geom", "g.sysl", "module geom\nstruct Point\n    x: int\n    y: int"),
       ) shouldBe "7\n"
     }
 
     "so the bare name does not match it" in {
       errIn(
-        ("", "main.sysl", "var p: geom.Point = geom.Point(3, 4)\nmatch p\n    Point{x} -> print(x)"),
+        ("", "main.sysl", "var p: geom.Point = geom.Point(3, 4)\np match\n    Point{x} -> print(x)"),
         ("geom", "g.sysl", "module geom\nstruct Point\n    x: int\n    y: int"),
       ) should include("'Point{…}' does not match a geom.Point value")
     }
@@ -421,7 +421,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "converts from an integer" in {
       runIn(
         ("", "main.sysl",
-         "var c: geom.Color = geom.Color(1)\nmatch c\n    Red -> print(0)\n    Green -> print(1)"),
+         "var c: geom.Color = geom.Color(1)\nc match\n    Red -> print(0)\n    Green -> print(1)"),
         ("geom", "g.sysl", "module geom\nenum Color\n    Red\n    Green"),
       ) shouldBe "1\n"
     }
@@ -429,7 +429,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "and offers the fallible constructor beside it" in {
       runIn(
         ("", "main.sysl",
-         "var c = geom.Color.try(5)\nmatch c\n    Some(v) -> print(1)\n    None -> print(0)"),
+         "var c = geom.Color.try(5)\nc match\n    Some(v) -> print(1)\n    None -> print(0)"),
         ("geom", "g.sysl", "module geom\nenum Color\n    Red\n    Green"),
       ) shouldBe "0\n"
     }

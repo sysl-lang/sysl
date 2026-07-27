@@ -77,20 +77,20 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "a value match must be exhaustive" in {
-    err("var x = match 1\n    1 -> 10\n    2 -> 20") should include("exhaustive")
+    err("var x = 1 match\n    1 -> 10\n    2 -> 20") should include("exhaustive")
   }
 
   "match patterns and results" - {
     // `bool` is exhaustive only when both values are covered; one value with no else is a gap.
     "a value match on a bool covering only one value is rejected" in {
-      err("var x = match true\n    true -> 1") should include("must cover both 'true' and 'false'")
+      err("var x = true match\n    true -> 1") should include("must cover both 'true' and 'false'")
     }
 
     // A range pattern is for numbers and characters; `string` is ordered but a string range is a
     // trap, so it is refused.
     "a string range pattern is rejected" in {
       err(
-        """f(s: string) -> int = match s
+        """f(s: string) -> int = s match
           |    "a".."z" -> 1
           |    else -> 0""".stripMargin
       ) should include("a range pattern needs a numeric or char value, not string")
@@ -100,7 +100,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
     // silent collapse to unit.
     "arms that yield different value types are rejected" in {
       err(
-        """var x = match 3
+        """var x = 3 match
           |    1 -> 10
           |    else -> "big"""".stripMargin
       ) should include("match arms have different types: int and string")
@@ -113,10 +113,55 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |    x: int
           |    y: int
           |end Point
-          |f(p: Point) -> int = match p
+          |f(p: Point) -> int = p match
           |    Point(x) -> x
           |    else -> 0""".stripMargin
       ) should include("struct 'Point' has 2 fields, but 1 sub-pattern was given")
+    }
+
+    // Selection reaches through a memory mode and a pattern does not (`03`), which a recursive type
+    // meets the moment it is walked — so the complaint names the dereference that would fix it.
+    "a variant pattern against a reference to the enum says to dereference it" in {
+      val e = err(
+        """enum Shape
+          |    Dot
+          |    Round(r: int)
+          |end Shape
+          |f(s: &Shape) -> int = s match
+          |    Round(r) -> r
+          |    else -> 0""".stripMargin
+      )
+
+      e should include("but the value is &Shape")
+      e should include("'*x match'")
+    }
+
+    "and so does a struct pattern against a pointer to the struct" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |end Point
+          |f(p: *Point) -> int = p match
+          |    Point{x: n} -> n
+          |    else -> 0""".stripMargin
+      ) should include("'*x match'")
+    }
+
+    // The hint is about a mode over something matchable, so a value that was never going to match
+    // is not told to dereference itself.
+    "but a value of no such shape is not" in {
+      val e = err(
+        """struct Point
+          |    x: int
+          |end Point
+          |f(n: int) -> int = n match
+          |    Point(x) -> x
+          |    else -> 0""".stripMargin
+      )
+
+      e should include("but the value is int")
+      e should not include "*x match"
     }
 
     "a named struct pattern naming an unknown field is rejected" in {
@@ -125,7 +170,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |    x: int
           |    y: int
           |end Point
-          |f(p: Point) -> int = match p
+          |f(p: Point) -> int = p match
           |    Point{z} -> z
           |    else -> 0""".stripMargin
       ) should include("struct 'Point' has no field 'z'")
@@ -137,7 +182,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |    x: int
           |    y: int
           |end Point
-          |f(p: Point) -> int = match p
+          |f(p: Point) -> int = p match
           |    Point{x, x} -> x
           |    else -> 0""".stripMargin
       ) should include("field 'x' is matched more than once")
@@ -150,7 +195,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |    x: int
           |    y: int
           |end Point
-          |f(p: Point) -> int = match p
+          |f(p: Point) -> int = p match
           |    Other(x, y) -> x
           |    else -> 0""".stripMargin
       ) should include("'Other(…)' does not match a Point value")
@@ -164,7 +209,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |    x: int
           |    y: int
           |end Point
-          |var r = match Point(1, 2)
+          |var r = Point(1, 2) match
           |    Point(0, 0) -> 1""".stripMargin
       ) should include("must be exhaustive")
     }

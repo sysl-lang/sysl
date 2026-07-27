@@ -87,16 +87,24 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   /** `if` and `match` are expressions (they yield the taken branch's value), so they sit at
    * the top of the grammar — an ordinary operand everywhere an expression is expected.
+   *
+   * `match` is **postfix**, as Scala's is, so it comes last: it reads an ordinary expression and
+   * then looks for the keyword, which is what makes `x match` and `a + b match` both name the
+   * value they are written after. An operand with no `match` behind it is that operand, so this
+   * alternative is also the ordinary fall-through to `assignment`.
    */
-  lazy val expression: PackratParser[Expr] = at(ifExpr | matchExpr | whileExpr | forExpr | assignment)
+  lazy val expression: PackratParser[Expr] = at(ifExpr | whileExpr | forExpr | matchExpr)
 
   private def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))
 
   /** Assignment is right-associative and lowest precedence, so it recurses on its right. The right
-   * side is a full `expression`, so a control-flow expression may sit there — `x = match …`,
+   * side is a full `expression`, so a control-flow expression may sit there — `x = if …`,
    * `total += if …` — in the same tail position `var x = …` already allows one; this does not put
-   * those forms into a binary operand, so `1 + match …` still does not parse.
+   * those forms into a binary operand, so `1 + if …` still does not parse.
+   *
+   * `match` needs no such allowance, being postfix: `x = y match` is an assignment whose right side
+   * is a match, and `a + b match` matches on the sum, exactly as the same lines read in Scala.
    */
   lazy val assignment: PackratParser[Expr] =
     at(
@@ -732,12 +740,23 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   // --- match ---------------------------------------------------------------------------
 
-  /** `match scrutinee` followed by an indented list of `pattern[, pattern…] [if guard] -> body`
+  /** `scrutinee match` followed by an indented list of `pattern[, pattern…] [if guard] -> body`
    * arms — an expression yielding the taken arm's value.
+   *
+   * The keyword goes **after** the value, as in Scala, and for Scala's reason: a match is a
+   * *transformation of the thing to its left*, so writing it there is what lets one feed another.
+   * `a match … match …` reads in the order the values flow, where the prefix form would have made
+   * the second one wrap the first and put the arms of each at a different distance from the value
+   * they choose between.
+   *
+   * It is therefore repeated rather than optional, and left-associative — each arms block matches
+   * whatever the chain has produced so far. An operand with no `match` after it is returned
+   * unchanged, which is how this doubles as the fall-through from `expression` to `assignment`.
    */
   private lazy val matchExpr: PackratParser[Expr] =
-    op("match") ~> expression ~ (newline ~> indent ~> opt(newlines) ~> repsep(matchArm, newlines) <~ opt(newlines) <~ dedent) ^^ {
-      case scrut ~ arms => MatchExpr(scrut, arms)
+    assignment ~ rep(opt(newlines) ~> op("match") ~>
+      (newline ~> indent ~> opt(newlines) ~> repsep(matchArm, newlines) <~ opt(newlines) <~ dedent)) ^^ {
+      case scrut ~ chain => chain.foldLeft(scrut)((e, arms) => MatchExpr(e, arms).setPos(e.pos))
     }
 
   private lazy val matchArm: Parser[MatchArm] =

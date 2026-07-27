@@ -95,7 +95,7 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
   "the join is no more permissive than it was" - {
     "two arms that yield different values still conflict" in {
       val src =
-        """f(n: int) -> int = match n
+        """f(n: int) -> int = n match
           |    1 -> 1
           |    2 -> exit(1)
           |    else -> "no"
@@ -110,7 +110,7 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
 
     "a match with a diverging arm must still be exhaustive" in {
       val src =
-        """f(n: int) -> int = match n
+        """f(n: int) -> int = n match
           |    1 -> 1
           |    2 -> exit(1)
           |print(f(1))""".stripMargin

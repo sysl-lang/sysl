@@ -65,10 +65,10 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport {
   "nested generic enums destructure through both layers" in {
     run("""var x: Option[Result[int, string]] = Some(Ok(99))
           |var y: Result[Option[int], string] = Ok(Some(5))
-          |var a = match x
+          |var a = x match
           |    Some(Ok(n)) -> n
           |    else -> -1
-          |var b = match y
+          |var b = y match
           |    Ok(Some(n)) -> n
           |    else -> -1
           |print(a, b)
@@ -90,7 +90,7 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport {
           |    Nothing
           |end Maybe
           |say(m: Maybe[string]) -> string
-          |    match m
+          |    m match
           |        Just(s) -> s
           |        Nothing -> "nothing"
           |end say
@@ -110,7 +110,7 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport {
   "the expected type supplies a type argument the arguments do not" in {
     run("""empty[T]() -> Option[T] = None
           |var e: Option[real] = empty()
-          |var isNone = match e
+          |var isNone = e match
           |    Some(x) -> false
           |    None -> true
           |print(isNone)

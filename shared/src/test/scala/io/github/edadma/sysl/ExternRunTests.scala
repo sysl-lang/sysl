@@ -231,7 +231,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
         """enum Shape
           |    Circle(r: int)
           |    Bad
-          |area(s: Shape) -> int = match s
+          |area(s: Shape) -> int = s match
           |    Circle(r) -> 3 * r * r
           |    Bad -> exit(1)
           |print(area(Circle(2)))""".stripMargin
@@ -244,7 +244,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
         """enum Shape
           |    Circle(r: int)
           |    Bad
-          |area(s: Shape) -> int = match s
+          |area(s: Shape) -> int = s match
           |    Circle(r) -> 3 * r * r
           |    Bad ->
           |        print("bad shape")
@@ -282,7 +282,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
           |enum Src
           |    Have(v: int)
           |    Gone
-          |grab(s: Src) -> &Inner = match s
+          |grab(s: Src) -> &Inner = s match
           |    Have(v) -> Inner(v)
           |    Gone -> exit(1)
           |var i = 0
@@ -340,7 +340,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
           |    Circle(r: int)
           |    Bad
           |show(s: Shape)
-          |    match s
+          |    s match
           |        Circle(r) -> print("circle", r)
           |        Bad -> exit(1)
           |show(Circle(3))
@@ -354,7 +354,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
         """enum Shape
           |    Circle(r: int)
           |    Bad
-          |area(s: Shape) -> int = match s
+          |area(s: Shape) -> int = s match
           |    Circle(r) if r < 0 -> exit(1)
           |    Circle(r) -> 3 * r * r
           |    Bad -> exit(2)
@@ -365,7 +365,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
 
     "every arm may diverge, and then the match itself does not return" in {
       val src =
-        """stop(c: bool) -> never = match c
+        """stop(c: bool) -> never = c match
           |    true ->
           |        print("true side")
           |        exit(1)
@@ -455,7 +455,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
 
     "an arm may return instead of yielding" in {
       val src =
-        """first(o: Option[int]) -> int = match o
+        """first(o: Option[int]) -> int = o match
           |    Some(v) -> v
           |    None -> return -1
           |print(first(Some(4)), first(None))""".stripMargin
@@ -519,7 +519,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
 
     "a body whose every arm returns is the same shape" in {
       val src =
-        """pick(o: Option[int]) -> int = match o
+        """pick(o: Option[int]) -> int = o match
           |    Some(v) -> return v * 2
           |    None -> return -1
           |print(pick(Some(3)), pick(None))""".stripMargin

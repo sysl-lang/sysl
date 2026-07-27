@@ -14,7 +14,7 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
 
   "a literal, alternative, range, and else arm" in {
     val src =
-      """match n
+      """n match
         |    0 -> print(1)
         |    1 | 2 -> print(2)
         |    3..5 -> print(3)
@@ -31,9 +31,40 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
     )
   }
 
+  // `match` is postfix and binds looser than any operator, so the scrutinee is the whole expression
+  // written before it — which is what lets one be written where the value is, rather than around it.
+  "the scrutinee is everything to the left of the keyword" in {
+    val src =
+      """a < b match
+        |    true -> print(1)
+        |    false -> print(2)""".stripMargin
+
+    matchExpr(src).scrutinee shouldBe Compare(List(Ident("a"), Ident("b")), List("<"))
+  }
+
+  // Being postfix is what makes a match feed another: each arms block chooses on whatever the chain
+  // has produced so far, so they read left to right in the order the values flow.
+  "and a second match takes the first one's value" in {
+    val src =
+      """n match
+        |    0 -> "zero"
+        |    else -> "other"
+        |match
+        |    "zero" -> print(1)
+        |    else -> print(2)""".stripMargin
+
+    matchExpr(src).scrutinee shouldBe MatchExpr(
+      Ident("n"),
+      List(
+        MatchArm(List(LitPattern(i(0))), None, List(ExprStmt(StrLit("zero")))),
+        MatchArm(List(WildcardPattern), None, List(ExprStmt(StrLit("other")))),
+      ),
+    )
+  }
+
   "a guarded wildcard arm" in {
     val src =
-      """match x
+      """x match
         |    _ if x > 0 -> print(1)
         |    else -> print(2)""".stripMargin
 
@@ -48,7 +79,7 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
 
   "a positional struct pattern parses like a variant" in {
     val src =
-      """match p
+      """p match
         |    Point(0, y) -> print(y)
         |    else -> print(0)""".stripMargin
 
@@ -63,7 +94,7 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
 
   "a named struct pattern carries field-name/sub-pattern pairs" in {
     val src =
-      """match p
+      """p match
         |    Point{x: 0, y} -> print(y)
         |    else -> print(0)""".stripMargin
 
@@ -82,7 +113,7 @@ class MatchParserTests extends AnyFreeSpec with ParseSupport {
 
   "a named-field shorthand binds each field to its own name" in {
     val src =
-      """match p
+      """p match
         |    Point{x, y} -> print(x)""".stripMargin
 
     matchExpr(src) shouldBe MatchExpr(

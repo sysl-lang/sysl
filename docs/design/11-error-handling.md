@@ -199,7 +199,7 @@ the departure itself is an `extern` (`12 §1`): the prelude declares `exit(code:
 stopping is a call, not an intrinsic.
 
 ```
-unwrap(self) -> T = match self
+unwrap(self) -> T = self match
     Some(v) -> v
     None ->
         print("panic: unwrap of a None value")

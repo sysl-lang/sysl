@@ -58,7 +58,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
             |    Green
             |impl Display for Colour
             |    display(self, out: *Writer, fmt: FormatSpec)
-            |        var name = match self
+            |        var name = self match
             |            Red -> "red"
             |            Green -> "green"
             |        display_str(name, out, fmt)

@@ -285,23 +285,23 @@ object Prelude {
       |    Some(value: T)
       |    None
       |
-      |    is_some(self) -> bool = match self
+      |    is_some(self) -> bool = self match
       |        Some(_) -> true
       |        None -> false
       |
       |    is_none(self) -> bool = !self.is_some()
       |
-      |    unwrap_or(self, default: T) -> T = match self
+      |    unwrap_or(self, default: T) -> T = self match
       |        Some(v) -> v
       |        None -> default
       |
-      |    unwrap(self) -> T = match self
+      |    unwrap(self) -> T = self match
       |        Some(v) -> v
       |        None ->
       |            print("panic: unwrap of a None value")
       |            exit(1)
       |
-      |    expect(self, msg: string) -> T = match self
+      |    expect(self, msg: string) -> T = self match
       |        Some(v) -> v
       |        None ->
       |            print("panic:", msg)
@@ -312,23 +312,23 @@ object Prelude {
       |    Ok(value: T)
       |    Err(error: E)
       |
-      |    is_ok(self) -> bool = match self
+      |    is_ok(self) -> bool = self match
       |        Ok(_) -> true
       |        Err(_) -> false
       |
       |    is_err(self) -> bool = !self.is_ok()
       |
-      |    unwrap_or(self, default: T) -> T = match self
+      |    unwrap_or(self, default: T) -> T = self match
       |        Ok(v) -> v
       |        Err(_) -> default
       |
-      |    unwrap(self) -> T = match self
+      |    unwrap(self) -> T = self match
       |        Ok(v) -> v
       |        Err(_) ->
       |            print("panic: unwrap of an Err value")
       |            exit(1)
       |
-      |    expect(self, msg: string) -> T = match self
+      |    expect(self, msg: string) -> T = self match
       |        Ok(v) -> v
       |        Err(_) ->
       |            print("panic:", msg)

@@ -117,7 +117,7 @@ class ImplGenericRunTests extends AnyFreeSpec with RunSupport {
           |    Nothing
           |impl[T: Display] Show for Maybe[T]
           |    show(self) -> string
-          |        match self
+          |        self match
           |            Just(x) -> str(x)
           |            Nothing -> "-"
           |var a: Maybe[int] = Just(4)

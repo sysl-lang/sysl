@@ -104,8 +104,10 @@ before they appear and may be mutually recursive).
   indented block**. Optional `end if` / `end while` / `end for` markers may close a block (`end`
   is a *soft* keyword, not reserved).
 - **`if`, `match`, and loops are expressions.** They yield the value of the taken branch/arm, so
-  `var label = if c then a else b` and `f() -> T = match x …` both work; in statement position
-  the value is simply unused.
+  `var label = if c then a else b` and `f() -> T = x …` both work; in statement position the value
+  is simply unused. **`match` is postfix** (`09 §5`) — `scrutinee match` with the arms indented
+  under the keyword, as in Scala, so one match feeds another and the scrutinee reads left to
+  right. It binds looser than every operator, so `a < b match` chooses on the comparison.
 - **Loops** — `while cond` and `for name in a..b` / `a..<b` (over a range) or `for name in seq`
   (over an array or slice) — are expressions too. A `break expr` leaves the nearest loop and
   makes `expr` its value; `continue` skips to the next iteration. An optional `else` block (after

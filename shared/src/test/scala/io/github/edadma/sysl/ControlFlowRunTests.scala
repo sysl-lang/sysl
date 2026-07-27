@@ -409,7 +409,7 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
       val src =
         """var total = 0
           |for i in 0..<4
-          |    total += match i % 2 == 0
+          |    total += i % 2 == 0 match
           |        true -> 10
           |        false -> 1
           |print(total)""".stripMargin
@@ -430,7 +430,7 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
     "a reassignment takes a match value" in {
       val src =
         """var y = 0
-          |y = match 5
+          |y = 5 match
           |    5 -> 50
           |    else -> 0
           |print(y)""".stripMargin

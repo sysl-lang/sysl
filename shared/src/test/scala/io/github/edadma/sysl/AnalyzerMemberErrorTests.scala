@@ -233,7 +233,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
         """enum Shape
           |    Circle(r: int)
           |    Empty
-          |    area(self) -> int = match self
+          |    area(self) -> int = self match
           |        Empty -> 0""".stripMargin
       ) should include("not exhaustive")
     }

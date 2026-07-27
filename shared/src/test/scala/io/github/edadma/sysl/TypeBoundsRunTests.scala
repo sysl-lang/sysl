@@ -105,7 +105,7 @@ class TypeBoundsRunTests extends AnyFreeSpec with RunSupport {
            |    Just(value: T)
            |    Nothing
            |
-           |    render(self) -> string = match self
+           |    render(self) -> string = self match
            |        Just(v) -> v.show()
            |        Nothing -> "-"
            |var a = Just(P(4))

@@ -9,7 +9,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
 
   private val unwrap =
     """unwrap(o: Option[int], dflt: int) -> int
-      |    match o
+      |    o match
       |        Some(v) -> v
       |        None -> dflt
       |end unwrap
@@ -38,7 +38,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |    if n % 2 == 0 then Ok(n / 2) else Err("odd")
             |end half
             |report(r: Result[int, string]) -> string
-            |    match r
+            |    r match
             |        Ok(v) -> "ok"
             |        Err(e) -> e
             |end report
@@ -57,7 +57,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |    half(h)
             |end quarter
             |report(r: Result[int, string]) -> string
-            |    match r
+            |    r match
             |        Ok(v) -> "ok"
             |        Err(e) -> e
             |end report
@@ -83,7 +83,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |    Ok(n * 2)
             |end twice
             |show(r: Result[int, string]) -> string
-            |    match r
+            |    r match
             |        Ok(v) -> "ok"
             |        Err(e) -> e
             |end show
@@ -105,7 +105,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |    var p = mk(ok)?
             |    Ok(p.x + p.y)
             |show(r: Result[int, string]) -> int
-            |    match r
+            |    r match
             |        Ok(v) -> v
             |        Err(e) -> -1
             |print(show(use(true)), show(use(false)))
@@ -123,7 +123,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |    var n = mk(ok)?
             |    Ok(n * 10)
             |show(r: Result[int, &Fail]) -> int
-            |    match r
+            |    r match
             |        Ok(v) -> v
             |        Err(e) -> e.code
             |print(show(use(true)), show(use(false)))
@@ -142,7 +142,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |    var nx = h.next?
             |    Some(nx.value)
             |unwrap(o: Option[int]) -> int
-            |    match o
+            |    o match
             |        Some(v) -> v
             |        None -> -1
             |var a: &Node = Node(3, None)
@@ -162,7 +162,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |relay(ok: bool) -> Result[&Point, string]
             |    Ok(mk(ok)?)
             |show(r: Result[&Point, string]) -> int
-            |    match r
+            |    r match
             |        Ok(p) -> p.x + p.y
             |        Err(e) -> -1
             |print(show(relay(true)), show(relay(false)))
@@ -184,7 +184,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |var i = 0
             |var total = 0
             |while i < 20000
-            |    match use()
+            |    use() match
             |        Ok(v) -> total += v
             |        Err(e) -> total += 0
             |    i++
@@ -205,7 +205,7 @@ class TryRunTests extends AnyFreeSpec with RunSupport {
             |var i = 0
             |var total = 0
             |while i < 20000
-            |    match use()
+            |    use() match
             |        Ok(v) -> total += 0
             |        Err(e) -> total += e.code
             |    i++

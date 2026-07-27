@@ -275,7 +275,7 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
       val src =
         """extern stop() -> never
           |f(c: bool) -> never
-          |    match c
+          |    c match
           |        true -> stop()
           |        false -> stop()
           |f(true)""".stripMargin
@@ -308,7 +308,7 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     "an all-returning match does too" in {
       val src =
-        """f(o: Option[int]) -> int = match o
+        """f(o: Option[int]) -> int = o match
           |    Some(v) -> return v
           |    None -> return -1
           |print(f(Some(1)))""".stripMargin

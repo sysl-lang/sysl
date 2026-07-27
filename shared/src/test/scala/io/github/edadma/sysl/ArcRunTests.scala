@@ -84,7 +84,7 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
   "a linked list is built out of references and walked back down" in {
     val src = node +
       """total(n: Option[&Node]) -> int
-        |    match n
+        |    n match
         |        Some(node) -> node.value + total(node.next)
         |        None -> 0
         |var a: &Node = Node(3, None)
@@ -98,7 +98,7 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
   "a list is rebuilt in a loop, so each link is dropped as the head moves on" in {
     val src = node +
       """digits(n: Option[&Node], acc: int) -> int
-        |    match n
+        |    n match
         |        Some(node) -> digits(node.next, acc * 10 + node.value)
         |        None -> acc
         |var head: Option[&Node] = None
@@ -117,7 +117,7 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
         |    Add(l: &Expr, r: &Expr)
         |    Mul(l: &Expr, r: &Expr)
         |eval(e: &Expr) -> int
-        |    match *e
+        |    *e match
         |        Num(n) -> n
         |        Add(l, r) -> eval(l) + eval(r)
         |        Mul(l, r) -> eval(l) * eval(r)
@@ -130,7 +130,7 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
   "an absent reference is an Option, matched like any other enum" in {
     val src = node +
       """first(n: Option[&Node]) -> int
-        |    match n
+        |    n match
         |        Some(node) -> node.value
         |        None -> -1
         |var lone: &Node = Node(9, None)
@@ -171,7 +171,7 @@ class ArcRunTests extends AnyFreeSpec with RunSupport {
         |head.next = None
         |head.next = Some(Node(3, None))
         |var out = 0
-        |match head.next
+        |head.next match
         |    Some(n) -> out = n.value
         |    None -> out = 0
         |print(out)""".stripMargin

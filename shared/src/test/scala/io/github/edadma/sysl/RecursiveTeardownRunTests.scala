@@ -19,7 +19,7 @@ class RecursiveTeardownRunTests extends AnyFreeSpec with RunSupport {
     val src =
       node +
         """sum(n: &Node) -> int
-          |    match n.next
+          |    n.next match
           |        Some(nx) -> n.value + sum(nx)
           |        None -> n.value
           |build3() -> &Node

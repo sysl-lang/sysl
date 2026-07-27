@@ -198,7 +198,7 @@ class AssociatedGenericRunTests extends AnyFreeSpec with RunSupport {
           |    Nothing
           |    Just(v: T)
           |    of(x: T) -> Maybe[T] = Just(x)
-          |    or(self, fallback: T) -> T = match self
+          |    or(self, fallback: T) -> T = self match
           |        Just(v) -> v
           |        Nothing -> fallback
           |print(Maybe.of(3).or(0))""".stripMargin

@@ -15,7 +15,7 @@ class EnumRunTests extends AnyFreeSpec with RunSupport {
         |    Blue = 10
         |
         |name(c: Color) -> string
-        |    match c
+        |    c match
         |        Red -> "red"
         |        Green -> "green"
         |        Blue -> "blue"
@@ -32,7 +32,7 @@ class EnumRunTests extends AnyFreeSpec with RunSupport {
         |    Empty
         |
         |area(s: Shape) -> int
-        |    match s
+        |    s match
         |        Circle(r) -> r * r * 3
         |        Rect(w, h) -> w * h
         |        Empty -> 0
@@ -48,7 +48,7 @@ class EnumRunTests extends AnyFreeSpec with RunSupport {
         |    Rect(w: int, h: int)
         |
         |describe(s: Shape) -> string
-        |    match s
+        |    s match
         |        Circle(r) if r > 10 -> "big circle"
         |        Circle(r) -> "small circle"
         |        other -> "not a circle"
@@ -68,7 +68,7 @@ class EnumRunTests extends AnyFreeSpec with RunSupport {
         |    Nothing
         |
         |unwrap(o: Outer) -> int
-        |    match o
+        |    o match
         |        Wrap(Val(v)) -> v
         |        Wrap(Nil) -> -1
         |        else -> -2
@@ -87,7 +87,7 @@ class EnumRunTests extends AnyFreeSpec with RunSupport {
         |    if big then Rect(10, 10) else Circle(1)
         |
         |var s = pick(true)
-        |var answer = match s
+        |var answer = s match
         |    Circle(r) -> r
         |    Rect(w, h) -> w * h
         |print(answer)""".stripMargin

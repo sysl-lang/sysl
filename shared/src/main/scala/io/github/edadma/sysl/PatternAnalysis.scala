@@ -88,7 +88,7 @@ trait PatternAnalysis extends TypeResolution {
               s"but ${supplied(args.length, "sub-pattern")}")
           TStructPattern(s, args.zip(s.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
         case other =>
-          err(s"'$name(…)' matches an enum variant or a struct, but the value is ${show(other)}")
+          err(s"'$name(…)' matches an enum variant or a struct, but the value is ${show(other)}" + heldBehind(other))
 
     // The named form matches a struct by field name, in any order, and may leave fields unlisted —
     // those are unconstrained. Both source forms end as one `TStructPattern` with a sub-pattern per
@@ -110,7 +110,29 @@ trait PatternAnalysis extends TypeResolution {
             },
           )
         case other =>
-          err(s"'$name{…}' matches a struct, but the value is ${show(other)}")
+          err(s"'$name{…}' matches a struct, but the value is ${show(other)}" + heldBehind(other))
+
+  /** What a "this pattern does not fit that value" complaint adds when the value is the right shape
+   * held behind a memory mode.
+   *
+   * **Selection is the only implicit dereference** (`03`), and deliberately: `p.x` reaches through a
+   * `*T` or a `&T`, and a pattern does not, so a recursive type — which has to be held behind one to
+   * exist at all — is matched by writing the dereference. That is a rule a reader has to know before
+   * they can guess the fix, and the fix is one character, so the one place it bites is where it is
+   * worth saying.
+   */
+  private def heldBehind(t: Type): String = t match
+    case Type.Ptr(inner) if matchable(inner)    => hint
+    case Type.Ref(inner, _) if matchable(inner) => hint
+    case _                                      => ""
+
+  private def hint: String =
+    " — a pattern does not reach through a memory mode the way a field selection does, so match what " +
+      "it holds: '*x match'"
+
+  private def matchable(t: Type): Boolean = t match
+    case _: Type.Enum | _: Type.Struct => true
+    case _                             => false
 
   /** Whether a pattern binds any name (directly or inside a variant's or struct's sub-patterns). */
   protected def binds(p: TPattern): Boolean = p match

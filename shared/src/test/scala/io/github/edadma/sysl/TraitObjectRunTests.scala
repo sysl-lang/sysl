@@ -108,7 +108,7 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport {
           |    One
           |    Two
           |impl Shape for E
-          |    area(self) -> int = match self
+          |    area(self) -> int = self match
           |        One -> 1
           |        Two -> 2
           |var e = Two
@@ -222,7 +222,7 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport {
       val out = run(shape +
         """make(big: bool) -> &Shape = if big then Sq(5) else Rect(3, 4)
           |var pick = 1
-          |var m: &Shape = match pick
+          |var m: &Shape = pick match
           |    1 -> Sq(6)
           |    _ -> Rect(1, 1)
           |print(make(true).area(), make(false).area(), m.area())""".stripMargin)
@@ -236,7 +236,7 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport {
           |    it: &Shape
           |var h = Holder(Rect(6, 7))
           |var o: Option[&Shape] = Some(Sq(5))
-          |var second = match o
+          |var second = o match
           |    Some(s) -> s.area()
           |    None -> 0
           |print(h.it.area(), second)""".stripMargin)
