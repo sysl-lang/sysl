@@ -91,26 +91,67 @@ trait AnalyzerBase {
     // A name carrying the module separator is one the compiler built rather than one a file wrote
     // — a synthesized `Self` reference, a default's bound on its own trait — and is already the key
     // it names. Nothing in source can be spelled this way, so passing it through is unambiguous.
-    if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written).map(reachable)
-    else if dot < 0 then
-      val own = Modules.qualify(currentModule, written)
+    val key =
+      if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written).map(reachable)
+      else if dot < 0 then
+        val own = Modules.qualify(currentModule, written)
 
-      if declared(own) && visible(own) then Some(own)
+        if declared(own) && visible(own) then Some(own)
+        else
+          // A declaration this file may not name is not a candidate, so the search goes on rather
+          // than stopping at it: a file that imported a `width` said which one it meant, and a
+          // sibling file's private helper is not an answer to that. Only where nothing else answers
+          // at all is the restriction worth reporting — at which point it is the whole story, and a
+          // better one than an undefined name.
+          importedName(written)(declared)
+            .orElse(Option.when(preludeNames(written) && declared(written))(written))
+            .orElse(Option.when(declared(own))(reachable(own)))
       else
-        // A declaration this file may not name is not a candidate, so the search goes on rather
-        // than stopping at it: a file that imported a `width` said which one it meant, and a
-        // sibling file's private helper is not an answer to that. Only where nothing else answers
-        // at all is the restriction worth reporting — at which point it is the whole story, and a
-        // better one than an undefined name.
-        importedName(written)(declared)
-          .orElse(Option.when(preludeNames(written) && declared(written))(written))
-          .orElse(Option.when(declared(own))(reachable(own)))
-    else
-      val module = modulePath(written.take(dot))
-      val name   = Modules.qualify(module, written.drop(dot + 1))
+        val module = modulePath(written.take(dot))
+        val name   = Modules.qualify(module, written.drop(dot + 1))
 
-      Option.when(moduleNames(module) && declared(name))(name).map(reachable)
+        Option.when(moduleNames(module) && declared(name))(name).map(reachable)
+
+    // Resolution is where a dependency between two modules is *made*, so it is where one is
+    // recorded (`13 §6`). Nothing earlier could see it: a qualified path names another module's
+    // declaration with no import to scan for, and which module an unqualified name reaches is the
+    // whole question this answered.
+    //
+    // A name carrying the separator is exempt, because a dependency is something a **file** wrote
+    // and one of these was written by the compiler. Each is a re-spelling of a reference already
+    // resolved from source, where the edge was recorded in the module that wrote it — and recording
+    // one again here would file it under whichever declaration's terms the walk is reading, which
+    // for a trait's default copied into another module's type is not where the reference came from.
+    // The one *source* reference that arrives already spelled this way is a qualified value path,
+    // and `Analyzer.throughModule`, which spells it in the terms of the body that wrote it, records
+    // that edge itself.
+    if written.indexOf(Modules.sep.toInt) < 0 then key.foreach(k => dependsOn(Modules.moduleOf(k)))
+    key
   }
+
+  // --- the module graph -------------------------------------------------------------------
+
+  /** Which module depends on which, and where the reference that first said so was written
+   * (`13 §6`).
+   *
+   * The **first** reference is the one kept, because a cycle is reported against one line and the
+   * earliest of them is the one a reader can follow the rest of the chain from.
+   */
+  protected val moduleEdges = mutable.LinkedHashMap.empty[(String, String), Option[Pos]]
+
+  /** Records that whatever is being read now depends on `to`.
+   *
+   * A module does not depend on itself, and nothing depends on the **root** module: the prelude
+   * lives there and is the language rather than a module (`13 §8`), and a program's own root-module
+   * declarations are its files' alone, since the root module has no name for anything else to
+   * write. So the root is a module that only ever depends, and can never be depended on.
+   *
+   * A path that names no module is not one either: an import may be written for one that does not
+   * exist, and the diagnostic for that says so far better than a graph built around it could.
+   */
+  protected def dependsOn(to: String): Unit =
+    if to != currentModule && to != Modules.root && moduleNames(to) then
+      moduleEdges.getOrElseUpdate((currentModule, to), currentPos)
 
   // --- visibility -----------------------------------------------------------------------
 
@@ -364,14 +405,20 @@ trait AnalyzerBase {
   protected val composedMembers = mutable.LinkedHashMap.empty[(String, String), String]
 
   /** What `Self` means inside a member of a *generic* type, as the reference it was written from —
-   * `Box[T]` for the members of `Box`, whichever declaration form brought them.
+   * `Box[T]` for the members of `Box`, whichever declaration form brought them — **and the terms it
+   * was written in**.
    *
    * A concrete type's members have their `Self` resolved once, at hoist, into `memberSelf`. A
    * generic type's cannot: `Box[T]` is not a type until a call fixes `T`. So the *reference* is
    * kept, and resolving it under the substitution an instantiation supplies is what gives `Self` its
    * meaning there — the same answer, one step later.
+   *
+   * The scope travels with it because the reference is the one part of an **inherited default** that
+   * the trait did not write: the copy is read in the trait's terms (`Hoisting.defaultHome`), and the
+   * subject came from the `impl` block, which may be in another module entirely. For every other
+   * member the two are the same scope and carrying it changes nothing.
    */
-  protected val genericSelf = mutable.LinkedHashMap.empty[String, TypeRef]
+  protected val genericSelf = mutable.LinkedHashMap.empty[String, (TypeRef, Scope)]
 
   /** What the **trait's** own type parameters mean inside a member of a generic `impl`, by the name
    * the member was lowered to.

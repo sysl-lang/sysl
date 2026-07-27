@@ -464,7 +464,7 @@ trait Hoisting extends TypeResolution {
         // On a generic type `Self` is the type applied to its own parameters, which is not a type
         // yet. The reference is what waits, and every substitution that fixes the parameters fixes
         // it too; on a concrete type it is already the answer and resolves to the same thing.
-        genericSelf(fd.name) = home.selfRef
+        genericSelf(fd.name) = (home.selfRef, currentScope)
         if home.outer.nonEmpty then genericOuter(fd.name) = home.outer
       else
         out += fd
@@ -928,15 +928,30 @@ trait Hoisting extends TypeResolution {
    * type's off the receiver and appends the ones it solved, so the same positional substitution
    * serves a member that adds parameters and one that adds none.
    */
-  private def synthesize(home: MemberHome, m: MethodDecl): FuncDecl =
+  private def synthesize(home: MemberHome, m: MethodDecl): FuncDecl = {
+    val name = s"${home.symbol}.${m.name}"
+
     FuncDecl(
-      s"${home.symbol}.${m.name}",
+      name,
       home.tparams ::: m.tparams,
-      receiverParam(m, home.selfRef).toList ::: m.params,
+      receiverParam(m, selfRefFor(name, home)).toList ::: m.params,
       m.retType,
       m.body,
       home.bounds ++ m.bounds,
     ).setPos(m.pos)
+  }
+
+  /** The receiver's type as a member's lowered signature carries it.
+   *
+   * A member written here names it as the block did. An **inherited default** is read in the trait's
+   * terms (`defaultHome`), because that is where its body and the rest of its signature came from —
+   * and the subject is the one thing in it that was not written there, so a copy naming it as the
+   * block spelled it would have that spelling looked for in the trait's module. The copy therefore
+   * names it `Self`, which is what the trait itself calls the implementing type, and the binding for
+   * `Self` is made where the subject really was written.
+   */
+  private def selfRefFor(name: String, home: MemberHome): TypeRef =
+    if defaultOrigin.contains(name) then NamedType(selfName) else home.selfRef
 
   /** The `self` parameter a member's receiver becomes, at the self type it is a member of. A
    * property's receiver is an implicit by-value read; an associated function has none.

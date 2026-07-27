@@ -1,15 +1,16 @@
 # Design Decisions: Modules
 
-**Status:** §1, §2's visibility modifiers, the whole of §3, §6's shared module scope, and §7's
-entry-point rule are **built** — a project is a tree of directories, each one a module named by its
-path from the root and holding its files to that name, their declarations visible across all of them
-with no ordering and no forward declaration, a member of one module reached from another by naming
-it in full, the `import` statement in all five of its forms shortening that path for the file or the
-block that writes it, `private` / `private[M]` deciding which of those spellings a given file is
-allowed to write at all, and no declaration allowed to name in its signature a type that does not
-reach as far as it does. The cycle check over the module *graph* (§6) and the capability clause (§4)
-are **not yet implemented**; they wait on open item (a), the project-config doc. Two written docs
-already lean on modules: `capabilities.md` attaches
+**Status:** §1, §2's visibility modifiers, the whole of §3, the whole of §6, and §7's entry-point
+rule are **built** — a project is a tree of directories, each one a module named by its path from
+the root and holding its files to that name, their declarations visible across all of them with no
+ordering and no forward declaration, a member of one module reached from another by naming it in
+full, the `import` statement in all five of its forms shortening that path for the file or the block
+that writes it, `private` / `private[M]` deciding which of those spellings a given file is allowed
+to write at all, no declaration allowed to name in its signature a type that does not reach as far
+as it does, and the graph those references make held to being acyclic. The capability clause (§4) is
+**not yet implemented**: the propagation it needs is the sweep §6 now makes available, but the
+*target* a propagated requirement would be checked against waits on open item (a), the
+project-config doc. Two written docs already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
 `cross-platform.md` fixes that "module names follow the directory tree relative to the project
 root." This chapter defines what a module **is** so those have something to name, and consolidates
@@ -383,12 +384,26 @@ the module name, not beside it.
 
 ## 6. The module graph is acyclic
 
-**Two modules may not import each other**, directly or through a chain. The import graph is a
-**DAG**, and a cycle in it is a compile error naming the modules on the cycle. This is Go's rule,
+**Two modules may not depend on each other**, directly or through a chain. The dependency graph is
+a **DAG**, and a cycle in it is a compile error naming the modules on the cycle. This is Go's rule,
 and it is a deliberate divergence from Scala, where a package's compilation units may depend on
 each other freely.
 
-Three things follow from it:
+The graph is over **references**, not over imports, and §3 forces the distinction: a member of
+another module is reachable by its full path with no import at all, so a file can depend on a module
+its header never mentions. An edge is therefore whatever *resolution* found — a call, a type named
+in a signature or a field, a trait named as a bound or behind a memory mode, a variant, a generic
+instantiated from elsewhere. An import contributes an edge of its own on top of those: a file that
+imports a module depends on it whether or not it goes on to write the shorter spelling it bought,
+because a file's imports are meant to be readable as what it needs, and a dependency that came and
+went with a use would not be.
+
+Two things sit outside the graph. The **prelude** is the language rather than a module, so writing
+`print` is not a dependency on anything. And the **anonymous root module** (§1) can be depended on
+by nothing, having no name for another module to write — a program's root files depend on the
+modules beneath them, and the dependency never runs back.
+
+Three things follow from acyclicity:
 
 - **Modules can be compiled in dependency order, and independent modules in parallel.** A
   topological sort exists, so a module's imports are all fully known before it is checked. A cyclic

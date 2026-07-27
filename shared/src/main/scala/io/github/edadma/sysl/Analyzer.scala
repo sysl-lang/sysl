@@ -35,7 +35,8 @@ class Analyzer private (units: List[Program])
     with Hoisting
     with StmtAnalysis
     with SpecialForms
-    with SignatureVisibility {
+    with SignatureVisibility
+    with ModuleGraph {
 
   /** Every error the walk found, rendered and in source order. */
   def errors: List[String] = diagnostics
@@ -171,6 +172,10 @@ class Analyzer private (units: List[Program])
         tfuncs ++= recoverOpt(analyzeFuncBody(name, available(name), Map.empty))
       drain()
 
+    // Every reference the program makes has been resolved, so which module depends on which is
+    // finally settled and the graph can be held to being acyclic (`13 §6`).
+    checkModuleGraph()
+
     val externs = externsUsed.toList.map { name =>
       val (params, rtype) = funcInsts(name)
       val e               = externDecls(name)
@@ -287,6 +292,10 @@ class Analyzer private (units: List[Program])
       val module = path.take(k).mkString(".")
       val rest   = path.drop(k)
 
+      // The key this builds is spelled the way the compiler spells its own references, so resolving
+      // it says nothing about which module wrote it — but *this* is a path a file wrote, in the
+      // terms of the body being read, so the dependency it makes is recorded here (`13 §6`).
+      dependsOn(module)
       rest.tail.foldLeft[Expr](Ident(Modules.qualify(module, rest.head)))((acc, n) => Field(acc, n))
         .setPos(e.pos)
 

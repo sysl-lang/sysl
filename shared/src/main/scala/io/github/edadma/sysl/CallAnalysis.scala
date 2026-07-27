@@ -189,7 +189,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       err(s"method '$shown' takes ${quantity(fd.params.length - 1, "argument")}, " +
         s"but ${supplied(args.length, "argument")}")
 
-    val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)(ref => spellSelf(_, ref))
+    val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val provisional = args.map(analyzeExpr(_))
     val own = inDecl(fd.name)(solve(
       shown,
@@ -569,7 +569,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       err(s"associated function '$shown' takes ${quantity(fd.params.length, "argument")}, " +
         s"but ${supplied(args.length, "argument")}")
 
-    val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)(ref => spellSelf(_, ref))
+    val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val provisional = args.map(analyzeExpr(_))
     val targs = inDecl(fd.name)(solve(
       shown,

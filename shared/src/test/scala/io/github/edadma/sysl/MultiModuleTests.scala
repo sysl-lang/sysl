@@ -342,6 +342,30 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ) shouldBe "10\n"
     }
 
+    // The receiver's type is the one part of such a copy that was *not* written in the trait: it
+    // came from the `impl` block. On a generic subject it is kept as a reference and resolved again
+    // at each instantiation, so it has to mean the same thing read from either of the two modules.
+    "and the receiver's own type still means the module the 'impl' was written in" in {
+      runIn(
+        ("", "main.sysl",
+         "struct P[T]\n    v: T\nimpl[T] fmt.Show for P[T]\n    raw(self) -> int = 5\nprint(P(1).show())"),
+        ("fmt", "f.sysl",
+         "module fmt\nhelper(n: int) -> int = n * 2\ntrait Show\n    raw(self) -> int\n" +
+           "    show(self) -> int = helper(self.raw())"),
+      ) shouldBe "10\n"
+    }
+
+    "however the 'impl' spelled it" in {
+      runIn(
+        ("", "main.sysl", "print(box.P(1).show())"),
+        ("box", "b.sysl",
+         "module box\nstruct P[T]\n    v: T\nimpl[T] fmt.Show for box.P[T]\n    raw(self) -> int = 5"),
+        ("fmt", "f.sysl",
+         "module fmt\nhelper(n: int) -> int = n * 2\ntrait Show\n    raw(self) -> int\n" +
+           "    show(self) -> int = helper(self.raw())"),
+      ) shouldBe "10\n"
+    }
+
     "and a generic type's bound on a foreign trait is met by the caller's own type" in {
       runIn(
         ("", "main.sysl",

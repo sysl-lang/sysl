@@ -61,7 +61,12 @@ trait TypeResolution extends ImportResolution {
    */
   protected def withSelf(fname: String, subst: Map[String, Type]): Map[String, Type] =
     genericOuter.getOrElse(fname, Map.empty) ++
-      genericSelf.get(fname).fold(subst)(ref => subst + (selfName -> resolveType(ref, subst)))
+      genericSelf.get(fname).fold(subst) { (ref, scope) =>
+        // Read where the subject was written, which for an inherited default is the `impl` block
+        // rather than the trait the rest of the declaration came from. The substitution itself is
+        // resolved types and means the same thing anywhere.
+        subst + (selfName -> inScope(scope)(resolveType(ref, subst)))
+      }
 
   /** Rewrites `Self` in a written type reference to the reference it stands for.
    *

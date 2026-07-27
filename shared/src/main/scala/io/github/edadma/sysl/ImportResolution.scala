@@ -69,6 +69,7 @@ trait ImportResolution extends AnalyzerBase {
     // a module's parent without being one — so it asks only that the path lead somewhere.
     if decl.wildcard then
       if !moduleNames(path) then err(s"no module is called '$path'")
+      dependsOn(path)
       acc.copy(wildcards = acc.wildcards :+ path)
     else if decl.selectors.nonEmpty then
       if !namesModule(path) then err(s"no module is called '$path'")
@@ -100,16 +101,25 @@ trait ImportResolution extends AnalyzerBase {
    * where `geom` is a top-level module — asks for what is already true, so it is left alone rather
    * than reported as the collision with itself that it is.
    */
-  private def bindModule(bound: String, module: String, acc: Imports): Imports =
+  private def bindModule(bound: String, module: String, acc: Imports): Imports = {
+    dependsOn(module)
+
     if bound == module then acc
     else {
       checkImportName(bound, acc)
       acc.copy(modules = acc.modules + (bound -> module))
     }
+  }
 
+  /** One name brought in from a module. Importing it is already a dependency on that module
+   * (`13 §6`), whether or not the file goes on to write the shorter spelling it bought — a file's
+   * imports are meant to be readable as what it needs, and a dependency that came and went with a
+   * use would not be.
+   */
   private def bindName(bound: String, module: String, name: String, acc: Imports): Imports = {
     val key = Modules.qualify(module, name)
 
+    dependsOn(module)
     checkImportName(bound, acc)
 
     if declsRegistered then checkDeclared(key, s"$module.$name")

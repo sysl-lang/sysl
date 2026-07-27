@@ -88,6 +88,16 @@ before they appear and may be mutually recursive).
   mismatch is refused as non-conformance. The diagnostic names the type by the path a reader would
   have to be able to write, so an import alias does not hide which type is meant.
 
+- **Two modules may not depend on each other** (`13 §6`). The graph is over **references** rather
+  than imports, because a qualified path reaches another module with no import to scan for: an edge
+  is recorded wherever resolution finds a name belonging elsewhere, and an import adds one whether or
+  not the name it bought is ever written. Nothing depends on the **prelude** or on the root module —
+  one is the language and the other has no name to be written. The check runs at the end of the
+  walk, since an edge can be made by a body only reached through an instantiation, and each cycle it
+  reports is broken at the reference the message points at so that an unrelated one elsewhere is
+  found too. The message is the chain (`'a' depends on 'b', which depends on 'a'`), turned to begin
+  at the first of its modules by name so that which file the walk started from does not show.
+
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
   compound assignment), `return [expr]`, and `break [expr]` / `continue`. Loop and branch bodies
   follow Scala-3 style: `then`/`do` is **required for a one-line body** and **optional before an
