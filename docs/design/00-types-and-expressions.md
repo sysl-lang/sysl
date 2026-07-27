@@ -327,7 +327,7 @@ operators; with those gone, operator lexing is trivial, and even a library lexer
 
 ## 10. Control flow is expression-oriented — `if`, `match`, and loops yield values
 
-`if`, `match`, `while`, and `for` are **expressions**, not statements. Each yields a value, so
+`if`, `match`, `while`, `loop`, and `for` are **expressions**, not statements. Each yields a value, so
 it can initialize a binding, be a function's body, or feed a branch of another:
 
 ```
@@ -360,6 +360,34 @@ With no `else`, normal completion yields `unit`, so a value-carrying `break` nee
 supply the matching value when the loop finishes on its own; every `break` value and the `else`
 value share one type, which becomes the loop's. A bare `break` with no `else` is the ordinary
 statement loop, of type `unit`.
+
+**A loop with nothing to test is written `loop`.** It runs until something leaves it, which is
+what `while true` was always being used to say:
+
+```
+loop
+    var line = read()
+    if line == "" then break
+    handle(line)
+```
+
+Two things follow from the condition being gone rather than merely constant. It takes **no
+`else`** — an `else` runs on normal completion, and this loop has none — so a value-carrying
+`break` needs nothing beside it, and the loop's type is what its `break`s carry:
+
+```
+var n = loop
+    if ready() then break count
+    wait()
+```
+
+And a `loop` **nothing breaks out of has type `never`** (§11), so it may stand as the last thing a
+function owing a value does, with nothing after it to supply one. That is the fact `while true`
+cannot state: a condition is an expression the analyzer does not evaluate, so a loop written that
+way looks like one that might finish, and the code after it looks reachable. Rust's `loop` carries
+its type for the same reason.
+
+`continue` starts the next iteration as it does in any loop, and a label works unchanged.
 
 **A loop may be labeled, so `break` and `continue` can reach an outer one.** A `'label` written
 before the loop keyword names that loop, and `break 'label` / `continue 'label` then act on it

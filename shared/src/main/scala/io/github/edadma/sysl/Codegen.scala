@@ -601,6 +601,7 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       genMatch(scrutinee, arms, ty)
 
     case w: TWhile   => genWhile(w)
+    case l: TLoop    => genLoop(l)
     case f: TFor     => genFor(f)
     case e: TForEach => genForEach(e)
 

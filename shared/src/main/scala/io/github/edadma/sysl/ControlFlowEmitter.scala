@@ -234,6 +234,29 @@ trait ControlFlowEmitter extends PlaceEmitter {
     genLoopResult(slot, ty, elseL, endL, elseBlock)
   }
 
+  /** A `loop` is the same shape with the test gone: the body branches straight back to itself, and
+   * the end is reached only by a `break`. `continue` targets the body's own label, since starting
+   * the next iteration is all there is to do. Where nothing breaks, the loop's type is `never` and
+   * the end label closes as unreachable.
+   */
+  protected def genLoop(l: TLoop): String = {
+    val TLoop(body, ty) = l
+    val bodyL = freshLabel("loop.body")
+    val endL  = freshLabel("loop.end")
+    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    genLoops = GenLoop(endL, bodyL, slot, ty, owned.length, tempStack.length) :: genLoops
+
+    emitTerm(s"br label %$bodyL")
+    emitLabel(bodyL)
+    pushOwned()
+    body.foreach(genStmt)
+    popOwned()
+    emitTerm(s"br label %$bodyL")
+
+    genLoops = genLoops.tail
+    genLoopResult(slot, ty, endL, endL, None)
+  }
+
   protected def genFor(f: TFor): String = {
     val TFor(name, varTy, lo, hi, inclusive, body, elseBlock, ty) = f
     val w     = varTy.llvm

@@ -297,6 +297,12 @@ case class TExprStmt(expr: TExpr)                         extends TStmt
  */
 case class TWhile(cond: TExpr, body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
 
+/** `loop body` — the same shape with the condition removed, so the only way out is a `break`.
+ * `ty` is the type its `break`s meet at, and `never` where it has none: nothing arrives after a
+ * loop that cannot end.
+ */
+case class TLoop(body: List[TStmt], ty: Type) extends TExpr
+
 /** `for name in lo..hi [else …]` — the loop variable has the integer type `varTy` of its bounds;
  * `ty` is the loop expression's result type.
  */

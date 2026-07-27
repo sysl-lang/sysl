@@ -96,6 +96,23 @@ trait StmtAnalysis extends TypeResolution {
       err(s"a loop's break values and its 'else' must have the same type, but got ${tys.map(show).mkString(" and ")}")
   }
 
+  /** The result type of a `loop`, which has no `else` and so nothing on the normal-completion path
+   * for its `break` values to meet: they decide it between them.
+   *
+   * A `loop` nothing breaks out of is `never`. That is the one thing `while true` could not say —
+   * a condition the analyzer does not evaluate leaves it looking like a loop that might finish —
+   * and it is what lets one stand as the last thing a function returning a value does.
+   */
+  protected def endlessResultType(ctx: LoopCtx): Type = {
+    val tys = ctx.breakTys.toList.distinct
+
+    if tys.isEmpty then Type.Never
+    else
+      tys.foldLeft(Option(tys.head))((acc, t) => acc.flatMap(join(_, t))).getOrElse {
+        err(s"a loop's break values must have the same type, but got ${tys.map(show).mkString(" and ")}")
+      }
+  }
+
   /** Analyzes one statement as its own recovery region, so a mistake costs the statement it is
    * in and nothing after it.
    *

@@ -60,6 +60,10 @@ trait ParseSupport extends Matchers { this: Assertions =>
   ): Stmt =
     ExprStmt(While(label, cond, body, elseBody))
 
+  /** `loop …` in statement position — a `Loop` expression wrapped in an `ExprStmt`. */
+  protected def loopStmt(body: List[Stmt], label: Option[String] = None): Stmt =
+    ExprStmt(Loop(label, body))
+
   /** `for name in iter …` in statement position — a `For` expression wrapped in an `ExprStmt`. */
   protected def forStmt(
       name: String,

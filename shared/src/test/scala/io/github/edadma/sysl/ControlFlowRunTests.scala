@@ -302,6 +302,149 @@ class ControlFlowRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  "loop" - {
+    // The plain shape: a counter, and the only way out is the `break`.
+    "a loop runs until something breaks out of it" in {
+      val src =
+        """var i = 0
+          |loop
+          |    i += 1
+          |    if i == 4 then break
+          |print(i)""".stripMargin
+
+      run(src) shouldBe "4\n"
+    }
+
+    // With no `else` to reach, the value is the break's alone — which is the difference from
+    // `while true`, where a value-carrying break needs an `else` that can never run.
+    "a loop yields its break value with no else to write" in {
+      val src =
+        """var n = 0
+          |var r = loop
+          |    n += 1
+          |    if n == 7 then break n * 100
+          |print(r)""".stripMargin
+
+      run(src) shouldBe "700\n"
+    }
+
+    "an inline loop body with `do`" in {
+      val src =
+        """var i = 0
+          |loop do if i == 3 then break else i++
+          |print(i)""".stripMargin
+
+      run(src) shouldBe "3\n"
+    }
+
+    "continue starts the next iteration" in {
+      val src =
+        """var i = 0
+          |var sum = 0
+          |loop
+          |    i += 1
+          |    if i > 10 then break
+          |    if i % 2 == 0 then continue
+          |    sum += i
+          |print(sum)""".stripMargin
+
+      run(src) shouldBe "25\n"
+    }
+
+    "a labeled break leaves an outer loop from inside an inner one" in {
+      val src =
+        """var i = 0
+          |var j = 0
+          |var found = 'outer loop
+          |    j = 0
+          |    loop
+          |        j += 1
+          |        if i * j == 12 then break 'outer i * 10 + j
+          |        if j == 5 then break
+          |    i += 1
+          |print(found)""".stripMargin
+
+      // i=3, j=4 is the first product of 12 → 34.
+      run(src) shouldBe "34\n"
+    }
+
+    // A loop with no break does not finish, so its type is `never` — which is what lets it stand
+    // where a function still owes an `int`, with nothing after it to supply one.
+    "a loop with no break types as never" in {
+      val src =
+        """spin(n: int) -> int
+          |    if n > 0 then return n
+          |    loop
+          |        print("x")
+          |print(spin(5))""".stripMargin
+
+      run(src) shouldBe "5\n"
+    }
+
+    // The loop's expected type reaches its `break`s the way it reaches an `if`'s branches, so a
+    // value breaks out boxed rather than being refused against the `&Point` the binding asks for.
+    "a break in a &T context boxes its value" in {
+      val src =
+        """struct Point
+          |    x: int
+          |    y: int
+          |var n = 0
+          |var p: &Point = loop
+          |    n += 1
+          |    if n == 3 then break Point(n, n * 2)
+          |print(p.x, p.y)""".stripMargin
+
+      run(src) shouldBe "3 6\n"
+    }
+
+    // A `return` leaves the function from inside a loop that has no `break` of its own — so the
+    // loop is still `never` and the exit is the return's, not the loop's.
+    "a return leaves a loop that has no break" in {
+      val src =
+        """first_square_over(limit: int) -> int
+          |    var i = 0
+          |    loop
+          |        i += 1
+          |        if i * i > limit then return i * i
+          |print(first_square_over(20), first_square_over(100))""".stripMargin
+
+      run(src) shouldBe "25 121\n"
+    }
+
+    // An unlabeled `break` binds to the nearest loop whichever kind that is, so the `loop` inside
+    // a `for` catches it and the `for` keeps going.
+    "a loop inside a for catches the unlabeled break" in {
+      val src =
+        """var total = 0
+          |for i in 1..3
+          |    var j = 0
+          |    loop
+          |        j += 1
+          |        if j == i then break
+          |    total += i * 10 + j
+          |print(total)""".stripMargin
+
+      // j ends at i each time: 11 + 22 + 33
+      run(src) shouldBe "66\n"
+    }
+
+    // The body owns a fresh string each iteration and leaves through a break, so the teardown on
+    // the way out has to release what the last iteration took and nothing more.
+    "a loop that owns values neither leaks nor frees twice" in {
+      val src =
+        """var total = 0
+          |var k = 0
+          |loop
+          |    var s = "ab" + "cd"
+          |    total += int(s[0])
+          |    k += 1
+          |    if k == 2000 then break
+          |print(total)""".stripMargin
+
+      run(src) shouldBe (97 * 2000).toString + "\n"
+    }
+  }
+
   "labeled loops" - {
     // `break 'outer` from the inner loop leaves both loops at once — the outer loop's `hits`
     // counter is never bumped past the iteration where the match is found.

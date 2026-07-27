@@ -97,6 +97,7 @@ class SyslLexical
     "elif",
     "else",
     "while",
+    "loop",
     "do",
     "for",
     "in",

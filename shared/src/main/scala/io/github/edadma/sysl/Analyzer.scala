@@ -864,6 +864,10 @@ class Analyzer private (units: List[Program])
       val telse         = elseOpt.map(analyzeValueBlock(_, expected))
       TWhile(tc, tbody, telse, loopResultType(ctx, telse))
 
+    case Loop(label, body) =>
+      val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))
+      TLoop(tbody, endlessResultType(ctx))
+
     case For(label, name, iter, body, elseOpt) =>
       iter match
         case RangeExpr(Some(lo), Some(hi), inclusive) =>

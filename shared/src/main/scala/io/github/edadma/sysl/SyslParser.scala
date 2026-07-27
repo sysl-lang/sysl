@@ -93,7 +93,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * value they are written after. An operand with no `match` behind it is that operand, so this
    * alternative is also the ordinary fall-through to `assignment`.
    */
-  lazy val expression: PackratParser[Expr] = at(ifExpr | whileExpr | forExpr | matchExpr)
+  lazy val expression: PackratParser[Expr] = at(ifExpr | whileExpr | loopExpr | forExpr | matchExpr)
 
   private def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))
@@ -730,6 +730,15 @@ class SyslParser(val source: Source) extends PackratParsers {
     opt(labelRef) ~ (op("while") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(endMarker("while")) ^^ {
       case lbl ~ c ~ b ~ e ~ _ => While(lbl, c, b, e)
     }
+
+  /** `loop body` — a `while` with the condition left out, ended by a `break` rather than by a test.
+   *
+   * It takes no `else`: an `else` runs when a loop finishes on its own, and this one never does.
+   * The inline `loop do …` form is there because `while c do …` has it and a one-line body should
+   * not have to change shape when its condition goes away.
+   */
+  private lazy val loopExpr: PackratParser[Expr] =
+    opt(labelRef) ~ (op("loop") ~> body("do")) ~ opt(endMarker("loop")) ^^ { case lbl ~ b ~ _ => Loop(lbl, b) }
 
   private lazy val forExpr: PackratParser[Expr] =
     opt(labelRef) ~ (op("for") ~> ident) ~ (op("in") ~> expression) ~ body("do") ~ opt(elseClause) ~ opt(

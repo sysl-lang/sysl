@@ -127,6 +127,57 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
     }
   }
 
+  "loop" - {
+    "a loop with a multi-statement body" in {
+      prog("loop\n    print(i)\n    i++") shouldBe List(
+        loopStmt(List(printStmt(Ident("i")), ExprStmt(PostIncDec("++", Ident("i")))))
+      )
+    }
+
+    "a one-line loop body needs `do`" in {
+      prog("loop do i++") shouldBe List(
+        loopStmt(List(ExprStmt(PostIncDec("++", Ident("i")))))
+      )
+    }
+
+    "`do` is optional before an indented block" in {
+      prog("loop\n    print(1)") shouldBe prog("loop do\n    print(1)")
+    }
+
+    "an inline body still ends at a following statement" in {
+      prog("loop do print(1)\nprint(2)") shouldBe List(
+        loopStmt(List(printStmt(i(1)))),
+        printStmt(i(2)),
+      )
+    }
+
+    "a labeled loop, and a labeled break out of a nested one" in {
+      prog("'outer loop\n    loop\n        break 'outer") shouldBe List(
+        loopStmt(List(loopStmt(List(Break(Some("outer"), None)))), label = Some("outer"))
+      )
+    }
+
+    "a break carrying a value" in {
+      prog("loop\n    break 5") shouldBe List(loopStmt(List(Break(None, Some(i(5))))))
+    }
+
+    "`end loop` closes it and parses the same as without" in {
+      prog("loop\n    print(1)\nend loop") shouldBe prog("loop\n    print(1)")
+    }
+
+    // An `else` runs on normal completion, which a `loop` does not have; there is nowhere for one
+    // to go, so the grammar does not offer it.
+    "a loop takes no else" in {
+      progError("loop\n    print(1)\nelse\n    print(2)")
+    }
+
+    "a loop is a value, so it may sit on the right of a var" in {
+      prog("var x = loop\n    break 5") shouldBe List(
+        VarDecl("x", None, Some(Loop(None, List(Break(None, Some(i(5)))))))
+      )
+    }
+  }
+
   "inline if/then/else" - {
     "an inline if/then/else" in {
       prog("if x then print(1) else print(2)") shouldBe List(

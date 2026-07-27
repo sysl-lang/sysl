@@ -45,6 +45,26 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("must have the same type")
     }
 
+    // A `loop` has no `else` to disagree with, so its breaks have only each other to meet — and
+    // two carrying different types still cannot.
+    "two breaks of different types out of a loop are rejected" in {
+      err(
+        """var r = loop
+          |    if true then break 1
+          |    break "two"""".stripMargin
+      ) should include("must have the same type")
+    }
+
+    // A bare `break` yields unit, which is not the int the other one carries. Worth its own case
+    // because a `loop` is the one form where the absence of an `else` is not itself the error.
+    "a valued break and a bare one out of a loop are rejected" in {
+      err(
+        """var r = loop
+          |    if true then break 1
+          |    break""".stripMargin
+      ) should include("must have the same type")
+    }
+
     // A labeled break/continue must name a loop that actually encloses it.
     "breaking or continuing to an unknown label is rejected" in {
       err(

@@ -101,14 +101,15 @@ before they appear and may be mutually recursive).
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
   compound assignment), `return [expr]`, and `break [expr]` / `continue`. Loop and branch bodies
   follow Scala-3 style: `then`/`do` is **required for a one-line body** and **optional before an
-  indented block**. Optional `end if` / `end while` / `end for` markers may close a block (`end`
+  indented block**. Optional `end if` / `end while` / `end loop` / `end for` markers may close a block (`end`
   is a *soft* keyword, not reserved).
 - **`if`, `match`, and loops are expressions.** They yield the value of the taken branch/arm, so
   `var label = if c then a else b` and `f() -> T = x …` both work; in statement position the value
   is simply unused. **`match` is postfix** (`09 §5`) — `scrutinee match` with the arms indented
   under the keyword, as in Scala, so one match feeds another and the scrutinee reads left to
   right. It binds looser than every operator, so `a < b match` chooses on the comparison.
-- **Loops** — `while cond` and `for name in a..b` / `a..<b` (over a range) or `for name in seq`
+- **Loops** — `while cond`, `loop` (no condition at all), and `for name in a..b` / `a..<b` (over a
+  range) or `for name in seq`
   (over an array or slice) — are expressions too. A `break expr` leaves the nearest loop and
   makes `expr` its value; `continue` skips to the next iteration. An optional `else` block (after
   the body, Python-style) runs on *normal* completion — the condition turned false, or the range
@@ -116,7 +117,10 @@ before they appear and may be mutually recursive).
   no `else`, normal completion yields `unit`, so a value-carrying `break` needs an `else` to give
   a matching value when the loop finishes on its own; every `break` value and the `else` value
   must share one type, which becomes the loop's. A `break`/`continue` unwinds the body's
-  ownership regions on the way out, the same discipline as `return` bounded to the loop. Scalar patterns are literals, `|`-alternatives (Scala-style —
+  ownership regions on the way out, the same discipline as `return` bounded to the loop.
+  **`loop` takes no `else`** — it has no normal completion for one to run on — so its `break`s
+  alone decide its type, and a `loop` with no `break` is `never` (`00 §10`): the body branches
+  straight back to itself and the end block closes as `unreachable`. Scalar patterns are literals, `|`-alternatives (Scala-style —
   `1 | 2 | 3`), literal ranges (`1..10`, `0..<10`), and the `_` wildcard, with optional `if`
   guards; a bare name binds the value. A scalar `match` used as a value must be exhaustive
   (have a catch-all); an enum `match` must always cover every variant or carry a catch-all.

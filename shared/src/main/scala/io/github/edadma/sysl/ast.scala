@@ -277,6 +277,16 @@ case class ExprStmt(expr: Expr)                                    extends Stmt
  */
 case class While(label: Option[String], cond: Expr, body: List[Stmt], elseBody: Option[List[Stmt]]) extends Expr
 
+/** `['label] loop body` — a loop with no condition, which runs until something leaves it.
+ *
+ * It is `while true` with the part that was never a question taken out, and it carries one thing
+ * that spelling cannot: a loop nothing breaks out of does not finish, so its type is `never` and
+ * the code after it is unreachable. There is no `else`, because `else` runs on normal completion
+ * and this loop has none — the value it yields is the value its `break`s carry, and `unit` where
+ * they carry none.
+ */
+case class Loop(label: Option[String], body: List[Stmt]) extends Expr
+
 /** `['label] for name in iter body [else elseBody]` — an **expression** with the same
  * `break`/`else` value rules as `while`. `iter` is a range for now (`a..b`, `a..<b`).
  */
