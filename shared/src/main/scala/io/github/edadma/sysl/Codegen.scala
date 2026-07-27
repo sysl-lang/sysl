@@ -631,6 +631,19 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
         trapUnless(r, "where")
       v
 
+    case TStructInvCheck(value, struct, invFn) =>
+      val v = genExpr(value)
+      // Read each stored field back out of the value and hand it to the invariant function, exactly
+      // as an ordinary call passes its arguments — the callee borrows, so no count is taken here.
+      val args = struct.fields.zipWithIndex.collect {
+        case ((_, ft), i) if !Type.zeroSized(ft) =>
+          val r = freshTemp(); emit(s"$r = extractvalue ${struct.llvm} $v, ${struct.slot(i)}")
+          s"${ft.llvm} $r"
+      }
+      val ok = freshTemp(); emit(s"$ok = call i1 @$invFn(${args.mkString(", ")})")
+      trapUnless(ok, "invariant")
+      v
+
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.
     case TLoad(_, ty) if Type.zeroSized(ty) => ""
 

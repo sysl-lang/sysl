@@ -210,6 +210,25 @@ trait Hoisting extends TypeResolution {
       funcInsts(pkey) =
         (List(("value", recover(Type.Unknown)(resolveType(t.base, Map.empty)))), Type.Bool)
 
+    // A struct's `invariant` clauses become one function `<Struct>$inv(field₁: T₁, …) -> bool`,
+    // whose body is the clauses `and`-ed together. The fields are its *parameters* rather than one
+    // `self`, so the bare field names a clause writes resolve with no rewrite of the expression, and
+    // the whole thing type-checks — and reports a non-bool clause — through the ordinary body pass.
+    // The check site (struct construction, a field write) calls it with the struct's field values.
+    case s: StructDecl if s.invariants.nonEmpty =>
+      val key  = Modules.qualify(currentModule, s.name)
+      val ikey = invKey(key)
+
+      if s.tparams.nonEmpty then
+        at(s.pos)(err(s"invariants on generic structs are not supported yet — '${s.name}'"))
+      else
+        val cond = s.invariants.reduce((a, b) => Binary("&&", a, b))
+        funcDecls(ikey) = FuncDecl(ikey, Nil, s.fields, Some(NamedType("bool")),
+          List(ExprStmt(cond)), Map.empty, variadic = false).setPos(s.pos)
+        declScope(ikey) = currentScope
+        funcInsts(ikey) =
+          (s.fields.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))), Type.Bool)
+
     case _ =>
 
   /** Records how far a declaration is visible, for the modifier it was written with (`13 §2`).

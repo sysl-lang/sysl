@@ -668,8 +668,15 @@ trait CallAnalysis extends Literals with TraitObjects {
                 solve(qn(name), decl.tparams, decl.fields.map(_.typ), provisional.map(_.ty), None, expected))
             (targs, Some(provisional))
 
-    val s = instantiateStruct(name, targs)
-    TStructNew(s, checkArgs(s.name, s.fields, args, pre))
+    val s   = instantiateStruct(name, targs)
+    val nnew = TStructNew(s, checkArgs(s.name, s.fields, args, pre))
+
+    // A struct with `invariant` clauses is checked the moment it is built: every construction site —
+    // `var a: T = T(…)`, `a = T(…)` — flows through here, so one wrap covers them all. Generic
+    // structs have no synthesised invariant function yet (rejected at the declaration), so they build
+    // unchecked.
+    if decl.invariants.nonEmpty && decl.tparams.isEmpty then TStructInvCheck(nnew, s, invKey(name))
+    else nnew
   }
 
   protected def constructVariant(key: String, args: List[Expr], expected: Option[Type]): TExpr = {
