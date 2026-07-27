@@ -351,6 +351,60 @@ object Prelude {
       |            print("panic:", msg)
       |            exit(1)
       |end Result
+      |
+      |struct Buf[T]
+      |    elems: []T
+      |    count: usize
+      |
+      |    len(self) -> usize = self.count
+      |
+      |    cap(self) -> usize = self.elems.len
+      |
+      |    is_empty(self) -> bool = self.count == 0usize
+      |
+      |    at(self, i: usize) -> T
+      |        if i >= self.count
+      |            print("panic: index", i, "past the", self.count, "elements of a Buf")
+      |            exit(1)
+      |        self.elems[i]
+      |    end at
+      |
+      |    set(*self, i: usize, v: T)
+      |        if i >= self.count
+      |            print("panic: index", i, "past the", self.count, "elements of a Buf")
+      |            exit(1)
+      |        self.elems[i] = v
+      |    end set
+      |
+      |    push(*self, v: T)
+      |        if self.count == self.elems.len
+      |            var bigger: []T = [v; if self.elems.len == 0usize then 8usize else self.elems.len * 2]
+      |
+      |            for i in 0..<self.count do bigger[i] = self.elems[i]
+      |
+      |            self.elems = bigger
+      |
+      |        self.elems[self.count] = v
+      |        self.count += 1usize
+      |    end push
+      |
+      |    pop(*self) -> Option[T]
+      |        if self.count == 0usize then return None
+      |
+      |        self.count -= 1usize
+      |        Some(self.elems[self.count])
+      |    end pop
+      |
+      |    clear(*self)
+      |        self.count = 0usize
+      |
+      |    view(self) -> []T = self.elems[..<self.count]
+      |end Buf
+      |
+      |buf[T]() -> Buf[T]
+      |    var b: Buf[T] = Buf([], 0usize)
+      |
+      |    b
       |""".stripMargin
 
   /** The source the prelude's own declarations point into, so a diagnostic against one quotes the

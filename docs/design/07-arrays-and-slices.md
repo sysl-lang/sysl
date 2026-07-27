@@ -132,6 +132,60 @@ allocate a small buffer that is then written past; and a failed allocation traps
 back a null the elements are stored through. All three are `§Indexing`'s trap, for `§Indexing`'s
 reason.
 
+## Growing one
+
+`Buf[T]` is the growable array, and it is **ordinary sysl in the prelude** rather than a type the
+compiler knows: a `[]T` field for the storage, a count of how much of it is live, and `push`, `pop`,
+`at`, `set`, `view`, `len`, `cap`, `clear`. That it can be written at all is the interesting part,
+and it is what the section above bought.
+
+**Correcting what this document said.** The claim here was that a library could not reach a growable
+array — that it would need `sizeof` over a type parameter, a cast to reach the elements through it,
+and above all a **destructor**, since the language has exactly one and no way to write another. That
+was wrong. A container does not need a destructor if its storage is a value that already has one,
+and `§Storage sized while running` is precisely what makes a `[]T` field into storage a container
+sizes for itself and ARC destroys on its behalf. The missing piece was never `Drop`; it was the
+ability to ask for storage at a length worked out while running.
+
+The other apparent blocker was `§Not yet`'s own: a generic container cannot make its own storage,
+because a repeat needs a value in its value position and no bound promises one. **A `push` arrives
+holding one** — so the value being pushed seeds the new storage, and the question never comes up.
+
+### What an append does to the other views
+
+This was the open question, and the answer is that **sysl does not have to choose**. A growable
+array is a struct, so how a push is seen follows from how it is held, which is a choice the language
+already makes the author write:
+
+```
+var p: &Buf[int] = buf()
+var q = p                       // one buffer, two names: q sees every push through p
+var c = *p                      // a copy, because copying a struct is what that means
+```
+
+Go's confusion — two slices that agree until one of them grows — comes from having one
+representation and therefore one behaviour. Held by reference, a `Buf` behaves the way `03` says a
+`&T` behaves: shared, mutable through any alias, visible to all of them. Held by value it is a
+value. Neither is a rule about growable arrays; both are rules that were already there.
+
+### A view taken before a growth stays valid
+
+An append can move the elements, and the storage they move out of is an ARC buffer like any other,
+so a view made before the move **keeps that storage alive** and goes on showing what it was made
+from. It does not dangle, which is the half of Go's behaviour sysl could not have reproduced even
+if it had wanted to: the guarantee in `03` is that a program with no `*T` in it cannot fault.
+
+What such a view does *not* do is grow with the buffer — it is a view of some elements, and it has
+the length it was made with. Take it again to see more.
+
+### What it costs
+
+The spare capacity holds **copies of the value that seeded the growth**, because there is no way to
+have storage without values in it. They are harmless and bounded, but they are real: a `Buf[&T]`
+that grew to a capacity of 1024 holding one element is holding 1024 references to it, and that
+element stays alive until the slots are overwritten. What a container actually wants here is
+capacity that is storage without being values yet — see `§Not yet`.
+
 ## Indexing
 
 `a[i]` reads the element, and it is a **place** — so `a[i] = v`, `a[i] += 1`, `a[i]++`, and
@@ -220,33 +274,13 @@ implementation:
 
 ## Not yet
 
-- **Growth** — `append`, and a length that changes after the storage exists. `§Storage sized while
-  running` settles the half that reached signatures: a view may own its elements, so a function
-  sizes its own buffers and returns one. What is left is the question that decides the rest, which
-  is **what an append does to the other views of the same storage**. Go's answer — write in place
-  while the capacity lasts, reallocate silently when it does not — is why a Go program can hold two
-  slices that agree until one of them grows. sysl cannot reproduce the memory-unsafe half of that
-  (an earlier view retains its own storage, so it stays valid), but it would reproduce the
-  confusion, and a container whose aliases quietly stop agreeing is not worth an `append`. The other
-  answer is that a growable array is a **reference** — one object every alias reaches through, so a
-  push is visible to all of them, which is what `&T` already means and needs no new rule. That is
-  the likely shape; it is not yet decided, and neither is whether the thing is written in the
-  language or in a library once the language can express a destructor.
-- **A library container at all.** Growth is above rather than here because a library cannot yet
-  reach it: a `Vec[T]` written in sysl would need storage sized from `sizeof(T)` over a type
-  parameter, a cast to reach the elements through it, and — the one that decides it — **a
-  destructor**, so the storage is returned when the last holder goes. The language has exactly one
-  destructor, the deallocation hook every ARC box carries (`03`), and no way to write another. So a
-  container in a library is not a smaller feature than a container in the language: it is that
-  feature plus `Drop`, plus `sizeof` over a parameter, plus a pointer cast — which is opening the
-  unsafe tier to generic code to get to something ARC already does.
-- **A generic container making its own storage.** The repeat form `[v; n]` (`§Writing one down`)
-  settles the concrete half of this: an `enum` has no zero value, but `[Empty; 16]` needs none. What
-  is left is the generic half — a `[16]K` still cannot be declared *whatever* `K` is, because a
-  bound promises behaviour and no trait in the catalog promises a value, so there is nothing to
-  write in the repeat's value position. A generic container can therefore make its own storage only
-  once it already holds something to fill it with. A `Default`-style bound is the obvious answer and
-  is not in the catalog (`14`); whether it should be is that document's decision.
+- **Capacity that is not yet values.** `Buf`'s spare slots hold copies of whatever seeded the last
+  growth (`§What it costs`), because every element of a `[]T` is a value and there is no way to have
+  storage that is merely reserved. Every container wants that: it is the difference between a
+  capacity and a length. What it needs is either a bound that promises a value (`14`, the same
+  `Default`-shaped decision as the bullet below) or a way to hold storage whose elements are not
+  live yet, which is a question about the view types here — a length and a capacity as two separate
+  facts about one allocation.
 - **Promotion of an escaping local array** (`05`). The analysis that *finds* the escape is
   implemented; what happens next is not. A view that would outlive its array is a diagnostic
   rather than a silent heap promotion, so a program that means to return one writes `&[64]u8`
