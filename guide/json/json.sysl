@@ -22,31 +22,27 @@
 //     to be a nullary function. `const` was added afterwards, for a reason this program did not
 //     turn up on its own: a nullary function reads perfectly well *in an expression*, and what it
 //     cannot do is be an array bound. See `max_depth` below, which is now what it always meant.
-//   * **There is no growable collection**, so an array and an object are each a linked list built
-//     by appending through the tail reference. That is honest for a tree of references and would
-//     not be for a `[]T` of them.
+//   * **There was no growable collection**, so an array and an object were each a linked list built
+//     by appending through the tail reference — honest for a tree of references, and not what the
+//     data is. Answered: `Buf[T]` is in the prelude, so an array is a `&Buf[&Json]` and an object a
+//     `&Buf[Field]`, appended with `push` and rendered by index. That deleted two list-cell structs,
+//     both tail-threading loops, and the two recursive renderers.
 
 enum Json
     Null
     Bool(b: bool)
     Num(n: long)
     Str(s: string)
-    Arr(items: Option[&Items])
-    Obj(fields: Option[&Fields])
+    Arr(items: &Buf[&Json])
+    Obj(fields: &Buf[Field])
 end Json
 
-// The list cell an array is made of. `Json` reaches itself through here, and `&` on both edges is
-// what makes the cycle finite.
-struct Items
-    value: &Json
-    rest: Option[&Items]
-end Items
-
-struct Fields
+// One member of an object. `Json` reaches itself from here through the `&` on the value, which is
+// the edge that makes the cycle finite.
+struct Field
     key: string
     value: &Json
-    rest: Option[&Fields]
-end Fields
+end Field
 
 // ---------------------------------------------------------------------------- what can go wrong
 
@@ -247,46 +243,37 @@ private struct Reader
         Ok(n)
     end hex4
 
-    // Built by appending through the tail, since a linked list is what a tree of references has
-    // instead of a growable array.
     parse_array(*self, depth: int) -> Result[&Json, Fault]
         self.bump()
         self.skip_ws()
+
+        var items: &Buf[&Json] = buf()
+
         if self.at_byte(u8(']'))
             self.bump()
-            return Ok(Arr(None))
-
-        var head: Option[&Items] = None
-        var tail: Option[&Items] = None
+            return Ok(Arr(items))
 
         loop
-            var v = self.parse_value(depth + 1)?
-            var cell: &Items = Items(v, None)
-
-            tail match
-                None -> head = Some(cell)
-                Some(t) -> t.rest = Some(cell)
-            tail = Some(cell)
-
+            items.push(self.parse_value(depth + 1)?)
             self.skip_ws()
+
             if self.at_byte(u8(',')) then self.bump()
             else if self.at_byte(u8(']'))
                 self.bump()
                 break
             else return Err(Expected(self.at, "',' or ']'"))
 
-        Ok(Arr(head))
+        Ok(Arr(items))
     end parse_array
 
     parse_object(*self, depth: int) -> Result[&Json, Fault]
         self.bump()
         self.skip_ws()
+        var fields: &Buf[Field] = buf()
+
         if self.at_byte(u8('}'))
             self.bump()
-            return Ok(Obj(None))
-
-        var head: Option[&Fields] = None
-        var tail: Option[&Fields] = None
+            return Ok(Obj(fields))
 
         loop
             self.skip_ws()
@@ -297,14 +284,7 @@ private struct Reader
             if !self.at_byte(u8(':')) then return Err(Expected(self.at, "':'"))
             self.bump()
 
-            var v = self.parse_value(depth + 1)?
-            var cell: &Fields = Fields(key, v, None)
-
-            tail match
-                None -> head = Some(cell)
-                Some(t) -> t.rest = Some(cell)
-            tail = Some(cell)
-
+            fields.push(Field(key, self.parse_value(depth + 1)?))
             self.skip_ws()
             if self.at_byte(u8(',')) then self.bump()
             else if self.at_byte(u8('}'))
@@ -312,7 +292,7 @@ private struct Reader
                 break
             else return Err(Expected(self.at, "',' or '}'"))
 
-        Ok(Obj(head))
+        Ok(Obj(fields))
     end parse_object
 end Reader
 
@@ -337,24 +317,28 @@ render(j: &Json) -> string
         Obj(fields) -> "{" + render_fields(fields) + "}"
 end render
 
-private render_items(items: Option[&Items]) -> string
-    items match
-        None -> ""
-        Some(cell) ->
-            cell.rest match
-                None -> render(cell.value)
-                Some(_) -> render(cell.value) + "," + render_items(cell.rest)
+private render_items(items: &Buf[&Json]) -> string
+    var s = ""
+
+    for i in 0..<items.len()
+        if i > 0usize then s += ","
+
+        s += render(items.at(i))
+
+    s
 end render_items
 
-private render_fields(fields: Option[&Fields]) -> string
-    fields match
-        None -> ""
-        Some(cell) ->
-            var one = quote(cell.key) + ":" + render(cell.value)
+private render_fields(fields: &Buf[Field]) -> string
+    var s = ""
 
-            cell.rest match
-                None -> one
-                Some(_) -> one + "," + render_fields(cell.rest)
+    for i in 0..<fields.len()
+        if i > 0usize then s += ","
+
+        var f = fields.at(i)
+
+        s += quote(f.key) + ":" + render(f.value)
+
+    s
 end render_fields
 
 // The mirror of `parse_string`: the source is copied between the bytes that need replacing, since
