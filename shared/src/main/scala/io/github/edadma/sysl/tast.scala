@@ -237,6 +237,22 @@ case class TVaArg(ap: TExpr, ty: Type) extends TExpr
 /** Positional construction of a value struct. */
 case class TStructNew(struct: Type.Struct, args: List[TExpr]) extends TExpr { def ty: Type = struct }
 
+/** A struct value checked against its `invariant` clauses (`05`): `value` builds the struct, `invFn`
+ * is the synthesised `<Struct>$inv` that takes the fields and returns a `bool`. Codegen emits
+ * `value`, calls `invFn` with its field values, traps on a false result, and yields the same value —
+ * the struct is unchanged, so the only run-time effect is a trap when an invariant is violated.
+ */
+case class TStructInvCheck(value: TExpr, struct: Type.Struct, invFn: String) extends TExpr { def ty: Type = struct }
+
+/** A field write into a struct that carries `invariant` clauses (`05`): `store` performs the write,
+ * then `recv` — the struct being mutated — is re-read and passed to `invFn`, trapping on a false
+ * result. Yields the stored value, so `s.f = v` remains an expression of the field's type. Covers a
+ * direct `s.f = v`, a compound `s.f op= v`, and a through-pointer `(*p).f = v`.
+ */
+case class TCheckedStore(store: TExpr, recv: TExpr, struct: Type.Struct, invFn: String) extends TExpr {
+  def ty: Type = store.ty
+}
+
 /** Construction of an enum value: a simple enum's integer constant, or a data enum's variant
  * (with `args` for a data-carrying variant, empty for a nullary one).
  */

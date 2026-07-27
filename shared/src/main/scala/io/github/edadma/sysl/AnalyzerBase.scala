@@ -343,6 +343,12 @@ trait AnalyzerBase {
    */
   protected def predKey(typeKey: String): String = s"$typeKey$$pred"
 
+  /** The function key a struct's `invariant` clauses are synthesised under — the conjunction of them
+   * as one `bool` function of the struct's fields. `$` keeps it clear of any user name, as `predKey`
+   * does for a `where` predicate.
+   */
+  protected def invKey(typeKey: String): String = s"$typeKey$$inv"
+
   /** Declared constants by key (`13 §7`). A constant is folded into each use and has no storage, so
    * this table is read by the analyzer and never by codegen — there is nothing downstream to emit.
    */

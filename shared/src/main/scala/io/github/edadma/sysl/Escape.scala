@@ -142,6 +142,8 @@ private class Escape(program: TProgram) {
       case TCall(_, args, _)    => args.exists(viewsFrame)
       case TVCall(_, _, args, _) => args.exists(viewsFrame)
       case TStructNew(_, args)  => args.exists(viewsFrame)
+      case TStructInvCheck(v, _, _) => viewsFrame(v)
+      case TCheckedStore(store, _, _, _) => viewsFrame(store)
       case TEnumNew(_, _, args) => args.exists(viewsFrame)
       case TArrayLit(elems, _)  => elems.exists(viewsFrame)
       case TArrayFill(v, _)     => viewsFrame(v)
@@ -324,6 +326,8 @@ private class Escape(program: TProgram) {
     case TVCall(r, _, args, _)      => r :: args
     case TErase(v, _, _)            => List(v)
     case TStructNew(_, args)        => args
+    case TStructInvCheck(v, _, _)   => List(v)
+    case TCheckedStore(store, recv, _, _) => List(store, recv)
     case TEnumNew(_, _, args)       => args
     case TEnumFromInt(v, _)         => List(v)
     case TEnumTry(v, _, _, _, _)    => List(v)
