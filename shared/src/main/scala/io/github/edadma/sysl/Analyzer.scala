@@ -265,7 +265,7 @@ class Analyzer private (units: List[Program])
     // written at the top of a file never reach it.
     def executable(u: Program) = u.body.filter {
       case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-          _: ImportDecl | _: ConstDecl | _: ValDecl =>
+          _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl =>
         false
       case _ => true
     }
@@ -493,16 +493,66 @@ class Analyzer private (units: List[Program])
     retTy = rtype
     variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
+    val (contracts, rest)         = f.body.span { case _: Require | _: Ensure => true; case _ => false }
+    val (requires, ensures, olds) = analyzeContracts(rtype, contracts)
+
     // A function owing no value is where statement position starts: its body block is the outermost
     // one written for effect, and every `if` and `match` that ends it inherits that.
     val tbody =
-      if rtype == Type.Unit then analyzeValueBlock(f.body, None, discarded = true)
-      else analyzeValueBlock(f.body, Some(rtype))
+      if rtype == Type.Unit then analyzeValueBlock(rest, None, discarded = true)
+      else analyzeValueBlock(rest, Some(rtype))
 
     if rtype != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, rtype) then
       err(s"function '${f.name}' should return ${show(rtype)}, but its body yields ${show(tbody.ty)}")
 
-    TFunc(name, tparams, rtype, tbody, f.variadic)
+    TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds)
+  }
+
+  /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`
+   * and `old(e)` are only in scope inside an `ensure` — `result` also only when the function
+   * returns a value — and the `old` expressions are collected so codegen can snapshot them at
+   * entry.
+   */
+  private def analyzeContracts(
+      rtype: Type,
+      clauses: List[Stmt],
+  ): (List[(TExpr, Option[String])], List[(TExpr, Option[String])], List[TExpr]) = {
+    val requires = mutable.ListBuffer.empty[(TExpr, Option[String])]
+    val ensures  = mutable.ListBuffer.empty[(TExpr, Option[String])]
+    val olds     = mutable.ListBuffer.empty[TExpr]
+
+    for c <- clauses do
+      c match
+        case Require(cond, msg) =>
+          requires += ((analyzeBool(cond), msg))
+        case Ensure(cond, msg) =>
+          ensureResultTy = if rtype == Type.Unit then None else Some(rtype)
+          oldBuf = Some(olds)
+          val tc = analyzeBool(cond)
+          oldBuf = None
+          ensureResultTy = None
+          ensures += ((tc, msg))
+        case _ => // span guarantees only Require/Ensure reach here
+    (requires.toList, ensures.toList, olds.toList)
+  }
+
+  /** `old(e)` — the value `e` had at function entry. It is analyzed in the entry scope the `ensure`
+   * runs in (parameters, but no body locals, which are not in scope yet), then recorded in the
+   * `old` buffer so codegen snapshots it before the body runs. The position it took is what the
+   * postcondition reads back.
+   */
+  private def oldCall(args: List[Expr]): TExpr = {
+    val e = args match
+      case List(one) => one
+      case _         => err(s"'old' takes exactly one argument, but got ${args.length}")
+
+    val te = analyzeExpr(e, None)
+    if te.ty == Type.Unit then err("'old' needs a value to remember, but its argument is unit")
+
+    val buf = oldBuf.get
+    val idx = buf.length
+    buf += te
+    TOld(idx, te.ty)
   }
 
   /** A comparison chain, checked link by link. A link the machine performs directly needs its
@@ -657,6 +707,13 @@ class Analyzer private (units: List[Program])
     case Unary("-", IntLit(v, suffix))   => intLiteral(-v, suffix, expected)
     case Unary("-", FloatLit(t, suffix)) => floatLiteral("-" + t, suffix, expected)
 
+    // `result` is a contextual keyword: it names the returned value inside an `ensure`, but a
+    // real binding of that name (a parameter or local) still shadows it, so the lookup comes first.
+    case Ident("result") if lookupOpt("result").isEmpty =>
+      ensureResultTy match
+        case Some(ty) => TResult(ty)
+        case None     => err("'result' is only meaningful inside an 'ensure' of a value-returning function")
+
     case Ident(name) =>
       lookupOpt(name) match
         case Some((u, ty)) => TLoad(u, ty)
@@ -764,6 +821,10 @@ class Analyzer private (units: List[Program])
     case Call(Ident("va_start"), args)                      => vaStart(args)
     case Call(Ident("va_end"), args)                        => vaEnd(args)
     case Call(Ident("va_arg"), args)                        => vaArg(args, expected)
+
+    // `old(e)` is a contextual keyword read only while an `ensure` is being analyzed; the guard is
+    // what lets `old` stay an ordinary name outside a postcondition.
+    case Call(Ident("old"), args) if oldBuf.isDefined       => oldCall(args)
 
     // A conversion is written with call syntax, so a scalar type name in call position is one.
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && scalarType(name).isDefined =>

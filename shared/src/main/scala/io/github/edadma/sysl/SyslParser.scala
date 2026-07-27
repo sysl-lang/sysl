@@ -304,8 +304,21 @@ class SyslParser(val source: Source) extends PackratParsers {
   lazy val statement: PackratParser[Stmt] =
     at(
       importDecl | implDecl | declaration | varDecl | returnStmt |
-        breakStmt | continueStmt | exprStmt,
+        breakStmt | continueStmt | requireStmt | ensureStmt | exprStmt,
     )
+
+  /** `require <cond> [, "message"]` / `ensure <cond> [, "message"]` — a design-by-contract
+   * clause. Only meaningful at the top of a function body; the analyzer rejects one that
+   * appears after ordinary statements.
+   */
+  private lazy val requireStmt: PackratParser[Stmt] =
+    op("require") ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Require(c, m) }
+
+  private lazy val ensureStmt: PackratParser[Stmt] =
+    op("ensure") ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Ensure(c, m) }
+
+  private lazy val contractMsg: Parser[String] =
+    accept("string literal", { case t: lexical.StrLit => t.value })
 
   /** A declaration that may carry a visibility modifier (`13 §2`).
    *
@@ -314,7 +327,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
   private lazy val declaration: PackratParser[Stmt] =
-    visibility ~ (structDecl | enumDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
+    visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
       case Visibility.Public ~ d => d
       case v ~ d                 => restrict(v, d)
     }
@@ -336,6 +349,7 @@ class SyslParser(val source: Source) extends PackratParsers {
     case c: ConstDecl  => c.copy(vis = v).setPos(c.pos)
     case l: ValDecl    => l.copy(vis = v).setPos(l.pos)
     case f: FuncDecl   => f.copy(vis = v).setPos(f.pos)
+    case t: TypeDecl   => t.copy(vis = v).setPos(t.pos)
     case other         => other
 
   /** A dotted name — a module path. */
@@ -611,6 +625,39 @@ class SyslParser(val source: Source) extends PackratParsers {
         ident ~ (op("=") ~> expression) ^^ { case n ~ v => EnumVariantDecl(n, Some(v), Nil) } |
         ident ^^ (n => EnumVariantDecl(n, None, Nil)),
     )
+
+  /** `type Name = [new] Base [within lo..hi] [where predicate]` — a constrained subtype (`03`).
+   * `new`, `within`, and `where` are contextual: they are ordinary identifiers everywhere else, so
+   * a function or field may still be named `where`, and are recognised as keywords only here.
+   */
+  private lazy val typeDecl: PackratParser[Stmt] =
+    op("type") ~> ident ~ (op("=") ~> opt(newKw) ~ typeRef ~ opt(withinClause) ~ opt(whereClause)) ^^ {
+      case name ~ (nw ~ base ~ range ~ pred) => TypeDecl(name, base, nw.isDefined, range, pred)
+    }
+
+  /** `within lo..hi` (inclusive) or `within lo..<hi` (upper-exclusive). The `..<` token is a single
+   * lexeme, so it is told from `..` by the tokenizer rather than here.
+   */
+  private lazy val withinClause: Parser[RangeBound] =
+    withinKw ~> boundLit ~ (op("..<") ^^^ true | op("..") ^^^ false) ~ boundLit ^^ {
+      case lo ~ excl ~ hi => RangeBound(lo, hi, excl)
+    }
+
+  private lazy val whereClause: Parser[Expr] = whereKw ~> expression
+
+  /** A bound of a `within` range: a character literal, or a numeric literal with an optional sign. */
+  private lazy val boundLit: Parser[Expr] =
+    charLit | op("-") ~> (floatLit | intLit) ^^ (Unary("-", _)) | floatLit | intLit
+
+  private lazy val newKw: Parser[Unit]    = softWord("new")
+  private lazy val withinKw: Parser[Unit] = softWord("within")
+  private lazy val whereKw: Parser[Unit]  = softWord("where")
+
+  /** A contextual keyword: an identifier spelled exactly `word`, matched where the grammar wants the
+   * keyword but the word must stay a legal identifier everywhere else (the `sync` of `&sync T`).
+   */
+  private def softWord(word: String): Parser[Unit] =
+    accept(s"'$word'", { case t: lexical.Identifier if t.chars == word => () })
 
   /** `trait Name` with indented member declarations. Each is a method header — a receiver, a
    * parameter list, and an optional result — either bare, which requires an implementation to

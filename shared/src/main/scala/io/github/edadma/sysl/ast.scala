@@ -358,6 +358,14 @@ case class Return(value: Option[Expr]) extends Stmt
 case class Break(label: Option[String], value: Option[Expr]) extends Stmt
 case class Continue(label: Option[String]) extends Stmt
 
+/** A design-by-contract clause at the top of a function body. `require` is a precondition,
+ * checked once on entry; `ensure` is a postcondition, checked before every return. The optional
+ * `msg` accompanies the runtime trap. Inside an `ensure` condition the identifier `result`
+ * denotes the value being returned.
+ */
+case class Require(cond: Expr, msg: Option[String]) extends Stmt
+case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
+
 /** A function declaration. The body is a statement list whose trailing expression is the
  * implicit return value; an `= expr` short body is stored as a single-element list. A
  * missing `retType` means the function returns `unit`. `tparams` names the type parameters of
@@ -444,6 +452,33 @@ case class EnumDecl(name: String, tparams: List[String], underlying: Option[Type
                     variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil,
                     bounds: Map[String, List[BoundRef]] = Map.empty,
                     vis: Visibility = Visibility.Public) extends Stmt
+
+/** The `within lo..hi` clause of a constrained subtype. `exclusiveHi` marks `..<`, which excludes
+ * the upper endpoint; a plain `..` includes it. Bounds are literal expressions — an integer, a
+ * float, or a character literal, optionally negated — evaluated to constants when the type resolves.
+ */
+case class RangeBound(lo: Expr, hi: Expr, exclusiveHi: Boolean) extends Positioned
+
+/** `type Name = [new] Base [within lo..hi] [where predicate]` — a constrained subtype (`03`).
+ *
+ * `Base` is a scalar (an integer, a float, or `char`). Without `new` the subtype is **transparent**:
+ * a value flows to and from its base with no cast, and every value produced into it is checked at
+ * run time against `range` and `pred`, trapping on violation. With `new` it is a **derived** type:
+ * nominally distinct from its base and from other deriveds, mixed only through an explicit cast.
+ *
+ * `range` is the `within` clause and `pred` the `where` predicate; either or both may be present,
+ * and at least one must be unless the type is `new` (a bare transparent alias carries no constraint
+ * and is not yet a form the language accepts). Inside `pred`, the contextual name `value` binds the
+ * value being checked.
+ */
+case class TypeDecl(
+    name: String,
+    base: TypeRef,
+    derived: Boolean,
+    range: Option[RangeBound],
+    pred: Option[Expr],
+    vis: Visibility = Visibility.Public,
+) extends Stmt
 
 /** `trait Name` with indented method declarations — a method with a receiver and a parameter list,
  * written either as a bare **signature** (`show(self) -> string`) or with a body, which makes it a

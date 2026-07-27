@@ -223,7 +223,12 @@ trait StmtAnalysis extends TypeResolution {
     // walk meets one among the entry point's statements there is nothing left to run.
     case _: ConstDecl => TExprStmt(TUnitLit())
 
-    case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl =>
-      err("functions, structs, enums, traits, impls, and externs may only be declared at the top level")
+    case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl | _: TypeDecl =>
+      err("functions, structs, enums, traits, impls, externs, and types may only be declared at the top level")
+
+    // The leading clauses of a function body are split off before the body is analyzed, so any
+    // that reach here sit after another statement or inside an inner block — both disallowed.
+    case _: Require | _: Ensure =>
+      err("'require'/'ensure' clauses must come before any other statement in a function body")
 
 }
