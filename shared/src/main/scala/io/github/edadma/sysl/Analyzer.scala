@@ -688,6 +688,10 @@ class Analyzer private (units: List[Program])
    */
   private def typeAttr(key: String, attr: String, args: List[Expr]): TExpr =
     if constrainedDecls.contains(key) then constrainedAttr(resolveConstrained(key), key, attr, args)
+    else if enumDecls.contains(key) then
+      if enumDecls(key).tparams.nonEmpty then
+        err(s"'${qn(key)}' is generic, so '${qn(key)}::$attr' has no single enum to read")
+      enumAttr(instantiateEnum(key, Nil), key, attr, args)
     else err(s"'${qn(key)}' has no type attributes")
 
   /** The attributes a constrained integer subtype exposes: its bounds (`First`/`Last`), the total
@@ -717,6 +721,35 @@ class Analyzer private (units: List[Program])
       case "Succ"  => val x = oneArg(); ranged; TConstrainedStep(x, c, up = true, base)
       case "Pred"  => val x = oneArg(); ranged; TConstrainedStep(x, c, up = false, base)
       case "Range" => err(s"'${qn(key)}::Range' is only meaningful as the iterable of a 'for' loop")
+      case _       => err(s"'${qn(key)}' has no attribute '$attr'")
+  }
+
+  /** The attributes a simple enum exposes: its endpoints (`First`/`Last`), the ordinal maps
+   * (`Pos` a value to its 0-based position, `Val` a position back to its value), the neighbouring
+   * values (`Succ`/`Pred`), and the name maps (`Image` a value to its name, `Value` a name to its
+   * value). All but `First`/`Last` carry an operand, and the ones that could be handed something
+   * out of range (`Val`, `Succ` at the end, `Pred` at the start, `Value` with no such name) trap.
+   */
+  private def enumAttr(en: Type.Enum, key: String, attr: String, args: List[Expr]): TExpr = {
+    if !en.simple then err(s"'${qn(key)}::$attr' needs a simple enum, and '${qn(key)}' carries data")
+
+    def noArgs(): Unit = if args.nonEmpty then err(s"'${qn(key)}::$attr' takes no arguments")
+
+    def oneArg(want: Type): TExpr =
+      if args.length != 1 then err(s"'${qn(key)}::$attr' takes exactly one argument")
+      val x = analyzeExpr(args.head, Some(want))
+      if disagree(x.ty, want) then err(s"'${qn(key)}::$attr' takes a ${show(want)}, not ${show(x.ty)}")
+      x
+
+    attr match
+      case "First" => noArgs(); TIntLit(BigInt(en.variants.head.tag), en)
+      case "Last"  => noArgs(); TIntLit(BigInt(en.variants.last.tag), en)
+      case "Pos"   => TEnumAttr("Pos", en, oneArg(en), Type.Int)
+      case "Val"   => TEnumAttr("Val", en, oneArg(Type.Int), en)
+      case "Succ"  => TEnumAttr("Succ", en, oneArg(en), en)
+      case "Pred"  => TEnumAttr("Pred", en, oneArg(en), en)
+      case "Image" => TEnumAttr("Image", en, oneArg(en), Type.Str)
+      case "Value" => TEnumAttr("Value", en, oneArg(Type.Str), en)
       case _       => err(s"'${qn(key)}' has no attribute '$attr'")
   }
 
