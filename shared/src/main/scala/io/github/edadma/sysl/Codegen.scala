@@ -215,10 +215,32 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
    * caller can hand over a temporary and a callee can store one without either having to know
    * what the other did with it.
    */
+  /** The postconditions of the function currently being emitted, checked before every return,
+   * and the SSA value `result` denotes while a postcondition is being lowered. */
+  private var ensures:   List[(TExpr, Option[String])] = Nil
+  private var resultSSA: Option[String]                = None
+
+  /** Emits a contract clause as a trap-on-false check, discarding any temporaries the condition
+   * allocated before the trap so the checked path stays leak-free. */
+  private def emitContract(cond: TExpr, kind: String): Unit = {
+    pushTemps()
+    val ok = genExpr(cond)
+    popTemps()
+    trapUnless(ok, kind)
+  }
+
+  /** Runs every postcondition with `result` bound to the value about to be returned. */
+  private def emitEnsures(result: Option[String]): Unit =
+    if ensures.nonEmpty then
+      resultSSA = result
+      for (cond, _) <- ensures do emitContract(cond, "ensure")
+      resultSSA = None
+
   private def genFunction(f: TFunc): String = {
     startFunction()
     pushTemps()
     pushOwned()
+    ensures = f.ensures
 
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep,
     // so it takes no slot and the emitted signature below does not mention it.
@@ -228,6 +250,8 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       retainValue(ty, s"%$name.param")
       ownSlot(name, ty)
 
+    for (cond, _) <- f.requires do emitContract(cond, "require")
+
     f.body.stmts.foreach(genStmt)
 
     // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
@@ -236,12 +260,13 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       case Some(r) if !Type.noValue(f.retTy) =>
         val v = genExpr(r)
         retainValue(f.retTy, v)
+        emitEnsures(Some(v))
         releaseAll()
         emitTerm(s"ret ${f.retTy.llvm} $v")
       case Some(r) =>
-        genExpr(r); releaseAll(); emitTerm("ret void")
+        genExpr(r); emitEnsures(None); releaseAll(); emitTerm("ret void")
       case None if Type.noValue(f.retTy) =>
-        releaseAll(); emitTerm("ret void")
+        emitEnsures(None); releaseAll(); emitTerm("ret void")
       case None =>
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
@@ -315,9 +340,11 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
         case Some(t) =>
           val v = genExpr(t)
           retainValue(t.ty, v)
+          emitEnsures(Some(v))
           releaseAll()
           emitTerm(s"ret ${t.ty.llvm} $v")
         case None =>
+          emitEnsures(None)
           releaseAll()
           emitTerm("ret void")
 
@@ -430,6 +457,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
 
     case TLoad(name, ty) =>
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %$name.addr"); r
+
+    case TResult(_) =>
+      resultSSA.getOrElse(sys.error("'result' lowered outside an ensure postcondition"))
 
     case TGlobal(symbol, ty) =>
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr @$symbol"); r

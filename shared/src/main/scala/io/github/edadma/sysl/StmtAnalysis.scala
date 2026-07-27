@@ -226,4 +226,9 @@ trait StmtAnalysis extends TypeResolution {
     case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl =>
       err("functions, structs, enums, traits, impls, and externs may only be declared at the top level")
 
+    // The leading clauses of a function body are split off before the body is analyzed, so any
+    // that reach here sit after another statement or inside an inner block — both disallowed.
+    case _: Require | _: Ensure =>
+      err("'require'/'ensure' clauses must come before any other statement in a function body")
+
 }

@@ -567,6 +567,12 @@ trait AnalyzerBase {
    */
   protected var variadicFn: Boolean = false
 
+  /** The return type while analyzing an `ensure` postcondition, so `result` resolves to it.
+   * `None` everywhere else, which is what makes `result` an ordinary identifier outside a
+   * postcondition.
+   */
+  protected var ensureResultTy: Option[Type] = None
+
   /** The enclosing loops, innermost first, so a `break`/`continue` finds the one it leaves and a
    * `break value` records its type against that loop's result. `expected` is the type the loop's
    * context wants, pushed down so a `break`/`else` value boxes to `&T` on its own. `label` is the
@@ -1090,6 +1096,7 @@ trait AnalyzerBase {
     scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
     importStack = List(Imports.empty)
     loops = Nil
+    ensureResultTy = None
   }
 
   protected def freshName(base: String): String =

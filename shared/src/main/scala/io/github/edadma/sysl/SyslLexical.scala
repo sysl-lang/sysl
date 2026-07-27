@@ -122,6 +122,8 @@ class SyslLexical
     "alloc",
     "requires",
     "sizeof",
+    "require",
+    "ensure",
   )
 
   /** The operator set is closed, so operators are a fixed list tokenized by longest

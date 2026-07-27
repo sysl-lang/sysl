@@ -358,6 +358,14 @@ case class Return(value: Option[Expr]) extends Stmt
 case class Break(label: Option[String], value: Option[Expr]) extends Stmt
 case class Continue(label: Option[String]) extends Stmt
 
+/** A design-by-contract clause at the top of a function body. `require` is a precondition,
+ * checked once on entry; `ensure` is a postcondition, checked before every return. The optional
+ * `msg` accompanies the runtime trap. Inside an `ensure` condition the identifier `result`
+ * denotes the value being returned.
+ */
+case class Require(cond: Expr, msg: Option[String]) extends Stmt
+case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
+
 /** A function declaration. The body is a statement list whose trailing expression is the
  * implicit return value; an `= expr` short body is stored as a single-element list. A
  * missing `retType` means the function returns `unit`. `tparams` names the type parameters of

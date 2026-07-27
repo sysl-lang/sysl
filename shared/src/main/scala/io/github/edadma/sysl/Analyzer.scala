@@ -493,16 +493,42 @@ class Analyzer private (units: List[Program])
     retTy = rtype
     variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
+    val (contracts, rest)   = f.body.span { case _: Require | _: Ensure => true; case _ => false }
+    val (requires, ensures) = analyzeContracts(rtype, contracts)
+
     // A function owing no value is where statement position starts: its body block is the outermost
     // one written for effect, and every `if` and `match` that ends it inherits that.
     val tbody =
-      if rtype == Type.Unit then analyzeValueBlock(f.body, None, discarded = true)
-      else analyzeValueBlock(f.body, Some(rtype))
+      if rtype == Type.Unit then analyzeValueBlock(rest, None, discarded = true)
+      else analyzeValueBlock(rest, Some(rtype))
 
     if rtype != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, rtype) then
       err(s"function '${f.name}' should return ${show(rtype)}, but its body yields ${show(tbody.ty)}")
 
-    TFunc(name, tparams, rtype, tbody, f.variadic)
+    TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures)
+  }
+
+  /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`
+   * is only in scope inside an `ensure`, and only when the function returns a value.
+   */
+  private def analyzeContracts(
+      rtype: Type,
+      clauses: List[Stmt],
+  ): (List[(TExpr, Option[String])], List[(TExpr, Option[String])]) = {
+    val requires = mutable.ListBuffer.empty[(TExpr, Option[String])]
+    val ensures  = mutable.ListBuffer.empty[(TExpr, Option[String])]
+
+    for c <- clauses do
+      c match
+        case Require(cond, msg) =>
+          requires += ((analyzeBool(cond), msg))
+        case Ensure(cond, msg) =>
+          ensureResultTy = if rtype == Type.Unit then None else Some(rtype)
+          val tc = analyzeBool(cond)
+          ensureResultTy = None
+          ensures += ((tc, msg))
+        case _ => // span guarantees only Require/Ensure reach here
+    (requires.toList, ensures.toList)
   }
 
   /** A comparison chain, checked link by link. A link the machine performs directly needs its
@@ -647,6 +673,13 @@ class Analyzer private (units: List[Program])
     // minimum is writable even though its magnitude overflows the positive range.
     case Unary("-", IntLit(v, suffix))   => intLiteral(-v, suffix, expected)
     case Unary("-", FloatLit(t, suffix)) => floatLiteral("-" + t, suffix, expected)
+
+    // `result` is a contextual keyword: it names the returned value inside an `ensure`, but a
+    // real binding of that name (a parameter or local) still shadows it, so the lookup comes first.
+    case Ident("result") if lookupOpt("result").isEmpty =>
+      ensureResultTy match
+        case Some(ty) => TResult(ty)
+        case None     => err("'result' is only meaningful inside an 'ensure' of a value-returning function")
 
     case Ident(name) =>
       lookupOpt(name) match

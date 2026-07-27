@@ -304,8 +304,21 @@ class SyslParser(val source: Source) extends PackratParsers {
   lazy val statement: PackratParser[Stmt] =
     at(
       importDecl | implDecl | declaration | varDecl | returnStmt |
-        breakStmt | continueStmt | exprStmt,
+        breakStmt | continueStmt | requireStmt | ensureStmt | exprStmt,
     )
+
+  /** `require <cond> [, "message"]` / `ensure <cond> [, "message"]` — a design-by-contract
+   * clause. Only meaningful at the top of a function body; the analyzer rejects one that
+   * appears after ordinary statements.
+   */
+  private lazy val requireStmt: PackratParser[Stmt] =
+    op("require") ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Require(c, m) }
+
+  private lazy val ensureStmt: PackratParser[Stmt] =
+    op("ensure") ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Ensure(c, m) }
+
+  private lazy val contractMsg: Parser[String] =
+    accept("string literal", { case t: lexical.StrLit => t.value })
 
   /** A declaration that may carry a visibility modifier (`13 §2`).
    *
