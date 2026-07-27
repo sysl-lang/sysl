@@ -337,7 +337,7 @@ trait CallAnalysis extends Literals with TraitObjects {
    * *does* declare it, the fix is the bound, and naming it is what checking at the definition is for.
    */
   private def unlicensedProperty(a: Type.Abstract, name: String): Nothing =
-    traitDecls.values.filter(_.methods.exists(m => m.name == name && m.isProperty)).map(_.name).toList match
+    traitDecls.values.filter(_.methods.exists(m => m.name == name && m.isProperty)).map(t => qn(t.name)).toList match
       case Nil =>
         boundErr(s"'${a.name}' is a type parameter, so it has no fields to read — a field is layout, " +
           s"and no trait declares a property '$name' that a bound could promise instead")
@@ -406,7 +406,7 @@ trait CallAnalysis extends Literals with TraitObjects {
    * point of checking at the definition instead of at some caller three files away.
    */
   private def unlicensed(a: Type.Abstract, mname: String): Nothing =
-    traitDecls.values.filter(_.methods.exists(_.name == mname)).map(_.name).toList match
+    traitDecls.values.filter(_.methods.exists(_.name == mname)).map(t => qn(t.name)).toList match
       case Nil =>
         boundErr(s"no trait declares a method '$mname', so no bound on '${a.name}' could license this call")
       case one :: Nil =>

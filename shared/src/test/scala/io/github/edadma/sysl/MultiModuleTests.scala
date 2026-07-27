@@ -273,6 +273,23 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         ("fmt", "f.sysl", "module fmt\ntrait Show\n    show(self) -> int"),
       ) should include("fmt.Show")
     }
+
+    // The bound a call *would* need is named the same way: it is advice to write a line, so it has
+    // to be spelled the way that line would be written.
+    "including the bound a call would have needed" in {
+      errIn(
+        ("", "main.sysl", "loud[T](x: T) -> int = x.show()\nprint(1)"),
+        ("fmt", "f.sysl", "module fmt\ntrait Show\n    show(self) -> int"),
+      ) should include("'show' needs 'T: fmt.Show'")
+    }
+
+    "and the traits offering one, where several do" in {
+      errIn(
+        ("", "main.sysl", "loud[T](x: T) -> int = x.show()\nprint(1)"),
+        ("fmt", "f.sysl", "module fmt\ntrait Show\n    show(self) -> int"),
+        ("txt", "t.sysl", "module txt\ntrait Render\n    show(self) -> int"),
+      ) should include("it is declared by 'fmt.Show', 'txt.Render'")
+    }
   }
 
   "a pattern names a foreign type" - {
