@@ -141,7 +141,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
       val tagVal =
         if en.simple then value
         else { val t = freshTemp(); emit(s"$t = extractvalue ${en.llvm} $value, 0"); t }
-      val tagOk = freshTemp(); emit(s"$tagOk = icmp eq i32 $tagVal, ${variant.tag}")
+      val tagOk = freshTemp(); emit(s"$tagOk = icmp eq ${en.tagLlvm} $tagVal, ${variant.tag}")
       if args.isEmpty then tagOk
       else
         val payload = freshTemp()

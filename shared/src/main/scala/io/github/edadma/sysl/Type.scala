@@ -377,6 +377,13 @@ object Type {
 
     def llvm: String = if simple then underlying.llvm else s"%enum.${mangled(base, targs)}"
 
+    /** The type a discriminant is compared at. A simple enum **is** its discriminant, so the width
+     * is whatever its `: iN` annotation said; a data enum keeps its tag in the aggregate's first
+     * field, which is always `i32`. Reading it off the enum rather than assuming `i32` is what
+     * keeps a narrow simple enum's variant test well-typed.
+     */
+    def tagLlvm: String = if simple then underlying.llvm else "i32"
+
     def variant(v: String): Option[EnumVariant] = variants.find(_.name == v)
 
     /** The payload aggregate type name for a data variant, e.g. `%Shape.Circle`. */

@@ -357,4 +357,114 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "514900\n"
   }
+
+  /** A simple enum **is** its discriminant, so a `: iN` annotation is its storage — and a variant
+   * test compares against that width rather than against `i32`. Getting this wrong emitted IR that
+   * compared an `i8` value at `i32`, which no program with a narrow enum could get past the
+   * assembler; every case here is one that failed to build before.
+   */
+  "a simple enum narrower than i32" - {
+    "matches its variants at its own width" in {
+      val src =
+        """enum Op: u8
+          |    Halt
+          |    Push
+          |    Jump
+          |name(o: Op) -> string
+          |    o match
+          |        Halt -> "halt"
+          |        Push -> "push"
+          |        Jump -> "jump"
+          |print(name(Halt), name(Push), name(Jump))""".stripMargin
+
+      run(src) shouldBe "halt push jump\n"
+    }
+
+    // A discriminant above 127 is a legal `u8` and no legal `i8`, so the constant the comparison
+    // is emitted with has to be read as the enum's own type rather than as a signed byte.
+    "compares a discriminant that fills the high half of a byte" in {
+      val src =
+        """enum Code: u8
+          |    Fine = 3
+          |    Gone = 200
+          |    Late = 255
+          |word(c: Code) -> string
+          |    c match
+          |        Fine -> "fine"
+          |        Gone -> "gone"
+          |        Late -> "late"
+          |print(word(Fine), word(Gone), word(Late))""".stripMargin
+
+      run(src) shouldBe "fine gone late\n"
+    }
+
+    "matches a negative discriminant of a signed underlying type" in {
+      val src =
+        """enum Trend: i8
+          |    Down = -1
+          |    Flat = 0
+          |    Up = 1
+          |step(t: Trend) -> int
+          |    t match
+          |        Down -> -10
+          |        Flat -> 0
+          |        Up -> 10
+          |print(step(Down), step(Flat), step(Up))""".stripMargin
+
+      run(src) shouldBe "-10 0 10\n"
+    }
+
+    "matches at a width between the byte and the word" in {
+      val src =
+        """enum Port: u16
+          |    Shut = 0
+          |    Http = 80
+          |    High = 40000
+          |busy(p: Port) -> bool
+          |    p match
+          |        Shut -> false
+          |        Http -> true
+          |        High -> true
+          |print(busy(Shut), busy(Http), busy(High))""".stripMargin
+
+      run(src) shouldBe "false true true\n"
+    }
+
+    // Nested inside a data enum's payload the value arrives from an `extractvalue` rather than
+    // straight off a local, which is the other way a variant test is reached. Coverage is not
+    // computed through a nested pattern, so the arms need an `else` to be exhaustive.
+    "matches inside another enum's payload" in {
+      val src =
+        """enum Op: u8
+          |    Halt
+          |    Push
+          |read(o: Option[Op]) -> int
+          |    o match
+          |        Some(Halt) -> 0
+          |        Some(Push) -> 1
+          |        else -> -1
+          |var some: Option[Op] = Some(Push)
+          |var gone: Option[Op] = None
+          |print(read(some), read(gone))""".stripMargin
+
+      run(src) shouldBe "1 -1\n"
+    }
+
+    // The conversions were already right — they widen before testing — so this pins the two halves
+    // together: what `try` accepts is what a `match` on the result then discriminates.
+    "discriminates a value the fallible constructor handed back" in {
+      val src =
+        """enum Op: u8
+          |    Halt
+          |    Push = 9
+          |decode(b: u8) -> string
+          |    Op.try(b) match
+          |        Some(Halt) -> "halt"
+          |        Some(Push) -> "push"
+          |        else -> "?"
+          |print(decode(0u8), decode(9u8), decode(4u8))""".stripMargin
+
+      run(src) shouldBe "halt push ?\n"
+    }
+  }
 }
