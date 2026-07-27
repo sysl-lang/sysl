@@ -188,7 +188,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
   private def comparison(c: TCmp, ty: Type, av: String, bv: String): String =
     c.dispatch match
       case Some(d) => dispatchValue(d, ty, av, bv, Type.Bool)
-      case None    => compareValue(c.op, ty, av, bv)
+      // A constrained value compares through its base's instruction — the derived type has no
+      // ordering of its own, it inherits the base's.
+      case None    => compareValue(c.op, Type.underlying(ty), av, bv)
 
   /** Applies an operator's trait method to two **values** rather than two expressions (`14 §3`).
    *
@@ -647,11 +649,13 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       ownTemp(strConcat(genExpr(l), genExpr(r)), Type.Str)
 
     case TBinary(op, l, r, _) =>
-      arith(op, l.ty, genExpr(l), genExpr(r))
+      // Arithmetic runs at the base representation — a derived type keeps its own identity in the
+      // analyzer but is added, multiplied, and divided as the base it is laid out as.
+      arith(op, Type.underlying(l.ty), genExpr(l), genExpr(r))
 
-    case TUnary("-", operand, ty: Type.Integer) =>
+    case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Integer] =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} 0, $v"); r
-    case TUnary("-", operand, ty: Type.Floating) =>
+    case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Floating] =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = fneg ${ty.llvm} $v"); r
     case TUnary("!", operand, _) =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor i1 $v, true"); r

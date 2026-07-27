@@ -47,4 +47,23 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
   "a bare transparent alias with no constraint is rejected" in {
     err("type T = int\nvar x: T = 1\nprint(int(x))") should include("has no constraint")
   }
+
+  "a derived type is nominally distinct" - {
+    val Meters = "type Meters = new f64\n"
+
+    "mixing it with its base in arithmetic is rejected" in {
+      err(Meters + "print(f64(Meters(3.0) + 1.0))") should include("needs matching types")
+    }
+
+    "an implicit conversion from the base is rejected" in {
+      err(Meters + "var m: Meters = 3.0\nprint(f64(m))") should include("declared Meters but the value is real")
+    }
+
+    "two derived types over one base do not mix" in {
+      err(
+        Meters + "type Feet = new f64\n" +
+          "sum(a: Meters, b: Feet) -> f64\n    f64(a + b)\nprint(1)"
+      ) should include("needs matching types")
+    }
+  }
 }

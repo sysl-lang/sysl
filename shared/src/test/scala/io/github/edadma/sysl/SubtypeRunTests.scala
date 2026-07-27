@@ -141,4 +141,38 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport {
       }
     }
   }
+
+  "a new derived type is nominally distinct" - {
+    val Meters = "type Meters = new f64\n"
+
+    "arithmetic between two of the derived type yields the derived type" in {
+      run(
+        Meters + "add(a: Meters, b: Meters) -> Meters\n    a + b\n" +
+          "print(f64(add(Meters(3.0), Meters(4.5))))"
+      ) shouldBe "7.5\n"
+    }
+
+    "wrapping and unwrapping round-trips through the base" in {
+      run(Meters + "var m: Meters = Meters(2.5)\nprint(f64(m) * 2.0)") shouldBe "5\n"
+    }
+
+    "two values of the derived type compare through the base ordering" in {
+      run(Meters + "print(Meters(3.0) < Meters(4.0))") shouldBe "true\n"
+    }
+
+    "a derived type may carry a range, which still traps" - {
+      val SafeAge = "type SafeAge = new int within 0..150\n"
+
+      "an in-range wrap passes" in {
+        run(SafeAge + "print(int(SafeAge(40)) + 1)") shouldBe "41\n"
+      }
+      "an out-of-range wrap traps" in {
+        exits(SafeAge + "print(int(SafeAge(200)))")
+      }
+    }
+
+    "a derived char type wraps and prints through its base" in {
+      run("type Glyph = new char\nprint(Glyph('a'))") shouldBe "a\n"
+    }
+  }
 }
