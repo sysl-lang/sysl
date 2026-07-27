@@ -5,8 +5,9 @@ entry-point rule are **built** — a project is a tree of directories, each one 
 path from the root and holding its files to that name, their declarations visible across all of them
 with no ordering and no forward declaration, a member of one module reached from another by naming
 it in full, the `import` statement in all five of its forms shortening that path for the file or the
-block that writes it, and `private` / `private[M]` deciding which of those spellings a given file is
-allowed to write at all. The cycle check over the module *graph* (§6) and the capability clause (§4)
+block that writes it, `private` / `private[M]` deciding which of those spellings a given file is
+allowed to write at all, and no declaration allowed to name in its signature a type that does not
+reach as far as it does. The cycle check over the module *graph* (§6) and the capability clause (§4)
 are **not yet implemented**; they wait on open item (a), the project-config doc. Two written docs
 already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
@@ -162,6 +163,46 @@ rule are what keeps adding a private helper from changing what its module's othe
 cannot see is simply not among what it brings in — and therefore cannot make another module's name
 ambiguous either. Naming something deliberately is the opposite case, and being told at the import
 that it is private is more use than an undefined name at every shorter spelling it would have bound.
+
+### A declaration may not be more visible than the types it names
+
+**What a declaration says about itself has to be as nameable as the declaration is.** A `private
+struct Point` beside a public `make() -> Point` would hand every module a value of a type none of
+them may name: they could hold it, pass it on, and read its fields, and the one thing they could not
+do is write the type down. That is a hole in the restriction rather than a use of it, so the
+declaration is refused:
+
+```
+private struct Point
+    x: int
+
+make() -> Point = Point(1)   // refused: 'make' is public, but its result names 'Point',
+                             // which is private to the file that declares it
+```
+
+The comparison is between two *reaches*, and every reach is a contiguous region because `private[M]`
+may only name an enclosing module (above): a type restricted to a subtree may stand in a signature
+restricted to that subtree or to anything inside it, and never the other way round. A bare-`private`
+declaration is exempt in every case — it is read in one file, and a type it can name at all is
+visible there.
+
+**It reaches everything a caller has to be able to write**, which is more than a parameter and a
+result: a struct's fields and an enum variant's payload, since neither has a visibility of its own; a
+type *argument*, since `Box[Point]` names `Point` as much as a bare `Point` does; a trait behind a
+memory mode, which is an object over it; a member of a type or a trait, which carries no modifier and
+is therefore as visible as the thing it belongs to; and a **bound**, since a trait a caller cannot
+name leaves it unable to say what is being asked of it.
+
+**An `impl` block is outside the rule, in both directions.** Implementing a private trait for a
+public type adds a member nobody outside can ask for by trait; implementing a public trait for a
+private type makes a public promise about a type that stays unnameable. Neither leaks a name, and a
+private type reaching a caller *through* a trait's signature is a leak in the trait, which is where
+it is reported.
+
+**Rust refuses this and Scala allows it**; this follows Rust. The refusal is what makes `private`
+mean something a reader can rely on — a restricted type stays inside its region — and it is additive
+in the safe direction: forbidding it now rules out nothing that a later rule would have had to keep
+allowing, while allowing it and tightening later would break programs.
 
 ### Anything visible outside its file states its types
 
@@ -442,20 +483,12 @@ which is what it should compile to — a library is not an error.
   always a contiguous subtree. What is left open is how scoped-private interacts with re-export
   (b) — whether a facade module may forward a name it can see but its own importers cannot — which
   cannot be pinned before (b) is.
-- **f. A restricted type in an unrestricted signature.** Nothing yet stops a public function from
-  taking or returning a `private` type: an importer cannot *name* the type, but it can hold a value
-  of it, pass it back, and read its fields. Rust refuses this outright (a private type in a public
-  interface); Scala allows it and lets the type be unnameable. The refusal is a real rule — a
-  declaration's signature may not be less visible than the declaration — and it is not hard to
-  check, but it is a decision about how strong encapsulation should be rather than a gap in what §2
-  says, so it is recorded rather than guessed at. Whichever way it goes is additive: allowing it
-  today refuses nothing that a later rule would have to keep allowing.
-- **g. Visibility below the top level.** §2 governs a *top-level* declaration. Whether a type's
+- **f. Visibility below the top level.** §2 governs a *top-level* declaration. Whether a type's
   **member** can be restricted — a helper method that is not part of what the type offers — is
   open, and is the same question as (c) one level down: both are about a boundary that is not the
   file or the module. A member written with a modifier is a parse error today, which is the right
   refusal for something not yet designed but a poor way to say so.
-- **h. What the file level buys the backend.** §2 notes that a bare `private` is the level at which
+- **g. What the file level buys the backend.** §2 notes that a bare `private` is the level at which
   mangling can be skipped and LLVM `internal` linkage applies. Neither is done: the compiler emits
   one module for the whole program, so `internal` would be correct but would buy nothing
   measurable. It becomes worth doing exactly when (d) does — separate compilation is what makes an

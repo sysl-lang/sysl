@@ -34,7 +34,8 @@ class Analyzer private (units: List[Program])
     with Literals
     with Hoisting
     with StmtAnalysis
-    with SpecialForms {
+    with SpecialForms
+    with SignatureVisibility {
 
   /** Every error the walk found, rendered and in source order. */
   def errors: List[String] = diagnostics
@@ -81,6 +82,11 @@ class Analyzer private (units: List[Program])
     // Every declaration exists now, so what an `import` claimed a module declares can be looked up
     // — and every import from here on, a block's, is checked as it is read.
     checkImportTargets()
+
+    // How far each declaration reaches is settled too, so a signature can be held to naming nothing
+    // that reaches less far than it does (`13 §2`). It waits until here because the question is
+    // about two declarations at a time, and either may be written below the other.
+    checkExposedTypes()
 
     // A type's members lower to ordinary functions under mangled names, registered here so a
     // method call and an associated-function call resolve exactly as a free call does.

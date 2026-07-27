@@ -72,9 +72,21 @@ before they appear and may be mutually recursive).
   still spends its name in its module, and an enum's variants carry its own. A name a file may not
   reach is **not a candidate**: resolution goes on through the file's imports and the prelude, and
   reports the restriction only where nothing else answers. A wildcard offers only what is visible;
-  a selector naming something private is refused at the import. Nothing yet refuses a private type
-  in a public signature (`13 § Open f`), and file-private functions are not emitted `internal`
-  (`13 § Open h`) — one LLVM module means it would buy nothing until separate compilation.
+  a selector naming something private is refused at the import. File-private functions are not
+  emitted `internal` (`13 § Open g`) — one LLVM module means it would buy nothing until separate
+  compilation.
+
+- **A declaration may not name in its signature a type that does not reach as far as it does**
+  (`13 §2`). The check runs once every declaration is registered, since either of the two may be
+  written below the other, and it compares **written names** rather than resolved types — a type
+  parameter, `Self`, and a scalar stand for no declaration, and a name the file may not reach at all
+  is a complaint the resolution that built the signature has already made. It covers a parameter, a
+  result, a struct field, an enum variant's payload, a type argument, a trait behind a memory mode, a
+  member of a type or trait (as visible as what it belongs to), and a **bound**. A bare-`private`
+  declaration is exempt: it is read in one file, and a type it can name is visible there. An `impl`
+  is outside the rule in both directions, since its members' signatures are the trait's and a
+  mismatch is refused as non-conformance. The diagnostic names the type by the path a reader would
+  have to be able to write, so an import alias does not hide which type is meant.
 
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
   compound assignment), `return [expr]`, and `break [expr]` / `continue`. Loop and branch bodies

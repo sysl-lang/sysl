@@ -398,4 +398,228 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
       out.linesIterator.count(_.contains("is private to")) shouldBe 1
     }
   }
+
+  // A restriction a signature could carry a value out of would hardly be one: another module could
+  // hold a value of a type it cannot name, pass it on, and read its fields. So what a declaration
+  // says about itself has to be as nameable as the declaration is.
+  "a declaration may not be more visible than the types it names" - {
+    "a public function's result" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |make() -> Point = Point(1)
+          |print(1)
+          |""".stripMargin)) should include(
+        "'make' is public, but its result names 'Point', which is private to 'main.sysl', the file " +
+          "that declares it — a declaration may not be more visible than the types it names")
+    }
+
+    "a public function's parameter" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |read(p: Point) -> int = p.x
+          |print(1)
+          |""".stripMargin)) should include("'read' is public, but parameter 'p' names 'Point'")
+    }
+
+    "and a type reached through a slice or a memory mode is named just as much" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |count(ps: []Point) -> int = 0
+          |print(1)
+          |""".stripMargin)) should include("'count' is public, but parameter 'ps' names 'Point'")
+    }
+
+    // A bound is part of what a caller has to satisfy, so a trait it cannot name leaves it unable to
+    // say what the declaration is asking of it.
+    "a bound naming a private trait" in {
+      errIn(("", "main.sysl",
+        """private trait Show
+          |    show(self) -> int
+          |loud[T: Show](x: T) -> int = x.show()
+          |print(1)
+          |""".stripMargin)) should include(
+        "'loud' is public, but the bound on 'T' names 'Show', which is private to 'main.sysl'")
+    }
+
+    // Fields have no visibility of their own, so a field of a reachable struct is reachable.
+    "a field of a public struct" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |struct Line
+          |    a: Point
+          |print(1)
+          |""".stripMargin)) should include("'Line' is public, but field 'a' names 'Point'")
+    }
+
+    "the payload of a public enum's variant" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |enum Shape
+          |    Dot(at: Point)
+          |    Round
+          |print(1)
+          |""".stripMargin)) should include("'Shape' is public, but the 'at' of variant 'Dot' names 'Point'")
+    }
+
+    // A member carries no modifier of its own, so it is as visible as the type it belongs to.
+    "a member of a public struct" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |struct Line
+          |    n: int
+          |    tip(self) -> Point = Point(self.n)
+          |print(1)
+          |""".stripMargin)) should include("'Line.tip' is public, but its result names 'Point'")
+    }
+
+    "a method a public trait declares" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |trait Tip
+          |    tip(self) -> Point
+          |print(1)
+          |""".stripMargin)) should include("'Tip.tip' is public, but its result names 'Point'")
+    }
+
+    "an extern, which the linker resolves and the rule reaches all the same" in {
+      errIn(("", "main.sysl",
+        """private enum Mode
+          |    On
+          |    Off
+          |extern pick() -> Mode
+          |print(1)
+          |""".stripMargin)) should include("'pick' is public, but its result names 'Mode'")
+    }
+
+    "a type argument, which is named as much as the type it is applied to" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |struct Box[T]
+          |    value: T
+          |make() -> Box[Point] = Box(Point(1))
+          |print(1)
+          |""".stripMargin)) should include("'make' is public, but its result names 'Point'")
+    }
+
+    "a trait behind a memory mode, which is an object over it" in {
+      errIn(("", "main.sysl",
+        """private trait Show
+          |    show(self) -> int
+          |render(s: &Show) -> int = s.show()
+          |print(1)
+          |""".stripMargin)) should include("'render' is public, but parameter 's' names 'Show'")
+    }
+
+    // The diagnostic names the type by the path a reader would have to be able to write, not by the
+    // shorter spelling this file gave it — the alias is exactly what they do not have.
+    "and an alias does not hide which type is meant" in {
+      errIn(
+        ("", "main.sysl", "print(1)"),
+        ("geom", "g.sysl", "module geom\nprivate[geom] struct P\n    x: int"),
+        ("geom", "h.sysl", "module geom\nimport geom.{P as Q}\nmake() -> Q = Q(1)"),
+      ) should include("'make' is public, but its result names 'geom.P', which is private to module 'geom'")
+    }
+
+    // Both are restricted; what fails is that one subtree does not contain the other.
+    "a 'private[M]' signature naming a type scoped more narrowly than it is" in {
+      errIn(
+        ("", "main.sysl", "print(1)"),
+        ("a.b", "x.sysl",
+         """module a.b
+           |private[b] struct P
+           |    x: int
+           |private[a] make() -> P = P(1)
+           |""".stripMargin),
+      ) should include(
+        "'make' is visible throughout module 'a', but its result names 'a.b.P', which is private " +
+          "to module 'a.b'")
+    }
+  }
+
+  "but a signature naming a type that reaches at least as far is fine" - {
+    // The one level that never needs checking: a file-private declaration is read in one file, and
+    // every type it names is visible there or the signature would not have resolved.
+    "a private function may name a private type" in {
+      runIn(
+        ("", "main.sysl", "print(geom.read())"),
+        ("geom", "g.sysl",
+         """module geom
+           |private struct P
+           |    x: int
+           |private make() -> P = P(7)
+           |read() -> int = make().x
+           |""".stripMargin),
+      ) shouldBe "7\n"
+    }
+
+    "and a narrower scope may name a type its ancestor keeps" in {
+      runIn(
+        ("", "main.sysl", "print(a.b.go())"),
+        ("a.b", "x.sysl",
+         """module a.b
+           |private[a] struct P
+           |    x: int
+           |private[b] make() -> P = P(7)
+           |go() -> int = make().x
+           |""".stripMargin),
+      ) shouldBe "7\n"
+    }
+
+    "and one private type may be another's field, in the file that has both" in {
+      runIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |private struct Line
+          |    a: Point
+          |print(Line(Point(6)).a.x)
+          |""".stripMargin)) shouldBe "6\n"
+    }
+
+    // The rule is about names, and a signature's type parameters are not names of declarations —
+    // even where the module happens to declare something spelled the same way.
+    "a type parameter is not the private type it shares a spelling with" in {
+      runIn(("", "main.sysl",
+        """private struct T
+          |    x: int
+          |id[T](x: T) -> T = x
+          |print(id(5))
+          |""".stripMargin)) shouldBe "5\n"
+    }
+  }
+
+  // An `impl` names no type of its own, so neither half of it is a leak: the members' signatures are
+  // the trait's, and a mismatch is refused as non-conformance rather than reaching this rule at all.
+  "an 'impl' is outside the rule, in both directions" - {
+    "a private trait may be implemented for a public type" in {
+      runIn(("", "main.sysl",
+        """private trait Show
+          |    show(self) -> int
+          |struct Tag
+          |    n: int
+          |impl Show for Tag
+          |    show(self) -> int = self.n
+          |print(Tag(5).show())
+          |""".stripMargin)) shouldBe "5\n"
+    }
+
+    "and a public trait for a private type" in {
+      runIn(("", "main.sysl",
+        """trait Show
+          |    show(self) -> int
+          |private struct Tag
+          |    n: int
+          |impl Show for Tag
+          |    show(self) -> int = self.n
+          |print(Tag(5).show())
+          |""".stripMargin)) shouldBe "5\n"
+    }
+  }
 }
