@@ -147,6 +147,15 @@ implementation:
 
 - **Growable arrays** — `append`, capacity, a `[]T` that owns rather than views. Needs an
   allocator and a decision about whether growth is a library type or a language one.
+- **An array filled with a value, rather than with zeroes or with a literal.** There is no repeat
+  form — `[None; 16]`, or whatever it would be spelled — so an array of a type with no zero value
+  is written out element by element. The types that bite are the ones a container needs: an `enum`
+  has no zero at all (an `Option[&T]` would want `None` to be one, but `Option`'s first variant is
+  `Some`, so "the zero is variant 0" is not the rule that gives it), and a **type parameter** can
+  have none whatever it is bound by, since a bound promises behaviour and no trait in the catalog
+  promises a value. So a generic container cannot make its own storage unless it already holds
+  something to fill it with — see `guide/hashmap`, whose bucket array is `Option[&Entry]` for
+  exactly this reason and whose empty block is sixteen `None`s.
 - **Promotion of an escaping local array** (`05`). The analysis that *finds* the escape is
   implemented; what happens next is not. A view that would outlive its array is a diagnostic
   rather than a silent heap promotion, so a program that means to return one writes `&[64]u8`

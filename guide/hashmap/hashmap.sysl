@@ -1,0 +1,279 @@
+// A hash map, generic in its key and its value.
+//
+// The axis this owns is **the trait system under load**. A container is where bounds, the
+// behaviour they promise, and ownership all have to agree at once: the map may hash and compare a
+// key it knows nothing else about, it holds keys and values it did not make, and it hands entries
+// back out while still owning them. Nothing else in the set asks for all three at the same time.
+//
+// It is a chained map — a bucket is a list of entries, and an entry is a `&Entry` so the list can
+// hold itself. The bucket array grows by doubling and everything is rehashed, which is the part of
+// the problem the language had the most to say about.
+//
+// What writing it turned up, in the order it bit:
+//
+//   * **There is no `Hash` in the core catalog.** The prelude has `Eq` and `Ord` — enough to sort
+//     with, not enough to key on — so a map declares its own, as this one does. That is not a
+//     style problem: `02`'s coherence rule lets an `impl` live only with its trait or with its
+//     type, so two libraries that each declare a `Hash` can never share a key type's
+//     implementation, and a program using both writes the same hash twice.
+//   * **An enum has no zero value, so an array of them cannot be declared without one.**
+//     `var cells: [16]Option[&Entry[K, V]]` is refused, and there is no repeat form of an array
+//     literal, so an empty block is sixteen `None`s written out — see `empty_block` below.
+//   * **Generically it is worse than that.** A `[16]K` could not be declared *whatever* `K` is,
+//     since a type parameter promises no zero value and no bound can promise one. A generic
+//     container therefore cannot make its own storage unless it already has a value to fill it
+//     with, which is why the bucket array here holds `Option[…]` rather than entries.
+//   * **Storage cannot be asked for at a size chosen while running** (`07`, *Not yet*), so the
+//     table is a fixed directory of fixed blocks and its capacity has a ceiling written into the
+//     type. The growth is real — blocks are allocated, the mask changes, every entry is rehashed
+//     into a new bucket — but it stops at `max_blocks()`, after which the map keeps working with
+//     longer chains instead.
+//   * **A bound is repeated at every declaration that needs it.** `[K: Hash + Eq, V]` is written
+//     on the type and again on each free function over it; there is no `where` clause (`10 § Open
+//     c`) and no name for a set of bounds.
+//   * **An assignment is an expression, and a `match` written for effect is checked as if it were
+//     not.** `00 §2` settles that `x = v` yields `v`, and `match`'s arms must agree on one value
+//     type — so a match whose arms merely each end in an assignment is refused for disagreeing
+//     about a value nobody wanted. An `if` has a rule for exactly this case (one `unit` branch
+//     makes the whole thing a statement) and `match` does not; `put` below gets past it with a
+//     `return`.
+//   * **Two generics cannot solve each other.** `Map(empty_dir(), …)` asks the constructor to fix
+//     `Map`'s parameters from its arguments while asking `empty_dir` to fix its own from the field
+//     it lands in, and neither can go first — so the binding is annotated. Inference is
+//     bidirectional (`10 §4`) but not simultaneous.
+//
+// What went in without friction is worth recording too, since the point of the exercise is where
+// the language stops rather than a list of complaints: the definition-time bound check does what
+// `10 §5` promises, so `k.hash()` is refused at the line that writes it when `K: Hash` is missing
+// rather than at some instantiation; `impl Hash for string` and `impl Hash for int` are as
+// ordinary as one for a struct; and `Cursor` below takes no bounds at all, because walking a table
+// asks nothing of a key — which is what having the bound on the declaration that needs it means.
+
+trait Hash
+    hash(self) -> u64
+
+impl Hash for string
+    hash(self) -> u64
+        var h = 0xcbf29ce484222325u64
+
+        for b in self.bytes
+            h = (h ^ u64(b)) * 0x100000001b3u64
+        h
+    end hash
+
+// An integer is its own hash in the sense that matters — it is already spread over 64 bits — but
+// the low bits are what a power-of-two table indexes by, and consecutive keys have none. So the
+// value is avalanched first, which is what keeps `0, 1, 2, …` from landing in a handful of
+// buckets.
+impl Hash for int
+    hash(self) -> u64 = mix(u64(self))
+
+private mix(x: u64) -> u64
+    var h = x
+
+    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64
+    h = (h ^ (h >> 27u64)) * 0x94d049bb133111ebu64
+    h ^ (h >> 31u64)
+end mix
+
+// ------------------------------------------------------------------------------------- storage
+
+// One bucket's worth of the table: the entries whose keys landed on the same index, held through
+// each other so the list is as long as it needs to be.
+struct Entry[K, V]
+    key: K
+    value: V
+    next: Option[&Entry[K, V]]
+end Entry
+
+struct Block[K, V]
+    cell: [16]Option[&Entry[K, V]]
+end Block
+
+struct Dir[K, V]
+    block: [16]Option[&Block[K, V]]
+end Dir
+
+// How many buckets a block holds, and how many blocks the directory can point at. Nullary
+// functions because a module has no constants (`13 §7`), and the two of them fix the capacity
+// ceiling at 256 buckets.
+private block_size() -> usize = 16usize
+
+private max_blocks() -> usize = 16usize
+
+// Sixteen `None`s, because a fixed array has no repeat literal and an `Option` has no zero value
+// to fill one with. Written once so the rest of the file does not have to look at it.
+private empty_block[K, V]() -> &Block[K, V] =
+    Block([None, None, None, None, None, None, None, None,
+           None, None, None, None, None, None, None, None])
+
+private empty_dir[K, V]() -> &Dir[K, V] =
+    Dir([None, None, None, None, None, None, None, None,
+         None, None, None, None, None, None, None, None])
+
+// ----------------------------------------------------------------------------------- the map
+
+// A map starts with one block and doubles from there. `blocks` is always a power of two, so the
+// bucket count is one as well and an index is a mask rather than a division.
+struct Map[K: Hash + Eq, V]
+    dir: &Dir[K, V]
+    blocks: usize
+    count: usize
+
+    buckets(self) -> usize = self.blocks * block_size()
+
+    // The block a bucket lives in. Every block below `blocks` is allocated the moment the table
+    // grows to it, so this is the one place the invariant is spelled out.
+    at(self, i: usize) -> &Block[K, V] = self.dir.block[i / block_size()].expect("a live block")
+
+    bucket(self, i: usize) -> Option[&Entry[K, V]] = self.at(i).cell[i % block_size()]
+
+    set_bucket(*self, i: usize, e: Option[&Entry[K, V]])
+        self.at(i).cell[i % block_size()] = e
+
+    index(self, k: K) -> usize = usize(k.hash()) & (self.buckets() - 1usize)
+
+    // The entry a key names, or `None`. Handing the entry itself back is what lets `get`, `put`,
+    // and `has` be three lines each — and it is safe to hand out because the map still holds it.
+    find(self, k: K) -> Option[&Entry[K, V]]
+        var at = self.bucket(self.index(k))
+
+        loop
+            at match
+                None -> break None
+                Some(e) ->
+                    if e.key == k then break Some(e)
+                    at = e.next
+    end find
+
+    get(self, k: K) -> Option[V]
+        self.find(k) match
+            None -> None
+            Some(e) -> Some(e.value)
+    end get
+
+    has(self, k: K) -> bool = self.find(k).is_some()
+
+    // A key already in the map keeps its entry and takes the new value; a fresh one goes at the
+    // head of its bucket, which is what makes an insert a constant number of writes.
+    //
+    // The `return` is not only for reading. An assignment is an expression that yields what it
+    // assigned (`00 §2`), so without it the two arms would end at a `V` and a `usize` and have to
+    // agree on a type that nothing here wants.
+    put(*self, k: K, v: V)
+        self.find(k) match
+            Some(e) ->
+                e.value = v
+                return
+            None ->
+                if self.count * 4usize >= self.buckets() * 3usize then self.grow()
+
+                var i = self.index(k)
+                var e: &Entry[K, V] = Entry(k, v, self.bucket(i))
+
+                self.set_bucket(i, Some(e))
+                self.count += 1usize
+    end put
+
+    // Unlinking is the one walk that needs to remember where it came from, since the entry before
+    // the one being removed is what has to be made to point past it.
+    remove(*self, k: K) -> bool
+        var i = self.index(k)
+        var at = self.bucket(i)
+        var prev: Option[&Entry[K, V]] = None
+
+        loop
+            at match
+                None -> break false
+                Some(e) ->
+                    if e.key == k
+                        prev match
+                            None -> self.set_bucket(i, e.next)
+                            Some(p) -> p.next = e.next
+                        self.count -= 1usize
+                        break true
+                    prev = Some(e)
+                    at = e.next
+    end remove
+
+    // Doubling the table changes the mask, so where a key belongs changes with it and every entry
+    // has to be looked at. They are **relinked** rather than rebuilt: an entry is already a
+    // reference, so moving one between buckets is two writes and no allocation, and the keys and
+    // values it holds are never copied.
+    //
+    // Growth stops at the ceiling rather than failing. A map that has run out of directory keeps
+    // answering every question correctly; the chains simply get longer.
+    grow(*self)
+        if self.blocks >= max_blocks() then return
+
+        var old = self.dir
+        var old_buckets = self.buckets()
+
+        self.dir = empty_dir()
+        self.blocks = self.blocks * 2usize
+        for b in 0usize..<self.blocks
+            self.dir.block[b] = Some(empty_block())
+
+        for i in 0usize..<old_buckets
+            var at = old.block[i / block_size()].expect("a live block").cell[i % block_size()]
+
+            loop
+                at match
+                    None -> break
+                    Some(e) ->
+                        // The rest of the old chain is read before the entry is relinked, since
+                        // relinking is what overwrites the link to it.
+                        var rest = e.next
+                        var j = self.index(e.key)
+
+                        e.next = self.bucket(j)
+                        self.set_bucket(j, Some(e))
+                        at = rest
+    end grow
+
+    walk(self) -> Cursor[K, V] = Cursor(self.dir, self.buckets(), 0usize, None)
+end Map
+
+// An empty map, with its first block already under it so that every later question can assume one.
+//
+// A nullary generic solves its parameters from what the binding asks for (`10 §4`), which is why
+// the key and value types of a map are written on the `var` that holds it. The annotation on `m`
+// is the same rule biting one level in: `Map(empty_dir(), …)` would have to solve `Map`'s
+// parameters from its arguments and `empty_dir`'s from the field it lands in, and neither can go
+// first.
+map[K: Hash + Eq, V]() -> Map[K, V]
+    var m: Map[K, V] = Map(empty_dir(), 1usize, 0usize)
+
+    m.dir.block[0] = Some(empty_block())
+    m
+end map
+
+// ------------------------------------------------------------------------------------ walking
+
+// A position in a table: which bucket to look at next, and where in the current chain.
+//
+// It takes **no bounds**, and that is the point of writing them where they are needed: walking a
+// table hashes nothing and compares nothing, so a cursor asks nothing of a key. It holds the
+// directory rather than the map so that it keeps the storage alive while it walks — but the table
+// it is walking must not grow underneath it, and a cursor is finished with before the next `put`.
+struct Cursor[K, V]
+    dir: &Dir[K, V]
+    buckets: usize
+    at: usize
+    cell: Option[&Entry[K, V]]
+
+    next(*self) -> Option[&Entry[K, V]]
+        loop
+            self.cell match
+                Some(e) ->
+                    self.cell = e.next
+                    break Some(e)
+                None ->
+                    if self.at >= self.buckets then break None
+
+                    var b = self.dir.block[self.at / block_size()].expect("a live block")
+
+                    self.cell = b.cell[self.at % block_size()]
+                    self.at += 1usize
+    end next
+end Cursor

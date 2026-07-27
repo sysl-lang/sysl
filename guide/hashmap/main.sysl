@@ -1,0 +1,226 @@
+// The checks. Every line of output begins `ok`, so the whole of stdout is the assertion.
+
+check(name: string, got: string, want: string)
+    if got == want then print(s"ok    $name = $got")
+    else print(s"FAIL  $name = $got, wanted $want")
+end check
+
+// A key of the program's own, to show that a map asks for behaviour rather than for a built-in
+// type: two values are the same key exactly when `Eq` says so, and land together exactly when
+// `Hash` says so.
+struct Name
+    first: string
+    last: string
+end Name
+
+impl Hash for Name
+    hash(self) -> u64 = self.first.hash() * 31u64 + self.last.hash()
+
+impl Eq for Name
+    eq(self, rhs: Name) -> bool = self.first == rhs.first && self.last == rhs.last
+
+// A key that hashes to one bucket whatever it holds. Legal — a hash may be any function of the
+// key — and it turns the map into a single linked list, which is the shape every chained table
+// has to stay correct in.
+struct Clumped
+    n: int
+end Clumped
+
+impl Hash for Clumped
+    hash(self) -> u64 = 0u64
+
+impl Eq for Clumped
+    eq(self, rhs: Clumped) -> bool = self.n == rhs.n
+
+print("-- string keys")
+
+var m: Map[string, int] = map()
+
+check("empty count", str(m.count), "0")
+check("a miss on an empty map", str(m.get("nothing").is_none()), "true")
+
+m.put("one", 1)
+m.put("two", 2)
+m.put("three", 3)
+
+check("count", str(m.count), "3")
+check("get one", str(m.get("one").unwrap_or(-1)), "1")
+check("get two", str(m.get("two").unwrap_or(-1)), "2")
+check("get three", str(m.get("three").unwrap_or(-1)), "3")
+check("a key that was never put", str(m.get("four").unwrap_or(-1)), "-1")
+check("has", str(m.has("one")), "true")
+check("has not", str(m.has("four")), "false")
+
+// A key equal to one already there replaces its value and does not add an entry — the property
+// that makes it a map rather than a list of pairs.
+print("-- replacing")
+m.put("two", 22)
+check("the replaced value", str(m.get("two").unwrap_or(-1)), "22")
+check("the count is unchanged", str(m.count), "3")
+
+// A key built at run time out of pieces is a different string object with the same bytes, so
+// this also checks that the map compares by value rather than by identity.
+m.put("t" + "wo", 222)
+check("an equal key found by content", str(m.get("two").unwrap_or(-1)), "222")
+check("still three entries", str(m.count), "3")
+
+print("-- removing")
+check("remove a key that is there", str(m.remove("one")), "true")
+check("it is gone", str(m.has("one")), "false")
+check("the count fell", str(m.count), "2")
+check("remove it again", str(m.remove("one")), "false")
+check("remove a key never put", str(m.remove("zzz")), "false")
+check("the others survive", str(m.get("three").unwrap_or(-1)), "3")
+
+m.put("one", 111)
+check("the slot takes a new entry", str(m.get("one").unwrap_or(-1)), "111")
+check("and the count rose", str(m.count), "3")
+
+print("-- integer keys")
+
+var n: Map[int, string] = map()
+
+n.put(0, "zero")
+n.put(-7, "minus seven")
+n.put(1000000, "a million")
+
+check("zero is an ordinary key", n.get(0).unwrap_or("?"), "zero")
+check("a negative key", n.get(-7).unwrap_or("?"), "minus seven")
+check("a large key", n.get(1000000).unwrap_or("?"), "a million")
+check("a near miss", n.get(7).unwrap_or("?"), "?")
+check("two instantiations coexist", str(m.count) + "/" + str(n.count), "3/3")
+
+print("-- a key of one's own")
+
+var byname: Map[Name, int] = map()
+
+byname.put(Name("ada", "lovelace"), 1815)
+byname.put(Name("alan", "turing"), 1912)
+
+check("a struct key", str(byname.get(Name("ada", "lovelace")).unwrap_or(0)), "1815")
+check("an equal struct built again", str(byname.get(Name("alan", "turing")).unwrap_or(0)), "1912")
+check("one field different", str(byname.get(Name("ada", "byron")).unwrap_or(0)), "0")
+
+print("-- every key in one bucket")
+
+var clumped: Map[Clumped, int] = map()
+
+for i in 0..<20
+    clumped.put(Clumped(i), i * i)
+
+var clumped_hits = 0
+
+for i in 0..<20
+    if clumped.get(Clumped(i)).unwrap_or(-1) == i * i then clumped_hits += 1
+
+check("all twenty found down one chain", str(clumped_hits), "20")
+check("removing from the middle of the chain", str(clumped.remove(Clumped(9))), "true")
+check("its neighbours are untouched",
+      str(clumped.get(Clumped(8)).unwrap_or(-1)) + "/" + str(clumped.get(Clumped(10)).unwrap_or(-1)),
+      "64/100")
+check("and the hole is a miss", str(clumped.get(Clumped(9)).is_none()), "true")
+
+print("-- growth")
+
+var big: Map[string, int] = map()
+
+check("one block to begin with", str(big.blocks), "1")
+for i in 0..<300
+    big.put(s"k$i", i)
+
+check("everything went in", str(big.count), "300")
+check("the table doubled to its ceiling", str(big.blocks), "16")
+
+var found = 0
+var total = 0
+
+for i in 0..<300
+    big.get(s"k$i") match
+        Some(v) ->
+            if v == i
+                found += 1
+                total += v
+        None -> print(s"FAIL  k$i went missing")
+
+check("every key survived the rehashing", str(found), "300")
+check("with the value it went in with", str(total), "44850")
+check("a key that was never there", str(big.has("k300")), "false")
+
+// Past the ceiling the map stops growing and the chains lengthen, which is a slower map and not a
+// wrong one — so the check is that nothing was lost on the way.
+check("the load factor past the ceiling", str(big.count / big.buckets()), "1")
+
+print("-- walking")
+
+var seen = 0
+var walked = 0
+var c = big.walk()
+
+loop
+    c.next() match
+        None -> break
+        Some(e) ->
+            seen += 1
+            walked += e.value
+
+check("the walk reaches every entry", str(seen), "300")
+check("and each one once", str(walked), "44850")
+
+// A `*self` method needs somewhere to point, so the cursor goes in a `var` rather than being
+// walked where it stands.
+var empty: Map[string, int] = map()
+var e = empty.walk()
+
+check("walking an empty map ends at once", str(e.next().is_none()), "true")
+
+var few = 0
+var d = clumped.walk()
+
+loop
+    d.next() match
+        None -> break
+        Some(e) -> few += 1
+
+check("a walk down one long chain", str(few), "19")
+
+// The map holds keys and values it did not make, and lets go of them when they leave. Replacing a
+// value has to release the one it displaced, and removing an entry has to release both halves of
+// it — neither of which shows up in an answer, so the check is that a great many of them in a row
+// neither leak nor free twice.
+print("-- entries that own what they hold")
+
+var owned: Map[string, string] = map()
+
+for i in 0..<2000
+    owned.put("key" + str(i % 8), "value " + str(i))
+
+check("the replacements left eight entries", str(owned.count), "8")
+check("each holding the last value written", owned.get("key0").unwrap_or("?"), "value 1992")
+
+for i in 0..<2000
+    owned.put("gone" + str(i), "value " + str(i))
+    owned.remove("gone" + str(i))
+
+check("and putting then removing leaves nothing behind", str(owned.count), "8")
+
+print("-- emptying")
+
+var removed = 0
+
+for i in 0..<300
+    if big.remove(s"k$i") then removed += 1
+
+check("every key removed", str(removed), "300")
+check("the map is empty", str(big.count), "0")
+
+var g = big.walk()
+
+check("and walking it finds nothing", str(g.next().is_none()), "true")
+
+// A table does not shrink: the storage it grew into is what it will use again, which is the right
+// trade for a map that emptied because it is about to be refilled.
+check("the blocks it grew are still there", str(big.blocks), "16")
+
+big.put("again", 1)
+check("it takes new entries", str(big.get("again").unwrap_or(-1)), "1")
+check("counting from zero", str(big.count), "1")

@@ -26,6 +26,7 @@ that quietly stopped running would otherwise look like a check that passed.
 | directory | axis it owns |
 |---|---|
 | `json` | recursive ownership — a value that contains itself through `&T` |
+| `hashmap` | the trait system under load — bounds, the behaviour they promise, and ownership at once |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

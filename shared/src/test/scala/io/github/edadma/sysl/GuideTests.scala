@@ -35,4 +35,23 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- malformed input",
     )
   }
+
+  "hashmap — the trait system under load" in {
+    val out = guide("hashmap")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 53
+    sections(out) shouldBe List(
+      "-- string keys",
+      "-- replacing",
+      "-- removing",
+      "-- integer keys",
+      "-- a key of one's own",
+      "-- every key in one bucket",
+      "-- growth",
+      "-- walking",
+      "-- entries that own what they hold",
+      "-- emptying",
+    )
+  }
 }
