@@ -45,6 +45,24 @@ class ContractErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "old" - {
+    "is rejected outside an ensure" in {
+      err(
+        """f(x: int) -> int
+          |    require old(x) >= 0
+          |    x""".stripMargin
+      ) should include("undefined function 'old'")
+    }
+
+    "takes exactly one argument" in {
+      err(
+        """f(x: int) -> int
+          |    ensure result == old(x, x)
+          |    x""".stripMargin
+      ) should include("'old' takes exactly one argument")
+    }
+  }
+
   "misplaced clauses" - {
     "a require after an ordinary statement is rejected" in {
       err(

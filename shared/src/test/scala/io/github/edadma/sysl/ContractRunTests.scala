@@ -119,4 +119,42 @@ class ContractRunTests extends AnyFreeSpec with RunSupport {
         |print(result)""".stripMargin
     ) shouldBe "7\n"
   }
+
+  // `old(e)` remembers the entry value even after the body mutates it — the whole point, and what
+  // tells it apart from naming the parameter directly.
+  "old captures the entry value across a mutation" - {
+    "the postcondition that compares against the entry value holds" in {
+      run(
+        """bump(x: int) -> int
+          |    ensure result == old(x) + 10
+          |    x = x + 5
+          |    x + 5
+          |print(bump(100))""".stripMargin
+      ) shouldBe "110\n"
+    }
+
+    // Naming `x` here would read the *mutated* value and pass; `old(x)` reads the entry value, so
+    // this postcondition is false and must trap — proving the snapshot is the entry value.
+    "comparing the mutated value against the entry snapshot traps" in {
+      exits(
+        """bad(x: int) -> int
+          |    ensure result == old(x)
+          |    x = x + 5
+          |    x
+          |print(bad(100))""".stripMargin
+      )
+    }
+  }
+
+  // Several `old`s in one ensure each keep their own entry snapshot.
+  "multiple old snapshots are independent" in {
+    run(
+      """f(a: int, b: int) -> int
+        |    ensure result == old(a) - old(b)
+        |    a = 0
+        |    b = 0
+        |    9 - 4
+        |print(f(9, 4))""".stripMargin
+    ) shouldBe "5\n"
+  }
 }

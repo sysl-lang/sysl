@@ -573,6 +573,13 @@ trait AnalyzerBase {
    */
   protected var ensureResultTy: Option[Type] = None
 
+  /** The entry-time snapshots an `ensure` has asked for so far, present only while a postcondition
+   * is being analyzed. Each `old(e)` appends its typed expression and reads back its position, so
+   * codegen can capture them all at entry. `None` outside an `ensure`, which is what keeps `old`
+   * an ordinary name everywhere else.
+   */
+  protected var oldBuf: Option[mutable.ListBuffer[TExpr]] = None
+
   /** The enclosing loops, innermost first, so a `break`/`continue` finds the one it leaves and a
    * `break value` records its type against that loop's result. `expected` is the type the loop's
    * context wants, pushed down so a `break`/`else` value boxes to `&T` on its own. `label` is the
@@ -1097,6 +1104,7 @@ trait AnalyzerBase {
     importStack = List(Imports.empty)
     loops = Nil
     ensureResultTy = None
+    oldBuf = None
   }
 
   protected def freshName(base: String): String =

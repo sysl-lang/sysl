@@ -252,6 +252,18 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
 
     for (cond, _) <- f.requires do emitContract(cond, "require")
 
+    // Each `old(e)` snapshots the entry value into a hidden owned slot, exactly as a `var` would,
+    // so a postcondition can compare the returned state against the state on entry. The slot is
+    // released with every other local at each return.
+    for (oldExpr, i) <- f.olds.zipWithIndex do
+      pushTemps()
+      val v = genExpr(oldExpr)
+      emitAlloca(s"%old.$i.addr", oldExpr.ty.llvm)
+      retainValue(oldExpr.ty, v)
+      emit(s"store ${oldExpr.ty.llvm} $v, ptr %old.$i.addr")
+      ownSlot(s"old.$i", oldExpr.ty)
+      popTemps()
+
     f.body.stmts.foreach(genStmt)
 
     // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
@@ -460,6 +472,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
 
     case TResult(_) =>
       resultSSA.getOrElse(sys.error("'result' lowered outside an ensure postcondition"))
+
+    case TOld(index, ty) =>
+      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %old.$index.addr"); r
 
     case TGlobal(symbol, ty) =>
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr @$symbol"); r

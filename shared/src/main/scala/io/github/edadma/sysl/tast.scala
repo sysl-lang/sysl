@@ -79,6 +79,11 @@ case class TLoad(name: String, ty: Type) extends TExpr
 /** `result` inside an `ensure` postcondition — the value the function is about to return. */
 case class TResult(ty: Type) extends TExpr
 
+/** `old(e)` inside an `ensure` — reads the value expression `e` had at function entry, captured
+ * into the function's `olds` slab before the body ran. `index` is that slab position.
+ */
+case class TOld(index: Int, ty: Type) extends TExpr
+
 /** Names a module-level `val` — storage that exists for the whole run, under the key its module
  * gives it. It is a *place*, so indexing and iterating reach into it without copying the whole
  * thing out; what it is not is a writable one, which the analyzer enforces rather than the type.
@@ -352,6 +357,7 @@ case class TFunc(
     variadic: Boolean = false,
     requires: List[(TExpr, Option[String])] = Nil,
     ensures: List[(TExpr, Option[String])] = Nil,
+    olds: List[TExpr] = Nil,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones
