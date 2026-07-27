@@ -317,6 +317,40 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
+  // A count is an index's twin — both are a number of elements read unsigned at 64 bits — so the
+  // rule about which types may be one has to be the same rule, and `03`'s is that a transparent
+  // constrained subtype stands where its base does while a derived one does not.
+  "a count takes the types an index takes" - {
+    "a transparent 'within' subtype counts, and indexes, with no cast" in {
+      run(
+        """type Small = usize within 0..100
+          |f(n: Small) -> []int = [7; n]
+          |var xs = f(Small(4usize))
+          |var i: Small = Small(1usize)
+          |print(xs.len, xs[i])""".stripMargin
+      ) shouldBe "4 7\n"
+    }
+
+    // `new` parses but is not analyzed yet, so these two assert the behaviour the design fixes
+    // rather than behaviour that can be run: a derived type is nominally distinct, so reaching its
+    // base is what a written conversion is for and a count is not an exception.
+    "a derived one does neither, since 'new' is nominal" ignore {
+      err(
+        """type Count = new usize
+          |f(n: Count) -> []int = [7; n]""".stripMargin
+      ) should include("a repeat count is a number of elements, and Count is not an integer")
+    }
+
+    "and the index refuses it in the same words" ignore {
+      err(
+        """type Ix = new usize
+          |var a = [1, 2, 3]
+          |var i: Ix = Ix(1usize)
+          |print(a[i])""".stripMargin
+      ) should include("an index must be an integer, not Ix")
+    }
+  }
+
   "what is refused" - {
     "a count that is not a number of elements" in {
       err("f(s: string) -> []int = [0; s]") should include(

@@ -1019,7 +1019,9 @@ class Analyzer private (units: List[Program])
         case Some(Type.Slice(_)) =>
           val tc = analyzeExpr(count)
 
-          if !tc.ty.isInstanceOf[Type.Integer] then
+          // A count is an index's twin, so it takes a transparent subtype for the same reason one
+          // does — and refuses a derived one for the same reason too.
+          if !Type.repr(tc.ty).isInstanceOf[Type.Integer] then
             err(s"a repeat count is a number of elements, and ${show(tc.ty)} is not an integer")
 
           TBufFill(tv, tc, Type.Slice(tv.ty))
@@ -1071,7 +1073,10 @@ class Analyzer private (units: List[Program])
       val elem = Type.element(tr.ty).getOrElse(err(s"cannot index ${show(tr.ty)}"))
       val ti   = analyzeExpr(index, Some(Type.Usize))
 
-      ti.ty match
+      // A transparent constrained subtype stands where its base does, so an `Index within 0..<n`
+      // indexes without a cast. A derived one does not: `new` is nominal, and reaching the base is
+      // exactly what a written conversion is for.
+      Type.repr(ti.ty) match
         case _: Type.Integer => TIndex(tr, ti, elem)
         case other           => err(s"an index must be an integer, not ${show(other)}")
 

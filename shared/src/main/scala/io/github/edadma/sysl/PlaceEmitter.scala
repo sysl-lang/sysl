@@ -200,7 +200,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
   /** An index at 64 bits, keeping its signedness so a negative one stays negative through the
    * widening and then fails the unsigned bounds test.
    */
-  protected def widen64(index: TExpr): String = index.ty match
+  protected def widen64(index: TExpr): String = Type.underlying(index.ty) match
     case i: Type.Integer => convert(i, Type.Integer(64, i.signed), genExpr(index))
     case other           => sys.error(s"unreachable index of type ${other.llvm}")
 
