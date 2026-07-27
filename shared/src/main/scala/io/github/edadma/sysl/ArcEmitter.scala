@@ -202,6 +202,77 @@ trait ArcEmitter extends Emitter {
     ownTemp(p, refTy)
   }
 
+  /** The box that holds elements the program sized while running: the refcount, the deallocation
+   * hook, how many elements there are, and then the elements. The count has to be *in* the box
+   * because the hook is what destroys them and the hook is reached with no static type in sight —
+   * which is the same reason `07` gives for the hook existing at all.
+   */
+  protected def bufName(elem: Type): String = {
+    heap = true
+    val n = s"%arc.buf.${Type.mangle(elem)}"
+    bufs.getOrElseUpdate(n, elem)
+    n
+  }
+
+  /** The function that destroys such a box: it lets go of each element it still holds and returns
+   * the storage. Elements that hold nothing need no walk, so the plain free is the hook.
+   */
+  protected def dropBufFn(elem: Type): String = {
+    if !containsRef(elem) then "@arc.free"
+    else
+      val m  = Type.mangle(elem)
+      val bn = bufName(elem)
+
+      "@" + request(s"arc.dropbuf.$m") {
+        inFunction(s"define private void @arc.dropbuf.$m(ptr %p)") {
+          val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr %p, i32 0, i32 2")
+          val n    = freshTemp(); emit(s"$n = load i64, ptr $lenp")
+          val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr %p, i32 0, i32 3")
+
+          eachElement(elem, data, n) { ep =>
+            val ev = freshTemp(); emit(s"$ev = load ${elem.llvm}, ptr $ep")
+            releaseValue(elem, ev)
+          }
+          emit("call void @free(ptr %p)")
+          emitTerm("ret void")
+        }
+      }
+  }
+
+  /** Puts one value in every one of `n` slots, taking a share for each — the elements belong to the
+   * buffer, and it is the hook above that eventually lets them go.
+   */
+  protected def fillElements(elem: Type, data: String, n: String, v: String): Unit =
+    eachElement(elem, data, n) { ep =>
+      retainValue(elem, v)
+      emit(s"store ${elem.llvm} $v, ptr $ep")
+    }
+
+  /** Walks `n` elements starting at `data`, handing each element's address to `body`. A loop rather
+   * than a straight line for the reason the ARC walk over an array gives: the count is exactly the
+   * thing that may be large here.
+   */
+  protected def eachElement(elem: Type, data: String, n: String)(body: String => Unit): Unit = {
+    val i     = emitAlloca(freshTemp(), "i64")
+    val condL = freshLabel("buf.test")
+    val bodyL = freshLabel("buf.elem")
+    val endL  = freshLabel("buf.done")
+
+    emit(s"store i64 0, ptr $i")
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
+    val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, $n")
+    emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+    emitLabel(bodyL)
+    val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $data, i64 $iv")
+    body(ep)
+    val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
+    emit(s"store i64 $nxt, ptr $i")
+    emitTerm(s"br label %$condL")
+    emitLabel(endL)
+  }
+
   /** Where a pointer's pointee actually lives. A `*T` addresses its value directly; a `&T`
    * addresses the box, whose payload sits after the refcount and the deallocation hook.
    */

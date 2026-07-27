@@ -36,6 +36,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     if heap then
       out ++= "declare ptr @malloc(i64)\n"
       out ++= "declare void @free(ptr)\n"
+    if checked then
+      out ++= "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n"
+      out ++= "declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)\n"
     if usesSnprintf then out ++= "declare i32 @snprintf(ptr, i64, ptr, ...)\n"
     if usesVarargs then
       out ++= "declare void @llvm.va_start.p0(ptr)\n"
@@ -73,7 +76,11 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     // same everywhere, and an object frees itself into whichever heap made it.
     for (name, payload) <- boxes do
       out ++= s"$name = type { i64, ptr, ${payload.llvm} }\n"
-    if boxes.nonEmpty then out ++= "\n"
+    // A buffer is the same box with the element count in front of elements there may be any number
+    // of, so the hook — which is reached with no static type — can still find them all.
+    for (name, elem) <- bufs do
+      out ++= s"$name = type { i64, ptr, i64, [0 x ${elem.llvm}] }\n"
+    if boxes.nonEmpty || bufs.nonEmpty then out ++= "\n"
 
     if boolStrs then
       out ++= "@.true = private constant [5 x i8] c\"true\\00\"\n"
@@ -396,6 +403,31 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
         emitLabel(endL)
 
         val r = freshTemp(); emit(s"$r = load ${arrayTy.llvm}, ptr $buf"); r
+
+    // The same two forms, sized and owned rather than laid out in a frame. Each element the buffer
+    // takes is a share of its own — the box holds them until its hook lets them go — so the value
+    // that lands in one is retained as it is stored, exactly as a slot that binds an array is.
+    case TBufLit(elems, sliceTy) =>
+      val vals       = elems.map(genExpr)
+      val (box, data) = genBuffer(sliceTy.elem, vals.length.toString)
+
+      for (v, i) <- vals.zipWithIndex do
+        retainValue(sliceTy.elem, v)
+        val ep = freshTemp(); emit(s"$ep = getelementptr ${sliceTy.elem.llvm}, ptr $data, i64 $i")
+        emit(s"store ${sliceTy.elem.llvm} $v, ptr $ep")
+
+      bufferView(sliceTy, box, data, vals.length.toString)
+
+    // The value is generated once, above the loop, which is what makes `[tick(); n]` one call
+    // whose result lands in n places — the repeat's own rule (`07`), and the reason the count may
+    // be zero and the call still happen.
+    case TBufFill(value, count, sliceTy) =>
+      val v           = genExpr(value)
+      val n           = widen64(count)
+      val (box, data) = genBuffer(sliceTy.elem, n)
+
+      fillElements(sliceTy.elem, data, n, v)
+      bufferView(sliceTy, box, data, n)
 
     case TIndex(receiver, index, ty) =>
       val p = elementAddr(receiver, index)

@@ -229,7 +229,8 @@ allocation or "pointer-ness":
 
 The practical consequence: even low-level, allocator-free code stays bounds-safe by using
 slices; `*T` is reserved for genuine address work, not merely for having an indexable buffer.
-Growable (appendable) arrays need an allocator; fixed arrays and slices do not.
+An array whose length the program computes needs an allocator, and so would a growable one; a fixed
+array and a view of one do not.
 
 How the two are written, indexed, and sliced — the literal, the zero-valued declaration, the
 range subscript, `.len` — is **`07-arrays-and-slices.md`**.

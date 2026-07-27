@@ -90,6 +90,48 @@ has none, so it can size an array but cannot *be* one; a `val` is storage, so it
 value only known while running, iterated, and reached into. What it may not be is written — see
 `§Ownership` below for the one thing that costs today.
 
+## Storage sized while running
+
+Every form above fixes its length in the type, and that is the one thing a program reading a file
+cannot do: the size is in the header, and the header is read by the code that needs the buffer. The
+*heap* is not what is missing — `var p: &[64]u8 = [0; 64]` already puts elements on the heap, and
+`p[..]` views them with the box as owner (`§Ownership`). What is missing is a length the program
+**computes**.
+
+A length that is not in the type is exactly what `[]T` is, so nothing here needs a new spelling. The
+**expected type decides**, which is `03`'s rule for `&T` applied to the forms above — a `T` written
+where a `&T` is wanted goes on the heap, and an array written where a `[]T` is wanted does the same:
+
+```
+var buf: [64]u8 = [0; 64]              // an array: the count is part of the type, so constant
+var raw: []u8   = [0; n]               // a view of fresh storage: n is any expression
+var xs:  []int  = [1, 2, 3]            // likewise, with the elements written out
+```
+
+The declaration carries the choice, as it does everywhere else in the language, and the two readings
+of `[0; n]` are told apart by what is being asked for rather than by whether `n` happens to be
+constant. Under a `[N]T` a non-constant count is still the error it was; under a `[]T` a constant
+one is simply the easy case.
+
+**The storage is the view's own**, and that is the whole of the mechanism: the `owner` word is a
+reference to the elements, so everything in `§Ownership` is already true of it. A sub-slice retains
+it, the last view to go releases it, and the deallocation hook destroys the elements before
+returning the bytes. Nothing about indexing, slicing, `.len`, or iterating distinguishes a `[]T`
+that owns its elements from one that views someone else's — which is the point, and is why a second
+type would have been a second type for nothing.
+
+What it adds that the fixed forms cannot is **leaving the frame**. A function may build one and
+return it, so a decoder that learns its size from what it is decoding takes one argument and returns
+a result, instead of asking its caller to size buffers whose sizes are in a header the caller has
+not read.
+
+**Three things are checked**, because a computed length is where the arithmetic goes wrong. The
+count is widened to 64 bits and read unsigned, so a negative one arrives as a very large one; the
+byte size is computed with an overflow-checked multiply and add, so a count that would wrap cannot
+allocate a small buffer that is then written past; and a failed allocation traps rather than handing
+back a null the elements are stored through. All three are `§Indexing`'s trap, for `§Indexing`'s
+reason.
+
 ## Indexing
 
 `a[i]` reads the element, and it is a **place** — so `a[i] = v`, `a[i] += 1`, `a[i]++`, and
@@ -178,13 +220,26 @@ implementation:
 
 ## Not yet
 
-- **Growable arrays** — `append`, capacity, a `[]T` that owns rather than views. Needs an
-  allocator and a decision about whether growth is a library type or a language one. The cost is
-  not only inside a function: it reaches the **signature**. `guide/png`'s `decode` takes three
-  slices, and two of them are its own intermediate stages — somewhere to gather compressed data,
-  somewhere to unpack it to — because it cannot make either for itself. The caller must therefore
-  size both, and the sizes are not knowable until the file's header has been read, which happens
-  inside. A decoder that could grow its own buffers would take one slice and return an image.
+- **Growth** — `append`, and a length that changes after the storage exists. `§Storage sized while
+  running` settles the half that reached signatures: a view may own its elements, so a function
+  sizes its own buffers and returns one. What is left is the question that decides the rest, which
+  is **what an append does to the other views of the same storage**. Go's answer — write in place
+  while the capacity lasts, reallocate silently when it does not — is why a Go program can hold two
+  slices that agree until one of them grows. sysl cannot reproduce the memory-unsafe half of that
+  (an earlier view retains its own storage, so it stays valid), but it would reproduce the
+  confusion, and a container whose aliases quietly stop agreeing is not worth an `append`. The other
+  answer is that a growable array is a **reference** — one object every alias reaches through, so a
+  push is visible to all of them, which is what `&T` already means and needs no new rule. That is
+  the likely shape; it is not yet decided, and neither is whether the thing is written in the
+  language or in a library once the language can express a destructor.
+- **A library container at all.** Growth is above rather than here because a library cannot yet
+  reach it: a `Vec[T]` written in sysl would need storage sized from `sizeof(T)` over a type
+  parameter, a cast to reach the elements through it, and — the one that decides it — **a
+  destructor**, so the storage is returned when the last holder goes. The language has exactly one
+  destructor, the deallocation hook every ARC box carries (`03`), and no way to write another. So a
+  container in a library is not a smaller feature than a container in the language: it is that
+  feature plus `Drop`, plus `sizeof` over a parameter, plus a pointer cast — which is opening the
+  unsafe tier to generic code to get to something ARC already does.
 - **A generic container making its own storage.** The repeat form `[v; n]` (`§Writing one down`)
   settles the concrete half of this: an `enum` has no zero value, but `[Empty; 16]` needs none. What
   is left is the generic half — a `[16]K` still cannot be declared *whatever* `K` is, because a

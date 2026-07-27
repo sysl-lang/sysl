@@ -30,12 +30,15 @@
 //     The array bounds were the other half, and they were answered by `const`. Every one of them
 //     names a number the format chose — `[max_lit + max_dist]u8` where this first said `[320]u8`
 //     and meant "286 + 30, rounded up".
-//   * **A decoder's intermediate storage is in its signature.** `decode` takes three buffers,
-//     and two of them are its own internals: somewhere to gather the compressed data, somewhere to
-//     unpack it to. With no growable collection the caller supplies both, in sizes it cannot work
-//     out without reading the header, which is inside. This is the JSON program's missing `[]T`
-//     again, but the consequence is new — it is not awkward *inside* a function, it is visible in
-//     the API.
+//   * **A decoder's intermediate storage was in its signature.** `decode` took three buffers, and
+//     two of them were its own internals: somewhere to gather the compressed data, somewhere to
+//     unpack it to. The caller had to supply both, in sizes it could not work out without reading
+//     the header — which happens inside — so the finding was not that a function was awkward but
+//     that the gap was visible in the API, and there was a `NoRoom` fault whose only cause was the
+//     signature. Answered: an array form written where a `[]T` is expected makes storage of its own
+//     and the view owns it, so a length may be computed rather than declared. `decode` now takes a
+//     file and returns an image, `NoRoom` is gone, and the two checks that existed to provoke it
+//     are gone with it.
 //   * **`Result[unit, E]` was missing here too**, in a program with nothing else in common with a
 //     parser. Eight functions across the two modules returned `Result[bool, Fault]` with a `bool`
 //     nobody read. The compiler front end that found this first made it look like a property of
@@ -168,22 +171,18 @@ end crowded
 
 header(label: string, file: string, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
         Ok(img) -> same(label, f"${img.width}%dx${img.height}%d type ${img.kind}%d", want)
 end header
 
 pixel(label: string, file: string, x: usize, y: usize, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
         Ok(img) ->
             var p = img.at(x, y)
@@ -195,11 +194,9 @@ end pixel
 // than sixty, because sixty checks of the same shape say nothing sixty times.
 sweep(label: string, file: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
         Ok(img) ->
             var wrong = 0
@@ -218,11 +215,9 @@ end sweep
 // wrongly, or a row were read at the wrong offset, the picture would say so.
 art(label: string, file: string, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
         Ok(img) ->
             var out = ""
@@ -241,23 +236,19 @@ end art
 
 broken(label: string, file: string, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Ok(img) -> print(s"FAIL  $label decoded")
         Err(f) -> same(label, describe(f), want)
 end broken
 
 cut(label: string, file: string, keep: usize, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
 
     unhex(file, src[..])
 
-    decode(src[..<keep], zbuf[..], raw[..]) match
+    decode(src[..<keep]) match
         Ok(img) -> print(s"FAIL  $label decoded")
         Err(f) -> same(label, describe(f), want)
 end cut
@@ -265,13 +256,11 @@ end cut
 // One byte changed and nothing else, so the checksum notices.
 scratched(label: string, file: string, at: usize, value: u8, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
     src[at] = value
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Ok(img) -> print(s"FAIL  $label decoded")
         Err(f) -> same(label, describe(f), want)
 end scratched
@@ -279,14 +268,12 @@ end scratched
 // One byte changed and the checksum put back, so the reader has to be the one that objects.
 edited(label: string, file: string, at: usize, value: u8, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
     src[at] = value
     reseal(src[..], 8usize)
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Ok(img) -> print(s"FAIL  $label decoded")
         Err(f) -> same(label, describe(f), want)
 end edited
@@ -295,14 +282,12 @@ end edited
 // can object, so whatever objects does so from inside the deflate stream.
 spoiled(label: string, file: string, chunk: usize, at: usize, value: u8, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
     src[at] = value
     reseal(src[..], chunk)
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Ok(img) -> print(s"FAIL  $label decoded")
         Err(f) -> same(label, describe(f), want)
 end spoiled
@@ -311,8 +296,6 @@ end spoiled
 // is the only difference between a chunk a reader may skip and one it may not.
 renamed(label: string, file: string, at: usize, name: string, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
     for i in 0usize..<4usize
@@ -320,7 +303,7 @@ renamed(label: string, file: string, at: usize, name: string, want: string)
 
     reseal(src[..], at)
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Ok(img) -> print(s"FAIL  $label decoded")
         Err(f) -> same(label, describe(f), want)
 end renamed
@@ -328,8 +311,6 @@ end renamed
 // The same tampering, where the new name is one a reader is allowed to walk past.
 tolerated(label: string, file: string, at: usize, name: string, want: string)
     var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
     var n = unhex(file, src[..])
 
     for i in 0usize..<4usize
@@ -337,21 +318,10 @@ tolerated(label: string, file: string, at: usize, name: string, want: string)
 
     reseal(src[..], at)
 
-    decode(src[..<n], zbuf[..], raw[..]) match
+    decode(src[..<n]) match
         Err(f) -> print(s"FAIL  $label -> ${describe(f)}")
         Ok(img) -> same(label, f"${img.width}%dx${img.height}%d type ${img.kind}%d", want)
 end tolerated
-
-cramped(label: string, file: string, zroom: usize, rroom: usize, want: string)
-    var src: [256]u8
-    var zbuf: [256]u8
-    var raw: [256]u8
-    var n = unhex(file, src[..])
-
-    decode(src[..<n], zbuf[..<zroom], raw[..<rroom]) match
-        Ok(img) -> print(s"FAIL  $label decoded")
-        Err(f) -> same(label, describe(f), want)
-end cramped
 
 // ------------------------------------------------------------------------------ what to expect
 
@@ -483,5 +453,3 @@ renamed("a paletted image with no palette", paletted(), 33usize, "pLTE", "a pale
 broken("a row filtered by a rule that does not exist", badfilter(), "row 0 claims filter 5")
 spoiled("a byte of the pixel data changed", rgb(), 33usize, 45usize, 0x00u8, "the checksum says 1eef04fc and the bytes say 00f200f1")
 spoiled("the byte before it, where the codes are", rgb(), 33usize, 44usize, 0x00u8, "a match reaching 6530 bytes back, before anything was written")
-cramped("no room for the compressed data", rgb(), 4usize, 256usize, "no room left for the image")
-cramped("no room for the image", rgb(), 256usize, 4usize, "no room left for the image")

@@ -142,6 +142,61 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     ownTemp(whole, sliceTy)
   }
 
+  /** Storage for `n` elements, with one count taken for whoever is about to view it. Yields where
+   * the box is and where its elements start.
+   *
+   * A count the program computed is where the arithmetic can go wrong, so the size is built with
+   * checked arithmetic: a count that would wrap traps rather than allocating something smaller than
+   * the elements that are about to be written into it, and an allocation that fails traps rather
+   * than handing back a null those elements are then stored through. Both are `07 §Indexing`'s trap
+   * for `07 §Indexing`'s reason — the guarantee is that a program with no `*T` in it cannot fault.
+   */
+  protected def genBuffer(elem: Type, n: String): (String, String) = {
+    val bn = bufName(elem)
+    checked = true
+
+    val e1   = freshTemp(); emit(s"$e1 = getelementptr ${elem.llvm}, ptr null, i64 1")
+    val esz  = freshTemp(); emit(s"$esz = ptrtoint ptr $e1 to i64")
+    val h1   = freshTemp(); emit(s"$h1 = getelementptr $bn, ptr null, i32 0, i32 3")
+    val hsz  = freshTemp(); emit(s"$hsz = ptrtoint ptr $h1 to i64")
+
+    val mul   = freshTemp(); emit(s"$mul = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 $n, i64 $esz)")
+    val bytes = freshTemp(); emit(s"$bytes = extractvalue { i64, i1 } $mul, 0")
+    val over1 = freshTemp(); emit(s"$over1 = extractvalue { i64, i1 } $mul, 1")
+    val add   = freshTemp(); emit(s"$add = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 $bytes, i64 $hsz)")
+    val total = freshTemp(); emit(s"$total = extractvalue { i64, i1 } $add, 0")
+    val over2 = freshTemp(); emit(s"$over2 = extractvalue { i64, i1 } $add, 1")
+    val over  = freshTemp(); emit(s"$over = or i1 $over1, $over2")
+    val fits  = freshTemp(); emit(s"$fits = xor i1 $over, true")
+    trapUnless(fits, "size")
+
+    val p   = freshTemp(); emit(s"$p = call ptr @malloc(i64 $total)")
+    val got = freshTemp(); emit(s"$got = icmp ne ptr $p, null")
+    trapUnless(got, "alloc")
+
+    emit(s"store i64 1, ptr $p")
+    val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
+    emit(s"store ptr ${dropBufFn(elem)}, ptr $hook")
+    val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr $p, i32 0, i32 2")
+    emit(s"store i64 $n, ptr $lenp")
+    val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr $p, i32 0, i32 3")
+
+    (p, data)
+  }
+
+  /** The view of a whole buffer: the box keeps the elements alive, and the one count it was made
+   * with is the count this view holds.
+   */
+  protected def bufferView(sliceTy: Type.Slice, box: String, data: String, n: String): String = {
+    maybeHeap = true
+
+    val withOwner = freshTemp(); emit(s"$withOwner = insertvalue ${sliceTy.llvm} zeroinitializer, ptr $box, 0")
+    val withPtr   = freshTemp(); emit(s"$withPtr = insertvalue ${sliceTy.llvm} $withOwner, ptr $data, 1")
+    val whole     = freshTemp(); emit(s"$whole = insertvalue ${sliceTy.llvm} $withPtr, i64 $n, 2")
+
+    ownTemp(whole, sliceTy)
+  }
+
   /** An index at 64 bits, keeping its signedness so a negative one stays negative through the
    * widening and then fails the unsigned bounds test.
    */

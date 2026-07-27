@@ -145,6 +145,11 @@ private class Escape(program: TProgram) {
       case TEnumNew(_, _, args) => args.exists(viewsFrame)
       case TArrayLit(elems, _)  => elems.exists(viewsFrame)
       case TArrayFill(v, _)     => viewsFrame(v)
+      // The storage a buffer form makes is its own and outlives every frame, so the view it yields
+      // is never the frame's — but what it was filled *with* may still be, which is the same rule
+      // the two array forms above follow and the same route out.
+      case TBufLit(elems, _)    => elems.exists(viewsFrame)
+      case TBufFill(v, _, _)    => viewsFrame(v)
       case TField(r, _, _)      => viewsFrame(r)
       case TIndex(r, _, _)      => viewsFrame(r)
       case TBytes(r)            => viewsFrame(r)
@@ -242,8 +247,8 @@ private class Escape(program: TProgram) {
         escape = Some(
           Diagnostic.render(
             s"a slice of an array this frame owns $how, so it would outlive the array — " +
-              "put the storage on the heap as '&[N]T', or return a length and let the caller " +
-              "slice its own buffer",
+              "declare the storage as a '[]T', which makes a buffer of its own and owns it, " +
+              "or as a '&[N]T' where the length is fixed",
             at.pos,
           ),
         )
@@ -324,6 +329,8 @@ private class Escape(program: TProgram) {
     case TEnumTry(v, _, _, _, _)    => List(v)
     case TArrayLit(elems, _)        => elems
     case TArrayFill(v, _)           => List(v)
+    case TBufLit(elems, _)          => elems
+    case TBufFill(v, n, _)          => List(v, n)
     case TIndex(r, i, _)            => List(r, i)
     case TLen(r)                    => List(r)
     case TBytes(r)                  => List(r)

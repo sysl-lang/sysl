@@ -44,6 +44,14 @@ case class TZero(ty: Type) extends TExpr
 case class TArrayLit(elems: List[TExpr], arrayTy: Type.Array) extends TExpr { def ty: Type = arrayTy }
 case class TArrayFill(value: TExpr, arrayTy: Type.Array)      extends TExpr { def ty: Type = arrayTy }
 
+/** The same two forms written where a `[]T` was expected: storage of the program's own, and a view
+ * of all of it. The count of a `TBufFill` is an ordinary expression rather than part of a type,
+ * which is the whole reason these exist — an array's length is fixed when it is compiled, and a
+ * length read out of a file is not (`07 §Storage sized while running`).
+ */
+case class TBufLit(elems: List[TExpr], sliceTy: Type.Slice) extends TExpr { def ty: Type = sliceTy }
+case class TBufFill(value: TExpr, count: TExpr, sliceTy: Type.Slice) extends TExpr { def ty: Type = sliceTy }
+
 /** `a[i]` — one element of an array, slice, or string, checked against the length. It is a
  * *place* when its receiver is one, which is what makes `a[i] = v` and `&a[i]` ordinary.
  */

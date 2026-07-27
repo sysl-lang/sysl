@@ -37,6 +37,16 @@ trait Emitter {
    */
   protected val boxes = mutable.LinkedHashMap.empty[String, Type]
 
+  /** Buffer layouts to declare, keyed the same way. A buffer carries its element count, since the
+   * elements it holds are only reachable from the hook that destroys them.
+   */
+  protected val bufs = mutable.LinkedHashMap.empty[String, Type]
+
+  /** Whether the module sizes an allocation from something it computed, and so needs the checked
+   * arithmetic that keeps a count from wrapping into a buffer too small for it.
+   */
+  protected var checked = false
+
   /** Runtime helpers (retain, release, destructors) to emit, generated on demand. Generating one
    * may ask for another, so they are queued rather than emitted inline.
    */

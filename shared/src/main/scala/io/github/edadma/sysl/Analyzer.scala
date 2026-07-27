@@ -604,6 +604,15 @@ class Analyzer private (units: List[Program])
   /** Whether a context of this type converts what it is given rather than simply requiring it. */
   private def converts(want: Type): Boolean = Type.erased(want) || want.isInstanceOf[Type.Ref]
 
+  /** What an array form's elements should be analyzed as, given what the form itself is expected to
+   * produce. A `string` is not on the list: its elements are bytes, but writing one is a validity
+   * question rather than an arrangement of elements.
+   */
+  private def elementWanted(want: Type): Option[Type] = want match
+    case Type.Array(_, e) => Some(e)
+    case Type.Slice(e)    => Some(e)
+    case _                => None
+
   /** Whether an expression yields its value through branches rather than producing one itself. */
   private def branching(expr: Expr): Boolean = expr match
     case _: IfExpr | _: MatchExpr | _: While | _: For => true
@@ -875,7 +884,7 @@ class Analyzer private (units: List[Program])
         case other                        => err(s"cannot read field '$f' of ${show(other)}")
 
     case ArrayLit(elems) =>
-      val elemExp = expected.collect { case Type.Array(_, e) => e }
+      val elemExp = expected.flatMap(elementWanted)
       val ts      = elems.map(analyzeExpr(_, elemExp))
 
       for t <- ts do
@@ -886,24 +895,44 @@ class Analyzer private (units: List[Program])
       val elemTy = ts.headOption.map(_.ty).orElse(elemExp).getOrElse(
         err("an empty array literal takes its element type from its context, and there is none here"),
       )
-      TArrayLit(ts, Type.Array(ts.length, elemTy))
+
+      expected match
+        case Some(Type.Slice(_)) => TBufLit(ts, Type.Slice(elemTy))
+        case _                   => TArrayLit(ts, Type.Array(ts.length, elemTy))
 
     // `[v; n]` — the form for an array whose element type has no zero, or has one that is not the
-    // wanted starting value. The count is a compile-time constant for the same reason an array
-    // bound is: it is part of the type. The value is evaluated **once** and copied into every
-    // element, which is what makes `[f(); 8]` mean one call rather than eight.
+    // wanted starting value. The value is evaluated **once** and copied into every element, which
+    // is what makes `[f(); 8]` mean one call rather than eight.
+    //
+    // What is being asked for decides which of the two things this is (`07 §Storage sized while
+    // running`). Under a `[N]T` the count is part of the type and so a compile-time constant; under
+    // a `[]T` the length is not in the type at all, so the count is an ordinary expression and the
+    // elements are storage of their own that the view owns.
     case ArrayFill(value, count) =>
-      val elemExp = expected.collect { case Type.Array(_, e) => e }
+      val elemExp = expected.flatMap(elementWanted)
       val tv      = analyzeExpr(value, elemExp)
 
       if Type.noValue(tv.ty) then err(s"an array cannot hold ${show(tv.ty)} values")
 
-      val n = constInt(count) match
-        case Some(v) if v >= 0 && v.isValidInt => v.toInt
-        case Some(v)                           => err(s"an array cannot have $v elements")
-        case None => err("an array's repeat count must be a constant — a literal, or a 'const' naming one")
+      expected match
+        case Some(Type.Slice(_)) =>
+          val tc = analyzeExpr(count)
 
-      TArrayFill(tv, Type.Array(n, tv.ty))
+          if !tc.ty.isInstanceOf[Type.Integer] then
+            err(s"a repeat count is a number of elements, and ${show(tc.ty)} is not an integer")
+
+          TBufFill(tv, tc, Type.Slice(tv.ty))
+
+        case _ =>
+          val n = constInt(count) match
+            case Some(v) if v >= 0 && v.isValidInt => v.toInt
+            case Some(v)                           => err(s"an array cannot have $v elements")
+            case None =>
+              err("an array's repeat count must be a constant, since it is the array's bound — a " +
+                "literal, or a 'const' naming one. A count computed while running makes storage " +
+                "instead, which is written where a '[]T' is expected")
+
+          TArrayFill(tv, Type.Array(n, tv.ty))
 
     // A range subscript takes a view. The receiver is left *undereferenced* on purpose: for a
     // heap array the reference is both where the elements are and what keeps them alive, and

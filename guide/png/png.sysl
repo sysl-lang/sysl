@@ -31,7 +31,6 @@ enum Fault
     NoEnd
     BadFilter(f: u8, row: usize)
     Squashed(f: inflate.Fault)
-    NoRoom
     WrongSize(want: usize, got: usize)
 end Fault
 
@@ -53,7 +52,6 @@ describe(f: Fault) -> string
         NoEnd -> "the last chunk is not the end chunk"
         BadFilter(f, row) -> s"row ${str(row)} claims filter ${str(f)}"
         Squashed(e) -> inflate.describe(e)
-        NoRoom -> "no room left for the image"
         WrongSize(want, got) -> s"the rows need ${str(want)} bytes and the data unpacks to ${str(got)}"
 end describe
 
@@ -158,16 +156,21 @@ private name_of(b: []u8, at: usize) -> string
     s
 end name_of
 
-// Read a file. `zbuf` collects the compressed data, which arrives in as many pieces as the encoder
-// felt like using; `raw` receives what it unpacks to, and the returned image views it.
+// Read a file. The two intermediate stages — somewhere to gather the compressed data, somewhere to
+// unpack it to — are this function's own, so the signature is a file in and an image out.
 //
-// Three buffers in a signature is what a language with no growable collection looks like from the
-// outside. The decoder's two intermediate stages are the caller's problem, in the caller's frame,
-// and the sizes it needs are not knowable until the header has been read — which is inside.
-decode(src: []u8, zbuf: []u8, raw: []u8) -> Result[Image, Fault]
+// This used to take three slices, because neither stage could be sized without reading a header
+// that is read *here*: the caller had to size both and be told `NoRoom` when it guessed low. Both
+// are now storage declared as a `[]T`, which is the form that takes a length computed while
+// running. `zbuf` is sized at the whole file, which is an upper bound rather than a guess — every
+// byte it gathers is a byte of `src` — and `raw` is sized exactly, from a header that by then has
+// been read.
+decode(src: []u8) -> Result[Image, Fault]
     var signature = [137u8, 80u8, 78u8, 71u8, 13u8, 10u8, 26u8, 10u8]
 
     if src.len < 8 then return Err(NotPng)
+
+    var zbuf: []u8 = [0; src.len]
 
     for i in 0..<8
         if src[i] != signature[i] then return Err(NotPng)
@@ -211,8 +214,6 @@ decode(src: []u8, zbuf: []u8, raw: []u8) -> Result[Image, Fault]
         else if named(src, at + 4, "PLTE")
             palette = body
         else if named(src, at + 4, "IDAT")
-            if zn + len > zbuf.len then return Err(NoRoom)
-
             for i in 0..<len
                 zbuf[zn + i] = body[i]
 
@@ -234,17 +235,16 @@ decode(src: []u8, zbuf: []u8, raw: []u8) -> Result[Image, Fault]
     var channels = channels_of(kind)
     var stride = 1usize + width * channels
     var need = stride * height
+    var raw: []u8 = [0; need]
 
-    if need > raw.len then return Err(NoRoom)
-
-    inflate.zlib(zbuf[..<zn], raw[..<need]) match
+    inflate.zlib(zbuf[..<zn], raw) match
         Err(e) -> return Err(Squashed(e))
         Ok(n) ->
             if n != need then return Err(WrongSize(need, n))
 
-    unfilter(raw[..<need], stride, height, channels)?
+    unfilter(raw, stride, height, channels)?
 
-    Ok(Image(width, height, kind, raw[..<need], palette))
+    Ok(Image(width, height, kind, raw, palette))
 end decode
 
 // Undo the per-row filters, in place. Each row was encoded as the difference between its samples

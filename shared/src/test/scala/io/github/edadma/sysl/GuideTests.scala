@@ -83,7 +83,9 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
     val out = guide("png")
 
     out should not include "FAIL"
-    checks(out) shouldBe 84
+    // 82 rather than the 84 this once had: `decode` sizes its own intermediate buffers now, so the
+    // two checks that made a caller supply one too small have nothing left to provoke.
+    checks(out) shouldBe 82
     sections(out) shouldBe List(
       "-- checksums",
       "-- deflate",
