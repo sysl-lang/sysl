@@ -338,6 +338,11 @@ trait AnalyzerBase {
    */
   protected val constrainedInsts = mutable.LinkedHashMap.empty[String, Type.Constrained]
 
+  /** The function key a `where` predicate is synthesised under, derived from the subtype's key. The
+   * `$` keeps it clear of any name a program could write, so it never collides with a user function.
+   */
+  protected def predKey(typeKey: String): String = s"$typeKey$$pred"
+
   /** Declared constants by key (`13 §7`). A constant is folded into each use and has no storage, so
    * this table is read by the analyzer and never by codegen — there is nothing downstream to emit.
    */

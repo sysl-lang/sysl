@@ -228,10 +228,10 @@ trait TypeResolution extends ImportResolution {
         err(s"'${qn(key)}' has no constraint — add a 'within' range or a 'where' predicate, or 'new' to " +
           "make it a distinct type")
 
-      if d.pred.isDefined then err("'where' predicates are not supported yet")
       if d.derived then err("'new' derived types are not supported yet")
 
-      Type.Constrained(key, base, d.derived, lo, hi, d.range.exists(_.exclusiveHi), predFn = None)
+      val predFn = if d.pred.isDefined then Some(predKey(key)) else None
+      Type.Constrained(key, base, d.derived, lo, hi, d.range.exists(_.exclusiveHi), predFn)
     }
   }
 

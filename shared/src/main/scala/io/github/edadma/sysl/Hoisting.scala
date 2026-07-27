@@ -196,6 +196,20 @@ trait Hoisting extends TypeResolution {
       for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
         err(s"'$s' is not a symbol a linker can resolve")
 
+    // A `where` predicate becomes an ordinary function `<Type>$pred(value: Base) -> bool`, so it is
+    // analyzed and emitted through the same path every function takes; the check site calls it by
+    // the key `predKey` gives it. It is registered here, in the pass that fills the function tables,
+    // rather than at the check, so the predicate is type-checked whether or not the type is used.
+    case t: TypeDecl if t.pred.isDefined =>
+      val key  = Modules.qualify(currentModule, t.name)
+      val pkey = predKey(key)
+
+      funcDecls(pkey) = FuncDecl(pkey, Nil, List(Param("value", t.base)), Some(NamedType("bool")),
+        List(ExprStmt(t.pred.get)), Map.empty, variadic = false).setPos(t.pos)
+      declScope(pkey) = currentScope
+      funcInsts(pkey) =
+        (List(("value", recover(Type.Unknown)(resolveType(t.base, Map.empty)))), Type.Bool)
+
     case _ =>
 
   /** Records how far a declaration is visible, for the modifier it was written with (`13 §2`).

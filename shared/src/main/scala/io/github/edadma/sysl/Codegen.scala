@@ -527,6 +527,12 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     case TConstrainedCheck(value, target) =>
       val v = genExpr(value)
       emitRangeChecks(v, target)
+      // A `where` predicate is a synthesised `i1`-returning function over the base value; it traps
+      // exactly as the range does when it answers false.
+      for pf <- target.predFn do
+        val r = freshTemp()
+        emit(s"$r = call i1 @$pf(${Type.underlying(target.base).llvm} $v)")
+        trapUnless(r, "where")
       v
 
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.

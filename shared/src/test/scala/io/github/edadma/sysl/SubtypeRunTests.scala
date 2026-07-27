@@ -103,4 +103,42 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport {
   "a subtype value used as its base needs no cast" in {
     run(Age + "var a: Age = 12\nvar n: int = a\nprint(n + 1)") shouldBe "13\n"
   }
+
+  "a where predicate is checked at each produce site" - {
+    val Even = "type Even = int within 0..100 where value % 2 == 0\n"
+
+    "a value satisfying both the range and the predicate passes" in {
+      run(Even + "var e: Even = 8\nprint(e)") shouldBe "8\n"
+    }
+    "a value the predicate rejects traps" in {
+      exits(Even + "print(Even(7))")
+    }
+    "a value the range rejects traps before the predicate would even matter" in {
+      exits(Even + "print(Even(200))")
+    }
+
+    // A predicate with no range is a legal transparent subtype on its own.
+    "a predicate-only subtype checks just the predicate" - {
+      val Positive = "type Positive = int where value > 0\n"
+
+      "an accepted value passes" in {
+        run(Positive + "print(Positive(5))") shouldBe "5\n"
+      }
+      "a rejected value traps" in {
+        exits(Positive + "print(Positive(0))")
+      }
+    }
+
+    // `char` has no arithmetic, but its predicate may still test equality and ordering.
+    "a char predicate uses comparison rather than arithmetic" - {
+      val Hex = "type HexDigit = char where value >= '0' && value <= '9'\n"
+
+      "an accepted character passes" in {
+        run(Hex + "print(HexDigit('7'))") shouldBe "7\n"
+      }
+      "a rejected character traps" in {
+        exits(Hex + "print(HexDigit('x'))")
+      }
+    }
+  }
 }
