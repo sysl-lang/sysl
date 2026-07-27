@@ -33,8 +33,11 @@ trait VtableEmitter extends ArcEmitter {
   private def adapter(vt: TVtable, slot: TVSlot): String = {
     val name    = s"vt.adapt.${if vt.boxed then "ref." else ""}${slot.target}"
     val ret     = if Type.noValue(slot.retTy) then "void" else slot.retTy.llvm
-    val declare = slot.params.zipWithIndex.map { case (t, i) => s"${t.llvm} %a$i" }
-    val pass    = slot.params.zipWithIndex.map { case (t, i) => s"${t.llvm} %a$i" }
+    // A zero-sized parameter is not in the implementation's signature, so it is not in the
+    // adapter's either — the two have to agree, and the argument was never a word to forward.
+    val forwarded = slot.params.zipWithIndex.filterNot((t, _) => Type.zeroSized(t))
+    val declare   = forwarded.map { case (t, i) => s"${t.llvm} %a$i" }
+    val pass      = forwarded.map { case (t, i) => s"${t.llvm} %a$i" }
 
     request(name) {
       inFunction(s"define private $ret @$name(${("ptr %d" :: declare).mkString(", ")})") {

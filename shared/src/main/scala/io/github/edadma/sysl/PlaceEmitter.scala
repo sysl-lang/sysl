@@ -23,10 +23,15 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // is what makes indexing one reach into the table rather than copy it out first.
     case TGlobal(symbol, _) => s"@$symbol"
     case TDeref(operand, _) => payloadAddr(operand)
+    // A zero-sized field occupies nothing, so it is wherever its receiver is: the address is never
+    // read or written through, and handing back the receiver's keeps the walk to it — and whatever
+    // that walk evaluates — exactly as it is for every other field.
+    case TField(receiver, _, ty) if Type.zeroSized(ty) => address(receiver)
+
     case TField(receiver, index, _) =>
       val base = address(receiver)
       val r    = freshTemp()
-      emit(s"$r = getelementptr ${receiver.ty.llvm}, ptr $base, i32 0, i32 $index")
+      emit(s"$r = getelementptr ${receiver.ty.llvm}, ptr $base, i32 0, i32 ${fieldSlot(receiver.ty, index)}")
       r
     case TIndex(receiver, index, _) => elementAddr(receiver, index)
 
@@ -37,6 +42,13 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       val slot = emitAlloca(freshTemp(), other.ty.llvm)
       emit(s"store ${other.ty.llvm} ${genExpr(other)}, ptr $slot")
       slot
+
+  /** Where a written field index lands in the emitted aggregate, once the zero-sized fields before
+   * it are dropped.
+   */
+  protected def fieldSlot(recvTy: Type, index: Int): Int = recvTy match
+    case s: Type.Struct => s.slot(index)
+    case _              => index
 
   /** The address of one element, after checking that it exists. An array is indexed from its
    * own storage; a slice is indexed from the pointer it carries.
@@ -157,9 +169,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         case None => tagged
         case Some(slot) =>
           var payload = "undef"
-          for (v, i) <- vals.zipWithIndex do
+          for (v, i) <- vals.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
             val r = freshTemp()
-            emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, ${variant.fields(i)._2.llvm} $v, $i")
+            emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, " +
+              s"${variant.fields(i)._2.llvm} $v, ${variant.slot(i)}")
             payload = r
           val r = freshTemp()
           emit(s"$r = insertvalue ${en.llvm} $tagged, ${en.payloadLlvm(variant)} $payload, $slot")
@@ -222,9 +235,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         val p = freshTemp()
         emit(s"$p = extractvalue ${en.llvm} $value, $slot")
         variant.fields.indices.map { i =>
-          val f = freshTemp()
-          emit(s"$f = extractvalue ${en.payloadLlvm(variant)} $p, $i")
-          f
+          if Type.zeroSized(variant.fields(i)._2) then ""
+          else
+            val f = freshTemp()
+            emit(s"$f = extractvalue ${en.payloadLlvm(variant)} $p, ${variant.slot(i)}")
+            f
         }.toList
 
   /** `expr?` — on success the payload becomes the expression's value; on failure the function

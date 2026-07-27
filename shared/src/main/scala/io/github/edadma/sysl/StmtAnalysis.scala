@@ -159,7 +159,6 @@ trait StmtAnalysis extends TypeResolution {
     case VarDecl(name, typOpt, Some(init)) =>
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
-      if ti.ty == Type.Unit then err(s"cannot bind '$name' to a unit value")
       // A binding needs a value to hold, and an initializer that does not finish never produces
       // one — the code after it is unreachable, so the declaration is a mistake rather than a
       // clever way to spell divergence.
@@ -175,7 +174,6 @@ trait StmtAnalysis extends TypeResolution {
     case ValDecl(name, typOpt, init, _) =>
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
-      if ti.ty == Type.Unit then err(s"cannot bind '$name' to a unit value")
       if ti.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
       val declTy = declared.getOrElse(ti.ty)
       if declared.isDefined && declTy != ti.ty then

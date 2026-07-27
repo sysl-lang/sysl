@@ -70,7 +70,7 @@ private keyword(w: string) -> bool =
 // offers. `Lexer` beside it is `private[compiler]`, which is the module-wide level — the one the
 // other file needs and importers still do not get.
 //
-// **Every step below returns `Result[bool, Fault]`, and the `bool` means nothing.** A parse step
+// **Every step below returns `Result[unit, Fault]`, and the `bool` means nothing.** A parse step
 // emits code and yields no value, so what it wants to say is `Result[unit, Fault]` — which cannot
 // be written, because `unit` is not a layout and so is not a type argument (`00 §12`). The choice
 // is a placeholder payload, kept here so that `?` still chains the failures, or an `Option[Fault]`
@@ -119,8 +119,8 @@ private struct Parser
         true
     end eat_word
 
-    need_sym(*self, s: string) -> Result[bool, Fault]
-        if self.eat_sym(s) then Ok(true)
+    need_sym(*self, s: string) -> Result[unit, Fault]
+        if self.eat_sym(s) then Ok(())
         else Err(self.fault(s"'$s'"))
     end need_sym
 
@@ -159,15 +159,15 @@ private struct Parser
 
     // ---------------------------------------------------------------------------- the statements
 
-    program(*self) -> Result[bool, Fault]
+    program(*self) -> Result[unit, Fault]
         while !self.at_end()
             self.statement()?
 
         self.chunk.op(Op.Halt)
-        Ok(true)
+        Ok(())
     end program
 
-    statement(*self) -> Result[bool, Fault]
+    statement(*self) -> Result[unit, Fault]
         if self.eat_word("var") then self.declaration()
         else if self.eat_word("print") then self.print_stmt()
         else if self.eat_word("if") then self.if_stmt()
@@ -177,7 +177,7 @@ private struct Parser
 
     // The name is declared **after** its initializer is compiled, so `var x = x;` is the
     // undefined name it reads as rather than a variable quietly initialized from itself.
-    declaration(*self) -> Result[bool, Fault]
+    declaration(*self) -> Result[unit, Fault]
         var where = self.at
         var n = self.need_name()?
 
@@ -189,10 +189,10 @@ private struct Parser
 
         self.chunk.op(Op.Store)
         self.chunk.slot(slot)
-        Ok(true)
+        Ok(())
     end declaration
 
-    assignment(*self) -> Result[bool, Fault]
+    assignment(*self) -> Result[unit, Fault]
         var where = self.at
         var n = self.need_name()?
 
@@ -205,20 +205,20 @@ private struct Parser
             Some(slot) ->
                 self.chunk.op(Op.Store)
                 self.chunk.slot(slot)
-                Ok(true)
+                Ok(())
     end assignment
 
-    print_stmt(*self) -> Result[bool, Fault]
+    print_stmt(*self) -> Result[unit, Fault]
         self.expr()?
         self.need_sym(";")?
         self.chunk.op(Op.Print)
-        Ok(true)
+        Ok(())
     end print_stmt
 
     // The conditional jump over the consequence is emitted before the consequence exists, so its
     // target is written as a zero and corrected once there is somewhere to land. An `else` needs a
     // second jump, over the alternative, for the consequence to leave by.
-    if_stmt(*self) -> Result[bool, Fault]
+    if_stmt(*self) -> Result[unit, Fault]
         self.expr()?
         self.chunk.op(Op.Jz)
 
@@ -239,12 +239,12 @@ private struct Parser
         else
             self.chunk.patch(over_then, self.chunk.here())
 
-        Ok(true)
+        Ok(())
     end if_stmt
 
     // A loop tests at the top and jumps back to the test, so the condition is compiled where it
     // will be re-entered and its address is the only one known before the body exists.
-    while_stmt(*self) -> Result[bool, Fault]
+    while_stmt(*self) -> Result[unit, Fault]
         var top = self.chunk.here()
 
         self.expr()?
@@ -257,17 +257,17 @@ private struct Parser
         self.chunk.op(Op.Jmp)
         self.chunk.target(top)
         self.chunk.patch(out, self.chunk.here())
-        Ok(true)
+        Ok(())
     end while_stmt
 
-    block(*self) -> Result[bool, Fault]
+    block(*self) -> Result[unit, Fault]
         self.need_sym("{")?
         while !self.at_sym("}")
             if self.at_end() then return Err(Expected(self.at, "'}'"))
             self.statement()?
 
         self.advance()
-        Ok(true)
+        Ok(())
     end block
 
     need_name(*self) -> Result[string, Fault]
@@ -285,16 +285,16 @@ private struct Parser
 
     // Comparison binds loosest and does not chain: `a < b < c` is a mistake caught here rather
     // than a pair of comparisons whose middle operand means something surprising.
-    expr(*self) -> Result[bool, Fault]
+    expr(*self) -> Result[unit, Fault]
         self.sum()?
 
         self.compare_op() match
-            None -> Ok(true)
+            None -> Ok(())
             Some(code) ->
                 self.advance()
                 self.sum()?
                 self.chunk.op(code)
-                Ok(true)
+                Ok(())
     end expr
 
     compare_op(self) -> Option[Op]
@@ -310,7 +310,7 @@ private struct Parser
             else -> None
     end compare_op
 
-    sum(*self) -> Result[bool, Fault]
+    sum(*self) -> Result[unit, Fault]
         self.term()?
 
         loop
@@ -322,10 +322,10 @@ private struct Parser
                 self.chunk.op(Op.Sub)
             else break
 
-        Ok(true)
+        Ok(())
     end sum
 
-    term(*self) -> Result[bool, Fault]
+    term(*self) -> Result[unit, Fault]
         self.unary()?
 
         loop
@@ -340,17 +340,17 @@ private struct Parser
                 self.chunk.op(Op.Mod)
             else break
 
-        Ok(true)
+        Ok(())
     end term
 
-    unary(*self) -> Result[bool, Fault]
+    unary(*self) -> Result[unit, Fault]
         if !self.eat_sym("-") then return self.primary()
         self.unary()?
         self.chunk.op(Op.Neg)
-        Ok(true)
+        Ok(())
     end unary
 
-    primary(*self) -> Result[bool, Fault]
+    primary(*self) -> Result[unit, Fault]
         var where = self.at
 
         self.tok match
@@ -358,7 +358,7 @@ private struct Parser
                 self.advance()
                 self.chunk.op(Op.Push)
                 self.chunk.imm(v)
-                Ok(true)
+                Ok(())
             Word(w) ->
                 if keyword(w) then return Err(Expected(where, "a value"))
                 self.advance()
@@ -367,13 +367,13 @@ private struct Parser
                     Some(slot) ->
                         self.chunk.op(Op.Load)
                         self.chunk.slot(slot)
-                        Ok(true)
+                        Ok(())
             Sym(s) ->
                 if s != "(" then return Err(self.fault("a value"))
                 self.advance()
                 self.expr()?
                 self.need_sym(")")?
-                Ok(true)
+                Ok(())
             else -> Err(self.fault("a value"))
     end primary
 end Parser

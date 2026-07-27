@@ -273,6 +273,20 @@ object Type {
    */
   def noValue(t: Type): Boolean = t == Unit || t == Never
 
+  /** Whether a type occupies no storage — the **layout** question, as against `noValue`'s question
+   * about a register.
+   *
+   * `unit` is zero-sized: it has one value, and that value is nothing at all, so a field of it is
+   * not a field, a parameter of it is not an argument, and a binding of it is not a slot. Each is
+   * skipped where the layout is built, with whatever follows shifted up, and nothing is emitted to
+   * read or write one. That is what lets `Result[unit, E]` be written.
+   *
+   * `never` is deliberately **not** here. It has no values at all, so a field of it could never be
+   * given one; skipping its layout would leave a type nobody can construct, which is a different
+   * thing from one that costs nothing to construct.
+   */
+  def zeroSized(t: Type): Boolean = t == Unit
+
   def isNumeric(t: Type): Boolean = t match
     case _: Integer | _: Floating => true
     case _                        => false
@@ -354,6 +368,16 @@ object Type {
 
     def fieldType(field: String): Option[Type] = fields.find(_._1 == field).map(_._2)
 
+    /** The fields that occupy storage, in order. A zero-sized field is not one of them, so this is
+     * what the emitted aggregate is made of.
+     */
+    def stored: List[(String, Type)] = Type.stored(fields)
+
+    /** Where the field written `i`th lands in the emitted aggregate. Undefined for a zero-sized
+     * field, which lands nowhere — nothing reads or writes one, so nothing asks.
+     */
+    def slot(i: Int): Int = Type.slot(fields, i)
+
     override def equals(other: Any): Boolean = other match
       case s: Struct => s.base == base && s.targs == targs
       case _         => false
@@ -370,7 +394,20 @@ object Type {
    *   - `payloadSlot` is the index of this variant's payload inside the enum aggregate, present
    *     only for data variants that carry fields.
    */
-  case class EnumVariant(name: String, tag: Int, fields: List[(String, Type)], payloadSlot: Option[Int])
+  case class EnumVariant(name: String, tag: Int, fields: List[(String, Type)], payloadSlot: Option[Int]) {
+
+    /** The payload fields that occupy storage, and where each written field lands among them — the
+     * same skipping a struct does, so `Ok(())` carries a payload aggregate with nothing in it.
+     */
+    def stored: List[(String, Type)] = Type.stored(fields)
+    def slot(i: Int): Int            = Type.slot(fields, i)
+  }
+
+  /** The members of a field list that occupy storage. */
+  def stored(fields: List[(String, Type)]): List[(String, Type)] = fields.filterNot((_, t) => zeroSized(t))
+
+  /** Where the `i`th written field lands once the zero-sized ones before it are dropped. */
+  def slot(fields: List[(String, Type)], i: Int): Int = fields.take(i).count((_, t) => !zeroSized(t))
 
   /** An enum. A *simple* enum (every variant dataless) lowers to `i32`; a *data* enum lowers to
    * a value aggregate `{ i32 tag, payload₁, payload₂, … }` with one payload slot per

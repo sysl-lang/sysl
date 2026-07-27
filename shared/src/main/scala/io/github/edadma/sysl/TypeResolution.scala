@@ -148,32 +148,28 @@ trait TypeResolution extends ImportResolution {
 
   private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
     case PtrType(inner) =>
-      traitObject(inner, subst, "*").fold(Type.Ptr(underIndirection(resolveType(inner, subst))))(Type.Ptr.apply)
+      traitObject(inner, subst, "*")
+        .fold(Type.Ptr(addressable(underIndirection(resolveType(inner, subst)), "'*'")))(Type.Ptr.apply)
     case RefType(inner, sync) =>
       traitObject(inner, subst, "&")
-        .fold(Type.Ref(underIndirection(resolveType(inner, subst)), sync))(Type.Ref(_, sync))
+        .fold(Type.Ref(addressable(underIndirection(resolveType(inner, subst)), "'&'"), sync))(Type.Ref(_, sync))
 
     // An array holds its elements, so it is no indirection at all and a type cannot contain an
     // array of itself. A slice only points at them, so it breaks a cycle exactly as `*T` does.
-    case ArrayType(None, elem) => Type.Slice(underIndirection(resolveType(elem, subst)))
+    case ArrayType(None, elem) => Type.Slice(addressable(underIndirection(resolveType(elem, subst)), "a slice"))
     // A bound is a compile-time constant, which a `const` is and a call is not (`13 §7`).
     case ArrayType(Some(len), elem) =>
       val n = constInt(len) match
         case Some(v) if v >= 0 && v.isValidInt => v.toInt
         case Some(v)                           => err(s"an array cannot have $v elements")
         case None => err("an array length must be a constant — a literal, or a 'const' naming one")
-      Type.Array(n, resolveType(elem, subst))
+      Type.Array(n, addressable(resolveType(elem, subst), "an array"))
 
     case NamedType(n, argRefs) =>
       if argRefs.isEmpty && subst.contains(n) then subst(n)
       else
         val targs = argRefs.map(resolveType(_, subst))
         scalarType(n) match
-          // `unit` is a scalar so that a result may be written as one, but it is the absence of a
-          // value, so everything reached from here — a parameter, a field, an element, a type
-          // argument — is asking it for a layout it does not have.
-          case Some(Type.Unit) if argRefs.isEmpty =>
-            err("'unit' is the type of an expression that yields no value, so it can only be a result type")
           case Some(s) => plain(n, targs, s)
           // A declared type is named in this module's terms — its own, or a module's it names in
           // full (`13 §3`) — so what the tables are asked for is the key that resolves to.
@@ -253,6 +249,18 @@ trait TypeResolution extends ImportResolution {
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
    * whatever type is currently being laid out.
    */
+  /** Holds a type to being one that can be *pointed at* or laid out in a row.
+   *
+   * A zero-sized type may be a field, a parameter, or a binding — none of those needs an address —
+   * but a `&T`, a `*T`, a slice, and an array all reach their contents through one, and there is
+   * nothing to reach. An array is the sharper case: every element would be at the same address, so
+   * a bounds check would be the only thing `a[i]` did.
+   */
+  protected def addressable(t: Type, what: String): Type =
+    if Type.zeroSized(t) then
+      err(s"${show(t)} occupies no storage, so there is nothing for $what to point at")
+    else t
+
   protected def underIndirection(resolve: => Type): Type = {
     indirection += 1
     try resolve
@@ -696,7 +704,11 @@ trait TypeResolution extends ImportResolution {
     // A zeroed view owns nothing and names no elements, which is exactly the empty slice — and,
     // for a string, the empty string, which is well-formed UTF-8 the way anything empty is.
     case _: Type.View        => true
-    case Type.Array(_, elem) => hasZero(elem)
-    case s: Type.Struct      => s.fields.forall(f => hasZero(f._2))
-    case _                   => false
+    // A zero-sized type has exactly one value, so it is trivially its own zero — there is nothing
+    // to produce and nowhere to put it. Without this a struct would lose its zero value by gaining
+    // a field that costs nothing, which is the opposite of what zero-sized means.
+    case t if Type.zeroSized(t) => true
+    case Type.Array(_, elem)    => hasZero(elem)
+    case s: Type.Struct         => s.fields.forall(f => hasZero(f._2))
+    case _                      => false
 }

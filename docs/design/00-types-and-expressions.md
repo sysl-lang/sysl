@@ -522,47 +522,66 @@ something that traps or exits.
 its open branch at it, and a loop that finishes without a value ends at it. Writing `-> unit`
 explicitly is legal and means exactly what leaving the arrow off means.
 
-**It is a scalar, so it can be named; it is not a layout, so it cannot be held.** Its one value
-occupies nothing, and a slot for a value that occupies nothing is not a slot. So `unit` shares
-`never`'s one-position rule, for the neighbouring reason — `never` has no values at all, `unit` has
-one that is nothing at all, and neither leaves a field, a parameter, or an element anything to be:
+**It is the language's zero-sized type: it has a layout, and that layout is empty.** Its one value
+occupies nothing, so a field of it is not a field, a parameter of it is not an argument, and a
+binding of it is not a slot — but none of those is an *error*. Each is skipped where the layout is
+built, and nothing is emitted to read or write one:
 
 ```
-f(x: unit)                  // no
+f(x: unit)                  // yes — dropped from the emitted signature
 struct S
-    x: unit                 // no
-var xs: [4]unit             // no
-Option[unit]                // no
-f() -> unit                 // yes — a result is the one place it stands
+    x: unit                 // yes — skipped, with the fields behind it shifted up
+Option[unit]                // yes — this is what the rule exists for
+var x = print(1)            // yes — no slot, and the call still happens
+f() -> unit                 // yes
 ```
 
-**And a unit value cannot arrive anywhere a value has to.** Binding one (`var x = print(1)`),
-assigning one, putting one in an array, comparing two, printing one, or passing one down a variadic
-tail are each an error, for the same reason the type is not a slot: there is nothing to arrive.
+This is the **layout** question, and it is deliberately separate from `never`'s. `never` has no
+values at all, so a slot of it could never be given one; `unit` has one that costs nothing to
+supply. They are not the same rule wearing two names, which is why `never` keeps every refusal
+below and `unit` keeps none of them.
 
-**Inference is held to the same rule.** A written parameter of type `unit` is refused where the
-type is resolved, but a *generic* one accepts whatever its argument turns out to be — so
-`f[T](x: T)` handed `print(1)` would otherwise instantiate at `unit` and emit a parameter for a
-value there is none of. Passing a unit value to a generic parameter is therefore an error at the
-call, and so is passing a diverging one, which would bind that parameter to `never` for the same
-empty result. A **written** parameter still takes a diverging argument (§11) — it has a layout, and
-the call is the dead code that rule already accepts.
+**What is still refused is refused for a reason other than layout:**
+
+```
+f(x: *unit)                 // no — a pointer needs something to point at
+f(x: &unit)                 // no — likewise, and a &T is never null (03)
+var xs: [4]unit             // no — every element would be at the same address
+f(a: []unit)                // no — a slice is a pointer and a count
+str(print(1))               // no — there is no rendering of nothing
+print(1) == print(2)        // no — a type with one value has no question to ask
+printf(fmt, ())             // no — a C variadic counts what it was handed
+```
+
+The array case is the one worth spelling out: an array *is* its elements, and an array of nothing
+would put every element at one address, leaving a bounds check as the whole of what `a[i]` did. A
+read-only view of one would be no better. So an array and a slice ask for something to point at,
+exactly as `&T` and `*T` do.
+
+**Inference is held to the same split.** A generic parameter accepts whatever its argument turns
+out to be, so `f[T](x: T)` handed `print(1)` instantiates at `unit` — and that is fine, because the
+parameter is then dropped. Handed a *diverging* argument it would instantiate at `never`, which is
+still an error at the call: there is no value, not merely a small one. A **written** parameter still
+takes a diverging argument (§11) — it has a layout, and the call is the dead code that rule already
+accepts.
 
 The result rule is about the *position*, not the syntax, so it extends to wherever a result is
-named. When function types land (`12 §6`), the result in `Fn(Event) -> unit` is a result and stays
-legal; the parameter in `Fn(unit) -> int` is a slot and does not.
+named. When function types land (`12 §6`), the result in `Fn(Event) -> unit` is a result; the
+parameter in `Fn(unit) -> int` is a zero-sized one and is dropped like any other.
 
-The cost of this is that `Result[unit, E]` — a fallible operation that yields nothing on success —
-cannot be written, and the workaround is an error-only channel or a placeholder payload. Making it
-work means zero-sized types (a `unit` field omitted from the layout, with every field index behind
-it shifted), which is a layout feature and not a property of `unit`; it is recorded below rather
-than half-built.
+**What this bought.** `Result[unit, E]` — a fallible operation that yields nothing on success — is
+writable, and the alternatives it replaces were both bad. Two unrelated guide programs paid for its
+absence in full: `guide/bytecode`'s compiler front end, where every parse step consumes input, emits
+code, yields nothing and can fail; and `guide/png`'s deflate decoder, which has nothing in common
+with a parser and arrived at the same `Result[bool, Fault]` with a `bool` nobody read. The
+placeholder payload was what kept `?` chaining the failures; an error-only `Option[Fault]` was the
+honest alternative and turned each of those call sites into three lines. Twenty-five signatures
+across the two programs now say what they mean.
 
-That cost is not evenly spread. A parser is the shape that pays it in full: every step consumes
-input and emits code, none of them yields a value, and all of them can fail — so `guide/bytecode`'s
-compiler writes `Result[bool, Fault]` throughout with a `bool` that means nothing, because the
-placeholder payload is what keeps `?` chaining the failures. An error-only `Option[Fault]` is the
-honest alternative and turns each of those call sites into three lines.
+**What is deliberately not done.** Zero-sizedness is not transitive: a struct whose fields are all
+zero-sized is emitted as an empty aggregate, and it is still a type with an address that a `&T` may
+point at. Making *that* zero-sized as well would be a second rule with its own consequences for
+identity and for `&T`'s non-null guarantee, and nothing has asked for it.
 
 ## Open at the basics level (not yet decided)
 
@@ -580,10 +599,9 @@ work:
   continues a line today, so an expression that outgrows its line has to become statements — see
   the table of single-character symbols in `guide/bytecode`'s lexer, written as three early
   returns for exactly that reason.
-- **Zero-sized types** (§12): whether a `unit` field is omitted from a layout rather than refused,
-  which is what would let `Result[unit, E]` be written. It is a layout rule — a field the layout
-  skips, with the indices behind it shifted, and the same question for a parameter dropped from a
-  signature — so it is decided with the layout, not with `unit`. Additive: everything §12 refuses
-  today would start compiling, and nothing written against the current rule would change meaning.
+- ~~Zero-sized types~~ — **done**, see §12. A `unit` field is skipped in the layout with the
+  indices behind it shifted, and a `unit` parameter is dropped from the signature, which is what
+  makes `Result[unit, E]` writable. It was additive as predicted: everything §12 used to refuse
+  started compiling, and nothing written against the old rule changed meaning.
 - ~~Final scalar-type table and operator-precedence table~~ — **done**, see
   `01-scalar-types-and-operators.md`.

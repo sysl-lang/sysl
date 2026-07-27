@@ -122,9 +122,12 @@ trait ArcEmitter extends Emitter {
 
   private def walkValue(ty: Type, v: String, retain: Boolean): Unit = {
     def each(fields: List[(String, Type)], aggregate: String, value: String): Unit =
+      // A zero-sized field holds no reference, so it is skipped by the filter already — but the
+      // index has to be the slot it landed in rather than the one it was written at, or a field
+      // after one would be walked at the wrong offset.
       for ((_, fty), i) <- fields.zipWithIndex if containsRef(fty) do
         val f = freshTemp()
-        emit(s"$f = extractvalue $aggregate $value, $i")
+        emit(s"$f = extractvalue $aggregate $value, ${Type.slot(fields, i)}")
         if retain then retainValue(fty, f) else releaseValue(fty, f)
 
     ty match

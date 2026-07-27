@@ -147,8 +147,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
         val payload = freshTemp()
         emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
         args.zipWithIndex.foldLeft(tagOk) { case (acc, (arg, i)) =>
-          val fv = freshTemp(); emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, $i")
-          andI1(acc, patternTest(arg, fv))
+          andI1(acc, patternTest(arg, payloadField(en, variant, payload, i)))
         }
 
     // A struct has no tag, so the test is just its refutable fields' tests ANDed together; an
@@ -157,15 +156,16 @@ trait ControlFlowEmitter extends PlaceEmitter {
     case TStructPattern(struct, args) =>
       args.zipWithIndex.foldLeft("true") { case (acc, (arg, i)) =>
         if !refutable(arg) then acc
-        else
-          val fv = freshTemp(); emit(s"$fv = extractvalue ${struct.llvm} $value, $i")
-          andI1(acc, patternTest(arg, fv))
+        else andI1(acc, patternTest(arg, structField(struct, value, i)))
       }
 
   /** Establishes the bindings a pattern introduces, once its arm has been taken. Only binding
    * and (nested) variant patterns carry bindings; the rest are no-ops.
    */
   private def patternBind(p: TPattern, value: String): Unit = p match
+    // A zero-sized binding is not a slot, exactly as a `var` of one is not. The name is still in
+    // scope for the arm; every read of it yields nothing.
+    case TBindPattern(_, bty) if Type.zeroSized(bty) => ()
     case TBindPattern(name, bty) =>
       emitAlloca(s"%$name.addr", bty.llvm)
       retainValue(bty, value)
@@ -174,14 +174,27 @@ trait ControlFlowEmitter extends PlaceEmitter {
     case TVariantPattern(en, variant, args) if args.exists(bindsAny) =>
       val payload = freshTemp()
       emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
-      for (arg, i) <- args.zipWithIndex do
-        val fv = freshTemp(); emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, $i")
-        patternBind(arg, fv)
+      for (arg, i) <- args.zipWithIndex do patternBind(arg, payloadField(en, variant, payload, i))
     case TStructPattern(struct, args) if args.exists(bindsAny) =>
-      for (arg, i) <- args.zipWithIndex if bindsAny(arg) do
-        val fv = freshTemp(); emit(s"$fv = extractvalue ${struct.llvm} $value, $i")
-        patternBind(arg, fv)
+      for (arg, i) <- args.zipWithIndex if bindsAny(arg) do patternBind(arg, structField(struct, value, i))
     case _ => ()
+
+  /** One field of a variant's payload, or nothing where the field is zero-sized — the same skipping
+   * the layout does, seen from the reading side.
+   */
+  private def payloadField(en: Type.Enum, variant: Type.EnumVariant, payload: String, i: Int): String =
+    if Type.zeroSized(variant.fields(i)._2) then ""
+    else
+      val fv = freshTemp()
+      emit(s"$fv = extractvalue ${en.payloadLlvm(variant)} $payload, ${variant.slot(i)}")
+      fv
+
+  private def structField(struct: Type.Struct, value: String, i: Int): String =
+    if Type.zeroSized(struct.fields(i)._2) then ""
+    else
+      val fv = freshTemp()
+      emit(s"$fv = extractvalue ${struct.llvm} $value, ${struct.slot(i)}")
+      fv
 
   private def bindsAny(p: TPattern): Boolean = p match
     case _: TBindPattern    => true

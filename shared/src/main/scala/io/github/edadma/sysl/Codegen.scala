@@ -50,19 +50,21 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       (if usesSnprintf then Set("snprintf") else Set.empty)
 
     for e <- program.externs if declared.add(e.symbol) do
-      val params = e.params.map(_.llvm) ++ Option.when(e.variadic)("...")
+      val params = e.params.filterNot(Type.zeroSized).map(_.llvm) ++ Option.when(e.variadic)("...")
       out ++= s"declare ${e.retTy.llvm} @${e.symbol}(${params.mkString(", ")})\n"
 
     for d <- satDecls do out ++= d + "\n"
     out ++= "\n"
 
+    // A zero-sized field is skipped: the aggregate is what occupies storage, and `Type.slot` is what
+    // keeps every index that reaches into it agreeing with what was laid down here.
     for s <- program.structs do
-      out ++= s"${s.llvm} = type { ${s.fields.map(_._2.llvm).mkString(", ")} }\n"
+      out ++= s"${s.llvm} = type { ${s.stored.map(_._2.llvm).mkString(", ")} }\n"
     if program.structs.nonEmpty then out ++= "\n"
 
     for e <- program.enums do
       for v <- e.variants if v.payloadSlot.isDefined do
-        out ++= s"${e.payloadLlvm(v)} = type { ${v.fields.map(_._2.llvm).mkString(", ")} }\n"
+        out ++= s"${e.payloadLlvm(v)} = type { ${v.stored.map(_._2.llvm).mkString(", ")} }\n"
       val slots = "i32" :: e.variants.collect { case v if v.payloadSlot.isDefined => e.payloadLlvm(v) }
       out ++= s"${e.llvm} = type { ${slots.mkString(", ")} }\n"
     if program.enums.nonEmpty then out ++= "\n"
@@ -130,12 +132,27 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     else f"0x${java.lang.Double.doubleToLongBits(d.toFloat.toDouble)}%016X"
   }
 
+  /** The arguments of a call, as an LLVM argument list.
+   *
+   * Every one is evaluated, in the order it was written, because the *effect* of an argument is
+   * owed whatever its type — but a zero-sized one is then not passed, since the callee has no
+   * parameter to receive it. That keeps the two sides of the call agreeing with `genFunction`,
+   * which drops the same parameters from the signature.
+   */
+  private def argList(args: List[TExpr]): List[String] =
+    args.flatMap { a =>
+      val v = genExpr(a)
+
+      Option.unless(Type.zeroSized(a.ty))(s"${a.ty.llvm} $v")
+    }
+
   /** Every callee declared with a `...`, foreign or sysl's own, mapped to the LLVM function type a
    * call to it must name: result type, declared parameter types, ellipsis.
    */
   private val variadics: Map[String, String] =
-    val fromExterns = program.externs.filter(_.variadic).map(e => e.name -> (e.retTy, e.params.map(_.llvm)))
-    val fromFuncs   = program.funcs.filter(_.variadic).map(f => f.name -> (f.retTy, f.params.map(_._2.llvm)))
+    val fromExterns =
+      program.externs.filter(_.variadic).map(e => e.name -> (e.retTy, e.params.filterNot(Type.zeroSized).map(_.llvm)))
+    val fromFuncs   = program.funcs.filter(_.variadic).map(f => f.name -> (f.retTy, Type.stored(f.params).map(_._2.llvm)))
 
     (fromExterns ++ fromFuncs).map { case (name, (retTy, params)) =>
       name -> s"${if Type.noValue(retTy) then "void" else retTy.llvm} (${(params :+ "...").mkString(", ")})"
@@ -203,7 +220,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     pushTemps()
     pushOwned()
 
-    for (name, ty) <- f.params do
+    // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep,
+    // so it takes no slot and the emitted signature below does not mention it.
+    for (name, ty) <- f.params if !Type.zeroSized(ty) do
       emitAlloca(s"%$name.addr", ty.llvm)
       emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
       retainValue(ty, s"%$name.param")
@@ -226,12 +245,15 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       case None =>
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
-    val declared = f.params.map { case (name, ty) => s"${ty.llvm} %$name.param" }
+    val declared = Type.stored(f.params).map { case (name, ty) => s"${ty.llvm} %$name.param" }
     val params   = (declared ++ Option.when(f.variadic)("...")).mkString(", ")
     finishFunction(s"define ${f.retTy.llvm} @${f.name}($params)")
   }
 
   private def zero(ty: Type): String = ty match
+    // Nothing is stored for a zero-sized value, so its zero is nothing at all — the same empty
+    // register every other read of one yields.
+    case t if Type.zeroSized(t) => ""
     case _: Type.Integer  => "0"
     case _: Type.Floating => "0.0"
     case Type.Char        => "0"
@@ -273,6 +295,11 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
   }
 
   private def genStmtBody(stmt: TStmt): Unit = stmt match
+    // A zero-sized binding is not a slot: the initializer still runs, for its effect, and there is
+    // nothing to keep afterwards. Every later read of the name yields nothing in the same way.
+    case TVarDecl(_, ty, init) if Type.zeroSized(ty) =>
+      genExpr(init)
+
     case TVarDecl(name, ty, init) =>
       val v = genExpr(init)
       emitAlloca(s"%$name.addr", ty.llvm)
@@ -398,6 +425,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     case TCast(operand, ty) =>
       convert(operand.ty, ty, genExpr(operand))
 
+    // Nothing is stored for a zero-sized binding, so there is nothing to read back.
+    case TLoad(_, ty) if Type.zeroSized(ty) => ""
+
     case TLoad(name, ty) =>
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %$name.addr"); r
 
@@ -413,6 +443,11 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
 
     case TBox(value, refTy) =>
       genBox(value, refTy)
+
+    case TStore(place, value, ty) if Type.zeroSized(ty) =>
+      genExpr(value)
+      address(place)
+      ""
 
     case TStore(place, value, ty) =>
       val v = genExpr(value)
@@ -590,7 +625,7 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     // follows in the same block is unreachable and `emit` drops it, which is exactly why a
     // diverging arm needs no special handling anywhere else.
     case TCall(name, args, ty) =>
-      val argVals = args.map(a => s"${a.ty.llvm} ${genExpr(a)}")
+      val argVals = argList(args)
       val callee  = calleeOf(name, ty)
       if Type.noValue(ty) then
         emit(s"call $callee(${argVals.mkString(", ")})")
@@ -615,7 +650,7 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       val obj     = genExpr(receiver)
       val table   = freshTemp(); emit(s"$table = extractvalue ${Type.fatPointer} $obj, 0")
       val data    = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $obj, 1")
-      val argVals = args.map(a => s"${a.ty.llvm} ${genExpr(a)}")
+      val argVals = argList(args)
       val entry   = freshTemp(); emit(s"$entry = getelementptr ptr, ptr $table, i64 $slot")
       val fn      = freshTemp(); emit(s"$fn = load ptr, ptr $entry")
       val passed  = (s"ptr $data" :: argVals).mkString(", ")
@@ -646,9 +681,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)
       var acc  = "undef"
-      for (v, i) <- vals.zipWithIndex do
+      for (v, i) <- vals.zipWithIndex if !Type.zeroSized(struct.fields(i)._2) do
         val r = freshTemp()
-        emit(s"$r = insertvalue ${struct.llvm} $acc, ${struct.fields(i)._2.llvm} $v, $i")
+        emit(s"$r = insertvalue ${struct.llvm} $acc, ${struct.fields(i)._2.llvm} $v, ${struct.slot(i)}")
         acc = r
       acc
 
@@ -664,9 +699,12 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     case TTry(operand, ok, fail, retEnum, retFail, _) =>
       genTry(operand, ok, fail, retEnum, retFail)
 
+    case TField(receiver, _, ty) if Type.zeroSized(ty) =>
+      genExpr(receiver); ""
+
     case TField(receiver, index, ty) =>
       val rv = genExpr(receiver); val r = freshTemp()
-      emit(s"$r = extractvalue ${receiver.ty.llvm} $rv, $index"); r
+      emit(s"$r = extractvalue ${receiver.ty.llvm} $rv, ${fieldSlot(receiver.ty, index)}"); r
 
     case TIf(cond, thenBlock, elseBlock, ty) =>
       genIf(cond, thenBlock, elseBlock, ty)
