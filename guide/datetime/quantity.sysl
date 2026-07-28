@@ -1,0 +1,175 @@
+// Wall clocks, timelines, and the conversion between them.
+//
+// The axis this owns is **a conversion that can succeed twice**. Every other program in the set
+// converts things that either work or do not, and `Option` and `Result` are the two shapes that
+// covers. A wall clock reading turned into a moment is neither: it usually has one answer, in one
+// hour of the year it has none, and in one other hour it has two — and both of the two are correct,
+// for different questions. Nothing in the set had asked for that before.
+//
+// The program is a recurring-meeting expander, because that is where the distinction cannot be
+// avoided. A meeting is a rule about a wall clock — every Tuesday at half past nine, in New York —
+// and the answer a participant elsewhere needs is a point on the timeline. Expanding the rule puts
+// the conversion in the middle of the program rather than in a corner of it.
+//
+// **The assertion the whole thing is for**: across a daylight-saving change, "next week's meeting"
+// and "one hundred and sixty-eight hours from now" are different moments, and *both are right*.
+// One is 167 hours later and reads as half past nine; the other is 168 hours later and reads as
+// half past ten. A single type for both could only ever have been wrong about one of them.
+//
+// Every expected value came from outside: the transitions, the offsets and each meeting time were
+// computed with Python's `zoneinfo` against the real tz database. That was worth doing for its own
+// sake — Python subtracts two aware date-times in one zone by *wall clock*, so the first attempt at
+// the reference values reported the week across the spring change as 168 hours. The confusion this
+// program is about is not a hypothetical one.
+//
+// What it found, in the order it bit:
+//
+//   * **The difference of two moments cannot be spelled `-`.** Every operator row is
+//     `op(self, rhs: Rhs) -> Self`, so an implementation says what it *takes* and never what it
+//     *produces*. `Instant + Duration`, `Instant - Duration` and `Duration ± Duration` all write
+//     themselves; `Instant - Instant -> Duration` is refused, because `Sub`'s result is fixed to
+//     the type on the left. Three quarters of an algebra is spellable and the quarter that is not
+//     is the operation the library exists to provide, so it is a named function called `since`.
+//     Dispatching on the pair does not rescue it: the two implementations would differ in what
+//     they produce, which no row can say.
+//   * **A derived scalar and a one-field struct are exactly complementary, and neither is what a
+//     quantity wants.** `type Instant = new i64` inherits its base's whole catalog for free — `==`,
+//     `<`, `+`, `str` — and may replace none of it, so it arrives with `Instant + Instant`, which
+//     is nonsense, and cannot be given `Instant + Duration`, which is not. A struct of one field
+//     gets the algebra exactly right and arrives with nothing at all: five `impl` blocks per type
+//     before anything can be compared or printed. So a quantity type chooses between the catalog
+//     and the meaning, and this program pays the struct's price on every one of its six types.
+//   * **The three-way answer needed nothing new**, and that is a result rather than an absence. A
+//     data enum already spells "one answer, or none, or two, and here they are"; `Resolution` is an
+//     ordinary enum and the compiler's coverage checking is what makes a caller handle all three.
+//     The axis the problem was chosen for turns out to be covered by the machinery that was already
+//     there — which is the useful thing to know before designing a library around it.
+//   * **An enum still cannot render its own variant names**, third program to report it. `ZoneId`,
+//     `Weekday` and `Resolution` each carry a hand-written map from variant to word, and the two
+//     that are simple enums at least convert to their numbers and back, which is what let the
+//     weekday arithmetic drop fourteen lines of if-chain.
+//   * **A `val` cannot be sliced**, third program to report that too: the two transition tables are
+//     reached through a function whose whole body is an index.
+//   * **A built-in is on nobody's left.** `Duration * 2` is writable and `2 * Duration` is not, so
+//     the scaling in a date-time library only ever reads one way round.
+//
+// Deliberately not modelled, so that the program stays a guide problem rather than a standard
+// library: the tz database, leap seconds, calendars other than the proleptic Gregorian, and any
+// zone rule more elaborate than one yearly pair of transitions.
+
+// The two quantities everything else is built out of, and the algebra between them.
+//
+// An **instant** is a point on the timeline, the same point for everybody. A **duration** is a
+// length of timeline, with no place on it. The whole discipline of a date-time library is in
+// keeping those two apart, because almost every operation is legal for one of them and nonsense
+// for the other: two instants may be compared and subtracted but never added, while a duration may
+// be added to itself, negated, and scaled.
+//
+// Both are counts of **microseconds**, and that choice is the one piece of representation worth
+// arguing about. A `long` of nanoseconds runs out in 1678–2262, which is close enough to today to
+// look fine in every test and fail on a birth date; a `long` of microseconds reaches ±292,000
+// years. Nothing here needs to resolve a nanosecond, and a range that quietly ends is a worse
+// defect than a precision that never begins.
+
+const us_per_second: long = 1000000
+const us_per_minute: long = 60000000
+const us_per_hour: long = 3600000000
+const us_per_day: long = 86400000000
+
+// A point on the timeline, counted from 1970-01-01T00:00:00Z. It names no place and no calendar:
+// the same `Instant` is a different wall clock in every zone, which is the entire reason it is a
+// separate type from the ones below.
+struct Instant
+    us: long
+end Instant
+
+// A length of timeline. It is not a number of days, because a day is not a fixed length of
+// timeline — that is what `next_week` below is about.
+struct Duration
+    us: long
+end Duration
+
+// How far a zone's wall clock is set from UTC, in whole minutes. Minutes rather than hours because
+// India is at +05:30 and Nepal at +05:45, and a library that assumes whole hours works everywhere
+// its author lives.
+struct Offset
+    minutes: int
+end Offset
+
+seconds(n: long) -> Duration = Duration(n * us_per_second)
+minutes(n: long) -> Duration = Duration(n * us_per_minute)
+hours(n: long) -> Duration = Duration(n * us_per_hour)
+
+// An instant moved by a length of time. This is the *absolute* answer — it lands exactly that many
+// microseconds later on the timeline no matter what any calendar does in between.
+impl Add[Duration] for Instant
+    add(self, rhs: Duration) -> Instant = Instant(self.us + rhs.us)
+end Instant
+
+impl Sub[Duration] for Instant
+    sub(self, rhs: Duration) -> Instant = Instant(self.us - rhs.us)
+end Instant
+
+// The difference of two instants is a duration, and **it cannot be written as `-`**. `Sub`'s method
+// is `sub(self, rhs: Rhs) -> Self`, so the result is fixed to the type on the left: an
+// `impl Sub[Instant] for Instant` may only produce another `Instant`, which is the one thing the
+// difference of two points on a timeline is not. The operator is available and the meaning is not,
+// so the most-asked-for operation in the library is a named function.
+since(later: Instant, earlier: Instant) -> Duration = Duration(later.us - earlier.us)
+
+impl Add for Duration
+    add(self, rhs: Duration) -> Duration = Duration(self.us + rhs.us)
+end Duration
+
+impl Sub for Duration
+    sub(self, rhs: Duration) -> Duration = Duration(self.us - rhs.us)
+end Duration
+
+impl Neg for Duration
+    neg(self) -> Duration = Duration(-self.us)
+end Duration
+
+impl Mul[long] for Duration
+    mul(self, rhs: long) -> Duration = Duration(self.us * rhs)
+end Duration
+
+impl Eq for Instant
+    eq(self, rhs: Instant) -> bool = self.us == rhs.us
+end Instant
+
+impl Ord for Instant
+    lt(self, rhs: Instant) -> bool = self.us < rhs.us
+end Instant
+
+impl Eq for Duration
+    eq(self, rhs: Duration) -> bool = self.us == rhs.us
+end Duration
+
+impl Ord for Duration
+    lt(self, rhs: Duration) -> bool = self.us < rhs.us
+end Duration
+
+impl Eq for Offset
+    eq(self, rhs: Offset) -> bool = self.minutes == rhs.minutes
+end Offset
+
+// Whole hours of a duration, truncated toward zero, and the minutes left over. Together they are
+// how every check below states a length of time, because "167 hours" is the sentence a reader can
+// check against a calendar and 601200000000 is not.
+whole_hours(d: Duration) -> long = d.us / us_per_hour
+odd_minutes(d: Duration) -> long = d.us % us_per_hour / us_per_minute
+
+// `+05:30`, the way an offset is written everywhere it is written down. A sign, then a width the
+// reader can rely on, which is what makes a rendered timestamp sortable as text.
+offset_text(o: Offset) -> string
+    if o.minutes == 0 then return "Z"
+
+    var sign = if o.minutes < 0 then "-" else "+"
+    var m = if o.minutes < 0 then -o.minutes else o.minutes
+
+    f"$sign%s${m / 60}%02d:${m % 60}%02d"
+end offset_text
+
+impl Display for Offset
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(offset_text(self), out, fmt)
+end Offset

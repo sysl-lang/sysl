@@ -10,7 +10,7 @@ import org.scalatest.matchers.should.Matchers
  * under-sized region does not fail to compile, it aliases. So the arithmetic is pinned here
  * directly, and the enum tests below it check that what the emitter writes down agrees.
  */
-class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport {
+class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport with RunSupport {
 
   private def struct(fields: (String, Type)*): Type.Struct = {
     val s = new Type.Struct("S", Nil)
@@ -148,6 +148,54 @@ class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport {
 
       out should include("%E.Nothing = type {  }")
       out should include("%enum.E = type { i32, [0 x i8] }")
+    }
+
+    // The shape a conversion with more than one answer takes: variants of one, two and three
+    // wrapped words. The region is three words because of the widest of them, and the two narrower
+    // variants are stored in the same three — which is the claim, since laying them out side by
+    // side would give six.
+    "the widest variant sizes the region and the others share it" in {
+      val out = ir("""struct Moment
+                     |    us: i64
+                     |struct Span
+                     |    us: i64
+                     |enum Answer
+                     |    Once(at: Moment)
+                     |    Skipped(gap: Span, at: Moment, shifted: Moment)
+                     |    Twice(earlier: Moment, later: Moment)
+                     |which(a: Answer) -> i64
+                     |    a match
+                     |        Once(at) -> at.us
+                     |        Skipped(gap, at, shifted) -> gap.us + at.us + shifted.us
+                     |        Twice(earlier, later) -> earlier.us + later.us
+                     |print(which(Skipped(Span(1i64), Moment(2i64), Moment(4i64))))
+                     |print(which(Twice(Moment(8i64), Moment(16i64))))
+                     |print(which(Once(Moment(32i64))))
+                     |""".stripMargin)
+
+      out should include("%enum.Answer = type { i32, [3 x i64] }")
+    }
+
+    "and every one of them reads back what it wrote" in {
+      run("""struct Moment
+            |    us: i64
+            |struct Span
+            |    us: i64
+            |enum Answer
+            |    Once(at: Moment)
+            |    Skipped(gap: Span, at: Moment, shifted: Moment)
+            |    Twice(earlier: Moment, later: Moment)
+            |which(a: Answer) -> i64
+            |    a match
+            |        Once(at) -> at.us
+            |        Skipped(gap, at, shifted) -> gap.us + at.us + shifted.us
+            |        Twice(earlier, later) -> earlier.us + later.us
+            |var t: [3]Answer = [Once(Moment(32i64)); 3]
+            |t[1usize] = Skipped(Span(1i64), Moment(2i64), Moment(4i64))
+            |t[2usize] = Twice(Moment(8i64), Moment(16i64))
+            |for i in 0..<3
+            |    print(which(t[usize(i)]))
+            |""".stripMargin) shouldBe "32\n7\n24\n"
     }
   }
 }

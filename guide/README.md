@@ -34,6 +34,7 @@ that quietly stopped running would otherwise look like a check that passed.
 | `shapes` | dynamic dispatch — a heterogeneous collection whose element types are forgotten |
 | `scheduler` | OS shapes — a run queue, blocking and waking, and `&T` graphs mutated through references |
 | `kernel` | the same scheduler with no heap — a fixed table, indices for identity, intrusive lists |
+| `datetime` | a conversion that can succeed twice — wall clocks, timelines, and daylight saving |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

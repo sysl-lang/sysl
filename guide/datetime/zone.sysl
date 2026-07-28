@@ -1,0 +1,225 @@
+// Where the wall is. This is the file the whole problem is about: everything above is arithmetic
+// that cannot go wrong, and everything here is the seam where a wall clock reading and a point on
+// the timeline are turned into each other.
+//
+// **The two directions are not symmetric, and that asymmetry is the subject.** An instant seen from
+// a zone is always exactly one wall clock reading. A wall clock reading interpreted in a zone is
+// **usually** one instant, **sometimes none**, and **sometimes two** — and a library whose
+// conversion returns one answer has to be lying in two of those three cases. Which is why the
+// answer here is an enum.
+//
+// Scope, stated up front because without it this stops being a guide problem and becomes a
+// standard library: no tzdb, no leap seconds, four zones, and a transition table that covers
+// 2023 through 2027 and says so.
+
+// A zone is named, not described. Two of these have a wall clock that moves twice a year and two
+// do not, and a program that holds one has no way to tell which without asking.
+enum ZoneId
+    Utc
+    NewYork
+    Berlin
+    Kolkata
+end ZoneId
+
+zone_name(z: ZoneId) -> string = z match
+    Utc -> "UTC"
+    NewYork -> "America/New_York"
+    Berlin -> "Europe/Berlin"
+    Kolkata -> "Asia/Kolkata"
+
+// What the clock reads when the zone is not observing daylight saving. India's +05:30 is here to
+// keep the whole file honest about minutes: every intermediate below is a count of minutes, and a
+// half-hour zone is what catches an implementation that quietly rounded to hours.
+standard_offset(z: ZoneId) -> Offset = z match
+    Utc -> Offset(0)
+    NewYork -> Offset(-300)
+    Berlin -> Offset(60)
+    Kolkata -> Offset(330)
+
+// What it reads when the zone is. For a zone that never moves this is the same value, and
+// `resolve` below leans on that: where the two offsets agree there is nothing to be ambiguous
+// about, and one comparison retires the whole question.
+daylight_offset(z: ZoneId) -> Offset = z match
+    Utc -> Offset(0)
+    NewYork -> Offset(-240)
+    Berlin -> Offset(120)
+    Kolkata -> Offset(330)
+
+moves(z: ZoneId) -> bool = standard_offset(z) != daylight_offset(z)
+
+const first_year: int = 2023
+const last_year: int = 2027
+const transition_count: usize = 10
+
+// The nth given weekday of a month — "the second Sunday in March", which is how the United States
+// writes its rule down.
+nth_weekday(y: int, m: int, w: Weekday, n: int) -> LocalDate
+    var first = on_or_after(date_at(y, m, 1), w)
+
+    LocalDate(first.day + 7 * (n - 1))
+end nth_weekday
+
+// The last given weekday of a month — "the last Sunday in March", which is how the European Union
+// writes the same kind of rule down. The two spellings are why the two zones change on different
+// days in years where the last Sunday of March is not the fifth one.
+last_weekday(y: int, m: int, w: Weekday) -> LocalDate
+    var next_month = if m == 12 then date_at(y + 1, 1, 1) else date_at(y, m + 1, 1)
+    var last = LocalDate(next_month.day - 1)
+
+    LocalDate(last.day - int(floor_mod(long(int(weekday(last)) - int(w)), 7i64)))
+end last_weekday
+
+// The moments the wall clock jumps, as instants, in order. Two per year, spring first, so the
+// **parity** of how many have gone by is the answer to "is it summer time" — which is what makes
+// the lookup below a count and not a search for a matching interval.
+//
+// Both tables are computed: a rule is written down once as a rule, and the instants come out of it
+// at start-up rather than being pasted in as numbers nobody can check. The transitions themselves
+// are the part a reader can verify against a calendar; a column of microsecond counts is not.
+us_transitions() -> [10]Instant
+    var ts: [transition_count]Instant = [Instant(0i64); transition_count]
+
+    for y in first_year..last_year
+        var i = usize(y - first_year) * 2usize
+
+        // Both rules are written in *local* time — 02:00 on the day — so each one is turned into an
+        // instant with the offset that is in force on the way in, standard in spring and daylight
+        // in autumn. That is the same trap `resolve` exists to handle, met here first.
+        ts[i] = Instant(long(nth_weekday(y, 3, Sunday, 2).day) * us_per_day + 7i64 * us_per_hour)
+        ts[i + 1usize] = Instant(long(nth_weekday(y, 11, Sunday, 1).day) * us_per_day + 6i64 * us_per_hour)
+
+    ts
+end us_transitions
+
+// The European rule is simpler to state and lands in a different place: 01:00 **UTC** for the whole
+// union at once, so Berlin, Paris and Lisbon change at the same instant and read three different
+// clocks while doing it.
+eu_transitions() -> [10]Instant
+    var ts: [transition_count]Instant = [Instant(0i64); transition_count]
+
+    for y in first_year..last_year
+        var i = usize(y - first_year) * 2usize
+
+        ts[i] = Instant(long(last_weekday(y, 3, Sunday).day) * us_per_day + us_per_hour)
+        ts[i + 1usize] = Instant(long(last_weekday(y, 10, Sunday).day) * us_per_day + us_per_hour)
+
+    ts
+end eu_transitions
+
+val us_dst: [10]Instant = us_transitions()
+val eu_dst: [10]Instant = eu_transitions()
+
+transition(z: ZoneId, i: usize) -> Instant = z match
+    NewYork -> us_dst[i]
+    Berlin -> eu_dst[i]
+    _ -> Instant(0i64)
+
+// The first and last instants the tables have anything to say about. Outside them every answer is
+// the zone's standard offset, which is right for a zone that has never moved and wrong for one that
+// has — so the span is part of the type's contract and the checks below state it.
+covered_from() -> Instant = Instant(long(date_at(first_year, 1, 1).day) * us_per_day)
+covered_until() -> Instant = Instant(long(date_at(last_year + 1, 1, 1).day) * us_per_day)
+
+// How far the clock is set from UTC at a given instant. Counting transitions rather than searching
+// for the interval containing `t` is what the alternating table buys: an even count means no
+// transition since the start of the covered span put the zone into summer time and left it there.
+offset_at(z: ZoneId, t: Instant) -> Offset
+    if !moves(z) then return standard_offset(z)
+
+    var passed = 0usize
+
+    for i in 0usize..<transition_count
+        if !(t < transition(z, i)) then passed += 1usize
+
+    if passed % 2usize == 1usize then daylight_offset(z) else standard_offset(z)
+end offset_at
+
+// What an instant reads as on a wall, which is the direction that always has exactly one answer.
+struct ZonedDateTime
+    local: LocalDateTime
+    offset: Offset
+    zone: ZoneId
+end ZonedDateTime
+
+to_local(t: Instant, z: ZoneId) -> ZonedDateTime
+    var off = offset_at(z, t)
+
+    ZonedDateTime(wall_of(t.us + long(off.minutes) * us_per_minute), off, z)
+end to_local
+
+// What a wall clock reading was a moment of — the direction that does not.
+//
+// `Skipped` carries both answers a caller might want: `at` is the instant the clock jumped, the
+// first one that exists on the far side of the hole, and `shifted` is the requested reading moved
+// forward by the length of the hole, which is what a calendar does with a meeting that was
+// scheduled into it. `Twice` carries them in timeline order, which is not the order they are
+// usually wanted in — the later one is the second time the clock reads it, and the earlier one is
+// what almost every calendar picks.
+enum Resolution
+    Once(at: Instant)
+    Skipped(gap: Duration, at: Instant, shifted: Instant)
+    Twice(earlier: Instant, later: Instant)
+end Resolution
+
+// Try the reading as standard time and as daylight time, and keep whichever guesses turn out to
+// agree with themselves. A guess is right when the offset actually in force at the instant it
+// produces is the offset that was guessed — which is the whole algorithm, and the reason it needs
+// no knowledge of where the transitions are.
+resolve(ldt: LocalDateTime, z: ZoneId) -> Resolution
+    var wall = wall_us(ldt)
+    var std = standard_offset(z)
+    var dst = daylight_offset(z)
+
+    if !moves(z) then return Once(Instant(wall - long(std.minutes) * us_per_minute))
+
+    var as_dst = Instant(wall - long(dst.minutes) * us_per_minute)
+    var as_std = Instant(wall - long(std.minutes) * us_per_minute)
+    var dst_holds = offset_at(z, as_dst) == dst
+    var std_holds = offset_at(z, as_std) == std
+
+    // A clock set further ahead reaches a given reading sooner, so in a zone whose summer offset is
+    // the larger one the daylight guess is the earlier instant. Every zone here is such a zone and
+    // the compare still happens, because "the summer offset is the larger one" is a fact about the
+    // northern hemisphere's habits and not about time.
+    if dst_holds && std_holds then
+        return if as_dst < as_std then Twice(as_dst, as_std) else Twice(as_std, as_dst)
+    if dst_holds then return Once(as_dst)
+    if std_holds then return Once(as_std)
+
+    // Neither guess agreed with itself, so the reading fell in the hole a forward jump leaves
+    // behind. The jump is the one transition strictly between the two guesses, and the reading
+    // pushed forward past it is the later of them.
+    var early = if as_dst < as_std then as_dst else as_std
+    var late = if as_dst < as_std then as_std else as_dst
+    var jump = late
+
+    for i in 0usize..<transition_count
+        var c = transition(z, i)
+
+        if early < c && !(late < c) then jump = c
+
+    Skipped(since(late, early), jump, late)
+end resolve
+
+// The instant a reading names, with the two awkward cases decided the way a calendar decides them:
+// a meeting scheduled into the spring hole happens an hour later by the clock, and one scheduled
+// into the autumn overlap happens the first time round.
+resolve_calendar(ldt: LocalDateTime, z: ZoneId) -> Instant = resolve(ldt, z) match
+    Once(at) -> at
+    Skipped(gap, at, shifted) -> shifted
+    Twice(earlier, later) -> earlier
+
+zoned_text(z: ZonedDateTime) -> string =
+    f"${datetime_text(z.local)}%s ${offset_text(z.offset)}%s"
+
+impl Display for ZonedDateTime
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(zoned_text(self), out, fmt)
+end ZonedDateTime
+
+// An instant with no zone at all still has to be written down somehow, and UTC is what "no zone"
+// is spelled as. This is a rendering, not a conversion: the instant did not become a date.
+instant_text(t: Instant) -> string = zoned_text(to_local(t, Utc))
+
+impl Display for Instant
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(instant_text(self), out, fmt)
+end Instant

@@ -321,4 +321,62 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
             |    mul(self, c: C) -> int = self""".stripMargin) should include("the compiler provides")
     }
   }
+
+  /** The argument list selects **which** implementation runs; it does not reach the result.
+   *
+   * Every operator row is `op(self, rhs: Rhs) -> Self`, so an implementation may say what it takes
+   * and never what it produces. That is invisible in the arithmetic the rule was designed against —
+   * scaling a vector by a scalar gives a vector, and `guide/fft` wanted nothing else — and it is
+   * the first thing a timeline asks for: two points subtract to a *distance*, which is a different
+   * type from either of them. The three-quarters that do work are pinned beside it, because what
+   * makes this worth recording is that it is one row of an otherwise complete algebra.
+   */
+  "what an argument list does not reach" - {
+    val timeline =
+      """struct Instant
+        |    us: long
+        |struct Duration
+        |    us: long
+        |""".stripMargin
+
+    "a moment plus a length is a moment" in {
+      run(timeline +
+        """impl Add[Duration] for Instant
+          |    add(self, d: Duration) -> Instant = Instant(self.us + d.us)
+          |print((Instant(100i64) + Duration(5i64)).us)""".stripMargin) shouldBe "105\n"
+    }
+
+    "a moment minus a length is a moment" in {
+      run(timeline +
+        """impl Sub[Duration] for Instant
+          |    sub(self, d: Duration) -> Instant = Instant(self.us - d.us)
+          |print((Instant(100i64) - Duration(5i64)).us)""".stripMargin) shouldBe "95\n"
+    }
+
+    "and two lengths add to a length" in {
+      run(timeline +
+        """impl Add for Duration
+          |    add(self, d: Duration) -> Duration = Duration(self.us + d.us)
+          |print((Duration(100i64) + Duration(5i64)).us)""".stripMargin) shouldBe "105\n"
+    }
+
+    // The one the whole subject is named after, and the one that cannot be written.
+    "but two moments cannot subtract to a length" in {
+      err(timeline +
+        """impl Sub[Instant] for Instant
+          |    sub(self, o: Instant) -> Duration = Duration(self.us - o.us)
+          |print(1)""".stripMargin) should include("method 'sub' returns Duration, but trait 'Sub' declares Instant")
+    }
+
+    // Nor does dispatching on the pair rescue it: the two implementations differ in what they take,
+    // which the rule above allows, and in what they produce, which no row can express.
+    "and giving the subject both argument lists does not help" in {
+      err(timeline +
+        """impl Sub[Duration] for Instant
+          |    sub(self, d: Duration) -> Instant = Instant(self.us - d.us)
+          |impl Sub[Instant] for Instant
+          |    sub(self, o: Instant) -> Duration = Duration(self.us - o.us)
+          |print(1)""".stripMargin) should include("but trait 'Sub' declares Instant")
+    }
+  }
 }

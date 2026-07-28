@@ -174,5 +174,30 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport {
     "a derived char type wraps and prints through its base" in {
       run("type Glyph = new char\nprint(Glyph('a'))") shouldBe "a\n"
     }
+
+    /** The other side of what `SubtypeErrorTests` refuses. Everything the base can do the derived
+     * type can do at itself, for free and with no way to stop it — which is the bargain: a
+     * derivation buys the checking that two of them cannot be confused, and buys no say at all in
+     * what one of them means on its own.
+     */
+    "the whole of the base's arithmetic arrives with it" - {
+      val Stamp = "type Stamp = new i64\n"
+
+      "including operations the derived meaning does not have" in {
+        run(Stamp + "print(i64(Stamp(3i64) + Stamp(4i64)))") shouldBe "7\n"
+      }
+
+      "and the ones it does" in {
+        run(Stamp + "print(i64(Stamp(7i64) - Stamp(4i64)))") shouldBe "3\n"
+      }
+
+      "equality and ordering come along too" in {
+        run(Stamp + "print(Stamp(3i64) == Stamp(3i64), Stamp(3i64) < Stamp(4i64))") shouldBe "true true\n"
+      }
+
+      "and so does rendering, as the base renders" in {
+        run(Stamp + "print(s\"${Stamp(3i64)}\")") shouldBe "3\n"
+      }
+    }
   }
 }

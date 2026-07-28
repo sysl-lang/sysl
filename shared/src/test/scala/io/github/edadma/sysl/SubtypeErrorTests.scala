@@ -72,4 +72,33 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("needs matching types")
     }
   }
+
+  /** A derived scalar takes its base's whole catalog and may replace none of it.
+   *
+   * That is two decisions in one, and they pull opposite ways. Inheriting is what makes a `new u8`
+   * cheap to declare — it compares, orders and adds without a line of support code, which is the
+   * whole reason `guide/kernel`'s three bounded identities were worth having. Not being able to
+   * *replace* any of it is what puts a ceiling on the technique: a derived type gets exactly the
+   * behaviour its representation happens to have, including the operations that are meaningless for
+   * what it now means, and it cannot be given one operation the representation does not have.
+   */
+  "a derived type inherits behaviour it cannot replace" - {
+    val Stamp = "type Stamp = new i64\ntype Span = new i64\n"
+
+    "an operator implementation collides with the one the compiler provides" in {
+      err(Stamp + "impl Add[Span] for Stamp\n    add(self, s: Span) -> Stamp = self\nprint(1)") should
+        include("'add' is how 'Add' is implemented for Stamp, and the compiler provides that")
+    }
+
+    "and so does any other row of the catalog" in {
+      err(Stamp + "impl Display for Stamp\n    display(self, out: *Writer, fmt: FormatSpec)\n" +
+        "        display_str(\"x\", out, fmt)\nprint(1)") should
+        include("'Stamp' already implements 'Display' — the compiler provides it")
+    }
+
+    "even where the base's meaning does not survive the derivation" in {
+      err(Stamp + "impl Eq for Stamp\n    eq(self, o: Stamp) -> bool = true\nprint(1)") should
+        include("the compiler provides")
+    }
+  }
 }

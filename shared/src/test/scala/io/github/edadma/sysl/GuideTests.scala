@@ -222,4 +222,36 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- the links come apart",
     )
   }
+
+  // The one program whose expected values all came out of a *different* implementation of the same
+  // subject — the transitions, the offsets and every meeting time were computed with Python's
+  // `zoneinfo` against the real tz database, so the checks are a cross-check and not a recording.
+  // Two of them are the point of the whole program: a week of calendar is 167 hours of timeline in
+  // the spring and 169 in the autumn, and neither of those is a bug.
+  "datetime — wall clocks, timelines, and the conversion between them" in {
+    val out = guide("datetime")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 158
+    sections(out) shouldBe List(
+      "-- instants and durations",
+      "-- days and civil dates",
+      "-- the day of the week",
+      "-- a time of day",
+      "-- when the clocks move",
+      "-- an instant seen from a wall",
+      "-- the offset in force",
+      "-- a reading that happens once",
+      "-- a reading that never happens",
+      "-- a reading that happens twice",
+      "-- next week, and one hundred and sixty-eight hours",
+      "-- six weeks of one meeting",
+      "-- who is awake",
+      "-- every hour of a year",
+      "-- how much of a year is not a moment",
+      "-- the table has ends",
+      "-- a meeting that lands where the clock does not",
+      "-- the edges of the arithmetic",
+    )
+  }
 }
