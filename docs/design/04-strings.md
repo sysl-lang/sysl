@@ -311,9 +311,43 @@ can carry them, and would remove the last of the names the compiler knows.
 
 ## Literals
 
-Double-quoted, UTF-8, the escape table in `01`. A literal may not span a line break, and a
-comment marker inside one is ordinary text. Concatenation of adjacent literals and multi-line forms
-are not yet specified.
+Double-quoted, UTF-8, the escape table in `01`. A one-quote literal may not span a line break, and
+a comment marker inside one is ordinary text. Concatenation of adjacent literals is not specified —
+nothing has asked for it now that a block exists.
+
+### Text blocks
+
+A literal that spans lines is written `"""` … `"""`. The content begins on the line **after** the
+opening delimiter, which is what gives the indentation rule an anchor — the opening delimiter's own
+column then means nothing, so the form reads the same at any depth of nesting.
+
+Three things happen to a line inside a block that do not happen inside `"…"`:
+
+- **Its incidental indentation is dropped.** The strip is the least indented line that carries
+  content, together with the line the closing delimiter sits on when it sits on one alone. So the
+  closing delimiter is the control — move it left and the value keeps more, right and it keeps less
+  — and there is no margin character to remember. This matters more here than in a free-form
+  language: a block written inside an indented body would otherwise carry that body's indentation in
+  its value, and the depth a piece of code sits at is not something its data should record.
+- **Its trailing blanks are dropped.** Whitespace at the end of a line is invisible in a source file
+  and would otherwise enter the value unseen. One that is *meant* is written `\u{20}`, which
+  survives because escapes are read after the trimming rather than before it.
+- **A `\` at the end of it joins it to the next line.** This is the form's reason for existing:
+  embedded data wants no line breaks in its value at all, and a file written as hex over twenty
+  lines is one string. The joining happens in the lexer, so a block is a **single constant** — where
+  the same data assembled with `+` allocates and copies once per piece.
+
+Whether the value ends with a newline needs no rule of its own. A closing delimiter alone on its
+line is reached *after* the last content line's break has been taken, and one that follows content
+is reached before any break at all.
+
+A carriage return goes with the rest of a line's trailing whitespace, so a block means the same
+thing in a file with either line ending. A lone `"` inside a block is ordinary text, which is the
+other thing the form buys; a block cannot end with one, and `\"` writes it.
+
+**The prefixes are orthogonal to the quote form** — `c"""`, `s"""`, `f"""` and `raw"""` all
+compose, since a prefix says how a literal is *read* and the quote form says how it was *written*.
+A `raw` block does no escape decoding, so nothing joins its lines.
 
 ## Interpolation
 

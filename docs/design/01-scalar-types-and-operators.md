@@ -122,16 +122,17 @@ error. A character literal may not span a line break.
 
 Double-quoted, UTF-8, the escape table above: `"héllo ☃"`. The value is a sequence of bytes
 with a known length, so an embedded `\0` is an ordinary byte rather than a terminator. A
-string literal may not span a line break, and `//` or `/*` inside one is ordinary text.
-Concatenation and interpolation are settled (`00` §7); **raw and multi-line forms are not**.
-A literal's bytes are immortal, which is what lets allocator-free code use one (`04`).
+one-quote literal may not span a line break, and `//` or `/*` inside one is ordinary text.
+Concatenation and interpolation are settled (`00` §7), and so is the multi-line form — the
+**text block**, `"""` … `"""`, specified in `04`. A literal's bytes are immortal, which is what
+lets allocator-free code use one (`04`).
 
-The case that wants a multi-line form is **data rather than prose**. A program with a file
-embedded in it — `guide/png` carries ten of them — writes the bytes as hex, and with no
-line-spanning literal and no line continuation the choice is one unreadable line or a chain of
-`+=`. An array literal is no better: two hundred numbers on one line. Whatever the eventual
-spelling, this is the shape it has to serve, and prose that happens to be long is the easier
-half of the problem.
+**The case that wanted the multi-line form was data rather than prose**, and that is why it is
+specified the way it is. A program with a file embedded in it — `guide/png` carries ten of them —
+writes the bytes as hex, and what such a program needs is not line breaks in its value but the
+opposite: one constant, written over as many lines as it takes to read. So a text block drops the
+indentation it was written at, and a `\` at the end of a line joins that line to the next. Prose
+that happens to be long is the easier half of the problem and falls out of the same form.
 
 ## Conversions between scalar types
 

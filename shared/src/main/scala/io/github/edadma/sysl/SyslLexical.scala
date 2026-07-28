@@ -423,6 +423,7 @@ class SyslLexical
    */
   private def stringBody(token: String => Token): Parser[Token] = Parser { in =>
     if (in.atEnd || in.first != '"') Failure("not a string literal", in)
+    else if (opensBlock(in)) scanBlock(in.rest.rest.rest, escapes = true, token)
     else {
       val buf                                = new StringBuilder
       var rest                               = in.rest
@@ -444,6 +445,53 @@ class SyslLexical
     }
   }
 
+  /** The body of a text block, `"""` … `"""`, which is the one-quote scan with a line discipline
+   * over it (`04 § Text blocks`).
+   *
+   * Three things happen to a line that do not happen inside `"…"`. Its incidental indentation is
+   * dropped, so the block may be indented with the code around it. Its trailing blanks are dropped,
+   * because whitespace at a line's end is invisible and would otherwise enter the value unseen —
+   * `\u{20}` writes one that is meant, since escapes are read after the trimming and so survive it.
+   * And a `\` at the end of a line joins it to the next, which is how data written a line at a time
+   * becomes one string with no breaks in it.
+   *
+   * The trailing newline needs no rule of its own: a closing delimiter on a line of its own is
+   * reached *after* the last content line's break has been taken, and one that follows content is
+   * reached before any break at all.
+   */
+  private def scanBlock(start: Reader[Char], escapes: Boolean, token: String => Token): ParseResult[Token] =
+    blockIndent(start, escapes) match {
+      case Left((msg, at)) => Success(errorToken(msg), at)
+      case Right((strip, first)) =>
+        val buf     = new StringBuilder
+        val pending = new StringBuilder
+        var rest    = afterIndent(first, strip)
+        var result: Option[ParseResult[Token]] = None
+
+        while (result.isEmpty)
+          if (rest.atEnd) result = Some(Success(errorToken("unterminated text block"), rest))
+          else if (rest.first == '"' && opensBlock(rest))
+            result = Some(Success(token(buf.toString), rest.rest.rest.rest))
+          else if (rest.first == '\n') {
+            pending.clear(); buf += '\n'; rest = afterIndent(rest.rest, strip)
+          } else if (isBlank(rest.first)) { pending += rest.first; rest = rest.rest }
+          else if (escapes && rest.first == '\\' && joinsLine(rest.rest).isDefined) {
+            pending.clear(); rest = afterIndent(joinsLine(rest.rest).get, strip)
+          } else if (!escapes) {
+            buf ++= pending; pending.clear()
+            buf += rest.first; rest = rest.rest
+          } else
+            scanChar(rest) match {
+              case Left((msg, next)) => result = Some(Success(errorToken(msg), next))
+              case Right((cp, next)) =>
+                buf ++= pending; pending.clear()
+                buf ++= codepointToString(cp)
+                rest = next
+            }
+
+        result.get
+    }
+
   /** An interpolated string is an identifier `s`, `raw`, or `f` written directly against a `"`. The
    * prefix has to be the whole identifier — `sfoo"…"` is an ordinary name beside a string, not an
    * interpolation — so a mismatch falls through to `identifier`, which keeps those names usable.
@@ -455,7 +503,16 @@ class SyslLexical
       val (name, afterName) = takeWhile(in, isIdentPart)
 
       if ((name == "s" || name == "raw" || name == "f") && !afterName.atEnd && afterName.first == '"')
-        scanInterp(afterName.rest, escapes = name != "raw", allowSpec = name == "f")
+        if (opensBlock(afterName))
+          // A block's shape is settled before its holes are, since the strip has to be known at the
+          // first line and only the last line can lower it.
+          blockIndent(afterName.rest.rest.rest, escapes = name != "raw") match {
+            case Left((msg, at)) => Success(errorToken(msg), at)
+            case Right((strip, first)) =>
+              scanInterp(afterIndent(first, strip), escapes = name != "raw",
+                         allowSpec = name == "f", block = true, strip = strip)
+          }
+        else scanInterp(afterName.rest, escapes = name != "raw", allowSpec = name == "f")
       else Failure("not an interpolated string", in)
     }
   }
@@ -466,12 +523,14 @@ class SyslLexical
    * table unless escapes are off. In an `f"…"` string a `%` immediately after a hole is scanned as
    * that hole's specifier; a `%` that does not form a valid specifier stays ordinary text.
    */
-  private def scanInterp(start: Reader[Char], escapes: Boolean, allowSpec: Boolean): ParseResult[Token] = {
-    val parts = ListBuffer.empty[String]
-    val exprs = ListBuffer.empty[String]
-    val specs = ListBuffer.empty[Option[String]]
-    val part  = new StringBuilder
-    var rest  = start
+  private def scanInterp(start: Reader[Char], escapes: Boolean, allowSpec: Boolean,
+                         block: Boolean = false, strip: Int = 0): ParseResult[Token] = {
+    val parts   = ListBuffer.empty[String]
+    val exprs   = ListBuffer.empty[String]
+    val specs   = ListBuffer.empty[Option[String]]
+    val part    = new StringBuilder
+    val pending = new StringBuilder
+    var rest    = start
 
     var result: Option[ParseResult[Token]] = None
 
@@ -484,11 +543,21 @@ class SyslLexical
       else specs += None
 
     while (result.isEmpty)
-      if (rest.atEnd || rest.first == '\n') result = Some(Success(errorToken("unterminated string literal"), rest))
-      else if (rest.first == '"') {
+      if (rest.atEnd || (!block && rest.first == '\n'))
+        result = Some(Success(errorToken(if (block) "unterminated text block" else "unterminated string literal"), rest))
+      // A block ends at `"""`, and a lone `"` inside one is ordinary text; a one-line literal ends
+      // at the first quote it meets.
+      else if (rest.first == '"' && (if (block) opensBlock(rest) else true)) {
         parts += part.toString
-        result = Some(Success(StrInterp(parts.toList, exprs.toList, specs.toList), rest.rest))
+        result = Some(Success(StrInterp(parts.toList, exprs.toList, specs.toList),
+                              if (block) rest.rest.rest.rest else rest.rest))
+      } else if (block && rest.first == '\n') {
+        pending.clear(); part += '\n'; rest = afterIndent(rest.rest, strip)
+      } else if (block && isBlank(rest.first)) { pending += rest.first; rest = rest.rest }
+      else if (block && escapes && rest.first == '\\' && joinsLine(rest.rest).isDefined) {
+        pending.clear(); rest = afterIndent(joinsLine(rest.rest).get, strip)
       } else if (rest.first == '$') {
+        part ++= pending; pending.clear()
         val after = rest.rest
 
         if (after.atEnd) result = Some(Success(errorToken("expected a name or '{' after '$'"), after))
@@ -510,11 +579,14 @@ class SyslLexical
           rest = next
           takeSpec()
         } else result = Some(Success(errorToken("expected a name or '{' after '$'"), after))
-      } else if (!escapes) { part += rest.first; rest = rest.rest }
-      else
+      } else if (!escapes) {
+        part ++= pending; pending.clear()
+        part += rest.first; rest = rest.rest
+      } else
         scanChar(rest) match {
           case Left((msg, next)) => result = Some(Success(errorToken(msg), next))
           case Right((cp, next)) =>
+            part ++= pending; pending.clear()
             part ++= codepointToString(cp)
             rest = next
         }
@@ -584,6 +656,87 @@ class SyslLexical
         }
 
     result.get
+  }
+
+  /** Whether a `"` begins a **text block**, `"""` — the multi-line literal form. Asked at the
+   * opening quote of every literal form, so the prefixes compose: `c"""`, `s"""`, `raw"""`, `f"""`.
+   */
+  private def opensBlock(in: Reader[Char]): Boolean =
+    !in.rest.atEnd && in.rest.first == '"' && !in.rest.rest.atEnd && in.rest.rest.first == '"'
+
+  /** What a text block treats as blank. A carriage return is in the set so that a block means the
+   * same thing in a file with either line ending: it is dropped with the rest of a line's trailing
+   * whitespace rather than reaching the value, so a checkout's line endings cannot change what a
+   * program says.
+   */
+  private def isBlank(c: Char): Boolean = c == ' ' || c == '\t' || c == '\r'
+
+  /** How much leading whitespace every line of a text block gives up.
+   *
+   * This is the block's **incidental** indentation: the least indented of the lines that carry
+   * content, together with the line the closing delimiter sits on when it sits on one alone. The
+   * closing delimiter counting is what puts the programmer in control — moving it left widens what
+   * the value keeps, moving it right narrows it — without a margin character to remember, and it is
+   * why the block can be indented with the code around it and still say what it means. Lines that
+   * are entirely blank say nothing about the block's shape and are left out of the reckoning.
+   *
+   * A pre-pass rather than a running minimum, because the strip has to be known at the first line
+   * and the last line may lower it.
+   */
+  private def blockIndent(start: Reader[Char],
+                          escapes: Boolean): Either[(String, Reader[Char]), (Int, Reader[Char])] =
+    joinsLine(start) match {
+      case None =>
+        Left(("a text block's content begins on the line after its opening \"\"\"", start))
+      case Some(first) =>
+        var rest    = first
+        var least   = Int.MaxValue
+        var indent  = 0
+        var blank   = true
+        var atStart = true
+        var result: Option[Either[(String, Reader[Char]), (Int, Reader[Char])]] = None
+
+        while (result.isEmpty)
+          if (rest.atEnd) result = Some(Left(("unterminated text block", rest)))
+          // The line the delimiter sits on counts whether or not it carries content: alone, its
+          // own column is the offer; after content, it is an ordinary content line.
+          else if (rest.first == '"' && opensBlock(rest)) {
+            val strip = least min indent
+
+            result = Some(Right((if (strip == Int.MaxValue) 0 else strip, first)))
+          }
+          else if (rest.first == '\n') {
+            if (!blank) least = least min indent
+            indent = 0; blank = true; atStart = true; rest = rest.rest
+          } else if (atStart && isBlank(rest.first)) { indent += 1; rest = rest.rest }
+          // Stepped over whole, so a `\"""` inside the block does not read as the terminator.
+          else if (escapes && rest.first == '\\' && !rest.rest.atEnd) {
+            atStart = false; blank = false; rest = rest.rest.rest
+          } else { atStart = false; blank = false; rest = rest.rest }
+
+        result.get
+    }
+
+  /** Steps over the incidental whitespace at the head of a text block's line. A line with less
+   * whitespace than the strip — a blank one, in practice — simply gives up what it has.
+   */
+  private def afterIndent(in: Reader[Char], strip: Int): Reader[Char] = {
+    var rest = in
+    var n    = 0
+
+    while (n < strip && !rest.atEnd && isBlank(rest.first)) { n += 1; rest = rest.rest }
+    rest
+  }
+
+  /** Whether a backslash joins its line to the next — a `\` with nothing but blanks between it and
+   * the line break. This is what lets embedded data be written a line at a time and still be one
+   * string with no breaks in it, which is the case a text block otherwise cannot serve.
+   */
+  private def joinsLine(in: Reader[Char]): Option[Reader[Char]] = {
+    var rest = in
+
+    while (!rest.atEnd && isBlank(rest.first)) rest = rest.rest
+    Option.when(!rest.atEnd && rest.first == '\n')(rest.rest)
   }
 
   /** Reads one character of a character or string literal — an escape sequence, a plain
