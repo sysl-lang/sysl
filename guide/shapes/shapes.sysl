@@ -86,16 +86,52 @@ end Kind
 // object-safe because it carries a receiver it never spells, and this is where that is spent: the
 // read goes through the object's table exactly as a call does.
 //
-// `describe` is the member that should not be here. Every shape below also implements `Display`,
-// and an object cannot reach it — see the note at the head of `main.sysl`.
+// `render` is the member that should not be here, and it is worth looking at why it takes the shape
+// it does. Every shape below also implements `Display`, whose one method is `display(self, out:
+// *Writer, fmt: FormatSpec)` — and an object cannot reach it, so the trait declares that method
+// again, minus the specifier it has no use for. The duplication is no longer a paraphrase of
+// `Display`; it is `Display`. See the note at the head of `main.sysl`.
 trait Shape
     area(self) -> f64
     perimeter(self) -> f64
     bounds(self) -> Box
     kind -> Kind
-    describe(self) -> string
+    render(self, out: *Writer)
 
+// A number as text, to six decimals. This is the one thing on the rendering path that still builds a
+// string: `%.6f` is a fixed-point conversion and the sink family renders a real as `%g`, which is
+// significant digits. `14 §2` decided that the conversion letter does not cross into a `Display` —
+// only a width, a precision, and a justification do — so a fixed-point rendering into a sink has
+// nowhere to be asked for.
 six(x: f64) -> string = f"$x%.6f"
+
+// The specifier a part is rendered with: no width, no precision, no justification. `14 §2` is
+// explicit that a part gets the neutral one and the whole value gets the caller's.
+plain() -> FormatSpec = FormatSpec(0, -1, false)
+
+// The shape as text, gathered from what it writes. This is the whole of what `from_utf8` bought the
+// program: rendering can go the allocation-free way, into a `*Writer`, and a caller that genuinely
+// wants a `string` can still have one — which is the direction that did not exist before.
+// The sigil is the one this program's call sites hold, and there is no crossing to the other —
+// the same gap `size` and `size_raw` are written twice for.
+describe(s: &Shape) -> string
+    var g = byte_sink()
+
+    s.render(&g)
+    from_utf8(g.text()).unwrap()
+
+// A `Display` for a shape is its rendering put in the field the specifier asked for. `14 §2` says
+// the field belongs to the whole value rather than to each part, so the parts are gathered before
+// any padding is applied — which is what `byte_sink` is in the prelude for.
+//
+// It is written **once, over the bound**, and that is the finding stated from the other side: a
+// `[T: Shape]` may say "and it is a `Display` too" in the seven impls below, because a bound is a
+// list. A `&Shape` may not, because a type is one name.
+display_shape[T: Shape](x: T, out: *Writer, fmt: FormatSpec)
+    var g = byte_sink()
+
+    x.render(&g)
+    display_pad(g.text(), out, fmt)
 
 // -- the leaves ------------------------------------------------------------------------------
 
@@ -110,7 +146,10 @@ impl Shape for Circle
     perimeter(self) -> f64 = 2.0 * pi * self.r
     bounds(self) -> Box = Box(self.cx - self.r, self.cy - self.r, self.cx + self.r, self.cy + self.r)
     kind -> Kind = Circular
-    describe(self) -> string = "circle(r=" + six(self.r) + ")"
+    render(self, out: *Writer)
+        out.write("circle(r=".bytes)
+        out.write(six(self.r).bytes)
+        out.write(")".bytes)
 
 struct Rect
     x: f64
@@ -124,7 +163,12 @@ impl Shape for Rect
     perimeter(self) -> f64 = 2.0 * (self.w + self.h)
     bounds(self) -> Box = Box(self.x, self.y, self.x + self.w, self.y + self.h)
     kind -> Kind = Rectangular
-    describe(self) -> string = "rect(" + six(self.w) + "x" + six(self.h) + ")"
+    render(self, out: *Writer)
+        out.write("rect(".bytes)
+        out.write(six(self.w).bytes)
+        out.write("x".bytes)
+        out.write(six(self.h).bytes)
+        out.write(")".bytes)
 
 struct Tri
     a: Point
@@ -153,7 +197,7 @@ impl Shape for Tri
     end bounds
 
     kind -> Kind = Triangular
-    describe(self) -> string = "triangle"
+    render(self, out: *Writer) = out.write("triangle".bytes)
 
 // A closed polygon through its vertices, in order.
 struct Poly
@@ -197,7 +241,10 @@ impl Shape for Poly
     end bounds
 
     kind -> Kind = Polygonal
-    describe(self) -> string = "polygon(" + str(self.pts.len()) + ")"
+    render(self, out: *Writer)
+        out.write("polygon(".bytes)
+        display_uint(ulong(self.pts.len()), out, plain())
+        out.write(")".bytes)
 
 // -- the combinators -------------------------------------------------------------------------
 
@@ -234,16 +281,19 @@ impl Shape for Group
 
     kind -> Kind = Composite
 
-    describe(self) -> string
-        var s = "group("
+    // The concatenation this used to be was quadratic — a fresh string per part, each copying
+    // everything already gathered. Writing into the caller's sink is linear, and the recursion is
+    // unchanged: a part is a `&Shape`, so `render` on it goes through the object's table.
+    render(self, out: *Writer)
+        out.write("group(".bytes)
 
         for i in 0..<self.parts.len()
-            if i > 0usize then s += ", "
+            if i > 0usize then out.write(", ".bytes)
 
-            s += self.parts.at(i).describe()
+            self.parts.at(i).render(out)
 
-        s + ")"
-    end describe
+        out.write(")".bytes)
+    end render
 
 // A shape moved. Area and perimeter are what they were; only the bound moves.
 struct Moved
@@ -263,7 +313,10 @@ impl Shape for Moved
     end bounds
 
     kind -> Kind = Displaced
-    describe(self) -> string = "moved(" + self.inner.describe() + ")"
+    render(self, out: *Writer)
+        out.write("moved(".bytes)
+        self.inner.render(out)
+        out.write(")".bytes)
 
 // A shape scaled about the origin. Area goes as the square of the factor and perimeter as the
 // factor itself, which is the one law in this program that holds for every shape there could ever
@@ -284,33 +337,38 @@ impl Shape for Scaled
     end bounds
 
     kind -> Kind = Resized
-    describe(self) -> string = "scaled(" + six(self.k) + ", " + self.inner.describe() + ")"
+    render(self, out: *Writer)
+        out.write("scaled(".bytes)
+        out.write(six(self.k).bytes)
+        out.write(", ".bytes)
+        self.inner.render(out)
+        out.write(")".bytes)
 
 // -- rendering, which is the same thing said a second time ------------------------------------
 //
 // Every one of these seven impls exists because a `&Shape` cannot be printed. `Display` is a trait
 // each shape implements perfectly well; erasing to `Shape` throws it away, and there is no way to
-// say that a `Shape` is also a `Display`. So the trait carries a `describe` of its own, and these
-// forward `Display` back onto it — fourteen lines whose entire content is that the two traits are
-// about the same value.
+// say that a `Shape` is also a `Display`. So the trait declares `Display`'s own method a second
+// time, and these forward one onto the other — fourteen lines whose entire content is that the two
+// traits are about the same value.
 
 impl Display for Circle
-    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec) = display_shape(self, out, fmt)
 
 impl Display for Rect
-    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec) = display_shape(self, out, fmt)
 
 impl Display for Tri
-    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec) = display_shape(self, out, fmt)
 
 impl Display for Poly
-    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec) = display_shape(self, out, fmt)
 
 impl Display for Group
-    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec) = display_shape(self, out, fmt)
 
 impl Display for Moved
-    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec) = display_shape(self, out, fmt)
 
 impl Display for Scaled
-    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+    display(self, out: *Writer, fmt: FormatSpec) = display_shape(self, out, fmt)

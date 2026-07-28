@@ -2,16 +2,18 @@ package io.github.edadma.sysl
 
 /** The call forms the compiler resolves by name.
  *
- * A call is normally a name looked up among the program's declarations. These six are not: the
- * analyzer recognizes `print`, `str`, `format`, `va_start`, `va_end`, and `va_arg` before it gets
- * that far. Collecting them in one file is deliberate — it is the whole of what the language knows
- * that a program could not have told it, and the list is meant to shrink.
+ * A call is normally a name looked up among the program's declarations. These seven are not: the
+ * analyzer recognizes `print`, `str`, `format`, `from_utf8_unchecked`, `va_start`, `va_end`, and
+ * `va_arg` before it gets that far. Collecting them in one file is deliberate — it is the whole of
+ * what the language knows that a program could not have told it, and the list is meant to shrink.
  *
  * The three `va_*` forms belong here permanently. Each is an **ABI primitive** that no sysl body
  * could implement, in the same category as `sizeof`, so there is nothing to put in the prelude
- * (`12` §9). The other three are the temporary ones: all three are now desugarings onto a
- * `Display`, and what keeps them here is the sink each supplies — standard output for `print`, a
- * fresh buffer for `str` and `format` — neither of which the prelude can name yet.
+ * (`12` §9). `from_utf8_unchecked` is permanent for the same reason from the other direction: every
+ * safe route to a `string` carries the UTF-8 guarantee, so the one operation that sets it aside can
+ * only come from underneath the language. The other three are the temporary ones: all three are now
+ * desugarings onto a `Display`, and what keeps them here is the sink each supplies — standard output
+ * for `print`, a fresh buffer for `str` and `format` — neither of which the prelude can name yet.
  */
 trait SpecialForms extends CallAnalysis {
 
@@ -87,6 +89,32 @@ trait SpecialForms extends CallAnalysis {
         val (method, value) = displayOf(t, "str")
 
         TRender(value, method, plainSpec)
+  }
+
+  /** `from_utf8_unchecked(b)` — a `[]u8` taken as a `string` without looking at it.
+   *
+   * This is the whole of what the prelude's `from_utf8` cannot write for itself: it validates, and
+   * then it needs somewhere to say "these bytes are a string now". `04` puts the unchecked form in
+   * the `*T` tier deliberately — breaking the UTF-8 invariant breaks `char`'s downstream — so the
+   * spelling is long and greppable rather than convenient.
+   *
+   * A `string` argument is refused rather than passed through. It would be the identity, but the
+   * only way to write one is to have gone looking for this function, and a program that reaches for
+   * the unchecked conversion on a value that is already checked has misunderstood which direction it
+   * is going.
+   */
+  protected def fromUtf8Unchecked(args: List[Expr]): TExpr = {
+    if args.length != 1 then err("'from_utf8_unchecked' takes exactly one value, the bytes to take as a string")
+    val t = analyzeExpr(args.head)
+
+    Type.underlying(t.ty) match
+      case Type.Slice(Type.Byte) => TFromBytes(t)
+      case Type.Array(_, Type.Byte) =>
+        err("'from_utf8_unchecked' takes a []u8, and an array is not one — slice it, as 'from_utf8_unchecked(a[..])'")
+      case Type.Str =>
+        err("'from_utf8_unchecked' makes a string out of bytes, and this value is already a string")
+      case other =>
+        err(s"'from_utf8_unchecked' takes a []u8, but the value has type ${show(other)}")
   }
 
   /** `format(value, "%spec")` renders one value through a printf specifier. It is the desugaring of

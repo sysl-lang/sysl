@@ -24,21 +24,28 @@
 //     `[T: Shape + Display]` bound has both, because a bound is a list and a type is one name. So
 //     **the price of erasing is paid in capabilities, not just in speed**, and it is paid at the
 //     moment a program stops knowing the type — which is the moment it most needs to describe it.
-//     What this program does instead is declare `describe(self) -> string` on `Shape` and forward
-//     `Display` back onto it in seven two-line impls that say nothing.
+//     What this program does instead is declare `Display`'s own method on `Shape` under another
+//     name and forward one onto the other in seven two-line impls that say nothing.
 //     The mechanism that would fix it is one already deferred: **a trait that requires another
 //     trait**. `trait Shape: Display` would let a `&Shape` carry `Display`'s table too, and problem
 //     10 wanted the same feature for a quite different reason — writing one bound instead of nine.
 //     Second customer, and a much stronger one: there, a supertrait was an economy; here it is the
 //     difference between a thing being writable and not.
-//   * **A `*Writer` renders bytes and nothing turns them back into a string.** The natural way to
-//     write `describe` is not to build a string at all — it is `render(self, out: *Writer)`, which
-//     is what `Display` already is and what costs no allocation. It cannot be used, because after
-//     rendering into a `ByteSink` there is no way to get a `string` out of the bytes: `from_utf8`
-//     does not exist. So the two ways of turning a shape into text are *both* blocked, one by the
-//     missing supertrait and one by the missing conversion, and the program concatenates strings.
-//     `guide/json` reported the same absence for a quite different reason (unescaping), and this is
-//     the second program to be pushed off its natural design by it.
+//   * **A `*Writer` rendered bytes and nothing turned them back into a string.** The natural way to
+//     write the trait's text member is not to build a string at all — it is `render(self, out:
+//     *Writer)`, which is what `Display` already is and what costs no allocation. It could not be
+//     used, because after rendering into a `ByteSink` there was no way to get a `string` out of the
+//     bytes. So both routes to text were blocked, one by the missing supertrait and one by the
+//     missing conversion, and the program concatenated strings. Answered: `from_utf8` exists, the
+//     trait member is `render`, and `describe(s: &Shape)` gathers a rendering into a string at the
+//     one place that wants one. What that leaves is a sharper statement of the *first* blocker —
+//     `Shape` now declares `Display`'s own method a second time, so the duplication is no longer a
+//     paraphrase. It also removed a quadratic: `Group` used to build a fresh string per part.
+//   * **A fixed-point number cannot be rendered into a sink.** `six(x)` is `f"$x%.6f"` and still
+//     allocates, because the sink family renders a real as `%g` — significant digits. `14 §2`
+//     decided that the conversion letter does not cross into a `Display`, only a width, a precision
+//     and a justification, so there is nowhere to ask for `%f`. That is the one allocation left on
+//     this program's rendering path, and it is a recorded decision rather than a gap.
 //   * **There is no way to ask a trait object what it forgot.** No cast, no test, no pattern — `g
 //     is Circle` is a syntax error, because a type is not a pattern. A catalogue that wants to
 //     count its circles has to be told, so `Shape` declares a `kind` property and every impl
@@ -63,7 +70,7 @@
 //     object's table exactly as a call does — which is what `02` claims and had no guide program
 //     checking.
 //   * Positives worth keeping: a combinator holding `&Shape` makes recursion through the object's
-//     table ordinary, so a group of groups needs nothing special and neither does a `describe`
+//     table ordinary, so a group of groups needs nothing special and neither does a `render`
 //     that calls itself down the tree; a `Buf[&Shape]` is a heterogeneous growable collection with
 //     no annotation anywhere; the two sigils cost nothing to mix, with `*Shape` over stack values
 //     allocating nothing at all; and an object built and dropped a hundred thousand times in a
@@ -215,7 +222,7 @@ check("its box reaches around both", extent(nested.bounds()),
       "-2.000000 -2.000000 5.000000 6.000000")
 
 // Describing it walks the same tree the same way.
-check("and describing it walks the tree", nested.describe(),
+check("and describing it walks the tree", describe(nested),
       "group(group(circle(r=2.000000), rect(3.000000x4.000000), triangle), polygon(5))")
 
 // A group of one is that shape; a group is not obliged to be interesting.
@@ -249,7 +256,7 @@ var both: &Shape = Scaled(Moved(group, 10.0, 20.0), 2.0)
 check("a wrapper wrapping a wrapper", size(both), "122.265482 77.132741")
 check("and the box it works out to", extent(both.bounds()),
       "16.000000 36.000000 28.000000 52.000000")
-check("which says what it is made of", both.describe(),
+check("which says what it is made of", describe(both),
       "scaled(2.000000, moved(group(circle(r=2.000000), rect(3.000000x4.000000), triangle)))")
 
 // Scaling by one is the shape it wrapped.
@@ -344,8 +351,9 @@ var printable = Circle(0.0, 0.0, 2.0)
 check("a shape prints while its type is known", f"${printable}", "circle(r=2.000000)")
 check("and pads like anything else does", f"${printable}%22s", "    circle(r=2.000000)")
 
-// Erased, it does not — `f"${chosen}"` is a compile error, so the trait's own `describe` stands in.
-check("erased, it answers only what the trait asked", chosen.describe(), "circle(r=2.000000)")
+// Erased, it does not — `f"${chosen}"` is a compile error, so the trait's own `render` stands in,
+// gathered back into a string by `describe`.
+check("erased, it answers only what the trait asked", describe(chosen), "circle(r=2.000000)")
 
 // The kind property is the hand-written copy of what the object's table already knows.
 check("and says what it is only because it was told", chosen.kind.name(), "circle")

@@ -13,11 +13,14 @@
 //
 //   * **A pattern does not reach through a reference.** Selection does (`p.x` on a `&T`), so the
 //     asymmetry is a thing to learn rather than to guess; every walk here starts `*j match`.
-//   * **There is no way to build a `string` out of bytes a program computed.** The only sources of
-//     one are a literal, a slice of an existing string, concatenation, and `str`. So unescaping is
-//     written as "copy the source between the escapes, and append a literal for each" — which is
-//     the fast way to write it anyway, but it is not a choice here. `\uXXXX` reaches a string only
-//     through `str(char(n))`, a *rendering* path, because no construction path exists.
+//   * **There was no way to build a `string` out of bytes a program computed.** The only sources of
+//     one were a literal, a slice of an existing string, concatenation, and `str`, so unescaping was
+//     written as "copy the source between the escapes, and append a literal for each" and `\uXXXX`
+//     reached text only through `str(char(n))` — a *rendering* function standing in for a
+//     constructor. Answered: `from_utf8` validates a `[]u8` into a `string`, so `parse_string`
+//     gathers into one sink and converts once at the end, and an escape writes the bytes it encodes
+//     to instead of being rendered into a string that is immediately concatenated away. The
+//     structure that had been forced is now the structure that is wanted.
 //   * **There were no constants** when this was written, so a value shared by several functions had
 //     to be a nullary function. `const` was added afterwards, for a reason this program did not
 //     turn up on its own: a nullary function reads perfectly well *in an expression*, and what it
@@ -78,6 +81,9 @@ end parse
 
 // How deep a document may nest before the reader gives up.
 private const max_depth: int = 64
+
+// The neutral specifier: an escape's bytes are written as themselves, with no field around them.
+private plain() -> FormatSpec = FormatSpec(0, -1, false)
 
 // The reader is a position in a source text, and both spellings of the text are kept: the bytes to
 // decide by, and the `string` to cut pieces out of. Nothing here can turn the one back into the
@@ -162,14 +168,14 @@ private struct Reader
         Ok(Num(if self.src[start] == u8('-') then -n else n))
     end parse_number
 
-    // Everything between two escapes is copied out of the source as a substring; the escapes
-    // themselves are the only bytes this can name a replacement for, because a `string` cannot be
-    // built out of bytes a program has in hand.
+    // Bytes are gathered into one sink and validated once at the end. The runs between escapes are
+    // copied out of the source as slices and the escapes write their own bytes into the same place,
+    // so a string with fifty escapes in it allocates for its buffer's growth and not once per piece.
     parse_string(*self) -> Result[string, Fault]
         var opened = self.at
 
         self.bump()
-        var out = ""
+        var out = byte_sink()
         var start = self.at
 
         loop
@@ -177,46 +183,52 @@ private struct Reader
             var c = self.src[self.at]
 
             if c == u8('"')
-                out += self.text[start..<self.at]
+                out.write(self.src[start..<self.at])
                 self.bump()
                 break
             else if c == u8('\\')
-                out += self.text[start..<self.at]
+                out.write(self.src[start..<self.at])
                 self.bump()
-                out += self.unescape()?
+                self.unescape(&out)?
                 start = self.at
             else if c < 32u8
                 return Err(Expected(self.at, "a character"))
             else
                 self.bump()
 
-        Ok(out)
+        // The bytes are well-formed by construction — every run came out of a `string`, and every
+        // escape wrote one encoded scalar value — so this walk can only agree. It is here anyway:
+        // the alternative is `from_utf8_unchecked`, and a parser is the last place to spend a
+        // guarantee on an argument about where its input came from.
+        Ok(from_utf8(out.text()).unwrap())
     end parse_string
 
-    unescape(*self) -> Result[string, Fault]
+    unescape(*self, out: *Writer) -> Result[unit, Fault]
         if self.done() then return Err(BadEscape(self.at))
         var c = char(self.src[self.at])
 
         self.bump()
         c match
-            '"' -> Ok("\"")
-            '\\' -> Ok("\\")
-            '/' -> Ok("/")
-            'b' -> Ok(str(char(8)))
-            'f' -> Ok(str(char(12)))
-            'n' -> Ok("\n")
-            'r' -> Ok("\r")
-            't' -> Ok("\t")
-            'u' -> self.unescape_hex()
+            '"' -> Ok(out.write("\"".bytes))
+            '\\' -> Ok(out.write("\\".bytes))
+            '/' -> Ok(out.write("/".bytes))
+            'b' -> Ok(out.write([8u8]))
+            'f' -> Ok(out.write([12u8]))
+            'n' -> Ok(out.write("\n".bytes))
+            'r' -> Ok(out.write("\r".bytes))
+            't' -> Ok(out.write("\t".bytes))
+            'u' -> self.unescape_hex(out)
             else Err(BadEscape(self.at - 1))
     end unescape
 
-    // `str(char(n))` is the whole of the route from a code point to text. It is a rendering
-    // function standing in for a constructor, because there is no constructor.
-    unescape_hex(*self) -> Result[string, Fault]
+    // A code point reaches the output as the bytes it encodes to, which is what an escape always
+    // meant. This used to be `str(char(n))` — a *rendering* function standing in for a constructor,
+    // because no way to make bytes into text existed. `display_char` is the encoder the prelude
+    // already had, and `from_utf8` is what makes writing into a sink an option at all.
+    unescape_hex(*self, out: *Writer) -> Result[unit, Fault]
         var hi = self.hex4()?
 
-        if hi < 0xD800 || hi > 0xDFFF then return Ok(str(char(hi)))
+        if hi < 0xD800 || hi > 0xDFFF then return Ok(display_char(char(hi), out, plain()))
         if hi > 0xDBFF then return Err(BadEscape(self.at))
         if !self.at_byte(u8('\\')) then return Err(BadEscape(self.at))
         self.bump()
@@ -226,7 +238,7 @@ private struct Reader
         var lo = self.hex4()?
 
         if lo < 0xDC00 || lo > 0xDFFF then return Err(BadEscape(self.at))
-        Ok(str(char(0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00))))
+        Ok(display_char(char(0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)), out, plain()))
     end unescape_hex
 
     hex4(*self) -> Result[int, Fault]

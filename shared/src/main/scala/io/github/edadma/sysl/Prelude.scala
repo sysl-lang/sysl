@@ -79,13 +79,24 @@ package io.github.edadma.sysl
  * be written at all until a `[]T` could be sized while running. The writer standing for standard
  * output stays the compiler's, because it holds no state and there is no struct with no fields.
  *
+ * **`from_utf8` is the one direction a `string` could not otherwise be reached from**, and it is
+ * here rather than in the compiler because only its last line needs to be: validation is ordinary
+ * sysl over a `[]u8`, and the compiler supplies just `from_utf8_unchecked`, the primitive that says
+ * "these bytes are a string now". The validator is Unicode's own well-formedness table rather than a
+ * decode-and-range-check, which is what makes the four ways of being ill-formed — overlong, a
+ * surrogate, a value past `10FFFF`, and a byte that can never appear — fall out of the lead byte's
+ * row instead of each needing its own test. `Utf8Error` carries the offset `04` asks for plus the
+ * one distinction a caller can act on: whether the input merely **ended** in the middle of a
+ * sequence, which more bytes would fix, or holds one that no continuation could rescue.
+ *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
  * reaches it, a **member of a non-generic type declared here** is held back by that same
  * reachability, and an `extern` is declared only if something calls it. Layout is the one exception,
  * and not one of this file's making — a non-generic type is instantiated eagerly wherever it is
- * declared, so `FormatSpec`'s and `ByteSink`'s are emitted whether or not anything renders. That is
- * two type declarations with no code behind them, which is why the rule is worth what it saves.
+ * declared, so `FormatSpec`'s, `ByteSink`'s and `Utf8Error`'s are emitted whether or not anything
+ * renders or decodes. That is three type declarations with no code behind them, which is why the
+ * rule is worth what it saves.
  */
 object Prelude {
 
@@ -371,6 +382,50 @@ object Prelude {
       |            print("panic:", msg)
       |            exit(1)
       |end Result
+      |
+      |struct Utf8Error
+      |    offset: usize
+      |    truncated: bool
+      |
+      |from_utf8(b: []u8) -> Result[string, Utf8Error]
+      |    var i = 0usize
+      |    while i < b.len
+      |        var c = b[i]
+      |        var need = 0usize
+      |        var lo = 128u8
+      |        var hi = 191u8
+      |
+      |        if c < 128u8 then
+      |            need = 1usize
+      |        elif c < 194u8 then
+      |            return Err(Utf8Error(i, false))
+      |        elif c < 224u8 then
+      |            need = 2usize
+      |        elif c < 240u8 then
+      |            need = 3usize
+      |            if c == 224u8 then lo = 160u8
+      |            if c == 237u8 then hi = 159u8
+      |        elif c < 245u8 then
+      |            need = 4usize
+      |            if c == 240u8 then lo = 144u8
+      |            if c == 244u8 then hi = 143u8
+      |        else
+      |            return Err(Utf8Error(i, false))
+      |
+      |        var have = b.len - i
+      |        var k = 1usize
+      |        while k < need && k < have
+      |            var t = b[i + k]
+      |            var min = if k == 1usize then lo else 128u8
+      |            var max = if k == 1usize then hi else 191u8
+      |            if t < min || t > max then return Err(Utf8Error(i, false))
+      |            k += 1usize
+      |
+      |        if have < need then return Err(Utf8Error(i, true))
+      |        i += need
+      |
+      |    Ok(from_utf8_unchecked(b))
+      |end from_utf8
       |
       |struct Buf[T]
       |    elems: []T

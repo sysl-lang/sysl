@@ -174,6 +174,17 @@ case class TSeq(exprs: List[TExpr]) extends TExpr { def ty: Type = Type.Unit }
  */
 case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
 
+/** The built-in `from_utf8_unchecked(b)` — the bytes of a `[]u8` as a `string`, with nothing
+ * checked (`04 § Validity`).
+ *
+ * It is here rather than in the prelude for the reason the `va_*` forms are: no sysl body can build
+ * a `string`, since every safe route to one already has the UTF-8 guarantee behind it. The bytes are
+ * **copied** into a fresh owning string rather than shared with the slice — a `[]u8` is mutable and
+ * a `string` is not, so aliasing the source would let a later write break the invariant of a value
+ * that had already been checked.
+ */
+case class TFromBytes(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
+
 /** `format(value, spec)` — one value rendered through a printf specifier, the lowering of an
  * `f"…"` hole. Always allocates a fresh string; `spec` is the sysl specifier (`%08.2f`), which
  * codegen turns into the C one it hands `snprintf`.

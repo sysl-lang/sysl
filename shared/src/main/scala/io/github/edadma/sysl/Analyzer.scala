@@ -947,11 +947,13 @@ class Analyzer private (units: List[Program])
 
     // The forms the compiler resolves by name rather than by looking a function up: `print` and
     // its two rendering companions, which are temporary and leave once a `Display` trait can carry
-    // them, and the three ABI primitives of a variadic body, which stay. What each one means is in
+    // them, and the four primitives no sysl body could implement — the unchecked byte-to-string
+    // conversion and the three a variadic body needs — which stay. What each one means is in
     // `SpecialForms`; the dispatch is here so it reads in the order the match tries.
     case Call(Ident("print"), args)                         => printCall(args)
     case Call(Ident("str"), args)                           => strCall(args)
     case Call(Ident("format"), List(argExpr, StrLit(spec))) => formatCall(argExpr, spec)
+    case Call(Ident("from_utf8_unchecked"), args)           => fromUtf8Unchecked(args)
     case Call(Ident("va_start"), args)                      => vaStart(args)
     case Call(Ident("va_end"), args)                        => vaEnd(args)
     case Call(Ident("va_arg"), args)                        => vaArg(args, expected)

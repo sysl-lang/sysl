@@ -9,10 +9,13 @@ What exists: the three-word representation, literals, `s.len`, `s[i]`, `s[a..b]`
 bounds and the boundary checked, `s.bytes`, comparison by bytes, string literals as `match`
 patterns, **concatenation** — `a + b` and `s += t`, which allocate a fresh buffer — **`str(x)`**,
 which renders a primitive value into one, and **interpolation** — `s"…$x…"`, `raw"…"`, and
-`f"…${x}%d…"`, which desugar to concatenation, `str`, and printf-style formatting. What does not: the rest of the operations that produce
-new bytes — `from_utf8`, `copy()`, `str.builder`, `cstring`, `string(c)` — since each needs either
-the raw-bytes surface or methods. A string is therefore no longer always traceable to a literal; a
-program can build one by joining or by rendering.
+`f"…${x}%d…"`, which desugar to concatenation, `str`, and printf-style formatting — and
+**`from_utf8`** with the `from_utf8_unchecked` primitive under it, which is the one route from bytes
+a program computed back to text. What does not: the rest of the operations that produce new bytes —
+`copy()`, `str.builder`, `cstring`, `string(c)` — since each needs either the raw-bytes surface or
+methods, and **`s.chars`**, which needs an iteration protocol the language does not yet have. A
+string is therefore no longer always traceable to a literal; a program can build one by joining, by
+rendering, or by validating bytes.
 
 ## The decision in one paragraph
 
@@ -104,24 +107,53 @@ Construction:
 | From | Spelling | Behaviour |
 |---|---|---|
 | literal | `"héllo"` | validated at compile time |
-| bytes | `string.from_utf8(b: []u8) -> Result[string, Utf8Error]` | validates; the error names the offending byte offset |
-| bytes, trusted | `string.from_utf8_unchecked(b: []u8)` | **unsafe** — available only where raw pointers are, so it stays greppable |
+| bytes | `from_utf8(b: []u8) -> Result[string, Utf8Error]` | validates; the error names the offending byte offset |
+| bytes, trusted | `from_utf8_unchecked(b: []u8) -> string` | **unsafe** — the long name is the point: it stays greppable |
 | a `char` | `string(c)` | encodes one scalar value |
 
 `from_utf8_unchecked` is in the `*T` category deliberately: breaking the UTF-8 invariant
 breaks `char`'s invariant downstream, so it belongs with the other primitive that can break
 the safe subset rather than alongside the ordinary conversions.
 
-**`from_utf8` is specified above and not built, and two guide programs have now paid for it in
-different currencies.** `guide/json` pays in *workarounds*: unescaping copies the source between
-the escapes and reaches text for a `\uXXXX` only through `str(char(n))`, a rendering path standing
-in for a constructor. `guide/shapes` pays in *design* — the allocation-free way to turn a value
-into text is to render into a `*Writer`, which is what `Display` is, and a program that does so
-cannot get a `string` back out of the sink, so it concatenates instead. The second is the more
-serious report: the first says the conversion is inconvenient to live without, the second says its
-absence pushes a program away from the rendering path this document and `14 §2` are built around.
-Both blockers on the entry are gone — validation is a decided semantics above, and allocation
-arrived with storage sized while running — so what remains is the work, not a question.
+**Both are free functions, and the first spelling of them here was `string.from_utf8(…)` — an
+associated function on a built-in, which `08` says cannot be written**: only a struct or an enum has
+a name in call position. The doc had been written against a namespace mechanism the language does
+not have, and the fix is to stop pretending it does. Nothing is lost by the shorter spelling and
+nothing is decided by it either: if built-ins ever carry associated functions, these two become
+`string.from_utf8` with no change to what they do.
+
+**The division of labour is worth stating, because it is the whole reason `from_utf8` is not a
+built-in.** The compiler supplies exactly one primitive — `from_utf8_unchecked`, which is a `[]u8`
+taken as a `string` with nothing looked at — and the validator on top of it is ordinary sysl in the
+prelude. That is possible for the same reason `Buf[T]` is: nothing in a byte-by-byte scan needs
+anything the language does not already offer. What no sysl body can do is the last line, because
+every safe route to a `string` already carries the guarantee.
+
+**The validator is Unicode's well-formedness table (Table 3-7), not a decode-then-range-check**, and
+the difference is not stylistic. In the table, the *lead* byte fixes the legal range of the byte
+after it — `E0` demands `A0..BF`, `ED` only `80..9F`, `F0` demands `90..BF`, `F4` only `80..8F` —
+so an overlong encoding, a surrogate, and a value past `10FFFF` are all rejected at the second byte,
+by the same test, before any codepoint is assembled. Written the other way each needs its own check
+and each is its own chance to be forgotten.
+
+`Utf8Error` carries the offset promised above and one thing more: whether the input merely **ended**
+in the middle of a sequence. That distinction is the only one a caller can act on differently — more
+bytes would fix an unfinished sequence and could never fix a wrong one — which is why it is a field
+rather than a taxonomy of fault names nobody would match on.
+
+**The bytes are copied rather than viewed.** A `string` could in principle share a `[]u8`'s owner,
+which would make the conversion O(1) — but a slice is writable and a string is not, so a later write
+through the slice would change a value that had already been checked. Copying is what makes
+validation mean anything afterwards, and it is why the entry requires `alloc`.
+
+**Two guide programs paid for the absence in different currencies.** `guide/json` paid in
+*workarounds*: unescaping copied the source between the escapes and reached text for a `\uXXXX` only
+through `str(char(n))`, a rendering path standing in for a constructor. `guide/shapes` paid in
+*design* — the allocation-free way to turn a value into text is to render into a `*Writer`, which is
+what `Display` is, and a program that did so could not get a `string` back out of the sink, so it
+concatenated instead. The second was the more serious report: the first says the conversion is
+inconvenient to live without, the second says its absence pushes a program away from the rendering
+path this document and `14 §2` are built around.
 
 ## Granularity: bytes and scalar values, not graphemes
 
@@ -139,15 +171,25 @@ choice is right for a systems language; Swift's is right for an application lang
 | byte at an index | `s[i] -> u8` | O(1), bounds-checked |
 | substring | `s[a..b] -> string` | O(1), shares; bounds-checked **and** boundary-checked |
 | bytes | `s.bytes -> []u8` | O(1) view |
-| scalar values | `s.chars` | O(1) per step, total — no replacement characters |
+| scalar values | `s.chars` | O(1) per step, total — no replacement characters. **Not built** |
 | copy out | `s.copy() -> string` | O(n), allocates; releases the parent |
 | concatenation | `a + b` | O(n), allocates |
 | repeated append | `str.builder` | amortized |
 
+**`s.chars` is specified here and not built**, and building `from_utf8` is what made the gap worth
+recording rather than merely noting: a program can now go from bytes to text and still has no way to
+go from text to scalar values, so the round trip this table describes is open at one end. It is not
+the same size of job as the rows above it — every one of those yields a value, and this one yields a
+*sequence*, which `for` currently knows only as an array or a slice. So it waits on an iteration
+protocol, which is the same thing `Index` and a growable container's `for` are waiting on (`14 §7`),
+and it should be decided with them rather than special-cased into `for`.
+
 **Slicing is boundary-checked.** `s[a..b]` must land on scalar-value boundaries; landing
 mid-codepoint traps, in the same runtime-safety category as a bounds check and `char(u)`. Go
 permits the mid-codepoint slice and lets you build an invalid string with it — that option is
-closed here by the validity guarantee.
+closed here by the validity guarantee. This holds for a string that arrived through `from_utf8`
+exactly as it does for a literal, which is the point of validating at the door: nothing downstream
+may undo it.
 
 ### Comparison is by bytes
 

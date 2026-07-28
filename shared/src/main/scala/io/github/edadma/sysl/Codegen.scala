@@ -735,6 +735,18 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     case TFormat(arg, spec) =>
       ownTemp(genFormat(arg, spec), Type.Str)
 
+    // The bytes are copied into a string that owns them rather than viewed in place: a `[]u8` can
+    // be written through afterwards, and a `string` whose bytes could change is not one that was
+    // ever validated. The same copy is what `str(x)` finishes through, so both spend one allocation.
+    case TFromBytes(arg) =>
+      heap = true
+      val fn  = request("sysl.str.from_bytes")(StringEmitter.fromBytes)
+      val v   = genExpr(arg)
+      val p   = freshTemp(); emit(s"$p = extractvalue ${arg.ty.llvm} $v, 1")
+      val n   = freshTemp(); emit(s"$n = extractvalue ${arg.ty.llvm} $v, 2")
+      val r   = freshTemp(); emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $p, i64 $n)")
+      ownTemp(r, Type.Str)
+
     // A sink with no state: the table is the compiler's and the data word is null, because a writer
     // over standard output has nothing to point at.
     case TStdout() =>

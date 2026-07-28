@@ -466,6 +466,14 @@ exactly (`§5`), one row further down the catalog.
   is actually missing is narrower than "the operators a container wants" — it is indexing alone,
   and it is worth checking whether a container that hands out a slice needs anything else at all
   before the associated-type machinery is built for it.
+  **The iteration half now has a customer the indexing half does not, and it is a built-in.**
+  `04`'s granularity table specifies `s.chars`, a string's Unicode scalar values, and it is not
+  built: a string cannot hand out a slice of them the way a container hands out a view of its
+  storage, because the decoding is what makes them. So the "just use `.view()`" answer that covers
+  `Buf[T]` does not reach it, and `s.chars` is the case that decides whether the protocol is
+  something a *type* implements or something `for` knows about. Building `from_utf8` is what made
+  this worth writing down: a program can now go from bytes to text and still has no way to walk the
+  text it got.
 
 - **A heterogeneous *operand*, which is not the same ask as a heterogeneous result.** `§1` argues
   that `Self`-homogeneity costs nothing, because the scalars already obey it — `u8 + u8` is a `u8`

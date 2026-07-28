@@ -339,6 +339,9 @@ private class Escape(program: TProgram) {
     case TLen(r)                    => List(r)
     case TBytes(r)                  => List(r)
     case TStr(a)                    => List(a)
+    // The string it yields owns a copy, so nothing of the argument's storage survives in it — the
+    // walk is here for the argument's own sake.
+    case TFromBytes(a)              => List(a)
     case TFormat(a, _)              => List(a)
     // A render's result is a fresh string that owns its own bytes, so it views nothing here; what
     // is worth walking is the value and the specifier it hands the implementation.
