@@ -4,10 +4,10 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** What a generic trait refuses, and why. Three groups of rule: the arguments must be there and be
  * right wherever the trait is named; the promise an implementation makes is the one a bound has to
- * ask for; and one trait is implemented once per type, whatever arguments would have distinguished
- * two implementations.
+ * ask for; and a trait is implemented once per **argument list**, so what tells two implementations
+ * apart is the thing that distinguishes them and nothing else does.
  */
-class GenericTraitErrorTests extends AnyFreeSpec with CodegenSupport {
+class GenericTraitErrorTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "a trait applied to the wrong arguments is refused where it is written" - {
     "an 'impl' that leaves them out" in {
@@ -78,7 +78,7 @@ class GenericTraitErrorTests extends AnyFreeSpec with CodegenSupport {
           |print(f(P(1)))""".stripMargin,
       ) should include(
         "'f' requires its type parameter 'X' to implement 'Get[real]', but P does not — " +
-          "it implements 'Get[int]', and one trait is implemented once per type",
+          "it implements 'Get[int]'",
       )
     }
 
@@ -93,7 +93,7 @@ class GenericTraitErrorTests extends AnyFreeSpec with CodegenSupport {
           |var u: &Sink[real] = A(0)""".stripMargin,
       ) should include(
         "a &Sink[real] needs a type that implements 'Sink[real]', and A does not — " +
-          "it implements 'Sink[int]', and one trait is implemented once per type",
+          "it implements 'Sink[int]'",
       )
     }
 
@@ -124,9 +124,9 @@ class GenericTraitErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  "one trait is implemented once per type" - {
-    "a second implementation at other arguments is refused" in {
-      err(
+  "one trait is implemented once per argument list" - {
+    "a second implementation at other arguments is what the arguments are for" in {
+      run(
         """trait From[T]
           |    from(x: T) -> Self
           |struct C
@@ -134,11 +134,10 @@ class GenericTraitErrorTests extends AnyFreeSpec with CodegenSupport {
           |impl From[int] for C
           |    from(x: int) -> Self = C(x)
           |impl From[real] for C
-          |    from(x: real) -> Self = C(int(x))""".stripMargin,
-      ) should include(
-        "'C' already implements 'From[int]' — a trait's members become the type's, so a second " +
-          "'From' would give 'from' two meanings and a call no way to say which",
-      )
+          |    from(x: real) -> Self = C(int(x) * 10)
+          |print(C.from(3).v)
+          |print(C.from(2.5).v)""".stripMargin,
+      ) shouldBe "3\n20\n"
     }
 
     "a second implementation at the same arguments is the duplicate it always was" in {
@@ -152,6 +151,22 @@ class GenericTraitErrorTests extends AnyFreeSpec with CodegenSupport {
           |impl Get[int] for C
           |    get(self) -> int = 2""".stripMargin,
       ) should include("'C' already implements 'Get[int]'")
+    }
+
+    "and one that let the arguments default is the same duplicate said differently" in {
+      err(
+        """trait Get[T = Self]
+          |    get(self) -> T
+          |struct C
+          |    v: int
+          |impl Get for C
+          |    get(self) -> C = self
+          |impl Get[C] for C
+          |    get(self) -> C = self""".stripMargin,
+      ) should include(
+        "'C' already implements 'Get' — arguments left out are the ones 'Get' declares them to " +
+          "default to, so the two blocks implement the same trait at the same arguments",
+      )
     }
   }
 

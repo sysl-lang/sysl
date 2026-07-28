@@ -4,7 +4,8 @@
 rule, definition-checked bounds on both method calls and operators, the compiler-provided scalar
 memberships, `print`/`str` requiring `Display`, and every renderer honouring the specifier it is
 handed. The ten binary arithmetic traits now take the right-hand type as a parameter defaulting to
-`Self`, so an operator dispatches on the **pair** (`§7`). `§8 b`, `§8 d`, and `§8 e` settled on the
+`Self`, so an operator dispatches on the **pair**, and a type may implement one of them at more than
+one argument list (`§7`). `§8 b`, `§8 d`, and `§8 e` settled on the
 way, leaving `§8 a` and `§8 c` — neither of which
 is about this chapter's own surface. This is the concrete spec for three things the earlier chapters
 *decided* but left unbuilt, because all three turned on the same missing layer:
@@ -521,23 +522,23 @@ exactly (`§5`), one row further down the catalog.
   and a parameter carrying no bound for the operator is left homogeneous so the diagnostic can ask
   for the bare bound.
 
-- **One trait, implemented once per type — which is what `guide/fft` is still waiting on.** The
-  catalog change did not free the program that motivated it. A transform needs **both**
-  `Complex * Complex`, the butterfly, and `Complex * f64`, the scaling an inverse does to every
-  sample — and those are `Mul[Complex]` and `Mul[f64]`, two argument lists for one trait on one
-  type. `02`'s coherence rule refuses the second: *a trait's members become the type's, and a type's
-  members are one namespace, so a second `Mul` would give `mul` two meanings and a call no way to
-  say which.* So `guide/fft` keeps its `scale` method, and what it is short of is no longer a
-  parameter on `Mul` but a decision about that rule.
+- **One trait at more than one argument list — the half the catalog change did not cover, now
+  shipped too.** The parameter on `Mul` did not by itself free the program that motivated it. A
+  transform needs **both** `Complex * Complex`, the butterfly, and `Complex * f64`, the scaling an
+  inverse does to every sample — and those are `Mul[Complex]` and `Mul[f64]`, two argument lists for
+  one trait on one type, which `02`'s coherence rule refused. Both are written in
+  `guide/fft/complex.sysl` now and `scale` is gone; what tells them apart is what was always going
+  to tell them apart, the type of the right operand.
 
-  The decision is **not** general member overloading. Picking among the implementations of *one*
-  parameterized trait by that trait's own argument is fully determined by the call — `c.mul(x)` has
-  exactly one candidate once `x`'s type is known, which is the same question the operator already
-  answers. What it costs is that a trait's implementations stop being keyed by (trait, type) alone:
-  `traitImpls`, `implFor`, `implWritten`, `implBounds`, the member namespace `08` describes, and the
-  mangled name a member lowers to would each key on the argument list as well. Recorded here with
-  its customer rather than decided; the parameter on `Mul` is the half that could be built without
-  answering it.
+  It is **not** general member overloading, and that is the whole reason it was affordable. What is
+  chosen among is the implementations of *one* parameterized trait, told apart by the argument list
+  that declares them to be different — and every use carries one already: the operator has its pair
+  of operands, a bound names the arguments, an object was formed at written ones, a call passes
+  values of those types. The resolution is determined rather than preferred, so a call answering to
+  none of the candidates or to more than one is reported instead of ranked. The rules and the two
+  places they stop — a property, which has no argument to select with, and the shape boundary, where
+  the implementations would be in two namespaces — are in `02 § One implementation per argument
+  list` and `08 § One name, one member`.
 - **A bound that promises a *value*.** Every trait in the catalog promises behaviour, which is what
   a trait is for, and three separate programs have now wanted one that promises a value instead.
   A generic container cannot declare `[16]K` for any `K` (`07 § Not yet`); a growable one cannot

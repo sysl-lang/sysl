@@ -197,13 +197,15 @@ trait CallAnalysis extends Literals with TraitObjects {
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
       case t: Type.Trait    => callTraitObject(tr, t, mname, args)
       case rty =>
-        val (base, targs) = memberKey(rty, mname)
+        val (base, _) = memberKey(rty, mname)
+        val chosen    = pickOverload(rty, base, mname, args)
+        val targs     = memberKey(rty, chosen)._2
 
-        memberDecls.get((base, mname)) match
+        memberDecls.get((base, chosen)) match
           case Some(m) if m.receiver.isDefined && m.tparams.nonEmpty =>
-            callGenericMethod(genericMembers((base, mname)), m, targs, tr, args, expected)
+            callGenericMethod(genericMembers((base, chosen)), m, targs, tr, args, expected)
           case Some(m) if m.receiver.isDefined =>
-            val fname           = memberFuncName(rty, mname)
+            val fname           = memberFuncName(rty, chosen)
             val (params, rtype) = funcInsts(fname)
             if args.length != params.length - 1 then
               err(s"method '$fname' takes ${quantity(params.length - 1, "argument")}, " +
@@ -224,6 +226,66 @@ trait CallAnalysis extends Literals with TraitObjects {
               .orElse(builtinHash(rty, mname, tr, args))
               .getOrElse(err(s"type '$base' has no method '$mname'"))
   }
+
+  /** Which of a type's members a written name means, where more than one implementation of one trait
+   * gave the type a member of that name.
+   *
+   * A name that reaches one member — everything a program writes until a type implements a trait
+   * twice — comes straight back, so the ordinary call is the lookup it always was. Where there are
+   * several, the arguments decide: each candidate's parameters are compared against the types the
+   * arguments already have, and exactly one candidate accepting them is the answer.
+   *
+   * This is **not** overloading, and the difference is that the answer is determined rather than
+   * chosen. A trait's argument list is what tells its implementations apart, and a call carries the
+   * argument list in the values it passes — so a call that does not determine one is a call whose
+   * arguments name no implementation, which is reported rather than resolved by a preference rule.
+   * The arguments are analyzed here with nothing expected of them, and a literal has no type of its
+   * own to be matched by, so `c.mul(2)` where the candidates take a `Complex` and a `real` is one of
+   * the calls that determines nothing (`08 § One name, one member`).
+   */
+  protected def pickOverload(owner: String, mname: String, args: List[Expr], subject: String)(
+      params: String => Option[List[Type]],
+  ): String =
+    memberAlts.get((owner, mname)) match
+      case None => mname
+      case Some(cands) =>
+        val supplied = args.map(probeType)
+        val from = s"'$mname' comes from ${quantity(cands.length, "implementation")} of one trait on $subject"
+
+        val fits = cands.filter { c =>
+          params(c).exists(ps => ps.length == supplied.length && ps.zip(supplied).forall((p, s) => s.contains(p)))
+        }
+
+        fits match
+          case one :: Nil => one
+          case Nil =>
+            err(s"$from, and none of them takes (${supplied.map(_.fold("?")(show)).mkString(", ")}) — " +
+              "write the argument at the type of the implementation that was meant")
+          case _ => err(s"$from, and the arguments do not say which was meant")
+
+  /** `value.m(…)`, where the receiver's type names each candidate's instantiation. */
+  protected def pickOverload(rty: Type, base: String, mname: String, args: List[Expr]): String =
+    pickOverload(base, mname, args, show(rty))(c => probe(funcInsts(memberFuncName(rty, c))._1.tail.map(_._2)))
+
+  /** `Type.f(…)` — an associated function, which has no receiver to drop off the front. */
+  protected def pickAssociated(tname: String, mname: String, args: List[Expr]): String =
+    pickOverload(tname, mname, args, qn(tname))(c => funcInsts.get(s"$tname.$c").map(_._1.map(_._2)))
+
+  /** The type an argument already has, with nothing expected of it and nothing said about whatever
+   * goes wrong — the ordinary analysis that follows reports that, in the place it belongs.
+   */
+  private def probeType(e: Expr): Option[Type] = probe(analyzeExpr(e).ty)
+
+  /** A question asked of the tables that is allowed to have no answer, with everything it registers
+   * on the way dropped and everything it complains about left for the walk that follows.
+   */
+  private def probe[T](body: => T): Option[T] =
+    sandboxed {
+      try Some(body)
+      catch
+        case AnalyzerError(_, _) => None
+        case Poisoned()          => None
+    }
 
   /** `value.m(…)` where `m` declares type parameters of its own, at the instantiation this call
    * resolves to.
@@ -588,8 +650,9 @@ trait CallAnalysis extends Literals with TraitObjects {
           Some(TDispatch(s"$trName.$method", swap, negate))
         // The implementation is named by the rule a method call uses, which for a generic type is
         // the instantiation the receiver's own arguments make — `a + b` on a `Box[int]` reaches the
-        // same function `a.add(b)` would.
-        case _ if satisfies(tr, ty) => Some(TDispatch(memberFuncName(ty, method), swap, negate))
+        // same function `a.add(b)` would. Where the type implements the trait more than once it is
+        // the operand pair that says which, and the pair is what this bound was built from.
+        case _ if satisfies(tr, ty) => Some(TDispatch(traitMemberName(ty, tr, method), swap, negate))
         // A type that implements the operator's trait, but not at *this* pair of operands, is worth
         // saying so about here. Falling through would leave the scalar path's "operands must match",
         // which is advice to change the operands when the answer is to implement the trait for them.
@@ -704,12 +767,14 @@ trait CallAnalysis extends Literals with TraitObjects {
    * where the arguments do not determine them.
    */
   protected def callAssociated(tname: String, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
-    memberDecls.get((tname, mname)) match
+    val chosen = pickAssociated(tname, mname, args)
+
+    memberDecls.get((tname, chosen)) match
       case Some(m) if m.receiver.isEmpty && !m.isProperty =>
-        genericMembers.get((tname, mname)) match
+        genericMembers.get((tname, chosen)) match
           case Some(fd) => callGenericAssociated(tname, fd, m, args, expected)
           case None =>
-            val fname           = s"$tname.$mname"
+            val fname           = s"$tname.$chosen"
             val (params, rtype) = funcInsts(fname)
             if args.length != params.length then
               err(s"associated function '$fname' takes ${quantity(params.length, "argument")}, but ${supplied(args.length, "argument")}")

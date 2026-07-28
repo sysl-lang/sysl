@@ -378,82 +378,88 @@ trait AnalyzerBase {
    */
   protected val implDecls = mutable.ListBuffer.empty[(Scope, ImplDecl)]
 
-  /** Every `impl Trait for Type`, keyed by (trait name, the implementing type's **owner key**). The
-   * key catches a duplicate implementation, and it is what a trait bound consults to decide whether
-   * a type conforms.
+  /** One `impl Trait for Type` block, as everything downstream of the hoist reads it.
+   *
+   *   - `written` are the trait arguments the block **wrote**, as against the ones the trait's own
+   *     defaults filled in. They are always concrete: `implBound` refuses a block's own parameter
+   *     there, since an argument the author left open would be a family of implementations rather
+   *     than one. The distinction is what a defaulted block means — `impl Mul for Box[T]` does not
+   *     promise `Mul` at one particular `Box` but whatever the default gives for the type being
+   *     asked about, which at a `Box[string]` is `Mul[Box[string]]`.
+   *   - `wkey` renders `written`, and is empty where the block wrote nothing. It is what tells a
+   *     block that named its trait from one that let it default, without a subject in hand.
+   *   - `alt` is the suffix this block's members carry, empty for the first implementation of a
+   *     trait for a type and distinct for each one after it.
+   *   - `bounds` is what a **generic** block asks of the type arguments its subject is applied to:
+   *     the block's own parameters in the subject's argument order, and the bounds it wrote on
+   *     them. `impl[T: Show] Show for Box[T]` is **conditional conformance** — a `Box` implements
+   *     `Show` when its element does — and this is the condition. It is kept as written rather than
+   *     resolved because one bound may name another of the block's parameters, and only the
+   *     arguments a particular `Box` was made with say what that means. An unconditional block has
+   *     `None`, which is what makes the ordinary case a lookup that asks nothing further.
+   */
+  protected case class TraitImpl(
+      decl: ImplDecl,
+      written: List[Type],
+      wkey: String,
+      alt: String,
+      bounds: Option[(List[String], Map[String, List[BoundRef]])],
+  )
+
+  /** Every `impl Trait for Type` for one (trait name, the implementing type's **owner key**), in the
+   * order the source wrote them. It is what a trait bound consults to decide whether a type
+   * conforms, and where a duplicate implementation is caught.
    *
    * Keying by the owner key rather than by the name as written is what makes `impl Show for int` and
    * `impl Show for i32` the one implementation they are — the same type reached by two spellings.
    *
-   * Keying by the trait's **name** rather than by the arguments it was applied to is the decision a
-   * generic trait forced. A trait's members become the type's members, and a type's members are one
-   * namespace (`08`), so a second implementation of one trait — however different its arguments —
-   * would give the type two members of each name with no rule for choosing between them. One per
-   * (trait, type) is therefore the rule, and `implFor` is where the arguments that one supplies are
-   * recorded.
+   * There is a **list** of them because a trait that takes arguments is a family of promises rather
+   * than one, and a type may keep more than one: a `Complex` that is `Mul[Complex]` and `Mul[real]`
+   * multiplies by another complex number and scales by a real, and refusing the second would be
+   * refusing the arithmetic rather than resolving an ambiguity. What picks between them is the
+   * argument list, which every use — an operator, a bound, a named call — already has in hand
+   * (`02 § A trait may be implemented at more than one argument list`).
    */
-  protected val traitImpls = mutable.LinkedHashMap.empty[(String, String), ImplDecl]
+  protected val traitImpls = mutable.LinkedHashMap.empty[(String, String), List[TraitImpl]]
 
-  /** Which promise each implementation actually makes — the trait at the arguments the block wrote
-   * for it — keyed exactly as `traitImpls` is.
-   *
-   * `impl Sink[int] for Adder` files an `Adder` under `Sink`, and this is what says the `Sink` it
-   * implements is `Sink[int]`: a bound asking for `Sink[string]` is not met by it, and the
-   * diagnostic can say what the type does implement instead of only what it does not.
-   */
-  protected val implFor = mutable.LinkedHashMap.empty[(String, String), String]
+  /** Every implementation of a trait for one owner key, in source order. */
+  protected def implsOf(traitName: String, key: String): List[TraitImpl] =
+    traitImpls.getOrElse((traitName, key), Nil)
 
-  /** What a **generic** `impl` asks of the type arguments its subject is applied to — the block's
-   * own parameters in the subject's argument order, and the bounds it wrote on them — keyed exactly
-   * as `traitImpls` is.
-   *
-   * `impl[T: Show] Show for Box[T]` is **conditional conformance**: a `Box` implements `Show` when
-   * its element does, and this is the condition. The bounds are kept as written rather than resolved
-   * because one may name another of the block's parameters, and only the arguments a particular
-   * `Box` was made with say what that means. An unconditional `impl` — generic or not — has no
-   * entry, which is what makes the ordinary case a lookup that asks nothing further.
-   */
-  protected val implBounds =
-    mutable.LinkedHashMap.empty[(String, String), (List[String], Map[String, List[BoundRef]])]
-
-  /** The trait arguments an `impl` block **wrote**, as against the ones the trait's defaults filled
-   * in, keyed exactly as `traitImpls` is. They are always concrete: `implBound` refuses a block's
-   * own parameter here, since an argument the author left open would be a family of
-   * implementations rather than one.
-   *
-   * The distinction is what a defaulted block means. `impl Mul for Box[T]` does not promise `Mul` at
-   * one particular `Box`; it promises whatever the trait's own default gives for the type being
-   * asked about, so at a `Box[string]` it is `Mul[Box[string]]`. Comparing against the arguments the
-   * *declaration* filled in would compare against the block's parameters and match nothing.
-   */
-  protected val implWritten = mutable.LinkedHashMap.empty[(String, String), List[Type]]
-
-  /** The promise an implementation makes **about this subject**: what the block wrote, with the
+  /** The promise one implementation makes **about this subject**: what the block wrote, with the
    * trait's own defaults supplying the rest under a `Self` of the type being asked about.
    */
-  protected def suppliedBound(name: String, key: String, subject: Type): Type.Bound = {
-    val written = implWritten.getOrElse((name, key), Nil)
-
+  protected def suppliedBound(ti: TraitImpl, name: String, subject: Type): Type.Bound =
     traitDecls.get(name) match
-      case Some(d) if written.length < d.tparams.length =>
-        Type.Bound(name, sandboxed(withDefaults(name, d.tparams, d.tdefaults, written, selfBinding(subject))))
-      case _ => Type.Bound(name, written)
-  }
+      case Some(d) if ti.written.length < d.tparams.length =>
+        Type.Bound(
+          name,
+          sandboxed(withDefaults(name, d.tparams, d.tdefaults, ti.written, selfBinding(subject))),
+        )
+      case _ => Type.Bound(name, ti.written)
 
-  /** Whether an implementation of `tr.name` supplies exactly the promise `tr` asks for. Trivially
-   * true for a trait that takes no arguments, which is why nothing outside a generic trait ever
-   * has to think about it.
+  /** Which of a type's implementations of a trait supplies exactly the promise `tr` asks for. A
+   * trait that takes no arguments has one promise to make, so the search is a lookup for everything
+   * outside a generic trait.
    */
-  protected def suppliesBound(tr: Type.Bound, key: String, subject: Type): Boolean =
-    !implWritten.contains((tr.name, key)) || suppliedBound(tr.name, key, subject).key == tr.key
+  protected def implAt(tr: Type.Bound, key: String, subject: Type): Option[TraitImpl] =
+    implsOf(tr.name, key).find(ti => suppliedBound(ti, tr.name, subject).key == tr.key)
 
   /** The composed types written out in full that implement a trait, keyed by (trait name, the
-   * **shape** each one has). It is what a shape-matched `impl` consults to find that the thing it
-   * would cover has already been covered one type at a time.
+   * arguments the block **wrote** for it, the **shape** each one has). It is what a shape-matched
+   * `impl` consults to find that the thing it would cover has already been covered one type at a
+   * time.
    *
    * `impl Display for []int` and `impl[T] Display for []T` are two implementations of `Display` for
    * a `[]int`, and sysl has no rule that picks between two — so whichever is written second is
    * refused, and this is how the one written first is found however the file ordered them.
+   *
+   * The trait's arguments are deliberately **not** in the key, though they are what lets one type
+   * keep several implementations elsewhere. A shape's members and a written-out type's are filed
+   * under two different owner keys, and a member lookup takes the type's own key or the shape's and
+   * never both — so two implementations split across that boundary would leave one of them
+   * unreachable by name whatever their arguments were. What makes several implementations work at
+   * all is that they share a namespace to be told apart in, and here they do not.
    */
   protected val writtenShapes = mutable.LinkedHashMap.empty[(String, String), String]
 
@@ -520,6 +526,18 @@ trait AnalyzerBase {
    * mangled name `Type.member`, so calling one is a call and codegen needs no method concept.
    */
   protected val memberDecls = mutable.LinkedHashMap.empty[(String, String), MethodDecl]
+
+  /** Every member a type has under one **source** name, where more than one implementation of one
+   * trait gave it one — keyed by (type name, the name as written) and holding the names those
+   * members are actually filed under, in source order.
+   *
+   * A type with one `mul` has no entry here and is reached by the name it was written with, which is
+   * what keeps the ordinary case a lookup. A `Complex` that is both `Mul[Complex]` and `Mul[real]`
+   * has two, and a call naming `mul` is answered by the one whose parameters accept the arguments —
+   * a resolution the call fully determines, not an overload set to search (`08 § One name, one
+   * member — and what a second implementation does to that`).
+   */
+  protected val memberAlts = mutable.LinkedHashMap.empty[(String, String), List[String]]
 
   /** Which trait default a member was copied from, keyed by the name the copy was lowered to.
    *
@@ -1042,8 +1060,8 @@ trait AnalyzerBase {
    * covered by `impl[T: Show] Show for []T` is the same question asked of its element.
    */
   protected def conforms(tr: Type.Bound, t: Type): Boolean =
-    implKey(tr, t).exists { case (key, targs) =>
-      implBounds.get((tr.name, key)).forall { case (tps, bounds) =>
+    implKey(tr, t).exists { case (targs, ti) =>
+      ti.bounds.forall { case (tps, bounds) =>
         val subst = tps.zip(targs).toMap
 
         targs.length == tps.length &&
@@ -1056,20 +1074,37 @@ trait AnalyzerBase {
   /** The same, for a trait that takes no arguments. */
   protected def conforms(traitName: String, t: Type): Boolean = conforms(Type.Bound(traitName, Nil), t)
 
-  /** Which implementation of a trait a type is covered by, if any: the one written for the type,
-   * or the one written for its shape, with the arguments it matched at.
+  /** Which implementation of a trait **at these arguments** a type is covered by, if any: the one
+   * written for the type, or the one written for its shape, with the arguments it matched at.
    *
-   * At most one of the two exists — a shape and a type written out in full may not both implement
-   * one trait (`hoistImpl`) — so this is a lookup rather than a choice between implementations, and
-   * sysl needs no rule saying which of two would be the more specific.
+   * The argument list is what selects, and it selects exactly one. A type may implement a trait more
+   * than once, but never twice at one argument list; and a shape and a type written out in full may
+   * both implement a trait only where each says which one it implements (`hoistImpl`). So this stays
+   * a lookup rather than a choice between implementations, and sysl still needs no rule saying which
+   * of two would be the more specific.
    */
-  protected def implKey(tr: Type.Bound, t: Type): Option[(String, List[Type])] = {
-    val own    = memberOwner(t)
-    def has(k: String) = traitImpls.contains((tr.name, k)) && suppliesBound(tr, k, t)
+  protected def implKey(tr: Type.Bound, t: Type): Option[(List[Type], TraitImpl)] = {
+    def at(k: (String, List[Type])) = implAt(tr, k._1, t).map((k._2, _))
 
-    if has(own._1) then Some(own)
-    else shapeOwner(t).filter(s => has(s._1))
+    at(memberOwner(t)).orElse(shapeOwner(t).flatMap(at))
   }
+
+  /** The suffix the members of a type's implementation of one particular trait-at-arguments carry,
+   * empty for the first implementation of that trait and distinct for each one after it.
+   *
+   * It is what makes a second implementation possible at all: a trait's members become the type's,
+   * and a type's members are one namespace (`08`), so two implementations of one trait would give
+   * the type two members of each name. They are filed under names that differ, and every way of
+   * reaching one — an operator, a vtable slot, a named call — arrives with the argument list that
+   * says which is meant.
+   */
+  protected def implAlt(tr: Type.Bound, t: Type): String = implKey(tr, t).map(_._2.alt).getOrElse("")
+
+  /** The name codegen emits for the member a type got from one particular implementation of a
+   * trait — what `memberFuncName` is for a call that already knows which trait it is dispatching.
+   */
+  protected def traitMemberName(t: Type, tr: Type.Bound, mname: String): String =
+    memberFuncName(t, mname + implAlt(tr, t))
 
   /** Why a type an implementation *covers* still does not implement the trait — which is a different
    * answer from having no implementation at all, and the one a diagnostic should give when there is
@@ -1083,19 +1118,19 @@ trait AnalyzerBase {
    */
   protected def unmetBound(tr: Type.Bound, t: Type): Option[String] =
     // A type that implements the trait at *other* arguments is a different situation from one that
-    // does not implement it at all, and the advice differs with it: there is no second `impl` to
-    // write, since one trait is implemented once per type.
+    // does not implement it at all, and the advice differs with it: what is missing is one more
+    // `impl`, at the arguments the bound asked for, beside the ones already there.
     val wrongArgs =
       for
         key <- List(memberOwner(t)._1) ::: shapeOwner(t).map(_._1).toList
-        if traitImpls.contains((tr.name, key)) && !suppliesBound(tr, key, t)
-      yield s"it implements '${suppliedBound(tr.name, key, t).show}', and one trait is implemented " +
-        "once per type"
+        impls = implsOf(tr.name, key)
+        if impls.nonEmpty && implAt(tr, key, t).isEmpty
+      yield s"it implements ${conjoin(impls.map(ti => s"'${suppliedBound(ti, tr.name, t).show}'"))}"
 
     val unmetCondition =
       for
-        (key, targs)  <- implKey(tr, t)
-        (tps, bounds) <- implBounds.get((tr.name, key))
+        (targs, ti)   <- implKey(tr, t)
+        (tps, bounds) <- ti.bounds
         if targs.length == tps.length
         subst = tps.zip(targs).toMap
         (arg, unmet) <- tps
@@ -1125,6 +1160,14 @@ trait AnalyzerBase {
    * wants to give at the moment the programmer is already annoyed.
    */
   protected def quantity(n: Int, noun: String): String = if n == 1 then s"1 $noun" else s"$n ${noun}s"
+
+  /** `a`, `a and b`, `a, b and c` — a list read aloud, for a diagnostic naming everything a type
+   * does implement when it does not implement the one that was asked for.
+   */
+  protected def conjoin(xs: List[String]): String = xs match
+    case Nil      => ""
+    case one :: Nil => one
+    case _        => s"${xs.init.mkString(", ")} and ${xs.last}"
 
   /** `1 argument was given`, `2 arguments were given` — the same, with the verb agreeing too. */
   protected def supplied(n: Int, noun: String): String =

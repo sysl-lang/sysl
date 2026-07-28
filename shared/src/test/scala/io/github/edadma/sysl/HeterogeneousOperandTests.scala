@@ -27,6 +27,15 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
       |show(c: C) -> string = str(c.re) + " " + str(c.im)
       |""".stripMargin
 
+  /** The same, multiplied by another complex number as well — the two argument lists `guide/fft`
+    * needs on one type, since the butterfly wants `C * C` and the inverse wants `C * f64`.
+    */
+  private val both =
+    complex +
+      """impl Mul for C
+        |    mul(self, o: C) -> C = C(self.re * o.re - self.im * o.im, self.re * o.im + self.im * o.re)
+        |""".stripMargin
+
   "an operator over two types" - {
     "a struct scaled by a scalar" in {
       run(complex + """print(show(C(1.0, 2.0) * 2.5))""") shouldBe "2.5 5\n"
@@ -184,7 +193,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
   "what a mistake says" - {
     "the wrong right-hand type names the trait that is missing" in {
       err(complex + "print(show(C(1.0, 2.0) * 2))") should include(
-        "one trait is implemented once per type",
+        "'*' between C and int needs 'Mul[int]' — it implements 'Mul[real]'",
       )
     }
 
@@ -213,13 +222,52 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
       )
     }
 
-    // This is what `guide/fft` still cannot say, and the reason the `.scale(k)` workaround stays:
-    // the butterfly wants `Complex * Complex` and the inverse transform wants `Complex * f64`, and
-    // a type implements one trait once (`02`). Pinned here as the shape of the remaining gap.
-    "two right-hand types for one trait is still one trait twice" in {
-      err(complex + """impl Mul[int] for C
-                      |    mul(self, k: int) -> C = C(self.re, self.im)
+    // Two implementations at one argument list is still one implementation too many, and the
+    // arguments are no help — this is the case that has nothing to pick between them.
+    "two implementations at one argument list is still one too many" in {
+      err(complex + """impl Mul[f64] for C
+                      |    mul(self, k: f64) -> C = C(self.re, self.im)
                       |print(1)""".stripMargin) should include("'C' already implements 'Mul[real]'")
+    }
+  }
+
+  // The butterfly of a transform wants `Complex * Complex`; scaling every sample on the way out of
+  // an inverse wants `Complex * f64`. They are two argument lists for one trait on one type, which
+  // is what `guide/fft`'s `.scale(k)` workaround existed for.
+  "one trait at two argument lists" - {
+    "the operator picks by the pair of operands" in {
+      run(both + """print(show(C(1.0, 2.0) * C(3.0, 4.0)))
+                   |print(show(C(1.0, 2.0) * 2.5))""".stripMargin) shouldBe "-5 10\n2.5 5\n"
+    }
+
+    "and so does the named call" in {
+      run(both + """print(show(C(1.0, 2.0).mul(C(3.0, 4.0))))
+                   |print(show(C(1.0, 2.0).mul(2.5)))""".stripMargin) shouldBe "-5 10\n2.5 5\n"
+    }
+
+    "each implementation is a function of its own" in {
+      val out = ir(both + "print(show(C(1.0, 2.0) * C(3.0, 4.0) * 2.5))")
+
+      out should include("define %struct.C @C.mul(%struct.C %self.param, double %k.param)")
+      out should include("define %struct.C @C.mul.2(%struct.C %self.param, %struct.C %o.param)")
+      out should include("call %struct.C @C.mul.2(%struct.C %t2, %struct.C %t4)")
+    }
+
+    "a bound asks for the one it names" in {
+      run(both + """scaled[T: Mul[f64]](x: T, k: f64) -> T = x * k
+                   |print(show(scaled(C(1.0, 2.0), 3.0)))""".stripMargin) shouldBe "3 6\n"
+    }
+
+    "and the other bound reaches the other implementation" in {
+      run(both + """squared[T: Mul](x: T) -> T = x * x
+                   |print(show(squared(C(1.0, 2.0))))""".stripMargin) shouldBe "-3 4\n"
+    }
+
+    "a call whose argument names neither is refused rather than guessed at" in {
+      err(both + "print(show(C(1.0, 2.0).mul(2)))") should include(
+        "'mul' comes from 2 implementations of one trait on C, and none of them takes (int) — " +
+          "write the argument at the type of the implementation that was meant",
+      )
     }
   }
 

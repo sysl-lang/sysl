@@ -318,6 +318,12 @@ already has, and vice versa — otherwise one name on one type would mean two di
 depending on which table was asked, and a trait object's slot would be filled from the wrong one.
 Two traits with distinct member names are unaffected, exactly as they are for a struct.
 
+This is also the boundary a **second implementation of one trait** does not cross. A type may
+implement a parameterized trait at more than one argument list (below), and what makes that work is
+that the implementations share a namespace to be told apart in. A shape and a written-out type have
+two, and a lookup takes one or the other — so a second implementation split across the boundary
+would be one no call could reach, whatever arguments the two blocks wrote.
+
 Refusing the overlap is the conservative choice and can be relaxed; shipping a rule that picks
 between two implementations cannot be walked back. If a case turns up that genuinely wants
 `[]byte` to render differently from every other slice, the language would be adding specialization
@@ -362,31 +368,55 @@ conformance all read the trait's parameters as ordinary types once the implement
 them; a method written in the trait's `T` and one written in the type that `T` is are the same
 signature, which is the same rule that makes `Self` and the concrete name interchangeable (`14 §1`).
 
-### One implementation per type, whatever the arguments
+### One implementation per **argument list**
 
-A type may implement a trait **once**, and the trait's arguments do not make a second one a
-different implementation:
+A type may implement a trait once at each argument list, and the argument list is what tells two
+implementations apart:
 
 ```
 impl From[int]  for Celsius        // fine
-impl From[real] for Celsius        // refused
+impl From[real] for Celsius        // fine, and a different implementation
+impl From[int]  for Celsius        // refused — that one is already there
 ```
 
-The reason is the rule the rest of this chapter already rests on: **a trait's members become the
-type's members, and a type's members are one namespace** (`08`). Two implementations of `From` would
-give a `Celsius` two members called `from`, and `c.from(x)` would have no way to say which — the
-same collision that stops two traits declaring `show` from both being implemented for one type, and
-the same one that stops a shape and a written type from overlapping.
+This is the one place the "a trait's members become the type's, and a type's members are one
+namespace" rule (`08`) is qualified, and the qualification is narrow. A `Celsius` with both blocks
+above has two members called `from`; what says which a use means is the **argument list**, which
+every way of reaching one already carries:
 
-So the trait's arguments are what an implementation *supplies*, not part of what it is filed under.
-A bound asking for `From[real]` is not met by a type that implements `From[int]`, and the diagnostic
-says so in those words — there is no second `impl` to write, and telling someone to write one would
-be sending them at a block that will be refused.
+- an **operator** carries the pair of operands, which is what `14 §3` dispatches on;
+- a **bound** names the arguments — `[T: Mul[f64]]` asks for that one and no other;
+- a **trait object** is formed at written arguments, and its table's slots are filled from the
+  implementation those arguments name;
+- a **named call** passes values, whose types are the arguments.
 
-Relaxing this needs a way to say which implementation a use means: overload resolution on the
-argument types, or a syntax that names the trait at the call. Both are additive, and neither is
-worth guessing at before a program wants one. It is the same conservative choice the overlap rule
-makes, for the same reason — refusing is reversible.
+The resolution is **determined, not preferred**. Nothing ranks two candidates: a call is answered by
+the one implementation whose parameters are the types the arguments have, and a call that answers to
+none of them or to more than one is reported rather than resolved. So `c.mul(2)` where the
+candidates take a `Complex` and a `real` is refused — an integer literal is neither, and picking the
+nearest would be the specialization rule this chapter does not have. This is why it is not general
+member overloading: what is being chosen among is the implementations of **one** trait, told apart by
+the very thing that declares them to be different.
+
+Two limits fall out of "several implementations are told apart inside one namespace":
+
+- A **property** has no arguments, so two implementations both supplying one leave nothing to select
+  with, and reading it is refused.
+- A **shape** and a type of that shape are filed under two different owner keys, and a member lookup
+  takes one or the other and never both — so the overlap rule above stays exactly as it was, whatever
+  arguments the two blocks write.
+
+And one on the declaring side: on a **generic** subject a defaulted argument list is not one promise
+but one per instantiation, since the trait's own default names the type being asked about. So
+`impl[T] Mul[Box[int]] for Box[T]` is refused — at a `Box[int]` it would promise what a defaulted
+block promises there, and at every other `Box` it would not. An argument built out of anything else
+is fine, which is the case the feature exists for.
+
+What has not changed is what a bound means. `Mul` is `Mul[Self]` by `10 §3`'s default, so a bare
+bound still names the homogeneous implementation rather than "whichever there is", and every bound
+written before parameterized traits existed means what it meant. A bound asking for `From[real]` is
+still not met by a type that implements only `From[int]` — the difference is that now the advice is
+to write that second implementation, and the diagnostic names every one the type does have.
 
 ## Trait objects, as built
 

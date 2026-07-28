@@ -1334,10 +1334,13 @@ class Analyzer private (units: List[Program])
    */
   private def readProperty(tr: TExpr, ty: Type, f: String): TExpr = {
     val (base, _) = memberKey(ty, f)
+    // A property takes no arguments, so where two implementations of one trait both supply one there
+    // is nothing to say which is meant — which `pickOverload` reports as the call it is.
+    val chosen = pickOverload(ty, base, f, Nil)
 
-    memberDecls.get((base, f)) match
+    memberDecls.get((base, chosen)) match
       case Some(m) if m.isProperty =>
-        val fname      = memberFuncName(ty, f)
+        val fname      = memberFuncName(ty, chosen)
         val (_, rtype) = funcInsts(fname)
         funcsUsed += fname
         TCall(fname, List(tr), rtype)

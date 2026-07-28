@@ -45,7 +45,7 @@ trait TraitObjects extends TypeResolution {
       // A type that implements the trait at *other* arguments looks unrelated to the fall-through
       // below, and what that would report is two type names with nothing said about why they do not
       // match. So it is reported here instead, where the arguments can be named.
-      case (_, inner) if implFor.contains((tr.name, ownerKey(inner))) =>
+      case (_, inner) if implsOf(tr.name, ownerKey(inner)).nonEmpty =>
         erase(t, tr, inner, want, boxed = false)
 
       case _ => t
@@ -105,7 +105,10 @@ trait TraitObjects extends TypeResolution {
             err(s"'${show(tr)}' requires '${from.show}', and ${show(ty)} does not implement it — so " +
               s"there is no '${m.name}' for its table to point at")
 
-        val fname           = memberFuncName(ty, m.name)
+        // Named by the trait the slot is for, not by the member's own name alone: a type may
+        // implement one trait at more than one argument list, and a table for `&Sink[int]` whose
+        // slot pointed at the `Sink[string]` member would be a table pointing at the wrong thing.
+        val fname           = traitMemberName(ty, from, m.name)
         val (params, rtype) = funcInsts(fname)
 
         funcsUsed += fname

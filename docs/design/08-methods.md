@@ -312,6 +312,28 @@ the implementation rather than reporting a clash. The operator traits of `00` §
 comparisons) are trait members by this rule — overloading an operator is implementing its trait,
 declared as `impl Trait for Type`, never an inherent method with an operator name.
 
+### One name, one member — and what a second implementation does to that
+
+A type's members are one namespace: two traits declaring a `show` cannot both be implemented for one
+type, and a member may not take a struct field's name. That is what makes `p.show()` a lookup, and
+it is the rule the whole of `02`'s coherence rests on.
+
+There is exactly one qualification, and a **parameterized** trait is the whole of it. A type may
+implement such a trait at more than one argument list (`02 § One implementation per argument list`),
+and each implementation brings the trait's members under the name the trait declared — so a
+`Complex` that is both `Mul[Complex]` and `Mul[real]` has two members called `mul`. What resolves
+the name is the **argument list**, which every use already carries: an operator has its pair of
+operands, a bound names the arguments, a trait object was formed at written ones, and a call passes
+values whose types are the arguments.
+
+Resolution is by exact parameter types and is **determined, not preferred**. Exactly one candidate
+accepting the arguments is the answer; none and more than one are both reported. In particular a
+literal has no type of its own to be matched by, so `c.mul(2)` against candidates taking a `Complex`
+and a `real` is refused rather than rounded to the nearest — choosing there would be a specialization
+rule, which `02` deliberately does not have. A **property** takes no arguments and so cannot be
+resolved this way at all: two implementations both supplying one make it unreadable, which is
+reported where it is read.
+
 ## Not yet
 
 - **Settable properties.** A property is read-only. A getter/setter pair, so that `p.name = v`

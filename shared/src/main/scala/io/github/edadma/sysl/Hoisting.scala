@@ -610,6 +610,9 @@ trait Hoisting extends TypeResolution {
    *     generic trait brings. They are fixed by the block rather than by anything a call does, so
    *     unlike `tparams` they are answers rather than questions, and a member's signature and body
    *     read them exactly as they read `Self`.
+   *   - `alt` distinguishes the members of a second implementation of one trait from the first's.
+   *     It is empty everywhere else, so a type's own body and its first `impl` file their members
+   *     under exactly the names they were written with.
    */
   private case class MemberHome(
       key: String,
@@ -623,6 +626,7 @@ trait Hoisting extends TypeResolution {
       noun: String,
       self: Map[String, Type],
       outer: Map[String, Type] = Map.empty,
+      alt: String = "",
   ) {
 
     /** Everything a member's signature resolves against that a call does not supply: the trait's
@@ -685,15 +689,22 @@ trait Hoisting extends TypeResolution {
         err(s"'${m.name}' has no receiver, and '${home.label}' is not a name a call could reach it " +
           "through — give it a 'self' parameter")
 
-      if memberDecls.contains((home.key, m.name)) then
+      // The name this member is actually filed under. It is the one it was written with everywhere
+      // but a second implementation of one trait, whose members would otherwise collide with the
+      // first's — and the collisions asked about below are still asked about the *written* name,
+      // since that is the one a program spells.
+      val filed = m.name + home.alt
+
+      if memberDecls.contains((home.key, filed)) then
         err(s"type '${home.label}' already has a member named '${m.name}'")
       if home.taken.contains(m.name) then
         err(s"type '${home.label}' has both a ${home.noun} and a member named '${m.name}'")
 
       // A composed type's members and its shape's are one namespace, so that a name reaches one
       // member however the type came by it. Both directions are asked, since a file may write the
-      // shape before the types it covers or after them.
-      for h <- home.head do
+      // shape before the types it covers or after them. A second implementation's members are left
+      // out: the name they are filed under is one no other block can have written.
+      for h <- home.head if home.alt.isEmpty do
         if home.shaped then
           for written <- composedMembers.get((h, m.name)) do
             err(s"'$written' already has a member named '${m.name}', and this 'impl' would give " +
@@ -718,7 +729,13 @@ trait Hoisting extends TypeResolution {
           err(s"'${m.name}' is a member the compiler provides for ${show(ty)} — a member of this " +
             "name would hide it")
 
-      memberDecls((home.key, m.name)) = m
+      memberDecls((home.key, filed)) = m
+
+      // A name a program spells that now reaches more than one member is recorded as reaching all of
+      // them, first one included, so a call has the whole set to answer from.
+      if home.alt.nonEmpty then
+        memberAlts((home.key, m.name)) = memberAlts.getOrElse((home.key, m.name), List(m.name)) :+ filed
+
       val fd = synthesize(home, m)
 
       // A member is filed under the type it belongs to, which an `impl` in another module may have
@@ -731,7 +748,7 @@ trait Hoisting extends TypeResolution {
       // A signature mentioning a type parameter — the type's own, or the member's — has no meaning
       // until something fixes it, so the member is kept as written and made real per call.
       if fd.tparams.nonEmpty then
-        genericMembers((home.key, m.name)) = fd
+        genericMembers((home.key, filed)) = fd
         // On a generic type `Self` is the type applied to its own parameters, which is not a type
         // yet. The reference is what waits, and every substitution that fixes the parameters fixes
         // it too; on a concrete type it is already the answer and resolves to the same thing.
@@ -760,9 +777,9 @@ trait Hoisting extends TypeResolution {
     val tr   = traitKey(block.traitName).map(traitDecls).getOrElse(err(s"unknown trait '${block.traitName}'"))
     val impl = block.copy(traitName = tr.name).setPos(block.pos)
 
-    val (ty, target)    = implTarget(impl)
+    val (ty, target)     = implTarget(impl)
     val (bound, written) = implBound(impl, tr)
-    val home            = target.copy(outer = tr.tparams.zip(bound.args).toMap)
+    val outer            = target.copy(outer = tr.tparams.zip(bound.args).toMap)
 
     // A built-in's memberships come from the compiler (`14 §5`), so an `impl` for one is not adding
     // a capability but competing with the one that is already there — and the operator would keep
@@ -771,38 +788,72 @@ trait Hoisting extends TypeResolution {
     // int` that wrote none of them is the one the compiler already provides, while one that wrote
     // an argument is asking for something else entirely.
     if written.isEmpty && CoreTraits.builtin(impl.traitName, ty) then
-      err(s"'${home.label}' already implements '${qn(impl.traitName)}' — the compiler provides it")
+      err(s"'${outer.label}' already implements '${qn(impl.traitName)}' — the compiler provides it")
+
+    // What this block's own promise is read against: the type where it has one, and the type applied
+    // to the block's own parameters where it is generic — the same subject `superChecks` uses, and
+    // the one every comparison below has to be made under for the two sides to mean the same thing.
+    val subject =
+      if impl.tparams.isEmpty then ty
+      else sandboxed(resolveType(impl.forType, abstractSubst(impl.tparams, impl.bounds)))
 
     // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
     // are the one implementation they are, and so are `[]int` and `[]i32`. A generic type has one
     // key for all of its instantiations, which is what makes an implementation cover the type as a
-    // whole and two of them for one generic type a collision rather than a choice.
+    // whole rather than one instantiation of it.
     //
-    // The trait's arguments are deliberately **not** part of the key. A trait's members become the
-    // type's, and a type's members are one namespace, so `impl From[int] for C` and
-    // `impl From[real] for C` would give a `C` two members called `from` with nothing to say which
-    // one `c.from(x)` meant.
-    for supplied <- implFor.get((impl.traitName, home.key)) do
-      err(s"'${home.label}' already implements '${qn(supplied)}'" + secondImplementation(tr))
+    // A trait that takes arguments is a family of promises, and a type may keep more than one of
+    // them — what it may not keep is two of the *same* one, since nothing would pick between them.
+    // So the argument lists are what is compared, under this block's own subject so that a defaulted
+    // list and a written one are read in the same terms.
+    val already = implsOf(impl.traitName, outer.key)
+
+    for other <- already.find(ti => suppliedBound(ti, impl.traitName, subject).key == bound.key) do
+      err(s"'${outer.label}' already implements '${showBound(bound, subject)}'" + secondImplementation(tr, other))
+
+    // On a **generic** subject a defaulted argument list is not one promise but one per
+    // instantiation, since the trait's own default names the type being asked about. A written
+    // argument built out of that same type would coincide with it at one instantiation and not at
+    // others, which is a choice between implementations rather than a lookup — so it is refused
+    // here, where the block that would need choosing between is the one being read.
+    if outer.tparams.nonEmpty && tr.tdefaults.values.exists(mentionsSelf) then
+      for a <- written if mentionsKey(a, outer.key) do
+        err(s"'${show(a)}' is ${aOrAn(outer.label)}, and a '${qn(impl.traitName)}' whose arguments " +
+          s"default names the type it is written for — so at one ${outer.label} this block and a " +
+          "defaulted one would promise the same thing")
 
     // A shape and a type of that shape written out in full would both implement the trait for that
     // type, and sysl has no rule that picks between two implementations — the more specific one does
     // not win, because nothing here is more specific than anything else. So the second one written is
     // refused, in whichever order the file put them.
-    for h <- home.head do
-      if home.shaped then
+    //
+    // The arguments do not rescue this one, though they are what lets a type keep several
+    // implementations of a trait elsewhere. Several work because they share a namespace to be told
+    // apart in; a shape's members and a written-out type's are filed under two different owner keys
+    // and a lookup takes one or the other, so a second implementation across that boundary would be
+    // one a program could not name however it was written.
+    val wkey = if written.isEmpty then "" else Type.Bound(impl.traitName, written).key
+
+    for h <- outer.head do
+      if outer.shaped then
         for one <- writtenShapes.get((impl.traitName, h)) do
           err(s"'$one' already implements '${qn(impl.traitName)}', and this 'impl' would implement " +
             s"it for ${everyShape(h)} — including that one")
       else
-        if traitImpls.contains((impl.traitName, h)) then
-          err(s"${everyShape(h)} already implements '${qn(impl.traitName)}', so '${home.label}' has an " +
-            "implementation and cannot be given a second one")
-        writtenShapes((impl.traitName, h)) = home.label
+        if implsOf(impl.traitName, h).nonEmpty then
+          err(s"${everyShape(h)} already implements '${qn(impl.traitName)}', so '${outer.label}' has " +
+            "an implementation and cannot be given a second one")
+        writtenShapes((impl.traitName, h)) = outer.label
 
-    traitImpls((impl.traitName, home.key)) = impl
-    implFor((impl.traitName, home.key)) = bound.key
-    implWritten((impl.traitName, home.key)) = written
+    // The first implementation of a trait for a type files its members under the names they were
+    // written with; each one after it under names that differ, since a type's members are one
+    // namespace whatever brought them (`08`). Nothing outside the hoist reads the suffix: every way
+    // of reaching one of these members arrives with the argument list that says which is meant.
+    val home = outer.copy(alt = if already.isEmpty then "" else s".${already.length + 1}")
+
+    traitImpls((impl.traitName, home.key)) =
+      already :+ TraitImpl(impl, written, wkey, home.alt,
+        Option.when(home.tparams.nonEmpty && home.bounds.nonEmpty)((home.tparams, home.bounds)))
 
     // What the trait **requires** is asked of the implementing type here, at the block that makes
     // the promise, rather than at each bound that relies on it. Two reasons, and the second decides
@@ -816,16 +867,9 @@ trait Hoisting extends TypeResolution {
     // for itself and carrying what the block asked of it. That is what makes
     // `impl[T: Named] Greet for Box[T]` answerable against `impl[T: Named] Named for Box[T]`: the
     // condition on one side is met by the condition on the other.
-    val subject =
-      if impl.tparams.isEmpty then ty
-      else sandboxed(resolveType(impl.forType, abstractSubst(impl.tparams, impl.bounds)))
-
     for s <- tr.supers do
       superChecks += ((home.label, qn(tr.name),
         resolveBound(s, tr.tparams.zip(bound.args).toMap ++ selfBinding(subject)), subject, impl.pos))
-
-    if home.tparams.nonEmpty && home.bounds.nonEmpty then
-      implBounds((impl.traitName, home.key)) = (home.tparams, home.bounds)
 
     // A default the block left out is hoisted for this type exactly as a written method is, from the
     // body the trait supplied — so everything downstream (a call, a vtable slot, the escape summary)
@@ -838,7 +882,8 @@ trait Hoisting extends TypeResolution {
     // them. Those instantiations are diagnostic only, so the walk is sandboxed the way `14 §4`'s is.
     val inherited = sandboxed(checkConformance(tr, impl, home, signatures(home)))
 
-    for m <- inherited do defaultOrigin(s"${home.symbol}.${m.name}") = s"${impl.traitName}.${m.name}"
+    for m <- inherited do
+      defaultOrigin(s"${home.symbol}.${m.name}${home.alt}") = s"${impl.traitName}.${m.name}"
 
     val lowered = hoistMemberList(home, impl.methods ::: inherited, out)
 
@@ -858,14 +903,36 @@ trait Hoisting extends TypeResolution {
   private def defaultHome(member: String): Option[Scope] =
     defaultOrigin.get(member).map(origin => scopeFor(origin.take(origin.lastIndexOf('.'))))
 
-  /** Why a *generic* trait is no more implementable twice than any other, said only where the
-   * arguments might have made a reader think otherwise.
+  /** Why a trait implemented twice **at one argument list** is refused, where the arguments might
+   * have made a reader think this block asked for something else.
+   *
+   * A generic trait may be implemented more than once, so the complaint is not that there is already
+   * an implementation but that there is already this one — and where the block wrote nothing, what
+   * is worth saying is that leaving the arguments out is what made the two the same.
    */
-  private def secondImplementation(tr: TraitDecl): String =
+  private def secondImplementation(tr: TraitDecl, other: TraitImpl): String =
     if tr.tparams.isEmpty then ""
+    else if other.written.isEmpty || other.wkey.isEmpty then
+      s" — arguments left out are the ones '${qn(tr.name)}' declares them to default to, so the two " +
+        "blocks implement the same trait at the same arguments"
     else
-      s" — a trait's members become the type's, so a second '${qn(tr.name)}' would give '${tr.methods.head.name}' " +
-        "two meanings and a call no way to say which"
+      s" — a trait's members become the type's, so a second '${tr.methods.head.name}' at these " +
+        "arguments would have a call no way to say which was meant"
+
+  /** Whether a type is built out of one particular owner key — what tells an argument that names the
+   * type an `impl` is written for from one that names something else.
+   */
+  private def mentionsKey(t: Type, key: String): Boolean = t match
+    case n: Type.Named       => n.base == key || n.targs.exists(mentionsKey(_, key))
+    case Type.Ptr(inner)     => mentionsKey(inner, key)
+    case Type.Ref(inner, _)  => mentionsKey(inner, key)
+    case Type.Array(_, elem) => mentionsKey(elem, key)
+    case Type.Slice(elem)    => mentionsKey(elem, key)
+    case _                   => false
+
+  /** `a Box`, `an Adder` — the article a diagnostic needs when it names a type in running prose. */
+  private def aOrAn(label: String): String =
+    s"${if "aeiouAEIOU".contains(label.head) then "an" else "a"} $label"
 
   /** Which promise an `impl` block supplies: the trait, at the arguments this block writes for it.
    *
@@ -1237,7 +1304,7 @@ trait Hoisting extends TypeResolution {
    * serves a member that adds parameters and one that adds none.
    */
   private def synthesize(home: MemberHome, m: MethodDecl): FuncDecl = {
-    val name = s"${home.symbol}.${m.name}"
+    val name = s"${home.symbol}.${m.name}${home.alt}"
 
     FuncDecl(
       name,
