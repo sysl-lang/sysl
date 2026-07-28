@@ -181,8 +181,10 @@ recording rather than merely noting: a program can now go from bytes to text and
 go from text to scalar values, so the round trip this table describes is open at one end. It is not
 the same size of job as the rows above it — every one of those yields a value, and this one yields a
 *sequence*, which `for` currently knows only as an array or a slice. So it waits on an iteration
-protocol, which is the same thing `Index` and a growable container's `for` are waiting on (`14 §7`),
-and it should be decided with them rather than special-cased into `for`.
+protocol, which is what a growable container's `for` is also waiting on (`14 §7`), and it should be
+decided with that rather than special-cased into `for`. `Index` used to be filed beside it and no
+longer is: indexing turned out to want nothing this does not already have, which leaves the protocol
+as the one open half.
 
 **Slicing is boundary-checked.** `s[a..b]` must land on scalar-value boundaries; landing
 mid-codepoint traps, in the same runtime-safety category as a bounds check and `char(u)`. Go

@@ -381,15 +381,19 @@ trait AnalyzerBase {
   /** One `impl Trait for Type` block, as everything downstream of the hoist reads it.
    *
    *   - `written` are the trait arguments the block **wrote**, as against the ones the trait's own
-   *     defaults filled in. They are always concrete: `implBound` refuses a block's own parameter
-   *     there, since an argument the author left open would be a family of implementations rather
-   *     than one. The distinction is what a defaulted block means — `impl Mul for Box[T]` does not
-   *     promise `Mul` at one particular `Box` but whatever the default gives for the type being
-   *     asked about, which at a `Box[string]` is `Mul[Box[string]]`.
+   *     defaults filled in. They may name the block's own type parameters, but only ones the
+   *     **subject** binds: `impl[T] Index[usize, T] for Buf[T]` writes an argument that every
+   *     particular `Buf` settles, while `impl[T] From[T] for Wrapper` writes one nothing settles and
+   *     is refused (`implBound`). The distinction is what a defaulted block means — `impl Mul for
+   *     Box[T]` does not promise `Mul` at one particular `Box` but whatever the default gives for
+   *     the type being asked about, which at a `Box[string]` is `Mul[Box[string]]`.
    *   - `wkey` renders `written`, and is empty where the block wrote nothing. It is what tells a
    *     block that named its trait from one that let it default, without a subject in hand.
    *   - `alt` is the suffix this block's members carry, empty for the first implementation of a
    *     trait for a type and distinct for each one after it.
+   *   - `tparams` are the block's own type parameters **in the subject's argument order**, which is
+   *     what lets a subject's arguments be substituted into `written` positionally. Empty for a
+   *     block written for one type.
    *   - `bounds` is what a **generic** block asks of the type arguments its subject is applied to:
    *     the block's own parameters in the subject's argument order, and the bounds it wrote on
    *     them. `impl[T: Show] Show for Box[T]` is **conditional conformance** — a `Box` implements
@@ -403,6 +407,7 @@ trait AnalyzerBase {
       written: List[Type],
       wkey: String,
       alt: String,
+      tparams: List[String],
       bounds: Option[(List[String], Map[String, List[BoundRef]])],
   )
 
@@ -427,23 +432,29 @@ trait AnalyzerBase {
     traitImpls.getOrElse((traitName, key), Nil)
 
   /** The promise one implementation makes **about this subject**: what the block wrote, with the
-   * trait's own defaults supplying the rest under a `Self` of the type being asked about.
+   * subject's own type arguments put in for the block's parameters and the trait's own defaults
+   * supplying the rest under a `Self` of the type being asked about.
+   *
+   * The substitution is what makes an argument built out of a parameter a promise about a
+   * particular type rather than an open one. `impl[T] Index[usize, T] for Buf[T]` wrote
+   * `Index[usize, T]`, and what a `Buf[int]` gets from it is `Index[usize, int]` — the block's
+   * parameter is not free here, it is whatever the subject was made with.
    */
-  protected def suppliedBound(ti: TraitImpl, name: String, subject: Type): Type.Bound =
+  protected def suppliedBound(ti: TraitImpl, name: String, subject: Type, targs: List[Type]): Type.Bound = {
+    val written = ti.written.map(substParams(_, ti.tparams.zip(targs).toMap))
+
     traitDecls.get(name) match
-      case Some(d) if ti.written.length < d.tparams.length =>
-        Type.Bound(
-          name,
-          sandboxed(withDefaults(name, d.tparams, d.tdefaults, ti.written, selfBinding(subject))),
-        )
-      case _ => Type.Bound(name, ti.written)
+      case Some(d) if written.length < d.tparams.length =>
+        Type.Bound(name, sandboxed(withDefaults(name, d.tparams, d.tdefaults, written, selfBinding(subject))))
+      case _ => Type.Bound(name, written)
+  }
 
   /** Which of a type's implementations of a trait supplies exactly the promise `tr` asks for. A
    * trait that takes no arguments has one promise to make, so the search is a lookup for everything
    * outside a generic trait.
    */
-  protected def implAt(tr: Type.Bound, key: String, subject: Type): Option[TraitImpl] =
-    implsOf(tr.name, key).find(ti => suppliedBound(ti, tr.name, subject).key == tr.key)
+  protected def implAt(tr: Type.Bound, key: String, subject: Type, targs: List[Type]): Option[TraitImpl] =
+    implsOf(tr.name, key).find(ti => suppliedBound(ti, tr.name, subject, targs).key == tr.key)
 
   /** The composed types written out in full that implement a trait, keyed by (trait name, the
    * arguments the block **wrote** for it, the **shape** each one has). It is what a shape-matched
@@ -1084,7 +1095,7 @@ trait AnalyzerBase {
    * of two would be the more specific.
    */
   protected def implKey(tr: Type.Bound, t: Type): Option[(List[Type], TraitImpl)] = {
-    def at(k: (String, List[Type])) = implAt(tr, k._1, t).map((k._2, _))
+    def at(k: (String, List[Type])) = implAt(tr, k._1, t, k._2).map((k._2, _))
 
     at(memberOwner(t)).orElse(shapeOwner(t).flatMap(at))
   }
@@ -1122,10 +1133,10 @@ trait AnalyzerBase {
     // `impl`, at the arguments the bound asked for, beside the ones already there.
     val wrongArgs =
       for
-        key <- List(memberOwner(t)._1) ::: shapeOwner(t).map(_._1).toList
+        (key, targs) <- List(memberOwner(t)) ::: shapeOwner(t).toList
         impls = implsOf(tr.name, key)
-        if impls.nonEmpty && implAt(tr, key, t).isEmpty
-      yield s"it implements ${conjoin(impls.map(ti => s"'${suppliedBound(ti, tr.name, t).show}'"))}"
+        if impls.nonEmpty && implAt(tr, key, t, targs).isEmpty
+      yield s"it implements ${conjoin(impls.map(ti => s"'${suppliedBound(ti, tr.name, t, targs).show}'"))}"
 
     val unmetCondition =
       for
@@ -1311,6 +1322,7 @@ trait AnalyzerBase {
 
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound
   protected def selfBinding(t: Type): Map[String, Type]
+  protected def substParams(t: Type, subst: Map[String, Type]): Type
   protected def withDefaults(
       key: String,
       tparams: List[String],

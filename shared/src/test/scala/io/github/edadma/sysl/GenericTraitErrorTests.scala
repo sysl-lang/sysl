@@ -171,29 +171,47 @@ class GenericTraitErrorTests extends AnyFreeSpec with RunSupport with CodegenSup
   }
 
   "an 'impl' fixes the trait's arguments and its own parameters separately" - {
-    "the trait's argument may not be one of the block's own parameters" in {
-      err(
+    // A block's parameter is an argument the *subject* settles, so the promise is one per
+    // instantiation exactly as a defaulted list on a generic subject is (`02 § One implementation
+    // per argument list`). This is what carries the element type of a container.
+    "the trait's argument may be one of the block's own parameters" in {
+      run(
         """trait Get[T]
           |    get(self) -> T
           |struct Box[U]
           |    v: U
           |impl[U] Get[U] for Box[U]
-          |    get(self) -> U = self.v""".stripMargin,
-      ) should include(
-        "'U' is a type parameter of this 'impl', so it leaves which 'Get' this block implements " +
-          "open — write the type the trait is applied to",
-      )
+          |    get(self) -> U = self.v
+          |print(Box(3).get())
+          |print(Box("hi").get())""".stripMargin,
+      ) shouldBe "3\nhi\n"
     }
 
-    "nor may it be built out of one" in {
-      err(
+    "and may be built out of one" in {
+      run(
+        """trait Get[T]
+          |    get(self) -> T
+          |struct Box[U]
+          |    v: U
+          |impl[U] Get[Box[U]] for Box[U]
+          |    get(self) -> Box[U] = self
+          |print(Box(3).get().v)""".stripMargin,
+      ) shouldBe "3\n"
+    }
+
+    // Resolving that argument instantiates `Box[U]`, and a `U` is not something a layout can be
+    // emitted for. The instantiation is a diagnostic type — it names the family the block covers —
+    // so it is dropped before codegen rather than reaching a backend that would have to invent a
+    // representation for a type parameter.
+    "and the instantiation it names is not emitted, even where nothing uses the block" in {
+      ir(
         """trait Get[T]
           |    get(self) -> T
           |struct Box[U]
           |    v: U
           |impl[U] Get[Box[U]] for Box[U]
           |    get(self) -> Box[U] = self""".stripMargin,
-      ) should include("'U' is a type parameter of this 'impl'")
+      ) should not include "%struct.Box"
     }
 
     "the block may not spell one of its own the way the trait spells one of its" in {

@@ -5,7 +5,8 @@ rule, definition-checked bounds on both method calls and operators, the compiler
 memberships, `print`/`str` requiring `Display`, and every renderer honouring the specifier it is
 handed. The ten binary arithmetic traits now take the right-hand type as a parameter defaulting to
 `Self`, so an operator dispatches on the **pair**, and a type may implement one of them at more than
-one argument list (`§7`). `§8 b`, `§8 d`, and `§8 e` settled on the
+one argument list (`§7`). `Index` and `IndexSet` are built too, and without the associated types
+`§1` said they would need. `§8 b`, `§8 d`, and `§8 e` settled on the
 way, leaving `§8 a` and `§8 c` — neither of which
 is about this chapter's own surface. This is the concrete spec for three things the earlier chapters
 *decided* but left unbuilt, because all three turned on the same missing layer:
@@ -69,8 +70,8 @@ like `+` is homogeneous (`Self + Self -> Self`), and only `Self` can say that in
 type other than the operands'. sysl does not: an operator trait's **result** is `Self`. This is not
 a loss the target code feels — the existing scalar rule is already exactly this: **no operator
 promotes** (`01`). `u8 + u8 -> u8`, never `-> u16`. Associated types remain deferred (`02` open
-item); the one operator that genuinely needs a second type — `Index`, whose element differs from
-the container — waits on them (`§7`).
+item), and the operator that was supposed to need them does not: `Index` carries the element type
+as an ordinary trait argument, because the type it is written for settles it (`§7`).
 
 The **operands** are a separate question, and it was answered separately. A binary arithmetic trait
 takes the right-hand type as a parameter defaulting to `Self` (`§7`), so `add(self, rhs: Rhs) ->
@@ -475,26 +476,58 @@ exactly (`§5`), one row further down the catalog.
 
 ## 7. What stays deferred
 
-- **`Index` and user-defined `[]`.** Overloading indexing needs the element type and the index
-  type, which differ from `Self` — the one operator that genuinely wants an associated type. It
-  waits on associated types (`§1`). Built-in indexing of arrays, slices, and strings is
-  compiler-provided and unaffected.
-  **Two customers now, and they are the same customer twice**: the prelude's `Buf[T]`, read with
-  `at`/`set` because `b[i]` is "cannot index Buf[T]", and `guide/shapes`, whose catalogue is a
-  `Buf[&Shape]` and reads it the same way. Both also want `for x in b`, which is the other half of
-  the same absence — there is no iteration protocol either, and the workaround is the same in both
-  programs: `for x in b.view()`, because a view is a slice and slices iterate. So what a container
-  is actually missing is narrower than "the operators a container wants" — it is indexing alone,
-  and it is worth checking whether a container that hands out a slice needs anything else at all
-  before the associated-type machinery is built for it.
-  **The iteration half now has a customer the indexing half does not, and it is a built-in.**
+- **~~`Index` and user-defined `[]`.~~ Built, and the associated type it was waiting on turned out
+  not to be needed.** The reasoning that filed it here was that a subscript wants the element type
+  and the index type, neither of which is `Self`, so the trait would have to *derive* the element
+  from the container. That is one way to write it and not the only one: the element type can be an
+  ordinary trait argument, because the type the block is written for settles it.
+
+  ```
+  trait Index[I, E]
+      index(self, i: I) -> E
+
+  trait IndexSet[I, E]
+      index_set(*self, i: I, v: E)
+  ```
+
+  `impl[T] Index[usize, T] for Buf[T]` says a `Buf` of anything is read by a `usize` and gives back
+  whatever it holds. That is **one promise per instantiation** — a `Buf[int]` implements
+  `Index[usize, int]` and nothing else — which is exactly what a defaulted argument list on a
+  generic subject already meant (`§3`). Nothing had to be added for it: a generic block's parameters
+  are already required to be the arguments of the type it is for, each appearing once, so a
+  parameter an argument can name is one the subject settles. What made this impossible before was a
+  single refusal in the hoist that read every parameter in an argument list as an open one.
+
+  **The index is not held to being an integer**, which the built-in subscript is: what a container
+  is read by is the trait's own argument, so `e["answer"]` on a type that implements
+  `Index[string, int]` is ordinary. A type may implement `Index` at more than one index type, and
+  the written index says which (`02 § A trait may be implemented at more than one argument list`).
+  Built-in indexing of arrays, slices and strings is compiler-provided and unaffected; nothing a
+  program writes competes with it.
+
+  **Writing is a call, and the compound forms are refused.** A trait's method gives back a value and
+  never an address, so a container's element is not a place — `b[i] = v` is `IndexSet`'s method, and
+  `b[i] += v` would have to read the element and write it back, evaluating the receiver and the
+  index twice. Written out as `b[i] = b[i] + v`, the program says that itself. **Slicing through the
+  trait is not built**: `b[a..b]` would want a range as the index argument, and a range is not yet a
+  type a program can name.
+
+  **One customer this does not reach, and it is worth saying which.** `guide/png` reads a pixel as
+  `img.at(x, y)` — two indices, which a subscript taking one argument cannot spell. The shapes it
+  could take are a tuple (sysl has none), a variadic index (an index list is not a value), or a
+  second trait per arity. None of the three is obviously right and nothing is blocked on it, so the
+  two-argument accessor stays a method.
+
+- **The iteration protocol, which was the other half of this entry and is now the whole of it.**
   `04`'s granularity table specifies `s.chars`, a string's Unicode scalar values, and it is not
   built: a string cannot hand out a slice of them the way a container hands out a view of its
   storage, because the decoding is what makes them. So the "just use `.view()`" answer that covers
   `Buf[T]` does not reach it, and `s.chars` is the case that decides whether the protocol is
   something a *type* implements or something `for` knows about. Building `from_utf8` is what made
   this worth writing down: a program can now go from bytes to text and still has no way to walk the
-  text it got.
+  text it got. What indexing settled applies here too — a `trait Iterate[E]` implemented for a
+  cursor type wants exactly the argument `Index` wanted, so the protocol's shape is now an ordinary
+  design question rather than one blocked on a missing feature.
 
 - **~~A heterogeneous *operand*.~~ The catalog change is built; what it turned out to wait on is
   something else.** `§1` argues that `Self`-homogeneity costs nothing, because the scalars already

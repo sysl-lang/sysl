@@ -201,6 +201,15 @@ used.
 A failed check **traps**. It is the same runtime-safety category as the partial `char(u)`
 conversion, and it gets the same treatment.
 
+**A type with no elements of its own is indexed through a trait**, and everything above is about the
+built-in subscript rather than about `[]` as a token. A user type — the prelude's `Buf[T]`, a
+lookup table, anything a program writes — implements `Index` and is read with the same syntax
+(`14 §7`). Two differences follow from its being a call rather than a walk to an address: the index
+is whatever the implementation takes and not necessarily an integer, and the element is **not** a
+place, so `b[i] = v` is a second trait's method and `b[i] += v` is refused rather than reading and
+writing back. Nothing a program writes competes with the built-in subscript: an array, a slice and a
+string are indexed by the compiler.
+
 ## Slicing
 
 A slice expression is an index whose subscript is a range, and the two range operators keep the

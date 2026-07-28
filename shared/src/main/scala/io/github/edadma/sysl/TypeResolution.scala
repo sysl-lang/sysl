@@ -753,6 +753,31 @@ trait TypeResolution extends ImportResolution {
         s
   }
 
+  /** A type with type parameters replaced by what a particular instantiation was made with — the
+   * substitution `resolveType` performs on a *reference*, performed on a type that is already
+   * resolved.
+   *
+   * It exists for one question: what an `impl` written with its own parameters promises about a
+   * subject those parameters are bound in. `impl[T] Index[usize, T] for Buf[T]` stored `T` as a
+   * trait argument, and asking what a `Buf[int]` implements means putting `int` there. Nothing
+   * unresolved is reachable from here, so this is a walk rather than a resolution — a named type is
+   * rebuilt through its instantiator so the result is the one canonical instantiation, and anything
+   * with no parameter inside it comes back as itself.
+   */
+  protected def substParams(t: Type, subst: Map[String, Type]): Type =
+    if subst.isEmpty then t
+    else
+      t match
+        case a: Type.Abstract => subst.getOrElse(a.name, a)
+        case n: Type.Named if n.targs.isEmpty => n
+        case n: Type.Struct   => instantiateStruct(n.base, n.targs.map(substParams(_, subst)))
+        case n: Type.Enum     => instantiateEnum(n.base, n.targs.map(substParams(_, subst)))
+        case Type.Ptr(inner)      => Type.Ptr(substParams(inner, subst))
+        case Type.Ref(inner, syn) => Type.Ref(substParams(inner, subst), syn)
+        case Type.Array(n, elem)  => Type.Array(n, substParams(elem, subst))
+        case Type.Slice(elem)     => Type.Slice(substParams(elem, subst))
+        case other                => other
+
   /** Instantiates an enum for one set of type arguments. All-dataless variants make a *simple*
    * enum (integer constants, auto-incrementing from an optional explicit `= value`); any
    * data-carrying variant makes a *data* enum, whose variants take sequential tags and whose

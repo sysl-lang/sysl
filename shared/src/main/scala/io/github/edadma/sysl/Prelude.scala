@@ -177,6 +177,12 @@ object Prelude {
       |trait Hash
       |    hash(self) -> u64
       |
+      |trait Index[I, E]
+      |    index(self, i: I) -> E
+      |
+      |trait IndexSet[I, E]
+      |    index_set(*self, i: I, v: E)
+      |
       |hash_u64(v: u64) -> u64
       |    var h = v + 0x9e3779b97f4a7c15u64
       |    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64
@@ -475,6 +481,12 @@ object Prelude {
       |
       |    view(self) -> []T = self.elems[..<self.count]
       |end Buf
+      |
+      |impl[T] Index[usize, T] for Buf[T]
+      |    index(self, i: usize) -> T = self.at(i)
+      |
+      |impl[T] IndexSet[usize, T] for Buf[T]
+      |    index_set(*self, i: usize, v: T) = self.set(i, v)
       |
       |buf[T]() -> Buf[T]
       |    var b: Buf[T] = Buf([], 0usize)

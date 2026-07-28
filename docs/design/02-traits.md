@@ -412,6 +412,21 @@ but one per instantiation, since the trait's own default names the type being as
 block promises there, and at every other `Box` it would not. An argument built out of anything else
 is fine, which is the case the feature exists for.
 
+**A generic block may write its own parameter as a trait argument**, and this is that same
+"one promise per instantiation" reading rather than an exception to it:
+
+```
+impl[T] Index[usize, T] for Buf[T]      // a Buf[int] implements Index[usize, int], and nothing else
+```
+
+Nothing about it is open, because a generic block's parameters are already exactly the arguments of
+the type it is written for — each appearing in the subject, and each appearing once. A parameter an
+argument can name is therefore one the subject settles, and what settles it is the same thing that
+settles a defaulted `Self`. This is what lets a container carry the type of what it holds in the
+trait it implements without an associated type to derive it from (`14 §7`), and it is safe for the
+reason the rest of this section is: there is no specialization here, so `impl Index[usize, int] for
+Buf[int]` beside it is refused outright and the two never have to be chosen between.
+
 What has not changed is what a bound means. `Mul` is `Mul[Self]` by `10 §3`'s default, so a bare
 bound still names the homogeneous implementation rather than "whichever there is", and every bound
 written before parameterized traits existed means what it meant. A bound asking for `From[real]` is

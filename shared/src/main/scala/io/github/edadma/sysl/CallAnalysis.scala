@@ -190,9 +190,14 @@ trait CallAnalysis extends Literals with TraitObjects {
    * A method with type parameters **of its own** is the one shape the receiver does not settle, and
    * `callGenericMethod` is where the rest of the answer comes from.
    */
-  protected def callMethod(recv: Expr, mname: String, args: List[Expr], expected: Option[Type]): TExpr = {
-    val tr = analyzeExpr(recv)
+  protected def callMethod(recv: Expr, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
+    callMethodOn(analyzeExpr(recv), mname, args, expected)
 
+  /** The same, for a receiver already analyzed — what a form that had to look at the receiver's type
+   * to know it was a method call uses, so the receiver is analyzed once and the analysis that
+   * decided is the one that runs.
+   */
+  protected def callMethodOn(tr: TExpr, mname: String, args: List[Expr], expected: Option[Type]): TExpr = {
     receiverType(tr.ty) match
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
       case t: Type.Trait    => callTraitObject(tr, t, mname, args)
@@ -279,7 +284,7 @@ trait CallAnalysis extends Literals with TraitObjects {
   /** A question asked of the tables that is allowed to have no answer, with everything it registers
    * on the way dropped and everything it complains about left for the walk that follows.
    */
-  private def probe[T](body: => T): Option[T] =
+  protected def probe[T](body: => T): Option[T] =
     sandboxed {
       try Some(body)
       catch

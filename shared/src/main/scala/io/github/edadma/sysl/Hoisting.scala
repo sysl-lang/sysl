@@ -808,7 +808,13 @@ trait Hoisting extends TypeResolution {
     // list and a written one are read in the same terms.
     val already = implsOf(impl.traitName, outer.key)
 
-    for other <- already.find(ti => suppliedBound(ti, impl.traitName, subject).key == bound.key) do
+    // Asked with **this** block's parameters standing in for the subject's arguments, so a block
+    // already filed under them is read in the names this one wrote: `impl[U] Index[usize, U] for
+    // Buf[U]` and an `impl[T] Index[usize, T] for Buf[T]` before it are the one promise they are,
+    // rather than two that differ in the letter their author chose.
+    val mine = outer.tparams.map(Type.Abstract(_, Nil))
+
+    for other <- already.find(ti => suppliedBound(ti, impl.traitName, subject, mine).key == bound.key) do
       err(s"'${outer.label}' already implements '${showBound(bound, subject)}'" + secondImplementation(tr, other))
 
     // On a **generic** subject a defaulted argument list is not one promise but one per
@@ -852,7 +858,7 @@ trait Hoisting extends TypeResolution {
     val home = outer.copy(alt = if already.isEmpty then "" else s".${already.length + 1}")
 
     traitImpls((impl.traitName, home.key)) =
-      already :+ TraitImpl(impl, written, wkey, home.alt,
+      already :+ TraitImpl(impl, written, wkey, home.alt, home.tparams,
         Option.when(home.tparams.nonEmpty && home.bounds.nonEmpty)((home.tparams, home.bounds)))
 
     // What the trait **requires** is asked of the implementing type here, at the block that makes
@@ -936,11 +942,21 @@ trait Hoisting extends TypeResolution {
 
   /** Which promise an `impl` block supplies: the trait, at the arguments this block writes for it.
    *
-   * The arguments must be types the block fixes outright, not its own parameters. An
-   * `impl[T] From[T] for Wrapper` would be an implementation for every `From` at once, and deciding
-   * which of several such blocks a `From[int]` reaches is the matching problem sysl does not have —
-   * one implementation per (trait-at-arguments, type) is what every table here is keyed by, and a
-   * parameter in the key is a key that matches many things.
+   * An argument may name one of the block's own parameters — `impl[T] Index[usize, T] for Buf[T]`
+   * says a `Buf` of anything is read by a `usize` and gives back whatever it holds. That is one
+   * promise per instantiation, exactly as a defaulted argument list on a generic subject is: a
+   * `Buf[int]` implements `Index[usize, int]` and nothing else.
+   *
+   * Nothing has to be checked here for that to hold, because a generic block's parameters are
+   * already exactly the arguments of the type it is for — `implArgs` and `shapeArgs` require each
+   * one to appear in the subject and to appear once. So a parameter an argument can name is one the
+   * subject settles, and the open case those checks refuse (`impl[V, T] From[T] for Wrapper[V]`,
+   * where nothing would ever fix `T`) never reaches this far.
+   *
+   * What makes it safe beyond that is that sysl has no specialization: an `impl` for a generic type
+   * covers every instantiation, and `impl Index[usize, int] for Buf[int]` is refused outright
+   * (`implTarget`). So one block per (trait-at-arguments, generic type) still holds, and a parameter
+   * the subject settles is a key that matches one thing per subject rather than many.
    */
   private def implBound(impl: ImplDecl, tr: TraitDecl): (Type.Bound, List[Type]) = {
     checkTraitArity(qn(impl.traitName), tr.tparams, tr.tdefaults, impl.traitArgs.map(_ => Type.Unknown))
@@ -950,24 +966,19 @@ trait Hoisting extends TypeResolution {
     // declaration rather than at the argument they meant to fix.
     val declared = abstractSubst(impl.tparams, impl.bounds)
     val written  = impl.traitArgs.map(resolveType(_, declared))
+    val subject  = sandboxed(resolveType(impl.forType, declared))
 
     // What the block leaves out the trait supplies, and `Self` in one of those defaults is the type
     // this block implements the trait for — which is what makes `impl Mul for Point` the
     // `impl Mul[Point] for Point` it reads as.
     val args =
       if written.length == tr.tparams.length then written
-      else
-        withDefaults(impl.traitName, tr.tparams, tr.tdefaults, written,
-          selfBinding(sandboxed(resolveType(impl.forType, declared))))
+      else withDefaults(impl.traitName, tr.tparams, tr.tdefaults, written, selfBinding(subject))
 
     // Asked of what the block **wrote**, not of what the defaults filled in. A conditional block's
     // subject is the type applied to its own parameters, so a default of `Self` names them by
     // construction — `impl[T: Named] Pairable for Box[T]` supplies `Pairable[Box[T]]`, which is one
     // implementation and not a family of them, and only an argument the author left open is.
-    for a <- written; abs <- mentionedParam(a) do
-      err(s"'${abs.name}' is a type parameter of this 'impl', so it leaves which '${qn(impl.traitName)}' " +
-        "this block implements open — write the type the trait is applied to")
-
     for tp <- impl.tparams if tr.tparams.contains(tp) do
       err(s"trait '${qn(impl.traitName)}' already declares a type parameter '$tp', so this 'impl' " +
         "cannot declare one of that name")
@@ -976,18 +987,6 @@ trait Hoisting extends TypeResolution {
 
     (Type.Bound(impl.traitName, args), written)
   }
-
-  /** The first type parameter a type is built out of, if any — what tells a written type from one
-   * that still depends on something a call would fix.
-   */
-  private def mentionedParam(t: Type): Option[Type.Abstract] = t match
-    case a: Type.Abstract    => Some(a)
-    case n: Type.Named       => n.targs.flatMap(mentionedParam).headOption
-    case Type.Ptr(inner)     => mentionedParam(inner)
-    case Type.Ref(inner, _)  => mentionedParam(inner)
-    case Type.Array(_, elem) => mentionedParam(elem)
-    case Type.Slice(elem)    => mentionedParam(elem)
-    case _                   => None
 
   /** What a signature written inside these members resolves under.
    *

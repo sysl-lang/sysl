@@ -231,15 +231,35 @@ class Analyzer private (units: List[Program])
       TExtern(name, e.symbol, params.map(_._2), rtype, e.variadic)
     }
 
+    // An instantiation at a **type parameter** is a diagnostic type, not a laid-out one: a `Box[U]`
+    // written as a trait's argument in a generic `impl` names the family the block covers, and no
+    // value at run time has that type. It has no layout to emit — `Type.Abstract.llvm` says so by
+    // refusing — so it is dropped here rather than reaching a backend that would have to invent one.
     TProgram(
-      structInsts.values.toList,
-      enumInsts.values.filterNot(_.simple).toList,
+      structInsts.values.filterNot(abstracted).toList,
+      enumInsts.values.filterNot(e => e.simple || abstracted(e)).toList,
       vtables.values.toList,
       externs,
       tvals.toList,
       tfuncs.toList,
       tmain,
     )
+  }
+
+  /** Whether a named type was instantiated at something that is not a type — a parameter standing
+   * in for itself, or a type built out of one.
+   */
+  private def abstracted(t: Type.Named): Boolean = {
+    def mentions(x: Type): Boolean = x match
+      case _: Type.Abstract    => true
+      case n: Type.Named       => n.targs.exists(mentions)
+      case Type.Ptr(inner)     => mentions(inner)
+      case Type.Ref(inner, _)  => mentions(inner)
+      case Type.Array(_, elem) => mentions(elem)
+      case Type.Slice(elem)    => mentions(elem)
+      case _                   => false
+
+    t.targs.exists(mentions)
   }
 
   // --- the files of a module -----------------------------------------------------------
@@ -936,6 +956,19 @@ class Analyzer private (units: List[Program])
 
       compareChain(ts, ops.indices.map(i => compareLink(ops(i), ts(i), ts(i + 1))).toList)
 
+    // `b[i] = v` on a type with no elements of its own is `IndexSet`, and it is a call rather than a
+    // store because a trait's method gives back a value and never an address — so there is no place
+    // for the ordinary path to write through, and the trait says as much by taking the value.
+    case Assign("=", Index(receiver, index), value) if indexes("IndexSet", receiver) =>
+      callMethod(receiver, "index_set", List(index, value), None)
+
+    // The compound forms would have to read the element and write it back, which means evaluating
+    // the receiver and the index twice — and a container's subscript is a call, so twice is twice
+    // the calls. Written out, the program says that itself.
+    case Assign(op, Index(receiver, index), _) if indexes("IndexSet", receiver) =>
+      err(s"'$op' on an element read through 'Index' would evaluate the receiver and the index " +
+        s"twice — write it out as 'b[i] = b[i] ${op.dropRight(1)} …'")
+
     case Assign("=", target, value) =>
       val place = analyzePlace(target, "assignment")
       val tv    = analyzeExpr(value, Some(place.ty))
@@ -1197,16 +1230,27 @@ class Analyzer private (units: List[Program])
       TSlice(tr, lo.map(bound), hi.map(bound), inclusive, viewTy)
 
     case Index(receiver, index) =>
-      val tr   = autoDeref(analyzeExpr(receiver))
-      val elem = Type.element(tr.ty).getOrElse(err(s"cannot index ${show(tr.ty)}"))
-      val ti   = analyzeExpr(index, Some(Type.Usize))
+      val raw = analyzeExpr(receiver)
+      val tr  = autoDeref(raw)
 
-      // A transparent constrained subtype stands where its base does, so an `Index within 0..<n`
-      // indexes without a cast. A derived one does not: `new` is nominal, and reaching the base is
-      // exactly what a written conversion is for.
-      Type.repr(ti.ty) match
-        case _: Type.Integer => TIndex(tr, ti, elem)
-        case other           => err(s"an index must be an integer, not ${show(other)}")
+      Type.element(tr.ty) match
+        case Some(elem) =>
+          val ti = analyzeExpr(index, Some(Type.Usize))
+
+          // A transparent constrained subtype stands where its base does, so an `Index within 0..<n`
+          // indexes without a cast. A derived one does not: `new` is nominal, and reaching the base
+          // is exactly what a written conversion is for.
+          Type.repr(ti.ty) match
+            case _: Type.Integer => TIndex(tr, ti, elem)
+            case other           => err(s"an index must be an integer, not ${show(other)}")
+
+        // A type with no elements of its own is indexed through `Index`, whose one method the
+        // subscript *is* (`14 §3`). The index is not held to being an integer here: what a
+        // container is read by is the trait's own argument, and a type that indexes by something
+        // else is implementing a different `Index` rather than misusing this one.
+        case None if indexes("Index", tr.ty) => callMethodOn(raw, "index", List(index), expected)
+
+        case None => err(s"cannot index ${show(tr.ty)}")
 
     // An `if` whose own value is unused hands that down: each branch is a block in statement
     // position, so neither is asked what it yields and the two have nothing to disagree about.
@@ -1367,6 +1411,21 @@ class Analyzer private (units: List[Program])
       case i: Type.Integer => TIncDec(place, op, pre, i)
       case other           => err(s"'$op' is not defined for ${show(other)}")
   }
+
+  /** Whether a subscript on this type reaches one of the two indexing traits, asked of a type that
+   * has no elements of its own. A built-in's subscript is never this: an array, a slice and a
+   * string are indexed by the compiler, and nothing a program writes competes with that.
+   */
+  private def indexes(traitName: String, ty: Type): Boolean =
+    implsOf(traitName, memberOwner(ty)._1).nonEmpty
+
+  /** The same, asked of an assignment target before the statement has committed to being a store.
+   * Whatever goes wrong while typing the receiver is left for the ordinary path to report, in the
+   * place the programmer wrote it.
+   */
+  private def indexes(traitName: String, receiver: Expr): Boolean =
+    probe(autoDeref(analyzeExpr(receiver)).ty)
+      .exists(t => Type.element(t).isEmpty && indexes(traitName, t))
 
   // --- places --------------------------------------------------------------------------
 
