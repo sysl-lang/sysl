@@ -152,7 +152,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
     val out = guide("shapes")
 
     out should not include "FAIL"
-    checks(out) shouldBe 86
+    checks(out) shouldBe 88
     sections(out) shouldBe List(
       "-- each shape answers for itself",
       "-- one call site, many implementations",
@@ -160,7 +160,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- a shape that wraps a shape",
       "-- the law every shape obeys",
       "-- counted and raw",
-      "-- what an object no longer knows",
+      "-- what an object keeps and what it forgets",
       "-- objects made and dropped",
     )
   }

@@ -86,12 +86,17 @@ end Kind
 // object-safe because it carries a receiver it never spells, and this is where that is spent: the
 // read goes through the object's table exactly as a call does.
 //
-// `render` is the member that should not be here, and it is worth looking at why it takes the shape
-// it does. Every shape below also implements `Display`, whose one method is `display(self, out:
-// *Writer, fmt: FormatSpec)` — and an object cannot reach it, so the trait declares that method
-// again, minus the specifier it has no use for. The duplication is no longer a paraphrase of
-// `Display`; it is `Display`. See the note at the head of `main.sysl`.
-trait Shape
+// `Shape` **requires** `Display`, and that one word is what makes a catalogue of erased values
+// printable. A bound may name several traits because a bound is a list; a trait-object type names
+// one because it is a type, so without the requirement a `&Shape` would offer the four members
+// below and nothing else — and every shape here implements `Display` perfectly well. The
+// requirement is also what puts `display` in the object's table, so `print(s)` on a `&Shape` is one
+// indirect call and no different from `s.area()`.
+//
+// `render` is the shape's parts with no field around them. It stays a member of its own because
+// `Display` is *those parts placed in the field the specifier asked for* — two operations, and the
+// padding is worth writing once rather than seven times.
+trait Shape: Display
     area(self) -> f64
     perimeter(self) -> f64
     bounds(self) -> Box
@@ -109,24 +114,14 @@ six(x: f64) -> string = f"$x%.6f"
 // explicit that a part gets the neutral one and the whole value gets the caller's.
 plain() -> FormatSpec = FormatSpec(0, -1, false)
 
-// The shape as text, gathered from what it writes. This is the whole of what `from_utf8` bought the
-// program: rendering can go the allocation-free way, into a `*Writer`, and a caller that genuinely
-// wants a `string` can still have one — which is the direction that did not exist before.
-// The sigil is the one this program's call sites hold, and there is no crossing to the other —
-// the same gap `size` and `size_raw` are written twice for.
-describe(s: &Shape) -> string
-    var g = byte_sink()
-
-    s.render(&g)
-    from_utf8(g.text()).unwrap()
-
 // A `Display` for a shape is its rendering put in the field the specifier asked for. `14 §2` says
 // the field belongs to the whole value rather than to each part, so the parts are gathered before
 // any padding is applied — which is what `byte_sink` is in the prelude for.
 //
-// It is written **once, over the bound**, and that is the finding stated from the other side: a
-// `[T: Shape]` may say "and it is a `Display` too" in the seven impls below, because a bound is a
-// list. A `&Shape` may not, because a type is one name.
+// It is written **once, over the bound**, because the gather-and-pad is the same for every shape.
+// Note what is no longer here: this program used to carry a `describe(s: &Shape) -> string` beside
+// it, doing the same gathering a second time, because an erased shape could not be handed to `str`.
+// It can now — the requirement put `display` in the object's table — so `str(s)` is the whole of it.
 display_shape[T: Shape](x: T, out: *Writer, fmt: FormatSpec)
     var g = byte_sink()
 
@@ -344,13 +339,12 @@ impl Shape for Scaled
         self.inner.render(out)
         out.write(")".bytes)
 
-// -- rendering, which is the same thing said a second time ------------------------------------
+// -- rendering ---------------------------------------------------------------------------------
 //
-// Every one of these seven impls exists because a `&Shape` cannot be printed. `Display` is a trait
-// each shape implements perfectly well; erasing to `Shape` throws it away, and there is no way to
-// say that a `Shape` is also a `Display`. So the trait declares `Display`'s own method a second
-// time, and these forward one onto the other — fourteen lines whose entire content is that the two
-// traits are about the same value.
+// `Shape` requires `Display`, so these seven are not optional: an implementation that left one out
+// would be told at the `impl` that it cannot keep the trait's promise. Each is the same one line
+// because the work is in `display_shape` — the gathering and the padding are the same whatever the
+// shape, and what differs is `render`.
 
 impl Display for Circle
     display(self, out: *Writer, fmt: FormatSpec) = display_shape(self, out, fmt)

@@ -62,7 +62,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       "com.github.scopt"         %%% "scopt"                    % "4.1.0",
       "org.scala-lang.modules"   %%% "scala-parser-combinators" % "2.4.0",
       // Off-side-rule lexer base (see docs/design/front-end.md).
-      "io.github.edadma"         %%% "indentation"              % "0.0.4",
+      "io.github.edadma"         %%% "indentation"              % "0.0.5",
       // Cross-platform I/O boundary (see docs/design/cross-platform.md).
       "io.github.edadma"         %%% "path"                     % "0.0.6",
       "io.github.edadma"         %%% "cross_platform"           % "0.1.8",

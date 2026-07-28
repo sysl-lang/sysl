@@ -71,6 +71,10 @@ class Analyzer private (units: List[Program])
       currentPos = stmt.pos
       inScope(scope)(recover(())(hoistType(stmt)))
 
+    // What each trait requires of the types implementing it is answerable now that every trait is
+    // registered, and not before: `trait Ord: Eq` is ordinary whichever of the two is written first.
+    checkTraitSupers()
+
     // Every constant is folded now, whether or not anything reads it. Folding is lazy so that one
     // may be written in terms of another declared below it, and an unused constant would otherwise
     // never be looked at — leaving a value that does not fit its type, or is not constant at all, as
@@ -122,6 +126,10 @@ class Analyzer private (units: List[Program])
       currentPos = pos
       recover(())(checkParamBounds(name, tparams, bounds, targs))
     boundChecks.clear()
+
+    // And whether each `impl` of a trait that requires others supplies those too, which is the same
+    // question about the same table and so waits for the same moment.
+    checkImplSupers()
 
     // Every generic body is checked once here, against its bounds alone, before any instantiation
     // is looked at. That is what makes `sum[T](a: T, b: T) = a.plus(b)` fail on its own line

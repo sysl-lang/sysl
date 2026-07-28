@@ -15,32 +15,31 @@
 //
 // What writing it turned up:
 //
-//   * **THE finding: erasure forgets every trait but the one erased to.** A `Circle` implements
-//     `Shape` and it implements `Display`, and once it is a `&Shape` it can no longer be printed:
-//     "cannot make a string of a &Shape value — it does not implement 'Display'". That is not a
-//     gap in the implementation, it is what the type says — an object offers the trait's members
-//     and nothing else — but it means the most ordinary thing a heterogeneous collection does,
-//     print itself, cannot be written. The static half of the language has no such problem: a
-//     `[T: Shape + Display]` bound has both, because a bound is a list and a type is one name. So
-//     **the price of erasing is paid in capabilities, not just in speed**, and it is paid at the
-//     moment a program stops knowing the type — which is the moment it most needs to describe it.
-//     What this program does instead is declare `Display`'s own method on `Shape` under another
-//     name and forward one onto the other in seven two-line impls that say nothing.
-//     The mechanism that would fix it is one already deferred: **a trait that requires another
-//     trait**. `trait Shape: Display` would let a `&Shape` carry `Display`'s table too, and problem
-//     10 wanted the same feature for a quite different reason — writing one bound instead of nine.
-//     Second customer, and a much stronger one: there, a supertrait was an economy; here it is the
-//     difference between a thing being writable and not.
-//   * **A `*Writer` rendered bytes and nothing turned them back into a string.** The natural way to
-//     write the trait's text member is not to build a string at all — it is `render(self, out:
-//     *Writer)`, which is what `Display` already is and what costs no allocation. It could not be
-//     used, because after rendering into a `ByteSink` there was no way to get a `string` out of the
-//     bytes. So both routes to text were blocked, one by the missing supertrait and one by the
-//     missing conversion, and the program concatenated strings. Answered: `from_utf8` exists, the
-//     trait member is `render`, and `describe(s: &Shape)` gathers a rendering into a string at the
-//     one place that wants one. What that leaves is a sharper statement of the *first* blocker —
-//     `Shape` now declares `Display`'s own method a second time, so the duplication is no longer a
-//     paraphrase. It also removed a quadratic: `Group` used to build a fresh string per part.
+//   * **THE finding: erasure forgot every trait but the one erased to — answered.** A `Circle`
+//     implements `Shape` and it implements `Display`, and once it was a `&Shape` it could no longer
+//     be printed. That was not a gap in the implementation, it was what the type said — an object
+//     offers the trait's members and nothing else — but it meant the most ordinary thing a
+//     heterogeneous collection does, print itself, could not be written. The static half of the
+//     language never had the problem: a `[T: Shape + Display]` bound has both, because a bound is a
+//     list and a type is one name. So **the price of erasing is paid in capabilities, not just in
+//     speed**, and it is charged at the moment a program stops knowing the type — which is the
+//     moment it most needs to describe it.
+//     What answers it is `trait Shape: Display`: a **required** trait is a promise the trait makes,
+//     so its members are in the object's table alongside the trait's own, and `print(s)` on a
+//     `&Shape` is one indirect call. Two customers wanted this feature and they wanted different
+//     things — `guide/sha2` wanted an economy, one bound instead of nine; here it was the
+//     difference between a thing being writable and not, and it is the one that decided the table
+//     layout. What the object still cannot do is become a `&Display`: the slots are there and no
+//     word names them as a table of their own, which is the price of flattening.
+//   * **A `*Writer` rendered bytes and nothing turned them back into a string — answered.** The
+//     natural way to write the trait's text member is not to build a string at all — it is
+//     `render(self, out: *Writer)`, which is what `Display` already is and what costs no
+//     allocation. It could not be used, because after rendering into a `ByteSink` there was no way
+//     to get a `string` out of the bytes. So both routes to text were blocked at once, and the
+//     program concatenated strings. `from_utf8` answered one and the requirement answered the other:
+//     the trait member is `render`, `str(s)` on an erased shape goes through the table, and the
+//     `describe(s: &Shape)` this program used to need is gone. It also removed a quadratic: `Group`
+//     used to build a fresh string per part.
 //   * **A fixed-point number cannot be rendered into a sink.** `six(x)` is `f"$x%.6f"` and still
 //     allocates, because the sink family renders a real as `%g` — significant digits. `14 §2`
 //     decided that the conversion letter does not cross into a `Display`, only a width, a precision
@@ -221,8 +220,9 @@ check("a group of a group", size(nested), "51.566371 56.102028")
 check("its box reaches around both", extent(nested.bounds()),
       "-2.000000 -2.000000 5.000000 6.000000")
 
-// Describing it walks the same tree the same way.
-check("and describing it walks the tree", describe(nested),
+// Rendering it walks the same tree the same way, and `str` on the object reaches the `display`
+// the requirement put in its table.
+check("and describing it walks the tree", str(nested),
       "group(group(circle(r=2.000000), rect(3.000000x4.000000), triangle), polygon(5))")
 
 // A group of one is that shape; a group is not obliged to be interesting.
@@ -256,7 +256,7 @@ var both: &Shape = Scaled(Moved(group, 10.0, 20.0), 2.0)
 check("a wrapper wrapping a wrapper", size(both), "122.265482 77.132741")
 check("and the box it works out to", extent(both.bounds()),
       "16.000000 36.000000 28.000000 52.000000")
-check("which says what it is made of", describe(both),
+check("which says what it is made of", str(both),
       "scaled(2.000000, moved(group(circle(r=2.000000), rect(3.000000x4.000000), triangle)))")
 
 // Scaling by one is the shape it wrapped.
@@ -343,7 +343,7 @@ check("and it is the circle that was chosen", chosen.kind.name(), "circle")
 
 // -----------------------------------------------------------------------------------------------
 
-section("what an object no longer knows")
+section("what an object keeps and what it forgets")
 
 // A shape that is still a `Circle` prints, because `Display` is reached on the type.
 var printable = Circle(0.0, 0.0, 2.0)
@@ -351,12 +351,17 @@ var printable = Circle(0.0, 0.0, 2.0)
 check("a shape prints while its type is known", f"${printable}", "circle(r=2.000000)")
 check("and pads like anything else does", f"${printable}%22s", "    circle(r=2.000000)")
 
-// Erased, it does not — `f"${chosen}"` is a compile error, so the trait's own `render` stands in,
-// gathered back into a string by `describe`.
-check("erased, it answers only what the trait asked", describe(chosen), "circle(r=2.000000)")
+// Erased, it prints too, and that is what the requirement bought: `display` is a slot in the
+// object's table beside `area` and `kind`, so nothing about the call site changes when the type
+// goes away. The specifier crosses it intact — `14 §2` says the field belongs to the whole value,
+// and the implementation on the far side of the table is the one that honours it.
+check("erased, it prints exactly the same", f"${chosen}", "circle(r=2.000000)")
+check("and pads exactly the same", f"${chosen}%22s", "    circle(r=2.000000)")
+check("str reaches it through the table", str(chosen), "circle(r=2.000000)")
 
-// The kind property is the hand-written copy of what the object's table already knows.
-check("and says what it is only because it was told", chosen.kind.name(), "circle")
+// What it does *not* keep is its identity. The kind property is the hand-written copy of what the
+// object's first word already is, and it is still the only way to ask.
+check("but it answers only what the trait asked", chosen.kind.name(), "circle")
 
 // -----------------------------------------------------------------------------------------------
 

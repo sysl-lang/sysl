@@ -345,7 +345,7 @@ private class Escape(program: TProgram) {
     case TFormat(a, _)              => List(a)
     // A render's result is a fresh string that owns its own bytes, so it views nothing here; what
     // is worth walking is the value and the specifier it hands the implementation.
-    case TRender(v, _, s)           => List(v, s)
+    case TRender(v, _, s, _)        => List(v, s)
     case TSlice(b, lo, hi, _, _)    => b :: lo.toList ::: hi.toList
     // A `va_list` carries no view of this frame, and a value read out of the tail came from the
     // caller's — so walking these finds nothing, and they are here to keep the walk complete

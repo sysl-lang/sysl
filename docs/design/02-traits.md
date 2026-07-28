@@ -459,28 +459,35 @@ comparison (two objects over one value through different traits are the same val
 tables, so what equality means is the trait's question). A call is checked against the **trait's**
 signature, which stands in for every implementation because conformance is exact.
 
-### An object keeps one trait and drops the rest
+### An object keeps one trait and what that trait requires
 
 A bound may name several traits because a bound is a list; a trait-object type names one because it
 is a type. So a value that implements `Shape` *and* `Display` keeps only the first when it becomes a
-`&Shape`, and printing it is refused — "cannot make a string of a &Shape value — it does not
-implement 'Display'". That follows from what the type says and is not a gap in the implementation,
-but it is worth stating plainly, because it means **erasure is paid for in capabilities and not only
-in dispatch cost**, and it is charged at the moment a program stops knowing the type — which is
-exactly the moment it most wants to describe what it is holding.
+`&Shape` — unless `Shape` **requires** `Display`, which is what a supertrait is for and what makes
+the difference between the object being printable and not.
 
-`guide/shapes` is the record of what that costs. The trait declares a `describe(self) -> string` it
-should not have needed, every implementation supplies one, and seven two-line `impl Display` blocks
-forward the real trait back onto it. The natural design is worse off still: the allocation-free way
-to render is `render(self, out: *Writer)` — which is precisely what `Display` already is — and it
-cannot be used, because bytes written into a sink cannot become a `string` without `from_utf8`
-(`04`'s *Not yet*). Two independent absences meet on one program, and between them the most ordinary
-operation on a heterogeneous collection is unwritable in its natural form.
+That the two are the same question is worth seeing. A bound may say what it wants of the type it is
+given; an object type may not, because it is a type and a type is one name. So the only place the
+second promise can be written is on the **trait**, once, rather than at every use — which is exactly
+what a required trait is. A multi-trait object type (`&(Shape + Display)`) would be a second way to
+say the same thing and a worse one, since it puts at every use a fact that belongs to the trait.
 
-The mechanism that would lift it is **a trait requiring another trait**, deferred under *Details
-still to settle* below. Nothing else here is a candidate: a multi-trait object type (`&(Shape +
-Display)`) is a second way to say the same thing and a worse one, since it puts at every use a fact
-that belongs to the trait.
+Where a trait requires nothing, the old cost stands and is worth stating plainly: **erasure is paid
+for in capabilities and not only in dispatch cost**, and it is charged at the moment a program stops
+knowing the type — which is exactly the moment it most wants to describe what it is holding. The
+diagnostic names the fix rather than the symptom, since a word on the declaration is what is wanted:
+
+```
+cannot make a string of a &Shape value — an object offers what its trait declares and what
+that trait requires, so write 'trait Shape: Display' to keep the rendering the value had
+before it was erased
+```
+
+`guide/shapes` is the record of both states. It used to declare a `render` member the trait should
+not have needed *and* a `describe(s: &Shape)` gathering it back into a string, because an erased
+shape could not be handed to `str`. With `trait Shape: Display` the `describe` is gone and `str(s)`
+is the whole of it; `render` stays, because rendering the parts and placing them in the field a
+specifier asked for are two operations and the padding is worth writing once.
 
 ### The two sigils do not convert
 
@@ -518,6 +525,72 @@ circles in a catalogue has to be told, so `guide/shapes` declares a `kind` prope
 implementation answers with a constant — a hand-maintained copy of exactly the fact the object's
 first word already is, which has to be extended by hand every time a shape is added. If that burden
 ever justifies the machinery, the thing to add is the parallel mechanism, not a hole in this one.
+
+## A trait may require another trait
+
+`trait Word: Add + BitXor` — written after the name, with the same `:` and the same `+` a bound on a
+type parameter uses, because it asks the same thing of the implementing type. A generic trait writes
+both, the parameters first: `trait Convert[U]: Into[U]`, whose requirement is read under whatever
+arguments the trait was applied to.
+
+A required trait is a promise the **trait** makes rather than one each declaration repeats, and that
+is what separates it from the `where` clause `10 § Open c` defers and from the bound alias the hash
+map asked for and this document refused. `[T: Word]` then licenses the arithmetic; a **default body**
+in `Word` may use it, since what a default may assume is exactly what its trait promises; and — the
+case a bound alias could never have reached — a `&Word` object carries the required traits' members
+in its table.
+
+**The requirement is checked at the `impl`, not at the bound.** Two reasons, and the second decides
+it. The diagnostic belongs on the declaration that cannot keep its word:
+
+```
+'Greet' requires 'Named', so 'P' has to implement that too — write 'impl Named for P'
+```
+
+And a `&Sub` object's table needs a slot for every required trait's method, so a requirement checked
+only where the trait is *used* could leave a table with nothing to point at. Checking at the `impl`
+is also what keeps `conforms` a plain lookup: by the time anything asks whether a type implements a
+required trait, an implementation of it is already registered. A **built-in** membership counts —
+`impl Word for i32` is asking `i32` for arithmetic it has always had — and the question is held until
+every `impl` is registered, since the block that supplies a required trait may be written below the
+one that needs it.
+
+### The table carries the required trait's slots
+
+A trait's members are the required traits' members, depth-first with each trait taken once, followed
+by its own. Both the table and the call sites that index into it are laid out from that one list, so
+a required trait's method is **one indirect call**, exactly like the trait's own. The alternative —
+a word in the table pointing at the required trait's own table — costs a second load on every such
+call and buys one thing sysl does not have: an upcast.
+
+So **a `&Sub` cannot become a `&Super`**, and that is the price of the choice rather than an
+oversight. The slots are there and no word names them as a table of their own. Nothing is unwritable
+for want of it: what a program does with a required trait is call its members, which works. If an
+upcast is ever wanted the extension is additive — a table for the required trait, and a pointer to
+it appended *after* the slots, so no index moves.
+
+The diamond needs no rule of its own. `D: A + C` with both `A: B` and `C: B` carries `B`'s members
+once, because the walk takes each trait the first time it reaches it. What *is* refused is two traits
+in one closure declaring a member of the same name: a trait's members become the implementing type's
+and a type's members are one namespace, so this is the coherence rule one level up.
+
+```
+'R' and 'L' both declare 'len', and a trait's members become the implementing type's — so
+'Both' cannot require both
+```
+
+A trait may not require itself, directly or around a cycle; `Self` has no meaning in a requirement,
+since a trait requires another of *whatever* type implements it and `Self` is the name of that type;
+and a trait may not require one that reaches less far than it does (`13 §2`) — implementing the trait
+means implementing the required one, so a requirement the implementer cannot name leaves the trait
+unimplementable from outside.
+
+One thing follows from the table and is worth stating: a trait that requires an **unerasable** one is
+unerasable itself, so `trait Word: Add` has no object, and the diagnostic names `Add` as the trait
+the offending member came from. And a **built-in** that satisfies a requirement by the compiler's
+rule cannot be erased at all — a table holds function pointers and a scalar's `add` is an
+instruction, which is the sentence *Object safety* already carried, now reachable through a required
+trait rather than only through the operator catalog.
 
 ## Kept / dropped
 
@@ -568,27 +641,6 @@ reason a generic numeric routine in sysl reads worse than the same routine writt
 - **Laws / invariants on traits.** The old `trait` could assert invariants ("`Ord` is a total
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.
-- **A trait cannot require another trait.** `trait Word: Add + BitXor` is a parse error, so a bound
-  that means "a word" has to be spelled as everything a word can do, at every declaration that
-  wants one: `guide/sha2` writes `[T: Word + Add + BitAnd + BitOr + BitXor + Not + Shl + Shr + Sub]`
-  on each of its generic functions. This is *not* the `where` clause `10 § Open c` defers, and it is
-  not the "no bound alias" the hash map raised and this document settled — a supertrait is a
-  promise the **trait** makes, so `[T: Word]` would then license the arithmetic, and a default body
-  could use it. Cheap to add and additive; what it needs deciding is whether an `impl Word for X`
-  then checks that `X` implements the required traits at the `impl` or at the bound. Worth knowing
-  in the meantime: a bound written on a **struct** is inherited by every one of its members, which
-  is why the same program writes the nine traits once for a ten-method type and once per free
-  function beside it.
-  **A second customer, and a stronger one: `guide/shapes`.** There a supertrait is not an economy
-  but the difference between something being writable and not — see *An object keeps one trait and
-  drops the rest* below. A bound can name several traits because it is a list; a trait object names
-  one because it is a type, so the only way an erased value can offer two traits' worth of members
-  is for one of the traits to have required the other. That makes the deciding question sharper
-  than it looked: if a supertrait exists, a `&Sub` object has to be able to answer `Super`'s
-  members too, which means the table carries them or carries a pointer to `Super`'s. Neither is
-  hard; what matters is that the feature is chosen with the object case in view rather than only
-  the bound case, because a design that only tidies up bounds would leave the harder customer
-  unserved.
 - **Associated types.** A trait's own parameters (above) cover much of what an associated type is
   for — `Sink[T]`, `Into[T]` — with the difference that an argument is written by everything that
   names the trait rather than chosen once by the implementation. Which of the two a language wants,

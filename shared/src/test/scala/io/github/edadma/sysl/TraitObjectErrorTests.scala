@@ -158,8 +158,9 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
    *
    * This is what the type says rather than a gap in the implementation — an object offers the
    * trait's members and nothing else — but it is worth pinning, because it is the cost a program
-   * pays at the moment it stops knowing the type, and the feature that would lift it (a trait
-   * requiring another trait) is deferred rather than rejected.
+   * pays at the moment it stops knowing the type. What lifts it is the trait **requiring**
+   * `Display`, which is what the advice names: the fix is a word on the declaration, not a cast at
+   * the use.
    */
   "erasing drops the other traits the type implements" in {
     val src =
@@ -177,6 +178,7 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
         |var o: &Shape = Rect(3, 4)
         |print(f"${o}")""".stripMargin
 
-    err(src) should include("cannot make a string of a &Shape value — it does not implement 'Display'")
+    err(src) should include("cannot make a string of a &Shape value — an object offers what its " +
+      "trait declares and what that trait requires, so write 'trait Shape: Display'")
   }
 }

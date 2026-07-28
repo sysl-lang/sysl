@@ -758,7 +758,7 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     // it, and what landed there is copied into a string the statement owns. The slot is re-zeroed
     // on every arrival rather than once, since an alloca is hoisted to the entry block and a render
     // inside a loop meets the same one each time round.
-    case TRender(value, method, spec) =>
+    case TRender(value, method, spec, vslot) =>
       heap = true
       request("sysl.str.from_bytes")(StringEmitter.fromBytes)
 
@@ -770,7 +770,20 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       emit(s"store $bufferLayout zeroinitializer, ptr $slot")
       val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @$table, 0")
       val w = freshTemp(); emit(s"$w = insertvalue ${Type.fatPointer} $a, ptr $slot, 1")
-      emit(s"call void @$method(${value.ty.llvm} $v, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
+
+      // A trait object renders through the table it carries, so the callee and the receiver both
+      // come out of the value: the data word is the receiver a slot's entry expects, exactly as it
+      // is for any other call through one.
+      vslot match
+        case Some(n) =>
+          val vt   = freshTemp(); emit(s"$vt = extractvalue ${Type.fatPointer} $v, 0")
+          val data = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $v, 1")
+          val e    = freshTemp(); emit(s"$e = getelementptr ptr, ptr $vt, i64 $n")
+          val fn   = freshTemp(); emit(s"$fn = load ptr, ptr $e")
+
+          emit(s"call void $fn(ptr $data, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
+        case None =>
+          emit(s"call void @$method(${value.ty.llvm} $v, ${Type.fatPointer} $w, ${spec.ty.llvm} $s)")
 
       val r = freshTemp()
       emit(s"$r = call ${Type.Str.llvm} @sysl.w.buf.finish(ptr $slot)")

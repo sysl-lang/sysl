@@ -499,12 +499,18 @@ case class TypeDecl(
  * `tparams` makes the trait **generic**: `trait From[T]` is a different promise for every `T`, so a
  * type may implement it once per argument list and a bound naming it must say which one it means.
  * `bounds` is what the trait asks of those parameters, exactly as a struct's are.
+ *
+ * `supers` are the traits this one **requires**, written after the name as a bound is written:
+ * `trait Word: Add + BitXor`. A supertrait is a promise the trait itself makes, so an `impl` supplies
+ * it and everything that names the trait — a bound, a trait object — gets the required traits'
+ * members along with its own.
  */
 case class TraitDecl(
     name: String,
     tparams: List[String],
     methods: List[MethodDecl],
     bounds: Map[String, List[BoundRef]] = Map.empty,
+    supers: List[BoundRef] = Nil,
     vis: Visibility = Visibility.Public,
 ) extends Stmt
 

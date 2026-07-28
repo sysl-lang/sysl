@@ -756,6 +756,12 @@ trait AnalyzerBase {
   protected val boundChecks =
     mutable.ListBuffer.empty[(String, List[String], Map[String, List[BoundRef]], List[Type], Option[Pos])]
 
+  /** `impl` blocks whose trait requires other traits, each with the type it was written for and the
+   * position to report against. Held for the same reason a bound is: the implementation that
+   * supplies a required trait may be written below the one that needs it.
+   */
+  protected val superChecks = mutable.ListBuffer.empty[(String, String, Type.Bound, Type, Option[Pos])]
+
   /** Checks the arguments a *type* was applied to against what it asks of its parameters, now if
    * that can be answered and after hoisting if it cannot.
    */
@@ -804,9 +810,10 @@ trait AnalyzerBase {
             arg match
               // A type parameter standing in for itself, during the definition-time pass. It is not
               // a type anything has an `impl` for, so what it can promise is exactly what its own
-              // bounds promise: a bound is satisfied by a bound.
+              // bounds promise — those traits and whatever they require: a bound is satisfied by a
+              // bound.
               case a: Type.Abstract =>
-                if !a.bounds.exists(_.key == tr.key) then
+                if !satisfies(tr, a) then
                   boundErr(s"'$what' requires its type parameter '$tp' to implement '${tr.show}', " +
                     s"but '${a.name}' is not bounded by it")
               case concrete =>
@@ -913,6 +920,44 @@ trait AnalyzerBase {
     case (Type.Str, "bytes")                   => true
     case _                                     => false
 
+  /** Every trait a bound promises: the traits it **requires**, transitively, and then itself
+   * (`02 § A trait may require another trait`).
+   *
+   * The order is what the rest of this depends on — a required trait comes before the trait that
+   * required it — because it is the order a method table is laid out in, and a table and the call
+   * sites that index into it have to agree. Depth-first with each trait taken once, so a diamond
+   * (`D: A + C`, both `A: B` and `C: B`) carries `B`'s members once rather than twice.
+   *
+   * A required trait's arguments are read under the requiring trait's own parameters, which is what
+   * makes `trait Pair[T]: Sink[T]` mean the `Sink` of whatever the pair was applied to. A cycle
+   * terminates here rather than looping — it is reported once, at the declarations, by
+   * `checkTraitSupers`.
+   */
+  protected def traitClosure(b: Type.Bound): List[Type.Bound] = {
+    val seen = mutable.Set.empty[String]
+    val acc  = mutable.ListBuffer.empty[Type.Bound]
+
+    def walk(b: Type.Bound): Unit =
+      if seen.add(b.key) then
+        for decl <- traitDecls.get(b.name) do
+          val subst = decl.tparams.zip(b.args).toMap
+
+          for s <- decl.supers do walk(resolveBound(s, subst))
+        acc += b
+
+    walk(b)
+    acc.toList
+  }
+
+  /** Everything a trait offers — each member, with the bound of the trait that declared it.
+   *
+   * A trait that requires another offers that one's members too, so this is what a trait object
+   * dispatches through and what a bound licenses, and both read it from here so that neither can
+   * disagree with the other about which slot is which.
+   */
+  protected def traitMembers(b: Type.Bound): List[(Type.Bound, MethodDecl)] =
+    traitClosure(b).flatMap(sb => traitDecls.get(sb.name).toList.flatMap(_.methods.map((sb, _))))
+
   /** Whether a type implements a trait, which is the one question a bound asks.
    *
    * There are three ways to answer yes and they are not interchangeable. A **user** type opts in
@@ -921,9 +966,13 @@ trait AnalyzerBase {
    * an `impl` in and the integer family has no finite list of types to write one for. And a **type
    * parameter** implements exactly what its own bounds promise, which is what lets a bounded body
    * hand its parameter on to something that asks the same of it.
+   *
+   * What a bound promises includes what the traits it names require, which is the whole point of a
+   * supertrait: a `[T: Word]` may be handed to something asking `[U: Add]` without writing `Add`
+   * again.
    */
   protected def satisfies(tr: Type.Bound, t: Type): Boolean = t match
-    case a: Type.Abstract => a.bounds.exists(_.key == tr.key)
+    case a: Type.Abstract => a.bounds.exists(b => traitClosure(b).exists(_.key == tr.key))
     // A compiler-provided membership is a rule about one trait rather than a family of them, so a
     // trait applied to arguments is never one: `Add` is an instruction, `Add[int]` is not a thing.
     case _ => conforms(tr, t) || (tr.args.isEmpty && CoreTraits.builtin(tr.name, t))

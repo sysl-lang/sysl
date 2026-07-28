@@ -290,6 +290,84 @@ trait Hoisting extends TypeResolution {
           case Some(decl) => checkTraitArity(tr.name, decl.tparams, tr.args.map(_ => Type.Unknown))
       }
 
+  /** Checks what every trait **requires** of the types that implement it, in a pass of its own once
+   * every trait is registered — because `trait Ord: Eq` is ordinary whichever of the two is written
+   * first, and asking during the walk that registers them would report the one below.
+   *
+   * Three things are answered here, all of them about the declarations rather than about any use:
+   * that each required trait is a trait, applied to as many arguments as it declares; that the
+   * requirements do not come back around to the trait that made them; and that no two traits in the
+   * closure declare a member of one name. The last is the coherence rule one level up — a trait's
+   * members become the implementing type's, and a type's members are one namespace — so two traits
+   * that both declare `len` cannot be required together by a third.
+   */
+  protected def checkTraitSupers(): Unit =
+    for (key, decl) <- traitDecls do
+      currentPos = decl.pos
+      inScope(declScope(key))(recover(()) {
+        val declares = mutable.LinkedHashMap.empty[String, String]
+        val visited  = mutable.Set(key)
+
+        for m <- decl.methods do declares(m.name) = qn(key)
+
+        // The path is carried so a cycle can be reported as the chain that closes it rather than as
+        // the one name the walk happened to arrive at twice. A trait reached a second time by two
+        // different routes — the diamond — is taken once, which is what keeps its members from
+        // colliding with themselves.
+        def walk(name: String, path: List[String]): Unit =
+          for tr <- traitDecls.get(name); s <- tr.supers do
+            at(s.pos) {
+              traitKey(s.name) match
+                case None => err(s"trait '${qn(name)}' requires '${s.name}', which is not a trait")
+                case Some(skey) =>
+                  val sdecl = traitDecls(skey)
+
+                  checkTraitArity(s.name, sdecl.tparams, s.args.map(_ => Type.Unknown))
+
+                  for a <- s.args if mentionsSelf(a) do
+                    err(s"a trait requires another of whatever type implements it, so 'Self' has no " +
+                      s"meaning in '${s.show}' — it *is* the type doing the implementing")
+
+                  if path.contains(skey) then
+                    err(s"trait '${qn(skey)}' requires itself, through " +
+                      (path.reverse.dropWhile(_ != skey) ::: List(skey)).map(qn).mkString(" -> "))
+                  else if visited.add(skey) then
+                    for m <- sdecl.methods do
+                      for other <- declares.get(m.name) do
+                        err(s"'${qn(skey)}' and '$other' both declare '${m.name}', and a trait's " +
+                          s"members become the implementing type's — so '${qn(key)}' cannot require both")
+                      declares(m.name) = qn(skey)
+                    walk(skey, skey :: path)
+            }
+
+        walk(key, List(key))
+      })
+
+  /** Holds every `impl` of a trait that requires others to supplying those too, once every `impl`
+   * is registered and the question can be answered.
+   *
+   * A **built-in** membership counts, because that is what a required trait means to a type the
+   * compiler already made a member of — `impl Word for u32` is asking `u32` for the arithmetic it
+   * has always had. What that costs is recorded where it is paid: a table cannot name an
+   * instruction, so `vtableFor` refuses to erase such a type.
+   */
+  protected def checkImplSupers(): Unit = {
+    for (label, required, sup, ty, pos) <- superChecks.toList do
+      currentPos = pos
+      recover(()) {
+        if !satisfies(sup, ty) then
+          // A generic block's subject carries its own parameters, so the advice names the type the
+          // block covers rather than a bare name that would send the reader to write a second
+          // implementation for one instantiation — which is refused anyway (`02`).
+          val write =
+            if show(ty) == label then s"write 'impl ${sup.show} for $label'"
+            else s"write an implementation of '${sup.show}' for ${show(ty)}"
+
+          err(s"'$required' requires '${sup.show}', so '$label' has to implement that too — $write")
+      }
+    superChecks.clear()
+  }
+
   /** The rules a declared signature must satisfy whichever declaration form it came from, checked
    * after the name is registered so a failure reports the mistake without also erasing the
    * declaration it is about.
@@ -619,6 +697,26 @@ trait Hoisting extends TypeResolution {
 
     traitImpls((impl.traitName, home.key)) = impl
     implFor((impl.traitName, home.key)) = bound.key
+
+    // What the trait **requires** is asked of the implementing type here, at the block that makes
+    // the promise, rather than at each bound that relies on it. Two reasons, and the second decides
+    // it: the diagnostic belongs on the declaration that cannot keep its word, and a `&Sub` object's
+    // table needs a slot for every required trait's method — so if the requirement were only checked
+    // where the trait is *used*, a table could be asked for that has nothing to point at. The
+    // question is held until every `impl` is registered, since the one that supplies a required
+    // trait may be written below the one that needs it.
+    // A **generic** block covers a type it never instantiates, so `ty` is unknown for it and the
+    // subject of the question is the type applied to the block's own parameters — each standing in
+    // for itself and carrying what the block asked of it. That is what makes
+    // `impl[T: Named] Greet for Box[T]` answerable against `impl[T: Named] Named for Box[T]`: the
+    // condition on one side is met by the condition on the other.
+    val subject =
+      if impl.tparams.isEmpty then ty
+      else sandboxed(resolveType(impl.forType, abstractSubst(impl.tparams, impl.bounds)))
+
+    for s <- tr.supers do
+      superChecks +=
+        ((home.label, qn(tr.name), resolveBound(s, tr.tparams.zip(bound.args).toMap), subject, impl.pos))
 
     if home.tparams.nonEmpty && home.bounds.nonEmpty then
       implBounds((impl.traitName, home.key)) = (home.tparams, home.bounds)

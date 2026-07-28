@@ -137,8 +137,9 @@ So a user type becomes fully comparable by implementing **one** method, `lt`, an
 by implementing **one**, `eq`. The two are **independent** traits, not a hierarchy: this is the
 existing scalar law that *equality reaches further than ordering* (`01` — `bool` and the pointer
 modes have `==` but no `<`), lifted intact. A type may be `Eq` without being `Ord`; being `Ord`
-does not imply `Eq` (a type wanting both implements both). There is no supertrait relation to
-introduce, and no four-way Rust `PartialEq`/`Eq`/`PartialOrd`/`Ord` tower — the partial/total
+does not imply `Eq` (a type wanting both implements both). One trait may require another (`02`) and
+this catalog deliberately does not use it, so there is no four-way Rust
+`PartialEq`/`Eq`/`PartialOrd`/`Ord` tower — the partial/total
 distinction Rust draws for `NaN` is not modelled at the type level here, matching sysl's existing
 treatment of float `<` as the plain IEEE comparison.
 
@@ -529,11 +530,13 @@ exactly (`§5`), one row further down the catalog.
 - **A `Hasher` sink for `Hash`.** The streaming form (`§2`) composes better and would let a
   container pick its own algorithm, at the cost of a dynamic dispatch on every lookup. Recorded
   there with what taking it later would break.
-- **Supertraits / trait hierarchies.** Nothing in the catalog needs one — `Eq`, `Ord` and `Hash`
-  are deliberately independent — but a trait *outside* it now does: a `Word` that means "an integer
-  the SHA-2 compression can use" has to be spelled as nine traits at every declaration that wants
-  one, because a trait cannot require another. Recorded in `02 § Details still to settle` as the
-  trait-side question it is; the catalog stays flat either way.
+- **~~Supertraits / trait hierarchies.~~ Shipped — `02 § A trait may require another trait`.** A
+  trait may now require others (`trait Word: Add + BitXor`), and both customers were outside this
+  catalog: `guide/sha2`'s nine-trait bound, and `guide/shapes`, where `trait Shape: Display` is what
+  makes an erased value printable at all. **The catalog stays flat**, and deliberately: `Eq`, `Ord`
+  and `Hash` are independent for the reasons above, and making `Ord` require `Eq` would be a
+  behaviour change for every existing `impl Ord` rather than a tidying. The mechanism now exists if
+  a reason ever appears; nothing here is one.
 
 ## 8. Open (not yet decided)
 

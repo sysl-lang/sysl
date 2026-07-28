@@ -58,9 +58,9 @@ trait SpecialForms extends CallAnalysis {
     case Type.Char                   => callPrelude("printc", t)
     case Type.Str                    => callPrelude("prints", t)
     case _ =>
-      val (method, value) = displayOf(t, "print")
-
-      TCall(method, List(value, stdout(), plainSpec), Type.Unit)
+      renderer(t, "print") match
+        case (_, value, Some(slot)) => TVCall(value, slot, List(stdout(), plainSpec), Type.Unit)
+        case (method, value, None)  => TCall(method, List(value, stdout(), plainSpec), Type.Unit)
 
   /** The separator and the terminator `print` puts around its values. */
   private def printChar(c: Char): TExpr = callPrelude("printc", TIntLit(c.toInt, Type.Char))
@@ -86,9 +86,9 @@ trait SpecialForms extends CallAnalysis {
     t.ty match
       case _: Type.Integer | _: Type.Floating | Type.Bool | Type.Char | Type.Str => TStr(t)
       case _ =>
-        val (method, value) = displayOf(t, "str")
+        val (method, value, slot) = renderer(t, "str")
 
-        TRender(value, method, plainSpec)
+        TRender(value, method, plainSpec, slot)
   }
 
   /** `from_utf8_unchecked(b)` — a `[]u8` taken as a `string` without looking at it.
@@ -137,10 +137,10 @@ trait SpecialForms extends CallAnalysis {
 
     if ok then TFormat(t, spec)
     else if FormatSpec.isStr(c) && rendersItself(t.ty) then
-      val (method, value) = displayOf(t, "format")
-      val (width, prec, left) = FormatSpec.parts(spec)
+      val (method, value, slot)   = renderer(t, "format")
+      val (width, prec, left)     = FormatSpec.parts(spec)
 
-      TRender(value, method, specValue(width, prec, left))
+      TRender(value, method, specValue(width, prec, left), slot)
     else err(s"format '$spec' expects ${FormatSpec.expects(c)}, but the value has type ${show(t.ty)}")
   }
 
@@ -148,28 +148,35 @@ trait SpecialForms extends CallAnalysis {
 
   /** The `display` a value renders through, and the value in whatever width that renderer takes.
    *
-   * The three answers are `14 §3`'s one dispatch rule, applied to rendering: a **built-in** reaches
-   * the prelude renderer its membership provides (`§5`), a **user type** the member its `impl`
-   * produced, and a **bounded type parameter** the trait's own method, since which implementation
-   * runs is monomorphization's to decide once a concrete type is known.
+   * The answers are `14 §3`'s one dispatch rule, applied to rendering: a **built-in** reaches the
+   * prelude renderer its membership provides (`§5`), a **user type** the member its `impl` produced,
+   * and a **bounded type parameter** the trait's own method, since which implementation runs is
+   * monomorphization's to decide once a concrete type is known. A **trait object** answers with a
+   * slot rather than a name, since which `display` runs is a word in its table — and it has one
+   * exactly when the trait it was erased to **requires** `Display` (`02`). That is what a supertrait
+   * buys the ordinary way of printing: without one, a value stops being printable at the moment it
+   * is erased, which is the moment a program most wants to describe what it is holding.
    *
    * `op` is the form that asked, so a type that renders no way at all is complained about in the
    * words the programmer wrote rather than in the machinery underneath them.
    */
-  private def displayOf(t: TExpr, op: String): (String, TExpr) = {
+  private def renderer(t: TExpr, op: String): (String, TExpr, Option[Int]) = {
     // A constrained subtype renders exactly as its base does — a number or a character — so it
     // reaches the base's renderer rather than asking for a `Display` impl of its own.
     checkWriterShape(); Type.underlying(t.ty)
   } match
     case a: Type.Abstract =>
-      if !a.bounds.exists(_.key == "Display") then boundErr(s"'$op' needs '${a.name}: Display'")
-      ("Display.display", t)
+      if !satisfies("Display", a) then boundErr(s"'$op' needs '${a.name}: Display'")
+      ("Display.display", t, None)
+
+    case Type.Ptr(o: Type.Trait) => objectRenderer(t, o, op)
+    case Type.Ref(o: Type.Trait, _) => objectRenderer(t, o, op)
 
     case ty =>
       CoreTraits.display(ty) match
         case Some((name, want)) =>
           funcsUsed += name
-          (name, widen(t, want))
+          (name, widen(t, want), None)
 
         case None =>
           if !conforms("Display", ty) then
@@ -192,14 +199,39 @@ trait SpecialForms extends CallAnalysis {
           val fname = memberFuncName(ty, "display")
 
           funcsUsed += fname
-          (fname, t)
+          (fname, t, None)
+
+  /** The `display` slot in a trait object's table, or why the object has none.
+   *
+   * The advice is what tells the two failures apart. A trait that could require `Display` and does
+   * not is told to, since that is a one-word change to a declaration; the object type itself is not
+   * the thing to change, and neither is the value, which very likely implements `Display` already
+   * and lost it at the erasure.
+   */
+  private def objectRenderer(t: TExpr, o: Type.Trait, op: String): (String, TExpr, Option[Int]) =
+    displaySlot(o) match
+      case Some(slot) => ("Display.display", t, Some(slot))
+      case None =>
+        val asked = if op == "print" then "cannot print" else "cannot make a string of"
+
+        err(s"$asked a ${show(t.ty)} value — an object offers what its trait declares and what that " +
+          s"trait requires, so write 'trait ${qn(o.name)}: Display' to keep the rendering the value " +
+          "had before it was erased")
+
+  /** Which slot of a trait object's table holds `Display`'s renderer, if the trait requires it. */
+  private def displaySlot(o: Type.Trait): Option[Int] =
+    traitMembers(o.bound).zipWithIndex.collectFirst {
+      case ((from, m), slot) if from.name == "Display" && m.name == "display" => slot
+    }
 
   /** Whether a type renders through an `impl` rather than through a printf conversion — which is
    * the case `format` hands its specifier on for instead of applying it.
    */
   private def rendersItself(ty: Type): Boolean = ty match
-    case a: Type.Abstract => a.bounds.exists(_.key == "Display")
-    case _                => conforms("Display", ty)
+    case a: Type.Abstract           => satisfies("Display", a)
+    case Type.Ptr(o: Type.Trait)    => displaySlot(o).isDefined
+    case Type.Ref(o: Type.Trait, _) => displaySlot(o).isDefined
+    case _                          => conforms("Display", ty)
 
   /** The compiler's own writers are laid out by hand and reached by slot index, so `Writer`'s shape
    * is something the emitter depends on rather than merely reads. Checking it here turns a later

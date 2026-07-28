@@ -705,13 +705,18 @@ class SyslParser(val source: Source) extends PackratParsers {
    * parameter list, and an optional result — either bare, which requires an implementation to
    * supply it, or followed by a body, which supplies a **default** every `impl` inherits unless it
    * writes its own.
+   *
+   * `trait Name: Super + Other` names the traits this one **requires**, spelled exactly as a bound
+   * on a type parameter is — the same `:` and the same `+` — because it asks the same thing of the
+   * implementing type. A generic trait writes both: `trait Word[T]: Add`, the parameters first.
    */
   private lazy val traitDecl: PackratParser[Stmt] =
-    op("trait") ~> ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
-      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+    op("trait") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) >> {
+      case name ~ tps ~ supers =>
+        val (names, bounds) = tps.getOrElse((Nil, Map.empty))
 
-      (newline ~> indent ~> opt(newlines) ~> repsep(traitMember, newlines) <~ opt(newlines) <~ dedent) <~
-        endName(name) ^^ { methods => TraitDecl(name, names, methods, bounds) }
+        (newline ~> indent ~> opt(newlines) ~> repsep(traitMember, newlines) <~ opt(newlines) <~ dedent) <~
+          endName(name) ^^ { methods => TraitDecl(name, names, methods, bounds, supers.getOrElse(Nil)) }
     }
 
   /** A line inside a trait body. A **definition** is tried first, since it is a signature with more

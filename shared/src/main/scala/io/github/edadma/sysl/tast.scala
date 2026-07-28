@@ -207,8 +207,14 @@ case class TStdout() extends TExpr { def ty: Type = Type.Ptr(Type.Trait("Writer"
  * That buffer is the second sink the compiler provides, for the sibling of `TStdout`'s reason — a
  * growable byte buffer is not something sysl can express yet (`07`, *Not yet*), so the prelude
  * could no more declare this writer than the other one.
+ *
+ * `slot` is set where the value is a **trait object** whose trait requires `Display`: the renderer is
+ * then a word read out of the object's own table rather than a function named here, and `method`
+ * carries only the name a diagnostic would use.
  */
-case class TRender(value: TExpr, method: String, spec: TExpr) extends TExpr { def ty: Type = Type.Str }
+case class TRender(value: TExpr, method: String, spec: TExpr, slot: Option[Int] = None) extends TExpr {
+  def ty: Type = Type.Str
+}
 
 /** `c"…"` — the address of a NUL-terminated constant, which is what a C interface reads a string
  * as. The terminator is not counted in anything: it is there for the callee to find the end by, and

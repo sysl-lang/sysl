@@ -309,26 +309,31 @@ trait TypeResolution extends ImportResolution {
    * such a method, and `*Trait` points straight at a value and does not.
    */
   protected def checkObjectSafe(name: String, args: List[Type], sigil: String): Unit = {
-    val shown = qn(name)
-    val obj   = s"'$sigil${Type.qualified(shown, args)}'"
+    val obj = s"'$sigil${Type.qualified(qn(name), args)}'"
 
-    def mentionsSelf(t: TypeRef): Boolean = t match
-      case NamedType(n, args) => n == selfName || args.exists(mentionsSelf)
-      case PtrType(i)         => mentionsSelf(i)
-      case RefType(i, _)      => mentionsSelf(i)
-      case ArrayType(_, e)    => mentionsSelf(e)
+    // A trait offers what it requires as well as what it declares, so a required trait that cannot
+    // be erased makes the trait that required it unerasable too — and the diagnostic names the one
+    // the member came from, which for a required trait is not the one the object was written as.
+    for (from, m) <- traitMembers(Type.Bound(name, args)) do
+      val shown = qn(from.name)
 
-    for m <- traitDecls(name).methods do
       if m.recvMode.isEmpty then
         err(s"'$shown' declares the associated function '${m.name}', which has no receiver to " +
           s"dispatch on — so there is no $obj to form")
       if m.receiver.exists(_.isInstanceOf[RecvMode.ByRef]) && sigil == "*" then
         err(s"'${m.name}' of '$shown' takes '&self', so it needs its receiver inside a " +
-          s"reference-counted box — $obj points straight at a value, so write '&$shown' instead")
+          s"reference-counted box — $obj points straight at a value, so write '&${qn(name)}' instead")
       if m.params.exists(p => mentionsSelf(p.typ)) || m.retType.exists(mentionsSelf) then
         err(s"'${m.name}' of '$shown' mentions 'Self' away from its receiver, and an erased value " +
           s"has forgotten which type that is — so there is no $obj to form")
   }
+
+  /** Whether a written type names `Self` anywhere inside it. */
+  protected def mentionsSelf(t: TypeRef): Boolean = t match
+    case NamedType(n, args) => n == selfName || args.exists(mentionsSelf)
+    case PtrType(i)         => mentionsSelf(i)
+    case RefType(i, _)      => mentionsSelf(i)
+    case ArrayType(_, e)    => mentionsSelf(e)
 
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
    * whatever type is currently being laid out.

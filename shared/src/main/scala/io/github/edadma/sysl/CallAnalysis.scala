@@ -393,6 +393,7 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   private def boundMember(a: Type.Abstract, mname: String): Option[(Type.Bound, Map[String, Type], MethodDecl)] =
     a.bounds.iterator
+      .flatMap(traitClosure)
       .flatMap(b => traitDecls.get(b.name).map((b, _)))
       .flatMap { case (b, decl) =>
         decl.methods.find(_.name == mname).map(m => (b, selfBinding(a) ++ decl.tparams.zip(b.args), m))
@@ -443,22 +444,24 @@ trait CallAnalysis extends Literals with TraitObjects {
    * any trait that mentions it away from the receiver, so no signature reaching here contains one.
    */
   protected def callTraitObject(recv: TExpr, t: Type.Trait, mname: String, args: List[Expr]): TExpr = {
-    val decl = traitDecls(t.name)
-    // The trait's own parameters are what the *object's* type fixed — an object over `Sink[int]`
-    // takes an `int` — so they are the whole of the substitution a signature is read under. `Self`
-    // is not in it at all: object safety already refused any trait that mentions one away from its
-    // receiver, so no signature reaching here contains one.
-    val subst: Map[String, Type] = decl.tparams.zip(t.args).toMap
+    // A trait offers the members of the traits it requires as well as its own, and both kinds are
+    // one slot in one table — so this is the whole list, in the order the table was laid out.
+    val members = traitMembers(Type.Bound(t.name, t.args))
 
-    decl.methods.zipWithIndex.find(_._1.name == mname) match
+    members.zipWithIndex.find(_._1._2.name == mname) match
       case None =>
         err(s"trait '${t.name}' declares no method '$mname' — it has " +
-          decl.methods.map(_.name).mkString("'", "', '", "'"))
-      case Some((m, _)) if m.isProperty =>
+          members.map(_._2.name).mkString("'", "', '", "'"))
+      case Some(((_, m), _)) if m.isProperty =>
         err(s"'$mname' is a property of '${t.name}' — read it as 'value.$mname', without '()'")
-      case Some((m, slot)) =>
-        val params = m.params.map(p => (p.name, resolveType(p.typ, subst)))
-        val fname  = s"${t.name}.$mname"
+      case Some(((from, m), slot)) =>
+        // A signature is read under the parameters of the trait that *declared* it, at the arguments
+        // the object's type fixed for it — an object over `Sink[int]` takes an `int`. `Self` is not
+        // in the substitution at all: object safety already refused any trait that mentions one away
+        // from its receiver, so no signature reaching here contains one.
+        val subst: Map[String, Type] = traitDecls(from.name).tparams.zip(from.args).toMap
+        val params                   = m.params.map(p => (p.name, resolveType(p.typ, subst)))
+        val fname                    = s"${from.name}.$mname"
 
         if args.length != params.length then
           err(s"method '$fname' takes ${quantity(params.length, "argument")}, " +
@@ -477,11 +480,10 @@ trait CallAnalysis extends Literals with TraitObjects {
    * one is either a property the trait declares or a mistake, and the second half of this says which.
    */
   protected def readTraitObjectProperty(recv: TExpr, t: Type.Trait, name: String): TExpr = {
-    val decl                     = traitDecls(t.name)
-    val subst: Map[String, Type] = decl.tparams.zip(t.args).toMap
+    traitMembers(Type.Bound(t.name, t.args)).zipWithIndex.find(_._1._2.name == name) match
+      case Some(((from, m), slot)) if m.isProperty =>
+        val subst: Map[String, Type] = traitDecls(from.name).tparams.zip(from.args).toMap
 
-    decl.methods.zipWithIndex.find(_._1.name == name) match
-      case Some((m, slot)) if m.isProperty =>
         TVCall(recv, slot, Nil, m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit))
       case Some(_) =>
         err(s"'$name' is a method of '${t.name}' — call it with '$name(…)'")
@@ -556,7 +558,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     else
       ty match
         case a: Type.Abstract =>
-          if !a.bounds.exists(_.key == trName) then boundErr(s"'$op' needs '${a.name}: $trName'")
+          if !satisfies(trName, a) then boundErr(s"'$op' needs '${a.name}: $trName'")
           Some(TDispatch(s"$trName.$method", swap, negate))
         // The implementation is named by the rule a method call uses, which for a generic type is
         // the instantiation the receiver's own arguments make — `a + b` on a `Box[int]` reaches the

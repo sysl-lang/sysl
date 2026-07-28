@@ -75,16 +75,29 @@ trait TraitObjects extends TypeResolution {
    *
    * Every conforming type reaches this through a source `impl`, whose methods were lowered to
    * ordinary functions — so a slot is a name that already exists, and the table is the trait's
-   * methods in declaration order, which is the order a call site indexes by. A slot is named by the
-   * rule a *call* uses, since a table naming a member any other way is a table pointing at nothing:
-   * a member of a generic type is instantiated here as it would be at a call site, so erasing a
-   * `Box[int]` brings that instantiation into the program.
+   * members in the order `traitMembers` lays them out, which is the order a call site indexes by. A
+   * slot is named by the rule a *call* uses, since a table naming a member any other way is a table
+   * pointing at nothing: a member of a generic type is instantiated here as it would be at a call
+   * site, so erasing a `Box[int]` brings that instantiation into the program.
+   *
+   * A trait that **requires** another carries the required trait's slots too, rather than a pointer
+   * to a table of its own. That keeps a required trait's method the single indirect call the
+   * trait's own methods are, which is what makes a supertrait worth having on an object at all; what
+   * it gives up is an upcast from a `&Sub` to a `&Super`, since the slots are there but no word
+   * names them as a table (`02 § A trait may require another trait`).
    */
   private def vtableFor(tr: Type.Trait, ty: Type, boxed: Boolean): String = {
     val name = s"vt.${if boxed then "ref." else ""}${Type.mangle(tr)}.${Type.mangle(ty)}"
 
     if !vtables.contains(name) then
-      val slots = traitDecls(tr.name).methods.map { m =>
+      val slots = traitMembers(tr.bound).map { (from, m) =>
+        // A required trait a *built-in* satisfies by the compiler's rule (`14 §5`) has no function
+        // to name, because its operator is an instruction. The trait's own membership was checked
+        // before this was reached; a required one is checked here, where the table is being built.
+        if !conforms(from, ty) then
+          err(s"${show(ty)} implements '${qn(from.name)}' by the compiler's own rule rather than " +
+            s"through an 'impl', so there is no '${m.name}' for a slot of '${show(tr)}' to point at")
+
         val fname           = memberFuncName(ty, m.name)
         val (params, rtype) = funcInsts(fname)
 

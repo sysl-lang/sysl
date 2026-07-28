@@ -83,7 +83,7 @@ trait SignatureVisibility extends TypeResolution {
     for (key, d) <- traitDecls.toList do
       val own = d.tparams.toSet
 
-      expose(key, own, d.bounds, Nil)
+      expose(key, own, d.bounds, Nil, d.supers)
       for m <- d.methods do exposeMember(key, own, m)
 
     // An `extern` is here too: it is registered as a function, and a symbol the linker resolves is
@@ -98,7 +98,8 @@ trait SignatureVisibility extends TypeResolution {
       tparams: Set[String],
       bounds: Map[String, List[BoundRef]],
       parts: List[(String, TypeRef, Option[Pos])],
-  ): Unit = exposeIn(key, Modules.split(key)._2, reachOf(key), tparams, bounds, parts)
+      supers: List[BoundRef] = Nil,
+  ): Unit = exposeIn(key, Modules.split(key)._2, reachOf(key), tparams, bounds, parts, supers)
 
   /** One member of a type or of a trait, which is as visible as the thing it belongs to: a member
    * carries no modifier of its own (`13 § Open f`), and there would be nothing for one to widen to
@@ -127,6 +128,7 @@ trait SignatureVisibility extends TypeResolution {
       skip: Set[String],
       bounds: Map[String, List[BoundRef]],
       parts: List[(String, TypeRef, Option[Pos])],
+      supers: List[BoundRef] = Nil,
   ): Unit = reach match
     // A file-private declaration reaches one file, and every type it names is visible there or the
     // signature would not have resolved — so there is nothing left for this to find.
@@ -140,6 +142,13 @@ trait SignatureVisibility extends TypeResolution {
         // to say what the declaration asks of it.
         for (tp, refs) <- bounds; b <- refs if !skip(b.name); key <- quietly(traitKey(b.name)) do
           at(b.pos)(leak(label, reach, s"the bound on '$tp'", key))
+
+        // A **required** trait is the sharpest case of the same rule: implementing the trait means
+        // implementing that one as well, so a requirement the implementer cannot name leaves the
+        // trait unimplementable from outside — and the diagnostic at the `impl` would tell them to
+        // write a block naming a trait they may not.
+        for b <- supers; key <- quietly(traitKey(b.name)) do
+          at(b.pos)(leak(label, reach, "the trait it requires", key))
       }
 
   private def leak(label: String, reach: Reach, what: String, key: String): Unit =
