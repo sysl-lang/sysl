@@ -511,6 +511,7 @@ indexes a fixed table by a constrained integer writes the table's size twice, on
 bound and once as the range, and nothing checks that the two agree. That is the one magic number a
 table-driven program has left, and it is in the one place a constant cannot reach.
 `guide/kernel` is the customer; the diagnostic is a bare "newline expected" pointing at `within`.
+Recorded from the other side as `16 § Open b`, where the rest of the constrained-subtype design lives.
 
 **A constant has no address.** It is folded into each use and occupies no storage, which is why it
 needs no initialization order, why a `no alloc` module may hold one, and why `&capacity` is not a

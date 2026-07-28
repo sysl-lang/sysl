@@ -471,7 +471,7 @@ case class EnumDecl(name: String, tparams: List[String], underlying: Option[Type
  */
 case class RangeBound(lo: Expr, hi: Expr, exclusiveHi: Boolean) extends Positioned
 
-/** `type Name = [new] Base [within lo..hi] [where predicate]` — a constrained subtype (`03`).
+/** `type Name = [new] Base [within lo..hi] [where predicate]` — a constrained subtype (`16`).
  *
  * `Base` is a scalar (an integer, a float, or `char`). Without `new` the subtype is **transparent**:
  * a value flows to and from its base with no cast, and every value produced into it is checked at

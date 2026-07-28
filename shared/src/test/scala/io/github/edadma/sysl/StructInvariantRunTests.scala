@@ -136,4 +136,23 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
       exits(span + "var s = Span(2, 8)\ns.lo = 10\ns.hi = 12")
     }
   }
+
+  // `16 §5`. A struct held as a field of another struct is still constructed, so its invariant is
+  // checked where it is built — the outer struct's construction is not a way in.
+  "a struct inside a struct is checked as it is built" - {
+    val nested =
+      """struct Bounded
+        |    n: int
+        |    invariant n >= 0
+        |struct Holder
+        |    b: Bounded
+        |""".stripMargin
+
+    "a satisfied inner value proceeds" in {
+      run(nested + "var h = Holder(Bounded(5))\nprint(h.b.n)") shouldBe "5\n"
+    }
+    "and a violated one traps" in {
+      exits(nested + "var h = Holder(Bounded(-1))\nprint(h.b.n)")
+    }
+  }
 }

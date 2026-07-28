@@ -696,7 +696,7 @@ class SyslParser(val source: Source) extends PackratParsers {
         ident ^^ (n => EnumVariantDecl(n, None, Nil)),
     )
 
-  /** `type Name = [new] Base [within lo..hi] [where predicate]` — a constrained subtype (`03`).
+  /** `type Name = [new] Base [within lo..hi] [where predicate]` — a constrained subtype (`16`).
    * `new`, `within`, and `where` are contextual: they are ordinary identifiers everywhere else, so
    * a function or field may still be named `where`, and are recognised as keywords only here.
    */

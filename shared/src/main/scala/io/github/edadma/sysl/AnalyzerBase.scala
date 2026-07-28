@@ -332,7 +332,7 @@ trait AnalyzerBase {
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
-  /** Declared constrained subtypes by key (`03`). Each `type Name = Base …` is registered here; the
+  /** Declared constrained subtypes by key (`16`). Each `type Name = Base …` is registered here; the
    * resolved `Type.Constrained` it stands for is built and cached the first time the name is used.
    */
   protected val constrainedDecls = mutable.LinkedHashMap.empty[String, TypeDecl]

@@ -104,6 +104,34 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport {
     run(Age + "var a: Age = 12\nvar n: int = a\nprint(n + 1)") shouldBe "13\n"
   }
 
+  /** `16 §4` lists the places a constrained value is produced, and a struct field is one of them —
+   * at construction *and* at every later write, since a field is not read-only.
+   */
+  "a constrained struct field is checked wherever it is written" - {
+    val Person = "type Age = int within 0..150\nstruct Person\n    age: Age\n"
+
+    "a construction in range proceeds" in {
+      run(Person + "var p = Person(Age(40))\nprint(int(p.age))") shouldBe "40\n"
+    }
+    "a construction out of range traps" in {
+      exits(Person + "var p = Person(Age(200))\nprint(int(p.age))")
+    }
+    "a later write in range proceeds" in {
+      run(Person + "var p = Person(Age(40))\np.age = 41\nprint(int(p.age))") shouldBe "41\n"
+    }
+    "and one out of range traps" in {
+      exits(Person + "var p = Person(Age(40))\np.age = 200\nprint(int(p.age))")
+    }
+  }
+
+  // `16 §1`. A struct invariant may read one and is tested for it; a subtype predicate is the same
+  // question one declaration over, and it is what lets a table's ceiling be written down once.
+  "a where predicate may read a module constant" in {
+    run("""const ceiling: int = 150
+          |type Small = int where value < ceiling
+          |print(Small(3))""".stripMargin) shouldBe "3\n"
+  }
+
   "a where predicate is checked at each produce site" - {
     val Even = "type Even = int within 0..100 where value % 2 == 0\n"
 

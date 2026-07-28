@@ -7,7 +7,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * with the adjacent violation that must stop the program — catching a check that is too tight
  * (fails the valid case) or too loose (lets the invalid case run).
  */
-class ContractRunTests extends AnyFreeSpec with RunSupport {
+class ContractRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "require" - {
     "a satisfied precondition lets the body run" in {
@@ -156,5 +156,46 @@ class ContractRunTests extends AnyFreeSpec with RunSupport {
         |    9 - 4
         |print(f(9, 4))""".stripMargin
     ) shouldBe "5\n"
+  }
+
+  /** `16 §6`. A contract is a block at the **top** of the body, both kinds together — an `ensure`
+   * is written with the preconditions and checked before every return, and neither kind may come
+   * after ordinary work. A method is where the pair earns its keep, because `old` on a `*self`
+   * receiver is how a mutating method says what it changed.
+   */
+  "a method carries contracts, and old reads through its receiver" - {
+    val counter =
+      """struct Counter
+        |    n: int
+        |
+        |    bump(*self, k: int) -> int
+        |        require k > 0
+        |        ensure result > old(self.n)
+        |        self.n += k
+        |        self.n
+        |""".stripMargin
+
+    "a call that satisfies both runs" in {
+      run(counter + "var c = Counter(1)\nprint(c.bump(2))") shouldBe "3\n"
+    }
+
+    "one that breaks the precondition traps" in {
+      exits(counter + "var c = Counter(1)\nprint(c.bump(0))")
+    }
+
+    // Written after the increment, the postcondition would be a statement in the middle of the
+    // body, which is exactly what the placement rule refuses.
+    "and an ensure written after ordinary work is refused" in {
+      err("""struct Counter
+            |    n: int
+            |
+            |    bump(*self, k: int) -> int
+            |        self.n += k
+            |        ensure result > 0
+            |        self.n
+            |var c = Counter(1)
+            |print(c.bump(2))""".stripMargin) should
+        include("must come before any other statement")
+    }
   }
 }
