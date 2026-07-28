@@ -449,6 +449,21 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "5 0\n"
     }
 
+    // A subtype's `where` predicate is the one function whose name lives inside a *type* rather than
+    // beside it in the tree, and the walk stops at a type. So the node that checks a value against
+    // one has to read the name out itself, or the predicate's own reads are never followed.
+    "a read inside a subtype's predicate is followed" in {
+      val src =
+        """ten() -> int = 10
+          |type Small = int within 0..100 where value < limit
+          |make() -> Small = 3
+          |val flag: int = int(make())
+          |val limit: int = ten()
+          |print(limit, flag)""".stripMargin
+
+      run(src) shouldBe "10 3\n"
+    }
+
     // A contract clause is part of the function without being part of its body, so it is the other
     // place a read can hide. Getting the order wrong here traps rather than printing the wrong
     // number, which is the sharper failure of the two.

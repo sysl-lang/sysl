@@ -20,11 +20,9 @@ import scala.collection.mutable
  * can only ever be inside one module**. The diagnostic is therefore always local — every declaration
  * it names is in one directory, and usually in one file.
  *
- * **A call through a method table is followed too.** Which function a `&Trait` lands in is not known
- * here, but the whole program is compiled at once, so the *set* it could land in is: every table for
- * that trait supplies one function per slot. Taking the union of those is an over-approximation that
- * cannot miss a read, and it is a narrow one — the alternative, refusing dynamic dispatch inside an
- * initializer, would be a rule with no reason behind it.
+ * Which `val`s an initializer reads is `Reachability`'s walk, asked of one root. Everything that
+ * walk over-approximates — a call through a method table above all — errs towards ordering a `val`
+ * *earlier* than it strictly had to be, which is the harmless direction.
  */
 trait InitOrder extends AnalyzerBase {
 
@@ -40,80 +38,11 @@ trait InitOrder extends AnalyzerBase {
     if computed.isEmpty then vals
     else
       val ordered = computed.map(_.symbol).toSet
-      val deps    = computed.map(v => v.symbol -> needs(v, funcs, vtables).intersect(ordered)).toMap
+      val deps = computed
+        .map(v => v.symbol -> Reachability.reachedFrom(List(v.init), funcs, vtables).vals.intersect(ordered))
+        .toMap
 
       constant ::: sorted(computed, deps)
-  }
-
-  /** Which `val`s an initializer ends up reading — the ones it names itself, plus the ones named by
-   * everything it can reach from there.
-   */
-  private def needs(v: TVal, funcs: List[TFunc], vtables: List[TVtable]): Set[String] = {
-    val direct = summarize(v.init, vtables)
-    val seen   = mutable.HashSet.empty[String]
-    val queue  = mutable.Queue.from(direct.calls)
-    val byName = funcs.map(f => f.name -> f).toMap
-    val reads  = mutable.HashSet.from(direct.vals)
-
-    // A plain reachability walk rather than a fixpoint: recursion among the callees is fine, since
-    // what is being accumulated is a set and a function already visited adds nothing a second time.
-    while queue.nonEmpty do
-      val name = queue.dequeue()
-
-      if seen.add(name) then
-        for f <- byName.get(name) do
-          val s = summarize(f, vtables)
-
-          reads ++= s.vals
-          queue ++= s.calls
-
-    reads.toSet
-  }
-
-  /** What one tree names: the `val`s read out of it and the functions it can call. */
-  private case class Refs(vals: Set[String], calls: Set[String])
-
-  private def summarize(root: Any, vtables: List[TVtable]): Refs = {
-    val vals  = mutable.HashSet.empty[String]
-    val calls = mutable.HashSet.empty[String]
-
-    // Every table for a trait supplies one function per slot, so a call at a slot can be answered
-    // with the functions every implementation of that trait put there.
-    def dynamic(recvTy: Type, slot: Int): Unit =
-      val name = recvTy match
-        case Type.Ptr(Type.Trait(n, _))    => Some(n)
-        case Type.Ref(Type.Trait(n, _), _) => Some(n)
-        case _                             => None
-
-      for t <- vtables if name.contains(t.traitName); s <- t.slots.lift(slot) do calls += s.target
-
-    // The walk descends through the shape of the tree rather than through a case per node, and
-    // deliberately: a node added later is covered by it without anyone remembering to come back
-    // here, where a match with a catch-all would silently stop following the new one's children.
-    // Only the nodes that *name* something get a case, since a name is a string like any other and
-    // the shape cannot tell them apart. A `Type` is where the descent stops — it holds no
-    // expression, and a recursive one would otherwise be walked forever.
-    def scan(x: Any): Unit = x match
-      case _: Type            => ()
-      case g: TGlobal         => vals += g.symbol
-      case d: TDispatch       => calls += d.name
-      case c: TCall           => calls += c.name; c.args.foreach(scan)
-      case s: TStructInvCheck => calls += s.invFn; scan(s.value)
-      case s: TCheckedStore   => calls += s.invFn; scan(s.store); scan(s.recv)
-      case r: TRender =>
-        r.slot match
-          case Some(slot) => dynamic(r.value.ty, slot)
-          case None       => calls += r.method
-        scan(r.value); scan(r.spec)
-      case v: TVCall =>
-        dynamic(v.receiver.ty, v.slot)
-        scan(v.receiver); v.args.foreach(scan)
-      case xs: Iterable[?] => xs.foreach(scan)
-      case p: Product      => p.productIterator.foreach(scan)
-      case _               => ()
-
-    scan(root)
-    Refs(vals.toSet, calls.toSet)
   }
 
   /** The computed `val`s in an order that runs each after everything it needs, reporting any cycle

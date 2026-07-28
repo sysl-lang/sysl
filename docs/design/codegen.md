@@ -62,6 +62,14 @@ before they appear and may be mutually recursive).
   The type is held to **plain data** (no reference, pointer, slice, or `string`), which is what
   keeps read-only-ness whole and keeps a `val` from being a count nothing releases.
 
+- **Only what the program can reach is emitted** (`15 §3`). `Reachability` runs last, over a typed
+  program every other pass has already read: it walks out from the statements `main` runs, the `val`
+  initializers that fill storage before those, and the method tables, and drops every function and
+  `extern` it never arrives at. Analysis is untouched by it — a body nothing calls is still checked,
+  and a slice that escapes one is still rejected — which is what fixes the pass order. A call whose
+  target is settled at run time is answered with *every* function the trait's tables put in that
+  slot, so the walk over-approximates in the only direction that is safe.
+
 - **`import` shortens that path and grants nothing** (`13 §3`), in the five Scala forms:
   `import a.b.c`, `{c, d}`, `{c as e}`, `.*`, and `import a.b` for the module itself. A binding
   belongs to the **file** that wrote it — a sibling file of the same module does not get it — or to

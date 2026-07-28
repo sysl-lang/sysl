@@ -112,12 +112,13 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     }
 
     // A module none of whose files carries a statement still has an entry point, which does
-    // nothing and succeeds. The declarations are checked and emitted either way.
+    // nothing and succeeds. Its declarations are checked either way; what nothing reaches is not
+    // written out, so the program that comes back does nothing at all.
     "a module that runs nothing still compiles" in {
       val out = irOf("a.sysl" -> "f() -> int = 1")
 
-      out should include("define i32 @f()")
       out should include("define i32 @main()")
+      out should not include "define i32 @f()"
     }
 
     "and a module of no files at all is the empty program" in {
@@ -194,8 +195,9 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     // directly, and how a single file compiles with nothing to be measured against.
     "with no project around them, the headers are the whole of it" in {
       val out = irOf(
-        "a.sysl" -> "module oskit.arch\nf() -> int = 1",
-        "b.sysl" -> "module oskit.vm\ng() -> int = 2",
+        "a.sysl"    -> "module oskit.arch\nf() -> int = 1",
+        "b.sysl"    -> "module oskit.vm\ng() -> int = 2",
+        "main.sysl" -> "print(oskit.arch.f() + oskit.vm.g())",
       )
 
       out should include("define i32 @oskit.arch$f()")

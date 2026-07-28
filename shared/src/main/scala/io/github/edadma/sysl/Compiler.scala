@@ -29,9 +29,14 @@ object Compiler {
       case errs => Left(errs.mkString("\n"))
   }
 
+  /** Every pass that reads a whole typed program runs before anything is dropped from it: a
+   * declaration nothing can reach is still one the program declared, and checking it is what makes a
+   * mistake in it a mistake at all. Pruning is therefore the last thing that happens to the tree, and
+   * the only thing between the checks and the lowering.
+   */
   private def analyzed(units: List[Program]): Either[String, String] =
     for
       typed   <- Analyzer.analyze(units)
       checked <- Escape.check(typed).toLeft(typed)
-    yield Codegen.generate(checked)
+    yield Codegen.generate(Reachability.prune(checked))
 }

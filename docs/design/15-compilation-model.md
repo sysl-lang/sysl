@@ -90,6 +90,36 @@ cross-object reference and needs a real symbol. Visibility is a frontend concept
 a program may *name* — and hidden-versus-default is what survives into the object file to decide
 what a linker may bind.
 
+### What is emitted at all
+
+Linkage says how a symbol may be bound; **reachability says whether there is a symbol.** A
+declaration nothing can arrive at is not written out — neither the function nor the `extern` it
+would have called.
+
+Two rules keep that from being a way to hide mistakes or to lose one.
+
+**Only emission is filtered, never analysis.** Every body is checked, every contract typechecked,
+every escape found, whether or not anything calls it. A mistake is a mistake because of what the
+line says, not because of whether the program would have run it — Rust's rule, and the one that
+makes an unread `const` and an unused subtype errors today. So reachability is the *last* thing that
+happens to a typed program, after everything that reads one.
+
+**Reaching is over-approximated, never under.** Where the target of a call is settled at run time,
+every function it could land in is taken: a slot of a method table stands for whatever each table
+for that trait put there. Missing one would mean emitting a call to a function that was never
+written; keeping an extra costs a function nobody calls.
+
+The roots are what the program can start from — the statements it runs, the initializers that fill
+its `val`s before those (`13` §7), and the method tables a trait object dispatches through, a table
+being a constant a program reads a function pointer out of.
+
+**The rule survives separate compilation**, and it is the roots that change rather than the rule.
+Today the whole program is compiled at once and nothing outside it can name anything in it, so every
+declaration is a candidate. Under §5's per-file emission, a module's exported surface — everything
+not `private` per §3's table — joins the roots, because a module it has never heard of may call any
+of it. What stays prunable is exactly what stays unnameable, which is the same line visibility
+already draws.
+
 ## 4. A generic is instantiated at the use site
 
 The defining module **cannot know its own instantiation set** — any downstream module may apply

@@ -291,7 +291,9 @@ The reason it was not there sooner is worth keeping, because it was not the desi
 non-generic type used to be emitted whether or not anything called it**, so a prelude type with
 three methods put all three, and everything they reached, into every program. Prelude members are
 now held back by the same reachability their module's free functions already were, and a program
-that prints a number carries no more than it did.
+that prints a number carries no more than it did. That rule is no longer the prelude's alone: a
+program's own declarations are filtered the same way, by a pass over the whole typed program that
+runs after everything that checks one (`15 §3`).
 
 ## 3. One dispatch rule for operators
 

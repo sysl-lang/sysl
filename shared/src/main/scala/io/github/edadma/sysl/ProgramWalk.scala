@@ -207,6 +207,11 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       TExtern(name, e.symbol, params.map(_._2), rtype, e.variadic)
     }
 
+    // Every function the program declares is here, whether or not anything can reach it — analysis
+    // is eager, and a body nobody calls is checked and reported exactly as one that is called.
+    // Dropping the unreachable ones is `Reachability.prune`, which runs after the passes that read
+    // the whole program and just before it is lowered.
+    //
     // An instantiation at a **type parameter** is a diagnostic type, not a laid-out one: a `Box[U]`
     // written as a trait's argument in a generic `impl` names the family the block covers, and no
     // value at run time has that type. It has no layout to emit — `Type.Abstract.llvm` says so by

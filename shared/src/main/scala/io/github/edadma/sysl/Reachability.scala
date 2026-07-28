@@ -1,0 +1,130 @@
+package io.github.edadma.sysl
+
+import scala.collection.mutable
+
+/** What a program can still arrive at once it has started: the `val`s an expression ends up reading,
+ * and the functions it ends up calling.
+ *
+ * One walk answers both, because they are the same question asked of different roots. `13 §7` asks it
+ * of a single `val`'s initializer — which storage has to be filled before this one — and `prune` asks
+ * it of the whole program at once, so that a declaration nothing can reach costs the output nothing.
+ *
+ * **Only emission is filtered, never analysis.** A function nobody calls is analyzed and reported
+ * exactly as one that is called, which is why this runs as its own pass over a program the analyzer
+ * has already finished with, and after the checks that come between. A mistake is a mistake whether
+ * or not the program would have run the line; what being unreachable costs a declaration is its place
+ * in the output, which is the only thing it was costing the program.
+ *
+ * Two rules make the walk honest, and are worth stating here rather than at each use.
+ *
+ * **It over-approximates, never under.** Where a call's target is decided at run time, every function
+ * it could land in is taken: a slot of a method table is answered with what every table for that
+ * trait put there. The whole program is compiled at once, so that set is known even though the choice
+ * is not. An over-approximation costs a function that is never called; an under-approximation costs a
+ * call to a function that was never written, which is not a trade.
+ *
+ * **It descends through the shape of the tree rather than a case per node**, and deliberately: a node
+ * added later is followed without anyone remembering to come back here, where a match with a
+ * catch-all would silently stop descending into the new one's children. Only the nodes that *name*
+ * something get a case, since a name is a `String` like any other and the shape cannot tell one from
+ * a variable's or an operator's.
+ */
+object Reachability {
+
+  /** The same program with everything unreachable dropped.
+   *
+   * The roots are the three places the program can start from: the statements it runs, the
+   * initializers that fill its storage before those, and the method tables a trait object dispatches
+   * through — a table is a constant the program can read a function out of, so what it points at is
+   * reachable whatever can be proved about the calls themselves.
+   *
+   * The tables and the types are left alone. A table is reached by erasing a value into a trait
+   * object, and a type is emitted for its layout rather than for anything that runs, so neither is
+   * what this pass is about; both are their own question.
+   */
+  def prune(program: TProgram): TProgram = {
+    val live = reachedFrom(List(program.main, program.vals, program.vtables), program.funcs, program.vtables).calls
+
+    program.copy(
+      externs = program.externs.filter(e => live(e.name)),
+      funcs = program.funcs.filter(f => live(f.name)),
+    )
+  }
+
+  /** What a set of trees reaches: every `val` read and every function called, following each call
+   * into the body it lands in.
+   *
+   * A plain reachability walk rather than a fixpoint. Recursion among the callees is fine — what is
+   * being accumulated is a set, and a function already visited adds nothing a second time.
+   */
+  def reachedFrom(roots: List[Any], funcs: List[TFunc], vtables: List[TVtable]): Refs = {
+    val byName = funcs.map(f => f.name -> f).toMap
+    val vals   = mutable.HashSet.empty[String]
+    val called = mutable.HashSet.empty[String]
+    val queue  = mutable.Queue.empty[String]
+
+    def take(r: Refs): Unit =
+      vals ++= r.vals
+      for c <- r.calls if called.add(c) do queue += c
+
+    roots.foreach(r => take(summarize(r, vtables)))
+
+    while queue.nonEmpty do for f <- byName.get(queue.dequeue()) do take(summarize(f, vtables))
+
+    Refs(vals.toSet, called.toSet)
+  }
+
+  /** What one tree names, without following any of it: the `val`s read out of it and the functions
+   * it can call.
+   */
+  case class Refs(vals: Set[String], calls: Set[String])
+
+  private def summarize(root: Any, vtables: List[TVtable]): Refs = {
+    val vals  = mutable.HashSet.empty[String]
+    val calls = mutable.HashSet.empty[String]
+
+    // Every table for a trait supplies one function per slot, so a call at a slot can be answered
+    // with the functions every implementation of that trait put there.
+    def dynamic(recvTy: Type, slot: Int): Unit =
+      val name = recvTy match
+        case Type.Ptr(Type.Trait(n, _))    => Some(n)
+        case Type.Ref(Type.Trait(n, _), _) => Some(n)
+        case _                             => None
+
+      for t <- vtables if name.contains(t.traitName); s <- t.slots.lift(slot) do calls += s.target
+
+    // A `Type` is where the descent stops — it holds no expression, and a recursive one would
+    // otherwise be walked forever. The one function name that lives inside a type rather than beside
+    // it is a constrained subtype's `where` predicate, which is why the node checking against one
+    // reads it out here instead of leaving it to the descent.
+    def scan(x: Any): Unit = x match
+      case _: Type            => ()
+      case g: TGlobal         => vals += g.symbol
+      case d: TDispatch       => calls += d.name
+      case c: TCall           => calls += c.name; c.args.foreach(scan)
+      case s: TStructInvCheck => calls += s.invFn; scan(s.value)
+      case s: TCheckedStore   => calls += s.invFn; scan(s.store); scan(s.recv)
+      case c: TConstrainedCheck =>
+        c.target.predFn.foreach(calls += _)
+        scan(c.value)
+      // Standard output holds no state, so there is no value the prelude could have declared for it
+      // and its table is laid out by codegen rather than analyzed. The one function in that table is
+      // therefore named here, where nothing in the tree names it.
+      case _: TStdout => calls += "putbytes"
+      case s: TVSlot  => calls += s.target
+      case r: TRender =>
+        r.slot match
+          case Some(slot) => dynamic(r.value.ty, slot)
+          case None       => calls += r.method
+        scan(r.value); scan(r.spec)
+      case v: TVCall =>
+        dynamic(v.receiver.ty, v.slot)
+        scan(v.receiver); v.args.foreach(scan)
+      case xs: Iterable[?] => xs.foreach(scan)
+      case p: Product      => p.productIterator.foreach(scan)
+      case _               => ()
+
+    scan(root)
+    Refs(vals.toSet, calls.toSet)
+  }
+}
