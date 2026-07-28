@@ -11,11 +11,11 @@ patterns, **concatenation** — `a + b` and `s += t`, which allocate a fresh buf
 which renders a primitive value into one, and **interpolation** — `s"…$x…"`, `raw"…"`, and
 `f"…${x}%d…"`, which desugar to concatenation, `str`, and printf-style formatting — and
 **`from_utf8`** with the `from_utf8_unchecked` primitive under it, which is the one route from bytes
-a program computed back to text. What does not: the rest of the operations that produce new bytes —
-`copy()`, `str.builder`, `cstring`, `string(c)` — since each needs either the raw-bytes surface or
-methods, and **`s.chars`**, which needs an iteration protocol the language does not yet have. A
-string is therefore no longer always traceable to a literal; a program can build one by joining, by
-rendering, or by validating bytes.
+a program computed back to text, and **`s.chars`**, the cursor over the scalar values those bytes
+encode (`14 §7`). What does not: the rest of the operations that produce new bytes — `copy()`,
+`str.builder`, `cstring`, `string(c)` — since each needs either the raw-bytes surface or an
+allocator. A string is therefore no longer always traceable to a literal; a program can build one by
+joining, by rendering, or by validating bytes, and can walk what it built at either granularity.
 
 ## The decision in one paragraph
 
@@ -171,20 +171,29 @@ choice is right for a systems language; Swift's is right for an application lang
 | byte at an index | `s[i] -> u8` | O(1), bounds-checked |
 | substring | `s[a..b] -> string` | O(1), shares; bounds-checked **and** boundary-checked |
 | bytes | `s.bytes -> []u8` | O(1) view |
-| scalar values | `s.chars` | O(1) per step, total — no replacement characters. **Not built** |
+| scalar values | `s.chars` | O(1) per step, total — no replacement characters |
 | copy out | `s.copy() -> string` | O(n), allocates; releases the parent |
 | concatenation | `a + b` | O(n), allocates |
 | repeated append | `str.builder` | amortized |
 
-**`s.chars` is specified here and not built**, and building `from_utf8` is what made the gap worth
-recording rather than merely noting: a program can now go from bytes to text and still has no way to
-go from text to scalar values, so the round trip this table describes is open at one end. It is not
-the same size of job as the rows above it — every one of those yields a value, and this one yields a
-*sequence*, which `for` currently knows only as an array or a slice. So it waits on an iteration
-protocol, which is what a growable container's `for` is also waiting on (`14 §7`), and it should be
-decided with that rather than special-cased into `for`. `Index` used to be filed beside it and no
-longer is: indexing turned out to want nothing this does not already have, which leaves the protocol
-as the one open half.
+**`s.chars` is what the iteration protocol was decided around** (`14 §7`), and it is the one row of
+this table that could not be a value or a view. Every row above yields a value; this one yields a
+*sequence*, and a string cannot hand one out the way a container hands out a view of its storage,
+because the decoding is what makes the scalar values. So there has to be something that carries a
+position and answers "the next one" — and that is the whole of the protocol: `s.chars` is a cursor
+over the bytes, implementing `Iterate[char]`, and `for c in s.chars` walks it.
+
+The cursor validates nothing. A `string` is well-formed UTF-8 by construction, whether it arrived as
+a literal or through `from_utf8`, so the decoding reads the length off the lead byte and takes the
+continuation bytes as given — which is why the cost in the table is what it is, and why there are no
+replacement characters to hand back.
+
+**A cursor built over bytes that are not a string is unsafe in nothing.** `Chars` is an ordinary
+struct, so a program may make one over any `[]u8` and skip the validation `s.chars` never had to
+do. What it gets is the ordinary garbage-in answer — a lead byte that is really a continuation byte
+decodes as itself — and never a read past the end: every byte the decoder takes goes through the
+slice's own bounds check, so a truncated sequence traps like any other overrun. That is the same
+runtime-safety category `char(u)` and a mid-codepoint slice are in.
 
 **Slicing is boundary-checked.** `s[a..b]` must land on scalar-value boundaries; landing
 mid-codepoint traps, in the same runtime-safety category as a bounds check and `char(u)`. Go

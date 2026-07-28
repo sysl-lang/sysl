@@ -502,11 +502,14 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         // of a parameter. What no bound reaches is a real *field*: that is layout, which is `10 §5`'s
         // rule and the complaint left when nothing declares a property of the name.
         case a: Type.Abstract => readBoundProperty(a, tr, f)
-        // `len` and `bytes` are the first compiler-provided members: `len` a property on every
-        // array, slice, and string, and `bytes` the reinterpretation of a string's three words
-        // as a `[]u8`, dropping only the validity guarantee.
+        // `len`, `bytes` and `chars` are the compiler-provided members: `len` a property on every
+        // array, slice, and string, `bytes` the reinterpretation of a string's three words
+        // as a `[]u8`, dropping only the validity guarantee, and `chars` a cursor over the scalar
+        // values those bytes encode. `chars` is the one that cannot be a view — the decoding is
+        // what makes the characters — so it is the prelude's `Chars`, positioned at the start.
         case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
         case Type.Str if f == "bytes"                   => TBytes(tr)
+        case Type.Str if f == "chars"                   => callPrelude("chars_of", TBytes(tr))
 
         // Any other type reaches its own members too, since an `impl` may be written for one and a
         // trait may ask for a property. A name none of them supplies is the older complaint, which
@@ -711,21 +714,20 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
         case _ =>
           val seq = autoDeref(analyzeExpr(iter))
-          val elem = seq.ty match
-            case Type.Array(_, e) => e
-            case Type.Slice(e)    => e
+          seq.ty match
+            case Type.Array(_, elem) => forEach(label, name, seq, elem, body, elseOpt, expected, discarded)
+            case Type.Slice(elem)    => forEach(label, name, seq, elem, body, elseOpt, expected, discarded)
             // A string has two granularities and no reason to prefer one silently, so which one
-            // is wanted is written: `s.bytes` today, `s.chars` when there are characters.
+            // is wanted is written: `s.bytes` for the bytes, `s.chars` for the characters they
+            // encode. Neither is the default, because a program that means one rarely means both.
             case Type.Str =>
-              err("a string is iterated as 's.bytes', since a string has bytes and characters both")
+              err("a string is iterated as 's.bytes' or 's.chars', " +
+                "since a string has bytes and characters both")
+            case ty if iterateElem(ty).isDefined =>
+              iterating(label, name, seq, iterateElem(ty).get, body, elseOpt, expected, discarded)
             case other =>
-              err(s"'for' iterates an integer range, an array, or a slice, not ${show(other)}")
-          pushScope()
-          val u         = declare(name, elem)
-          val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
-          popScope()
-          val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-          TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
+              err(s"'for' iterates an integer range, an array, a slice, or a type that implements " +
+                s"'Iterate', and ${show(other)} is none of those")
 
     case TryExpr(e) =>
       analyzeTry(analyzeExpr(e))
@@ -779,6 +781,64 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     place.ty match
       case i: Type.Integer => TIncDec(place, op, pre, i)
       case other           => err(s"'$op' is not defined for ${show(other)}")
+  }
+
+  /** `for name in seq` over storage that is already there: each element is copied out by index, and
+   * the sequence is evaluated once.
+   */
+  private def forEach(label: Option[String], name: String, seq: TExpr, elem: Type, body: List[Stmt],
+                      elseOpt: Option[List[Stmt]], expected: Option[Type], discarded: Boolean): TExpr = {
+    pushScope()
+    val u         = declare(name, elem)
+    val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
+    popScope()
+    val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
+    TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
+  }
+
+  /** `for name in cursor` over a sequence that has to be produced a value at a time (`14 §7`).
+   *
+   * The cursor is the loop's own: the expression is evaluated once into a slot nothing outside the
+   * loop can name, and `next` takes that slot's address, so a `Chars` or any other iterator advances
+   * in place while whatever was written stays a value like every other. That the slot is a *copy* is
+   * the ordinary value semantics — draining `for c in it` leaves an `it` the program declared
+   * untouched, exactly as passing it to a function would.
+   */
+  private def iterating(label: Option[String], name: String, seq: TExpr, elem: Type, body: List[Stmt],
+                        elseOpt: Option[List[Stmt]], expected: Option[Type], discarded: Boolean): TExpr = {
+    val cursor = freshName("iter")
+    val step   = callMethodOn(TLoad(cursor, seq.ty), "next", Nil, None)
+    val opt = step.ty match
+      case e: Type.Enum if e.base == "Option" && e.targs == List(elem) => e
+      case other =>
+        err(s"'Iterate' asks its 'next' for an ${show(Type.Enum("Option", List(elem)))}, " +
+          s"and this one gives back ${show(other)}")
+
+    pushScope()
+    val u         = declare(name, elem)
+    val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
+    popScope()
+    val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
+    val bind      = TVariantPattern(opt, opt.variant("Some").get, List(TBindPattern(u, elem)))
+    TIterate(cursor, seq.ty, seq, step, bind, tb, telse, loopResultType(ctx, telse))
+  }
+
+  /** What a type's `Iterate` implementation yields, or `None` where it has none.
+   *
+   * A type may implement one parameterized trait at more than one argument list (`02`), and for
+   * every other trait the call's arguments are what say which — but `next` takes none, so a second
+   * `Iterate` leaves the loop nothing to decide with. That is reported here rather than left to the
+   * call, because the sentence a program needs names the loop.
+   */
+  private def iterateElem(ty: Type): Option[Type] = {
+    val (key, targs) = memberOwner(ty)
+    implsOf("Iterate", key).map(suppliedBound(_, "Iterate", ty, targs).args) match
+      case Nil            => None
+      case List(elem) :: Nil => Some(elem)
+      case several =>
+        err(s"${show(ty)} implements 'Iterate' " +
+          s"${conjoin(several.map(a => s"'${Type.Bound("Iterate", a).show}'"))}, and a 'for' has " +
+          "nothing to say which of them it means — call 'next' yourself, with the element type written")
   }
 
   /** Whether a subscript on this type reaches one of the two indexing traits, asked of a type that

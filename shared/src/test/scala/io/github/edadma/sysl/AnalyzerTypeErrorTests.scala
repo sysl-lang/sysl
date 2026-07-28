@@ -206,8 +206,8 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
             |for c in s do print(c)""".stripMargin) should include("iterated as 's.bytes'")
     }
 
-    "have a length and their bytes, and no other field yet" in {
-      err("""print("ab".chars)""") should include("cannot read field 'chars'")
+    "have a length, their bytes and their characters, and no other field yet" in {
+      err("""print("ab".graphemes)""") should include("cannot read field 'graphemes'")
     }
 
     "are not a []u8 where one was asked for" in {

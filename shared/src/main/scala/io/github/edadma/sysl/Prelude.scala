@@ -183,6 +183,9 @@ object Prelude {
       |trait IndexSet[I, E]
       |    index_set(*self, i: I, v: E)
       |
+      |trait Iterate[E]
+      |    next(*self) -> Option[E]
+      |
       |hash_u64(v: u64) -> u64
       |    var h = v + 0x9e3779b97f4a7c15u64
       |    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64
@@ -432,6 +435,38 @@ object Prelude {
       |
       |    Ok(from_utf8_unchecked(b))
       |end from_utf8
+      |
+      |struct Chars
+      |    rest: []u8
+      |    at: usize
+      |end Chars
+      |
+      |chars_of(b: []u8) -> Chars = Chars(b, 0usize)
+      |
+      |impl Iterate[char] for Chars
+      |    next(*self) -> Option[char]
+      |        if self.at >= self.rest.len then return None
+      |
+      |        var lead = self.rest[self.at]
+      |        var need = 1usize
+      |        var v = u32(lead)
+      |
+      |        if lead >= 240u8
+      |            need = 4usize
+      |            v = u32(lead & 7u8)
+      |        elif lead >= 224u8
+      |            need = 3usize
+      |            v = u32(lead & 15u8)
+      |        elif lead >= 192u8
+      |            need = 2usize
+      |            v = u32(lead & 31u8)
+      |
+      |        for k in 1usize..<need
+      |            v = (v << 6u32) | u32(self.rest[self.at + k] & 63u8)
+      |
+      |        self.at += need
+      |        Some(char(v))
+      |    end next
       |
       |struct Buf[T]
       |    elems: []T

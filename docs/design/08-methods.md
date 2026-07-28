@@ -207,11 +207,17 @@ What exists today, as compiler-provided members:
 |---|---|---|
 | `[N]T`, `[]T`, `string` | `len -> usize` | property |
 | `string` | `bytes -> []u8` | property |
+| `string` | `chars -> Chars` | property |
+
+`chars` is the one of the three that is not a projection of the words already there: it hands back a
+cursor over the bytes, which `for` walks through `Iterate` (`14 §7`). It is compiler-provided rather
+than an `impl` on `string` for the same reason the other two are — a built-in has no body to write a
+member in — and the type it gives back is an ordinary prelude struct, so nothing about the member
+form is special.
 
 What the earlier docs specify but which waits on an allocator surface — every operation that
 makes new bytes — is compiler-provided too, and lands as these same member forms when it lands:
-`string.from_utf8` and `char.try` as associated functions, `s.copy()` and `s.chars` as methods
-(`04`, `00`). A user `struct` or `enum` is the case that declares its members in its own body;
+`string.from_utf8` and `char.try` as associated functions and `s.copy()` as a method (`04`, `00`). A user `struct` or `enum` is the case that declares its members in its own body;
 the built-ins are the case where the body is the language.
 
 A compiler-provided member is reached **ahead of** the member table rather than through it, which is

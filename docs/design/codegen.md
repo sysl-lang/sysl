@@ -304,8 +304,9 @@ before they appear and may be mutually recursive).
   `s[i] = v` and `&s[i]` are rejected outright. Comparison is by bytes, which for well-formed
   UTF-8 is codepoint order, so `==` and `<` work and a literal can be a `match` pattern. A
   literal's owner is **null**, which is how `04`'s "immortal" is spelled: no allocation, and
-  retain and release are run-time no-ops. Iterating is written `for b in s.bytes`, since a
-  string has two granularities and choosing one silently would be a guess.
+  retain and release are run-time no-ops. Iterating is written `for b in s.bytes` or
+  `for c in s.chars`, since a string has two granularities and choosing one silently would be a
+  guess; the second hands back a cursor the loop drives through `Iterate` (`14 §7`).
 - **Recursive types.** A cycle through a `*T` or a `&T` is legal and pointer-sized; a cycle
   every edge of which is by value is rejected as having no finite size. An instantiation is
   registered before its fields are resolved, so a field that points back at it finds it.
@@ -381,8 +382,8 @@ arity.
    `copy()`, concatenation, `str.builder`, `cstring`, and `string(c)` all need either an
    allocator surface or methods, and none of them exists. So every string a program can hold
    traces back to a literal, every owner word is null, and the validation `04` requires at
-   construction is done by the lexer rather than at run time. `s.chars` waits on the iterator
-   protocol; ordering is by byte with no collation, which is what `04` specifies.
+   construction is done by the lexer rather than at run time. `s.chars` decodes what is already
+   validated; ordering is by byte with no collation, which is what `04` specifies.
 3. **All locals are `alloca`.** Every `var`, parameter, and loop variable gets a stack slot;
    reads `load`, writes `store`. Slots are hoisted into the entry block (names are unique per
    function, so one inside a loop does not grow the stack per iteration), but there is no
@@ -413,9 +414,11 @@ arity.
    program that only prints an integer still carries the allocator declarations it never calls, and
    `FormatSpec`'s layout is emitted whether or not anything renders, since a non-generic type is
    instantiated eagerly wherever it is declared.
-8. **`for` iterates a range, an array, or a slice.** `downTo`, `step`, and `reverse` are not
-   yet lowered, and nothing else is iterable — there is no iterator protocol, which is also why
-   a string is iterated as `s.bytes` and has no `s.chars` yet.
+8. **`for` iterates a range, an array, a slice, or a cursor.** `downTo`, `step`, and `reverse`
+   are not yet lowered. A type implementing `Iterate` is the fourth thing a loop takes: the
+   expression is evaluated once into a slot the loop owns, `next` takes that slot's address each
+   round, and running out is normal completion so the `else` runs. A container is deliberately not
+   one — a `Buf` is walked as `b.view()`, which costs an index rather than a call (`14 §7`).
 9. **Escape analysis rejects rather than promotes.** An array whose view escapes is
    diagnosed where `05` says an allocator should silently promote it to the heap, so a program
    that means to return a view writes `&[N]T` itself. That is `05`'s `no alloc` behaviour

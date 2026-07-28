@@ -301,9 +301,17 @@ trait ArcEmitter extends Emitter {
 
   /** Releases the innermost region's temporaries and pops it. */
   protected def popTemps(): Unit = {
-    for (v, ty) <- tempStack.head.reverse do releaseValue(ty, v)
+    releaseTemps()
     tempStack = tempStack.tail
   }
+
+  /** Emits the releases for the innermost region without popping it, and drops the region without
+   * emitting them — the pair a caller needs when more than one edge leaves the region and each has
+   * to let go for itself. An iterating loop is the case: what `next` gave back is released on the
+   * way into the body and again on the way out of the loop, and those are different blocks.
+   */
+  protected def releaseTemps(): Unit = for (v, ty) <- tempStack.head.reverse do releaseValue(ty, v)
+  protected def dropTemps(): Unit    = tempStack = tempStack.tail
 
   protected def pushOwned(): Unit = owned = mutable.ListBuffer.empty[(String, Type)] :: owned
 

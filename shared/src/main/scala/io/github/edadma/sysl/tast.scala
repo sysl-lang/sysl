@@ -401,6 +401,17 @@ case class TCFor(init: Option[TStmt], cond: Option[TExpr], step: Option[TStmt], 
  */
 case class TForEach(name: String, elemTy: Type, seq: TExpr, body: List[TStmt],
                     elseBlock: Option[TBlock], ty: Type) extends TExpr
+
+/** `for name in cursor [else …]` over a type that implements `Iterate` (`14 §7`).
+ *
+ * `cursor` is the name of the loop's own slot holding the iterator: the sequence expression is
+ * evaluated once into it, and `next` is the already-built call that reads it and advances it, so
+ * the loop's state is the loop's and nothing outside it moves. `bind` is the `Some(name)` pattern
+ * that takes the element out of what `next` gave back — a `None` ends the loop, running the `else`
+ * exactly as running out of a range does.
+ */
+case class TIterate(cursor: String, cursorTy: Type, init: TExpr, next: TExpr, bind: TPattern,
+                    body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
 case class TReturn(value: Option[TExpr])                  extends TStmt
 
 /** `break [expr]` and `continue`. `break` carries the loop's value when the loop yields one.

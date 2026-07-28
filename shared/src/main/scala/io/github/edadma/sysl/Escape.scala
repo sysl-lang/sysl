@@ -168,6 +168,7 @@ private class Escape(program: TProgram) {
       case w: TWhile            => loopViewsFrame(w.body, w.elseBlock)
       case f: TFor              => loopViewsFrame(f.body, f.elseBlock)
       case e: TForEach          => loopViewsFrame(e.body, e.elseBlock)
+      case i: TIterate          => loopViewsFrame(i.body, i.elseBlock)
       case _                    => false
 
     private def blockValue(b: TBlock): Boolean = b.result.exists(viewsFrame)
@@ -285,7 +286,7 @@ private class Escape(program: TProgram) {
   }
 
   private def ownBreaksInExpr(e: TExpr): List[TExpr] = e match
-    case _: TWhile | _: TLoop | _: TFor | _: TForEach | _: TCFor => Nil
+    case _: TWhile | _: TLoop | _: TFor | _: TForEach | _: TCFor | _: TIterate => Nil
     case TIf(_, t, el, _)   => ownBreakValues(t.stmts) ::: el.toList.flatMap(b => ownBreakValues(b.stmts))
     case TMatch(_, arms, _) => arms.flatMap(a => ownBreakValues(a.body.stmts))
     case _                  => Nil
@@ -304,6 +305,8 @@ private class Escape(program: TProgram) {
       TBlock(init.toList ::: body ::: step.toList, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TFor(_, _, _, _, _, body, el, _) => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TForEach(_, _, _, body, el, _)   => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
+    case TIterate(_, _, _, _, _, body, el, _) =>
+      TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case _                  => children(e).flatMap(blocks)
 
   private def children(e: TExpr): List[TExpr] = e match
@@ -362,5 +365,8 @@ private class Escape(program: TProgram) {
     case TWhile(c, _, el, _)             => c :: el.flatMap(_.result).toList
     case TFor(_, _, lo, hi, _, _, el, _) => lo :: hi :: el.flatMap(_.result).toList
     case TForEach(_, _, seq, _, el, _)   => seq :: el.flatMap(_.result).toList
+    // The cursor's initializer and the `next` call that reads it are both the loop's own, and the
+    // element the loop binds comes out of the second — so both are walked.
+    case TIterate(_, _, init, next, _, _, el, _) => init :: next :: el.flatMap(_.result).toList
     case _                          => Nil
 }

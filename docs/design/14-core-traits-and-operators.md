@@ -5,8 +5,9 @@ rule, definition-checked bounds on both method calls and operators, the compiler
 memberships, `print`/`str` requiring `Display`, and every renderer honouring the specifier it is
 handed. The ten binary arithmetic traits now take the right-hand type as a parameter defaulting to
 `Self`, so an operator dispatches on the **pair**, and a type may implement one of them at more than
-one argument list (`§7`). `Index` and `IndexSet` are built too, and without the associated types
-`§1` said they would need. `§8 b`, `§8 d`, and `§8 e` settled on the
+one argument list (`§7`). `Index`, `IndexSet` and `Iterate` are built too, and without the associated
+types `§1` said the first two would need — so `s.chars` walks a string's scalar values and a `for`
+takes a cursor. `§8 b`, `§8 d`, and `§8 e` settled on the
 way, leaving `§8 a` and `§8 c` — neither of which
 is about this chapter's own surface. This is the concrete spec for three things the earlier chapters
 *decided* but left unbuilt, because all three turned on the same missing layer:
@@ -518,16 +519,42 @@ exactly (`§5`), one row further down the catalog.
   second trait per arity. None of the three is obviously right and nothing is blocked on it, so the
   two-argument accessor stays a method.
 
-- **The iteration protocol, which was the other half of this entry and is now the whole of it.**
-  `04`'s granularity table specifies `s.chars`, a string's Unicode scalar values, and it is not
-  built: a string cannot hand out a slice of them the way a container hands out a view of its
-  storage, because the decoding is what makes them. So the "just use `.view()`" answer that covers
-  `Buf[T]` does not reach it, and `s.chars` is the case that decides whether the protocol is
-  something a *type* implements or something `for` knows about. Building `from_utf8` is what made
-  this worth writing down: a program can now go from bytes to text and still has no way to walk the
-  text it got. What indexing settled applies here too — a `trait Iterate[E]` implemented for a
-  cursor type wants exactly the argument `Index` wanted, so the protocol's shape is now an ordinary
-  design question rather than one blocked on a missing feature.
+- **~~The iteration protocol.~~ Built, and `s.chars` is what decided its shape.**
+
+  ```
+  trait Iterate[E]
+      next(*self) -> Option[E]
+  ```
+
+  A `for` accepts a value of a type implementing it as a fourth thing, after a range, an array or a
+  slice, and a string's two granularities. The loop evaluates the expression once into a slot of its
+  own and calls `next` on that slot's address, so the cursor advances in place while what the
+  program wrote stays a value like every other — draining `for c in it` leaves an `it` the program
+  declared exactly where it was, which is the ordinary copy semantics rather than a rule of the
+  loop's. Running out is normal completion, so an `else` runs; `continue` goes back to the test,
+  because advancing is what `next` already did.
+
+  **A container is not an iterator, and that is the design decision here.** There is no `IntoIterate`
+  and no second trait: `for x in b.view()` walks a `Buf` by index with no call per element, so a
+  cursor for it would be a slower way to do something that already works. The protocol exists for
+  sequences whose elements have to be **computed**, and a container's never are. Nothing is lost by
+  waiting: a trait that turns a value into a cursor is additive, and can be added the day something
+  wants a container to be walked without naming its view.
+
+  **`s.chars` is the customer that had no workaround**, and the reason the protocol is a value rather
+  than a rule `for` knows. `04`'s granularity table specifies a string's Unicode scalar values, and a
+  string cannot hand out a slice of them the way a container hands out a view of its storage —
+  the decoding is what makes them. So there has to be something that carries a position and answers
+  "the next one", and once there is, `for` accepting it is a smaller change than teaching `for` about
+  strings. It is compiler-provided (`08`), lowering to the prelude's `Chars` over the bytes; the
+  string is well-formed by construction, so the decoding validates nothing that was already checked
+  at the door.
+
+  What indexing settled applies here as it stood: `impl Iterate[char] for Chars` writes the element
+  type as an ordinary trait argument, settled by the subject. The one place iteration differs is
+  selection — every other trait's implementations are told apart by a call's arguments, and `next`
+  takes none, so a type implementing `Iterate` twice leaves a `for` nothing to decide with. That is
+  reported at the loop rather than at the call, because the sentence a program needs names the loop.
 
 - **~~A heterogeneous *operand*.~~ The catalog change is built; what it turned out to wait on is
   something else.** `§1` argues that `Self`-homogeneity costs nothing, because the scalars already

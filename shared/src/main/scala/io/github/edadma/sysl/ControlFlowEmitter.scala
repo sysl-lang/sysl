@@ -400,6 +400,59 @@ trait ControlFlowEmitter extends PlaceEmitter {
     genLoopResult(slot, ty, elseL, endL, elseBlock)
   }
 
+  /** The iterating loop. The cursor gets a slot with a count of its own, taken before the loop is
+   * recorded so that a `break` — which lets go of everything pushed *after* the record — leaves it
+   * alone; the end label is where every path meets, and the release goes there.
+   *
+   * What `next` gives back is a temporary of its own each round, and the two edges out of the test
+   * let go of it separately: the body binds the element (retaining it into its own slot) and then
+   * releases the option, while the exhausted path releases it with nothing taken out.
+   */
+  protected def genIterate(e: TIterate): String = {
+    val TIterate(cursor, cursorTy, init, next, bind, body, elseBlock, ty) = e
+    val iv = genExpr(init)
+    pushOwned()
+    emitAlloca(s"%$cursor.addr", cursorTy.llvm)
+    retainValue(cursorTy, iv)
+    emit(s"store ${cursorTy.llvm} $iv, ptr %$cursor.addr")
+    ownSlot(cursor, cursorTy)
+
+    val condL = freshLabel("iter.cond")
+    val bodyL = freshLabel("iter.body")
+    val doneL = freshLabel("iter.done")
+    val endL  = freshLabel("iter.end")
+    val elseL = if elseBlock.isDefined then freshLabel("iter.else") else endL
+    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    // `continue` goes back to the test, which is where the next element comes from: an iterating
+    // loop has no step of its own, since advancing is what `next` did.
+    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
+
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    pushTemps()
+    val opt = genExpr(next)
+    val ok  = patternTest(bind, opt)
+    emitTerm(s"br i1 $ok, label %$bodyL, label %$doneL")
+
+    emitLabel(bodyL)
+    pushOwned()
+    patternBind(bind, opt)
+    releaseTemps()
+    body.foreach(genStmt)
+    popOwned()
+    emitTerm(s"br label %$condL")
+
+    emitLabel(doneL)
+    releaseTemps()
+    dropTemps()
+    emitTerm(s"br label %$elseL")
+
+    genLoops = genLoops.tail
+    val result = genLoopResult(slot, ty, elseL, endL, elseBlock)
+    popOwned()
+    result
+  }
+
   /** Finishes a loop expression: run the `else` (if any) on the normal-completion path into the
    * result slot, then land at the end and hand the slot's value out as the enclosing region's to
    * release. A `unit` loop has no slot and yields nothing.

@@ -990,6 +990,7 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     case f: TCFor    => genCFor(f)
     case f: TFor     => genFor(f)
     case e: TForEach => genForEach(e)
+    case i: TIterate => genIterate(i)
 
 }
 

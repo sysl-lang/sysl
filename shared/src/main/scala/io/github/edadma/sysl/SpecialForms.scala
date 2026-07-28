@@ -69,7 +69,7 @@ trait SpecialForms extends CallAnalysis {
    * what brings the function itself into the program: a prelude declaration nothing reaches is
    * neither analyzed nor emitted.
    */
-  private def callPrelude(name: String, arg: TExpr): TExpr = {
+  protected def callPrelude(name: String, arg: TExpr): TExpr = {
     val (_, rtype) = funcInsts(name)
 
     funcsUsed += name

@@ -263,6 +263,12 @@ for i in 0..<buf.len do …      // each index
 semantics mean; mutating the sequence goes through the index form. The loop evaluates its
 sequence once, so a slice temporary lives for the whole loop.
 
+**Storage is walked by index, and that is why a container is not an iterator.** A `for` also
+accepts a cursor — a value implementing `Iterate` (`14 §7`) — but nothing here implements it, and
+`Buf` deliberately does not: `for x in b.view()` reads elements that are already sitting in memory,
+which costs an index where a cursor would cost a call apiece. The protocol is for sequences whose
+elements have to be *computed*, which a container's never are.
+
 ## Ownership
 
 Taking a slice **retains the owner**, dropping one releases it — that is `03`'s rule, and it is
