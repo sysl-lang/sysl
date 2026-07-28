@@ -10,7 +10,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * which is a way of holding a type; a trait object, which has forgotten which type it holds; and a
  * generic type, which is later work.
  */
-class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport {
+class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   private val show = "trait Show\n    show(self) -> string\n"
 
@@ -214,8 +214,12 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport {
 
   // The elements a slice views belong to whoever made them, so putting one inside an object that
   // outlives the frame is the ordinary escape rule rather than anything new about the erasure.
-  "erasing a frame-owned slice is refused by escape analysis" in {
-    err(
+  // Erasing a view into a trait object is an escape — which is now answered by moving the array to
+  // the heap rather than by refusing (`05`), so what this checks is that the erasure still happens
+  // and still dispatches. The refusal that remains is for storage the body did not declare, and
+  // `EscapeErrorTests` holds it.
+  "erasing a frame-owned slice moves the array to the heap" in {
+    run(
       """trait Show
         |    show(self) -> string
         |impl Show for []int
@@ -223,6 +227,6 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport {
         |name(t: &Show) -> string = t.show()
         |var a = [1, 2]
         |print(name(a[0..]))""".stripMargin,
-    ) should include("would outlive the array")
+    ) shouldBe "s\n"
   }
 }

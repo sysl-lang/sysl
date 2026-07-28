@@ -36,7 +36,7 @@ object Compiler {
    */
   private def analyzed(units: List[Program]): Either[String, String] =
     for
-      typed   <- Analyzer.analyze(units)
-      checked <- Escape.check(typed).toLeft(typed)
-    yield Codegen.generate(Reachability.prune(checked))
+      typed    <- Analyzer.analyze(units)
+      promoted <- Escape.check(typed)
+    yield Codegen.generate(Reachability.prune(typed), promoted)
 }

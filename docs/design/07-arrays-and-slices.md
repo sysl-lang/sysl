@@ -312,11 +312,11 @@ implementation:
   for any `K`, because a repeat needs a value and no bound promises one. That is `14`'s decision
   rather than this chapter's — see its `§7` entry on a bound that promises a value, which the
   bullet above wants for the same reason.
-- **Promotion of an escaping local array** (`05`). The analysis that *finds* the escape is
-  implemented; what happens next is not. A view that would outlive its array is a diagnostic
-  rather than a silent heap promotion, so a program that means to return one writes `&[64]u8`
-  itself. That is `05`'s `no alloc` behaviour applied everywhere, which is the safe direction
-  to be wrong in, and `--explain-escapes` only becomes meaningful once promotion exists.
+- ~~**Promotion of an escaping local array**~~ (`05`) — **built.** A view that would outlive its
+  array now moves the array to a buffer instead of being refused, so a program that means to return
+  one writes the ordinary `var buf: [64]u8` and says nothing. What is still refused is storage the
+  body did not declare: an array a caller passed by value, and an array that is a field of a value.
+  `--explain-escapes` is now meaningful and is the remaining unbuilt piece of `05`.
 - **Slicing a `&sync` buffer.** A `[]T` does not record whether its owner's count is atomic, so
   it cannot carry an owner that needs the atomic path. Rejected with a diagnostic until slices
   distinguish the two.

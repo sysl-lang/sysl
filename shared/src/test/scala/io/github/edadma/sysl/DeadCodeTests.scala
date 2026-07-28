@@ -83,8 +83,9 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // never reached too — which is what fixes the order of the passes: everything that checks runs
     // before anything is dropped.
     "and a slice escaping a function nothing calls is still rejected" in {
-      err("""scratch() -> []u8
-            |    var s: [4]u8
+      // A **parameter** array, since a local one is promoted rather than reported now (`05`); what
+      // is being checked is that an unreachable body is analyzed at all.
+      err("""scratch(s: [4]u8) -> []u8
             |    s[..]
             |end scratch
             |print(1)

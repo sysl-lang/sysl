@@ -93,10 +93,12 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
         val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
         (o, p, l)
-      // Storage this frame owns, or a `*T` region: there is nothing to keep alive, so the
-      // owner is null and counting it is a no-op. The escape analysis is what makes the first
-      // of those safe, and nothing makes the second safe — that is what `*T` is.
-      case Type.Array(n, _)             => ("null", address(base), n.toString)
+      // Storage this frame owns, or a `*T` region. A frame-backed array has no owner, so counting
+      // it is a no-op — unless the escape analysis moved it to the heap, in which case the buffer
+      // it moved into is exactly what a view of it must count against, and the whole promotion
+      // comes down to naming that buffer here instead of `null`. Nothing makes a `*T` region safe;
+      // that is what `*T` is.
+      case Type.Array(n, _)             => (promotedOwner(base), address(base), n.toString)
       case Type.Ptr(Type.Array(n, _))   => ("null", genExpr(base), n.toString)
       case other                        => sys.error(s"unreachable slice of ${other.llvm}")
 
@@ -151,6 +153,17 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * than handing back a null those elements are then stored through. Both are `07 §Indexing`'s trap
    * for `07 §Indexing`'s reason — the guarantee is that a program with no `*T` in it cannot fault.
    */
+  /** The buffer a promoted array lives in, or `null` for one that still lives in the frame.
+   *
+   * Only a plain local is ever promoted, which is the same shape the analysis names its roots by
+   * (`05`): storage reached through a field or an index belongs to something else, and an array
+   * parameter is the caller's layout, so neither is this body's to have moved.
+   */
+  protected def promotedOwner(base: TExpr): String = base match
+    case TLoad(name, _)  => promotedBoxes.getOrElse(name, "null")
+    case TIndex(r, _, _) => promotedOwner(r)
+    case _               => "null"
+
   protected def genBuffer(elem: Type, n: String): (String, String) = {
     val bn = bufName(elem)
     checked = true

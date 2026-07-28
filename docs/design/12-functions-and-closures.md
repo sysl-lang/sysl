@@ -2,7 +2,8 @@
 
 **Status:** the top-level function surface is written against the implementation that already
 exists — keyword-less declarations, expression and block bodies, `return`, forward reference,
-recursion, and `extern` including its variadic `...` — and ratifies it. **Closures are not yet implemented**; the sections that describe
+recursion, and `extern` including its variadic `...` — and ratifies it. **Closures are not yet implemented, and neither are the
+nested functions of §5a**; the sections that describe
 them (§5 onward) are the design the rest of the docs already lean on — `05-escape-analysis.md`
 heap-boxes an escaping closure, and `capabilities.md` gates escaping closures behind `alloc` and
 inlines the non-escaping ones — written down here so that surface is decided before it is built,
@@ -258,6 +259,137 @@ inside an expression the parser is already reading as a value.
 expected — `xs.map(square)` — is simply a closure with an empty environment, and needs no lambda
 wrapper. There is no separate "function pointer" concept to learn; the capture-free case is the
 degenerate one, the way a simple enum is the degenerate data enum (`09` §1).
+
+## 5a. Nested functions — a closure with a name
+
+A function declaration may stand inside a function body, spelled exactly as a top-level one:
+
+```
+sort(xs: []int)
+    swap(i: usize, j: usize)                  // sees xs
+        var t = xs[i]
+        xs[i] = xs[j]
+        xs[j] = t
+
+    part(lo: usize, hi: usize) -> usize       // may call itself and may call swap
+        ...
+
+    quick(lo: usize, hi: usize)
+        if lo < hi
+            var p = part(lo, hi)
+            quick(lo, p)
+            quick(p + 1, hi)
+
+    quick(0, xs.len)
+```
+
+**This is not a second mechanism.** A nested function *is* a closure — capture follows §7 and
+representation follows §8, both unchanged. One that captures nothing and does not escape is an
+ordinary static function with a private name; one that captures is a closure; one that escapes is
+heap-boxed and is a compile error under `no alloc`. Nothing here needs a rule that a closure literal
+did not already need.
+
+**What the name buys is the reason the form exists**, because a `var f = x -> …` does not give it:
+
+- **Recursion.** A closure literal's name is not in scope in its own initializer, so an anonymous
+  closure cannot call itself. A nested function's name is in scope in its own body.
+- **Mutual recursion**, which falls out of the hoisting rule below.
+- **Written types.** A nested function states its parameters and its result the way every function
+  does, so it needs no context to be inferred from — which sidesteps rather than settles the
+  annotation awkwardness of `§ Open d`.
+- **A body of statements reads as one.** An indented block under a name is the shape the rest of the
+  language already uses for "here is a thing that does something"; an arrow bound to a `var` is the
+  shape for "here is a value".
+
+**Names are hoisted; captures are not.** These are two different scopes and the difference is
+load-bearing:
+
+- **Every nested function in a block is in scope throughout that block**, so two may call each other
+  and one may be used above where it is written — the same rule §4 gives top-level declarations, and
+  the reason `quick` above may call `part` whichever order they are written in.
+- **A nested function may capture only locals declared above it.** A capture takes the variable's
+  value, or a share of its reference, at the moment the function is *formed* (§7), and a local
+  written below it does not exist yet.
+
+So **name resolution is per block and capture is per position.** Splitting them is what lets mutual
+recursion work without smuggling in a read of an uninitialized local, and both halves are checkable
+where they are written.
+
+A nested function may contain another, and capture reaches through: an inner one may name the outer
+one's locals and parameters as well as its own. Nothing outside the body can name a nested function,
+so `13`'s visibility levels do not apply to one — there is nothing for `private` to restrict, and
+writing it is an error rather than a no-op.
+
+**Open here, and each is genuinely undecided:**
+
+- **A nested function that is recursive, capturing *and* escaping is a reference cycle.** The boxed
+  closure holds a capture that refers to the box. That is `03`'s `weak` problem arriving by a new
+  route, and it should be decided with `weak` rather than ahead of it.
+- **Whether one shadows a top-level function of the same name.** Ordinary lexical scoping says yes;
+  whether that is wanted for *functions*, where a shadowed name is harder to notice than a shadowed
+  variable, is a separate question.
+- **Whether a nested function may be generic.** `§ Open b` already holds the closure half of this;
+  a named one raises it in the same form and should be answered with it.
+
+## 5b. Several results — a list, not a tuple
+
+A function may declare more than one result, and a binding may take them apart:
+
+```
+divmod(a: int, b: int) -> int, int
+    a / b, a % b
+
+val q, r = divmod(7, 2)                   // q = 3, r = 1
+
+civil_from_days(d: int) -> int, int, int  // year, month, day
+    ...
+
+var y, m, day = civil_from_days(20520)
+```
+
+**This is a property of the signature, not a new type**, and that is the whole design. There is no
+tuple value anywhere: nothing may store one, put one in a field, hold one in an `Option`, or pass one
+along except by forwarding it whole. A multi-result call may appear in exactly three places — the
+right-hand side of a binding, the right-hand side of a multi-assignment (`00 §2`), and a `return` or
+trailing expression of a function whose own result list matches.
+
+The restriction is what buys the feature, and the reason is `02`'s orphan rule. An `impl` lives with
+its trait or with its type; an anonymous tuple type has neither, so `impl Eq for (int, int)` is
+precisely the *case with no home* that chapter names. A language with tuple *values* must answer
+that — either with built-in structural `Eq`/`Ord`/`Display`, a second mechanism running beside the
+catalog, or by leaving tuples uncomparable and unprintable. **A result list is never a value, so the
+question is never asked.** The `(x)`-versus-`(x,)` wart does not arise either, because a one-element
+result list is just a result.
+
+**Destructuring is `00 §2`'s multi-assignment, not a second mechanism.** `val a, b = f(x)` binds; `a,
+b = f(x)` assigns to places that already exist; and the evaluation rule is the one already written
+there — the call happens once, in full, before anything is bound or stored. The two forms of
+right-hand side, a list of expressions and a single multi-result call, are the only two there are.
+
+**Arity is checked and there is no partial take.** `val a = divmod(7, 2)` is an error rather than a
+binding of the first result: a function that says it yields two things yields two things, and
+silently dropping one is how a caller ends up reading the wrong number. A result that is genuinely
+optional to the caller is a sign the function wants a struct.
+
+**When to want a struct instead.** A result list is at its best where the components are few and
+obviously ordered — `divmod`, a quotient and a remainder, a value and a count. It is at its worst
+where they are several and alike, which is where the names carry the meaning: `guide/datetime` gets
+a year, a month and a day out of a day number, and `Civil { year, month, day }` reads better at every
+call site than `-> int, int, int` does, because `c.month` says what `1` does not. The list is the
+lightweight answer, not the general one.
+
+**Open here:**
+
+- **How a result list appears in a callable type.** §6 makes the bare arrow parameter-only sugar and
+  requires `&Fn` elsewhere; `(int) -> int, int` is ambiguous about where the parameter list ends, so
+  a callable yielding several results needs a spelling — probably `(int) -> (int, int)`, which
+  reintroduces the parentheses this section otherwise avoids. It waits on the closure implementation
+  like the rest of §6's corners.
+- **Whether a binding may annotate its parts.** `var a: int, b: int = f(x)` is noisy and
+  `var a, b: int = f(x)` reads as though it types only `b`. Inference covers the ordinary case; the
+  spelling for the case it does not is unsettled.
+- **Whether an `extern` may declare one.** C returns one value, so a multi-result extern would have
+  to mean a struct return, and that is an ABI question rather than a language one.
 
 ## 6. The type of a callable — the `Fn` trait
 

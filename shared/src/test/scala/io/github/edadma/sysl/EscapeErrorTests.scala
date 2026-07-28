@@ -8,106 +8,41 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
 
-  "a view that gets out is rejected when it" - {
-    "is returned" in {
-      err("""view() -> []int
-            |    var buf: [4]int
-            |    buf[0..<2]
-            |end view
-            |print(view().len)
-            |""".stripMargin) should include("is returned")
+  /** What promotion does **not** reach, and why each is a different question rather than the same
+   * one unfinished.
+   *
+   * `05 § What happens when a slice escapes` moves a local array to the heap when a view of it gets
+   * out. Both shapes below get a view out and neither has anywhere to move it to: the storage
+   * belongs to something the body did not declare. So the diagnostic that used to cover every
+   * escape now covers exactly these, and says which of the two it is.
+   */
+  "a view that gets out is still refused when the storage is not this body's to move" - {
+    // The caller laid the array out and passed a copy of it; moving it would mean copying it into a
+    // buffer on entry, which is a promotion of a *parameter* and is not what `05` specifies.
+    "the array is a parameter passed by value" in {
+      err("""take(a: [4]int) -> []int = a[0..<2]
+            |print(take([1, 2, 3, 4]).len)
+            |""".stripMargin) should include("not this body's to move")
     }
 
-    "is returned from a `return` in the middle" in {
-      err("""view(c: bool) -> []int
-            |    var buf: [4]int
-            |    if c then return buf[..]
-            |    buf[0..<0]
-            |end view
-            |print(view(true).len)
-            |""".stripMargin) should include("is returned")
+    // Moving a field means choosing between moving the field alone and moving the struct that holds
+    // it, which `05 § Deferred` names as unspecified — so it is left refused rather than guessed at.
+    "the array is a field of a local struct" in {
+      err("""struct Frame
+            |    cells: [4]int
+            |end Frame
+            |peek() -> []int
+            |    var f: Frame
+            |    f.cells[0..<2]
+            |end peek
+            |print(peek().len)
+            |""".stripMargin) should include("not this body's to move")
     }
 
-    "is returned inside a struct" in {
-      err("""struct Header
-            |    body: []u8
-            |end Header
-            |make() -> Header
-            |    var buf: [4]u8
-            |    Header(buf[..])
-            |end make
-            |print(make().body.len)
-            |""".stripMargin) should include("is returned")
-    }
-
-    "is returned by a function that only passed it along" in {
-      err("""pass(s: []int) -> []int = s
-            |leak() -> []int
-            |    var buf: [4]int
-            |    pass(buf[..])
-            |end leak
-            |print(leak().len)
-            |""".stripMargin) should include("is returned")
-    }
-
-    // A loop is an expression, so a `break` of a frame-backed slice out of a loop whose value is
-    // returned is the same escape as returning the slice directly — the break carries it out.
-    "is broken out of a loop that is returned" in {
-      err("""leak() -> []int
-            |    var buf: [4]int
-            |    for i in 0..<4
-            |        if i == 2 then break buf[..]
-            |    else buf[0..<0]
-            |end leak
-            |print(leak().len)
-            |""".stripMargin) should include("is returned")
-    }
-
-    "is a slice of a slice of a frame-local array" in {
-      err("""view() -> []int
-            |    var buf: [8]int
-            |    var s = buf[..]
-            |    s[1..<4]
-            |end view
-            |print(view().len)
-            |""".stripMargin) should include("is returned")
-    }
-
-    "reaches a local that is returned" in {
-      err("""leak() -> []int
-            |    var buf: [4]int
-            |    var s = buf[..]
-            |    var t = s
-            |    t
-            |end leak
-            |print(leak().len)
-            |""".stripMargin) should include("is returned")
-    }
-
-    "goes on the heap" in {
-      err("""struct Held
-            |    body: []int
-            |end Held
-            |stash() -> &Held
-            |    var buf: [4]int
-            |    var h: &Held = Held(buf[..])
-            |    h
-            |end stash
-            |print(stash().body.len)
-            |""".stripMargin) should include("is put on the heap")
-    }
-
-    "is handed to a callee that holds on to it" in {
-      err("""stash(dest: *[]int, s: []int)
-            |    *dest = s
-            |grab() -> usize
-            |    var buf: [4]int
-            |    var out: []int
-            |    stash(&out, buf[..])
-            |    out.len
-            |end grab
-            |print(grab())
-            |""".stripMargin) should include("holds on to it")
+    "the diagnostic points at the slice rather than at the function" in {
+      err("""take(a: [4]int) -> []int = a[0..<2]
+            |print(take([1, 2, 3, 4]).len)
+            |""".stripMargin) should include("1:29")
     }
   }
 
@@ -232,44 +167,6 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
 
   // The pointer has to be the route to *this* array. A local array beside a pointer to something
   // else is still a local array, and an element of a local array of arrays still belongs here.
-  "a local array is still local when" - {
-    "a pointer to something else is in scope" in {
-      err("""struct Box
-            |    a: [8]u8
-            |end Box
-            |view(b: *Box) -> []u8
-            |    var mine: [4]u8
-            |    mine[..]
-            |end view
-            |var b = Box([65u8; 8])
-            |print(view(&b).len)
-            |""".stripMargin) should include("is returned")
-    }
-
-    "the array is an element of a local array of arrays" in {
-      err("""view(i: usize) -> []u8
-            |    var grid: [2][4]u8
-            |    grid[i][..]
-            |end view
-            |print(view(0usize).len)
-            |""".stripMargin) should include("is returned")
-    }
-  }
-
-  // `05` gives the rule for a callee whose body is not here: assume it keeps everything, because
-  // nothing can tell whether the foreign side held on to what it was handed. An `extern` is that
-  // case made explicit, and it needs no new machinery — a name with no body is already the
-  // pessimistic one.
-  "an extern is assumed to keep whatever it is handed" in {
-    err("""extern take(s: []u8)
-          |use()
-          |    var buf: [4]u8
-          |    take(buf[0..<2])
-          |end use
-          |use()
-          |""".stripMargin) should include("is passed to 'take', which holds on to it")
-  }
-
   "a heap-backed view may still be handed to an extern" in {
     ir("""extern take(s: []u8)
          |use()
@@ -278,18 +175,6 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
          |end use
          |use()
          |""".stripMargin) should include("declare void @take({ ptr, ptr, i64 })")
-  }
-
-  // The tail is passed alongside the declared parameters rather than instead of them, so an
-  // ellipsis must not quietly excuse the argument that comes before it.
-  "an ellipsis does not excuse the parameters declared before it" in {
-    err("""extern take(s: []u8, ...)
-          |use()
-          |    var buf: [4]u8
-          |    take(buf[0..<2], 1)
-          |end use
-          |use()
-          |""".stripMargin) should include("is passed to 'take', which holds on to it")
   }
 
   "a recursive function converges rather than assuming the worst" in {

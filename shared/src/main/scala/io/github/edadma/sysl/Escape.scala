@@ -17,11 +17,29 @@ import scala.collection.mutable
  */
 object Escape {
 
-  /** Checks a whole program, returning every escape it finds as one rendered report — one per
-   * function body, since the first escape out of a frame is the one to fix and the rest of that
-   * body is usually the same mistake seen again.
+  /** Which local arrays each body must allocate on the heap rather than in its frame.
+   *
+   * An array is in here when a view of it gets out of the frame that declared it, and the answer
+   * to that is promotion rather than a diagnostic (`05 § What happens when a slice escapes`): the
+   * storage becomes an ARC buffer, the slice's owner points at it, and it lives exactly as long as
+   * the last view of it. Only arrays that are **both** sliced and escaped are here; one that is
+   * merely read, or whose views stay in the frame, keeps its stack slot.
+   *
+   * Keyed by function name, with `main`'s statements separate because they are not a function.
    */
-  def check(program: TProgram): Option[String] = new Escape(program).run()
+  case class Promotions(byFunc: Map[String, Set[String]], inMain: Set[String]) {
+    def apply(func: Option[String]): Set[String] =
+      func.fold(inMain)(byFunc.getOrElse(_, Set.empty))
+  }
+
+  object Promotions {
+    val none: Promotions = Promotions(Map.empty, Set.empty)
+  }
+
+  /** Analyzes a whole program: either the escapes that are *not* promotable, rendered as one
+   * report, or the promotions to make.
+   */
+  def check(program: TProgram): Either[String, Promotions] = new Escape(program).run()
 }
 
 private class Escape(program: TProgram) {
@@ -39,7 +57,7 @@ private class Escape(program: TProgram) {
    */
   private def kept(name: String, i: Int): Boolean = !funcs.contains(name) || keeps((name, i))
 
-  private def run(): Option[String] = {
+  private def run(): Either[String, Escape.Promotions] = {
     var changed = true
     while changed do
       changed = false
@@ -51,20 +69,28 @@ private class Escape(program: TProgram) {
 
     // With the summaries settled, the frame-backed views themselves are the question. Nothing
     // is seeded: a view that dies with the frame is one taken of an array the frame owns, and
-    // *here* returning one is an escape — the array is about to go away.
-    val bodies: List[(List[TStmt], Option[TExpr])] =
-      program.funcs.map(f => (f.body.stmts, f.body.result)) :+ (program.main, None)
+    // *here* returning one is the case promotion exists for — the array is about to go away, so
+    // the array moves to the heap rather than the program being refused.
+    val bodies: List[(Option[String], List[TStmt], Option[TExpr])] =
+      program.funcs.map(f => (Some(f.name), f.body.stmts, f.body.result)) :+ ((None, program.main, None))
 
-    val escapes =
-      bodies.flatMap { (stmts, result) =>
-        val walk = new Walk(Set.empty, returningEscapes = true)
+    val walks =
+      bodies.map { (who, stmts, result) =>
+        val walk = new Walk(Map.empty, returningEscapes = true, localArrays(stmts))
         walk.seed(stmts, result)
-        walk.escape
+        (who, walk)
       }
 
-    val all = borrowed ::: escapes
+    val refused = borrowed ::: walks.flatMap(_._2.escape)
 
-    if all.isEmpty then None else Some(Diagnostic.report(all))
+    if refused.nonEmpty then Left(Diagnostic.report(refused))
+    else
+      Right(
+        Escape.Promotions(
+          walks.collect { case (Some(n), w) if w.promoted.nonEmpty => n -> w.promoted.toSet }.toMap,
+          walks.collectFirst { case (None, w) => w.promoted.toSet }.getOrElse(Set.empty),
+        ),
+      )
   }
 
   /** A `Writer` is handed a **borrowed** view of the bytes to write, and that is the whole reason
@@ -111,70 +137,121 @@ private class Escape(program: TProgram) {
    * that is the difference `05` draws between keeping a thing and viewing it.
    */
   private def kepts(f: TFunc, param: String): Boolean = {
-    val walk = new Walk(Set(param), returningEscapes = false)
+    val walk = new Walk(Map(param -> View.unnamed), returningEscapes = false)
     walk.seed(f.body.stmts, f.body.result)
-    walk.escape.isDefined
+    walk.gotOut
+  }
+
+  /** What frame-owned storage a value may view: the local arrays it roots at by name, and whether
+   * it also views frame storage this pass cannot name.
+   *
+   * The distinction is what decides promotion from diagnostic. A view rooted at a plain local array
+   * has somewhere to move the storage to; one rooted at a field of a local struct, or at an array
+   * parameter the caller passed by value, does not — promoting the first would be `05 § Deferred`'s
+   * unspecified "promotion of aggregates", and the second is storage this frame was handed rather
+   * than storage it made.
+   */
+  private case class View(named: Set[String], anonymous: Boolean) {
+    def nonEmpty: Boolean  = named.nonEmpty || anonymous
+    def ++(o: View): View  = View(named ++ o.named, anonymous || o.anonymous)
+  }
+
+  private object View {
+    val none: View                = View(Set.empty, anonymous = false)
+    val unnamed: View             = View(Set.empty, anonymous = true)
+    def of(name: String): View    = View(Set(name), anonymous = false)
+    def any(vs: Iterable[View]): View = vs.foldLeft(none)(_ ++ _)
   }
 
   /** One function's worth of tracking: which of its locals may hold a view that dies with the
-   * frame, and the first place such a view gets out.
+   * frame, which arrays those views root at, and the first escape that has nowhere to be promoted.
    */
-  private class Walk(seeds: Set[String], returningEscapes: Boolean) {
+  private class Walk(seeds: Map[String, View], returningEscapes: Boolean, locals: Set[String] = Set.empty) {
 
     private var confined       = seeds
     var escape: Option[String] = None
+
+    /** The arrays this body must allocate on the heap. */
+    val promoted = mutable.Set.empty[String]
+
+    /** Whether any confined view left the frame at all, promotable or not. This is what a parameter
+     * summary asks — "does the callee let this outlive the call" is a yes/no, and the roots that
+     * answer promotion are not its question.
+     */
+    var gotOut = false
 
     /** Whether an expression may carry a view the frame outlives. A call is the conservative
      * case: a result that may view any argument is treated as viewing all of them, which costs
      * precision only for a function that both takes a stack-backed slice and returns an
      * unrelated fresh one.
      */
-    private def viewsFrame(e: TExpr): Boolean = carriesView(e.ty) && viewsFrameValue(e)
+    private def viewsFrame(e: TExpr): Boolean = views(e).nonEmpty
 
-    private def viewsFrameValue(e: TExpr): Boolean = e match
+    /** Which frame-owned storage a value may view. Answering with the *roots* rather than with a
+     * yes/no is the whole of what promotion needed from this pass: the escape sites already knew
+     * that something got out, and what they could not say was which array to move.
+     */
+    private def views(e: TExpr): View = if !carriesView(e.ty) then View.none else viewsValue(e)
+
+    private def viewsValue(e: TExpr): View = e match
       case TSlice(base, _, _, _, _) =>
         base.ty match
           // A view of a `*T` region is the programmer's problem, like every `*T` — it is
           // outside this analysis exactly as it is outside every other guarantee.
-          case _: Type.Array => !viaPointer(base)
-          case _             => viewsFrame(base)
-      case TLoad(name, _)       => confined(name)
-      case TCall(_, args, _)    => args.exists(viewsFrame)
-      case TVCall(_, _, args, _) => args.exists(viewsFrame)
-      case TStructNew(_, args)  => args.exists(viewsFrame)
-      case TStructInvCheck(v, _, _) => viewsFrame(v)
-      case TCheckedStore(store, _, _, _) => viewsFrame(store)
-      case TEnumNew(_, _, args) => args.exists(viewsFrame)
-      case TArrayLit(elems, _)  => elems.exists(viewsFrame)
-      case TArrayFill(v, _)     => viewsFrame(v)
+          case _: Type.Array => if viaPointer(base) then View.none else arrayRoot(base)
+          case _             => views(base)
+      case TLoad(name, _)       => confined.getOrElse(name, View.none)
+      case TCall(_, args, _)    => View.any(args.map(views))
+      case TVCall(_, _, args, _) => View.any(args.map(views))
+      case TStructNew(_, args)  => View.any(args.map(views))
+      case TStructInvCheck(v, _, _) => views(v)
+      case TCheckedStore(store, _, _, _) => views(store)
+      case TEnumNew(_, _, args) => View.any(args.map(views))
+      case TArrayLit(elems, _)  => View.any(elems.map(views))
+      case TArrayFill(v, _)     => views(v)
       // The storage a buffer form makes is its own and outlives every frame, so the view it yields
       // is never the frame's — but what it was filled *with* may still be, which is the same rule
       // the two array forms above follow and the same route out.
-      case TBufLit(elems, _)    => elems.exists(viewsFrame)
-      case TBufFill(v, _, _)    => viewsFrame(v)
-      case TField(r, _, _)      => viewsFrame(r)
-      case TIndex(r, _, _)      => viewsFrame(r)
-      case TBytes(r)            => viewsFrame(r)
+      case TBufLit(elems, _)    => View.any(elems.map(views))
+      case TBufFill(v, _, _)    => views(v)
+      case TField(r, _, _)      => views(r)
+      case TIndex(r, _, _)      => views(r)
+      case TBytes(r)            => views(r)
       // `str(s)` on a string is the identity, so it inherits its argument's view; on any other
-      // type it allocates a fresh buffer, and that argument carries no view for `viewsFrame` to
-      // find, so the one rule covers both.
-      case TStr(a)              => viewsFrame(a)
-      case TStore(_, v, _)      => viewsFrame(v)
-      case TIf(_, t, e, _)      => blockValue(t) || e.exists(blockValue)
-      case TMatch(_, arms, _)   => arms.exists(a => blockValue(a.body))
+      // type it allocates a fresh buffer, and that argument carries no view for `views` to find,
+      // so the one rule covers both.
+      case TStr(a)              => views(a)
+      case TStore(_, v, _)      => views(v)
+      case TIf(_, t, e, _)      => blockValue(t) ++ View.any(e.map(blockValue))
+      case TMatch(_, arms, _)   => View.any(arms.map(a => blockValue(a.body)))
       // A loop's value comes from its `break`s and its `else`, so it views the frame when any of
       // those do — a `break` of a frame-backed slice out of the loop is the same escape route as
       // returning one.
-      case w: TWhile            => loopViewsFrame(w.body, w.elseBlock)
-      case f: TFor              => loopViewsFrame(f.body, f.elseBlock)
-      case e: TForEach          => loopViewsFrame(e.body, e.elseBlock)
-      case i: TIterate          => loopViewsFrame(i.body, i.elseBlock)
-      case _                    => false
+      case w: TWhile            => loopViews(w.body, w.elseBlock)
+      case f: TFor              => loopViews(f.body, f.elseBlock)
+      case e: TForEach          => loopViews(e.body, e.elseBlock)
+      case i: TIterate          => loopViews(i.body, i.elseBlock)
+      case _                    => View.none
 
-    private def blockValue(b: TBlock): Boolean = b.result.exists(viewsFrame)
+    /** The array a slice's base names, when that is a local of this body.
+     *
+     * An **index** step is walked through: an element of a local array of arrays is part of that
+     * array's storage, so moving the whole thing moves the element with it. A **field** step is
+     * not, because the storage belongs to a struct and moving it would be `05 § Deferred`'s
+     * unspecified "promotion of aggregates" — the choice between moving the field alone and moving
+     * the struct has not been made. An array the caller passed **by value** is storage this frame
+     * was handed rather than storage it made, so it is not this body's to move either. Both of
+     * those come back unnamed and are reported as they always were.
+     */
+    private def arrayRoot(base: TExpr): View = base match
+      case TLoad(name, _) if locals(name) => View.of(name)
+      case TIndex(r, _, _)                => arrayRoot(r)
+      case _                              => View.unnamed
 
-    private def loopViewsFrame(body: List[TStmt], elseBlock: Option[TBlock]): Boolean =
-      ownBreakValues(body).exists(viewsFrame) || elseBlock.exists(blockValue)
+    private def blockValue(b: TBlock): View = View.any(b.result.map(views))
+
+    private def loopViews(body: List[TStmt], elseBlock: Option[TBlock]): View =
+      View.any(ownBreakValues(body).map(views)) ++ View.any(elseBlock.map(blockValue))
 
     /** Whether the storage an array place names is reached through a raw pointer, and so is not
      * this frame's to lose. The question is about the *root* of the place rather than about its
@@ -194,12 +271,18 @@ private class Escape(program: TProgram) {
       var changed = true
       while changed do
         changed = false
+
+        def bind(name: String, v: View): Unit =
+          val had = confined.getOrElse(name, View.none)
+          val now = had ++ v
+          if now != had then
+            confined += name -> now
+            changed = true
+
         forEachStmt(stmts) {
-          case TVarDecl(name, _, init) if !confined(name) && viewsFrame(init) =>
-            confined += name; changed = true
-          case TExprStmt(TStore(TLoad(name, _), v, _)) if !confined(name) && viewsFrame(v) =>
-            confined += name; changed = true
-          case _ =>
+          case TVarDecl(name, _, init)                  => bind(name, views(init))
+          case TExprStmt(TStore(TLoad(name, _), v, _))  => bind(name, views(v))
+          case _                                        =>
         }
 
       check(stmts)
@@ -217,7 +300,7 @@ private class Escape(program: TProgram) {
     }
 
     private def returned(v: TExpr): Unit =
-      if returningEscapes && viewsFrame(v) then report(v, "is returned")
+      if returningEscapes && viewsFrame(v) then gets_out(v, "is returned")
       else escaping(v)
 
     /** Walks an expression for the places a confined view stops being confined: the heap, a
@@ -225,16 +308,16 @@ private class Escape(program: TProgram) {
      */
     private def escaping(e: TExpr): Unit = {
       e match
-        case TBox(v, _) => if viewsFrame(v) then report(v, "is put on the heap")
+        case TBox(v, _) => if viewsFrame(v) then gets_out(v, "is put on the heap")
 
         case TStore(place, v, _) =>
           place match
             case _: TLoad => ()
-            case _        => if viewsFrame(v) then report(v, "is stored somewhere the frame does not own")
+            case _        => if viewsFrame(v) then gets_out(v, "is stored somewhere the frame does not own")
 
         case TCall(name, args, _) =>
           for (a, i) <- args.zipWithIndex do
-            if viewsFrame(a) && kept(name, i) then report(a, s"is passed to '$name', which holds on to it")
+            if viewsFrame(a) && kept(name, i) then gets_out(a, s"is passed to '$name', which holds on to it")
 
         // Which body a trait object's call reaches is decided at run time, so there is no one
         // summary to consult — the conservative answer is the only sound one, exactly as it is for
@@ -242,26 +325,46 @@ private class Escape(program: TProgram) {
         // because every implementation of one has been checked to borrow rather than keep.
         case TVCall(recv, _, args, _) if !borrows(recv.ty) =>
           for a <- args do
-            if viewsFrame(a) then report(a, "is passed through a trait object, which may hold on to it")
+            if viewsFrame(a) then gets_out(a, "is passed through a trait object, which may hold on to it")
 
         case _ =>
 
       children(e).foreach(escaping)
     }
 
-    /** Reports the escape against the expression that causes it, so the caret lands on the slice
-     * that leaves the frame rather than on the function as a whole.
+    /** A confined view has left the frame. Where it roots at arrays this body declared, they are
+     * promoted — the storage moves to the heap and the program is unchanged otherwise (`05 § What
+     * happens when a slice escapes`). Where it roots at storage that cannot be moved, the escape is
+     * reported against the expression that causes it, so the caret lands on the slice that leaves
+     * the frame rather than on the function as a whole.
      */
-    private def report(at: TExpr, how: String): Unit =
-      if escape.isEmpty then
+    private def gets_out(at: TExpr, how: String): Unit = {
+      val v = views(at)
+
+      promoted ++= v.named
+      gotOut = true
+
+      if v.anonymous && escape.isEmpty then
         escape = Some(
           Diagnostic.render(
-            s"a slice of an array this frame owns $how, so it would outlive the array — " +
-              "declare the storage as a '[]T', which makes a buffer of its own and owns it, " +
+            s"a slice of an array this frame owns $how, so it would outlive the array, and the " +
+              "storage is not this body's to move — it is a field of a value, or an array a caller " +
+              "passed by value. Declare it as a '[]T', which makes a buffer of its own and owns it, " +
               "or as a '&[N]T' where the length is fixed",
             at.pos,
           ),
         )
+    }
+  }
+
+  /** The arrays a body declares for itself, which are the ones it may move to the heap. A `[N]T`
+   * parameter is storage the caller laid out, so it is deliberately not here.
+   */
+  private def localArrays(stmts: List[TStmt]): Set[String] = {
+    val found = mutable.Set.empty[String]
+
+    forEachStmt(stmts) { case TVarDecl(name, _: Type.Array, _) => found += name }
+    found.toSet
   }
 
   // --- tree walking ----------------------------------------------------------------------

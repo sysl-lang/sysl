@@ -16,7 +16,7 @@ import scala.collection.mutable
  * storage that is laid down before any block exists. What stays here is the spine — the module
  * assembly, statements, and the expression dispatch the traits call back into.
  */
-class Codegen private (program: TProgram)
+class Codegen private (program: TProgram, promotions: Escape.Promotions)
     extends ControlFlowEmitter with VtableEmitter with WriterEmitter with StaticEmitter {
 
   // --- module --------------------------------------------------------------------------
@@ -208,6 +208,7 @@ class Codegen private (program: TProgram)
    */
   private def genMain(vals: List[TVal], stmts: List[TStmt]): String = {
     startFunction()
+    promoted = promotions(None)
     pushTemps()
     pushOwned()
 
@@ -351,6 +352,7 @@ class Codegen private (program: TProgram)
 
   private def genFunction(f: TFunc): String = {
     startFunction()
+    promoted = promotions(Some(f.name))
     pushTemps()
     pushOwned()
     ensures = f.ensures
@@ -451,6 +453,20 @@ class Codegen private (program: TProgram)
     // nothing to keep afterwards. Every later read of the name yields nothing in the same way.
     case TVarDecl(_, ty, init) if Type.zeroSized(ty) =>
       genExpr(init)
+
+    // An array a view of which gets out of this frame lives in a buffer instead of a slot, and
+    // that is the whole of the difference: the name still means the address of the storage, so the
+    // store below and every later use are the ones an unpromoted array gets. What the buffer adds
+    // is an owner for the views to count against, and a release when the name goes out of scope.
+    case TVarDecl(name, ty @ Type.Array(n, elem), init) if promoted(name) =>
+      val v           = genExpr(init)
+      val (box, data) = genBuffer(elem, n.toString)
+
+      promotedBoxes(name) = box
+      emit(s"%$name.addr = getelementptr ${elem.llvm}, ptr $data, i64 0")
+      retainValue(ty, v)
+      emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+      ownBox(name, box, elem)
 
     case TVarDecl(name, ty, init) =>
       val v = genExpr(init)
@@ -980,5 +996,6 @@ class Codegen private (program: TProgram)
 object Codegen {
 
   /** Lowers a typed program to an LLVM IR module. */
-  def generate(program: TProgram): String = new Codegen(program).gen()
+  def generate(program: TProgram, promotions: Escape.Promotions = Escape.Promotions.none): String =
+    new Codegen(program, promotions).gen()
 }

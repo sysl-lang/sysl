@@ -128,6 +128,47 @@ the assignment yields `int`). The compiler catches it with no grammar ban needed
 assignment-expressions would only cost the useful capture idioms — Python did exactly that
 and had to reintroduce them via the `:=` walrus operator.
 
+### Several places at once — `a, b = b, a`
+
+A comma-separated list of places may be assigned a comma-separated list of values:
+
+```
+a, b = b, a                              // a swap, with no temporary to name
+xs[i], xs[j] = xs[j], xs[i]              // the one every sort writes
+lo, hi, mid = 0, n, n / 2
+p.x, p.y = p.y, p.x
+```
+
+**The right side is evaluated in full, into temporaries, before any assignment happens.** That is
+the entire content of the feature: it is what makes the first line a swap rather than two
+statements that leave both variables holding `b`. The places are then written left to right.
+
+**A place's own subexpressions are evaluated exactly once, before the assignments.** In `xs[f()],
+xs[g()] = xs[g()], xs[f()]` each of `f` and `g` runs once, and the effects happen in written order:
+the two indices on the left are computed, then the two values on the right, then the stores. Without
+that rule the form would be a way of accidentally calling something twice.
+
+**Every left element is an ordinary assignable place** — a local, a field, an element, a
+dereference — the same set a single `=` accepts, and the types must match pairwise. The two sides
+must be the same length, which is a compile-time check.
+
+**It is a statement, not an expression**, and this is the decision that keeps the feature small. A
+single assignment yields the assigned value, which is what lets `a = b = c = 0` chain; a
+multi-assignment would have to yield *several* values, and the only thing that could be is a tuple.
+Sysl has none (`§ Open j`), and this form exists precisely so that the useful nine-tenths of what
+tuples are reached for costs no type at all. So a multi-assignment does not nest, does not appear in
+a condition, and has no value to discard.
+
+**Compound forms do not multi-assign.** `a, b += 1, 2` is refused: a compound assignment reads its
+place before writing it, and the rule above says every right-hand value is computed before any
+write — the two together are a sentence nobody should have to work out. Write the two statements.
+
+Counted values need no special care and it is worth saying why. Each right-hand value is evaluated
+and retained into its temporary before any store happens, so swapping two `&T`s never lets either
+count reach zero in between — the transient the naive `t = a; a = b; b = t` shape has to be careful
+about does not arise, because there is no window in which a reference has been overwritten but its
+replacement has not been taken.
+
 ### Statement position discards a block's value
 
 Every capture idiom the rule above exists for has the assignment **inside a larger expression**:
@@ -703,3 +744,44 @@ work:
   started compiling, and nothing written against the old rule changed meaning.
 - ~~Final scalar-type table and operator-precedence table~~ — **done**, see
   `01-scalar-types-and-operators.md`.
+- **j. Tuples — anonymous product types. DECIDED: not taken, because both things they were wanted
+  for are now had without them.** Sysl has no tuples, and until this was written that was an absence
+  rather than a decision (`14 §7` mentions it only in passing). The two motivating uses were the
+  swap, which is §2 above, and **multiple return values**, which is `12 §5b` — a function may
+  declare a *result list*, and a list is never a value, so nothing can store one, hold one in an
+  `Option`, or ask what its type is. What follows is why that split is the right one and not merely
+  the cheap one.
+
+  What a tuple would cost, in the order the questions bite:
+
+  - **Coherence has no answer for an anonymous type.** `02`'s orphan rule is that an `impl` lives
+    with its trait or with its type. A tuple type has no declaration and no home module, so
+    `impl Eq for (int, int)` is exactly the chapter's *case with no home*. Either tuples come with
+    built-in structural `Eq` / `Ord` / `Display` — a second mechanism running beside the catalog,
+    which is the thing `14` exists to avoid — or they get none of it, and a tuple is a value you
+    cannot compare or print. Neither is obviously right, and this is the hard part.
+  - **The one-element wart.** `(x)` is a parenthesized expression in every language that has both,
+    so a one-tuple needs a spelling of its own — Python's `(x,)`. A language that has just spent §2
+    refusing to let a comma mean two different things should not adopt a comma that means a type.
+  - **It competes with a struct, and does not clearly win.** `guide/datetime` returns
+    `Civil { year, month, day }` from its civil-from-days conversion, and that reads *better* than
+    `(int, int, int)` would, because the names say which number is which. A tuple is at its best
+    where the components are obviously ordered and few — `divmod` — and at its worst exactly where
+    multiple returns are most common, which is where the components are several and alike.
+
+  **The resolution, and it is the same move twice.** A tuple is wanted as a *carrier*, not as a
+  value with an identity: `a, b = b, a` wants two assignments to happen together, and
+  `val q, r = divmod(7, 2)` wants two results to come back together. Neither needs the carrier to
+  exist afterwards. So §2 makes the first a statement form and `12 §5b` makes the second a signature
+  form, and because a result list is never a value the coherence question above is never asked —
+  there is no type for an `impl` to have no home for. What is genuinely given up is a tuple that can
+  be *stored*: `Option[(int, int)]` is unwritable, and a program that wants one writes a struct.
+  That is the trade, taken deliberately, and the struct is often the better reading anyway for the
+  reason in the third bullet.
+
+  `out` parameters (`§ Open k`) were the other candidate for multiple returns and are no longer
+  needed for it; they remain open only for the separate case of a caller-supplied buffer.
+
+- **k. `out` parameters.** The other way to return more than one value without a new type: a
+  parameter the callee assigns and the caller reads, with no `*` at either end. Recorded beside
+  tuples because the two are alternative answers to one question and should be decided together.

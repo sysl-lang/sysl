@@ -1,12 +1,15 @@
 # Escape Analysis
 
-**Status:** decided, and implemented except for promotion. This specifies the analysis `03`
-calls for when it gives slices an owner word: which escapes are detected, how the answer
-crosses a call boundary, and what happens when something escapes that has nothing to keep it
-alive. What runs today finds the escapes and reports them; the heap promotion described below
-does not exist yet, so every escape is a diagnostic, which is the `no alloc` behaviour applied
-everywhere. The approximations it takes are the ones the *Deferred* section at the end
-permits.
+**Status:** decided and implemented, **promotion included**. This specifies the analysis `03`
+calls for when it gives slices an owner word: which escapes are detected, how the answer crosses a
+call boundary, and what happens when something escapes that has nothing to keep it alive. A local
+array a view of which gets out is now moved to the heap as described below, so the programs that
+used to be refused compile and run. What is still a diagnostic is storage the body did not declare —
+an array a caller passed **by value**, and an array that is a **field** of a value, the second being
+the *Deferred* section's unspecified promotion-of-aggregates. Under `no alloc` every promotion
+becomes an error again, which is the paragraph below; capabilities are not built, so today every
+promotable escape promotes. `--explain-escapes` is specified here and not yet built. The
+approximations the analysis takes are the ones *Deferred* permits.
 
 ## What it is for
 
@@ -96,6 +99,21 @@ parameter position.
 instead of a stack slot, the slice's `owner` points at it, and the storage lives exactly as
 long as the last slice of it. Nothing else about the program changes; the promotion is the
 compiler doing what the programmer would otherwise have had to do by declaring `&[64]u8`.
+
+**The array keeps its type, and only its storage moves.** A promoted `[64]u8` is still a `[64]u8`:
+its length is still a compile-time constant, it is still a value that copies on assignment, and
+every index, store and copy is emitted exactly as an unpromoted one's is. What changes is where the
+name's address points — into a buffer rather than into the frame — and that a view of it carries
+that buffer as its owner where an unpromoted array's view carries `null`. Rewriting the declaration
+into a `[]T` would have been the other way to do it and is **wrong**: it changes the type at every
+use, and an array is a value type where a view is not.
+
+**Which array moves.** The analysis answers with the *root* of the escaping view, and an index step
+is walked through while a field step is not: an element of a local array of arrays is part of that
+array's storage, so the whole array moves and the element goes with it, whereas a field belongs to a
+struct and moving it would be the *Deferred* section's unspecified choice between moving the field
+and moving the struct. An array a caller passed **by value** is not this body's to move either — it
+is the caller's layout — so both of those stay diagnostics, and the message says which it is.
 
 Only arrays that are *both* sliced *and* escaped are promoted. An array that is only read, or
 whose slices stay in the frame, keeps its stack slot.
@@ -209,8 +227,10 @@ right rather than as a field.
 ## Deferred
 
 - **Escaping closures** are stated in `capabilities.md` as heap-boxed and are governed by this
-  same analysis, but the closure design itself is not written. When it lands, the per-parameter
-  "does the callee keep it" bit should cover captured closures with no separate mechanism.
+  same analysis; the closure design is now written (`12 §5–§8`, and `§5a` for the named form) and
+  not yet built. When it lands, the per-parameter "does the callee keep it" bit should cover
+  captured closures with no separate mechanism, and the buffer machinery promotion uses is the
+  representation an escaping closure needs.
 - **Precision of the result summary.** "Which parameters the result may view" is a set; the
   first implementation may collapse it to "any parameter," which costs precision only for a
   function that both takes a stack-backed slice and returns an unrelated fresh one. Refine if

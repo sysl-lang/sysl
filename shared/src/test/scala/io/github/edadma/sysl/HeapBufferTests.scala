@@ -385,18 +385,22 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // The storage a buffer makes is its own, but what it is *filled with* may still be the frame's,
     // and that is the same escape it always was. Making the elements buffers of their own is now
     // one of the two ways out, which is what the diagnostic says.
-    "a buffer filled with views of this frame, since the storage moved and the views did not" in {
-      val message = err(
+    // The buffer's own storage was always its own; what used to escape was the *array* the views
+    // in it pointed at. That array is a plain local, so it moves to the heap with them (`05`) and
+    // the whole thing outlives the frame together.
+    "a buffer filled with views of this frame takes the array with it" in {
+      val src =
         """leak() -> [][]u8
           |    var local: [4]u8
+          |    local[0usize] = 68u8
           |    var xs: [][]u8 = [local[..]; 2]
           |    xs
           |end leak
-          |print(leak().len)""".stripMargin
-      )
+          |var xs = leak()
+          |print(xs.len, str(char(xs[0usize][0usize])), str(char(xs[1usize][0usize])))""".stripMargin
 
-      message should include("would outlive the array")
-      message should include("declare the storage as a '[]T'")
+      run(src) shouldBe "2 D D\n"
+      ir(src) should include("call ptr @malloc")
     }
 
     "while the same function keeps its own storage and returns it" in {

@@ -123,7 +123,20 @@ trait Emitter {
     owned = Nil
     genLoops = Nil
     scratch = mutable.HashMap.empty
+    promoted = Set.empty
+    promotedBoxes = mutable.HashMap.empty
   }
+
+  /** The local arrays this body allocates on the heap rather than in its frame, decided by the
+   * escape analysis (`05`), and the buffer each one ended up in.
+   *
+   * A promoted array keeps its `[N]T` type and only its storage moves, so `%name.addr` is the
+   * buffer's data pointer instead of an `alloca` and every index, store and copy is emitted exactly
+   * as it was. What the box is needed for is the one thing that differs: a slice of the array names
+   * it as its owner, where a frame-backed array has none.
+   */
+  protected var promoted: Set[String]                 = Set.empty
+  protected var promotedBoxes: mutable.HashMap[String, String] = mutable.HashMap.empty
 
   /** One stack slot per LLVM type per function, for the type punning a union needs: a value goes
    * in written as one type and comes back out read as another. Sharing the slot is safe because
@@ -191,7 +204,7 @@ trait Emitter {
    * gets written at the moment it is first asked for.
    */
   protected def inFunction(header: String)(gen: => Unit): String = {
-    val saved = (prologue, body, temp, label, terminated, tempStack, owned, scratch)
+    val saved = (prologue, body, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes)
 
     startFunction()
     gen
@@ -199,6 +212,7 @@ trait Emitter {
 
     prologue = saved._1; body = saved._2; temp = saved._3; label = saved._4
     terminated = saved._5; tempStack = saved._6; owned = saved._7; scratch = saved._8
+    promoted = saved._9; promotedBoxes = saved._10
     text
   }
 

@@ -165,17 +165,18 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
     }
 
     "an escape error points at the slice that leaves the frame" in {
+      // The vehicle is an array **parameter**, since a local one is promoted rather than reported
+      // now (`05`). What is being checked is the caret, not the rule.
       val src =
         """sum(bytes: []u8) -> int = 0
           |
-          |scratch() -> []u8
-          |    var s: [4]u8
+          |scratch(s: [4]u8) -> []u8
           |    s[..]
           |""".stripMargin
       val out = diag(src)
 
       out should include("would outlive the array")
-      out should include("--> t.sysl:5:6")
+      out should include("--> t.sysl:4:6")
     }
 
     "an error about a prelude type still quotes the user's file" in {
@@ -358,8 +359,7 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
 
     "caps escape errors the same way" in {
       val funcs = (1 to 7).map { n =>
-        s"""f$n() -> []u8
-           |    var a$n: [4]u8
+        s"""f$n(a$n: [4]u8) -> []u8
            |    a$n[..]
            |""".stripMargin
       }.mkString("\n")
@@ -446,18 +446,16 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       val src =
         """sum(bytes: []u8) -> int = 0
           |
-          |one() -> []u8
-          |    var a: [4]u8
+          |one(a: [4]u8) -> []u8
           |    a[..]
           |
-          |two() -> []u8
-          |    var b: [4]u8
+          |two(b: [4]u8) -> []u8
           |    b[..]
           |""".stripMargin
       val out = diag(src)
 
       count(out) shouldBe 2
-      at(out) shouldBe List(5, 9)
+      at(out) shouldBe List(4, 7)
     }
   }
 

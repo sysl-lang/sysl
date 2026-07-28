@@ -318,6 +318,21 @@ trait ArcEmitter extends Emitter {
   protected def ownSlot(name: String, ty: Type): Unit =
     if containsRef(ty) then owned.head += ((s"%$name.addr", ty))
 
+  /** Registers the buffer a promoted array lives in, so the scope that declared it gives back its
+   * share on the way out. A buffer is what a `&T` points at, so it is registered as one and the
+   * ordinary release path emits the `arc.release` — the only reason it needs a slot of its own is
+   * that everything in `owned` is a place to load from rather than a value.
+   *
+   * The count is what makes promotion work: a view of the array retains this box when it is
+   * returned or stored, so the release below takes the declaration's share and the storage outlives
+   * the frame exactly as long as some view of it does.
+   */
+  protected def ownBox(name: String, box: String, elem: Type): Unit = {
+    emitAlloca(s"%$name.box", "ptr")
+    emit(s"store ptr $box, ptr %$name.box")
+    owned.head += ((s"%$name.box", Type.Ref(elem, false)))
+  }
+
   /** Emits the releases for the innermost scope without popping it — the guard-failure path out
    * of a match arm, where the bindings have been made but the arm is not taken.
    */
