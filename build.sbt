@@ -57,7 +57,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
         "-language:existentials",
         "-language:dynamics",
       ),
-    libraryDependencies += "org.scalatest" %%% "scalatest" % "3.2.19" % "test",
+    libraryDependencies += "org.scalatest" %%% "scalatest" % "3.2.20" % "test",
     libraryDependencies ++= Seq(
       "com.github.scopt"         %%% "scopt"                    % "4.1.0",
       "org.scala-lang.modules"   %%% "scala-parser-combinators" % "2.4.0",

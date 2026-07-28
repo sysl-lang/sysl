@@ -20,9 +20,17 @@ trait Literals extends TypeResolution {
       case None =>
         expected match
           case Some(i: Type.Integer) => i
-          case _                     => Type.Int
+          // A type **parameter**, during the definition-time pass of `14 §4`. It is opaque, so there
+          // is no width to check against and no representation to pick — but it is still the type
+          // the literal has, since what the instantiation makes of `T` is what the literal is read
+          // as when the body is lowered. Taking `int` instead would make the `1` in a `[T: Sub]`
+          // body's `x - 1` ask for `Sub[int]` where what the body means is `T`'s own subtraction.
+          case Some(a: Type.Abstract) => a
+          case _                      => Type.Int
 
-    if !Type.fits(value, ty) then err(s"the literal $value does not fit ${show(ty)}")
+    ty match
+      case i: Type.Integer if !Type.fits(value, i) => err(s"the literal $value does not fit ${show(i)}")
+      case _                                       =>
 
     TIntLit(value, ty)
   }
@@ -40,6 +48,7 @@ trait Literals extends TypeResolution {
       case None =>
         expected match
           case Some(f: Type.Floating) => f
+          case Some(a: Type.Abstract) => a
           case _                      => Type.Real
 
     TFloatLit(hexDouble(text), ty)

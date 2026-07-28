@@ -858,6 +858,9 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("'<' needs matching types, got M and int")
     }
 
+    // A type that implements the operator's trait, but not at this pair of operands, is told which
+    // trait the pair would need — advice to write an implementation, rather than the older advice
+    // to change the operands, which is not the only way out now that a trait takes the pair.
     "compound assignment still needs the right operand to agree" in {
       err(
         """struct M
@@ -866,7 +869,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
           |var a = M(1)
           |a += 2""".stripMargin
-      ) should include("'+' needs matching types, got M and int")
+      ) should include("'+' between M and int needs 'Add[int]'")
     }
 
     "an operator on a user type with no impl is not defined" in {
@@ -885,7 +888,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |impl Add for M
           |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
           |var a = M(1) + 2""".stripMargin
-      ) should include("'+' needs matching types")
+      ) should include("'+' between M and int needs 'Add[int]' — it implements 'Add[M]'")
     }
 
     // Member lookup finds an inherent member before it asks about a membership, so an `impl` of

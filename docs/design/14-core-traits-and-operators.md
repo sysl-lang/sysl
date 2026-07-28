@@ -3,7 +3,9 @@
 **Status:** decided, and **§1–§6 are implemented** — `Self`, the whole catalog, the one dispatch
 rule, definition-checked bounds on both method calls and operators, the compiler-provided scalar
 memberships, `print`/`str` requiring `Display`, and every renderer honouring the specifier it is
-handed. `§8 b`, `§8 d`, and `§8 e` settled on the way, leaving `§8 a` and `§8 c` — neither of which
+handed. The ten binary arithmetic traits now take the right-hand type as a parameter defaulting to
+`Self`, so an operator dispatches on the **pair** (`§7`). `§8 b`, `§8 d`, and `§8 e` settled on the
+way, leaving `§8 a` and `§8 c` — neither of which
 is about this chapter's own surface. This is the concrete spec for three things the earlier chapters
 *decided* but left unbuilt, because all three turned on the same missing layer:
 
@@ -63,14 +65,17 @@ is the piece `02` and `08` needed before an operator trait could be written at a
 like `+` is homogeneous (`Self + Self -> Self`), and only `Self` can say that in a trait.
 
 **No associated types.** Rust's `Add` carries an associated `type Output`, so `+` may return a
-type other than the operands'. sysl does not: an operator trait is `Self`-homogeneous, and its
-result type *is* `Self`. This is not a loss the target code feels — the existing scalar rule is
-already exactly this: **both operands of a binary operator have the same type, and no operator
-promotes** (`01`). `u8 + u8 -> u8`, never `-> u16`. Making the operator traits `Self`-only is
-therefore not a simplification the language pays for later; it is the *same rule the scalars
-already obey*, lifted to user types. Associated types remain deferred (`02` open item); the one
-operator that genuinely needs a second type — `Index`, whose element differs from the container —
-waits on them (`§7`).
+type other than the operands'. sysl does not: an operator trait's **result** is `Self`. This is not
+a loss the target code feels — the existing scalar rule is already exactly this: **no operator
+promotes** (`01`). `u8 + u8 -> u8`, never `-> u16`. Associated types remain deferred (`02` open
+item); the one operator that genuinely needs a second type — `Index`, whose element differs from
+the container — waits on them (`§7`).
+
+The **operands** are a separate question, and it was answered separately. A binary arithmetic trait
+takes the right-hand type as a parameter defaulting to `Self` (`§7`), so `add(self, rhs: Rhs) ->
+Self` is homogeneous wherever nothing says otherwise and `Vec3 * f64` is writable where something
+does. The scalars are homogeneous by rule, not by the shape of the trait: `01`'s operator table is
+what makes an `int` a member of `Mul[int]` and of no other `Mul`.
 
 ## 2. The core trait catalog
 
@@ -78,29 +83,35 @@ These traits are **library traits with compiler-known meaning**: the standard li
 them (or will), the compiler maps each operator token to one, and the built-in scalar types are
 given their impls by the compiler (`§5`). A user type opts in with an ordinary `impl`.
 
-### Arithmetic and bitwise — `Self`-homogeneous, one method each
+### Arithmetic and bitwise — one method each, over a pair of types
 
 | Trait | Method | Operator |
 |---|---|---|
-| `Add` | `add(self, rhs: Self) -> Self` | `+` |
-| `Sub` | `sub(self, rhs: Self) -> Self` | `-` (binary) |
-| `Mul` | `mul(self, rhs: Self) -> Self` | `*` |
-| `Div` | `div(self, rhs: Self) -> Self` | `/` |
-| `Rem` | `rem(self, rhs: Self) -> Self` | `%` |
-| `BitAnd` | `bitand(self, rhs: Self) -> Self` | `&` (binary) |
-| `BitOr` | `bitor(self, rhs: Self) -> Self` | `\|` |
-| `BitXor` | `bitxor(self, rhs: Self) -> Self` | `^` |
-| `Shl` | `shl(self, rhs: Self) -> Self` | `<<` |
-| `Shr` | `shr(self, rhs: Self) -> Self` | `>>` |
+| `Add[Rhs = Self]` | `add(self, rhs: Rhs) -> Self` | `+` |
+| `Sub[Rhs = Self]` | `sub(self, rhs: Rhs) -> Self` | `-` (binary) |
+| `Mul[Rhs = Self]` | `mul(self, rhs: Rhs) -> Self` | `*` |
+| `Div[Rhs = Self]` | `div(self, rhs: Rhs) -> Self` | `/` |
+| `Rem[Rhs = Self]` | `rem(self, rhs: Rhs) -> Self` | `%` |
+| `BitAnd[Rhs = Self]` | `bitand(self, rhs: Rhs) -> Self` | `&` (binary) |
+| `BitOr[Rhs = Self]` | `bitor(self, rhs: Rhs) -> Self` | `\|` |
+| `BitXor[Rhs = Self]` | `bitxor(self, rhs: Rhs) -> Self` | `^` |
+| `Shl[Rhs = Self]` | `shl(self, rhs: Rhs) -> Self` | `<<` |
+| `Shr[Rhs = Self]` | `shr(self, rhs: Rhs) -> Self` | `>>` |
 | `Neg` | `neg(self) -> Self` | `-` (unary) |
 | `Not` | `not(self) -> Self` | `~` |
+
+The parameter defaults to `Self` (`10 §3`), so the homogeneous reading is what every one of these
+means where nothing says otherwise: `impl Mul for Point` is `impl Mul[Point] for Point`, and
+`[T: Mul]` asks for `Mul[T]`. Writing an argument is what asks for something else — `§7` has the
+case that wanted it, and what it is still short of.
 
 The compound-assignment forms (`+=`, `&=`, …) are **not** separate traits: `a += b` is defined
 as `a = a + b` and so requires exactly the trait `+` requires. There is no `AddAssign`.
 
-The shift traits keep the `Self` right-hand type for symmetry with the scalar rule that the shift
-amount takes the shifted value's type (`01`). A heterogeneous shift is still written with an
-explicit conversion, exactly as it is for scalars.
+The shifts default like everything else, so a scalar's shift amount still takes the shifted value's
+type (`01`) and a heterogeneous shift between scalars is still written with an explicit conversion.
+A *user* type may name a different shift-amount type, which is the same latitude the other eight
+rows have and costs the scalars nothing.
 
 ### Equality and ordering — two traits, the Swift split
 
@@ -286,7 +297,9 @@ difference between a scalar, a user type, and a bounded type parameter is only *
 comes from*, never the rule:
 
 `a ⊕ b`, for an operator `⊕` mapped to trait `Op` with method `m`, means `Op::m(a, b)`, and it
-type-checks iff the type of `a` (which must equal the type of `b`) satisfies `Op`. Then:
+type-checks iff the type of `a` satisfies `Op` **at the type of `b`** — `Op[B]` for a trait that
+takes a right-hand type, and `Op` for the two comparisons and the two prefix operators, which take
+none and so require the two sides to be the one type. Then:
 
 - **Built-in scalar (`int`, `f64`, …).** The scalars satisfy the operator traits by
   compiler-provided impl (`§5`), and codegen keeps emitting the **native machine instruction** —
@@ -410,6 +423,12 @@ These memberships change no codegen: a scalar operator still lowers to its nativ
 (`§3`). Their sole job is to make the type system agree that a scalar satisfies the bound a
 generic asks for, so `sum(3, 4)` and `sum(3.0, 4.0)` both instantiate `sum[T: Add]`.
 
+**They are homogeneous**, which is `01`'s rule and not a limitation of the mechanism: an `int` is
+`Mul[int]` and no other `Mul`, because no scalar operator promotes. A scalar therefore keeps its
+instruction whatever an `impl` written elsewhere might say — `impl Mul[Complex] for f64` does not
+make `2.0 * c` mean anything, and `c * 2.0` is how a program writes it. A **transparent** subtype is
+its base's member the same way it is its base's operand, so an `Age` over `int` is `Mul[Age]`.
+
 Because these impls are compiler-provided, they raise no coherence question: the orphan rule of
 `02` asks that an `impl` live in the module declaring the trait or the one declaring the type, and
 a built-in scalar has no module of its own. Whichever way `§8 a` settles, a scalar's memberships
@@ -476,30 +495,49 @@ exactly (`§5`), one row further down the catalog.
   this worth writing down: a program can now go from bytes to text and still has no way to walk the
   text it got.
 
-- **A heterogeneous *operand*, which is not the same ask as a heterogeneous result.** `§1` argues
-  that `Self`-homogeneity costs nothing, because the scalars already obey it — `u8 + u8` is a `u8`
-  and no operator promotes. That is true of every pair of scalars and does not reach the shape a
-  vector space is made of: `Complex * f64`. Scaling a complex number by a real one is what an
-  inverse transform does to every sample, what a window function applies, and what a spectrum is
-  normalized by, and it cannot be written as an operator at all — `c * 2.0` is "'\*' needs matching
-  types". `guide/fft` is the first program in the set with a reason to care, and it pays with a
-  `scale` method on the type and a `.scale(k)` at each of those call sites.
+- **~~A heterogeneous *operand*.~~ The catalog change is built; what it turned out to wait on is
+  something else.** `§1` argues that `Self`-homogeneity costs nothing, because the scalars already
+  obey it — `u8 + u8` is a `u8` and no operator promotes. That is true of every pair of scalars and
+  does not reach the shape a vector space is made of: `Complex * f64`.
 
-  **The mechanism is already there, which is what makes this a decision rather than a project.**
-  Traits take parameters — `trait Scale[R]` with `impl Scale[f64] for Complex` compiles and runs
-  today — so the change is to the *catalog*: `Mul` would become `Mul[Rhs]` with
-  `mul(self, rhs: Rhs) -> Self`, and the operator would dispatch on the pair. Note what is **not**
-  wanted: Rust carries both an `Rhs` parameter and an `Output` associated type, and only the first
-  of those is in question here. The result staying `Self` covers `Complex * f64` and `Vec3 * f64`
-  and deliberately does not cover a dot product, which returns neither operand's type.
+  The ten binary arithmetic and bitwise traits now take the right-hand type: `Mul` is
+  `Mul[Rhs = Self]` with `mul(self, rhs: Rhs) -> Self`, and the operator dispatches on the **pair**.
+  The default is what kept the change from touching anything already written — `impl Mul for Point`
+  still means `Mul[Point]`, and `[T: Mul]` still asks for `Mul[T]` — so `impl Mul[f64] for Vec3`
+  and `v * 2.0` are now ordinary code. `Eq` and `Ord` stay homogeneous: a comparison across two
+  types raises questions about reflexivity and transitivity that nothing has asked, and the two
+  traits provide six derived operators whose laws would all have to be restated.
 
-  **What it was waiting on was a default type parameter, and that is now built** (`10 §1`).
-  `trait Scale[R = Self]` is ordinary, `impl Scale for P` means `impl Scale[P] for P`, and
-  `[T: Scale]` asks for `Scale[T]` — which is exactly what the catalog needs for `Mul` to gain an
-  `Rhs` without every `impl Mul for Point` and every `[T: Mul]` being respelled. What remains is the
-  catalog change itself: `Mul` becoming `Mul[Rhs]` with `mul(self, rhs: Rhs) -> Self`, the operator
-  dispatching on the pair, and `guide/fft`'s `.scale(k)` at each call site becoming `* k`. Until
-  that lands the workaround is still the named method the guide uses.
+  **What is deliberately *not* here**: Rust carries both an `Rhs` parameter and an `Output`
+  associated type, and only the first is wanted. The result staying `Self` covers `Complex * f64`
+  and `Vec3 * f64` and does not cover a dot product, which returns neither operand's type.
+
+  **A built-in's membership is homogeneous, and that is `01`'s rule rather than a limitation.** An
+  `int` is `Mul[int]` and is `Mul` at nothing else, because no scalar operator promotes; `2.0 * c`
+  is therefore refused rather than reaching an `impl Mul[Complex] for f64`, since a scalar keeps its
+  native instruction whatever a block elsewhere says (`§5`). Where a bare literal sits beside a
+  **type parameter**, the parameter's own bounds decide what the literal is: `x - 1` in a `[T: Sub]`
+  body is `T`'s own subtraction, `x * 2.0` in a `[T: Mul[f64]]` body is the `real` that bound names,
+  and a parameter carrying no bound for the operator is left homogeneous so the diagnostic can ask
+  for the bare bound.
+
+- **One trait, implemented once per type — which is what `guide/fft` is still waiting on.** The
+  catalog change did not free the program that motivated it. A transform needs **both**
+  `Complex * Complex`, the butterfly, and `Complex * f64`, the scaling an inverse does to every
+  sample — and those are `Mul[Complex]` and `Mul[f64]`, two argument lists for one trait on one
+  type. `02`'s coherence rule refuses the second: *a trait's members become the type's, and a type's
+  members are one namespace, so a second `Mul` would give `mul` two meanings and a call no way to
+  say which.* So `guide/fft` keeps its `scale` method, and what it is short of is no longer a
+  parameter on `Mul` but a decision about that rule.
+
+  The decision is **not** general member overloading. Picking among the implementations of *one*
+  parameterized trait by that trait's own argument is fully determined by the call — `c.mul(x)` has
+  exactly one candidate once `x`'s type is known, which is the same question the operator already
+  answers. What it costs is that a trait's implementations stop being keyed by (trait, type) alone:
+  `traitImpls`, `implFor`, `implWritten`, `implBounds`, the member namespace `08` describes, and the
+  mangled name a member lowers to would each key on the argument list as well. Recorded here with
+  its customer rather than decided; the parameter on `Mul` is the half that could be built without
+  answering it.
 - **A bound that promises a *value*.** Every trait in the catalog promises behaviour, which is what
   a trait is for, and three separate programs have now wanted one that promises a value instead.
   A generic container cannot declare `[16]K` for any `K` (`07 § Not yet`); a growable one cannot

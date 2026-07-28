@@ -882,7 +882,9 @@ class Analyzer private (units: List[Program])
       TLogical(op, analyzeBool(l), analyzeBool(r))
 
     case Binary(op, l, r) =>
-      val List(tl, tr) = analyzeOperands(List(l, r), expected.filter(Type.isNumeric))
+      val List(tl, provisional) = analyzeOperands(List(l, r), expected.filter(Type.isNumeric))
+      val tr                    = operandRhs(op, tl, r, provisional)
+
       operatorCall(op, tl, tr).getOrElse(TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty)))
 
     case Unary("-", e) =>
@@ -949,7 +951,7 @@ class Analyzer private (units: List[Program])
     case Assign(op, target, value) =>
       val place  = analyzePlace(target, s"'$op'")
       val binSym = op.dropRight(1)
-      val tv     = analyzeExpr(value, Some(place.ty))
+      val tv     = analyzeExpr(value, updateExpected(binSym, place.ty))
       val d      = updateDispatch(binSym, place, tv)
 
       if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then

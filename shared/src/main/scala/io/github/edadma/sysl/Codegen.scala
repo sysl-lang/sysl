@@ -200,7 +200,9 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
    */
   private def comparison(c: TCmp, ty: Type, av: String, bv: String): String =
     c.dispatch match
-      case Some(d) => dispatchValue(d, ty, av, bv, Type.Bool)
+      // A comparison stays homogeneous — `Eq` and `Ord` take no right-hand type — so both operands
+      // are the one type here, unlike the arithmetic traits.
+      case Some(d) => dispatchValue(d, ty, ty, av, bv, Type.Bool)
       // A constrained value compares through its base's instruction — the derived type has no
       // ordering of its own, it inherits the base's.
       case None    => compareValue(c.op, Type.underlying(ty), av, bv)
@@ -211,12 +213,16 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
    * chain and a compound assignment — each use one operand twice from a single evaluation, and the
    * value is already in a register. `swap` and `negate` carry the derivation of the comparisons the
    * catalog declares no method for (`14 §2`), so `a > b` calls the one `lt` its `impl` wrote.
+   *
+   * The two operands carry their **own** types, which an arithmetic trait no longer requires to be
+   * the same one (`14 §7`): `c *= 2.0` passes a complex number and a `real`. A swap exchanges the
+   * values and their types together, since it is the values that are being reordered.
    */
-  private def dispatchValue(d: TDispatch, ty: Type, av: String, bv: String, resultTy: Type): String = {
-    val (l, r) = if d.swap then (bv, av) else (av, bv)
-    val res    = freshTemp()
+  private def dispatchValue(d: TDispatch, aty: Type, bty: Type, av: String, bv: String, resultTy: Type): String = {
+    val (l, lty, r, rty) = if d.swap then (bv, bty, av, aty) else (av, aty, bv, bty)
+    val res              = freshTemp()
 
-    emit(s"$res = call ${calleeOf(d.name, resultTy)}(${ty.llvm} $l, ${ty.llvm} $r)")
+    emit(s"$res = call ${calleeOf(d.name, resultTy)}(${lty.llvm} $l, ${rty.llvm} $r)")
 
     if !d.negate then res
     else
@@ -707,7 +713,7 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       // value for the slot and releases what was there before, exactly like a plain assignment; a
       // slot of anything else just overwrites.
       val updated = (ty, dispatch) match
-        case (_, Some(d))  => ownTemp(dispatchValue(d, ty, cur, v, ty), ty)
+        case (_, Some(d))  => ownTemp(dispatchValue(d, ty, value.ty, cur, v, ty), ty)
         case (Type.Str, _) => ownTemp(strConcat(cur, v), Type.Str)
         case _             => arith(op.dropRight(1), ty, cur, v)
 

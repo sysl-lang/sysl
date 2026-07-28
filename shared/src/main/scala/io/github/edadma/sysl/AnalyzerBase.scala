@@ -416,12 +416,36 @@ trait AnalyzerBase {
   protected val implBounds =
     mutable.LinkedHashMap.empty[(String, String), (List[String], Map[String, List[BoundRef]])]
 
+  /** The trait arguments an `impl` block **wrote**, as against the ones the trait's defaults filled
+   * in, keyed exactly as `traitImpls` is. They are always concrete: `implBound` refuses a block's
+   * own parameter here, since an argument the author left open would be a family of
+   * implementations rather than one.
+   *
+   * The distinction is what a defaulted block means. `impl Mul for Box[T]` does not promise `Mul` at
+   * one particular `Box`; it promises whatever the trait's own default gives for the type being
+   * asked about, so at a `Box[string]` it is `Mul[Box[string]]`. Comparing against the arguments the
+   * *declaration* filled in would compare against the block's parameters and match nothing.
+   */
+  protected val implWritten = mutable.LinkedHashMap.empty[(String, String), List[Type]]
+
+  /** The promise an implementation makes **about this subject**: what the block wrote, with the
+   * trait's own defaults supplying the rest under a `Self` of the type being asked about.
+   */
+  protected def suppliedBound(name: String, key: String, subject: Type): Type.Bound = {
+    val written = implWritten.getOrElse((name, key), Nil)
+
+    traitDecls.get(name) match
+      case Some(d) if written.length < d.tparams.length =>
+        Type.Bound(name, sandboxed(withDefaults(name, d.tparams, d.tdefaults, written, selfBinding(subject))))
+      case _ => Type.Bound(name, written)
+  }
+
   /** Whether an implementation of `tr.name` supplies exactly the promise `tr` asks for. Trivially
    * true for a trait that takes no arguments, which is why nothing outside a generic trait ever
    * has to think about it.
    */
-  protected def suppliesBound(tr: Type.Bound, key: String): Boolean =
-    implFor.get((tr.name, key)).forall(_ == tr.key)
+  protected def suppliesBound(tr: Type.Bound, key: String, subject: Type): Boolean =
+    !implWritten.contains((tr.name, key)) || suppliedBound(tr.name, key, subject).key == tr.key
 
   /** The composed types written out in full that implement a trait, keyed by (trait name, the
    * **shape** each one has). It is what a shape-matched `impl` consults to find that the thing it
@@ -814,7 +838,7 @@ trait AnalyzerBase {
               // bound.
               case a: Type.Abstract =>
                 if !satisfies(tr, a) then
-                  boundErr(s"'$what' requires its type parameter '$tp' to implement '${tr.show}', " +
+                  boundErr(s"'$what' requires its type parameter '$tp' to implement '${showBound(tr, a)}', " +
                     s"but '${a.name}' is not bounded by it")
               case concrete =>
                 if !satisfies(tr, concrete) then
@@ -823,7 +847,7 @@ trait AnalyzerBase {
                   // block that is already written.
                   val why = unmetBound(tr, concrete).fold("")(reason => s" — $reason")
 
-                  err(s"'$what' requires its type parameter '$tp' to implement '${tr.show}', " +
+                  err(s"'$what' requires its type parameter '$tp' to implement '${showBound(tr, concrete)}', " +
                     s"but ${show(concrete)} does not$why")
           case None =>
 
@@ -981,14 +1005,32 @@ trait AnalyzerBase {
    */
   protected def satisfies(tr: Type.Bound, t: Type): Boolean = t match
     case a: Type.Abstract => a.bounds.exists(b => traitClosure(b, selfBinding(a)).exists(_.key == tr.key))
-    // A compiler-provided membership is a rule about one trait rather than a family of them, so a
-    // trait applied to arguments is never one: `Add` is an instruction, `Add[int]` is not a thing.
-    case _ => conforms(tr, t) || (tr.args.isEmpty && CoreTraits.builtin(tr.name, t))
+    // A compiler-provided membership is **homogeneous**, and that is `01`'s rule about the scalars
+    // rather than a limitation of this one: no operator promotes, so an `int` is `Mul[int]` and is
+    // not `Mul` at anything else. The arguments are compared the way an assignment compares two
+    // types, so a transparent subtype is its base's member exactly as it is its base's operand.
+    case _ => conforms(tr, t) || (tr.args.forall(!disagree(_, t)) && CoreTraits.builtin(tr.name, t))
 
   /** The same question about a trait that takes no arguments, which is every trait the compiler
    * knows by name and most of the ones a program declares.
    */
   protected def satisfies(traitName: String, t: Type): Boolean = satisfies(Type.Bound(traitName, Nil), t)
+
+  /** How a bound is spelled back to a programmer: **without** the arguments a default would have
+   * supplied, because that is how the program writes it.
+   *
+   * `[T: Mul]` already means `Mul[T]`, so a diagnostic that told someone to write `T: Mul[T]` would
+   * be telling them to write out what they may leave out. The arguments are shown only where they
+   * are something the default would not have given — which is exactly the case the reader needs to
+   * see, since it is the one a bare bound does not cover.
+   */
+  protected def showBound(tr: Type.Bound, self: Type): String = {
+    val bare =
+      for d <- traitDecls.get(tr.name) if d.tparams.nonEmpty
+      yield Type.Bound(tr.name, sandboxed(withDefaults(tr.name, d.tparams, d.tdefaults, Nil, selfBinding(self))))
+
+    if bare.exists(_.key == tr.key) then Modules.show(tr.name) else tr.show
+  }
 
   /** Whether a type implements a trait **through a source `impl`** — conformance a table can point
    * at, as against a membership the compiler provides by rule.
@@ -1023,7 +1065,7 @@ trait AnalyzerBase {
    */
   protected def implKey(tr: Type.Bound, t: Type): Option[(String, List[Type])] = {
     val own    = memberOwner(t)
-    def has(k: String) = traitImpls.contains((tr.name, k)) && suppliesBound(tr, k)
+    def has(k: String) = traitImpls.contains((tr.name, k)) && suppliesBound(tr, k, t)
 
     if has(own._1) then Some(own)
     else shapeOwner(t).filter(s => has(s._1))
@@ -1045,9 +1087,10 @@ trait AnalyzerBase {
     // write, since one trait is implemented once per type.
     val wrongArgs =
       for
-        key      <- List(memberOwner(t)._1) ::: shapeOwner(t).map(_._1).toList
-        supplied <- implFor.get((tr.name, key)) if supplied != tr.key
-      yield s"it implements '$supplied', and one trait is implemented once per type"
+        key <- List(memberOwner(t)._1) ::: shapeOwner(t).map(_._1).toList
+        if traitImpls.contains((tr.name, key)) && !suppliesBound(tr, key, t)
+      yield s"it implements '${suppliedBound(tr.name, key, t).show}', and one trait is implemented " +
+        "once per type"
 
     val unmetCondition =
       for
@@ -1225,6 +1268,13 @@ trait AnalyzerBase {
 
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound
   protected def selfBinding(t: Type): Map[String, Type]
+  protected def withDefaults(
+      key: String,
+      tparams: List[String],
+      tdefaults: Map[String, TypeRef],
+      targs: List[Type],
+      self: Map[String, Type],
+  ): List[Type]
   protected def analyzeExpr(expr: Expr, expected: Option[Type] = None, discarded: Boolean = false): TExpr
   protected def analyzeBool(e: Expr): TExpr
   protected def analyzePlace(target: Expr, what: String): TExpr

@@ -760,14 +760,17 @@ trait Hoisting extends TypeResolution {
     val tr   = traitKey(block.traitName).map(traitDecls).getOrElse(err(s"unknown trait '${block.traitName}'"))
     val impl = block.copy(traitName = tr.name).setPos(block.pos)
 
-    val (ty, target) = implTarget(impl)
-    val bound        = implBound(impl, tr)
-    val home         = target.copy(outer = tr.tparams.zip(bound.args).toMap)
+    val (ty, target)    = implTarget(impl)
+    val (bound, written) = implBound(impl, tr)
+    val home            = target.copy(outer = tr.tparams.zip(bound.args).toMap)
 
     // A built-in's memberships come from the compiler (`14 §5`), so an `impl` for one is not adding
     // a capability but competing with the one that is already there — and the operator would keep
-    // lowering to its native instruction whatever this block said.
-    if bound.args.isEmpty && CoreTraits.builtin(impl.traitName, ty) then
+    // lowering to its native instruction whatever this block said. What the block *wrote* is what
+    // decides: a catalog trait's arguments default to the implementing type, so an `impl Mul for
+    // int` that wrote none of them is the one the compiler already provides, while one that wrote
+    // an argument is asking for something else entirely.
+    if written.isEmpty && CoreTraits.builtin(impl.traitName, ty) then
       err(s"'${home.label}' already implements '${qn(impl.traitName)}' — the compiler provides it")
 
     // Keyed by the type rather than by the spelling, so `impl Show for int` and `impl Show for i32`
@@ -799,6 +802,7 @@ trait Hoisting extends TypeResolution {
 
     traitImpls((impl.traitName, home.key)) = impl
     implFor((impl.traitName, home.key)) = bound.key
+    implWritten((impl.traitName, home.key)) = written
 
     // What the trait **requires** is asked of the implementing type here, at the block that makes
     // the promise, rather than at each bound that relies on it. Two reasons, and the second decides
@@ -871,7 +875,7 @@ trait Hoisting extends TypeResolution {
    * one implementation per (trait-at-arguments, type) is what every table here is keyed by, and a
    * parameter in the key is a key that matches many things.
    */
-  private def implBound(impl: ImplDecl, tr: TraitDecl): Type.Bound = {
+  private def implBound(impl: ImplDecl, tr: TraitDecl): (Type.Bound, List[Type]) = {
     checkTraitArity(qn(impl.traitName), tr.tparams, tr.tdefaults, impl.traitArgs.map(_ => Type.Unknown))
 
     // The block's parameters resolve to themselves so that naming one here is caught as the thing it
@@ -903,7 +907,7 @@ trait Hoisting extends TypeResolution {
 
     deferredBounds(impl.traitName, tr.tparams, tr.bounds, args)
 
-    Type.Bound(impl.traitName, args)
+    (Type.Bound(impl.traitName, args), written)
   }
 
   /** The first type parameter a type is built out of, if any — what tells a written type from one

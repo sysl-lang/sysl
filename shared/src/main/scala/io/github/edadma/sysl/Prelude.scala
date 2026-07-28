@@ -132,35 +132,35 @@ object Prelude {
       |    putbytes(buf[0..<usize(k)])
       |end printr
       |
-      |trait Add
-      |    add(self, rhs: Self) -> Self
+      |trait Add[Rhs = Self]
+      |    add(self, rhs: Rhs) -> Self
       |
-      |trait Sub
-      |    sub(self, rhs: Self) -> Self
+      |trait Sub[Rhs = Self]
+      |    sub(self, rhs: Rhs) -> Self
       |
-      |trait Mul
-      |    mul(self, rhs: Self) -> Self
+      |trait Mul[Rhs = Self]
+      |    mul(self, rhs: Rhs) -> Self
       |
-      |trait Div
-      |    div(self, rhs: Self) -> Self
+      |trait Div[Rhs = Self]
+      |    div(self, rhs: Rhs) -> Self
       |
-      |trait Rem
-      |    rem(self, rhs: Self) -> Self
+      |trait Rem[Rhs = Self]
+      |    rem(self, rhs: Rhs) -> Self
       |
-      |trait BitAnd
-      |    bitand(self, rhs: Self) -> Self
+      |trait BitAnd[Rhs = Self]
+      |    bitand(self, rhs: Rhs) -> Self
       |
-      |trait BitOr
-      |    bitor(self, rhs: Self) -> Self
+      |trait BitOr[Rhs = Self]
+      |    bitor(self, rhs: Rhs) -> Self
       |
-      |trait BitXor
-      |    bitxor(self, rhs: Self) -> Self
+      |trait BitXor[Rhs = Self]
+      |    bitxor(self, rhs: Rhs) -> Self
       |
-      |trait Shl
-      |    shl(self, rhs: Self) -> Self
+      |trait Shl[Rhs = Self]
+      |    shl(self, rhs: Rhs) -> Self
       |
-      |trait Shr
-      |    shr(self, rhs: Self) -> Self
+      |trait Shr[Rhs = Self]
+      |    shr(self, rhs: Rhs) -> Self
       |
       |trait Neg
       |    neg(self) -> Self

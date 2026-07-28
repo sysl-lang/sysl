@@ -184,7 +184,6 @@ trait TypeResolution extends ImportResolution {
       tdefaults: Map[String, TypeRef],
       targs: List[Type],
       self: Map[String, Type],
-      noSelf: String = "there is no type here for it to stand for",
   ): List[Type] =
     if targs.length >= tparams.length || tdefaults.isEmpty then targs
     else if !filling.add(key) then
@@ -198,15 +197,15 @@ trait TypeResolution extends ImportResolution {
       try
         inDecl(key) {
           val filled = mutable.ListBuffer.from(targs)
+          // Where the caller knows what `Self` is it says so. Where it does not, the implementing
+          // type is precisely what is not yet known, and the default stands for the one unknown type
+          // it is — which is enough to compare two requirements of the same trait, and is how
+          // `trait Word: Mul` resolves before anything implements `Word`. The one place that is not
+          // good enough is erasure, and `traitObject` refuses it there in its own words.
+          val here = (if self.contains(selfName) then self else self ++ selfBinding(abstractSelf))
 
           for tp <- tparams.drop(targs.length) do
-            filled += tdefaults.get(tp).fold(Type.Unknown) { ref =>
-              if mentionsSelf(ref) && !self.contains(selfName) then
-                err(s"'$tp' defaults to '${ref.show}', which names the type implementing " +
-                  s"'${qn(key)}', and $noSelf — write the argument")
-
-              resolveType(ref, self ++ tparams.zip(filled))
-            }
+            filled += tdefaults.get(tp).fold(Type.Unknown)(resolveType(_, here ++ tparams.zip(filled)))
 
           filled.toList
         }
@@ -381,14 +380,22 @@ trait TypeResolution extends ImportResolution {
         at(inner.pos) {
           checkTraitArity(n, decl.tparams, decl.tdefaults, written)
 
-          // An object has forgotten which type it holds, so there is no `Self` for a default to
-          // stand for and none is offered — a trait whose default names one has to be written out
-          // here, and `checkObjectSafe` says so in the same breath about the members.
-          val args = withDefaults(key, decl.tparams, decl.tdefaults, written, Map.empty,
-            "an object has forgotten which type it holds")
+          val args = withDefaults(key, decl.tparams, decl.tdefaults, written, Map.empty)
 
           deferredBounds(key, decl.tparams, decl.bounds, args)
+          // Object safety is asked **first**, because a trait whose default names `Self` is usually
+          // one whose members do too — the whole operator catalog is — and "this trait cannot be
+          // erased" is the answer that trait wants, not "write the argument", which would be advice
+          // that does not help.
           checkObjectSafe(key, args, sigil)
+
+          // An object has forgotten which type it holds, so a default that names one has nothing to
+          // stand for. It reaches here only for a trait that *is* erasable, where writing the
+          // argument really is the fix.
+          for tp <- decl.tparams.drop(written.length); ref <- decl.tdefaults.get(tp) if mentionsSelf(ref) do
+            err(s"'$tp' defaults to '${ref.show}', which names the type implementing '${qn(key)}', " +
+              "and an object has forgotten which type it holds — write the argument")
+
           Some(Type.Trait(key, args))
         }
       case _ => None
