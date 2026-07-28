@@ -314,4 +314,87 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
            |""".stripMargin) should not include "call ptr @malloc"
     }
   }
+
+  /** `05 § Promotion is silent, not hidden`. Silent promotion earns the obvious objection — an
+   * allocation appears that nothing in the source asked for — and the answer is discoverability
+   * rather than ceremony: the common case costs no reading, and "why did this allocate?" always has
+   * an answer. This is Go's `-m`, reached with `--explain-escapes`.
+   */
+  "every promotion can be asked about" - {
+    def explain(src: String): List[String] =
+      Compiler.compiled(List(Source("t.sysl", src))) match
+        case Right((_, notes)) => notes
+        case Left(err)         => fail(s"did not compile:\n$err")
+
+    "the array is named, with the view that forced it" in {
+      val notes = explain("""first() -> []u8
+                            |    var buf: [8]u8
+                            |    buf[0..<3]
+                            |end first
+                            |print(first().len)
+                            |""".stripMargin)
+
+      notes should have length 1
+      notes.head should include("'buf' is promoted to the heap, because this view of it is returned")
+      notes.head should startWith("t.sysl:3:8")
+    }
+
+    "one line per array, in source order" in {
+      val notes = explain("""first() -> []u8
+                            |    var buf: [8]u8
+                            |    buf[0..<3]
+                            |end first
+                            |second() -> []int
+                            |    var nums: [4]int
+                            |    nums[..]
+                            |end second
+                            |print(first().len + second().len)
+                            |""".stripMargin)
+
+      notes should have length 2
+      notes(0) should include("'buf'")
+      notes(1) should include("'nums'")
+    }
+
+    // An array is named once however many views of it get out, because the question the report
+    // answers is "why did this allocate", and it allocated once.
+    "an array that escapes twice is reported once" in {
+      val notes = explain("""both(c: bool) -> []int
+                            |    var buf: [4]int
+                            |    if c then return buf[0..<1]
+                            |    buf[..]
+                            |end both
+                            |print(both(true).len)
+                            |""".stripMargin)
+
+      notes should have length 1
+      notes.head should include("'buf'")
+    }
+
+    "and a program that promotes nothing has nothing to say" in {
+      explain("""use() -> int
+                |    var buf: [4]int
+                |    buf[0usize]
+                |end use
+                |print(use())
+                |""".stripMargin) shouldBe empty
+    }
+
+    // The reason is the *route* out, not a fixed phrase, so a program that escapes a different way
+    // is told which way.
+    "the route out is named" in {
+      val notes = explain("""stash(dest: *[]int, s: []int)
+                            |    *dest = s
+                            |grab() -> int
+                            |    var buf: [4]int
+                            |    var out: []int
+                            |    stash(&out, buf[..])
+                            |    out[0usize]
+                            |end grab
+                            |print(grab())
+                            |""".stripMargin)
+
+      notes.head should include("is passed to 'stash', which holds on to it")
+    }
+  }
 }

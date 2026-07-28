@@ -8,7 +8,7 @@ used to be refused compile and run. What is still a diagnostic is storage the bo
 an array a caller passed **by value**, and an array that is a **field** of a value, the second being
 the *Deferred* section's unspecified promotion-of-aggregates. Under `no alloc` every promotion
 becomes an error again, which is the paragraph below; capabilities are not built, so today every
-promotable escape promotes. `--explain-escapes` is specified here and not yet built. The
+promotable escape promotes. `--explain-escapes` is built and reports every promotion. The
 approximations the analysis takes are the ones *Deferred* permits.
 
 ## What it is for
@@ -151,9 +151,14 @@ every promotion the compiler made and the route that forced it:
 
 ```
 $ sysl build --explain-escapes tty.sysl
-tty.sysl:28: 'buf' promoted to the heap
-    because the slice at tty.sysl:31 is returned
+tty.sysl:31:12: 'buf' is promoted to the heap, because this view of it is returned
 ```
+
+One line per array, in source order, on stderr, and the flag is accepted by every subcommand. The
+position is the **view that forced the move** rather than the declaration, because that is the half
+a reader cannot work out for themselves — and it is the only half available, since a statement
+carries no position of its own today. An array is named once however many views of it get out: the
+question the report answers is *why did this allocate*, and it allocated once.
 
 This is Go's `-m`, and it is the right shape: the common case costs no reading, and the
 question "why did this allocate?" always has an answer. A program that must not allocate says
@@ -237,4 +242,6 @@ right rather than as a field.
   it bites.
 - **Promotion of aggregates.** A local struct containing an array, where only the array's
   slice escapes, could promote the array alone or the whole struct. The cheaper choice is the
-  array; not yet specified.
+  array; not yet specified, so a field's escaping view is still a diagnostic.
+- **A declaration has no position**, so the report names the escaping view and not the array's own
+  line. Giving statements positions is a change across the tree rather than a change here.

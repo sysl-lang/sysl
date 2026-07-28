@@ -126,6 +126,12 @@ object Diagnostic {
   def render(msg: String, pos: Option[Pos]): String =
     pos.map(_.render(msg)).getOrElse(s"error: $msg")
 
+  /** A note rather than a complaint: the location first, in the one-line form a build log wants,
+   * since these are printed by the handful and not read one at a time.
+   */
+  def explain(msg: String, pos: Option[Pos]): String =
+    pos.map(p => s"${p.location}: $msg").getOrElse(msg)
+
   /** Assembles the diagnostics of one compilation: at most `limit` of them, separated by a blank
    * line, with a closing count when there were more. The ones kept are the *first* — the list
    * arrives in source order, and an error early in a file is the one worth reading.

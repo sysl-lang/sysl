@@ -27,7 +27,16 @@ object Escape {
    *
    * Keyed by function name, with `main`'s statements separate because they are not a function.
    */
-  case class Promotions(byFunc: Map[String, Set[String]], inMain: Set[String]) {
+  case class Promotions(
+      byFunc: Map[String, Set[String]],
+      inMain: Set[String],
+      /** One line per promotion, in source order, for `--explain-escapes` (`05 § Promotion is
+       * silent, not hidden`). Silent promotion earns the objection that an allocation appears which
+       * nothing in the source asked for, and the answer is discoverability rather than ceremony:
+       * the common case costs no reading, and "why did this allocate?" always has an answer.
+       */
+      explanations: List[String] = Nil,
+  ) {
     def apply(func: Option[String]): Set[String] =
       func.fold(inMain)(byFunc.getOrElse(_, Set.empty))
   }
@@ -89,6 +98,7 @@ private class Escape(program: TProgram) {
         Escape.Promotions(
           walks.collect { case (Some(n), w) if w.promoted.nonEmpty => n -> w.promoted.toSet }.toMap,
           walks.collectFirst { case (None, w) => w.promoted.toSet }.getOrElse(Set.empty),
+          walks.flatMap(_._2.why.toList),
         ),
       )
   }
@@ -173,6 +183,9 @@ private class Escape(program: TProgram) {
 
     /** The arrays this body must allocate on the heap. */
     val promoted = mutable.Set.empty[String]
+
+    /** Why each of them moved, in the order the escapes were found. */
+    val why = mutable.ListBuffer.empty[String]
 
     /** Whether any confined view left the frame at all, promotable or not. This is what a parameter
      * summary asks — "does the callee let this outlive the call" is a yes/no, and the roots that
@@ -340,6 +353,9 @@ private class Escape(program: TProgram) {
      */
     private def gets_out(at: TExpr, how: String): Unit = {
       val v = views(at)
+
+      for name <- v.named if !promoted(name) do
+        why += Diagnostic.explain(s"'$name' is promoted to the heap, because this view of it $how", at.pos)
 
       promoted ++= v.named
       gotOut = true

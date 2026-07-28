@@ -19,7 +19,13 @@ object Compiler {
    * reaches another's members by naming them in full (`13 §3`) — so the order the files are handed
    * over in decides nothing but which one a diagnostic is reported against first.
    */
-  def compile(sources: List[Source]): Either[String, String] = {
+  def compile(sources: List[Source]): Either[String, String] = compiled(sources).map(_._1)
+
+  /** The same compilation, keeping the notes the driver may want to show — currently the heap
+   * promotions, for `--explain-escapes` (`05`). Separate from `compile` so that the ordinary path
+   * has nothing extra to ignore.
+   */
+  def compiled(sources: List[Source]): Either[String, (String, List[String])] = {
     val parsed = sources.map(SyslParser.parse)
 
     // Every file is parsed before any is rejected, so a syntax error in one does not hide the
@@ -34,9 +40,9 @@ object Compiler {
    * mistake in it a mistake at all. Pruning is therefore the last thing that happens to the tree, and
    * the only thing between the checks and the lowering.
    */
-  private def analyzed(units: List[Program]): Either[String, String] =
+  private def analyzed(units: List[Program]): Either[String, (String, List[String])] =
     for
       typed    <- Analyzer.analyze(units)
       promoted <- Escape.check(typed)
-    yield Codegen.generate(Reachability.prune(typed), promoted)
+    yield (Codegen.generate(Reachability.prune(typed), promoted), promoted.explanations)
 }

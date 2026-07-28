@@ -18,11 +18,15 @@ import scopt.OParser
  *   - `sysl run <path>`        compile and execute
  *   - `sysl build <path> -o x` compile to a native executable
  *   - `sysl emit-llvm <path>`  print the generated LLVM IR
+ *
+ * `--explain-escapes` may be given to any of them: it reports, on stderr, every local array the
+ * compiler moved to the heap and the view that forced it (`05`).
  */
 case class Config(
     command: String = "",
     file: String = "",
     output: Option[String] = None,
+    explainEscapes: Boolean = false,
 )
 
 @main def sysl(args: String*): Unit = {
@@ -46,6 +50,9 @@ case class Config(
         .action((_, c) => c.copy(command = "emit-llvm"))
         .text("print the generated LLVM IR")
         .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
+      opt[Unit]("explain-escapes")
+        .action((_, c) => c.copy(explainEscapes = true))
+        .text("report every local array promoted to the heap, and the view that forced it"),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
@@ -62,34 +69,38 @@ private def execute(cfg: Config): Int = {
 
   if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
 
+  // One compilation, whatever the subcommand does with it. The notes come back beside the IR
+  // rather than being printed from inside the compiler, which has no business writing to a console.
+  val compiled = Compiler.compiled(sources) match
+    case Left(err) => return report(err)
+    case Right((ir, notes)) =>
+      if cfg.explainEscapes then
+        if notes.isEmpty then Console.err.println("no arrays were promoted to the heap")
+        else notes.foreach(Console.err.println)
+      ir
+
   cfg.command match
     case "emit-llvm" =>
-      Compiler.compile(sources) match
-        case Left(err) => report(err)
-        case Right(ir) => stdout(ir); 0
+      stdout(compiled); 0
 
     case "build" =>
-      Compiler.compile(sources) match
-        case Left(err) => report(err)
-        case Right(ir) =>
-          val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
-          Toolchain.build(ir, exe) match
-            case Left(err) => fail(err)
-            case Right(_)  => Console.err.println(s"wrote $exe"); 0
+      val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
+
+      Toolchain.build(compiled, exe) match
+        case Left(err) => fail(err)
+        case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
-      Compiler.compile(sources) match
-        case Left(err) => report(err)
-        case Right(ir) =>
-          val exe = createTempFile("sysl-", "")
-          Toolchain.build(ir, exe) match
-            case Left(err) => deleteFile(exe); fail(err)
-            case Right(_) =>
-              val result = exec(Seq(exe))
-              deleteFile(exe)
-              stdout(result.stdout)
-              if result.stderr.nonEmpty then Console.err.print(result.stderr)
-              result.exitCode
+      val exe = createTempFile("sysl-", "")
+
+      Toolchain.build(compiled, exe) match
+        case Left(err) => deleteFile(exe); fail(err)
+        case Right(_) =>
+          val result = exec(Seq(exe))
+          deleteFile(exe)
+          stdout(result.stdout)
+          if result.stderr.nonEmpty then Console.err.print(result.stderr)
+          result.exitCode
 
     case other =>
       fail(s"unknown command '$other'")
