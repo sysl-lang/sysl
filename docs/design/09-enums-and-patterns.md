@@ -242,6 +242,12 @@ two gates are deliberately different:
   no useful meaning, and admitting it was an accident of gating ranges on the same
   ordered-type test as equality. A `string` is matched by literal or by binding, not by range.
 
+**Tuple patterns are struct patterns with the name left off.** `(a, b)` binds both components of a
+tuple (`00 §13`), `(a, _)` binds one, and a nested tuple pattern nests — all of it the positional
+form below with nothing before the parenthesis, so it needs no machinery of its own. A tuple has one
+shape, so a tuple pattern is irrefutable and discharges its column for exhaustiveness exactly as a
+struct pattern does.
+
 **Struct patterns — positional *and* named-field (settled).** A `struct` is destructured two
 ways, and both are supported:
 

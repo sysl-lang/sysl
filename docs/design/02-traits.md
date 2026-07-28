@@ -95,6 +95,13 @@ interface change to that module, visible to everything downstream — the same r
 `given`/`using`-style implicit resolution out of scope (`13` §7): unrestricted search and separate
 compilation are not compatible.
 
+**A type with no declaration is the prelude's.** A tuple (`00 §13`) has no module to be local to,
+which looks like a type the rule has nothing to say about. It is the question `int` already answers:
+a built-in belongs to the prelude, so the prelude is where its catalog rows live and a user module
+writing `impl Eq for (int, string)` is the ordinary orphan case — both halves foreign — while
+`impl MyTrait for (int, string)` is permitted, because the trait is local. No exception is needed;
+the rule needed a sentence saying where a nameless type lives.
+
 **Not built: nothing enforces the rule.** `Eq` and `Option` are both the prelude's, and a user
 module writing `impl[T: Eq] Eq for Option[T]` — a foreign trait for a foreign type, the case with
 no home — is accepted today. The rule matters exactly when a program is more than one module and

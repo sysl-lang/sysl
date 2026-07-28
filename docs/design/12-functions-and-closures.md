@@ -353,18 +353,19 @@ along except by forwarding it whole. A multi-result call may appear in exactly t
 right-hand side of a binding, the right-hand side of a multi-assignment (`00 §2`), and a `return` or
 trailing expression of a function whose own result list matches.
 
-The restriction is what buys the feature, and the reason is `02`'s orphan rule. An `impl` lives with
-its trait or with its type; an anonymous tuple type has neither, so `impl Eq for (int, int)` is
-precisely the *case with no home* that chapter names. A language with tuple *values* must answer
-that — either with built-in structural `Eq`/`Ord`/`Display`, a second mechanism running beside the
-catalog, or by leaving tuples uncomparable and unprintable. **A result list is never a value, so the
-question is never asked.** The `(x)`-versus-`(x,)` wart does not arise either, because a one-element
-result list is just a result.
+**Sysl has tuples as well** (`00 §13`), and the two coexist on purpose. The discriminator is whether
+the carrier ever exists: a result list is the light form for several things travelling from callee to
+caller and nothing afterwards, and a tuple is the type for several things that must be *held* — in a
+variable, a field, an `Option`, a container, or a generic argument. `-> int, int` and
+`-> (int, int)` therefore look alike and mean different things, which is the price of having both;
+what blunts it is that `val a, b = f(x)` takes either apart, so the choice is the callee's and the
+call site does not change when it changes.
 
 **Destructuring is `00 §2`'s multi-assignment, not a second mechanism.** `val a, b = f(x)` binds; `a,
 b = f(x)` assigns to places that already exist; and the evaluation rule is the one already written
-there — the call happens once, in full, before anything is bound or stored. The two forms of
-right-hand side, a list of expressions and a single multi-result call, are the only two there are.
+there — the call happens once, in full, before anything is bound or stored. A right-hand side is one
+of exactly three things, and `00 §13` lists them together: a list of expressions, a call with a
+result list, or a tuple.
 
 **Arity is checked and there is no partial take.** `val a = divmod(7, 2)` is an error rather than a
 binding of the first result: a function that says it yields two things yields two things, and

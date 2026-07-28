@@ -724,6 +724,83 @@ zero-sized is emitted as an empty aggregate, and it is still a type with an addr
 point at. Making *that* zero-sized as well would be a second rule with its own consequences for
 identity and for `&T`'s non-null guarantee, and nothing has asked for it.
 
+## 13. Tuples — a product type with no name
+
+A tuple is a fixed-length, positional product of values, written with parentheses:
+
+```
+var p: (int, string) = (1, "one")
+var q = (3, 4)                            // (int, int), inferred
+print(q.0, q.1)                           // 3 4
+
+find(k: string) -> Option[(string, int)]  // the thing a result list cannot do
+impl Iterate[(string, int)] for Cursor    // nor this
+```
+
+**Sysl has both tuples and result lists (`12 §5b`), deliberately, and the discriminator is whether
+the carrier ever exists as a value.** A result list is a property of a signature: the several things
+travel from callee to caller and there is nothing afterwards. A tuple is a type: it can be stored in
+a variable, held in a field, put inside an `Option`, made the element of a container, and named as a
+generic argument. Ask "does anything need to *hold* these together?" — if no, the result list is
+lighter and says so; if yes, only the tuple can.
+
+The cost of having both is honest and worth stating: `-> int, int` and `-> (int, int)` look alike and
+mean different things. What blunts it is that **the caller usually cannot tell and does not need
+to** — `val a, b = f(x)` takes either apart, so the choice is the callee's and changing it does not
+break the call site unless the caller was storing the pair.
+
+### One comma syntax, three things that feed it
+
+The comma forms are a single family, not three features. On the left of a `=` a comma list is
+**places or new bindings**; on the right it is one of three things:
+
+```
+a, b = b, a                     // a list of expressions            (§2)
+a, b = divmod(7, 2)             // a call with a result list        (12 §5b)
+a, b = pair                     // a tuple, taken apart             (§13)
+val x, y = origin()             // any of the three, at a binding
+```
+
+The evaluation rule is §2's throughout: the right side is produced in full before anything is bound
+or stored, and each place's own subexpressions run exactly once. So a program can be read without
+knowing which of the three the right side is, which is the point of spelling them the same.
+
+### What a tuple is, exactly
+
+- **Arity two and up.** There is no one-tuple: `(x)` is a parenthesized expression and always will
+  be, and inventing `(x,)` to work around that would be a wart bought for nothing, since a
+  one-element product is the element. Swift removed its one-tuples for the same reason. There is no
+  zero-tuple either — that is `unit` (§12), which already has the job.
+- **Positional access, `t.0` and `t.1`.** Written like a field because it is one; the name is an
+  index because there is nothing else to call it. **A nested access needs parentheses** —
+  `(t.0).1`, not `t.0.1` — because `0.1` lexes as a float and the tokenizer will not be made to
+  guess. That is Rust's wart, and taking the parentheses instead of the guesswork is the trade.
+- **Laid out as a struct with those fields in that order.** Nothing new for `Layout`, nothing new
+  for the ABI, and a tuple containing a `&T` retains and releases exactly as a struct field does
+  (`03`).
+- **Destructured by pattern**, in a `match` arm and at a binding: `(a, b)` binds both, `(a, _)`
+  binds one, and a nested tuple pattern nests. This is `09`'s positional struct pattern with the
+  name left off, so it needs no new pattern machinery.
+
+### Who owns a tuple's traits
+
+A tuple type has no declaration and so no module, which looks like `02`'s orphan rule having nothing
+to bite on. It is the same question `int` already answers: **a built-in type is the prelude's**, and
+the prelude is where its catalog rows live. So:
+
+- **The prelude provides `Eq`, `Ord`, `Hash` and `Display` structurally**, for each arity it
+  declares, whenever every component has the row. Ordering is lexicographic — first component first
+  — which is the only ordering a positional product has a claim to.
+- **A user may write `impl MyTrait for (int, string)`**, because their trait is local and that is
+  the half of the orphan rule that permits it.
+- **A user may not write `impl Eq for (int, string)`**, because the trait and the type are both the
+  prelude's. That is the existing rule producing the expected answer, not a new one.
+
+The one implementation consequence is that structural rows are **generated per arity** rather than
+written once, because sysl has no way to be generic over arity and is not getting one. The prelude
+declares them up to a stated maximum; beyond it a program writes a struct, which it should have been
+doing anyway.
+
 ## Open at the basics level (not yet decided)
 
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
@@ -744,43 +821,14 @@ work:
   started compiling, and nothing written against the old rule changed meaning.
 - ~~Final scalar-type table and operator-precedence table~~ — **done**, see
   `01-scalar-types-and-operators.md`.
-- **j. Tuples — anonymous product types. DECIDED: not taken, because both things they were wanted
-  for are now had without them.** Sysl has no tuples, and until this was written that was an absence
-  rather than a decision (`14 §7` mentions it only in passing). The two motivating uses were the
-  swap, which is §2 above, and **multiple return values**, which is `12 §5b` — a function may
-  declare a *result list*, and a list is never a value, so nothing can store one, hold one in an
-  `Option`, or ask what its type is. What follows is why that split is the right one and not merely
-  the cheap one.
-
-  What a tuple would cost, in the order the questions bite:
-
-  - **Coherence has no answer for an anonymous type.** `02`'s orphan rule is that an `impl` lives
-    with its trait or with its type. A tuple type has no declaration and no home module, so
-    `impl Eq for (int, int)` is exactly the chapter's *case with no home*. Either tuples come with
-    built-in structural `Eq` / `Ord` / `Display` — a second mechanism running beside the catalog,
-    which is the thing `14` exists to avoid — or they get none of it, and a tuple is a value you
-    cannot compare or print. Neither is obviously right, and this is the hard part.
-  - **The one-element wart.** `(x)` is a parenthesized expression in every language that has both,
-    so a one-tuple needs a spelling of its own — Python's `(x,)`. A language that has just spent §2
-    refusing to let a comma mean two different things should not adopt a comma that means a type.
-  - **It competes with a struct, and does not clearly win.** `guide/datetime` returns
-    `Civil { year, month, day }` from its civil-from-days conversion, and that reads *better* than
-    `(int, int, int)` would, because the names say which number is which. A tuple is at its best
-    where the components are obviously ordered and few — `divmod` — and at its worst exactly where
-    multiple returns are most common, which is where the components are several and alike.
-
-  **The resolution, and it is the same move twice.** A tuple is wanted as a *carrier*, not as a
-  value with an identity: `a, b = b, a` wants two assignments to happen together, and
-  `val q, r = divmod(7, 2)` wants two results to come back together. Neither needs the carrier to
-  exist afterwards. So §2 makes the first a statement form and `12 §5b` makes the second a signature
-  form, and because a result list is never a value the coherence question above is never asked —
-  there is no type for an `impl` to have no home for. What is genuinely given up is a tuple that can
-  be *stored*: `Option[(int, int)]` is unwritable, and a program that wants one writes a struct.
-  That is the trade, taken deliberately, and the struct is often the better reading anyway for the
-  reason in the third bullet.
-
-  `out` parameters (`§ Open k`) were the other candidate for multiple returns and are no longer
-  needed for it; they remain open only for the separate case of a caller-supplied buffer.
+- **j. Tuples — DECIDED: taken, alongside result lists.** See §13 for the type and `12 §5b` for the
+  result list, and §13's first subsection for the rule about which to reach for. **An earlier draft
+  of this item argued against tuples on coherence grounds, and that argument was wrong** — it said an
+  anonymous type has no home for `impl Eq for (int, int)` to live in, but `int` has no home either
+  and the prelude owns its rows. The orphan rule needed a sentence, not an exception. What tuples
+  actually cost is a second product type in the language and one structural `impl` per arity, and
+  both were judged worth paying for the thing result lists genuinely cannot do: carry a pair into an
+  `Option`, a container, or a generic argument.
 
 - **k. `out` parameters.** The other way to return more than one value without a new type: a
   parameter the callee assigns and the caller reads, with no `*` at either end. Recorded beside
