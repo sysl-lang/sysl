@@ -805,7 +805,7 @@ trait AnalyzerBase {
             // The bound is resolved under the very arguments being checked, since one may name
             // another of the parameters: `[T: From[U], U]` asks a different thing of `T` at every
             // call, and `U`'s argument is what says which.
-            val tr = resolveBound(ref, subst)
+            val tr = resolveBound(ref, subst ++ selfBinding(arg))
 
             arg match
               // A type parameter standing in for itself, during the definition-time pass. It is not
@@ -938,14 +938,17 @@ trait AnalyzerBase {
    * holding `Into[int]` and `Into[bool]` would be laying out two slots for one member. Keying this
    * walk any other way is how the table and the declaration check come to disagree.
    */
-  protected def traitClosure(b: Type.Bound): List[Type.Bound] = {
+  protected def traitClosure(b: Type.Bound, self: Map[String, Type] = Map.empty): List[Type.Bound] = {
     val seen = mutable.Set.empty[String]
     val acc  = mutable.ListBuffer.empty[Type.Bound]
 
     def walk(b: Type.Bound): Unit =
       if seen.add(b.name) then
         for decl <- traitDecls.get(b.name) do
-          val subst = decl.tparams.zip(b.args).toMap
+          // `Self` in a required trait's arguments is the type implementing the requiring one, which
+          // is the same type all the way down a chain of requirements — so it is carried in rather
+          // than rebound at each step.
+          val subst = self ++ decl.tparams.zip(b.args)
 
           for s <- decl.supers do walk(resolveBound(s, subst))
         acc += b
@@ -960,8 +963,8 @@ trait AnalyzerBase {
    * dispatches through and what a bound licenses, and both read it from here so that neither can
    * disagree with the other about which slot is which.
    */
-  protected def traitMembers(b: Type.Bound): List[(Type.Bound, MethodDecl)] =
-    traitClosure(b).flatMap(sb => traitDecls.get(sb.name).toList.flatMap(_.methods.map((sb, _))))
+  protected def traitMembers(b: Type.Bound, self: Map[String, Type] = Map.empty): List[(Type.Bound, MethodDecl)] =
+    traitClosure(b, self).flatMap(sb => traitDecls.get(sb.name).toList.flatMap(_.methods.map((sb, _))))
 
   /** Whether a type implements a trait, which is the one question a bound asks.
    *
@@ -977,7 +980,7 @@ trait AnalyzerBase {
    * again.
    */
   protected def satisfies(tr: Type.Bound, t: Type): Boolean = t match
-    case a: Type.Abstract => a.bounds.exists(b => traitClosure(b).exists(_.key == tr.key))
+    case a: Type.Abstract => a.bounds.exists(b => traitClosure(b, selfBinding(a)).exists(_.key == tr.key))
     // A compiler-provided membership is a rule about one trait rather than a family of them, so a
     // trait applied to arguments is never one: `Add` is an instruction, `Add[int]` is not a thing.
     case _ => conforms(tr, t) || (tr.args.isEmpty && CoreTraits.builtin(tr.name, t))
@@ -1003,7 +1006,7 @@ trait AnalyzerBase {
 
         targs.length == tps.length &&
         tps.zip(targs).forall { case (tp, arg) =>
-          bounds.getOrElse(tp, Nil).forall(b => satisfies(resolveBound(b, subst), arg))
+          bounds.getOrElse(tp, Nil).forall(b => satisfies(resolveBound(b, subst ++ selfBinding(arg)), arg))
         }
       }
     }
@@ -1055,7 +1058,8 @@ trait AnalyzerBase {
         (arg, unmet) <- tps
           .zip(targs)
           .flatMap((tp, a) =>
-            bounds.getOrElse(tp, Nil).map(resolveBound(_, subst)).filterNot(satisfies(_, a)).map((a, _)))
+            bounds.getOrElse(tp, Nil).map(resolveBound(_, subst ++ selfBinding(a))).filterNot(satisfies(_, a))
+              .map((a, _)))
           .headOption
       yield s"the 'impl' that covers it asks '${unmet.show}' of ${show(arg)}, which does not implement it"
 
@@ -1220,6 +1224,7 @@ trait AnalyzerBase {
   // called across the feature traits, so they are declared abstract here for the traits to see.
 
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound
+  protected def selfBinding(t: Type): Map[String, Type]
   protected def analyzeExpr(expr: Expr, expected: Option[Type] = None, discarded: Boolean = false): TExpr
   protected def analyzeBool(e: Expr): TExpr
   protected def analyzePlace(target: Expr, what: String): TExpr

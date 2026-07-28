@@ -46,6 +46,7 @@ trait Hoisting extends TypeResolution {
       if typeNameTaken(key, s.name) then err(s"type '${s.name}' is already declared")
       checkNoModuleOfThatName(key, s.name, "member")
       structDecls(key) = s.copy(name = key).setPos(s.pos)
+      for m <- s.members do checkSolvedDefaults("the method", s"${s.name}.${m.name}", m.tdefaults)
       declScope(key) = currentScope
       recordAccess(key, s.vis)
       if Prelude.declares(s) then preludeNames += key
@@ -59,6 +60,7 @@ trait Hoisting extends TypeResolution {
       if e.underlying.isDefined && e.tparams.nonEmpty then
         err(s"a generic enum cannot pin an underlying type — '${e.name}' takes type parameters")
       enumDecls(key) = e.copy(name = key).setPos(e.pos)
+      for m <- e.members do checkSolvedDefaults("the method", s"${e.name}.${m.name}", m.tdefaults)
       declScope(key) = currentScope
       recordAccess(key, e.vis)
       if Prelude.declares(e) then preludeNames += key
@@ -92,6 +94,7 @@ trait Hoisting extends TypeResolution {
           at(m.pos)(err(s"'${t.name}.${m.name}' has no receiver, so a default body has no value to " +
             "work on — give it a 'self' parameter or drop the body"))
         // No implementation could supply one either, so the trait is where it is worth saying so.
+        // A defaulted parameter is caught by this too, since carrying a default means having one.
         if m.tparams.nonEmpty then
           at(m.pos)(err(s"generic methods are not supported yet — '${t.name}.${m.name}'"))
     // A constrained subtype shares the type namespace, so a name clash is caught here; the base and
@@ -140,7 +143,11 @@ trait Hoisting extends TypeResolution {
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
     // — the duplicate check goes with the resolution, in `hoistImpl`. The module it was written in
     // travels with it, since that is what the trait it names and the type it is for resolve under.
-    case i: ImplDecl => implDecls += ((currentScope, i))
+    case i: ImplDecl =>
+      implDecls += ((currentScope, i))
+      checkSolvedDefaults("the 'impl' block", s"${i.traitName} for ${i.forType.show}", i.tdefaults)
+      for m <- i.methods do
+        checkSolvedDefaults("the method", s"${i.traitName}.${m.name}", m.tdefaults)
     case _ =>
 
   /** Registers one function's name and signature.
@@ -176,6 +183,7 @@ trait Hoisting extends TypeResolution {
            f.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkBoundNames(f.name, f.bounds)
+      checkSolvedDefaults("the function", f.name, f.tdefaults)
 
     // An `extern`'s **symbol** is not qualified, and cannot be: it names something the linker
     // already has, which knows nothing about sysl's modules. So the key the program calls it by
@@ -287,7 +295,8 @@ trait Hoisting extends TypeResolution {
       at(tr.pos) {
         traitKey(tr.name).map(traitDecls) match
           case None       => err(s"the bound on '$tp' in '$name' names '${tr.name}', which is not a trait")
-          case Some(decl) => checkTraitArity(tr.name, decl.tparams, tr.args.map(_ => Type.Unknown))
+          case Some(decl) =>
+            checkTraitArity(tr.name, decl.tparams, decl.tdefaults, tr.args.map(_ => Type.Unknown))
       }
 
   /** Checks what every trait **requires** of the types that implement it, in a pass of its own once
@@ -329,13 +338,13 @@ trait Hoisting extends TypeResolution {
                 case Some(skey) =>
                   val sdecl = traitDecls(skey)
 
-                  checkTraitArity(s.name, sdecl.tparams, s.args.map(_ => Type.Unknown))
+                  checkTraitArity(s.name, sdecl.tparams, sdecl.tdefaults, s.args.map(_ => Type.Unknown))
 
-                  for a <- s.args if mentionsSelf(a) do
-                    err(s"a trait requires another of whatever type implements it, so 'Self' has no " +
-                      s"meaning in '${s.show}' — it *is* the type doing the implementing")
-
-                  val bound = resolveBound(s, abstractSubst(tr.tparams, tr.bounds))
+                  // `Self` is the type implementing the requiring trait, which nothing here is yet,
+                  // so it stands in for itself: enough for the arguments to resolve and for two
+                  // requirements of one trait to be compared, and the same stand-in whether it was
+                  // written out or arrived from the required trait's own default.
+                  val bound = resolveBound(s, abstractSubst(tr.tparams, tr.bounds) ++ selfBinding(abstractSelf))
 
                   if path.contains(skey) then
                     err(s"trait '${qn(skey)}' requires itself, through " +
@@ -360,6 +369,81 @@ trait Hoisting extends TypeResolution {
 
         walk(key, List(key))
       })
+
+  /** Refuses a default on a type parameter that is **solved** rather than written.
+   *
+   * A function's parameters are fixed by what the call passes, a method's by that and its receiver,
+   * an `impl` block's by the type it is for — and sysl offers no call-site type arguments at all
+   * (`10 §2`), so in none of the three is there an argument list a default could fill a gap in. The
+   * thing that would be useful there is a fallback for an inference that found nothing, which is a
+   * different feature and not this one; saying so at the declaration is what keeps the two apart.
+   */
+  protected def checkSolvedDefaults(noun: String, label: String, tdefaults: Map[String, TypeRef]): Unit =
+    for (tp, ref) <- tdefaults.toList.sortBy(_._1) do
+      at(ref.pos)(err(s"'$tp' is a type parameter of $noun '$label', whose type parameters are solved " +
+        s"from what it is given rather than written where it is used — so '= ${ref.show}' has nothing " +
+        "to stand in for"))
+
+  /** Checks the defaults of the three declarations whose arguments *are* written — a trait, a struct
+   * and an enum — in a pass of its own once every type is registered, since a default may name one
+   * declared below it.
+   *
+   * What a default has to satisfy is checked at each **use** instead, by the same deferral every
+   * other type argument goes through: `withDefaults` fills the list before `deferredBounds` reads
+   * it, so a default that fails the parameter's own bound is caught wherever the declaration is
+   * applied, and by the machinery that already knows how to wait for the `impl` blocks.
+   */
+  protected def checkTypeDefaults(): Unit = {
+    def check(
+        key: String,
+        pos: Option[Pos],
+        noun: String,
+        tparams: List[String],
+        tdefaults: Map[String, TypeRef],
+        self: Map[String, Type],
+    ): Unit =
+      if tdefaults.nonEmpty then
+        currentPos = pos
+        inScope(declScope(key))(recover(())(sandboxed {
+          // Arguments are written left to right, so a parameter with no default sitting behind one
+          // that has could never be reached: leaving the earlier one out would leave nothing for the
+          // later one to be written after. The shape is refused here rather than at every use.
+          val first = tparams.indexWhere(tdefaults.contains)
+
+          for tp <- tparams.drop(first + 1) if !tdefaults.contains(tp) do
+            err(s"'$tp' has no default and comes after '${tparams(first)}', which has one — a use " +
+              s"writes its arguments in order, so nothing could leave out '${tparams(first)}' and " +
+              s"still supply '$tp'")
+
+          // Resolved in the order a use fills them, each under the ones already fixed. A parameter
+          // with no default stands in for itself, so a default naming one to its left is ordinary
+          // and one naming a parameter to its right is caught as the forward reference it is.
+          val known = mutable.LinkedHashMap.from(self)
+
+          for (tp, i) <- tparams.zipWithIndex do
+            tdefaults.get(tp) match
+              case None => known(tp) = Type.Abstract(tp, Nil)
+              case Some(ref) =>
+                at(ref.pos) {
+                  if mentions(ref, Set(tp)) then
+                    err(s"the default for '$tp' names '$tp' — a parameter cannot stand in for itself")
+
+                  for later <- tparams.drop(i + 1) if mentions(ref, Set(later)) do
+                    err(s"the default for '$tp' names '$later', which is fixed after it — a default " +
+                      "may name only the parameters written before it")
+
+                  if self.isEmpty && mentionsSelf(ref) then
+                    err(s"'Self' is the type implementing a trait, and $noun '${qn(key)}' is not a " +
+                      s"trait — so the default for '$tp' has nothing to name")
+
+                  known(tp) = resolveType(ref, known.toMap)
+                }
+        }))
+
+    for (key, d) <- traitDecls do check(key, d.pos, "trait", d.tparams, d.tdefaults, selfBinding(abstractSelf))
+    for (key, d) <- structDecls do check(key, d.pos, "struct", d.tparams, d.tdefaults, Map.empty)
+    for (key, d) <- enumDecls do check(key, d.pos, "enum", d.tparams, d.tdefaults, Map.empty)
+  }
 
   /** Holds every `impl` of a trait that requires others to supplying those too, once every `impl`
    * is registered and the question can be answered.
@@ -733,8 +817,8 @@ trait Hoisting extends TypeResolution {
       else sandboxed(resolveType(impl.forType, abstractSubst(impl.tparams, impl.bounds)))
 
     for s <- tr.supers do
-      superChecks +=
-        ((home.label, qn(tr.name), resolveBound(s, tr.tparams.zip(bound.args).toMap), subject, impl.pos))
+      superChecks += ((home.label, qn(tr.name),
+        resolveBound(s, tr.tparams.zip(bound.args).toMap ++ selfBinding(subject)), subject, impl.pos))
 
     if home.tparams.nonEmpty && home.bounds.nonEmpty then
       implBounds((impl.traitName, home.key)) = (home.tparams, home.bounds)
@@ -788,13 +872,22 @@ trait Hoisting extends TypeResolution {
    * parameter in the key is a key that matches many things.
    */
   private def implBound(impl: ImplDecl, tr: TraitDecl): Type.Bound = {
-    checkTraitArity(qn(impl.traitName), tr.tparams, impl.traitArgs.map(_ => Type.Unknown))
+    checkTraitArity(qn(impl.traitName), tr.tparams, tr.tdefaults, impl.traitArgs.map(_ => Type.Unknown))
 
     // The block's parameters resolve to themselves so that naming one here is caught as the thing it
     // is, rather than reported as an unknown type — which would send the reader looking for a
     // declaration rather than at the argument they meant to fix.
     val declared = abstractSubst(impl.tparams, impl.bounds)
-    val args     = impl.traitArgs.map(resolveType(_, declared))
+    val written  = impl.traitArgs.map(resolveType(_, declared))
+
+    // What the block leaves out the trait supplies, and `Self` in one of those defaults is the type
+    // this block implements the trait for — which is what makes `impl Mul for Point` the
+    // `impl Mul[Point] for Point` it reads as.
+    val args =
+      if written.length == tr.tparams.length then written
+      else
+        withDefaults(impl.traitName, tr.tparams, tr.tdefaults, written,
+          selfBinding(sandboxed(resolveType(impl.forType, declared))))
 
     for a <- args; abs <- mentionedParam(a) do
       err(s"'${abs.name}' is a type parameter of this 'impl', so it leaves which '${qn(impl.traitName)}' " +

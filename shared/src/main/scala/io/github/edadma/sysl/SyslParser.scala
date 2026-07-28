@@ -19,6 +19,20 @@ import scala.util.parsing.input.{NoPosition, Position, Reader}
  * the first token the rule consumed. A parser is bound to one `Source` so that stamp is complete
  * — file, line, and column — the moment the node exists.
  */
+/** What a `[T, U: Show, V = int]` list says, kept as one value because every generic declaration
+  * parses the same list and hands all three parts to the node it builds. A parameter carrying
+  * neither a bound nor a default is simply absent from both maps.
+  */
+case class TypeParams(
+    names: List[String],
+    bounds: Map[String, List[BoundRef]] = Map.empty,
+    defaults: Map[String, TypeRef] = Map.empty,
+)
+
+object TypeParams {
+  val none: TypeParams = TypeParams(Nil)
+}
+
 class SyslParser(val source: Source) extends PackratParsers {
 
   val lexical: SyslLexical = new SyslLexical
@@ -452,14 +466,26 @@ class SyslParser(val source: Source) extends PackratParsers {
    * A bound is a trait **applied**, so it takes type arguments where the trait declares any:
    * `[E: From[IoError]]`. The arguments are types and parse as such, which is what lets one mention
    * another of the parameters being declared.
+   *
+   * A parameter may also carry a **default**, `[Rhs = Self]`, which stands in where the declaration
+   * is applied to fewer arguments than it declares. The bound comes first and the default last, so
+   * `[R: Show = Self]` reads as the two clauses it is; both are optional and independent. Whether a
+   * default means anything in the position being parsed is the analyzer's question, since only it
+   * can say so with the declaration under the message.
    */
-  private lazy val boundedTypeParams: Parser[(List[String], Map[String, List[BoundRef]])] =
+  private lazy val boundedTypeParams: Parser[TypeParams] =
     op("[") ~> commaList1(boundedTypeParam) <~ op("]") ^^ { ps =>
-      (ps.map(_._1), ps.collect { case (n, bs) if bs.nonEmpty => n -> bs }.toMap)
+      TypeParams(
+        ps.map(_._1),
+        ps.collect { case (n, bs, _) if bs.nonEmpty => n -> bs }.toMap,
+        ps.collect { case (n, _, Some(d)) => n -> d }.toMap,
+      )
     }
 
-  private lazy val boundedTypeParam: Parser[(String, List[BoundRef])] =
-    ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ^^ { case n ~ bs => (n, bs.getOrElse(Nil)) }
+  private lazy val boundedTypeParam: Parser[(String, List[BoundRef], Option[TypeRef])] =
+    ident ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) ~ opt(op("=") ~> typeRef) ^^ {
+      case n ~ bs ~ d => (n, bs.getOrElse(Nil), d)
+    }
 
   private lazy val boundRef: Parser[BoundRef] =
     at(qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => BoundRef(n, args.getOrElse(Nil)) })
@@ -519,9 +545,10 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val funcDecl: PackratParser[Stmt] =
     ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
-      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+      val tp = tps.getOrElse(TypeParams.none)
       (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
-        case ((params, variadic)) ~ ret ~ body => FuncDecl(name, names, params, ret, body, bounds, variadic)
+        case ((params, variadic)) ~ ret ~ body =>
+          FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults)
       }
     }
 
@@ -569,14 +596,14 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   private lazy val structDecl: PackratParser[Stmt] =
     op("struct") ~> ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
-      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+      val tp = tps.getOrElse(TypeParams.none)
 
       (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
         items =>
           val fields     = items.collect { case StructPart.Fld(f)  => f }
           val members    = items.collect { case StructPart.Mem(m)  => m }
           val invariants = items.collect { case StructPart.Inv(e)  => e }
-          StructDecl(name, names, fields, members, bounds, invariants)
+          StructDecl(name, tp.names, fields, members, tp.bounds, invariants, tdefaults = tp.defaults)
       }
     }
 
@@ -608,15 +635,16 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val member: PackratParser[MethodDecl] =
     at(
       ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
-        methodTail(name, tps.getOrElse((Nil, Map.empty))) |
+        methodTail(name, tps.getOrElse(TypeParams.none)) |
           (if tps.isEmpty then propertyTail(name) else failure("a property takes no type parameters"))
       },
     )
 
-  private def methodTail(name: String, generics: (List[String], Map[String, List[BoundRef]])): Parser[MethodDecl] =
+  private def methodTail(name: String, generics: TypeParams): Parser[MethodDecl] =
     (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
       case (recv, params) ~ ret ~ body =>
-        MethodDecl(name, recv, isProperty = false, generics._1, params, ret, body, generics._2)
+        MethodDecl(name, recv, isProperty = false, generics.names, params, ret, body, generics.bounds,
+          generics.defaults)
     }
 
   private def propertyTail(name: String): Parser[MethodDecl] =
@@ -644,13 +672,13 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val enumDecl: PackratParser[Stmt] =
     op("enum") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> typeRef) >> { case name ~ tps ~ under =>
-      val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+      val tp = tps.getOrElse(TypeParams.none)
 
       (newline ~> indent ~> opt(newlines) ~> repsep(enumItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
         items =>
           val variants = items.collect { case Left(v)  => v }
           val members  = items.collect { case Right(m) => m }
-          EnumDecl(name, names, under, variants, members, bounds)
+          EnumDecl(name, tp.names, under, variants, members, tp.bounds, tdefaults = tp.defaults)
       }
     }
 
@@ -713,10 +741,12 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val traitDecl: PackratParser[Stmt] =
     op("trait") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) >> {
       case name ~ tps ~ supers =>
-        val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+        val tp = tps.getOrElse(TypeParams.none)
 
         (newline ~> indent ~> opt(newlines) ~> repsep(traitMember, newlines) <~ opt(newlines) <~ dedent) <~
-          endName(name) ^^ { methods => TraitDecl(name, names, methods, bounds, supers.getOrElse(Nil)) }
+          endName(name) ^^ { methods =>
+            TraitDecl(name, tp.names, methods, tp.bounds, supers.getOrElse(Nil), tdefaults = tp.defaults)
+          }
     }
 
   /** A line inside a trait body. A **definition** is tried first, since it is a signature with more
@@ -734,8 +764,8 @@ class SyslParser(val source: Source) extends PackratParsers {
     at(
       ident ~ opt(boundedTypeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
         case name ~ tps ~ ((recv, params)) ~ ret =>
-          val (names, bounds) = tps.getOrElse((Nil, Map.empty))
-          MethodDecl(name, recv, isProperty = false, names, params, ret, Nil, bounds)
+          val tp = tps.getOrElse(TypeParams.none)
+          MethodDecl(name, recv, isProperty = false, tp.names, params, ret, Nil, tp.bounds, tp.defaults)
       },
     )
 
@@ -765,10 +795,10 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val implDecl: PackratParser[Stmt] =
     op("impl") ~> opt(boundedTypeParams) ~ qualifiedName ~ opt(typeArgs) ~ (op("for") ~> typeRef) >> {
       case tps ~ tname ~ targs ~ forType =>
-        val (names, bounds) = tps.getOrElse((Nil, Map.empty))
+        val tp = tps.getOrElse(TypeParams.none)
 
         (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
-          ImplDecl(tname, forType, methods, names, bounds, targs.getOrElse(Nil))
+          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs.getOrElse(Nil), tp.defaults)
         }
     }
 

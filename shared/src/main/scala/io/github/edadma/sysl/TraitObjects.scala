@@ -90,7 +90,7 @@ trait TraitObjects extends TypeResolution {
     val name = s"vt.${if boxed then "ref." else ""}${Type.mangle(tr)}.${Type.mangle(ty)}"
 
     if !vtables.contains(name) then
-      val slots = traitMembers(tr.bound).map { (from, m) =>
+      val slots = traitMembers(tr.bound, selfBinding(ty)).map { (from, m) =>
         // The trait's own membership was checked before this was reached; a **required** one is
         // checked here, where the table is being built, and the two ways it can fail want different
         // things said. A built-in satisfies by the compiler's rule (`14 §5`) and has no function to

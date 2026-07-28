@@ -98,6 +98,19 @@ object Type {
   case class Abstract(name: String, bounds: List[Bound]) extends Type {
     def llvm: String =
       throw new IllegalStateException(s"the type parameter '$name' reached codegen")
+
+    /** Identity is the **name**, and deliberately not the bounds, for the reason `Bound.key` is a
+      * string one paragraph down: one parameter has more than one stand-in. Resolving what a
+      * declaration asks of `T` needs a `T` to ask it about, and that one cannot carry the bounds
+      * being resolved without walking back around forever — so it is built without them, while the
+      * `T` a parameter's *type* resolves to carries them all. Both are the same parameter, and
+      * anything that compares two types would say otherwise if the bounds were part of the answer.
+      */
+    override def equals(other: Any): Boolean = other match
+      case a: Abstract => a.name == name
+      case _           => false
+
+    override def hashCode: Int = name.hashCode
   }
 
   /** One trait a parameter is bounded by, or one an implementation supplies, with the arguments the

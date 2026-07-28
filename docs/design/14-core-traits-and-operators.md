@@ -493,12 +493,13 @@ exactly (`§5`), one row further down the catalog.
   of those is in question here. The result staying `Self` covers `Complex * f64` and `Vec3 * f64`
   and deliberately does not cover a dot product, which returns neither operand's type.
 
-  **What it waits on is a default type parameter.** Without `trait Mul[Rhs = Self]`, every
-  `impl Mul for Point` already written becomes `impl Mul[Point] for Point`, and the parameter has to
-  be spelled at every bound — `[T: Mul]` would no longer say what it says now. Defaults are not in
-  the language (`trait Scale[R = Self]` is a parse error), so the honest order is defaults first,
-  then the catalog. Until then the workaround is a named method, which is what `guide/fft` does and
-  what this entry exists to stop being rediscovered.
+  **What it was waiting on was a default type parameter, and that is now built** (`10 §1`).
+  `trait Scale[R = Self]` is ordinary, `impl Scale for P` means `impl Scale[P] for P`, and
+  `[T: Scale]` asks for `Scale[T]` — which is exactly what the catalog needs for `Mul` to gain an
+  `Rhs` without every `impl Mul for Point` and every `[T: Mul]` being respelled. What remains is the
+  catalog change itself: `Mul` becoming `Mul[Rhs]` with `mul(self, rhs: Rhs) -> Self`, the operator
+  dispatching on the pair, and `guide/fft`'s `.scale(k)` at each call site becoming `* k`. Until
+  that lands the workaround is still the named method the guide uses.
 - **A bound that promises a *value*.** Every trait in the catalog promises behaviour, which is what
   a trait is for, and three separate programs have now wanted one that promises a value instead.
   A generic container cannot declare `[16]K` for any `K` (`07 § Not yet`); a growable one cannot

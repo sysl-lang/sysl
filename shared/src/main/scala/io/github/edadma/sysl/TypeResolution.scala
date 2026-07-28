@@ -50,6 +50,13 @@ trait TypeResolution extends ImportResolution {
   /** The substitution that gives `Self` its meaning, for the one type it currently stands for. */
   protected def selfBinding(t: Type): Map[String, Type] = Map(selfName -> t)
 
+  /** `Self` standing in for itself, for the checks a trait's own declaration can run before any type
+   * has implemented it. A requirement's arguments have to resolve for the declaration to be checked
+   * at all, and here the implementing type is precisely what is not yet known — so it is treated as
+   * the one unknown type it is, which is enough to compare two requirements of the same trait.
+   */
+  protected def abstractSelf: Type = Type.Abstract(selfName, Nil)
+
   /** `subst`, extended with whatever `Self` means inside `fname` — which is a question only a
    * member of a *generic* type leaves open.
    *
@@ -103,11 +110,16 @@ trait TypeResolution extends ImportResolution {
    * three places a trait is applied — the others being an `impl` and a trait object.
    */
   protected def resolveBound(b: BoundRef, subst: Map[String, Type]): Type.Bound = at(b.pos) {
-    val args = b.args.map(resolveType(_, subst))
-    val key  = traitKey(b.name)
+    val written = b.args.map(resolveType(_, subst))
+    val key     = traitKey(b.name)
+    var args    = written
 
     for k <- key; decl <- traitDecls.get(k) do
-      checkTraitArity(b.name, decl.tparams, args)
+      checkTraitArity(b.name, decl.tparams, decl.tdefaults, written)
+      // What the bound leaves out the trait supplies, and `Self` in one of those defaults is
+      // whatever is being asked to implement the trait — the parameter the bound belongs to, which
+      // is what the substitution being resolved under already carries.
+      args = withDefaults(k, decl.tparams, decl.tdefaults, written, subst.filter(_._1 == selfName))
       deferredBounds(k, decl.tparams, decl.bounds, args)
 
     // A bound naming no trait at all keeps the name as written, so `checkBoundNames` reports it in
@@ -115,15 +127,75 @@ trait TypeResolution extends ImportResolution {
     Type.Bound(key.getOrElse(b.name), args)
   }
 
+  /** How many arguments a declaration has to be given: the parameters it declares, less the ones
+   * carrying a default. A default stands in only for an argument that was not written, so the
+   * parameters without one are exactly what a use is obliged to supply.
+   *
+   * The defaults are a suffix — `checkTypeDefaults` refuses any other arrangement at the
+   * declaration — so a count is enough here and no position has to be reasoned about.
+   */
+  protected def leastArgs(tparams: List[String], tdefaults: Map[String, TypeRef]): Int =
+    tparams.count(!tdefaults.contains(_))
+
+  private def arityPhrase(tparams: List[String], tdefaults: Map[String, TypeRef]): String = {
+    val least = leastArgs(tparams, tdefaults)
+
+    if least == tparams.length then s"takes ${quantity(tparams.length, "type argument")}"
+    else s"takes between $least and ${tparams.length} type arguments"
+  }
+
   /** A trait applied to the wrong number of arguments, said in the words a trait deserves — the
    * type-level message would send the reader looking for a struct of that name.
    */
-  protected def checkTraitArity(name: String, tparams: List[String], targs: List[Type]): Unit =
-    if tparams.length != targs.length then
+  protected def checkTraitArity(
+      name: String,
+      tparams: List[String],
+      tdefaults: Map[String, TypeRef],
+      targs: List[Type],
+  ): Unit =
+    if targs.length > tparams.length || targs.length < leastArgs(tparams, tdefaults) then
       if tparams.isEmpty then err(s"trait '$name' does not take type arguments")
       else
-        err(s"trait '$name' takes ${quantity(tparams.length, "type argument")}, " +
+        err(s"trait '$name' ${arityPhrase(tparams, tdefaults)}, " +
           s"but ${supplied(targs.length, "type argument")}")
+
+  /** The arguments a generic declaration was applied to, with the ones it was not given taken from
+   * the defaults it declares (`10 §3`).
+   *
+   * They are filled left to right, each resolved under the arguments already fixed, so a later
+   * default may name an earlier parameter and `[T, U = T]` means what it reads as. `self` carries
+   * what `Self` stands for where there is such a thing — the implementing type at an `impl`, the
+   * parameter itself at a bound — and is empty where there is not, which is what leaves a `Self`
+   * default at a trait object reported rather than silently taken as something else.
+   *
+   * A default is written in the file that declares it, so it is resolved in **that** file's terms
+   * rather than the applying one's: `[A = Heap]` names the `Heap` its author could see, whether or
+   * not the program applying it can see one at all.
+   */
+  protected def withDefaults(
+      key: String,
+      tparams: List[String],
+      tdefaults: Map[String, TypeRef],
+      targs: List[Type],
+      self: Map[String, Type],
+      noSelf: String = "there is no type here for it to stand for",
+  ): List[Type] =
+    if targs.length >= tparams.length || tdefaults.isEmpty then targs
+    else
+      inDecl(key) {
+        val filled = mutable.ListBuffer.from(targs)
+
+        for tp <- tparams.drop(targs.length) do
+          filled += tdefaults.get(tp).fold(Type.Unknown) { ref =>
+            if mentionsSelf(ref) && !self.contains(selfName) then
+              err(s"'$tp' defaults to '${ref.show}', which names the type implementing " +
+                s"'${qn(key)}', and $noSelf — write the argument")
+
+            resolveType(ref, self ++ tparams.zip(filled))
+          }
+
+        filled.toList
+      }
 
   /** A declaration's type parameters as its own body sees them: each standing in for itself, and
    * carrying what the declaration asked of it (`14 §4`).
@@ -140,7 +212,12 @@ trait TypeResolution extends ImportResolution {
         if seen(tp) then Nil
         else
           val inner: Map[String, Type] = tparams.map(p => p -> build(p, seen + tp)).toMap
-          bounds.getOrElse(tp, Nil).map(b => recorded(Type.Bound(b.name, Nil))(resolveBound(b, inner))),
+          // A bound asks something of the parameter it is written on, so `Self` inside it — written
+          // there, or arriving from a default — is that parameter. It is taken from `inner`, whose
+          // entry for it is already the bound-free stand-in that breaks the walk back around.
+          val here = inner ++ selfBinding(inner(tp))
+
+          bounds.getOrElse(tp, Nil).map(b => recorded(Type.Bound(b.name, Nil))(resolveBound(b, here))),
       )
 
     tparams.map(tp => tp -> build(tp, Set.empty)).toMap
@@ -282,16 +359,23 @@ trait TypeResolution extends ImportResolution {
   private def traitObject(inner: TypeRef, subst: Map[String, Type], sigil: String): Option[Type.Trait] =
     inner match
       case NamedType(n, argRefs) if traitKey(n).isDefined && !(argRefs.isEmpty && subst.contains(n)) =>
-        val key  = traitKey(n).get
-        val decl = traitDecls(key)
-        val args = argRefs.map(resolveType(_, subst))
+        val key     = traitKey(n).get
+        val decl    = traitDecls(key)
+        val written = argRefs.map(resolveType(_, subst))
 
         at(inner.pos) {
-          checkTraitArity(n, decl.tparams, args)
+          checkTraitArity(n, decl.tparams, decl.tdefaults, written)
+
+          // An object has forgotten which type it holds, so there is no `Self` for a default to
+          // stand for and none is offered — a trait whose default names one has to be written out
+          // here, and `checkObjectSafe` says so in the same breath about the members.
+          val args = withDefaults(key, decl.tparams, decl.tdefaults, written, Map.empty,
+            "an object has forgotten which type it holds")
+
           deferredBounds(key, decl.tparams, decl.bounds, args)
           checkObjectSafe(key, args, sigil)
+          Some(Type.Trait(key, args))
         }
-        Some(Type.Trait(key, args))
       case _ => None
 
   /** Whether a trait may be erased into an object at all, and what to say when it may not (`02`).
@@ -588,11 +672,16 @@ trait TypeResolution extends ImportResolution {
   protected def plain(name: String, targs: List[Type], ty: Type): Type =
     if targs.nonEmpty then err(s"type '$name' does not take type arguments") else ty
 
-  protected def checkArity(name: String, tparams: List[String], targs: List[Type]): Unit =
-    if tparams.length != targs.length then
+  protected def checkArity(
+      name: String,
+      tparams: List[String],
+      tdefaults: Map[String, TypeRef],
+      targs: List[Type],
+  ): Unit =
+    if targs.length > tparams.length || targs.length < leastArgs(tparams, tdefaults) then
       if tparams.isEmpty then err(s"type '${qn(name)}' does not take type arguments")
       else
-        err(s"type '${qn(name)}' takes ${quantity(tparams.length, "type argument")}, " +
+        err(s"type '${qn(name)}' ${arityPhrase(tparams, tdefaults)}, " +
           s"but ${supplied(targs.length, "type argument")}")
 
   /** Instantiates a struct for one set of type arguments, memoized on the display name. The
@@ -603,9 +692,14 @@ trait TypeResolution extends ImportResolution {
   protected def instantiateStruct(name: String, targs: List[Type]): Type.Struct =
     inDecl(name)(instantiateStructIn(name, targs))
 
-  private def instantiateStructIn(name: String, targs: List[Type]): Type.Struct = {
+  private def instantiateStructIn(name: String, written: List[Type]): Type.Struct = {
     val decl = structDecls(name)
-    checkArity(name, decl.tparams, targs)
+    checkArity(name, decl.tparams, decl.tdefaults, written)
+
+    // Filled before anything is keyed on it, so `Buf[int]` and `Buf[int, Heap]` are one
+    // instantiation rather than two that happen to have the same fields.
+    val targs = withDefaults(name, decl.tparams, decl.tdefaults, written, Map.empty)
+
     checkTypeBounds(name, decl.tparams, targs)
     val key = Type.qualified(name, targs)
 
@@ -645,9 +739,12 @@ trait TypeResolution extends ImportResolution {
   protected def instantiateEnum(name: String, targs: List[Type]): Type.Enum =
     inDecl(name)(instantiateEnumIn(name, targs))
 
-  private def instantiateEnumIn(name: String, targs: List[Type]): Type.Enum = {
+  private def instantiateEnumIn(name: String, written: List[Type]): Type.Enum = {
     val decl = enumDecls(name)
-    checkArity(name, decl.tparams, targs)
+    checkArity(name, decl.tparams, decl.tdefaults, written)
+
+    val targs = withDefaults(name, decl.tparams, decl.tdefaults, written, Map.empty)
+
     checkTypeBounds(name, decl.tparams, targs)
     val key = Type.qualified(name, targs)
 

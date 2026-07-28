@@ -208,6 +208,7 @@ case class MethodDecl(
     retType: Option[TypeRef],
     body: List[Stmt],
     bounds: Map[String, List[BoundRef]] = Map.empty,
+    tdefaults: Map[String, TypeRef] = Map.empty,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the
@@ -396,6 +397,7 @@ case class FuncDecl(
     bounds: Map[String, List[BoundRef]] = Map.empty,
     variadic: Boolean = false,
     vis: Visibility = Visibility.Public,
+    tdefaults: Map[String, TypeRef] = Map.empty,
 ) extends Stmt
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
@@ -438,6 +440,7 @@ case class StructDecl(
     bounds: Map[String, List[BoundRef]] = Map.empty,
     invariants: List[Expr] = Nil,
     vis: Visibility = Visibility.Public,
+    tdefaults: Map[String, TypeRef] = Map.empty,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
@@ -459,7 +462,8 @@ case class EnumVariantDecl(name: String, value: Option[Expr], fields: List[Param
 case class EnumDecl(name: String, tparams: List[String], underlying: Option[TypeRef],
                     variants: List[EnumVariantDecl], members: List[MethodDecl] = Nil,
                     bounds: Map[String, List[BoundRef]] = Map.empty,
-                    vis: Visibility = Visibility.Public) extends Stmt
+                    vis: Visibility = Visibility.Public,
+                    tdefaults: Map[String, TypeRef] = Map.empty) extends Stmt
 
 /** The `within lo..hi` clause of a constrained subtype. `exclusiveHi` marks `..<`, which excludes
  * the upper endpoint; a plain `..` includes it. Bounds are literal expressions — an integer, a
@@ -504,6 +508,12 @@ case class TypeDecl(
  * `trait Word: Add + BitXor`. A supertrait is a promise the trait itself makes, so an `impl` supplies
  * it and everything that names the trait — a bound, a trait object — gets the required traits'
  * members along with its own.
+ *
+ * `tdefaults` are the `= Type` clauses of `trait Mul[Rhs = Self]`, keyed by the parameter they
+ * belong to. A trait is one of the three declarations whose arguments are *written* where it is
+ * applied, so a default has somewhere to stand in — the others are a struct and an enum. The
+ * declarations whose parameters are solved instead carry the field only so the analyzer can say
+ * why they may not have one.
  */
 case class TraitDecl(
     name: String,
@@ -512,6 +522,7 @@ case class TraitDecl(
     bounds: Map[String, List[BoundRef]] = Map.empty,
     supers: List[BoundRef] = Nil,
     vis: Visibility = Visibility.Public,
+    tdefaults: Map[String, TypeRef] = Map.empty,
 ) extends Stmt
 
 /** `impl Trait for Type` with indented method **bodies**. Every method the trait declares without a
@@ -542,6 +553,7 @@ case class ImplDecl(
     tparams: List[String] = Nil,
     bounds: Map[String, List[BoundRef]] = Map.empty,
     traitArgs: List[TypeRef] = Nil,
+    tdefaults: Map[String, TypeRef] = Map.empty,
 ) extends Stmt
 
 /** The `module a.b.c` header a file carries, naming the module the file contributes to. The name is

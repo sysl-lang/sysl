@@ -242,13 +242,38 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     // A trait promises this of every type that implements it, and `Self` is the name of that type —
     // so writing it in a requirement is asking for something that is only known at the `impl`.
-    "'Self' has no meaning in a requirement" in {
-      err(
+    /** `Self` in a requirement's arguments is the type implementing the requiring trait, exactly as
+      * it is in a method signature — `trait T: Into[Self]` asks for a conversion into whatever
+      * implements `T`. It was once refused as meaningless, which it is not: a trait's parameter can
+      * be an operand type, and naming the implementing type there is the ordinary thing to want.
+      */
+    "a requirement may name the implementing type" in {
+      run(
         """trait Into[U]
           |    into(self) -> U
           |trait T: Into[Self]
+          |    m(self) -> int
+          |struct P
+          |    v: int
+          |impl Into[P] for P
+          |    into(self) -> P = P(self.v)
+          |impl T for P
+          |    m(self) -> int = self.v
+          |print(P(7).into().m())""".stripMargin,
+      ) shouldBe "7\n"
+    }
+
+    /** And it is the *same* requirement however it is spelled, which is what keeps the flattened
+      * table from laying out two slots for one member — the rule that a trait is required once, met
+      * here by two spellings rather than two argument lists.
+      */
+    "written out or left to the default, it is one requirement" in {
+      err(
+        """trait Into[U = Self]
+          |    into(self) -> U
+          |trait T: Into[Self] + Into[int]
           |    m(self) -> int""".stripMargin,
-      ) should include("'Self' has no meaning in 'Into[Self]'")
+      ) should include("a type implements one trait once")
     }
 
     "a trait may not require itself" in {

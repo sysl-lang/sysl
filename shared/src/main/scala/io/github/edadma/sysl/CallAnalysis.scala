@@ -393,10 +393,16 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   private def boundMember(a: Type.Abstract, mname: String): Option[(Type.Bound, Map[String, Type], MethodDecl)] =
     a.bounds.iterator
-      .flatMap(traitClosure)
+      .flatMap(traitClosure(_, selfBinding(a)))
       .flatMap(b => traitDecls.get(b.name).map((b, _)))
       .flatMap { case (b, decl) =>
-        decl.methods.find(_.name == mname).map(m => (b, selfBinding(a) ++ decl.tparams.zip(b.args), m))
+        // Padded rather than zipped, because a bound whose own resolution failed is recorded with
+        // whatever survived of its arguments — and reading a member against a short list would
+        // report the trait's signature as unresolvable, which is a second complaint about the one
+        // mistake already being reported.
+        decl.methods
+          .find(_.name == mname)
+          .map(m => (b, selfBinding(a) ++ decl.tparams.zipAll(b.args, "", Type.Unknown).filter(_._1.nonEmpty), m))
       }
       .nextOption()
 

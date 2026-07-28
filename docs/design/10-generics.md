@@ -48,6 +48,39 @@ or a composed shape applied to them (`02`), a **member**, which may be generic o
 own beyond its type's (`08`, §4 below), and a **trait**, which is then a family of promises rather
 than one (`02`) — `trait Sink[T]` is what an implementation applies to `int` to say what it accepts.
 
+### A parameter may carry a default
+
+A parameter of a **trait**, a **struct** or an **enum** may name the type to use where a use leaves
+it out:
+
+```
+trait Scale[R = Self]                    // the operand type, usually the implementing type
+    scale(self, k: R) -> Self
+struct Pair[A, B = A]                    // Pair[int] is Pair[int, int]
+    x: A
+    y: B
+```
+
+The bound comes first and the default last — `[R: Show = Self]` — and either may be written without
+the other. Defaults are filled left to right, each resolved under the arguments already fixed, so a
+default may name a parameter written **before** it and naming one written after it is the forward
+reference it looks like. They are a suffix: a parameter with no default may not come after one that
+has, because arguments are written in order and nothing could leave out the earlier one and still
+supply the later. And the filling happens before anything is keyed on the arguments, so `Pair[int]`
+and `Pair[int, int]` are one instantiation rather than two that happen to have the same fields.
+
+**`Self` is the case the feature exists for.** In a trait's default it means the type implementing
+the trait, exactly as it does in a method's signature — so `impl Scale for P` is the
+`impl Scale[P] for P` it reads as, and `[T: Scale]` asks for `Scale[T]`. A struct and an enum have no
+implementing type, so `Self` in one of their defaults is refused. Neither has a **trait object**: an
+object has forgotten which type it holds, so `&Scale` is refused and `&Scale[int]` is what to write.
+
+**Only those three declarations may carry one**, and the reason is §2's: a function's, a method's and
+an `impl` block's type parameters are *solved* from what they are given rather than written where
+they are used, so there is no argument list with a gap for a default to fill. What would be useful
+there is a fallback for an inference that found nothing, which is a different feature; writing
+`f[T = int](x: T)` is refused rather than quietly meaning that.
+
 ## 2. `[]` means type application in a type, indexing in an expression
 
 Square brackets are reused for two things, disambiguated by **position**, with no new token:

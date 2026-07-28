@@ -579,11 +579,20 @@ and a type's members are one namespace, so this is the coherence rule one level 
 'Both' cannot require both
 ```
 
-A trait may not require itself, directly or around a cycle; `Self` has no meaning in a requirement,
-since a trait requires another of *whatever* type implements it and `Self` is the name of that type;
-and a trait may not require one that reaches less far than it does (`13 §2`) — implementing the trait
+A trait may not require itself, directly or around a cycle; and a trait may not require one that
+reaches less far than it does (`13 §2`) — implementing the trait
 means implementing the required one, so a requirement the implementer cannot name leaves the trait
 unimplementable from outside.
+
+**`Self` in a requirement's arguments is the type implementing the requiring trait**, exactly as it
+is in a method's signature — `trait Vector: Scale[Self]` asks that whatever implements `Vector` can
+be scaled by its own type, and it is the same requirement `trait Vector: Scale` writes when `Scale`
+defaults its parameter to `Self` (`10 §1`). It was once refused as meaningless, on the reading that a
+trait requires another of *whatever* type implements it; that is true and it is exactly why `Self`
+names something there. Being one requirement however it is spelled is what keeps the flattened table
+from laying out two slots for one member: two spellings of one requirement are compared as the types
+they resolve to, so `Scale[Self]` and a defaulted `Scale` are the same row, while `Scale[Self]` and
+`Scale[int]` are the two the coherence rule refuses in advance.
 
 One thing follows from the table and is worth stating: a trait that requires an **unerasable** one is
 unerasable itself, so `trait Word: Add` has no object, and the diagnostic names `Add` as the trait

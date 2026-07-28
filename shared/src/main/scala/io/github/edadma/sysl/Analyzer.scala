@@ -75,6 +75,10 @@ class Analyzer private (units: List[Program])
     // registered, and not before: `trait Ord: Eq` is ordinary whichever of the two is written first.
     checkTraitSupers()
 
+    // And what each generic type's defaults stand in for, which is answerable for the same reason
+    // and not before: a default may name a type declared below the one that defaults to it.
+    checkTypeDefaults()
+
     // Every constant is folded now, whether or not anything reads it. Folding is lazy so that one
     // may be written in terms of another declared below it, and an unused constant would otherwise
     // never be looked at — leaving a value that does not fit its type, or is not constant at all, as
