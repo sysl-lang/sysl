@@ -95,6 +95,13 @@ interface change to that module, visible to everything downstream — the same r
 `given`/`using`-style implicit resolution out of scope (`13` §7): unrestricted search and separate
 compilation are not compatible.
 
+**Not built: nothing enforces the rule.** `Eq` and `Option` are both the prelude's, and a user
+module writing `impl[T: Eq] Eq for Option[T]` — a foreign trait for a foreign type, the case with
+no home — is accepted today. The rule matters exactly when a program is more than one module and
+two of them supply the same `impl`, which is the case that has not arisen yet; what it costs
+meanwhile is that a program can quietly depend on an implementation the chapter says it may not
+write. Pinned by an ignored test in `ImplShapeErrorTests`.
+
 ## Defaults — a trait may answer as well as ask
 
 A trait method is written either as a bare signature, which an implementation must supply, or with a

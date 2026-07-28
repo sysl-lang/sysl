@@ -187,6 +187,73 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
            |print(view().len)
            |""".stripMargin) should include("@view")
     }
+
+    // The array is a field of somebody else's struct, and the pointer is how this frame reached
+    // it — so the storage is no more this frame's than `*p` itself is. The route to the pointer
+    // runs through a field access rather than ending at the dereference.
+    "views an array field reached through a `*T`" in {
+      ir("""struct Box
+           |    a: [8]u8
+           |    n: usize
+           |end Box
+           |view(b: *Box) -> []u8 = b.a[0..<b.n]
+           |var b = Box([65u8; 8], 3usize)
+           |print(view(&b).len)
+           |""".stripMargin) should include("@view")
+    }
+
+    "views an array field of a `*T` receiver" in {
+      ir("""struct Box
+           |    a: [8]u8
+           |    n: usize
+           |
+           |    view(*self) -> []u8 = self.a[0..<self.n]
+           |end Box
+           |var b = Box([65u8; 8], 3usize)
+           |print(b.view().len)
+           |""".stripMargin) should include("@Box.view")
+    }
+
+    // Several steps of a place, not one: a table of structs indexed and then a field of the
+    // element. Every step is still somebody else's storage.
+    "views an array nested two steps inside a `*T`" in {
+      ir("""struct Row
+           |    a: [4]u8
+           |end Row
+           |struct Table
+           |    rows: [2]Row
+           |end Table
+           |view(t: *Table, i: usize) -> []u8 = t.rows[i].a[..]
+           |var t = Table([Row([65u8; 4]); 2])
+           |print(view(&t, 0usize).len)
+           |""".stripMargin) should include("@view")
+    }
+  }
+
+  // The pointer has to be the route to *this* array. A local array beside a pointer to something
+  // else is still a local array, and an element of a local array of arrays still belongs here.
+  "a local array is still local when" - {
+    "a pointer to something else is in scope" in {
+      err("""struct Box
+            |    a: [8]u8
+            |end Box
+            |view(b: *Box) -> []u8
+            |    var mine: [4]u8
+            |    mine[..]
+            |end view
+            |var b = Box([65u8; 8])
+            |print(view(&b).len)
+            |""".stripMargin) should include("is returned")
+    }
+
+    "the array is an element of a local array of arrays" in {
+      err("""view(i: usize) -> []u8
+            |    var grid: [2][4]u8
+            |    grid[i][..]
+            |end view
+            |print(view(0usize).len)
+            |""".stripMargin) should include("is returned")
+    }
   }
 
   // `05` gives the rule for a callee whose body is not here: assume it keeps everything, because

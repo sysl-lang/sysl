@@ -302,6 +302,31 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       err(src) should include("'==' is not defined for Money")
     }
 
+    // The catalog's memberships are written one type at a time, and the prelude's own generic
+    // enums have none — so "is this the same link" over an `Option` is written by taking both
+    // sides apart, even where the payload compares perfectly well on its own.
+    "and an Option is not equatable, whatever it holds" in {
+      err("""var a: Option[u8] = Some(3u8)
+            |var b: Option[u8] = Some(3u8)
+            |print(a == b)
+            |""".stripMargin) should include("'==' is not defined for Option[byte]")
+    }
+
+    // What it costs to write by hand, and that the payload's own equality is what answers it.
+    "though the implementation it wants is writable" in {
+      run("""impl[T: Eq] Eq for Option[T]
+            |    eq(self, rhs: Option[T]) -> bool = self match
+            |        Some(a) -> rhs match
+            |            Some(b) -> a == b
+            |            None -> false
+            |        None -> rhs.is_none()
+            |var a: Option[u8] = Some(3u8)
+            |var b: Option[u8] = Some(4u8)
+            |var c: Option[u8] = None
+            |print(a == a, a == b, a == c, c == c)
+            |""".stripMargin) shouldBe "true false false true\n"
+    }
+
     "both equality operators derive from one 'eq'" in {
       val src =
         """struct Money

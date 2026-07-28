@@ -1,0 +1,207 @@
+// The ready structure: which tasks could run right now, kept without allocating anything.
+//
+// The scheduler next door keeps its ready tasks in a binary heap of `&Task` and finds a task
+// again through a slot number the heap writes into the task. Take the heap away and the shape a
+// kernel reaches for instead is a **bitmap of occupied priority levels over one queue per level**:
+// the most urgent level is the lowest set bit of a word, and the task to run is the head of that
+// level's queue. Both answers are had without comparing anything.
+//
+// The queues are **intrusive**. There is no storage here for them — the links live in the tasks
+// themselves, as `next_ready`, and this file only ever holds the head and the tail of each level.
+// That is the whole trade the problem is about: a list that costs nothing to make, in exchange for
+// a list that cannot be walked without the table its links are indices into.
+//
+// Which is the first thing an index costs. A reference carries its referent; an index carries
+// nothing, so **every operation here takes the task table as a parameter** — `push` and `pop` and
+// `remove` all need `ts` to reach the very links they are threading. The heap next door needed no
+// such argument, because a `&Task` already was the task.
+
+// The lowest set bit of a word, which is where the most urgent ready task lives. A real kernel
+// spends one instruction on this; sysl has no such intrinsic, so it is written as five halvings,
+// which is the same log₂(64) work the instruction does. Undefined for zero — every caller has
+// already asked whether anything is ready at all.
+lowest_bit(x: u64) -> u8
+    var v = x
+    var n = 0u8
+
+    if v & 0xFFFFFFFFu64 == 0u64
+        v >>= 32u64
+        n += 32u8
+
+    if v & 0xFFFFu64 == 0u64
+        v >>= 16u64
+        n += 16u8
+
+    if v & 0xFFu64 == 0u64
+        v >>= 8u64
+        n += 8u8
+
+    if v & 0xFu64 == 0u64
+        v >>= 4u64
+        n += 4u8
+
+    if v & 0x3u64 == 0u64
+        v >>= 2u64
+        n += 2u8
+
+    if v & 0x1u64 == 0u64 then n += 1u8
+
+    n
+end lowest_bit
+
+// The queue a task of this priority belongs in. Priorities are arithmetic — a lent one is the
+// minimum of some numbers — so they stay `int`, and the conversion to a level is where the range
+// is checked. A subtype bounds a value where it is *stored*, not where it is computed.
+level(p: int) -> Level = Level(u8(p))
+
+// The two numbers a ready task is ordered by, in the order that decides it: priority first, and
+// among equals the one that became ready earlier. This is the same key the scheduler next door
+// orders its heap with, and it survives the change of representation unaltered — but it has one
+// customer here instead of every comparison, because the levels do the ordering and the bitmap
+// finds the level. A wait list is the one thing left that is searched rather than sorted.
+struct Urgency
+    prio: int
+    seq: int
+end Urgency
+
+impl Ord for Urgency
+    lt(self, rhs: Urgency) -> bool =
+        if self.prio != rhs.prio then self.prio < rhs.prio
+        else self.seq < rhs.seq
+
+// One FIFO per priority, and a word saying which of them have anybody in them. `n` is carried
+// because there is no array whose length answers the question.
+struct RunQueue
+    bits: u64
+    head: [max_levels]Option[TaskId]
+    tail: [max_levels]Option[TaskId]
+    n: usize
+
+    is_empty(self) -> bool = self.bits == 0u64
+
+    len(self) -> usize = self.n
+
+    // Joining a level at its tail is what makes equal priorities share the processor a tick at a
+    // time: a task re-entering after spending a tick goes behind everyone already there. The heap
+    // next door got the same behaviour from a sequence number stamped on every entry, which it
+    // then had to compare; here the order is the list.
+    push(*self, ts: []Task, id: TaskId)
+        var i = usize(id)
+        var lv = level(ts[i].prio)
+        var p = usize(lv)
+
+        ts[i].next_ready = None
+        ts[i].qlevel = Some(lv)
+
+        self.tail[p] match
+            None -> self.head[p] = Some(id)
+            Some(last) -> ts[usize(last)].next_ready = Some(id)
+
+        self.tail[p] = Some(id)
+        self.bits |= 1u64 << u64(p)
+        self.n += 1usize
+    end push
+
+    pop(*self, ts: []Task) -> Option[TaskId]
+        if self.bits == 0u64 then return None
+
+        var p = usize(lowest_bit(self.bits))
+        var id = self.head[p].unwrap()
+        var i = usize(id)
+
+        self.head[p] = ts[i].next_ready
+
+        if self.head[p].is_none()
+            self.tail[p] = None
+            self.bits &= ~(1u64 << u64(p))
+
+        ts[i].next_ready = None
+        ts[i].qlevel = None
+        self.n -= 1usize
+        Some(id)
+    end pop
+
+    // Taking a task out from the middle. A singly linked list is unlinked by the node in front of
+    // it, so the list is walked to find that node — which is what an intrusive list costs where a
+    // heap paid a swap. A task that is in no queue is not an error: a running task is out of the
+    // queue by definition.
+    remove(*self, ts: []Task, id: TaskId)
+        var i = usize(id)
+
+        if ts[i].qlevel.is_none() then return
+
+        var p = usize(ts[i].qlevel.unwrap())
+        var cur = self.head[p]
+        var prev: Option[TaskId] = None
+
+        while cur.is_some() && cur.unwrap() != id
+            prev = cur
+            cur = ts[usize(cur.unwrap())].next_ready
+
+        if cur.is_none() then return
+
+        var nxt = ts[i].next_ready
+
+        prev match
+            None -> self.head[p] = nxt
+            Some(q) -> ts[usize(q)].next_ready = nxt
+
+        if self.tail[p].unwrap_or(id) == id && self.tail[p].is_some() then self.tail[p] = prev
+        if self.head[p].is_none() then self.bits &= ~(1u64 << u64(p))
+
+        ts[i].next_ready = None
+        ts[i].qlevel = None
+        self.n -= 1usize
+    end remove
+
+    // A task whose priority has just changed. The heap next door moved the task where it stood,
+    // because it had written down where that was; here the queue a task belongs to *is* its
+    // priority, so changing the priority means taking it out first and putting it back after. The
+    // order of those three lines is the whole difference, and getting it wrong loses the task in a
+    // level it is no longer in.
+    reprio(*self, ts: []Task, id: TaskId, p: int)
+        var i = usize(id)
+
+        if ts[i].qlevel.is_none()
+            ts[i].prio = p
+            return
+
+        self.remove(ts, id)
+        ts[i].prio = p
+        self.push(ts, id)
+    end reprio
+
+    // The bitmap, the lists, and the tasks' own notes on which level they are in, all checked
+    // against each other — they are one invariant written in three places, and a level whose bit
+    // is set but whose list is empty is the failure that would otherwise show up as a task nobody
+    // can find. Every section of the checks that touches the queue asks this afterwards.
+    ok(self, ts: []Task) -> bool
+        var seen = 0usize
+
+        for p in 0..<max_levels
+            var occupied = self.bits & (1u64 << u64(p)) != 0u64
+            var cur = self.head[p]
+
+            if occupied == cur.is_none() then return false
+
+            var last: Option[TaskId] = None
+
+            while cur.is_some()
+                var i = usize(cur.unwrap())
+
+                if ts[i].qlevel.is_none() then return false
+                if usize(ts[i].qlevel.unwrap()) != p then return false
+                if usize(level(ts[i].prio)) != p then return false
+
+                last = cur
+                cur = ts[i].next_ready
+                seen += 1usize
+
+            if occupied && self.tail[p].unwrap() != last.unwrap() then return false
+            if !occupied && self.tail[p].is_some() then return false
+
+        seen == self.n
+    end ok
+end RunQueue
+
+run_queue() -> RunQueue = RunQueue(0u64, [None; max_levels], [None; max_levels], 0usize)

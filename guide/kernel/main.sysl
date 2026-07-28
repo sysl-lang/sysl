@@ -1,0 +1,822 @@
+// The checks. Every line of output begins `ok`, so the whole of stdout is the assertion.
+//
+// The schedules below are the **same strings** `guide/scheduler` asserts, for the same scenarios,
+// worked out on paper the same way. That is the point of writing the machine twice: two
+// implementations that share no representation and agree letter for letter are checking each
+// other, and what is left over — the checks in this file that have no counterpart next door — is
+// the measurement of what changed.
+//
+// Two of them have no counterpart, and both are about the same thing. Next door a queue of equals
+// is ordered by a sequence number the scheduler stamps, so a test could invert the order by
+// writing the numbers by hand; here the order *is* the list, so the only way a level can be in an
+// order is to have been joined in it. And next door the run queue could be exercised with no
+// scheduler at all, because a `&Task` is a task; here every question needs the table too.
+//
+// The reporting is the one part of the program that allocates. The machine does not.
+//
+// **Every section is a function, and that is not a matter of taste.** Next door the checks are a
+// script: thirty schedulers declared one after another as ordinary locals, because a scheduler
+// there is a handful of words and everything it holds is on the heap and freed as it is dropped.
+// A machine here is its whole storage — two tables, the queue and the trace, some fifty kilobytes
+// of it — and thirty of those in one frame is a stack overflow before the first check runs. What a
+// frame gives back at `return` is the only thing that gives anything back in a program that
+// allocates nothing, so a section that wants a fresh machine has to be a call. **Storage that is
+// never allocated is never freed either**, and this is where that is felt.
+
+check(name: string, got: string, want: string)
+    if got == want then print(s"ok    $name = $got")
+    else print(s"FAIL  $name = $got, wanted $want")
+end check
+
+// Which tick a task first got. Subtracting its arrival gives the latency the run cost it, which is
+// the number the two priority-inversion sections are about.
+first_at(line: string, c: u8) -> int
+    var b = line.bytes
+
+    for i in 0..<b.len
+        if b[i] == c then return int(i)
+
+    -1
+end first_at
+
+// What a task watched go past between arriving and running. This is the sharpest way to say what
+// priority inheritance does: with it the answer is the lock holder and nothing else.
+wait_span(line: string, arrive: int, c: u8) -> string =
+    line[usize(arrive)..<usize(first_at(line, c))]
+
+// The three intrusive lists, read out as the letters of what is on them. A list threaded through
+// index fields has no length and no elements to look at — the only way to see one is to walk it —
+// so these exist to let a check say what a list *contains* rather than only how long it is.
+ready_line(ts: []Task, first: Option[TaskId]) -> string
+    var s = ""
+    var cur = first
+
+    while cur.is_some()
+        var i = usize(cur.unwrap())
+
+        s += str(char(ts[i].mark))
+        cur = ts[i].next_ready
+
+    s
+end ready_line
+
+wait_line(ts: []Task, first: Option[TaskId]) -> string
+    var s = ""
+    var cur = first
+
+    while cur.is_some()
+        var i = usize(cur.unwrap())
+
+        s += str(char(ts[i].mark))
+        cur = ts[i].next_wait
+
+    s
+end wait_line
+
+held_line(ls: []Mutex, first: Option[LockId]) -> string
+    var s = ""
+    var cur = first
+
+    while cur.is_some()
+        var j = usize(cur.unwrap())
+
+        s += str(char(ls[j].mark))
+        cur = ls[j].next_held
+
+    s
+end held_line
+
+section_finding_the_most_urgent_level()
+    print("-- finding the most urgent level")
+
+    check("the lowest bit of one", str(lowest_bit(1u64)), "0")
+    check("of two", str(lowest_bit(2u64)), "1")
+    check("of a word with a hole under it", str(lowest_bit(0x100u64)), "8")
+    check("of the top bit alone", str(lowest_bit(1u64 << 63u64)), "63")
+    check("of every bit at once", str(lowest_bit(0xFFFFFFFFFFFFFFFFu64)), "0")
+    check("of the top half only", str(lowest_bit(0xFFFFFFFF00000000u64)), "32")
+end section_finding_the_most_urgent_level
+
+section_the_bitmap_keeps_its_levels()
+    print("-- the bitmap keeps its levels")
+
+    var kq = kernel(false)
+
+    check("an empty queue", str(kq.ready.is_empty()), "true")
+    check("and nothing comes out of it", str(kq.ready.pop(kq.tasks[..]).is_none()), "true")
+
+    for i in 0..<9
+        var id = kq.spawn(u8('t'), (i * 7) % 9, 0, [Work(1)]).unwrap()
+
+        kq.ready.push(kq.tasks[..], id)
+
+    check("nine tasks went in", str(kq.ready.len()), "9")
+    check("the levels hold together", str(kq.ready.ok(kq.tasks[..])), "true")
+
+    var out: [16]u8 = [0u8; 16]
+    var nout = 0usize
+
+    loop
+        kq.ready.pop(kq.tasks[..]) match
+            None -> break
+            Some(id) ->
+                out[nout] = 48u8 + u8(kq.tasks[usize(id)].prio)
+                nout += 1usize
+
+    check("and come out most urgent first", from_utf8(out[0..<nout]).unwrap_or("?"), "012345678")
+    check("leaving the queue empty", str(kq.ready.is_empty()), "true")
+    check("and every task knowing it is out", str(kq.tasks[0usize].qlevel.is_none()), "true")
+
+    // Where the scheduler next door stamps a sequence number and compares it, a level here is a queue
+    // and the order is the order things joined it. There is nothing to write by hand.
+    var kt = kernel(false)
+
+    for i in 0..<4
+        var id = kt.spawn(48u8 + u8(i), 7, 0, [Work(1)]).unwrap()
+
+        kt.ready.push(kt.tasks[..], id)
+
+    var tied: [8]u8 = [0u8; 8]
+    var ntied = 0usize
+
+    loop
+        kt.ready.pop(kt.tasks[..]) match
+            None -> break
+            Some(id) ->
+                tied[ntied] = kt.tasks[usize(id)].mark
+                ntied += 1usize
+
+    check("equal urgency is broken by which joined the level first",
+          from_utf8(tied[0..<ntied]).unwrap_or("?"), "0123")
+end section_the_bitmap_keeps_its_levels
+
+section_a_task_s_place_follows_it()
+    print("-- a task's place follows it")
+
+    var k2 = kernel(false)
+    var five: [8]TaskId = [TaskId(0u8); 8]
+
+    for i in 0..<5
+        var id = k2.spawn(u8('p') + u8(i), 10 + i, 0, [Work(1)]).unwrap()
+
+        five[usize(i)] = id
+        k2.ready.push(k2.tasks[..], id)
+
+    var least = five[4usize]
+
+    check("the least urgent is in the level its priority names",
+          str(usize(k2.tasks[usize(least)].qlevel.unwrap())), "14")
+
+    k2.ready.reprio(k2.tasks[..], least, 1)
+
+    check("lowering its number carried it to another level",
+          str(usize(k2.tasks[usize(least)].qlevel.unwrap())), "1")
+    check("and the levels still hold", str(k2.ready.ok(k2.tasks[..])), "true")
+    check("so it comes out first", str(k2.tasks[usize(k2.ready.pop(k2.tasks[..]).unwrap())].mark - u8('p')), "4")
+
+    var most = five[0usize]
+
+    k2.ready.reprio(k2.tasks[..], most, 63)
+
+    check("raising it pushed it to the last level",
+          str(usize(k2.tasks[usize(most)].qlevel.unwrap())), "63")
+    check("the levels still hold", str(k2.ready.ok(k2.tasks[..])), "true")
+    check("and somebody else is at the front",
+          str(k2.tasks[usize(k2.ready.pop(k2.tasks[..]).unwrap())].mark - u8('p')), "1")
+
+    // A running task is out of the queue by definition, and it is the common case for the task whose
+    // priority a lock has just raised — so repricing one has to be allowed and has to do nothing.
+    var loose = k2.spawn(u8('x'), 5, 0, [Work(1)]).unwrap()
+
+    k2.ready.reprio(k2.tasks[..], loose, 2)
+
+    check("repricing a task in no queue changes nothing", str(k2.ready.ok(k2.tasks[..])), "true")
+    check("and leaves it out of one", str(k2.tasks[usize(loose)].qlevel.is_none()), "true")
+    check("but it does take the new number", str(k2.tasks[usize(loose)].prio), "2")
+end section_a_task_s_place_follows_it
+
+section_taking_a_task_out_of_a_level()
+    // A level is a singly linked list, so taking a task out of one is the walk that finds the link in
+    // front of it — and the three places it can be taken from are three different fixes: the head, the
+    // tail, and neither. All four leave through `reprio`, which is the only thing that ever moves a
+    // task that is not at the front of the queue.
+    print("-- taking a task out of a level")
+
+    var kr = kernel(false)
+    var row: [8]TaskId = [TaskId(0u8); 8]
+
+    for i in 0..<4
+        var id = kr.spawn(48u8 + u8(i), 9, 0, [Work(1)]).unwrap()
+
+        row[usize(i)] = id
+        kr.ready.push(kr.tasks[..], id)
+
+    check("four tasks share one level", ready_line(kr.tasks[..], kr.ready.head[9usize]), "0123")
+
+    kr.ready.reprio(kr.tasks[..], row[1usize], 20)
+
+    check("one taken from the middle", ready_line(kr.tasks[..], kr.ready.head[9usize]), "023")
+    check("leaves the queue holding", str(kr.ready.ok(kr.tasks[..])), "true")
+
+    kr.ready.reprio(kr.tasks[..], row[3usize], 21)
+
+    check("one taken from the tail", ready_line(kr.tasks[..], kr.ready.head[9usize]), "02")
+    check("leaves the queue holding", str(kr.ready.ok(kr.tasks[..])), "true")
+
+    kr.ready.reprio(kr.tasks[..], row[0usize], 22)
+
+    check("one taken from the head", ready_line(kr.tasks[..], kr.ready.head[9usize]), "2")
+    check("leaves the queue holding", str(kr.ready.ok(kr.tasks[..])), "true")
+
+    kr.ready.reprio(kr.tasks[..], row[2usize], 23)
+
+    check("and the last of them leaves the level empty", ready_line(kr.tasks[..], kr.ready.head[9usize]), "")
+    check("with its bit gone out", str(kr.ready.head[9usize].is_none()), "true")
+    check("the queue still holds", str(kr.ready.ok(kr.tasks[..])), "true")
+    check("and nobody was lost on the way", str(kr.ready.len()), "4")
+
+    var moved: [8]u8 = [0u8; 8]
+    var nmoved = 0usize
+
+    loop
+        kr.ready.pop(kr.tasks[..]) match
+            None -> break
+            Some(id) ->
+                moved[nmoved] = kr.tasks[usize(id)].mark
+                nmoved += 1usize
+
+    check("they come out in the order their new numbers say",
+          from_utf8(moved[0..<nmoved]).unwrap_or("?"), "1302")
+end section_taking_a_task_out_of_a_level
+
+section_one_task_then_two()
+    print("-- one task, then two")
+
+    var s0 = kernel(false)
+    var r0 = s0.run(50)
+
+    check("a machine with nothing to run is over before it starts", describe_outcome(r0), "finished at 0")
+    check("and its schedule is empty", str(s0.schedule().bytes.len), "0")
+
+    var s1 = kernel(false)
+    var alone = s1.spawn(u8('A'), 1, 0, [Work(3)]).unwrap()
+    var r1 = s1.run(50)
+
+    check("a task on its own gets every tick", s1.schedule(), "AAA")
+    check("and the run ends when it does", describe_outcome(r1), "finished at 3")
+    check("having done the work it was given", str(s1.tasks[usize(alone)].ran), "3")
+    check("with no tick unused", str(s1.idle), "0")
+
+    var s2 = kernel(false)
+
+    s2.spawn(u8('A'), 1, 0, [Work(3)])
+    s2.spawn(u8('B'), 1, 0, [Work(3)])
+    s2.run(50)
+
+    check("equal priorities share the processor a tick at a time", s2.schedule(), "ABABAB")
+
+    var s3 = kernel(false)
+
+    s3.spawn(u8('A'), 1, 0, [Work(2)])
+    s3.spawn(u8('B'), 2, 0, [Work(2)])
+    s3.run(50)
+
+    check("an unequal pair does not", s3.schedule(), "AABB")
+end section_one_task_then_two
+
+section_the_most_urgent_ready_task_runs()
+    print("-- the most urgent ready task runs")
+
+    var s4 = kernel(false)
+
+    s4.spawn(u8('A'), 1, 0, [Work(2)])
+    s4.spawn(u8('B'), 2, 0, [Work(2)])
+    s4.spawn(u8('C'), 3, 0, [Work(2)])
+
+    var r4 = s4.run(50)
+
+    check("three tasks run in priority order", s4.schedule(), "AABBCC")
+    check("finishing together", describe_outcome(r4), "finished at 6")
+
+    // The order they were spawned in is not the order they run in, which is what the bitmap is for:
+    // nothing about the schedule below comes from the order the table was filled.
+    var s5 = kernel(false)
+
+    s5.spawn(u8('C'), 3, 0, [Work(2)])
+    s5.spawn(u8('B'), 2, 0, [Work(2)])
+    s5.spawn(u8('A'), 1, 0, [Work(2)])
+    s5.run(50)
+
+    check("and the same three spawned backwards run the same way", s5.schedule(), "AABBCC")
+end section_the_most_urgent_ready_task_runs
+
+section_arriving_in_the_middle()
+    print("-- arriving in the middle")
+
+    var s6 = kernel(false)
+    var low6 = s6.spawn(u8('L'), 3, 0, [Work(5)]).unwrap()
+    var high6 = s6.spawn(u8('H'), 1, 2, [Work(2)]).unwrap()
+    var r6 = s6.run(50)
+
+    check("an urgent task that arrives takes the processor", s6.schedule(), "LLHHLLL")
+    check("and gives it back when it is done", describe_outcome(r6), "finished at 7")
+    check("the interrupted task lost nothing", str(s6.tasks[usize(low6)].ran), "5")
+    check("and the urgent one did its own work", str(s6.tasks[usize(high6)].ran), "2")
+
+    var s7 = kernel(false)
+
+    s7.spawn(u8('A'), 1, 3, [Work(2)])
+
+    var r7 = s7.run(50)
+
+    check("time before anything arrives is nobody's", s7.schedule(), "...AA")
+    check("and is counted", str(s7.idle), "3")
+    check("the run still ends where the work does", describe_outcome(r7), "finished at 5")
+end section_arriving_in_the_middle
+
+section_a_lock_somebody_else_holds()
+    print("-- a lock somebody else holds")
+
+    var s8 = kernel(false)
+    var m8 = s8.declare(u8('m')).unwrap()
+
+    s8.spawn(u8('L'), 2, 0, [Lock(m8), Work(3), Unlock(m8)])
+
+    var high8 = s8.spawn(u8('H'), 1, 1, [Lock(m8), Work(2), Unlock(m8)]).unwrap()
+    var r8 = s8.run(50)
+
+    check("an urgent task waits for a lock it cannot have", s8.schedule(), "LLLHH")
+    check("and runs the moment it is let go", describe_outcome(r8), "finished at 5")
+    check("having waited the rest of the critical section",
+          str(first_at(s8.schedule(), u8('H')) - s8.tasks[usize(high8)].arrive), "2")
+    check("the lock ends free", str(s8.locks[usize(m8)].owner.is_none()), "true")
+    check("with nobody waiting on it", str(s8.locks[usize(m8)].waiters.is_none()), "true")
+end section_a_lock_somebody_else_holds
+
+section_priority_inversion()
+    // The classic three-task inversion, and the reason a scheduler needs to move a task between levels
+    // at all. `L` takes the lock, `M` is more urgent than `L` and wants nothing to do with the lock,
+    // and `H` is more urgent than both and wants the lock. Everything below is the same run twice with
+    // one switch changed.
+    print("-- priority inversion")
+
+    var si = kernel(false)
+    var mi = si.declare(u8('m')).unwrap()
+    var low_i = si.spawn(u8('L'), 3, 0, [Lock(mi), Work(6), Unlock(mi)]).unwrap()
+
+    si.spawn(u8('M'), 2, 2, [Work(4)])
+
+    var high_i = si.spawn(u8('H'), 1, 4, [Lock(mi), Work(2), Unlock(mi)]).unwrap()
+    var ri = si.run(100)
+
+    check("the schedule", si.schedule(), "LLMMMMLLLLHH")
+    check("the run is as long as the work in it", describe_outcome(ri), "finished at 12")
+    check("the most urgent task waited this long",
+          str(first_at(si.schedule(), u8('H')) - si.tasks[usize(high_i)].arrive), "6")
+    check("and this is what it waited through", wait_span(si.schedule(), 4, u8('H')), "MMLLLL")
+    check("two of those ticks belong to a task less urgent than it", str(si.tasks[usize(low_i)].prio), "3")
+end section_priority_inversion
+
+section_what_inheritance_does_about_it()
+    print("-- what inheritance does about it")
+
+    var sh = kernel(true)
+    var mh = sh.declare(u8('m')).unwrap()
+    var low_h = sh.spawn(u8('L'), 3, 0, [Lock(mh), Work(6), Unlock(mh)]).unwrap()
+    var mid_h = sh.spawn(u8('M'), 2, 2, [Work(4)]).unwrap()
+    var high_h = sh.spawn(u8('H'), 1, 4, [Lock(mh), Work(2), Unlock(mh)]).unwrap()
+    var rh = sh.run(100)
+
+    check("the schedule", sh.schedule(), "LLMMLLLLHHMM")
+    check("the same twelve ticks of work", describe_outcome(rh), "finished at 12")
+    check("the most urgent task waited this long",
+          str(first_at(sh.schedule(), u8('H')) - sh.tasks[usize(high_h)].arrive), "4")
+    check("and every tick of it was the lock holder's", wait_span(sh.schedule(), 4, u8('H')), "LLLL")
+    check("nobody did less work than before",
+          str(sh.tasks[usize(low_h)].ran) + "/" + str(sh.tasks[usize(mid_h)].ran) + "/" +
+            str(sh.tasks[usize(high_h)].ran),
+          "6/4/2")
+    check("and the lender ended with its own number", str(sh.tasks[usize(low_h)].prio), "3")
+
+    // Watched in the middle rather than at the end, because the lent priority exists only while the
+    // lock is held and the finished run has no trace of it left.
+    var sp = kernel(true)
+    var mp = sp.declare(u8('m')).unwrap()
+    var low_p = sp.spawn(u8('L'), 3, 0, [Lock(mp), Work(6), Unlock(mp)]).unwrap()
+
+    sp.spawn(u8('M'), 2, 2, [Work(4)])
+
+    var high_p = sp.spawn(u8('H'), 1, 4, [Lock(mp), Work(2), Unlock(mp)]).unwrap()
+
+    for i in 0..<5
+        sp.tick()
+
+    check("five ticks in, the holder is running at the waiter's priority", str(sp.tasks[usize(low_p)].prio), "1")
+    check("while the number it was created with is untouched", str(sp.tasks[usize(low_p)].base), "3")
+    check("the waiter is blocked", describe_state(sp.tasks[usize(high_p)].state), "blocked")
+    check("on the lock the holder holds",
+          str(sp.locks[usize(sp.tasks[usize(high_p)].blocked_on.unwrap())].mark), "109")
+    check("and moving the holder left the levels intact", str(sp.ready.ok(sp.tasks[..])), "true")
+
+    sp.run(100)
+
+    check("when it lets go it has its own number back", str(sp.tasks[usize(low_p)].prio), "3")
+end section_what_inheritance_does_about_it
+
+section_a_lock_several_tasks_want()
+    print("-- a lock several tasks want")
+
+    var sw = kernel(false)
+    var mw = sw.declare(u8('m')).unwrap()
+
+    sw.spawn(u8('O'), 5, 0, [Lock(mw), Work(3), Unlock(mw)])
+    sw.spawn(u8('A'), 4, 1, [Lock(mw), Work(1), Unlock(mw)])
+    sw.spawn(u8('B'), 2, 1, [Lock(mw), Work(1), Unlock(mw)])
+    sw.spawn(u8('C'), 3, 1, [Lock(mw), Work(1), Unlock(mw)])
+
+    var rw = sw.run(100)
+
+    check("a released lock goes to the most urgent waiter, not the longest", sw.schedule(), "OOOBCA")
+    check("and everybody gets it in the end", describe_outcome(rw), "finished at 6")
+    check("the lock ends free", str(sw.locks[usize(mw)].owner.is_none()), "true")
+    check("and its wait list empty", str(sw.locks[usize(mw)].waiters.is_none()), "true")
+
+    // Lending a priority to a task that was going to run anyway changes nothing, which is worth
+    // asserting: an optimisation that changed a schedule it had no business changing would be a bug.
+    var sv = kernel(true)
+    var mv = sv.declare(u8('m')).unwrap()
+
+    sv.spawn(u8('O'), 5, 0, [Lock(mv), Work(3), Unlock(mv)])
+    sv.spawn(u8('A'), 4, 1, [Lock(mv), Work(1), Unlock(mv)])
+    sv.spawn(u8('B'), 2, 1, [Lock(mv), Work(1), Unlock(mv)])
+    sv.spawn(u8('C'), 3, 1, [Lock(mv), Work(1), Unlock(mv)])
+    sv.run(100)
+
+    check("and inheritance changes nothing when the holder was going to run anyway",
+          sv.schedule(), "OOOBCA")
+end section_a_lock_several_tasks_want
+
+section_a_task_holding_two_locks()
+    // A task holding two locks that two different tasks want. This is the one shape where the chain of
+    // held locks is more than one link long, so it is where letting go of a lock has to unlink from
+    // the middle of a list rather than from its head — and where the lent priority is the smallest
+    // number among *all* the waiters on *all* the locks, given back one lock at a time.
+    print("-- a task holding two locks")
+
+    var s2l = kernel(true)
+    var la = s2l.declare(u8('a')).unwrap()
+    var lb = s2l.declare(u8('b')).unwrap()
+    var h2 = s2l.spawn(u8('L'), 5, 0, [Lock(la), Lock(lb), Work(4), Unlock(la), Work(1), Unlock(lb)]).unwrap()
+
+    s2l.spawn(u8('A'), 2, 1, [Lock(la), Work(1), Unlock(la)])
+    s2l.spawn(u8('B'), 1, 2, [Lock(lb), Work(1), Unlock(lb)])
+
+    for i in 0..<3
+        s2l.tick()
+
+    check("the holder has both locks on its chain", held_line(s2l.locks[..], s2l.tasks[usize(h2)].holds), "ba")
+    check("and carries the more urgent of the two waiters' numbers", str(s2l.tasks[usize(h2)].prio), "1")
+    check("each waiter is on the lock it wants",
+          wait_line(s2l.tasks[..], s2l.locks[usize(la)].waiters) + "/" +
+            wait_line(s2l.tasks[..], s2l.locks[usize(lb)].waiters),
+          "A/B")
+
+    s2l.tick()
+
+    check("letting one go leaves the other on the chain alone",
+          held_line(s2l.locks[..], s2l.tasks[usize(h2)].holds), "b")
+    check("the waiter that got it holds it now",
+          held_line(s2l.locks[..], s2l.tasks[usize(s2l.locks[usize(la)].owner.unwrap())].holds), "a")
+    check("and the holder still carries the number of whoever wants what is left",
+          str(s2l.tasks[usize(h2)].prio), "1")
+
+    var r2 = s2l.run(100)
+
+    check("the schedule", s2l.schedule(), "LLLLLBA")
+    check("the run is as long as the work in it", describe_outcome(r2), "finished at 7")
+    check("the lender ended with its own number", str(s2l.tasks[usize(h2)].prio), "5")
+    check("holding nothing", str(s2l.tasks[usize(h2)].holds.is_none()), "true")
+    check("and both locks ended free",
+          str(s2l.locks[usize(la)].owner.is_none()) + "/" + str(s2l.locks[usize(lb)].owner.is_none()),
+          "true/true")
+end section_a_task_holding_two_locks
+
+section_sleeping_and_time_nobody_uses()
+    print("-- sleeping, and time nobody uses")
+
+    var ss = kernel(false)
+    var sleeper = ss.spawn(u8('A'), 1, 0, [Work(1), Sleep(3), Work(1)]).unwrap()
+
+    ss.spawn(u8('B'), 2, 0, [Work(2)])
+
+    var rs = ss.run(50)
+
+    check("a sleeping task gives up the processor", ss.schedule(), "ABBA")
+    check("and takes it back when the clock reaches it", describe_outcome(rs), "finished at 4")
+    check("the sleeper finished", describe_state(ss.tasks[usize(sleeper)].state), "done")
+    check("and no tick was wasted", str(ss.idle), "0")
+
+    var st = kernel(false)
+
+    st.spawn(u8('A'), 1, 0, [Work(1), Sleep(2), Work(1)])
+
+    var rt = st.run(50)
+
+    check("with nobody else to run, the processor stands idle", st.schedule(), "A.A")
+    check("which is counted", str(st.idle), "1")
+    check("and the run is longer than the work in it", describe_outcome(rt), "finished at 3")
+
+    // A sleep of no ticks is the shortest thing a task can ask for and still leave: it gives up what
+    // is left of the tick and is admitted again by the next one, which is what a yield is.
+    var su = kernel(false)
+
+    su.spawn(u8('A'), 1, 0, [Work(1), Sleep(0), Work(1)])
+
+    var ru = su.run(50)
+
+    check("a sleep of no ticks comes back at the next one", su.schedule(), "AA")
+    check("costing nothing", describe_outcome(ru), "finished at 2")
+
+    // Sleepers laid down in one order and woken in another, which is what the relinking in `admit` is
+    // for: a pass over the list has to leave the survivors strung together in the order they were in.
+    // `A` lies down first and wakes last, so it is walked past on the tick that wakes `B` and has to
+    // come out of that walk still at the head.
+    var sy = kernel(false)
+    var ya = sy.spawn(u8('A'), 1, 0, [Work(1), Sleep(3), Work(1)]).unwrap()
+    var yb = sy.spawn(u8('B'), 2, 0, [Work(1), Sleep(1), Work(1)]).unwrap()
+
+    sy.spawn(u8('C'), 3, 0, [Work(1), Sleep(2), Work(1)])
+
+    for i in 0..<2
+        sy.tick()
+
+    check("two tasks are asleep, in the order they lay down",
+          str(u8(sy.sleep_head.unwrap())) + "/" +
+            str(u8(sy.tasks[usize(sy.sleep_head.unwrap())].next_sleep.unwrap())),
+          "0/1")
+
+    sy.tick()
+
+    check("the one that lay down second woke first", describe_state(sy.tasks[usize(yb)].state), "done")
+    check("and the first is still asleep, still at the head", str(u8(sy.sleep_head.unwrap())), "0")
+    check("with the list closed up behind it", str(sy.tasks[usize(ya)].next_sleep.is_none()), "true")
+
+    var ry = sy.run(50)
+
+    check("sleepers wake by the clock and not by the order they lay down", sy.schedule(), "ABBAC.C")
+    check("and the list empties behind them", str(sy.sleep_head.is_none()), "true")
+    check("a tick nobody could use in the middle", str(sy.idle), "1")
+    check("the run is as long as the last sleep", describe_outcome(ry), "finished at 7")
+end section_sleeping_and_time_nobody_uses
+
+section_two_tasks_that_will_not_finish()
+    // Two tasks, two locks, each taking one and then wanting the other. A scheduler that cannot tell a
+    // deadlock from a slow run is one that hangs.
+    print("-- two tasks that will not finish")
+
+    var sd = kernel(false)
+    var d1 = sd.declare(u8('x')).unwrap()
+    var d2 = sd.declare(u8('y')).unwrap()
+    var da = sd.spawn(u8('A'), 1, 0, [Lock(d1), Work(2), Lock(d2), Work(1), Unlock(d2), Unlock(d1)]).unwrap()
+    var db = sd.spawn(u8('B'), 1, 0, [Lock(d2), Work(2), Lock(d1), Work(1), Unlock(d1), Unlock(d2)]).unwrap()
+    var rd = sd.run(100)
+
+    check("they get four ticks between them", sd.schedule(), "ABAB")
+    check("and then the run stops rather than spinning", describe_outcome(rd), "stalled at 4")
+    check("both are blocked",
+          describe_state(sd.tasks[usize(da)].state) + "/" + describe_state(sd.tasks[usize(db)].state),
+          "blocked/blocked")
+    check("each on the lock the other holds",
+          str(sd.locks[usize(sd.tasks[usize(da)].blocked_on.unwrap())].mark) + "/" +
+            str(sd.locks[usize(sd.tasks[usize(db)].blocked_on.unwrap())].mark),
+          "121/120")
+    check("and each lock still names its owner",
+          str(sd.tasks[usize(sd.locks[usize(d1)].owner.unwrap())].mark) + "/" +
+            str(sd.tasks[usize(sd.locks[usize(d2)].owner.unwrap())].mark),
+          "65/66")
+
+    // The tables are still full of it, and nothing about that is a leak: the storage was never
+    // borrowed from anywhere, so a deadlock here costs exactly the slots the tasks were spawned into
+    // and not one byte more. That is the one thing this version has that the other does not.
+    check("the two slots are the whole cost of the deadlock", str(sd.ntasks), "2")
+
+    var se = kernel(true)
+    var e1 = se.declare(u8('x')).unwrap()
+    var e2 = se.declare(u8('y')).unwrap()
+
+    se.spawn(u8('A'), 1, 0, [Lock(e1), Work(2), Lock(e2), Work(1), Unlock(e2), Unlock(e1)])
+    se.spawn(u8('B'), 1, 0, [Lock(e2), Work(2), Lock(e1), Work(1), Unlock(e1), Unlock(e2)])
+
+    var re = se.run(100)
+
+    check("lending a priority does not untangle it", describe_outcome(re), "stalled at 4")
+
+    // The other way to strand a program, and the one a real system meets more often: a task that runs
+    // off the end of its work still holding a lock.
+    var sz = kernel(false)
+    var mz = sz.declare(u8('m')).unwrap()
+    var za = sz.spawn(u8('A'), 2, 0, [Lock(mz), Work(1)]).unwrap()
+    var zb = sz.spawn(u8('B'), 1, 1, [Lock(mz), Work(1), Unlock(mz)]).unwrap()
+    var rz = sz.run(100)
+
+    check("a task that finishes holding a lock strands whoever wants it", describe_outcome(rz), "stalled at 2")
+    check("the one that finished is finished", describe_state(sz.tasks[usize(za)].state), "done")
+    check("the other is waiting on a task that will never run again", describe_state(sz.tasks[usize(zb)].state), "blocked")
+    check("and the lock still names its owner",
+          str(sz.tasks[usize(sz.locks[usize(mz)].owner.unwrap())].mark), "65")
+end section_two_tasks_that_will_not_finish
+
+section_what_a_task_gets_wrong()
+    print("-- what a task gets wrong")
+
+    var sf = kernel(false)
+    var mf = sf.declare(u8('m')).unwrap()
+    var af = sf.spawn(u8('A'), 1, 0, [Unlock(mf)]).unwrap()
+    var rf = sf.run(10)
+
+    check("releasing a lock you never took", describe_fault(sf.tasks[usize(af)].fault.unwrap()),
+          "released m without holding it")
+    check("stops the task", describe_state(sf.tasks[usize(af)].state), "faulted")
+    check("costing a tick nobody used", sf.schedule(), ".")
+    check("and the run ends", describe_outcome(rf), "finished at 1")
+
+    var sg = kernel(false)
+    var mg = sg.declare(u8('m')).unwrap()
+    var ag = sg.spawn(u8('A'), 1, 0, [Lock(mg), Lock(mg), Work(1)]).unwrap()
+
+    sg.run(10)
+
+    check("taking a lock you already hold", describe_fault(sg.tasks[usize(ag)].fault.unwrap()),
+          "took m while already holding it")
+    check("leaves the lock held", str(sg.locks[usize(mg)].owner.is_some()), "true")
+    check("by the task that stopped",
+          str(sg.tasks[usize(sg.locks[usize(mg)].owner.unwrap())].mark), "65")
+
+    var sk = kernel(false)
+    var mk = sk.declare(u8('m')).unwrap()
+    var ka = sk.spawn(u8('A'), 1, 0, [Lock(mk), Work(2)]).unwrap()
+    var kb = sk.spawn(u8('B'), 2, 0, [Unlock(mk)]).unwrap()
+
+    sk.run(10)
+
+    check("releasing a lock somebody else holds", describe_fault(sk.tasks[usize(kb)].fault.unwrap()),
+          "released m without holding it")
+    check("does not disturb the holder", describe_state(sk.tasks[usize(ka)].state), "done")
+    check("and the schedule shows the tick it cost", sk.schedule(), "AA.")
+
+    var sn = kernel(false)
+
+    sn.spawn(u8('A'), 1, 0, [Work(0), Work(2)])
+
+    var rn = sn.run(10)
+
+    check("a step of no work is a step, and costs nothing", sn.schedule(), "AA")
+    check("so the run is the length of the rest", describe_outcome(rn), "finished at 2")
+
+    var so = kernel(false)
+    var oa = so.spawn(u8('A'), 1, 0, []).unwrap()
+    var ro = so.run(10)
+
+    check("a task with nothing to do is done as soon as it is looked at",
+          describe_state(so.tasks[usize(oa)].state), "done")
+    check("and the run is over", describe_outcome(ro), "finished at 1")
+end section_what_a_task_gets_wrong
+
+section_the_table_has_an_edge()
+    // Every fixed size in the machine is one a caller can reach, and reaching it is an answer rather
+    // than a trap. This is the half of a table-driven kernel that a heap simply does not have.
+    print("-- the table has an edge")
+
+    var sx = kernel(false)
+
+    check("a priority below the first level is refused", str(sx.spawn(u8('A'), -1, 0, [Work(1)]).is_none()), "true")
+    check("a priority past the last level is refused", str(sx.spawn(u8('A'), 64, 0, [Work(1)]).is_none()), "true")
+    check("the last level itself is allowed", str(sx.spawn(u8('A'), 63, 0, [Work(1)]).is_some()), "true")
+    check("a program longer than a task block is refused",
+          str(sx.spawn(u8('A'), 1, 0, [Work(1), Work(1), Work(1), Work(1), Work(1), Work(1), Work(1),
+                                       Work(1), Work(1)]).is_none()),
+          "true")
+    check("a program exactly as long as one is not",
+          str(sx.spawn(u8('A'), 1, 0, [Work(1), Work(1), Work(1), Work(1), Work(1), Work(1), Work(1),
+                                       Work(1)]).is_some()),
+          "true")
+
+    for i in 0..<4
+        sx.declare(u8('m'))
+
+    check("the lock table fills", str(sx.nlocks), "4")
+    check("and refuses the one after that", str(sx.declare(u8('m')).is_none()), "true")
+
+    // The trace is the last fixed size, and the only one a run can reach without anybody asking for
+    // it. A machine that quietly wrote a shorter schedule than it lived would be a machine whose
+    // assertion had stopped meaning anything, so it says so instead.
+    var sq = kernel(false)
+
+    sq.spawn(u8('A'), 1, 0, [Work(600)])
+
+    var rq = sq.run(700)
+
+    check("a run longer than the trace says so", str(sq.overflowed), "true")
+    check("keeping as much of the schedule as it had room for", str(sq.schedule().bytes.len), "512")
+    check("while the run itself is unaffected", describe_outcome(rq), "finished at 600")
+end section_the_table_has_an_edge
+
+section_many_tasks_at_once()
+    print("-- many tasks at once")
+
+    var sb = kernel(true)
+
+    for i in 0..<200
+        sb.spawn(u8('t'), (i * 37) % 50, i % 10, [Work(1 + i % 3)])
+
+    check("the task table is exactly full", str(usize(sb.ntasks)), "200")
+    check("and refuses the one after that", str(sb.spawn(u8('t'), 1, 0, [Work(1)]).is_none()), "true")
+
+    var rb = sb.run(5000)
+    var did = 0
+
+    for i in 0..<usize(sb.ntasks)
+        did += sb.tasks[i].ran
+
+    check("two hundred tasks all finish", describe_outcome(rb), "finished at 399")
+    check("and the ticks add up to the work", str(did), "399")
+    check("with none of them idle", str(sb.idle), "0")
+    check("the schedule is one letter a tick", str(sb.schedule().bytes.len), "399")
+    check("and fits the trace it was given", str(sb.overflowed), "false")
+    check("the queue ends empty", str(sb.ready.is_empty()), "true")
+    check("and its levels still hold", str(sb.ready.ok(sb.tasks[..])), "true")
+end section_many_tasks_at_once
+
+section_the_links_come_apart()
+    // The scheduler next door ends its checks by asserting that a graph of objects pointing at each
+    // other has come apart, because nothing else would have freed it. There is nothing to free here —
+    // the storage was decided before the program ran — so what is asserted instead is that the
+    // *bookkeeping* came apart: every link is empty, which is the same statement about correctness
+    // with the statement about memory removed.
+    print("-- the links come apart")
+
+    var sc = kernel(true)
+    var mc = sc.declare(u8('m')).unwrap()
+
+    sc.spawn(u8('L'), 3, 0, [Lock(mc), Work(6), Unlock(mc)])
+    sc.spawn(u8('M'), 2, 2, [Work(4)])
+    sc.spawn(u8('H'), 1, 4, [Lock(mc), Work(2), Unlock(mc)])
+    sc.run(100)
+
+    var clean = 0
+
+    for i in 0..<usize(sc.ntasks)
+        if sc.tasks[i].holds.is_none() && sc.tasks[i].blocked_on.is_none() &&
+            sc.tasks[i].qlevel.is_none() && sc.tasks[i].next_ready.is_none() &&
+            sc.tasks[i].next_wait.is_none() && sc.tasks[i].next_sleep.is_none()
+            clean += 1
+
+    check("every task let go of everything", str(clean), "3")
+    check("the lock is unowned", str(sc.locks[usize(mc)].owner.is_none()), "true")
+    check("nobody is waiting on it", str(sc.locks[usize(mc)].waiters.is_none()), "true")
+    check("and it is on nobody's chain", str(sc.locks[usize(mc)].next_held.is_none()), "true")
+    check("the queue is empty", str(sc.ready.is_empty()), "true")
+    check("nothing is asleep", str(sc.sleep_head.is_none()), "true")
+    check("and every task is finished", describe_state(sc.tasks[0usize].state), "done")
+end section_the_links_come_apart
+
+// One after another, so that at most one machine's storage is standing at a time.
+section_finding_the_most_urgent_level()
+section_the_bitmap_keeps_its_levels()
+section_a_task_s_place_follows_it()
+section_taking_a_task_out_of_a_level()
+section_one_task_then_two()
+section_the_most_urgent_ready_task_runs()
+section_arriving_in_the_middle()
+section_a_lock_somebody_else_holds()
+section_priority_inversion()
+section_what_inheritance_does_about_it()
+section_a_lock_several_tasks_want()
+section_a_task_holding_two_locks()
+section_sleeping_and_time_nobody_uses()
+section_two_tasks_that_will_not_finish()
+section_what_a_task_gets_wrong()
+section_the_table_has_an_edge()
+section_many_tasks_at_once()
+section_the_links_come_apart()
+
+// The rendering, which is the only part of the program that makes a string. A state has six names
+// and the compiler is holding all six; nothing in the language hands them over, so they are
+// written out here — one more reason the machine itself deals in letters.
+describe_state(s: State) -> string = s match
+    Fresh -> "fresh"
+    Ready -> "ready"
+    Blocked -> "blocked"
+    Sleeping -> "sleeping"
+    Done -> "done"
+    Faulted -> "faulted"
+
+describe_fault(f: Fault) -> string = f match
+    NotHeld(lock) -> s"released ${str(char(lock))} without holding it"
+    AlreadyHeld(lock) -> s"took ${str(char(lock))} while already holding it"
+
+describe_outcome(o: Outcome) -> string = o match
+    Running -> "running"
+    Finished(at) -> s"finished at $at"
+    Stalled(at) -> s"stalled at $at"
+    Timeout(at) -> s"timed out at $at"

@@ -633,6 +633,14 @@ exactly (`§5`), one row further down the catalog.
   would be the first one, and it arrives with that whole question attached: automatic for every
   enum, and therefore a member a program cannot replace without shadowing it, or asked for by
   something written at the declaration. Nothing here decides that.
+- **An `Option` is not equatable, whatever it holds.** The catalog's memberships are written one
+  type at a time and the prelude's own generic enums have none, so `a == b` over two `Option[u8]`s
+  is refused and "is this the same link" is written by taking both sides apart in a `match`.
+  `impl[T: Eq] Eq for Option[T]` is a *writable* implementation and would answer it, which is what
+  makes this a catalog omission rather than a language gap — but it would be the first row of the
+  catalog that a **generic** type carries, and the same question then arrives for `Result`, for
+  `Ord`, and for `Hash`. Decide the family, not the one row. `guide/kernel`, whose every link is an
+  `Option` of a slot number, is the customer.
 - **Associated types** generally (`02` open item) — deferred, and with them any trait whose
   method mentions a type derived from `Self` rather than `Self` itself.
 - **Deriving an operator through a default body.** Default method bodies are built (`02`), but the

@@ -32,6 +32,13 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       progError("module a\nprint(1)\nmodule b") should include("module")
     }
 
+    // `13 §4`'s capability clause is unbuilt, so the two guide programs written to hold the
+    // property — the bytecode machine's dispatch loop and `guide/kernel` entire — cannot declare
+    // it, and nothing checks that they do.
+    "carries no capability clause yet" in {
+      progError("module m no alloc\nprint(1)") should include("newline expected")
+    }
+
     "may be preceded by blank lines" in {
       moduleOf("\n\nmodule a.b\nprint(1)") shouldBe Some("a.b")
     }

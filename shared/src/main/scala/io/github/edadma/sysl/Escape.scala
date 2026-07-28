@@ -176,8 +176,15 @@ private class Escape(program: TProgram) {
     private def loopViewsFrame(body: List[TStmt], elseBlock: Option[TBlock]): Boolean =
       ownBreakValues(body).exists(viewsFrame) || elseBlock.exists(blockValue)
 
+    /** Whether the storage an array place names is reached through a raw pointer, and so is not
+     * this frame's to lose. The question is about the *root* of the place rather than about its
+     * last step: `p.table[i].bytes` is as much the caller's storage as `*p` is, and stopping at the
+     * dereference would call a field of somebody else's struct a local array.
+     */
     private def viaPointer(e: TExpr): Boolean = e match
       case TDeref(operand, _) => operand.ty.isInstanceOf[Type.Ptr]
+      case TField(r, _, _)    => viaPointer(r)
+      case TIndex(r, _, _)    => viaPointer(r)
       case _                  => false
 
     /** Propagates through the function's own locals to a fixpoint, then looks for the places a

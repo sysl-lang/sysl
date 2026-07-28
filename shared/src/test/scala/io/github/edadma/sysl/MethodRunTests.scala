@@ -228,4 +228,37 @@ class MethodRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "3\n"
   }
+
+  // A value receiver is a value, so a method called on an element of an array works on a copy of
+  // that element and the array is untouched. There is no reference to take without asking for one,
+  // which is why a program indexing a table writes the whole path for every field it touches.
+  "a value receiver on an array element is a copy of the element" in {
+    val src =
+      """struct Cell
+        |    v: int
+        |
+        |    bump(self) -> int
+        |        self.v += 1
+        |        self.v
+        |    end bump
+        |var a: [2]Cell = [Cell(7); 2]
+        |print(a[0].bump(), a[0].v)""".stripMargin
+
+    run(src) shouldBe "8 7\n"
+  }
+
+  "while a pointer receiver reaches the element itself" in {
+    val src =
+      """struct Cell
+        |    v: int
+        |
+        |    bump(*self) -> int
+        |        self.v += 1
+        |        self.v
+        |    end bump
+        |var a: [2]Cell = [Cell(7); 2]
+        |print(a[0].bump(), a[0].v, a[1].v)""".stripMargin
+
+    run(src) shouldBe "8 8 7\n"
+  }
 }

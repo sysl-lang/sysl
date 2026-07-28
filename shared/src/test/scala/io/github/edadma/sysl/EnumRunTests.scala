@@ -5,7 +5,30 @@ import org.scalatest.freespec.AnyFreeSpec
 /** Tier-2 runtime behavior of enums: simple integer enums, data-carrying tagged unions,
  * variant construction and destructuring, guards over bindings, and nested patterns.
  */
-class EnumRunTests extends AnyFreeSpec with RunSupport {
+class EnumRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
+
+  /** `09` says a data enum's "storage is sized for the largest variant plus a tag" — a union. What
+   * is emitted is the tag followed by *every* variant's payload side by side, so an enum of four
+   * variants carrying one scalar each is four scalars wide instead of one.
+   *
+   * The cost is real and multiplies: a fixed table of a struct holding eight of these is two and a
+   * half times the storage the design describes, which is what `guide/kernel` ran out of frame on.
+   * Turning it into a union means reaching a payload through memory rather than by `extractvalue`,
+   * because a union is not an LLVM aggregate a value can be taken apart with — so it is a change to
+   * how every data enum is represented, `Option` and `Result` included.
+   */
+  "a data enum is laid out as a union of its variants" ignore {
+    ir("""enum Step
+         |    Work(n: int)
+         |    Lock(m: u8)
+         |    Unlock(m: u8)
+         |    Sleep(n: int)
+         |var s = Work(1)
+         |print(s match
+         |    Work(n) -> n
+         |    _ -> 0)
+         |""".stripMargin) should include("%enum.Step = type { i32, i32 }")
+  }
 
   "a simple enum matches by variant name, bare and qualified" in {
     val src =

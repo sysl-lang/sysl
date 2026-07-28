@@ -124,4 +124,35 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
   "a program that never allocates declares no allocator" in {
     ir("var n = 1\nn += 1") should not include "@malloc"
   }
+
+  // The shape a program without a heap is built out of: a fixed table of task blocks, walked by
+  // index, with its lists threaded through the blocks themselves. Handing the table to a callee as
+  // a slice *declares* the ARC runtime — the over-approximation noted above, a retain of an owner
+  // that is statically null — so what is asserted is that nothing ever calls the allocator.
+  "nor does one that walks a fixed table by index ever call it" in {
+    val out = ir("""struct Node
+                   |    v: int
+                   |    next: Option[u8]
+                   |end Node
+                   |sum(ns: []Node, first: Option[u8]) -> int
+                   |    var total = 0
+                   |    var cur = first
+                   |
+                   |    while cur.is_some()
+                   |        var i = usize(cur.unwrap())
+                   |
+                   |        total += ns[i].v
+                   |        cur = ns[i].next
+                   |
+                   |    total
+                   |end sum
+                   |var t: [3]Node = [Node(0, None); 3]
+                   |t[0usize] = Node(10, Some(1u8))
+                   |t[1usize] = Node(20, None)
+                   |print(sum(t[..], Some(0u8)))
+                   |""".stripMargin)
+
+    out should not include "call ptr @malloc"
+    out should not include "@arc.copy"
+  }
 }

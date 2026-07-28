@@ -192,4 +192,34 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- the graph comes apart",
     )
   }
+
+  // The same machine as `scheduler`, with no heap: a fixed table, index numbers for identity, and
+  // intrusive lists threaded through the tasks. The shared scenarios assert byte-identical
+  // schedules, so the two programs check each other and the diff between them is the measurement.
+  "kernel — the same scheduler with a fixed table and no allocation at all" in {
+    val out = guide("kernel")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 160
+    sections(out) shouldBe List(
+      "-- finding the most urgent level",
+      "-- the bitmap keeps its levels",
+      "-- a task's place follows it",
+      "-- taking a task out of a level",
+      "-- one task, then two",
+      "-- the most urgent ready task runs",
+      "-- arriving in the middle",
+      "-- a lock somebody else holds",
+      "-- priority inversion",
+      "-- what inheritance does about it",
+      "-- a lock several tasks want",
+      "-- a task holding two locks",
+      "-- sleeping, and time nobody uses",
+      "-- two tasks that will not finish",
+      "-- what a task gets wrong",
+      "-- the table has an edge",
+      "-- many tasks at once",
+      "-- the links come apart",
+    )
+  }
 }

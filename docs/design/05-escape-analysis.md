@@ -177,12 +177,34 @@ read_line(f: &File) -> []u8
 Under `no alloc` that third one is the diagnostic above, and the fix is to take the buffer as
 a parameter and return `n`.
 
+## Which array a slice is a slice of
+
+"A local fixed array" is a statement about the **root of the place**, not about its last step.
+`p.table[i].bytes` is a fixed array, but the storage it names belongs to whoever the `*T` points
+at, so a view of it is no more this frame's than `*p` is; only a place rooted at a local of this
+function is. The analysis therefore follows a place through its field and index steps to find out
+where it started, and stops at the first dereference.
+
+The two halves have to be kept apart, because the shapes look alike. A local array **beside** a
+pointer parameter is still local, and so is an element of a local array of arrays — the pointer
+has to be the route to *this* array for the storage to be somebody else's.
+
 ## Not analyzed
 
 `*T` is outside all of this, as it is outside every other guarantee: a raw pointer into a
 local array can dangle exactly as in C, and that is the opt-out the mode exists to provide.
 Taking a `*T` to a local **does not** promote it — promotion follows slices, which carry
 their length and their owner, not raw addresses.
+
+## Not yet
+
+**A fixed array inside a `&T` has no owner word to hand out.** Slicing a `&[N]T` works, because the
+buffer that reference counts *is* the array; slicing a fixed array **field** of a `&Struct` does
+not, because the view is built with a null owner and would dangle as soon as the last reference to
+the struct went away. So it is refused as a frame-local view would be, which is sound but says the
+wrong thing — the storage is on the heap, and what is missing is the walk from the field back to
+the box that owns it. Until that exists, storage a view must outlive is declared `&[N]T` in its own
+right rather than as a field.
 
 ## Deferred
 

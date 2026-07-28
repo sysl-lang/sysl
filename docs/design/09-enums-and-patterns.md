@@ -110,6 +110,18 @@ for the largest variant plus a tag, and it moves by copy like any value), and it
 heap only where a `&Shape` is expected. Nothing about being a sum type changes the three-mode
 story — an enum is just a struct-shaped value with a tag.
 
+**Not built: the payload is not yet a union.** What is emitted is the tag followed by *every*
+variant's payload laid side by side, so a four-variant enum carrying one scalar each is four
+scalars wide rather than one — 20 bytes where the paragraph above promises 8. Programs are correct
+and merely fat, and the fat multiplies: a fixed table of a struct holding eight of them is two and
+a half times the storage the design describes, which is what `guide/kernel` overran a stack frame
+on. The reason it was written this way is that a data enum is an **SSA aggregate** here, taken
+apart with `extractvalue` — and a union is not an aggregate a value can be taken apart with, so a
+payload would have to be reached through memory instead. That is a change to how every data enum
+is represented, `Option` and `Result` included, and it wants the size model the compiler does not
+yet have (there is no `sizeof` and no emitted datalayout). Pinned by an ignored test in
+`EnumRunTests`.
+
 **Recursion goes through an indirection, as always (`03`).** A variant that holds the enum by
 value would make the type infinitely sized and is rejected; a recursive data type reaches
 itself through a `*T` or `&T`, which is how a `List`/`Tree` enum is spelled.

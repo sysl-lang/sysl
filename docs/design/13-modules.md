@@ -505,6 +505,13 @@ resolution rather than adding a second one. A **`val`** is the one module-level 
 have brought the trap back, since it is read while running and so has no value for a pattern to
 compare against; naming one in a pattern is therefore an error rather than a quiet binding.
 
+**A fourth place it may not stand, and should: the bounds of a `within` range.** `type Slot = u8
+within 0..<max_tasks` does not parse — the grammar takes a literal there — so a program that
+indexes a fixed table by a constrained integer writes the table's size twice, once as the array
+bound and once as the range, and nothing checks that the two agree. That is the one magic number a
+table-driven program has left, and it is in the one place a constant cannot reach.
+`guide/kernel` is the customer; the diagnostic is a bare "newline expected" pointing at `within`.
+
 **A constant has no address.** It is folded into each use and occupies no storage, which is why it
 needs no initialization order, why a `no alloc` module may hold one, and why `&capacity` is not a
 thing to write. That is also exactly what rules it out for the *other* half of what the guide

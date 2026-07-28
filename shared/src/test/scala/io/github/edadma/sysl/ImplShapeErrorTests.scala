@@ -193,4 +193,17 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport {
         "the 'impl' that covers it asks 'Show' of P, which does not implement it")
     }
   }
+
+  /** `02 § Coherence` says an `impl Trait for Type` may appear only in the module that declares
+   * `Trait` or the module that declares `Type`, and that a foreign trait for a foreign type is the
+   * case with no home. `Eq` and `Option` are both the prelude's, so a user module implementing one
+   * for the other is exactly that case — and it is accepted today, which means nothing enforces the
+   * rule the chapter states.
+   */
+  "an implementation of a foreign trait for a foreign type has no home" ignore {
+    err("""impl[T: Eq] Eq for Option[T]
+          |    eq(self, rhs: Option[T]) -> bool = self.is_some() == rhs.is_some()
+          |print(1)
+          |""".stripMargin) should include("may appear only in the module that declares")
+  }
 }

@@ -87,4 +87,13 @@ class SubtypeParserTests extends AnyFreeSpec with ParseSupport {
     prog("""where(within: int) -> int
            |    within""".stripMargin).collectFirst { case f: FuncDecl => f.name } shouldBe Some("where")
   }
+
+  // An array bound may name a `const`, which is what `const` exists for; a `within` bound may not,
+  // because the grammar takes a literal there. So a table's size and the range of the type that
+  // indexes it are written down separately and nothing checks that the two agree.
+  "a within bound is a literal and may not name a const" in {
+    progError("""const n: usize = 8
+                |type Slot = new u8 within 0..<n
+                |""".stripMargin) should include("newline expected")
+  }
 }
