@@ -649,6 +649,16 @@ work:
   continues a line today, so an expression that outgrows its line has to become statements — see
   the table of single-character symbols in `guide/bytecode`'s lexer, written as three early
   returns for exactly that reason.
+  **Four programs have now reported it, and the pattern in what they report is the useful part.**
+  `guide/bytecode` broke a long condition into early returns; `guide/sha2` has a signature that is
+  exactly 107 characters with nowhere to break it; `guide/shapes` splits a four-term conjunction
+  into two named halves and a cross product into three. Every one of them is an *operator* wanting
+  to carry the line — `&&`, `+`, `-` — and none wants a general escape character. That is the
+  narrow version of the feature, and the fact that a bracketed expression already continues
+  (`IndentationLexical` joins on `(`, `[`, `{`, which is why every multi-line call in those
+  programs is fine) means the remaining hole is precisely: an operator at end of line, outside
+  brackets. Worth deciding as its own thing rather than waiting on the whole block-grammar
+  question it is currently filed under.
 - ~~Zero-sized types~~ — **done**, see §12. A `unit` field is skipped in the layout with the
   indices behind it shifted, and a `unit` parameter is dropped from the signature, which is what
   makes `Result[unit, E]` writable. It was additive as predicted: everything §12 used to refuse

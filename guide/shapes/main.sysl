@@ -1,0 +1,404 @@
+// The shape catalogue — the checks.
+//
+// The axis this owns is **dynamic dispatch**. It is the smallest program in the set on purpose:
+// nothing else in the set needs `&Trait` or `*Trait` at all, and a feature with no guide program is
+// a feature nobody is checking. What it does need is for the dispatch to be genuinely dynamic, so
+// every section here drives at least two implementations through one call site, and the answers are
+// far enough apart that reaching the wrong one could not produce the right number.
+//
+// The geometry is all closed form or hand-computable: a circle of radius 2, a 3-by-4 rectangle, a
+// 3-4-5 triangle, and a pentagon whose area comes out of the shoelace formula. The composite
+// figures are sums and unions of those. Nothing is compared against a value this program produced,
+// except where the thing being checked *is* a law — scaling multiplies area by the square of the
+// factor and perimeter by the factor — and there the law is asserted against every implementation
+// in the catalogue rather than against a number.
+//
+// What writing it turned up:
+//
+//   * **THE finding: erasure forgets every trait but the one erased to.** A `Circle` implements
+//     `Shape` and it implements `Display`, and once it is a `&Shape` it can no longer be printed:
+//     "cannot make a string of a &Shape value — it does not implement 'Display'". That is not a
+//     gap in the implementation, it is what the type says — an object offers the trait's members
+//     and nothing else — but it means the most ordinary thing a heterogeneous collection does,
+//     print itself, cannot be written. The static half of the language has no such problem: a
+//     `[T: Shape + Display]` bound has both, because a bound is a list and a type is one name. So
+//     **the price of erasing is paid in capabilities, not just in speed**, and it is paid at the
+//     moment a program stops knowing the type — which is the moment it most needs to describe it.
+//     What this program does instead is declare `describe(self) -> string` on `Shape` and forward
+//     `Display` back onto it in seven two-line impls that say nothing.
+//     The mechanism that would fix it is one already deferred: **a trait that requires another
+//     trait**. `trait Shape: Display` would let a `&Shape` carry `Display`'s table too, and problem
+//     10 wanted the same feature for a quite different reason — writing one bound instead of nine.
+//     Second customer, and a much stronger one: there, a supertrait was an economy; here it is the
+//     difference between a thing being writable and not.
+//   * **A `*Writer` renders bytes and nothing turns them back into a string.** The natural way to
+//     write `describe` is not to build a string at all — it is `render(self, out: *Writer)`, which
+//     is what `Display` already is and what costs no allocation. It cannot be used, because after
+//     rendering into a `ByteSink` there is no way to get a `string` out of the bytes: `from_utf8`
+//     does not exist. So the two ways of turning a shape into text are *both* blocked, one by the
+//     missing supertrait and one by the missing conversion, and the program concatenates strings.
+//     `guide/json` reported the same absence for a quite different reason (unescaping), and this is
+//     the second program to be pushed off its natural design by it.
+//   * **There is no way to ask a trait object what it forgot.** No cast, no test, no pattern — `g
+//     is Circle` is a syntax error, because a type is not a pattern. A catalogue that wants to
+//     count its circles has to be told, so `Shape` declares a `kind` property and every impl
+//     answers with a constant that duplicates, by hand, exactly the fact the vtable pointer
+//     already is. This looks like a deliberate omission rather than a gap — a downcast is the one
+//     operation that makes erasure a lie, and Rust needs a whole `Any` machinery to offer it — but
+//     it should be written down as a decision, because the workaround is a maintenance burden that
+//     grows with the number of shapes.
+//   * **A `Buf` is not indexable and not iterable.** `cat[0]` is "cannot index Buf[&Shape]" and
+//     `for s in cat` is "'for' iterates an integer range, an array, or a slice, not Buf[&Shape]".
+//     Both are known: there is no `Index` trait and no iteration protocol, and `14 §7` already
+//     defers the first. This is the second customer for it, and the one the ledger predicted. The
+//     workaround is `cat.at(i)` and `for s in cat.view()`, and the second is fine — a view is a
+//     slice and slices iterate — so what is really missing is only the indexing.
+//   * **Object safety is enforced exactly as `02` describes, and the diagnostics are the best in
+//     the compiler.** All three rules were probed. A `Self` away from the receiver, an associated
+//     function, and a `&self` method under `*Trait` are each refused with a message that says what
+//     the rule is and, for the last one, which sigil to write instead. Worth recording as a
+//     positive: this is what the rest of the error surface should read like.
+//   * **A property is object-safe and reaching it through a table needed nothing.** `kind` is a
+//     member with no parameter list, and reading `s.kind` on an erased value goes through the
+//     object's table exactly as a call does — which is what `02` claims and had no guide program
+//     checking.
+//   * Positives worth keeping: a combinator holding `&Shape` makes recursion through the object's
+//     table ordinary, so a group of groups needs nothing special and neither does a `describe`
+//     that calls itself down the tree; a `Buf[&Shape]` is a heterogeneous growable collection with
+//     no annotation anywhere; the two sigils cost nothing to mix, with `*Shape` over stack values
+//     allocating nothing at all; and an object built and dropped a hundred thousand times in a
+//     loop neither leaks nor double-frees, including when its payload holds objects of its own.
+
+check(name: string, got: string, want: string)
+    if got == want then print(s"ok    $name = $got")
+    else print(s"FAIL  $name = $got, wanted $want")
+end check
+
+section(title: string) = print("-- " + title)
+
+// The two numbers a shape is asked for, to six decimals — written twice, once per sigil.
+//
+// A `&Shape` is not accepted where a `*Shape` is wanted. For a plain reference the crossing is
+// available and is spelled `&*x`: a dereference is a place and the address of a place is a raw
+// pointer, so lending a counted value to a function that only looks at it costs two characters and
+// stays greppable, which is exactly the discipline `03` wants for the unsafe tier. An object has no
+// dereference — `&*o` is "a &Shape has forgotten what it points at" — so for a trait object the
+// crossing has no spelling at all, and an observer has to be written once for each sigil.
+size(s: &Shape) -> string = six(s.area()) + " " + six(s.perimeter())
+
+size_raw(s: *Shape) -> string = six(s.area()) + " " + six(s.perimeter())
+
+// A bound, to six decimals.
+extent(b: Box) -> string =
+    six(b.x0) + " " + six(b.y0) + " " + six(b.x1) + " " + six(b.y1)
+
+away(x: f64, y: f64) -> f64 = if x > y then x - y else y - x
+
+close(x: f64, y: f64) -> bool = away(x, y) < 0.000001
+
+pentagon() -> &Buf[Point]
+    var p: &Buf[Point] = buf()
+
+    p.push(Point(0.0, 0.0))
+    p.push(Point(4.0, 0.0))
+    p.push(Point(5.0, 3.0))
+    p.push(Point(2.0, 5.0))
+    p.push(Point(-1.0, 3.0))
+    p
+end pentagon
+
+// -----------------------------------------------------------------------------------------------
+
+section("each shape answers for itself")
+
+var circle = Circle(0.0, 0.0, 2.0)
+var rect = Rect(1.0, 2.0, 3.0, 4.0)
+var tri = Tri(Point(0.0, 0.0), Point(4.0, 0.0), Point(0.0, 3.0))
+var poly = Poly(pentagon())
+
+check("a circle of radius two", size_raw(&circle), "12.566371 12.566371")
+check("and the box around it", extent(circle.bounds()), "-2.000000 -2.000000 2.000000 2.000000")
+check("a three-by-four rectangle", size_raw(&rect), "12.000000 14.000000")
+check("and the box around it", extent(rect.bounds()), "1.000000 2.000000 4.000000 6.000000")
+check("a three-four-five triangle", size_raw(&tri), "6.000000 12.000000")
+check("and the box around it", extent(tri.bounds()), "0.000000 0.000000 4.000000 3.000000")
+check("a five-sided polygon", size_raw(&poly), "21.000000 17.535658")
+check("and the box around it", extent(poly.bounds()), "-1.000000 0.000000 5.000000 5.000000")
+
+// The triangle's vertices the other way round enclose the same area — the shoelace sign is which
+// way the outline was traced, and a shape has no opinion about that.
+var flipped = Tri(Point(0.0, 3.0), Point(4.0, 0.0), Point(0.0, 0.0))
+
+check("a triangle traced the other way", six(flipped.area()), "6.000000")
+
+// -----------------------------------------------------------------------------------------------
+
+section("one call site, many implementations")
+
+// One variable, four types, four answers, all read through the same expression — so the call
+// cannot have been resolved when it was compiled.
+var it: *Shape = &circle
+var seen = ""
+
+seen += six(it.area())
+it = &rect
+seen += " " + six(it.area())
+it = &tri
+seen += " " + six(it.area())
+it = &poly
+seen += " " + six(it.area())
+
+check("one variable reaching four implementations", seen,
+      "12.566371 12.000000 6.000000 21.000000")
+
+var four: [4]*Shape = [&circle, &rect, &tri, &poly]
+var total = 0.0
+
+for s in four do total += s.area()
+
+check("four types of different sizes in one array", six(total), "51.566371")
+
+var edges = 0.0
+
+for s in four do edges += s.perimeter()
+
+check("and their perimeters", six(edges), "56.102028")
+
+// A property read through the table, which `02` says is as safe to erase as a method.
+var kinds = ""
+
+for s in four
+    if kinds != "" then kinds += " "
+
+    kinds += s.kind.name()
+
+check("a property reached through the object", kinds, "circle rect triangle polygon")
+
+// Counting by kind is the workaround for a downcast that does not exist.
+var circles = 0
+
+for s in four
+    circles += s.kind match
+        Circular -> 1
+        _ -> 0
+
+check("counting the circles the long way", str(circles), "1")
+
+// -----------------------------------------------------------------------------------------------
+
+section("a shape made of shapes")
+
+var parts: &Buf[&Shape] = buf()
+
+parts.push(Circle(0.0, 0.0, 2.0))
+parts.push(Rect(1.0, 2.0, 3.0, 4.0))
+parts.push(Tri(Point(0.0, 0.0), Point(4.0, 0.0), Point(0.0, 3.0)))
+
+var group: &Shape = Group(parts)
+
+check("a group of three", size(group), "30.566371 38.566371")
+check("its box is the union of theirs", extent(group.bounds()),
+      "-2.000000 -2.000000 4.000000 6.000000")
+check("and it says what it is", group.kind.name(), "group")
+
+// A group holding a group — the recursion goes through the object's table, and nothing in `Group`
+// knows that one of its parts is another one.
+var outer: &Buf[&Shape] = buf()
+
+outer.push(group)
+outer.push(Poly(pentagon()))
+
+var nested: &Shape = Group(outer)
+
+check("a group of a group", size(nested), "51.566371 56.102028")
+check("its box reaches around both", extent(nested.bounds()),
+      "-2.000000 -2.000000 5.000000 6.000000")
+
+// Describing it walks the same tree the same way.
+check("and describing it walks the tree", nested.describe(),
+      "group(group(circle(r=2.000000), rect(3.000000x4.000000), triangle), polygon(5))")
+
+// A group of one is that shape; a group is not obliged to be interesting.
+var lone: &Buf[&Shape] = buf()
+
+lone.push(Circle(0.0, 0.0, 2.0))
+
+var single: &Shape = Group(lone)
+
+check("a group of one is what it holds", size(single), "12.566371 12.566371")
+
+// -----------------------------------------------------------------------------------------------
+
+section("a shape that wraps a shape")
+
+var moved: &Shape = Moved(group, 10.0, 20.0)
+
+check("moving changes neither number", size(moved), "30.566371 38.566371")
+check("but it moves the box", extent(moved.bounds()),
+      "8.000000 18.000000 14.000000 26.000000")
+
+var scaled: &Shape = Scaled(group, 2.0)
+
+check("doubling quadruples the area", size(scaled), "122.265482 77.132741")
+check("and doubles the box", extent(scaled.bounds()),
+      "-4.000000 -4.000000 8.000000 12.000000")
+
+// Wrappers compose, because a wrapper is a shape and a wrapper takes a shape.
+var both: &Shape = Scaled(Moved(group, 10.0, 20.0), 2.0)
+
+check("a wrapper wrapping a wrapper", size(both), "122.265482 77.132741")
+check("and the box it works out to", extent(both.bounds()),
+      "16.000000 36.000000 28.000000 52.000000")
+check("which says what it is made of", both.describe(),
+      "scaled(2.000000, moved(group(circle(r=2.000000), rect(3.000000x4.000000), triangle)))")
+
+// Scaling by one is the shape it wrapped.
+var unchanged: &Shape = Scaled(group, 1.0)
+
+check("scaling by one changes nothing", size(unchanged), "30.566371 38.566371")
+
+// -----------------------------------------------------------------------------------------------
+
+section("the law every shape obeys")
+
+// The catalogue, one of each — including the three combinators, which is the point: a law checked
+// through a trait object is checked against every implementation there is, and a wrapper is an
+// implementation like any other.
+var all: &Buf[&Shape] = buf()
+
+all.push(Circle(0.0, 0.0, 2.0))
+all.push(Rect(1.0, 2.0, 3.0, 4.0))
+all.push(Tri(Point(0.0, 0.0), Point(4.0, 0.0), Point(0.0, 3.0)))
+all.push(Poly(pentagon()))
+all.push(group)
+all.push(Moved(group, 3.0, -1.0))
+all.push(Scaled(group, 0.5))
+
+check("seven implementations in the catalogue", str(all.len()), "7")
+
+for s in all.view()
+    var name = s.kind.name()
+    var big = Scaled(s, 3.0)
+
+    check("scaling " + name + " by three multiplies its area by nine",
+          str(close(big.area(), s.area() * 9.0)), "true")
+    check("and its perimeter by three",
+          str(close(big.perimeter(), s.perimeter() * 3.0)), "true")
+
+for s in all.view()
+    var name = s.kind.name()
+    var shifted = Moved(s, 7.0, -4.0)
+
+    check("moving " + name + " leaves its area alone",
+          str(close(shifted.area(), s.area())), "true")
+    check("and its perimeter alone",
+          str(close(shifted.perimeter(), s.perimeter())), "true")
+    check("and slides its box by exactly that much",
+          str(close(shifted.bounds().x0, s.bounds().x0 + 7.0) &&
+              close(shifted.bounds().y1, s.bounds().y1 - 4.0)), "true")
+
+// A shape is inside its own bound, and a bound is not smaller than the shape's own width.
+for s in all.view()
+    check("the box around " + s.kind.name() + " contains the shape's own box",
+          str(s.bounds().within(s.bounds())), "true")
+
+// A group of the whole catalogue has the area of the whole catalogue.
+var everything: &Shape = Group(all)
+var summed = 0.0
+
+for s in all.view() do summed += s.area()
+
+check("a group of them all sums them all", str(close(everything.area(), summed)), "true")
+
+// -----------------------------------------------------------------------------------------------
+
+section("counted and raw")
+
+// The same shape reached through both sigils. A raw object points straight at a value, so nothing
+// is allocated to form one; a counted object owns the box it erased.
+var stack = Rect(0.0, 0.0, 6.0, 7.0)
+var raw: *Shape = &stack
+var counted: &Shape = Rect(0.0, 0.0, 6.0, 7.0)
+
+check("a raw object over a value on the stack", six(raw.area()), "42.000000")
+check("a counted object over a box", six(counted.area()), "42.000000")
+check("and they agree about everything else", str(raw.perimeter() == counted.perimeter()), "true")
+
+// A shape built where a counted object is expected is boxed and erased in one step, and two arms
+// of different concrete types meet at the one type.
+var pick = 1
+var chosen: &Shape = pick match
+    1 -> Circle(0.0, 0.0, 2.0)
+    _ -> Rect(1.0, 2.0, 3.0, 4.0)
+
+check("two arms of different types meet at one object", six(chosen.area()), "12.566371")
+check("and it is the circle that was chosen", chosen.kind.name(), "circle")
+
+// -----------------------------------------------------------------------------------------------
+
+section("what an object no longer knows")
+
+// A shape that is still a `Circle` prints, because `Display` is reached on the type.
+var printable = Circle(0.0, 0.0, 2.0)
+
+check("a shape prints while its type is known", f"${printable}", "circle(r=2.000000)")
+check("and pads like anything else does", f"${printable}%22s", "    circle(r=2.000000)")
+
+// Erased, it does not — `f"${chosen}"` is a compile error, so the trait's own `describe` stands in.
+check("erased, it answers only what the trait asked", chosen.describe(), "circle(r=2.000000)")
+
+// The kind property is the hand-written copy of what the object's table already knows.
+check("and says what it is only because it was told", chosen.kind.name(), "circle")
+
+// -----------------------------------------------------------------------------------------------
+
+section("objects made and dropped")
+
+// A counted object holds one count of the box it erased, so the ordinary discipline has to carry
+// over unchanged. A long loop is what turns a leak into a growing heap and a double free into a
+// crash, rather than into a test that passes.
+var spun = 0.0
+var i = 0
+
+while i < 100000
+    var s: &Shape = Circle(0.0, 0.0, 1.0)
+
+    spun += s.area()
+    i++
+
+check("a hundred thousand objects made and let go", six(spun), "314159.265359")
+
+// The payload holds objects of its own, so releasing the outer one has to release what it held —
+// the box's destructor doing its work through a pointer whose type has been forgotten.
+var deep = 0.0
+
+i = 0
+
+while i < 20000
+    var inner: &Buf[&Shape] = buf()
+
+    inner.push(Circle(0.0, 0.0, 1.0))
+    inner.push(Rect(0.0, 0.0, 2.0, 2.0))
+
+    var g: &Shape = Scaled(Group(inner), 2.0)
+
+    deep += g.area()
+    i++
+
+check("and twenty thousand holding objects of their own", six(deep), "571327.412287")
+
+// A catalogue that grows reallocates its storage, which moves every object in it.
+var grown: &Buf[&Shape] = buf()
+
+i = 0
+
+while i < 5000
+    grown.push(Circle(0.0, 0.0, 1.0))
+    i++
+
+var after = 0.0
+
+for s in grown.view() do after += s.area()
+
+check("five thousand objects through a buffer that grew", six(after), "15707.963268")
+check("and the buffer still says how many", str(grown.len()), "5000")

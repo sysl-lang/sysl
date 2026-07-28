@@ -459,6 +459,66 @@ comparison (two objects over one value through different traits are the same val
 tables, so what equality means is the trait's question). A call is checked against the **trait's**
 signature, which stands in for every implementation because conformance is exact.
 
+### An object keeps one trait and drops the rest
+
+A bound may name several traits because a bound is a list; a trait-object type names one because it
+is a type. So a value that implements `Shape` *and* `Display` keeps only the first when it becomes a
+`&Shape`, and printing it is refused — "cannot make a string of a &Shape value — it does not
+implement 'Display'". That follows from what the type says and is not a gap in the implementation,
+but it is worth stating plainly, because it means **erasure is paid for in capabilities and not only
+in dispatch cost**, and it is charged at the moment a program stops knowing the type — which is
+exactly the moment it most wants to describe what it is holding.
+
+`guide/shapes` is the record of what that costs. The trait declares a `describe(self) -> string` it
+should not have needed, every implementation supplies one, and seven two-line `impl Display` blocks
+forward the real trait back onto it. The natural design is worse off still: the allocation-free way
+to render is `render(self, out: *Writer)` — which is precisely what `Display` already is — and it
+cannot be used, because bytes written into a sink cannot become a `string` without `from_utf8`
+(`04`'s *Not yet*). Two independent absences meet on one program, and between them the most ordinary
+operation on a heterogeneous collection is unwritable in its natural form.
+
+The mechanism that would lift it is **a trait requiring another trait**, deferred under *Details
+still to settle* below. Nothing else here is a candidate: a multi-trait object type (`&(Shape +
+Display)`) is a second way to say the same thing and a worse one, since it puts at every use a fact
+that belongs to the trait.
+
+### The two sigils do not convert
+
+`*Trait` and `&Trait` are two types and neither is accepted for the other. In the direction that
+would matter — lending a counted object to something that only wants to ask it questions — this is
+sharper than it is for plain references, which have a spelling for it. `&*r` is the address of the
+place `*r`, so a `&T` reaches a function written against `*T` with the crossing into the unsafe tier
+written down at the call, which is the discipline `03` is built on. An object has no dereference, so
+`&*o` says nothing, and a function that only reads a shape has to exist once per sigil.
+
+This is recorded as a gap rather than settled either way. The lend is meaningful — a fat pointer's
+two words are the same two words whichever sigil owns the second — and refusing it is not protecting
+anything, since the raw object is the weaker capability. What is missing is only a spelling, and any
+spelling must keep the property that makes `&*` acceptable: the crossing is greppable. Not chosen
+here, because the shape of it should be decided together with whatever `03` grows for the same
+question on plain references, if anything.
+
+The other direction stays refused for a stronger reason and needs no further thought: a raw object
+points at a value with no count to take a share of, so accepting one where a counted object is
+wanted would be inventing ownership.
+
+### There is no way back to the type
+
+An object cannot be asked what it forgot. There is no cast, no test, no pattern, and no syntax that
+would express one — a type is not a pattern, so even `o is Circle` does not parse. **This is a
+decision, not an omission.** A downcast is the one operation that makes erasure a lie: every other
+rule here says an object offers the trait's members and nothing else, and a type test would say that
+it also secretly offers its identity, which is what the vtable pointer is and what the type deliberately
+stops promising. Languages that offer it need a whole parallel mechanism to do so (Rust's `Any`, and
+the `'static` bound that comes with it), and that mechanism is the honest price — not a small
+addition to this one.
+
+The cost is real and should be written down beside the decision. A program that wants to count the
+circles in a catalogue has to be told, so `guide/shapes` declares a `kind` property that every
+implementation answers with a constant — a hand-maintained copy of exactly the fact the object's
+first word already is, which has to be extended by hand every time a shape is added. If that burden
+ever justifies the machinery, the thing to add is the parallel mechanism, not a hole in this one.
+
 ## Kept / dropped
 
 - **Kept:** static dispatch (monomorphized bounds), dynamic dispatch (boxed trait object),
@@ -519,6 +579,16 @@ reason a generic numeric routine in sysl reads worse than the same routine writt
   in the meantime: a bound written on a **struct** is inherited by every one of its members, which
   is why the same program writes the nine traits once for a ten-method type and once per free
   function beside it.
+  **A second customer, and a stronger one: `guide/shapes`.** There a supertrait is not an economy
+  but the difference between something being writable and not — see *An object keeps one trait and
+  drops the rest* below. A bound can name several traits because it is a list; a trait object names
+  one because it is a type, so the only way an erased value can offer two traits' worth of members
+  is for one of the traits to have required the other. That makes the deciding question sharper
+  than it looked: if a supertrait exists, a `&Sub` object has to be able to answer `Super`'s
+  members too, which means the table carries them or carries a pointer to `Super`'s. Neither is
+  hard; what matters is that the feature is chosen with the object case in view rather than only
+  the bound case, because a design that only tidies up bounds would leave the harder customer
+  unserved.
 - **Associated types.** A trait's own parameters (above) cover much of what an associated type is
   for — `Sink[T]`, `Into[T]` — with the difference that an argument is written by everything that
   names the trait rather than chosen once by the implementation. Which of the two a language wants,

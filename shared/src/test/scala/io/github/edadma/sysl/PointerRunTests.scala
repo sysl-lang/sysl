@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * through it, the one level of automatic dereference on a field, and the recursive types that
  * a pointer field makes possible.
  */
-class PointerRunTests extends AnyFreeSpec with RunSupport {
+class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   "a pointer reads and writes the variable it points at" in {
     val src =
@@ -161,5 +161,72 @@ class PointerRunTests extends AnyFreeSpec with RunSupport {
         |print(a == a, a == b, a != b)""".stripMargin
 
     run(src) shouldBe "true false true\n"
+  }
+
+  /** Lending a counted value to code that only wants to look at it.
+   *
+   * Nothing in `03` states this as a rule of its own — it falls out of two that are stated, that
+   * `*p` is a place and that the address of a place is a `*T`. So `&*r` is how a `&T` reaches a
+   * function written against `*T`, and the crossing into the unsafe tier stays visible at the call
+   * exactly as `03` wants it to. It had no test, and `guide/shapes` is what went looking.
+   */
+  "a counted reference" - {
+    "is lent to a raw pointer by taking the address of what it points at" in {
+      val src =
+        """struct Cell
+          |    n: int
+          |peek(p: *Cell) -> int = p.n
+          |var c: &Cell = Cell(7)
+          |print(peek(&*c))""".stripMargin
+
+      run(src) shouldBe "7\n"
+    }
+
+    // The lent pointer is the box's payload, not a copy of it, so a write through it is seen by
+    // everything else holding the reference.
+    "lends a pointer that writes through to the shared value" in {
+      val src =
+        """struct Cell
+          |    n: int
+          |bump(p: *Cell) = p.n += 1
+          |var c: &Cell = Cell(7)
+          |var also = c
+          |bump(&*c)
+          |bump(&*c)
+          |print(c.n, also.n)""".stripMargin
+
+      run(src) shouldBe "9 9\n"
+    }
+
+    // The lend takes no count, so the reference is released on its own schedule and the loop
+    // neither leaks nor frees twice.
+    "is not retained by the lending, so the count is unaffected" in {
+      val src =
+        """struct Cell
+          |    n: int
+          |peek(p: *Cell) -> int = p.n
+          |var total = 0
+          |var i = 0
+          |while i < 200000
+          |    var c: &Cell = Cell(3)
+          |    total += peek(&*c)
+          |    i++
+          |print(total)""".stripMargin
+
+      run(src) shouldBe "600000\n"
+    }
+
+    // Not accepted directly: the two modes are different types, and the whole value of `*T` being
+    // greppable is that entering it is written down.
+    "is not accepted where a raw pointer is wanted without the lend being written" in {
+      val src =
+        """struct Cell
+          |    n: int
+          |peek(p: *Cell) -> int = p.n
+          |var c: &Cell = Cell(7)
+          |print(peek(c))""".stripMargin
+
+      err(src) should include("'p' of 'peek' is *Cell, but &Cell was given")
+    }
   }
 }

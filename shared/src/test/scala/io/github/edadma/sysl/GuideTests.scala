@@ -143,4 +143,25 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- what a hasher refuses",
     )
   }
+
+  // The only program in the set that does not know the type of what it is computing with. Every
+  // section drives at least two implementations through one call site, and thirty-six of the checks
+  // are one law — scaling multiplies area by the square of the factor and perimeter by the factor —
+  // asserted against every implementation in the catalogue rather than against a number.
+  "shapes — a heterogeneous catalogue behind one trait" in {
+    val out = guide("shapes")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 86
+    sections(out) shouldBe List(
+      "-- each shape answers for itself",
+      "-- one call site, many implementations",
+      "-- a shape made of shapes",
+      "-- a shape that wraps a shape",
+      "-- the law every shape obeys",
+      "-- counted and raw",
+      "-- what an object no longer knows",
+      "-- objects made and dropped",
+    )
+  }
 }

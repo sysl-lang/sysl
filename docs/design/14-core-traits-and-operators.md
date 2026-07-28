@@ -458,6 +458,14 @@ exactly (`§5`), one row further down the catalog.
   type, which differ from `Self` — the one operator that genuinely wants an associated type. It
   waits on associated types (`§1`). Built-in indexing of arrays, slices, and strings is
   compiler-provided and unaffected.
+  **Two customers now, and they are the same customer twice**: the prelude's `Buf[T]`, read with
+  `at`/`set` because `b[i]` is "cannot index Buf[T]", and `guide/shapes`, whose catalogue is a
+  `Buf[&Shape]` and reads it the same way. Both also want `for x in b`, which is the other half of
+  the same absence — there is no iteration protocol either, and the workaround is the same in both
+  programs: `for x in b.view()`, because a view is a slice and slices iterate. So what a container
+  is actually missing is narrower than "the operators a container wants" — it is indexing alone,
+  and it is worth checking whether a container that hands out a slice needs anything else at all
+  before the associated-type machinery is built for it.
 
 - **A heterogeneous *operand*, which is not the same ask as a heterogeneous result.** `§1` argues
   that `Self`-homogeneity costs nothing, because the scalars already obey it — `u8 + u8` is a `u8`

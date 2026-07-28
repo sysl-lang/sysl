@@ -331,4 +331,68 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport {
       out shouldBe "1600000\n"
     }
   }
+
+  /** A type that implements a trait and holds objects of it — the shape `guide/shapes` is built
+   * out of, and the one that makes dispatch recursive without any recursion being written.
+   */
+  "a type that implements a trait and holds one" - {
+    // `Group.area` calls `area` through the table, and one of the parts is another `Group`. Nothing
+    // in the implementation knows that, which is the point: the recursion is in the values.
+    "reaches itself through the table when it holds itself" in {
+      val out = run(shape +
+        """struct Group
+          |    parts: &Buf[&Shape]
+          |impl Shape for Group
+          |    area(self) -> int
+          |        var t = 0
+          |        for i in 0..<self.parts.len() do t += self.parts.at(i).area()
+          |        t
+          |var inner: &Buf[&Shape] = buf()
+          |inner.push(Rect(3, 4))
+          |inner.push(Sq(5))
+          |var outer: &Buf[&Shape] = buf()
+          |outer.push(Group(inner))
+          |outer.push(Sq(10))
+          |var g: &Shape = Group(outer)
+          |print(g.area())""".stripMargin)
+
+      out shouldBe "137\n"
+    }
+
+    // A wrapper holding exactly one object, which is the other half of the pattern — the answer is
+    // the inner one's adjusted, and the wrapper is itself erasable so wrappers stack.
+    "wraps one object, and wrappers stack" in {
+      val out = run(shape +
+        """struct Scaled
+          |    inner: &Shape
+          |    k: int
+          |impl Shape for Scaled
+          |    area(self) -> int = self.inner.area() * self.k * self.k
+          |var once: &Shape = Scaled(Rect(3, 4), 2)
+          |var twice: &Shape = Scaled(Scaled(Rect(3, 4), 2), 3)
+          |print(once.area(), twice.area())""".stripMargin)
+
+      out shouldBe "48 432\n"
+    }
+
+    // A wrapper chain built and dropped repeatedly: every link holds one count of the next, so a
+    // leak or a double free anywhere down the chain shows up here rather than in a passing test.
+    "releases the whole chain when the outermost is let go" in {
+      val out = run(shape +
+        """struct Scaled
+          |    inner: &Shape
+          |    k: int
+          |impl Shape for Scaled
+          |    area(self) -> int = self.inner.area() * self.k * self.k
+          |var total = 0
+          |var i = 0
+          |while i < 100000
+          |    var s: &Shape = Scaled(Scaled(Scaled(Sq(2), 2), 2), 2)
+          |    total += s.area()
+          |    i++
+          |print(total)""".stripMargin)
+
+      out shouldBe "25600000\n"
+    }
+  }
 }

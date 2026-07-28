@@ -112,6 +112,17 @@ Construction:
 breaks `char`'s invariant downstream, so it belongs with the other primitive that can break
 the safe subset rather than alongside the ordinary conversions.
 
+**`from_utf8` is specified above and not built, and two guide programs have now paid for it in
+different currencies.** `guide/json` pays in *workarounds*: unescaping copies the source between
+the escapes and reaches text for a `\uXXXX` only through `str(char(n))`, a rendering path standing
+in for a constructor. `guide/shapes` pays in *design* — the allocation-free way to turn a value
+into text is to render into a `*Writer`, which is what `Display` is, and a program that does so
+cannot get a `string` back out of the sink, so it concatenates instead. The second is the more
+serious report: the first says the conversion is inconvenient to live without, the second says its
+absence pushes a program away from the rendering path this document and `14 §2` are built around.
+Both blockers on the entry are gone — validation is a decided semantics above, and allocation
+arrived with storage sized while running — so what remains is the work, not a question.
+
 ## Granularity: bytes and scalar values, not graphemes
 
 `string` is indexed and measured in **bytes**, and decoded into **`char`** (Unicode scalar

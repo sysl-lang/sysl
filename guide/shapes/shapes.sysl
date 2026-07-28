@@ -1,0 +1,322 @@
+// A catalogue of shapes behind one trait — the dynamic half of `02`.
+//
+// Every other program in the set knows the type of everything it computes with. This one does not,
+// and that is the whole exercise: a `&Shape` is a fat pointer that has forgotten what it points at,
+// and the only thing left to do with it is ask the trait's questions and believe the answers.
+//
+// The shapes come in two families, and the second is the reason the problem is worth writing. Four
+// of them are *leaves* — a circle, a rectangle, a triangle, a polygon — and each answers out of its
+// own fields. The other three are *combinators*: a group is a shape made of shapes, and a move and a
+// scale each wrap one shape and adjust what it says. A combinator holds `&Shape`, so it holds
+// something it cannot name, and a group of groups is dynamic dispatch calling itself.
+
+extern sqrt(x: f64) -> f64
+
+const pi: f64 = 3.141592653589793
+
+// Neither of these is in the language and neither is anywhere to import from, so they are written
+// here for the third program running.
+smaller(a: f64, b: f64) -> f64 = if a < b then a else b
+larger(a: f64, b: f64) -> f64 = if a > b then a else b
+
+struct Point
+    x: f64
+    y: f64
+end Point
+
+distance(a: Point, b: Point) -> f64
+    var dx = a.x - b.x
+    var dy = a.y - b.y
+
+    sqrt(dx * dx + dy * dy)
+end distance
+
+// An axis-aligned bounding box. It is a plain struct rather than a shape, because a bound is the
+// answer to a question about a shape and not another thing to dispatch on.
+struct Box
+    x0: f64
+    y0: f64
+    x1: f64
+    y1: f64
+
+    width(self) -> f64 = self.x1 - self.x0
+
+    height(self) -> f64 = self.y1 - self.y0
+
+    // The smallest box containing both, which is what a group's bound is built out of.
+    join(self, other: Box) -> Box =
+        Box(smaller(self.x0, other.x0), smaller(self.y0, other.y0),
+            larger(self.x1, other.x1), larger(self.y1, other.y1))
+
+    // Whether this box is inside that one, allowing for the last bit of a float. It is written in
+    // three statements because a line cannot be continued: the conjunction does not fit, and there
+    // is no trailing operator that would carry it onto the next line.
+    within(self, other: Box) -> bool
+        var across = self.x0 >= other.x0 - 0.000001 && self.x1 <= other.x1 + 0.000001
+        var down = self.y0 >= other.y0 - 0.000001 && self.y1 <= other.y1 + 0.000001
+
+        across && down
+    end within
+end Box
+
+// What a trait object has forgotten, written down by hand.
+//
+// There is no way to ask a `&Shape` what it was made from — no cast, no test, no pattern, and no
+// syntax that would express one. A catalogue that wants to count its circles therefore has to have
+// been told, so the trait asks every shape to say what it is and every implementation answers with
+// a constant. It works, and it is a hand-maintained copy of a fact the vtable pointer already
+// carries exactly.
+enum Kind
+    Circular
+    Rectangular
+    Triangular
+    Polygonal
+    Composite
+    Displaced
+    Resized
+
+    name(self) -> string = self match
+        Circular -> "circle"
+        Rectangular -> "rect"
+        Triangular -> "triangle"
+        Polygonal -> "polygon"
+        Composite -> "group"
+        Displaced -> "moved"
+        Resized -> "scaled"
+end Kind
+
+// The trait the catalogue is built on.
+//
+// `kind` is a property — a member with no parameter list, read as `s.kind`. `02` says a property is
+// object-safe because it carries a receiver it never spells, and this is where that is spent: the
+// read goes through the object's table exactly as a call does.
+//
+// `describe` is the member that should not be here. Every shape below also implements `Display`,
+// and an object cannot reach it — see the note at the head of `main.sysl`.
+trait Shape
+    area(self) -> f64
+    perimeter(self) -> f64
+    bounds(self) -> Box
+    kind -> Kind
+    describe(self) -> string
+
+six(x: f64) -> string = f"$x%.6f"
+
+// -- the leaves ------------------------------------------------------------------------------
+
+struct Circle
+    cx: f64
+    cy: f64
+    r: f64
+end Circle
+
+impl Shape for Circle
+    area(self) -> f64 = pi * self.r * self.r
+    perimeter(self) -> f64 = 2.0 * pi * self.r
+    bounds(self) -> Box = Box(self.cx - self.r, self.cy - self.r, self.cx + self.r, self.cy + self.r)
+    kind -> Kind = Circular
+    describe(self) -> string = "circle(r=" + six(self.r) + ")"
+
+struct Rect
+    x: f64
+    y: f64
+    w: f64
+    h: f64
+end Rect
+
+impl Shape for Rect
+    area(self) -> f64 = self.w * self.h
+    perimeter(self) -> f64 = 2.0 * (self.w + self.h)
+    bounds(self) -> Box = Box(self.x, self.y, self.x + self.w, self.y + self.h)
+    kind -> Kind = Rectangular
+    describe(self) -> string = "rect(" + six(self.w) + "x" + six(self.h) + ")"
+
+struct Tri
+    a: Point
+    b: Point
+    c: Point
+end Tri
+
+impl Shape for Tri
+    // Twice the signed area is the cross product of two edges; the sign says which way round the
+    // vertices were given, and a shape has no opinion about that.
+    area(self) -> f64
+        var one = (self.b.x - self.a.x) * (self.c.y - self.a.y)
+        var other = (self.c.x - self.a.x) * (self.b.y - self.a.y)
+        var twice = one - other
+
+        if twice < 0.0 then -twice / 2.0 else twice / 2.0
+    end area
+
+    perimeter(self) -> f64 =
+        distance(self.a, self.b) + distance(self.b, self.c) + distance(self.c, self.a)
+
+    bounds(self) -> Box
+        var b = Box(self.a.x, self.a.y, self.a.x, self.a.y)
+
+        b = b.join(Box(self.b.x, self.b.y, self.b.x, self.b.y))
+        b.join(Box(self.c.x, self.c.y, self.c.x, self.c.y))
+    end bounds
+
+    kind -> Kind = Triangular
+    describe(self) -> string = "triangle"
+
+// A closed polygon through its vertices, in order.
+struct Poly
+    pts: &Buf[Point]
+end Poly
+
+impl Shape for Poly
+    // The shoelace formula: twice the signed area is the sum of the cross products of consecutive
+    // vertices taken around the loop.
+    area(self) -> f64
+        var twice = 0.0
+
+        for i in 0..<self.pts.len()
+            var p = self.pts.at(i)
+            var q = self.pts.at((i + 1usize) % self.pts.len())
+
+            twice += p.x * q.y - q.x * p.y
+
+        if twice < 0.0 then -twice / 2.0 else twice / 2.0
+    end area
+
+    perimeter(self) -> f64
+        var t = 0.0
+
+        for i in 0..<self.pts.len()
+            t += distance(self.pts.at(i), self.pts.at((i + 1usize) % self.pts.len()))
+
+        t
+    end perimeter
+
+    bounds(self) -> Box
+        var p = self.pts.at(0usize)
+        var b = Box(p.x, p.y, p.x, p.y)
+
+        for i in 1usize..<self.pts.len()
+            var q = self.pts.at(i)
+
+            b = b.join(Box(q.x, q.y, q.x, q.y))
+
+        b
+    end bounds
+
+    kind -> Kind = Polygonal
+    describe(self) -> string = "polygon(" + str(self.pts.len()) + ")"
+
+// -- the combinators -------------------------------------------------------------------------
+
+// A shape made of shapes. Its own answers are computed by asking each part, and a part may itself
+// be a group, so the recursion goes through the object's table and not through a name.
+struct Group
+    parts: &Buf[&Shape]
+end Group
+
+impl Shape for Group
+    area(self) -> f64
+        var t = 0.0
+
+        for i in 0..<self.parts.len() do t += self.parts.at(i).area()
+
+        t
+    end area
+
+    perimeter(self) -> f64
+        var t = 0.0
+
+        for i in 0..<self.parts.len() do t += self.parts.at(i).perimeter()
+
+        t
+    end perimeter
+
+    bounds(self) -> Box
+        var b = self.parts.at(0usize).bounds()
+
+        for i in 1usize..<self.parts.len() do b = b.join(self.parts.at(i).bounds())
+
+        b
+    end bounds
+
+    kind -> Kind = Composite
+
+    describe(self) -> string
+        var s = "group("
+
+        for i in 0..<self.parts.len()
+            if i > 0usize then s += ", "
+
+            s += self.parts.at(i).describe()
+
+        s + ")"
+    end describe
+
+// A shape moved. Area and perimeter are what they were; only the bound moves.
+struct Moved
+    inner: &Shape
+    dx: f64
+    dy: f64
+end Moved
+
+impl Shape for Moved
+    area(self) -> f64 = self.inner.area()
+    perimeter(self) -> f64 = self.inner.perimeter()
+
+    bounds(self) -> Box
+        var b = self.inner.bounds()
+
+        Box(b.x0 + self.dx, b.y0 + self.dy, b.x1 + self.dx, b.y1 + self.dy)
+    end bounds
+
+    kind -> Kind = Displaced
+    describe(self) -> string = "moved(" + self.inner.describe() + ")"
+
+// A shape scaled about the origin. Area goes as the square of the factor and perimeter as the
+// factor itself, which is the one law in this program that holds for every shape there could ever
+// be — so it is checked through the object, over the whole catalogue, in `main.sysl`.
+struct Scaled
+    inner: &Shape
+    k: f64
+end Scaled
+
+impl Shape for Scaled
+    area(self) -> f64 = self.inner.area() * self.k * self.k
+    perimeter(self) -> f64 = self.inner.perimeter() * self.k
+
+    bounds(self) -> Box
+        var b = self.inner.bounds()
+
+        Box(b.x0 * self.k, b.y0 * self.k, b.x1 * self.k, b.y1 * self.k)
+    end bounds
+
+    kind -> Kind = Resized
+    describe(self) -> string = "scaled(" + six(self.k) + ", " + self.inner.describe() + ")"
+
+// -- rendering, which is the same thing said a second time ------------------------------------
+//
+// Every one of these seven impls exists because a `&Shape` cannot be printed. `Display` is a trait
+// each shape implements perfectly well; erasing to `Shape` throws it away, and there is no way to
+// say that a `Shape` is also a `Display`. So the trait carries a `describe` of its own, and these
+// forward `Display` back onto it — fourteen lines whose entire content is that the two traits are
+// about the same value.
+
+impl Display for Circle
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+
+impl Display for Rect
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+
+impl Display for Tri
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+
+impl Display for Poly
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+
+impl Display for Group
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+
+impl Display for Moved
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+
+impl Display for Scaled
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
