@@ -212,6 +212,17 @@ parent, the back-link of an intrusive doubly-linked list, a process's pointer to
 process. `weak T` expresses those safely; reach for it only when you have a genuine
 back-reference. Needs an allocator.
 
+**Not built.** `weak` is in the reserved words and has no production in the type grammar, so
+`var w: weak Node` stops at the colon. Everything above is the design and none of it is the
+compiler, which matters because a program that wants it has no way to *say* that an edge does not
+own — it can only arrange never to leave the cycle standing. `guide/scheduler` is written that
+way and is the shape that wants this most: a blocked task holds the lock it waits for while that
+lock's wait list holds the task, and an owner and the lock it holds are a second loop. Its run
+loop takes both apart — every wait ends in a wakeup, every lock in a release — so the memory
+comes back; the same program *stalled* leaves the whole graph in place and nothing says so.
+Until this lands, "a cycle is broken before the program lets go of it" is a property a program
+asserts about itself rather than one the language checks.
+
 ## References are never null
 
 References are **non-null**. There is no null pointer in the safe subset, so there is no null

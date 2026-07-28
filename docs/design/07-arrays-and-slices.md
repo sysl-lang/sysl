@@ -331,6 +331,14 @@ implementation:
   alternative — a `[80]T` parameter — copies the table at every call. A table small enough to copy
   escapes it, which is why the same program hands its eight initial values over as a `[8]T` and
   thinks nothing of it.
+- **A `Buf` grows and shrinks at its end and nowhere else.** `push`, `pop`, `clear`, and nothing
+  that takes an element out of the middle or cuts a length down to a number. Both are wanted by the
+  same kind of code and for the same reason: a list somebody *leaves*. `guide/scheduler` keeps three
+  of them — a lock's waiters, the locks a task holds, the tasks that are asleep — and takes an
+  element out of each by compacting the survivors down and then popping the tail off one at a time,
+  which is two loops for what is one operation, and the second loop is easy to forget (leaving the
+  last element in the buffer twice). What it wants is `remove(i)` and `truncate(n)`; neither is a
+  language question, and `truncate` is the one the other is written in terms of.
 - **An unchecked-index escape hatch** for hot loops, listed as likely-yes and deferred in `03`.
 - **Multi-dimensional shorthand.** `[3][3]f64` already works as an array of arrays; a distinct
   rectangular type is not planned.

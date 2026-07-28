@@ -621,6 +621,18 @@ exactly (`§5`), one row further down the catalog.
   records the second half, and the two want deciding together: a member with no receiver, reachable
   as `T.zero` through a bound, answers both.
 
+- **An enum cannot render its own variant names.** `str` on one is refused and the diagnostic is a
+  good one — it names the `impl Display` to write — but for the commonest case what that impl says
+  is already in the source: a match from each variant to the word the variant is spelled with.
+  `guide/scheduler`'s six-state `State` has a renderer that is six lines of exactly that, and a
+  scheduler is a program whose most useful output *is* its states. This is **not** the same ask as
+  the `describe` functions the other guide programs write: a fault's message is built out of the
+  variant's payload and only a person can write it, while a variant's name is a fact the compiler
+  is already holding. What it wants is a derived `Display` for the name-only case — and the reason
+  it is recorded rather than designed is that sysl has **no deriving mechanism at all**, so this
+  would be the first one, and it arrives with that whole question attached: automatic for every
+  enum, and therefore a member a program cannot replace without shadowing it, or asked for by
+  something written at the declaration. Nothing here decides that.
 - **Associated types** generally (`02` open item) — deferred, and with them any trait whose
   method mentions a type derived from `Self` rather than `Self` itself.
 - **Deriving an operator through a default body.** Default method bodies are built (`02`), but the

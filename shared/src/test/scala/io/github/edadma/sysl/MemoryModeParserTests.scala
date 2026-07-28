@@ -50,6 +50,15 @@ class MemoryModeParserTests extends AnyFreeSpec with ParseSupport {
       )
     }
 
+    // `03 § weak T` describes a third mode — a non-owning reference that degrades to `None` when
+    // its referent goes — and nothing implements it: `weak` is in the reserved words and has no
+    // production in the type grammar, so the declaration stops at the colon. Pinned here so the
+    // gap is a fact the suite states rather than one a reader has to discover from a design
+    // document that describes the feature in the present tense.
+    "'weak' is reserved and is not yet a type" in {
+      progError("var w: weak Node = a") should include("newline expected")
+    }
+
     "'sync' stays an ordinary name, so a type may be called it" in {
       prog("var x: &sync = p") shouldBe
         List(VarDecl("x", Some(RefType(NamedType("sync"), sync = false)), Some(Ident("p"))))

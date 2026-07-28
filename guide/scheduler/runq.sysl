@@ -1,0 +1,152 @@
+// The ready queue: a binary min-heap of the tasks that could run right now.
+//
+// This file is where the problem's second axis lives — **mutation through references**. A heap of
+// values can be reordered without anything outside it noticing. A heap of *references* that has to
+// support decrease-key cannot: raising a task's urgency means finding that task in the heap, and
+// finding it in logarithmic time means the task remembers where it sits. So every swap this file
+// makes writes into two objects the heap does not own, and `slot` is the heap's own field kept
+// inside somebody else's struct.
+//
+// The invariant that costs the attention is not the heap property — that is textbook — but the
+// agreement between the array and the back-pointers: `heap[i].slot == Some(i)`, for every `i`, at
+// every point an outsider can observe. `ok` below asserts both together, which is why every swap
+// goes through `put` rather than writing the array directly.
+
+// The two numbers a ready task is ordered by, in the order that decides it: priority first, and
+// among equals the one that became ready earlier. Without that tie-break a schedule would depend on
+// the shape the heap happened to be left in, and the traces this program asserts could not be
+// worked out on paper.
+//
+// A smaller number is more urgent, as it is in every scheduler that counts priorities rather than
+// levels: it makes "the most urgent thing" the minimum, which is the shape a heap already has.
+//
+// Ordering lives in a **key** rather than on `Task` itself, and the reason is worth stating. `Ord`
+// on a task would say that two tasks compare, and the only comparison a task actually wants is
+// address equality on the `&Task` — which the language already gives it (`14 §2`). Putting the
+// order in a two-field key keeps the question "which of these runs first" apart from the question
+// "are these the same task", which a scheduler asks constantly and about different things.
+struct Urgency
+    prio: int
+    seq: int
+end Urgency
+
+impl Ord for Urgency
+    lt(self, rhs: Urgency) -> bool =
+        if self.prio != rhs.prio then self.prio < rhs.prio
+        else self.seq < rhs.seq
+
+before(a: &Task, b: &Task) -> bool = a.key() < b.key()
+
+// The queue holds the tasks through `&`, so a task can be in the queue and still be the thing a
+// lock's waiter list points at and the thing a `Step` names. That sharing is the point of the
+// problem — a scheduler is a set of overlapping views of one set of objects — and it is what makes
+// the back-pointer legal in the first place: the heap may write `slot` because it is reaching the
+// same object everybody else is.
+struct RunQueue
+    heap: &Buf[&Task]
+
+    len(self) -> usize = self.heap.len()
+
+    is_empty(self) -> bool = self.heap.is_empty()
+
+    // A task and the place it now occupies are written together, because the two are one fact. Any
+    // path that set the array without setting the note, or the other way round, would leave a
+    // decrease-key looking in the wrong place — and it would keep working until the first time two
+    // tasks contended, which is the worst kind of wrong.
+    put(self, i: usize, t: &Task)
+        self.heap.set(i, t)
+        t.slot = Some(i)
+    end put
+
+    push(self, t: &Task)
+        self.heap.push(t)
+        self.put(self.heap.len() - 1usize, t)
+        self.up(self.heap.len() - 1usize)
+    end push
+
+    // The last element takes the root and sinks. When there was only one, the element taken off the
+    // end *is* the root — which is what the address comparison decides, and it is the whole use this
+    // program makes of `&T` being `Eq` (`14 §2`).
+    pop(self) -> Option[&Task]
+        if self.heap.is_empty() then return None
+
+        var top = self.heap[0usize]
+        var last = self.heap.pop().unwrap()
+
+        if !(last == top)
+            self.put(0usize, last)
+            self.down(0usize)
+
+        top.slot = None
+        Some(top)
+    end pop
+
+    up(self, from: usize)
+        var i = from
+
+        while i > 0usize
+            var p = (i - 1usize) / 2usize
+
+            if !before(self.heap[i], self.heap[p]) then break
+
+            self.swap(i, p)
+            i = p
+    end up
+
+    down(self, from: usize)
+        var i = from
+
+        loop
+            var l = i * 2usize + 1usize
+            var best = i
+
+            if l < self.heap.len() && before(self.heap[l], self.heap[best]) then best = l
+
+            if l + 1usize < self.heap.len() && before(self.heap[l + 1usize], self.heap[best])
+                best = l + 1usize
+
+            if best == i then break
+
+            self.swap(i, best)
+            i = best
+    end down
+
+    swap(self, i: usize, j: usize)
+        var a = self.heap[i]
+        var b = self.heap[j]
+
+        self.put(i, b)
+        self.put(j, a)
+    end swap
+
+    // A task whose priority has just changed. One of the two walks does nothing, and which one does
+    // is exactly whether the priority went down or up — so the caller never has to know, which is
+    // what lets a lock hand a priority over and a release hand it back through one entry point.
+    //
+    // A task that is not in the queue is not an error: a running task is out of the queue by
+    // definition, and it is the common case for the task whose priority a lock just raised.
+    reprio(self, t: &Task)
+        var at = t.slot.unwrap_or(self.heap.len())
+
+        if at >= self.heap.len() then return
+
+        self.up(at)
+        self.down(t.slot.unwrap_or(0usize))
+    end reprio
+
+    // The heap property and the back-pointers, checked together, because they are one invariant
+    // written in two places. Every section of the checks that touches the queue asks this
+    // afterwards: an answer that came out right from a heap that was already broken is a check that
+    // passed for the wrong reason.
+    ok(self) -> bool
+        for i in 0..<self.heap.len()
+            var t = self.heap[i]
+
+            if t.slot.unwrap_or(self.heap.len()) != i then return false
+            if i > 0usize && before(t, self.heap[(i - 1usize) / 2usize]) then return false
+
+        true
+    end ok
+end RunQueue
+
+run_queue() -> RunQueue = RunQueue(buf())

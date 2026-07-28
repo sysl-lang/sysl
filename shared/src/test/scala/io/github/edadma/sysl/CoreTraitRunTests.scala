@@ -9,7 +9,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * `add`, not a call — so what these check is that the *type system* now agrees a scalar satisfies a
  * bound, and that everything reached through that agreement computes what the operator computes.
  */
-class CoreTraitRunTests extends AnyFreeSpec with RunSupport {
+class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   /** A user type with the three memberships an operand-sharing form needs, plus a way of building
    * one that says when it is evaluated.
@@ -285,6 +285,21 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport {
 
       run(src) shouldBe
         "true false false\nfalse true false\ntrue false true\nfalse true true\n"
+    }
+
+    // The other half of the same claim, and the half that has to be checked rather than observed:
+    // `14 §2` says the catalog stays flat and being `Ord` does not imply `Eq`. So a type ordered by
+    // one `lt` gets all four comparisons above and no `==` at all — which is what lets an ordering
+    // key be written for a value whose equality would have meant something else entirely.
+    "and being ordered does not make a type equatable" in {
+      val src =
+        """struct Money
+          |    cents: int
+          |impl Ord for Money
+          |    lt(self, rhs: Self) -> bool = self.cents < rhs.cents
+          |print(Money(1) == Money(2))""".stripMargin
+
+      err(src) should include("'==' is not defined for Money")
     }
 
     "both equality operators derive from one 'eq'" in {

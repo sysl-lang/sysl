@@ -1,0 +1,456 @@
+// A priority scheduler: tasks, locks, and the run loop that decides who gets the next tick.
+//
+// The axis this owns is **OS territory** — the first program in the set where sysl has to behave
+// like systems code rather than like an application. A run queue, a priority, a task that blocks
+// and a task that wakes it are the shapes a kernel is made of, and they are made of `&T` graphs
+// mutated through references: a lock points at its owner, the owner points back at the lock it
+// holds, and a waiter points at what it is waiting for while that thing points at the waiter.
+//
+// The centrepiece is **priority inheritance**, because it is the one place where all of it has to
+// work at once. A low-priority task holding a lock that a high-priority task wants is lent the
+// waiter's urgency until it lets go — which means finding the holder in the ready queue and moving
+// it, which is the decrease-key the heap next door exists for. Run the same three tasks with the
+// lending switched off and the schedule is the classic unbounded inversion; switch it on and the
+// urgent task waits for the critical section instead of for an unrelated third task. Both traces
+// can be worked out on paper, and `main.sysl` asserts them character by character.
+//
+// What writing it turned up, in the order it bit:
+//
+//   * **The wait graph is a reference cycle, and `weak` is specified but not built.** A blocked
+//     task points at the lock and the lock's waiter list points back at the task; an owner and the
+//     lock it holds are a second cycle. `03 § weak T` names exactly this shape — "the tool for
+//     back-references" — and `weak` is a reserved word the compiler otherwise knows nothing about,
+//     so the program has no way to say which edge of a cycle does not own. What saves it is that a
+//     scheduler takes its own graph apart: every wait ends in a wakeup and every lock is released,
+//     so the last section of the checks asserts that nothing is left holding anything. That is a
+//     property worth having anyway, but here it is standing in for a guarantee the language should
+//     be making — a run that stops with a task still blocked leaks it, and nothing says so.
+//   * **A `Buf` grows and shrinks at its end and nowhere else.** Taking a waiter out of the middle
+//     of a list is `drop_one` below: compact, then pop the tail down to the new length, because
+//     there is no `remove` and no `truncate` to say it in one step. Every list a scheduler keeps is
+//     one that things leave from the middle of.
+//   * **A task is fifteen fields with no names at the call site and no defaults.** `task` below
+//     exists only to spell the five zeroes, the three `None`s and the empty list that every new
+//     task starts life holding, and a reader of the constructor call cannot see which argument is
+//     which. A task control block is exactly the shape that pays for this: it is mostly state that
+//     starts empty and is written later by somebody else.
+//   * **A nullary generic cannot be told what it is making.** `buf[&Mutex]()` is not the syntax —
+//     call-site type arguments are deliberately absent (`10 § Open a`), since a type-argument list
+//     and an index are the same grammar. Where the value lands somewhere already typed there is
+//     nothing to do — the `buf()` filling a task's `holds` below takes its element type from the
+//     field — so it is a `var` that has to say it. The reach for the other spelling is natural
+//     enough that the compiler used to answer it with "the thing being called must be a name"; it
+//     now names the rule and the annotation instead, which was this program's one change to the
+//     compiler rather than to itself.
+//   * **No enum renders itself.** `str` on one is refused — helpfully, naming the `impl Display`
+//     that would answer it — and that is true of a data-carrying enum and of a plain one alike. So
+//     `describe_state` below is a hand-written match from six variants to their own six names,
+//     which the compiler already knows: they are the words the match arms are written with. Other
+//     programs in the set write a `describe` too, but for a *message* built out of a variant's
+//     payload; this is the first one whose rendering is nothing but the name.
+//   * **`&T` is `Eq`, and that is what identity costs — nothing.** Address equality (`14 §2`) is
+//     what "is this the lock you actually hold" and "did the heap take its own root off the end"
+//     are written with. Worth recording as a positive, because a language without it forces a
+//     unique name compared as a string, which is wrong in a way that only shows up once two objects
+//     are named alike.
+//
+// Deliberately not modelled, so the traces stay computable on paper: more than one processor,
+// preemption inside a tick, and inheritance through a *chain* of holders (a lends to b lends to c).
+// The first two are not language questions; the third is the same decrease-key one more time.
+
+// One thing a task does. `Work` is the only step that costs time — a lock taken and a lock dropped
+// are decisions rather than labour — which is what makes the length of a run the sum of the work in
+// it plus whatever the processor stood idle.
+enum Step
+    Work(ticks: int)
+    Lock(m: &Mutex)
+    Unlock(m: &Mutex)
+    Sleep(ticks: int)
+end Step
+
+// Where a task is in its life. `Fresh` is before its arrival time, which is how a run is given a
+// shape without a separate list of pending events.
+enum State
+    Fresh
+    Ready
+    Blocked
+    Sleeping
+    Done
+    Faulted
+end State
+
+describe_state(s: State) -> string = s match
+    Fresh -> "fresh"
+    Ready -> "ready"
+    Blocked -> "blocked"
+    Sleeping -> "sleeping"
+    Done -> "done"
+    Faulted -> "faulted"
+
+// What a task can get wrong. Both are about a lock, because a lock is the only thing in this
+// machine that a task can hold an opinion about which the machine is in a position to check.
+enum Fault
+    NotHeld(lock: string)
+    AlreadyHeld(lock: string)
+end Fault
+
+describe_fault(f: Fault) -> string = f match
+    NotHeld(lock) -> s"released $lock without holding it"
+    AlreadyHeld(lock) -> s"took $lock while already holding it"
+
+// How a run ended. `Stalled` is the interesting one: every task that is not finished is blocked, so
+// no future tick can differ from this one — a deadlock detected rather than waited out.
+enum Outcome
+    Running
+    Finished(at: int)
+    Stalled(at: int)
+    Timeout(at: int)
+end Outcome
+
+describe_outcome(o: Outcome) -> string = o match
+    Running -> "running"
+    Finished(at) -> s"finished at $at"
+    Stalled(at) -> s"stalled at $at"
+    Timeout(at) -> s"timed out at $at"
+
+// A task control block. `prio` is what the scheduler orders by and `base` is what the task was
+// created with; the two differ exactly while the task is being lent somebody else's urgency, which
+// is the whole of priority inheritance seen from the task's side.
+struct Task
+    name: string
+    base: int
+    prio: int
+    arrive: int
+    steps: []Step
+    pc: usize
+    did: int
+    ran: int
+    seq: int
+    slot: Option[usize]
+    state: State
+    wake: int
+    holds: &Buf[&Mutex]
+    blocked_on: Option[&Mutex]
+    fault: Option[Fault]
+
+    // The letter this task writes into the trace. One character per task keeps a schedule short
+    // enough to read, and short enough to check against the one worked out on paper.
+    mark(self) -> u8 = self.name.bytes[0usize]
+
+    key(self) -> Urgency = Urgency(self.prio, self.seq)
+
+    is_fresh(self) -> bool = self.state match
+        Fresh -> true
+        _ -> false
+
+    is_ready(self) -> bool = self.state match
+        Ready -> true
+        _ -> false
+
+    settled(self) -> bool = self.state match
+        Done -> true
+        Faulted -> true
+        _ -> false
+
+    // Whether some future tick could still see this task run. A blocked task is not waiting for
+    // time to pass, it is waiting for another task to act, so it does not count.
+    movable(self) -> bool = self.state match
+        Fresh -> true
+        Ready -> true
+        Sleeping -> true
+        _ -> false
+end Task
+
+// A new task, with the five zeroes and the three `None`s every task starts life holding.
+task(name: string, prio: int, arrive: int, steps: []Step) -> &Task
+    Task(name, prio, prio, arrive, steps, 0usize, 0, 0, 0, None, Fresh, 0, buf(), None, None)
+end task
+
+// A lock. `owner` and the owner's `holds` are the same fact written from both ends, which is what
+// lets a release know whose priority to hand back without going looking for it.
+struct Mutex
+    name: string
+    owner: Option[&Task]
+    waiters: &Buf[&Task]
+end Mutex
+
+mutex(name: string) -> &Mutex
+    Mutex(name, None, buf())
+end mutex
+
+// Take one element out of a list that only grows and shrinks at its end: shift the survivors down,
+// then drop the tail. `Buf` has neither a remove nor a truncate, so both halves are written out —
+// and both are needed, since leaving the tail alone would leave the last element in twice.
+drop_one[T: Eq](b: &Buf[T], v: T)
+    var k = 0usize
+
+    for i in 0..<b.len()
+        if b[i] != v
+            b.set(k, b[i])
+            k += 1usize
+
+    while b.len() > k
+        b.pop()
+end drop_one
+
+// The waiter a lock should be handed to. A wait list is short and is walked rather than kept in
+// order, which is the trade a kernel makes too: the cost is paid once per release, where keeping a
+// second heap ordered would be paid on every block.
+most_urgent(b: &Buf[&Task]) -> Option[&Task]
+    if b.is_empty() then return None
+
+    var best = b[0usize]
+
+    for i in 1usize..<b.len()
+        if before(b[i], best) then best = b[i]
+
+    Some(best)
+end most_urgent
+
+// The machine. `inherit` is the one switch the program is built around: everything else about the
+// two runs in the priority-inversion sections is identical.
+struct Sched
+    ready: RunQueue
+    tasks: &Buf[&Task]
+    sleeping: &Buf[&Task]
+    now: int
+    seq: int
+    inherit: bool
+    trace: &Buf[u8]
+    idle: int
+
+    add(*self, t: &Task) -> &Task
+        self.tasks.push(t)
+        t
+    end add
+
+    // Becoming ready stamps the task with the moment it did, which is what `before` breaks ties
+    // with. Stamping it on *every* entry — including the re-entry of a task that has just spent a
+    // tick — is what makes equal priorities share the processor a tick at a time rather than one of
+    // them holding it until it blocks.
+    make_ready(*self, t: &Task)
+        t.state = Ready
+        self.seq += 1
+        t.seq = self.seq
+        self.ready.push(t)
+    end make_ready
+
+    // What a task's priority should be right now: its own, unless it is holding a lock somebody
+    // more urgent is waiting for, in which case it is theirs. Computing it from the graph rather
+    // than remembering it is what keeps it right when a second waiter arrives, when a waiter is
+    // handed the lock, and when the task lets go of one lock while still holding another.
+    urgency(self, t: &Task) -> int
+        var p = t.base
+
+        for i in 0..<t.holds.len()
+            var m = t.holds[i]
+
+            for j in 0..<m.waiters.len()
+                if m.waiters[j].prio < p then p = m.waiters[j].prio
+
+        p
+    end urgency
+
+    // Give a task the priority the graph says it should have, and move it in the queue if it is in
+    // one. This is the only writer of `prio`, which is what makes "a lent priority is always given
+    // back" a property of one function rather than of every call site.
+    reprice(*self, t: &Task)
+        if !self.inherit then return
+
+        var p = self.urgency(t)
+
+        if p != t.prio
+            t.prio = p
+            self.ready.reprio(t)
+    end reprice
+
+    // Taking a lock. Free, and it is yours; held by somebody else, and you go on its waiter list
+    // and lend it your urgency; held by you already, and that is a mistake the machine names.
+    acquire(*self, t: &Task, m: &Mutex) -> bool
+        var held = m.owner match
+            Some(o) -> true
+            None -> false
+
+        if !held
+            m.owner = Some(t)
+            t.holds.push(m)
+            return true
+
+        var o = m.owner.unwrap()
+
+        if o == t
+            t.fault = Some(AlreadyHeld(m.name))
+            t.state = Faulted
+            return false
+
+        t.state = Blocked
+        t.blocked_on = Some(m)
+        m.waiters.push(t)
+        self.reprice(o)
+        false
+    end acquire
+
+    // Letting go. The lock is handed straight to the most urgent waiter rather than thrown open for
+    // whoever runs next — which is what makes a release deterministic, and what stops a task that
+    // has been waiting from losing the lock to one that has not.
+    //
+    // The waiter's program counter moves past the `Lock` step it blocked on, because it did not
+    // take the lock, it was given it: leaving the counter where it was would send it round to ask
+    // for a lock it now owns, which the machine would rightly call a mistake.
+    release(*self, t: &Task, m: &Mutex) -> bool
+        var mine = m.owner match
+            Some(o) -> o == t
+            None -> false
+
+        if !mine
+            t.fault = Some(NotHeld(m.name))
+            t.state = Faulted
+            return false
+
+        drop_one(t.holds, m)
+        m.owner = None
+
+        var next = most_urgent(m.waiters)
+
+        if next.is_some()
+            var w = next.unwrap()
+
+            drop_one(m.waiters, w)
+            w.blocked_on = None
+            w.pc += 1usize
+            m.owner = Some(w)
+            w.holds.push(m)
+            self.make_ready(w)
+            self.reprice(w)
+
+        self.reprice(t)
+        true
+    end release
+
+    // Run the task's program until it is sitting on a step that costs time, or until it can go no
+    // further. The answer is whether it can spend the tick it was picked for: a task that blocked,
+    // slept, finished or made a mistake gives the tick back and somebody else is picked.
+    advance(*self, t: &Task) -> bool
+        loop
+            if t.pc >= t.steps.len
+                t.state = Done
+                return false
+
+            t.steps[t.pc] match
+                Work(n) ->
+                    if t.did < n then return true
+
+                    t.did = 0
+                    t.pc += 1usize
+                Sleep(n) ->
+                    t.pc += 1usize
+                    t.state = Sleeping
+                    t.wake = self.now + n
+                    self.sleeping.push(t)
+                    return false
+                Lock(m) ->
+                    if !self.acquire(t, m) then return false
+
+                    t.pc += 1usize
+                Unlock(m) ->
+                    if !self.release(t, m) then return false
+
+                    t.pc += 1usize
+    end advance
+
+    // Arrivals and wakeups, both of which are "the clock reached the number this task was waiting
+    // for". Sleepers are compacted the same way a waiter list is, and for the same reason.
+    admit(*self)
+        for i in 0..<self.tasks.len()
+            var t = self.tasks[i]
+
+            if t.is_fresh() && t.arrive <= self.now then self.make_ready(t)
+
+        var k = 0usize
+
+        for i in 0..<self.sleeping.len()
+            var t = self.sleeping[i]
+
+            if t.wake <= self.now then self.make_ready(t)
+            else
+                self.sleeping.set(k, t)
+                k += 1usize
+
+        while self.sleeping.len() > k
+            self.sleeping.pop()
+    end admit
+
+    // One tick of the machine: admit whoever the clock has reached, then hand the tick to the most
+    // urgent ready task. A task that turns out not to be able to use it — it blocks on a lock, goes
+    // to sleep, or has nothing left to do — is out of the queue by then, so the next pick is
+    // somebody else, and the tick is lost only if nobody at all can take it.
+    tick(*self)
+        self.admit()
+
+        var spent = false
+
+        loop
+            if spent then break
+
+            self.ready.pop() match
+                None -> break
+                Some(t) ->
+                    if self.advance(t)
+                        self.trace.push(t.mark())
+                        t.did += 1
+                        t.ran += 1
+                        spent = true
+
+                        // The same walk again, which is what rolls the counter past a step whose
+                        // last tick this was and runs whatever instantaneous steps follow it — so a
+                        // lock is released in the tick the work finished, not in the next one.
+                        self.advance(t)
+
+                        if t.is_ready() then self.make_ready(t)
+
+        if !spent
+            self.idle += 1
+            self.trace.push(46u8)
+
+        self.now += 1
+    end tick
+
+    // Where the run stands. Nothing left alive is a finish; something alive but nothing able to
+    // move is a deadlock, and it is worth reporting as its own answer rather than as a run that
+    // used up its budget — a stall at tick 9 and a timeout at tick 400 are different bugs.
+    status(self) -> Outcome
+        var live = 0
+        var movable = 0
+
+        for i in 0..<self.tasks.len()
+            var t = self.tasks[i]
+
+            if !t.settled() then live += 1
+            if t.movable() then movable += 1
+
+        if live == 0 then Finished(self.now)
+        elif movable == 0 then Stalled(self.now)
+        else Running
+    end status
+
+    run(*self, limit: int) -> Outcome
+        loop
+            var s = self.status()
+            var going = s match
+                Running -> true
+                _ -> false
+
+            if !going then return s
+            if self.now >= limit then return Timeout(self.now)
+
+            self.tick()
+    end run
+
+    // The schedule, one letter per tick, with `.` for a tick nobody could use. This is the whole
+    // assertion: two runs that differ anywhere differ here.
+    schedule(self) -> string = from_utf8(self.trace.view()).unwrap_or("?")
+end Sched
+
+sched(inherit: bool) -> &Sched
+    Sched(run_queue(), buf(), buf(), 0, 0, inherit, buf(), 0)
+end sched

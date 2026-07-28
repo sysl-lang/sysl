@@ -93,4 +93,40 @@ class RecursiveTeardownRunTests extends AnyFreeSpec with RunSupport {
 
     run(src) shouldBe "100000\n"
   }
+
+  // Two types that reach each other, one of them through a growable list — the shape a scheduler's
+  // wait graph has, where a lock's waiter list holds tasks and each task points back at what it is
+  // waiting for. Built and taken apart a hundred thousand times: the edge that closes the loop is
+  // cleared before the objects go, so ARC reclaims them and nothing is freed twice.
+  //
+  // Left standing, the same two objects would be a cycle ARC cannot reclaim at all. `03 § weak T`
+  // names the reference that would say so and no such type exists yet, which is why taking the
+  // graph apart is a program's own responsibility rather than the language's.
+  "two types that hold each other are reclaimed once the loop is cleared" in {
+    val src =
+      """struct Waiter
+        |    id: int
+        |    on: Option[&Held]
+        |struct Held
+        |    tag: int
+        |    queue: &Buf[&Waiter]
+        |round() -> int
+        |    var h: &Held = Held(7, buf())
+        |    var w: &Waiter = Waiter(1, Some(h))
+        |    var v: &Waiter = Waiter(2, Some(h))
+        |    h.queue.push(w)
+        |    h.queue.push(v)
+        |    var n = int(h.queue.len()) + h.tag
+        |    w.on = None
+        |    v.on = None
+        |    n
+        |var i = 0
+        |var total = 0
+        |while i < 100000
+        |    total += round()
+        |    i++
+        |print(total)""".stripMargin
+
+    run(src) shouldBe "900000\n"
+  }
 }

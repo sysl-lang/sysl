@@ -308,5 +308,52 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(only(3))
             |""".stripMargin) should include("cannot infer the type argument 'T'")
     }
+
+    // Call-site type arguments are deliberately absent (`10 § Open a`) because the list and an
+    // index share a grammar. The reach for them is natural enough — a nullary generic has no
+    // argument to be inferred from — so the complaint names the rule and the annotation that
+    // stands in for it, rather than reporting a callee that is not a name.
+    "type arguments at a call are refused by name" in {
+      err("""id[T](x: T) -> T = x
+            |print(id[int](3))
+            |""".stripMargin) should include("'id' cannot be given type arguments at a call")
+    }
+
+    // A generic method is at least as likely a place to reach for the syntax, and gets the same
+    // sentence — the receiver settles nothing about it, since the list is written after the name.
+    "including on a generic method" in {
+      err("""struct Box
+            |    n: int
+            |    pick[T](self, x: T) -> T = x
+            |var b = Box(1)
+            |print(b.pick[int](3))
+            |""".stripMargin) should include("'pick' cannot be given type arguments at a call")
+    }
+
+    // The improved wording is for a generic callee only: anything else applied to an index is
+    // still whatever the general complaint says it is, and telling a reader about type arguments
+    // they never wrote would be worse than saying less.
+    "and a non-generic name indexed and applied is not told about type arguments" in {
+      val out = err("""plain(x: int) -> int = x
+                      |var xs: []int = [1, 2, 3]
+                      |print(plain[1](3))
+                      |""".stripMargin)
+
+      out should include("the thing being called must be a name")
+      out should not include "type arguments"
+    }
+
+    // Nor is a local that happens to share a generic function's name: what is indexed there is the
+    // local, and the reading that mentions type arguments is about a declaration further away than
+    // the one the name reaches.
+    "nor a local shadowing a generic name" in {
+      val out = err("""id[T](x: T) -> T = x
+                      |var id: []int = [1, 2, 3]
+                      |print(id[0](3))
+                      |""".stripMargin)
+
+      out should include("the thing being called must be a name")
+      out should not include "type arguments"
+    }
   }
 }

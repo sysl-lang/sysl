@@ -30,6 +30,17 @@ class StringEdgeRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "9 1 3 4 1\ntrue true 7\n"
   }
 
+  // A cut of no width, which is what a program computing both ends out of an answer it just
+  // worked out will hand over sooner or later — a span between two events that turned out to be
+  // the same event. It is a string, it is empty, and it is not a trap.
+  "a substring of no width is the empty string" in {
+    val src =
+      """var s = "abcdef"
+        |print(s[2..<2].len, s[2..<2] == "", s[0..<0] == "", s[6..<6] == "")""".stripMargin
+
+    run(src) shouldBe "0 true true true\n"
+  }
+
   "byte indexing reaches each byte of a multi-byte character" in {
     val src =
       """var s = "a€b"

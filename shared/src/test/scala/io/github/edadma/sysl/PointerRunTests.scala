@@ -171,6 +171,50 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
    * exactly as `03` wants it to. It had no test, and `guide/shapes` is what went looking.
    */
   "a counted reference" - {
+    // `14 §2` puts the pointer modes in `Eq` with **address** equality. Two references to objects
+    // holding the same thing are therefore not equal, which is what makes a reference an identity:
+    // a program asking "is this the very object you are holding" — a scheduler asking whether a
+    // task owns the lock it is releasing — is asking about the box and never about its contents.
+    "compares by address rather than by what it holds" in {
+      val src =
+        """struct Cell
+          |    n: int
+          |var a: &Cell = Cell(4)
+          |var b: &Cell = Cell(4)
+          |var also = a
+          |print(a == a, a == b, a == also, a != b)""".stripMargin
+
+      run(src) shouldBe "true false true true\n"
+    }
+
+    // And it stays address equality inside a generic bounded `Eq`, which is what lets one
+    // `drop[T: Eq]` take an element out of a list of references. Both cells hold the same number,
+    // so a comparison that had reached through the reference would answer the other way round.
+    "carries that identity through a generic 'Eq' bound" in {
+      val src =
+        """struct Cell
+          |    n: int
+          |same[T: Eq](a: T, b: T) -> bool = a == b
+          |var a: &Cell = Cell(4)
+          |var b: &Cell = Cell(4)
+          |print(same(a, a), same(a, b))""".stripMargin
+
+      run(src) shouldBe "true false\n"
+    }
+
+    // Equality reaches further than ordering (`01`, lifted into `14 §2` intact): a reference has
+    // `==` and no `<`, since one address falling below another is not a fact about the program.
+    "has equality and no ordering" in {
+      val src =
+        """struct Cell
+          |    n: int
+          |var a: &Cell = Cell(1)
+          |var b: &Cell = Cell(2)
+          |print(a < b)""".stripMargin
+
+      err(src) should include("'<' is not defined for &Cell")
+    }
+
     "is lent to a raw pointer by taking the address of what it points at" in {
       val src =
         """struct Cell

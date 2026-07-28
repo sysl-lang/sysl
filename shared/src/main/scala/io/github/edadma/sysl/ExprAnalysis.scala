@@ -1,7 +1,5 @@
 package io.github.edadma.sysl
 
-import scala.collection.mutable
-
 /** What an expression means, and which expressions denote a **place**.
  *
  * This is the dispatch every other analysis trait calls back into — `analyzeExpr` is declared
@@ -438,6 +436,22 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args, expected)
+
+    // `f[T](…)` and `x.m[T](…)` — type arguments written at a call. Their absence is deliberate and
+    // recorded (`10 § Open a`): a type-argument list and an index are the same grammar, so the two
+    // cannot be told apart at a call head. What is left for the diagnostic is to say so and to name
+    // what to write instead, since the inference that stands in for them reads the *binding* rather
+    // than the call — which is exactly what somebody reaching for this syntax does not yet know.
+    //
+    // The name has to be a generic declaration and nothing nearer: a local shadowing one is an
+    // ordinary indexed value, and telling its author about type arguments they never wrote would be
+    // worse than the general complaint. That is the same shadowing test every call form above makes.
+    case Call(Index(Ident(written), _), _)
+        if lookupOpt(written).isEmpty && funcKey(written).exists(k => funcDecls(k).tparams.nonEmpty) =>
+      err(s"'$written' cannot be given type arguments at a call; write the type on what receives the result")
+
+    case Call(Index(Field(_, mname), _), _) if memberDecls.exists((k, d) => k._2 == mname && d.tparams.nonEmpty) =>
+      err(s"'$mname' cannot be given type arguments at a call; write the type on what receives the result")
 
     case Call(_, _) =>
       err("the thing being called must be a name")

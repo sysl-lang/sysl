@@ -336,6 +336,15 @@ never by a covariant container.
   (§2). If explicit arguments prove necessary, they need a disambiguating syntax (a Rust-style
   turbofish marker, or a rule that a type-argument list is only read in a call head). Deferred
   until a real case cannot be served by inference.
+
+  The reach for it is common enough to be worth a sentence of its own, because a **nullary**
+  generic has no argument to be inferred from: `buf()` and `map()` are solved by what receives the
+  result and nothing else, so `buf[u8]()` is the first thing a reader tries. That form is refused
+  by name — `'buf' cannot be given type arguments at a call; write the type on what receives the
+  result` — for a generic free function and a generic method alike, rather than by the general
+  complaint about a callee that is not a name. The message is the whole of the mitigation: the
+  syntax stays deferred, and the case that would otherwise look like a compiler limitation now
+  names the annotation that stands in for it.
 - **b. Members on generic types** — settled and implemented, and no longer open. A method or
   property is instantiated from the receiver's own type arguments, so `Box[int].get` and
   `Box[real].get` are two monomorphized functions exactly as two instantiations of a free generic

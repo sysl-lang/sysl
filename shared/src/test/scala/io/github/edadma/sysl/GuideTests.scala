@@ -164,4 +164,32 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- objects made and dropped",
     )
   }
+
+  // The one program whose assertions are almost all one string: a **schedule**, a letter per tick.
+  // Every schedule below was worked out on paper before the program was run, which is what makes it
+  // an assertion rather than a recording — and the two priority-inversion sections are the same
+  // three tasks and the same locks run twice with one switch changed, so the pair of schedules is
+  // the whole claim about what priority inheritance does.
+  "scheduler — a run queue, priorities, and the locks that reorder them" in {
+    val out = guide("scheduler")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 106
+    sections(out) shouldBe List(
+      "-- the heap keeps its shape",
+      "-- a task's place follows it",
+      "-- one task, then two",
+      "-- the most urgent ready task runs",
+      "-- arriving in the middle",
+      "-- a lock somebody else holds",
+      "-- priority inversion",
+      "-- what inheritance does about it",
+      "-- a lock several tasks want",
+      "-- sleeping, and time nobody uses",
+      "-- two tasks that will not finish",
+      "-- what a task gets wrong",
+      "-- many tasks at once",
+      "-- the graph comes apart",
+    )
+  }
 }
