@@ -123,7 +123,8 @@ before they appear and may be mutually recursive).
   straight back to itself and the end block closes as `unreachable`. Scalar patterns are literals, `|`-alternatives (Scala-style —
   `1 | 2 | 3`), literal ranges (`1..10`, `0..<10`), and the `_` wildcard, with optional `if`
   guards; a bare name binds the value. A scalar `match` used as a value must be exhaustive
-  (have a catch-all); an enum `match` must always cover every variant or carry a catch-all.
+  (have a catch-all); an enum `match` must always cover every value or carry a catch-all, and
+  the arms cover it together, nested patterns included.
 - **Functions** are keyword-less, Scala-style: `name(params) -> ret = expr` or an indented
   block whose trailing expression is the implicit return value. A missing `-> ret` means
   `unit`. A block-bodied function may also `return` early.
@@ -402,11 +403,13 @@ arity.
    built-in one, since there is no way yet to write an allocator; and a data enum still
    reserves storage for *every* variant's payload at once (a value aggregate, no size
    arithmetic) rather than sizing the box to the variant it holds.
-6. **Enum-match exhaustiveness ignores nested coverage.** An unguarded arm covers its variant
-   only when every sub-pattern is irrefutable (a binding or `_`); an arm with a nested variant
-   or literal sub-pattern does not count, so `Wrap(A) | Wrap(B)` covering `Wrap(Inner)` still
-   needs an `else`. Guard expressions are evaluated after the pattern matches and its bindings
-   are in scope.
+6. **Exhaustiveness is computed over all the arms at once**, as a matrix with one row per
+   unguarded pattern and one column per value still being discriminated. A column whose type has
+   a finite constructor set — an enum's variants, a struct's single shape, `bool`'s two values —
+   is split constructor by constructor; any other column is covered only by a wildcard, so rows
+   headed by a literal or a range drop out of it. The gap is reported as the values no row
+   matches, written the way a pattern is. Guard expressions are evaluated after the pattern
+   matches and its bindings are in scope, and a guarded arm is left out of the matrix entirely.
 7. **`print`'s renderers are the prelude's, not a `std` I/O surface**, and the desugaring picks a
    *scalar's* by static type rather than through its `Display` — deliberately, so a program that
    prints only numbers builds no sink (`14 §8 b`). A related over-approximation shows up in the

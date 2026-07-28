@@ -962,14 +962,15 @@ class SyslParser(val source: Source) extends PackratParsers {
   /** Patterns: scalar literals and ranges, the `_` wildcard, a positional destructuring
    * `V(sub…)` (an enum variant or a struct), a named struct destructuring `S{field: sub…}`, or a
    * bare name — which the analyzer reads as a nullary-variant pattern when it names a variant of
-   * the scrutinee's enum, and as a binding otherwise.
+   * the scrutinee's enum, and as a binding otherwise. A name may be qualified wherever a variant
+   * may be, which is every form: a nullary variant is spelled like a name and reached like one.
    */
   private lazy val pattern: Parser[Pattern] =
     patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
       structPattern |
       variantPattern |
       wildcard ^^^ WildcardPattern |
-      ident ^^ IdentPattern.apply |
+      qualifiedName ^^ IdentPattern.apply |
       patternLit ^^ LitPattern.apply
 
   private lazy val variantPattern: Parser[Pattern] =

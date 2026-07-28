@@ -188,7 +188,7 @@ The pattern forms the implementation accepts, each a decision this chapter ratif
 | Literal | `0`, `'a'`, `"hi"`, `true` | a value equal to the literal (see the type rule below) |
 | Range | `3..7`, `0..<10`, `'a'..'z'` | a value in the range, inclusive `..` / exclusive `..<` per `00` |
 | Bind | `r`, `other` | anything, and binds the value to the name |
-| Variant | `Circle(r)`, `Empty` | the named variant, binding each sub-pattern to a field |
+| Variant | `Circle(r)`, `Empty`, `Shape.Empty` | the named variant, binding each sub-pattern to a field |
 | Nested | `Wrap(Val(v))` | a variant whose payload itself matches a sub-pattern |
 | Struct, positional | `Point(a, b)` | a struct, binding every field by position |
 | Struct, named | `Point{x, y}`, `Point{x: a}` | a struct, binding fields by name; unlisted fields are unconstrained |
@@ -201,6 +201,13 @@ bare name that happens to be a *data* variant is a diagnostic — `variant 'Circ
 a misspelled or data-carrying variant silently becomes a catch-all binding. This is the same
 resolution Rust and Swift reach; sysl makes the data-variant case a hard error rather than a
 lint.
+
+**A qualified name is a pattern wherever a bare one is.** `isa.Halt` and `Op.Bare` match exactly
+as `Halt` and `Bare` do — the prefix is dropped, since the scrutinee's type already settled which
+enum is meant, the same reading a variant pattern's qualifier gets. What a qualified name cannot
+be is a *binding*: no program declares a name with a dot in it, so where one resolves to neither
+a variant nor a constant it is a diagnostic rather than a new local. Without this a nullary
+variant was the one form with nowhere to put a qualifier, since it is spelled like a name.
 
 **Alternatives (`|`) may not bind (settled).** `1 | 2 | 3` is one arm matching any of three
 literals; but `Some(x) | none-arm` binding `x` is rejected, because the body cannot know which
@@ -271,13 +278,23 @@ An arm may carry an `if` guard evaluated **after** its pattern matches. Three se
 
 The rule the analyzer enforces, ratified here as the language's:
 
-- **A `match` on a data enum must cover every variant or carry an unguarded catch-all.** A
-  missing variant is a compile error that *names the missing variants* (`missing Circle, Rect
-  (add an 'else' arm)`), so adding a variant to an enum turns every non-catch-all match on it
-  into a checked to-do list — the central payoff of a closed sum type.
-- **A variant pattern discharges its variant only when its sub-patterns are irrefutable.**
-  `Some(x)` covers `Some`; `Some(0)` does not, because a `Some` holding a non-zero value slips
-  through. Coverage is about which values are guaranteed handled, not merely which tags appear.
+- **A `match` on a data enum must cover every value or carry an unguarded catch-all.** A gap is
+  a compile error that *names what is missing* (`missing Circle, Rect (add an 'else' arm)`), so
+  adding a variant to an enum turns every non-catch-all match on it into a checked to-do list —
+  the central payoff of a closed sum type.
+- **Coverage is about which values are guaranteed handled, not which tags appear**, and the arms
+  answer that question *together*. `Some(Halt)`, `Some(Push)` and `None` cover an `Option[Op]`
+  between them even though no one of them covers a variant on its own, and `Some(0)` alone does
+  not cover `Some`, because a `Some` holding a non-zero value slips through.
+- **What is missing is named at the depth it is missing at.** A gap inside a payload reports as
+  `missing Some(Push)` rather than as `missing Some`, and a column no arm narrowed stays a `_`
+  standing for all of its values — `Turn(E, _, _)` rather than one line per combination behind it.
+  Where the gap is a number's or a string's complement there is no pattern that names it, so the
+  complaint says only that the match must be exhaustive.
+- **A type is covered by listing its values only when it has a finite, known set of them** — an
+  enum's variants, a struct's single shape, `bool`'s two. Everything else is covered by a wildcard
+  or a binding and by nothing shorter, which is why `1 -> … 2 -> …` on an `int` still needs an
+  `else`.
 - **A scalar `match` must be exhaustive only when it is used for a value.** In statement
   position a non-exhaustive scalar match is fine (the unmatched case is a no-op); used for a
   value it must carry a catch-all, since every use of the result needs a value to exist. An

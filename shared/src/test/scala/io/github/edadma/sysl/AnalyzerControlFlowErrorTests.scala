@@ -233,6 +233,33 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
           |    Point(0, 0) -> 1""".stripMargin
       ) should include("must be exhaustive")
     }
+
+    // A bare name binds where nothing answers to it, and a qualified one cannot: no program can
+    // declare a name with a dot in it, so the fall-through that would quietly make a local has to
+    // be a complaint instead.
+    "a qualified name that resolves to nothing cannot bind" in {
+      err(
+        """enum Colour
+          |    Red
+          |    Green
+          |f(c: Colour) -> int = c match
+          |    Colour.Blue -> 1
+          |    else 0""".stripMargin
+      ) should include("cannot bind")
+    }
+
+    // …and the data-variant complaint reads off the variant rather than the qualifier, so a
+    // qualified spelling gets the same sentence an unqualified one does.
+    "a qualified nullary pattern on a data variant still says it carries data" in {
+      err(
+        """enum Shape
+          |    Circle(radius: int)
+          |    Empty
+          |f(s: Shape) -> int = s match
+          |    Shape.Circle -> 1
+          |    else 0""".stripMargin
+      ) should include("variant 'Circle' carries data")
+    }
   }
 
   "the ? operator" - {

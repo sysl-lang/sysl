@@ -249,6 +249,23 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "42 -1 -2\n"
   }
 
+  // `09 §6` — a variant may be written with a qualifier, which the scrutinee's type makes
+  // redundant rather than wrong. It reads the same on a nullary variant, which is spelled like a
+  // name and so had nowhere to put one: `Wrap(i)` took a qualifier and `Bare` did not.
+  "a nullary variant pattern takes a qualifier as a data one does" in {
+    val src =
+      """enum Outer
+        |    Wrap(n: int)
+        |    Bare
+        |peek(o: Outer) -> int
+        |    o match
+        |        Outer.Wrap(n) -> n
+        |        Outer.Bare -> -1
+        |print(peek(Wrap(7)), peek(Bare))""".stripMargin
+
+    run(src) shouldBe "7 -1\n"
+  }
+
   // A guard is evaluated only after its arm's pattern matches, never for an arm that was ruled
   // out — check(3) never runs the guard, so "guard" prints only for check(5).
   "a guard is evaluated only when its arm's pattern matches" in {
@@ -431,8 +448,9 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
     }
 
     // Nested inside a data enum's payload the value arrives from an `extractvalue` rather than
-    // straight off a local, which is the other way a variant test is reached. Coverage is not
-    // computed through a nested pattern, so the arms need an `else` to be exhaustive.
+    // straight off a local, which is the other way a variant test is reached. The `else` is
+    // redundant here — the arms cover the type between them — and is kept so the fallthrough after
+    // a *covered* nested test stays exercised alongside `NestedCoverageTests`' `unreachable` one.
     "matches inside another enum's payload" in {
       val src =
         """enum Op: u8

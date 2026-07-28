@@ -55,22 +55,31 @@ trait PatternAnalysis extends TypeResolution {
     // a constant — which is what keeps `13 §7`'s constant patterns off the trap Rust documents,
     // where a `const` in a pattern quietly binds instead of matching. There is no second resolution
     // here to disagree with the first: a constant joins the one a variant already went through.
-    case IdentPattern(name) =>
+    // A qualifier is read the same way a variant pattern's is: the scrutinee's type already settled
+    // which enum is meant, so the prefix is dropped. It cannot be a binding, though — a name with a
+    // dot in it is not a name a program can declare — so a qualified pattern that resolves to
+    // nothing is a mistake rather than a new local.
+    case IdentPattern(written) =>
+      val name = written.substring(written.lastIndexOf('.') + 1)
+
       ty match
         case en: Type.Enum if en.variant(name).exists(_.fields.isEmpty) =>
           TVariantPattern(en, en.variant(name).get, Nil)
         case en: Type.Enum if en.variant(name).isDefined =>
           err(s"variant '$name' carries data — match it as '$name(…)'")
         case _ =>
-          constKey(name) match
+          constKey(written) match
             case Some(key) => analyzePattern(LitPattern(constLiteral(key)), ty)
             // A `val` is storage read while running, so there is no value here to compare against —
             // and letting the name bind instead is precisely the trap the paragraph above says
             // cannot arise. It is refused rather than quietly shadowed, which leaves the reader the
             // choice of a different name or an equality test.
-            case None if valKey(name).isDefined =>
-              err(s"'$name' is a 'val', which is read while the program runs, so a pattern cannot " +
+            case None if valKey(written).isDefined =>
+              err(s"'$written' is a 'val', which is read while the program runs, so a pattern cannot " +
                 s"match against it — compare it in a guard, or bind a different name")
+            case None if written != name =>
+              err(s"'$written' names no variant of ${show(ty)} and no constant, and a qualified " +
+                s"name cannot bind — write the name a program can declare")
             case None => TBindPattern(declare(name, ty), ty)
 
     // A variant is named within the scrutinee's own enum, so a module prefix on the pattern is
@@ -154,16 +163,8 @@ trait PatternAnalysis extends TypeResolution {
     case s: TStructPattern  => s.args.exists(binds)
     case _                  => false
 
-  /** A pattern that always matches, so an unguarded arm carrying it is a catch-all. A struct has
-   * one form, so a struct pattern is irrefutable exactly when every field's sub-pattern is.
-   */
-  protected def irrefutable(p: TPattern): Boolean = p match
-    case _: TWildPattern | _: TBindPattern => true
-    case s: TStructPattern                 => s.args.forall(irrefutable)
-    case _                                 => false
-
   /** Checks exhaustiveness and returns the value type of a match (`unit` unless every arm
-   * yields the same non-unit type). An enum match must cover every variant or carry a
+   * yields the same non-unit type). An enum match must cover every value or carry a
    * catch-all; a scalar match need only be exhaustive when it is used for a value.
    */
   protected def matchResultType(scrutTy: Type, arms: List[TArm]): Type = {
@@ -186,33 +187,34 @@ trait PatternAnalysis extends TypeResolution {
       else if reached.size == 1 && reached.head != Type.Unit then reached.head
       else Type.Unit
 
-    val hasCatchAll = arms.exists(a => a.guard.isEmpty && a.patterns.exists(irrefutable))
+    // An enum match is checked wherever it stands, because falling off the end of one has no
+    // defined result even for effect; every other scrutinee is checked only where the match is
+    // used for a value, since the unmatched case of a statement match is a no-op.
+    val checked = scrutTy match
+      case _: Type.Enum => true
+      case _            => valueTy != Type.Unit
 
-    scrutTy match
-      case en: Type.Enum =>
-        val covered = arms
-          .filter(_.guard.isEmpty)
-          .flatMap(_.patterns)
-          .collect { case v: TVariantPattern if v.args.forall(irrefutable) => v.variant.tag }
-          .toSet
-        if !hasCatchAll && !en.variants.map(_.tag).toSet.subsetOf(covered) then
-          val missing = en.variants.filterNot(v => covered(v.tag)).map(_.name)
-          err(s"match on '${show(en)}' is not exhaustive; missing ${missing.mkString(", ")} (add an 'else' arm)")
-
-      // `bool` is a closed two-value type, so covering both `true` and `false` with unguarded arms
-      // is exhaustive on its own — no `else` needed, exactly as for a two-variant enum.
-      case Type.Bool =>
-        val covered = arms
-          .filter(_.guard.isEmpty)
-          .flatMap(_.patterns)
-          .collect { case TLitPattern(TBoolLit(b)) => b }
-          .toSet
-        if valueTy != Type.Unit && !hasCatchAll && covered.size < 2 then
+    // Coverage is a question about values and the arms answer it together, so it is computed over
+    // all of them at once (`Exhaustiveness`) rather than arm by arm. What differs per scrutinee is
+    // what the answer can usefully be called.
+    if checked then
+      Exhaustiveness.gap(scrutTy, arms).foreach { g =>
+        // `bool` is a closed two-value type, so covering both `true` and `false` with unguarded
+        // arms is exhaustive on its own — and naming the one that is missing tells the reader less
+        // than saying what the type needs.
+        if scrutTy == Type.Bool then
           err("a 'match' on 'bool' that yields a value must cover both 'true' and 'false' — add the missing arm or an 'else'")
 
-      case _ =>
-        if valueTy != Type.Unit && !hasCatchAll then
-          err("a 'match' that yields a value must be exhaustive — add an 'else' arm")
+        // A gap worth naming: an enum's, which is the to-do list a closed sum type is for, or any
+        // other whose names are the whole of what is missing.
+        else if scrutTy.isInstanceOf[Type.Enum] || g.exact then
+          err(s"match on '${show(scrutTy)}' is not exhaustive; missing ${Exhaustiveness.describe(g.names)} " +
+            s"(add an 'else' arm)")
+
+        // Otherwise the gap is a number's or a string's complement, which has no pattern to name
+        // it, so the complaint says only that there is one.
+        else err("a 'match' that yields a value must be exhaustive — add an 'else' arm")
+      }
 
     valueTy
   }
