@@ -405,10 +405,11 @@ object Type {
    *   - `tag` is the discriminant: a simple enum's integer value, or a data enum's 0-based
    *     variant index.
    *   - `fields` are the variant's payload (empty for a nullary variant).
-   *   - `payloadSlot` is the index of this variant's payload inside the enum aggregate, present
-   *     only for data variants that carry fields.
+   *   - `carries` is whether this variant was written with a payload. Every variant that does
+   *     shares the enum's one payload region, so there is nothing further to record: what
+   *     distinguishes them is the type the region is written and read at, which is `fields`.
    */
-  case class EnumVariant(name: String, tag: Int, fields: List[(String, Type)], payloadSlot: Option[Int]) {
+  case class EnumVariant(name: String, tag: Int, fields: List[(String, Type)], carries: Boolean) {
 
     /** The payload fields that occupy storage, and where each written field lands among them — the
      * same skipping a struct does, so `Ok(())` carries a payload aggregate with nothing in it.
@@ -423,9 +424,10 @@ object Type {
   /** Where the `i`th written field lands once the zero-sized ones before it are dropped. */
   def slot(fields: List[(String, Type)], i: Int): Int = fields.take(i).count((_, t) => !zeroSized(t))
 
-  /** An enum. A *simple* enum (every variant dataless) lowers to `i32`; a *data* enum lowers to
-   * a value aggregate `{ i32 tag, payload₁, payload₂, … }` with one payload slot per
-   * data-carrying variant. The payload for variant `V` is the named aggregate `%Name.V`.
+  /** An enum. A *simple* enum (every variant dataless) lowers to its underlying integer; a *data*
+   * enum lowers to a value aggregate `{ i32 tag, payload }` whose payload is the one region every
+   * variant shares, sized and aligned for the widest of them (`Layout.payloadArea`). The payload
+   * of variant `V` is written and read at the named aggregate `%Name.V`.
    */
   final class Enum(val base: String, val targs: List[Type]) extends Named {
     var simple: Boolean            = true

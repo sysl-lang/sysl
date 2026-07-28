@@ -66,6 +66,7 @@ trait Emitter {
   private var temp       = 0
   private var label      = 0
   private var terminated = false
+  private var scratch    = mutable.HashMap.empty[String, String]
 
   /** References this expression owns and must let go of. The stack mirrors the regions a value
    * may not escape: a statement, and each branch of an `if` or arm of a `match`, release their
@@ -121,6 +122,43 @@ trait Emitter {
     tempStack = Nil
     owned = Nil
     genLoops = Nil
+    scratch = mutable.HashMap.empty
+  }
+
+  /** One stack slot per LLVM type per function, for the type punning a union needs: a value goes
+   * in written as one type and comes back out read as another. Sharing the slot is safe because
+   * every use of it stores and immediately loads with nothing emitted in between, and it is worth
+   * doing because a function that matches on an enum in a hundred places would otherwise carry a
+   * hundred slots it uses one at a time.
+   */
+  protected def scratchSlot(ty: String): String =
+    scratch.getOrElseUpdate(ty, emitAlloca(freshTemp(), ty))
+
+  /** The address of the payload region inside an enum sitting at `base`. */
+  protected def payloadPtr(en: Type.Enum, base: String): String = {
+    val r = freshTemp()
+    emit(s"$r = getelementptr ${en.llvm}, ptr $base, i32 0, i32 1")
+    r
+  }
+
+  /** Reads a variant's payload out of an enum value, at that variant's type.
+   *
+   * A union is read by putting the whole value somewhere and loading the part back at the type the
+   * variant that wrote it used, since an aggregate value has no operation that reinterprets part of
+   * itself. Reading a variant the value is not holding yields whatever the one it *is* holding left
+   * there — which is what a pattern test does before it knows the tag, and the tag test beside it is
+   * what makes the answer count.
+   */
+  protected def enumPayload(en: Type.Enum, variant: Type.EnumVariant, value: String): String = {
+    val slot = scratchSlot(en.llvm)
+
+    emit(s"store ${en.llvm} $value, ptr $slot")
+
+    val p = payloadPtr(en, slot)
+    val r = freshTemp()
+
+    emit(s"$r = load ${en.payloadLlvm(variant)}, ptr $p")
+    r
   }
 
   /** The text of the function just emitted: its header, the hoisted slots, and its blocks. */
@@ -153,14 +191,14 @@ trait Emitter {
    * gets written at the moment it is first asked for.
    */
   protected def inFunction(header: String)(gen: => Unit): String = {
-    val saved = (prologue, body, temp, label, terminated, tempStack, owned)
+    val saved = (prologue, body, temp, label, terminated, tempStack, owned, scratch)
 
     startFunction()
     gen
     val text = finishFunction(header)
 
     prologue = saved._1; body = saved._2; temp = saved._3; label = saved._4
-    terminated = saved._5; tempStack = saved._6; owned = saved._7
+    terminated = saved._5; tempStack = saved._6; owned = saved._7; scratch = saved._8
     text
   }
 

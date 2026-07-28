@@ -74,13 +74,19 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
     out should include("call void @arc.copy.Option.ref.Node(%enum.Option.ref.Node %t1)")
   }
 
+  // The tag is read straight off the value, since it is the aggregate's own first member; the
+  // payload is not, because it shares one region with every other variant — so reaching it is a
+  // store and a load back at this variant's type (`09 §3`).
   "a data enum walks only the variants that carry a reference, behind a tag test" in {
     val src = "struct Node\n    value: int\n    next: Option[&Node]\nvar n: &Node = Node(1, None)"
     val out = ir(src)
 
     out should include("define private void @arc.dispose.Option.ref.Node(%enum.Option.ref.Node %v) {")
     out should include regex raw"extractvalue %enum\.Option\.ref\.Node %v, 0\n  %t\d+ = icmp eq i32 %t\d+, 0"
-    out should include("call void @arc.release(ptr %t4)")
+    out should include regex
+      raw"getelementptr %enum\.Option\.ref\.Node, ptr %t\d+, i32 0, i32 1\n" +
+      raw"  %t\d+ = load %Option\.ref\.Node\.Some, ptr %t\d+"
+    out should include regex raw"extractvalue %Option\.ref\.Node\.Some %t\d+, 0\n  call void @arc\.release\("
   }
 
   "an ordinary reference counts with a plain load and store" in {

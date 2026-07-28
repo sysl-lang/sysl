@@ -144,8 +144,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
       val tagOk = freshTemp(); emit(s"$tagOk = icmp eq ${en.tagLlvm} $tagVal, ${variant.tag}")
       if args.isEmpty then tagOk
       else
-        val payload = freshTemp()
-        emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
+        val payload = enumPayload(en, variant, value)
         args.zipWithIndex.foldLeft(tagOk) { case (acc, (arg, i)) =>
           andI1(acc, patternTest(arg, payloadField(en, variant, payload, i)))
         }
@@ -172,8 +171,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
       emit(s"store ${bty.llvm} $value, ptr %$name.addr")
       ownSlot(name, bty)
     case TVariantPattern(en, variant, args) if args.exists(bindsAny) =>
-      val payload = freshTemp()
-      emit(s"$payload = extractvalue ${en.llvm} $value, ${variant.payloadSlot.get}")
+      val payload = enumPayload(en, variant, value)
       for (arg, i) <- args.zipWithIndex do patternBind(arg, payloadField(en, variant, payload, i))
     case TStructPattern(struct, args) if args.exists(bindsAny) =>
       for (arg, i) <- args.zipWithIndex if bindsAny(arg) do patternBind(arg, structField(struct, value, i))

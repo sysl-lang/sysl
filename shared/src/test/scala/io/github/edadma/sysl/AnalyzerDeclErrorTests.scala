@@ -80,6 +80,17 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
     "a type that contains itself has no finite size" in {
       err("struct Node\n    next: Node\nvar n = Node(n)") should include("contains itself")
     }
+
+    // `09 §3` says the same of a variant, and it has to be caught *here* rather than at layout: the
+    // model that sizes a data enum's payload region walks its variants, so a type that reached
+    // itself would be an unbounded walk in the compiler instead of a diagnostic.
+    "nor does a variant that holds its own enum" in {
+      err("""enum List
+            |    Cons(head: int, tail: List)
+            |    Nil
+            |var l: List = Nil
+            |""".stripMargin) should include("type 'List' contains itself")
+    }
   }
 
   "enum ↔ integer conversion" - {

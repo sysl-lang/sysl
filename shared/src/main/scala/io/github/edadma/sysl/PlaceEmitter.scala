@@ -212,26 +212,34 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     trapUnless(ok, "bounds")
   }
 
-  /** Builds an enum value from already-lowered payload values: the tag, then the variant's
-   * payload aggregate dropped into its slot.
+  /** Builds an enum value from already-lowered payload values: the tag, then the variant's payload
+   * aggregate written into the region every variant shares.
+   *
+   * The region is a union, so the payload cannot be dropped in with `insertvalue` — an aggregate
+   * value has no operation that reinterprets part of it as another type. It goes through a stack
+   * slot instead: written at the variant's own type, read back at the enum's. A nullary variant
+   * never touches the region and so needs no slot at all.
    */
   protected def enumValue(en: Type.Enum, variant: Type.EnumVariant, vals: List[String]): String =
     if en.simple then variant.tag.toString
-    else
+    else if !variant.carries then
       val tagged = freshTemp()
       emit(s"$tagged = insertvalue ${en.llvm} undef, i32 ${variant.tag}, 0")
-      variant.payloadSlot match
-        case None => tagged
-        case Some(slot) =>
-          var payload = "undef"
-          for (v, i) <- vals.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
-            val r = freshTemp()
-            emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, " +
-              s"${variant.fields(i)._2.llvm} $v, ${variant.slot(i)}")
-            payload = r
-          val r = freshTemp()
-          emit(s"$r = insertvalue ${en.llvm} $tagged, ${en.payloadLlvm(variant)} $payload, $slot")
-          r
+      tagged
+    else
+      var payload = "undef"
+      for (v, i) <- vals.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
+        val r = freshTemp()
+        emit(s"$r = insertvalue ${en.payloadLlvm(variant)} $payload, " +
+          s"${variant.fields(i)._2.llvm} $v, ${variant.slot(i)}")
+        payload = r
+      val slot = scratchSlot(en.llvm)
+      emit(s"store i32 ${variant.tag}, ptr $slot")
+      val p = payloadPtr(en, slot)
+      emit(s"store ${en.payloadLlvm(variant)} $payload, ptr $p")
+      val r = freshTemp()
+      emit(s"$r = load ${en.llvm}, ptr $slot")
+      r
 
   /** Whether an integer `v` of type `vt` equals one of the enum's declared discriminants — the
    * membership test both integer-to-enum conversions share. Every comparison is done at 64 bits
@@ -284,18 +292,16 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
   /** Reads every field of a variant's payload out of an enum value. */
   protected def payloadFields(en: Type.Enum, variant: Type.EnumVariant, value: String): List[String] =
-    variant.payloadSlot match
-      case None => Nil
-      case Some(slot) =>
-        val p = freshTemp()
-        emit(s"$p = extractvalue ${en.llvm} $value, $slot")
-        variant.fields.indices.map { i =>
-          if Type.zeroSized(variant.fields(i)._2) then ""
-          else
-            val f = freshTemp()
-            emit(s"$f = extractvalue ${en.payloadLlvm(variant)} $p, ${variant.slot(i)}")
-            f
-        }.toList
+    if !variant.carries then Nil
+    else
+      val p = enumPayload(en, variant, value)
+      variant.fields.indices.map { i =>
+        if Type.zeroSized(variant.fields(i)._2) then ""
+        else
+          val f = freshTemp()
+          emit(s"$f = extractvalue ${en.payloadLlvm(variant)} $p, ${variant.slot(i)}")
+          f
+      }.toList
 
   /** `expr?` — on success the payload becomes the expression's value; on failure the function
    * returns immediately with the failure re-wrapped in its own return type, carrying the error

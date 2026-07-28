@@ -819,8 +819,7 @@ trait TypeResolution extends ImportResolution {
               case other           => err(s"an enum's underlying type must be an integer, not ${show(other)}")
 
         val subst    = decl.tparams.zip(targs).toMap
-        var nextTag  = 0
-        var nextSlot = 1
+        var nextTag = 0
         try en.variants = decl.variants.map { v =>
           if en.simple then
             def fitting(n: BigInt): Int =
@@ -836,14 +835,13 @@ trait TypeResolution extends ImportResolution {
                   err(s"the value of variant '${v.name}' must be a constant integer")))
               case None => fitting(nextTag)
             nextTag = tag + 1
-            Type.EnumVariant(v.name, tag, Nil, None)
+            Type.EnumVariant(v.name, tag, Nil, false)
           else
             if v.value.isDefined then
               err(s"variant '${v.name}' carries data, so it cannot also have an explicit value")
             val tag    = nextTag; nextTag += 1
             val fields = v.fields.map(f => (f.name, recover(Type.Unknown)(resolveType(f.typ, subst))))
-            val slot   = if fields.nonEmpty then { val s = nextSlot; nextSlot += 1; Some(s) } else None
-            Type.EnumVariant(v.name, tag, fields, slot)
+            Type.EnumVariant(v.name, tag, fields, fields.nonEmpty)
         }
         finally
           resolving -= key

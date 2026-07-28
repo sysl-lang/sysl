@@ -110,17 +110,19 @@ for the largest variant plus a tag, and it moves by copy like any value), and it
 heap only where a `&Shape` is expected. Nothing about being a sum type changes the three-mode
 story — an enum is just a struct-shaped value with a tag.
 
-**Not built: the payload is not yet a union.** What is emitted is the tag followed by *every*
-variant's payload laid side by side, so a four-variant enum carrying one scalar each is four
-scalars wide rather than one — 20 bytes where the paragraph above promises 8. Programs are correct
-and merely fat, and the fat multiplies: a fixed table of a struct holding eight of them is two and
-a half times the storage the design describes, which is what `guide/kernel` overran a stack frame
-on. The reason it was written this way is that a data enum is an **SSA aggregate** here, taken
-apart with `extractvalue` — and a union is not an aggregate a value can be taken apart with, so a
-payload would have to be reached through memory instead. That is a change to how every data enum
-is represented, `Option` and `Result` included, and it wants the size model the compiler does not
-yet have (there is no `sizeof` and no emitted datalayout). Pinned by an ignored test in
-`EnumRunTests`.
+**The payload really is one region.** A four-variant enum carrying one scalar each is one scalar
+wide, not four: the tag is followed by a single area sized for the widest variant and aligned for
+the strictest one. So `Step` above — three of whose variants carry an `int` and one a `u8` — is
+eight bytes, and a table of two hundred tasks holding eight steps each costs what the paragraph
+above says it costs rather than two and a half times that.
+
+The cost of saying so is that a payload cannot be reached with `extractvalue`: an aggregate value
+has no operation that reinterprets part of itself as another type, which is exactly what reading a
+union is. A construction writes the payload into a stack slot at its own variant's type and reads
+the whole enum back out; a match does the reverse. The compiler therefore has to know how wide the
+widest variant is *before* LLVM sees the module, since an array length in the emitted text is a
+literal — that is what `Layout` is, and it is the only place the compiler models storage. It is
+deliberately not the language's `sizeof`, which is still open (§ Open).
 
 **Recursion goes through an indirection, as always (`03`).** A variant that holds the enum by
 value would make the type infinitely sized and is rejected; a recursive data type reaches
@@ -373,11 +375,18 @@ value (a copy) or as a `&`-projection into the still-living enum — is not yet 
 Recorded so they are not lost; each needs a decision before the relevant feature hardens.
 
 - **a. Data-enum tag width.** §2 settles the underlying type of a *simple* enum (selectable,
-  `int` default, any `iN`/`uN`, checked int→enum conversion). Pinning the *tag* width of a data
-  enum — `enum E: u8` selecting the discriminant type beside the payload union — is the same
-  idea, but it interacts with payload layout (`03`) and is deferred until data-enum
-  representation is specified. Also open within simple enums: whether explicit discriminants
-  must be distinct, and whether a simple enum is iterable / carries a `::Range`.
+  `int` default, any `iN`/`uN`, checked int→enum conversion). A data enum's tag is an `i32` and
+  is not selectable. Now that the payload is a union (§3) the two halves of the layout no longer
+  interact, so `enum E: u8` beside a payload region is a decision that can be taken on its own —
+  and it is worth taking, since a tag narrower than its payload's alignment is free: an
+  `Option[&T]` would be eight bytes rather than sixteen. Also open within simple enums: whether
+  explicit discriminants must be distinct, and whether a simple enum is iterable / carries a
+  `::Range`.
+- **f. `sizeof`.** The compiler models storage internally (`Layout`, §3) because a union's width
+  has to be written down. Whether the *language* can ask — `sizeof(T)` as a compile-time constant,
+  which is what a `static_assert` on a wire format needs — is a separate decision: it would fix
+  the layout of every type as part of the language rather than as an implementation detail, and
+  it wants an answer for a type whose size the host ABI decides.
 - **b. Binding mode through a reference.** When matching `*e` on a `&Enum`, does a payload
   binding copy the field or project a `&`/`*` into the live enum? This is the "match ergonomics"
   question Rust answers with default binding modes; sysl needs an explicit rule.

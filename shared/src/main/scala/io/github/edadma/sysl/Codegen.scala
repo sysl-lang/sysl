@@ -67,11 +67,14 @@ class Codegen private (program: TProgram)
       out ++= s"${s.llvm} = type { ${s.stored.map(_._2.llvm).mkString(", ")} }\n"
     if program.structs.nonEmpty then out ++= "\n"
 
+    // A data enum is the tag and **one** payload region, wide enough and aligned for whichever
+    // variant needs the most (`09 §3`). Each variant's own payload keeps its named aggregate type,
+    // which is what a construction stores into that region and what a match reads back out of it.
     for e <- program.enums do
-      for v <- e.variants if v.payloadSlot.isDefined do
+      for v <- e.variants if v.carries do
         out ++= s"${e.payloadLlvm(v)} = type { ${v.stored.map(_._2.llvm).mkString(", ")} }\n"
-      val slots = "i32" :: e.variants.collect { case v if v.payloadSlot.isDefined => e.payloadLlvm(v) }
-      out ++= s"${e.llvm} = type { ${slots.mkString(", ")} }\n"
+      val (unit, count) = Layout.payloadArea(e)
+      out ++= s"${e.llvm} = type { i32, [$count x $unit] }\n"
     if program.enums.nonEmpty then out ++= "\n"
 
     // A box is the refcount, the function that frees it, and the payload — so ARC works the

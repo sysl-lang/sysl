@@ -7,27 +7,162 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class EnumRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
-  /** `09` says a data enum's "storage is sized for the largest variant plus a tag" — a union. What
-   * is emitted is the tag followed by *every* variant's payload side by side, so an enum of four
-   * variants carrying one scalar each is four scalars wide instead of one.
-   *
-   * The cost is real and multiplies: a fixed table of a struct holding eight of these is two and a
-   * half times the storage the design describes, which is what `guide/kernel` ran out of frame on.
-   * Turning it into a union means reaching a payload through memory rather than by `extractvalue`,
-   * because a union is not an LLVM aggregate a value can be taken apart with — so it is a change to
-   * how every data enum is represented, `Option` and `Result` included.
+  /** `09 §3` — "storage is sized for the largest variant plus a tag". Four variants carrying one
+   * scalar each are one scalar wide, not four, and the width is the *widest* of them: what the
+   * region is counted in is the strictest alignment any variant needs, which is what keeps a
+   * payload holding an `i64` from landing four bytes past where it may start.
    */
-  "a data enum is laid out as a union of its variants" ignore {
-    ir("""enum Step
-         |    Work(n: int)
-         |    Lock(m: u8)
-         |    Unlock(m: u8)
-         |    Sleep(n: int)
-         |var s = Work(1)
-         |print(s match
-         |    Work(n) -> n
-         |    _ -> 0)
-         |""".stripMargin) should include("%enum.Step = type { i32, i32 }")
+  private val step =
+    """enum Step
+      |    Work(n: int)
+      |    Lock(m: u8)
+      |    Unlock(m: u8)
+      |    Sleep(n: int)
+      |code(s: Step) -> int
+      |    s match
+      |        Work(n) -> n
+      |        Lock(m) -> 100 + int(m)
+      |        Unlock(m) -> 200 + int(m)
+      |        Sleep(n) -> 300 + n
+      |""".stripMargin
+
+  "the storage of a data enum" - {
+    "is the tag and one region every variant shares" in {
+      ir(step + "print(code(Work(1)))") should include("%enum.Step = type { i32, [1 x i32] }")
+    }
+
+    "counted in whatever unit the strictest variant must be aligned to" in {
+      val out = ir("""enum Wide
+                     |    Pair(x: i64, y: i64)
+                     |    Small(c: u8)
+                     |    Empty
+                     |what(w: Wide) -> int
+                     |    w match
+                     |        Pair(x, y) -> int(x + y)
+                     |        Small(c) -> int(c)
+                     |        Empty -> -1
+                     |print(what(Pair(1i64, 2i64)))
+                     |""".stripMargin)
+
+      out should include("%enum.Wide = type { i32, [2 x i64] }")
+    }
+
+    "and is wide enough for a variant whose payload is itself an enum" in {
+      ir(step + "var o: Option[Step] = Some(Lock(1u8))\nprint(o.is_some())") should
+        include("%enum.Option.Step = type { i32, [2 x i32] }")
+    }
+
+    // The union is what makes this the interesting case: four variants writing four different
+    // types into one region, read back through a table that would alias if the region were sized
+    // for anything but the widest of them.
+    "so a table of them holds each variant's own payload" in {
+      val src = step +
+        """var t: [4]Step = [Sleep(0); 4]
+          |t[0usize] = Work(11)
+          |t[1usize] = Lock(3u8)
+          |t[2usize] = Unlock(4u8)
+          |t[3usize] = Sleep(5)
+          |for i in 0..<4
+          |    print(code(t[usize(i)]))
+          |""".stripMargin
+
+      run(src) shouldBe "11\n103\n204\n305\n"
+    }
+
+    // Sharing the region means a pattern reads whatever the variant that *wrote* it left there, so
+    // a literal payload pattern can match on bytes that were never written at its type. The tag
+    // test beside it is the whole of what keeps that from firing, and this is what checks it does.
+    "a literal payload pattern never fires for another variant" in {
+      val src =
+        """enum Step
+          |    Work(n: int)
+          |    Lock(m: u8)
+          |    Sleep(n: int)
+          |code(s: Step) -> int
+          |    s match
+          |        Work(0) -> 1
+          |        Work(n) -> 2
+          |        Lock(m) -> 3
+          |        Sleep(n) -> 4
+          |print(code(Lock(0u8)), code(Sleep(0)), code(Work(0)), code(Work(9)))
+          |""".stripMargin
+
+      run(src) shouldBe "3 4 1 2\n"
+    }
+
+    // Two enums nested one inside the other read two regions on the way to one field, at two
+    // different types. They can only ever be *different* types — an enum holding itself by value
+    // would be infinitely sized and is refused — so the two reads never collide.
+    "a nested pattern reaches through both regions" in {
+      val src =
+        """enum Step
+          |    Work(n: int)
+          |    Lock(m: u8)
+          |what(o: Option[Step]) -> int
+          |    o match
+          |        Some(Work(n)) -> n
+          |        Some(Lock(m)) -> 100 + int(m)
+          |        None -> -1
+          |print(what(Some(Work(7))), what(Some(Lock(3u8))), what(None))
+          |""".stripMargin
+
+      run(src) shouldBe "7 103 -1\n"
+    }
+
+    // A variant written with a payload that occupies nothing asks for a region of nothing, which is
+    // still a store and a load — of zero bytes.
+    "a payload that occupies nothing still round-trips" in {
+      val src =
+        """enum E
+          |    Nothing(n: unit)
+          |    Something
+          |which(e: E) -> int
+          |    e match
+          |        Nothing(n) -> 1
+          |        Something -> 2
+          |print(which(Nothing(())), which(Something))
+          |""".stripMargin
+
+      run(src) shouldBe "1 2\n"
+    }
+
+    // `09 §3` — "it moves by copy like any value". The region is written through a stack slot the
+    // whole function shares, so this is also what checks that two enum values of one type are not
+    // quietly the same storage.
+    "and it still moves by copy" in {
+      val src = step +
+        """var a = Work(1)
+          |var b = a
+          |a = Sleep(2)
+          |print(code(a), code(b))
+          |""".stripMargin
+
+      run(src) shouldBe "302 1\n"
+    }
+
+    // A nullary variant never touches the region, so overwriting a payload-carrying value with one
+    // has to leave the tag saying so — reading the old payload back would be the bug this catches.
+    "and a nullary variant leaves nothing of the one before it" in {
+      val src =
+        """enum Wide
+          |    Pair(x: i64, y: i64)
+          |    Small(c: u8)
+          |    Empty
+          |what(w: Wide) -> int
+          |    w match
+          |        Pair(x, y) -> int(x + y)
+          |        Small(c) -> int(c)
+          |        Empty -> -1
+          |var w = Pair(1i64, 2i64)
+          |print(what(w))
+          |w = Small(9u8)
+          |print(what(w))
+          |w = Empty
+          |print(what(w))
+          |""".stripMargin
+
+      run(src) shouldBe "3\n9\n-1\n"
+    }
   }
 
   "a simple enum matches by variant name, bare and qualified" in {
