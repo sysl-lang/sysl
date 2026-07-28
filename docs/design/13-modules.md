@@ -468,8 +468,8 @@ private const window: int = 1 << 15
 It is a declaration, not a statement — hoisted, order-free, visible to the whole module and beyond
 it under the ordinary rules — and it is what a top-level `var` is not. The three are told apart by
 the keyword rather than by immutability: a `var` at the top of a file is a local of the entry point
-(above), a `const` never runs at all, and a `val` (below) is storage laid down before anything
-runs.
+(above), a `const` never runs at all, and a `val` (below) is storage that is filled before any of
+those statements do.
 
 **Why it exists at all**, when a nullary function already serves every use in an expression. Three
 of the guide programs wanted a name for a number and could only get one that a *type* cannot read.
@@ -550,17 +550,76 @@ reason and is the one thing this costs today: a `[]T` permits writes and does no
 elements it views, so it cannot carry the property. That wants a read-only view type, which is
 `07`'s decision to make, and it is additive.
 
-**Its initializer must be a constant** — a number, or an array of them, or a repeat `[v; n]`
-(`07`). That is what lets it be written straight into the object file: no code runs before `main`,
-nothing has to be ordered, and a `no alloc` module may hold one. **A computed initializer is a
-further feature**, and the one `guide/png`'s CRC table still waits for. It is the harder half,
-because it needs an answer to *in what order* such initializers run across a module graph that
-deliberately has none — and keeping it separate is what lets the constant-initializer case ship
-without prejudging that.
+**A module-level `val` holds plain data** — the numbers, characters, booleans, enums, and the
+structs and arrays built out of those. A reference, a pointer, a slice, or a `string` in one is
+refused, and for two reasons that point the same way. The paragraph above is the first: read-only at
+every depth is a property of *storage*, and a reference inside it is a route around the property, one
+dereference from where the mistake could still be reported. The second is that a module `val` exists
+for the whole run and is therefore never let go of, so a counted value in one is a leak with no line
+to write the release on. The cost this carries today is that `val greeting: string = "hello"` cannot
+be written — a `string` is a view with an owner word, and a static one would need that word to mean
+"nobody", which is `04`'s decision rather than this one.
 
 **The type is written at module level and inferred inside a block.** Not two rules but one: §2 says
 anything visible outside its file states its types, and a module member always could be. A local
 states nothing to anyone, so it infers exactly as a `var` does.
+
+#### What order the initializers run in
+
+**An initializer may be computed**, and `guide/png`'s CRC table is what asked for it: 256 entries
+derived from a polynomial, which no constant tree could ever have carried.
+
+```
+private val crc_table: [256]u32 = build_crc_table()
+```
+
+The two forms are told apart by what the initializer *is*, not by how it is written. A constant tree
+— a number, an array of them, a repeat `[v; n]` (`07`) — is laid straight into the object file, runs
+nothing, and needs nothing ordered. Anything else is code, and code runs somewhere.
+
+**Where it runs is the program's own entry point**, ahead of the statements §7 pins to one file.
+That is the one moment that certainly comes first and is already written down; a platform's
+constructor section would run before the runtime was up, be spelled differently on every target, and
+hide the order somewhere a reader could not look.
+
+**What order they run in is the order their own dependencies describe.** A `val` is filled after
+every `val` it needs, and it needs the ones its initializer reads — directly, or through anything
+that initializer calls. That is a graph over the `val`s themselves, which is finer than the module
+graph in exactly the direction that matters: a module's own files have no order at all (§6), so
+ordering by module could never have settled two tables in one directory.
+
+§6 is what makes the rule usable, and in a way worth saying out loud. A reference to another
+module's `val` follows a module edge, and module edges may not cycle — so **a cycle among `val`s can
+only ever be inside a single module**. A diagnostic about one names declarations that are all in one
+directory and usually in one file, which is why the rule needs no cross-module story beyond the one
+§6 already tells:
+
+```
+'a' cannot be initialized: its value needs 'b', whose value needs 'a' — a computed 'val'
+runs once before anything else does, so what it needs has to be settled first
+```
+
+**A call through a method table is followed too**, and that is not a special case so much as the
+absence of one. Which function a `&Trait` lands in is not known while the order is being computed,
+but the whole program is compiled together, so the *set* it could land in is: every table for that
+trait supplies one function per slot. Taking their union cannot miss a read. Refusing dynamic
+dispatch inside an initializer would have been the alternative, and it would have been a restriction
+with no reason behind it.
+
+**The rule outlives whole-program compilation, which is why it can be stated now.** Today the driver
+has every module in front of it, so the order is one sort over one list. `15 §6` defers an
+incremental build, and the shape of the answer there is already fixed by this one: since a
+cross-module edge follows a module edge and those may not cycle, each module's initializers can be
+sorted *within* the module at the time that module is compiled, emitted as one init function, and
+called by the driver in the same dependency order §6 already compiles in. Nothing has to be
+recomputed across the seam, and no module needs another's bodies to settle its own order — which is
+this chapter's through-line rather than a concession to it.
+
+Two things follow that are worth having in mind rather than being rules of their own. An initializer
+runs code, so it may allocate on its way to a value even though the value itself may not carry a
+reference — which is a question for the `no alloc` capability (§4) once that exists, not for this.
+And an initializer that traps takes the program down before any statement of its own has run, which
+is what "before anything else" has to mean if it means anything at all.
 
 A `const`, a `val`, and an enum variant share one namespace, since all three are values a bare name
 reaches; a clash is reported at whichever was written second.

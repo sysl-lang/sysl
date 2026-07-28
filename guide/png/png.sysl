@@ -115,22 +115,41 @@ private channels_of(kind: u8) -> usize
         else 4
 end channels_of
 
-// The checksum every chunk carries, computed a bit at a time rather than through a table. There is
-// somewhere to put a static table now — the deflate decoder's five are `val`s — but this one is
-// *derived* rather than written down, and a `val`'s initializer has to be a value the object file
-// can carry as it stands.
+// One entry of the checksum table: the byte `n` run through the polynomial eight times, which is
+// what the bit-at-a-time loop would have done for it.
 //
 // Note what needs no parentheses: `c & 1u32 != 0u32` is `(c & 1) != 0`, because bitwise binds
 // tighter than comparison here. That is one of the two places this language corrects C's
-// precedence, and this function is exactly the code that gets it wrong in C.
+// precedence, and this is exactly the code that gets it wrong in C.
+private crc_entry(n: usize) -> u32
+    var c = u32(n)
+
+    for k in 0..<8
+        c = if c & 1u32 != 0u32 then c >> 1u32 ^ 0xEDB88320u32 else c >> 1u32
+
+    c
+end crc_entry
+
+private build_crc_table() -> [256]u32
+    var t: [256]u32
+
+    for n in 0usize..<256
+        t[n] = crc_entry(n)
+
+    t
+end build_crc_table
+
+// The table the checksum reads a byte at a time. It is *derived* rather than written down, which is
+// the one thing a `val` could not carry when the deflate decoder's five landed; the initializer runs
+// before the program's own statements do.
+private val crc_table: [256]u32 = build_crc_table()
+
+// The checksum every chunk carries.
 crc32(data: []u8) -> u32
     var c = 0xFFFFFFFFu32
 
     for x in data
-        c ^= u32(x)
-
-        for k in 0..<8
-            c = if c & 1u32 != 0u32 then c >> 1u32 ^ 0xEDB88320u32 else c >> 1u32
+        c = crc_table[usize((c ^ u32(x)) & 255u32)] ^ c >> 8u32
 
     c ^ 0xFFFFFFFFu32
 end crc32

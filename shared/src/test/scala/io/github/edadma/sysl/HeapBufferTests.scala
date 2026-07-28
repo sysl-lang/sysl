@@ -368,8 +368,8 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       message should include("written where a '[]T' is expected")
     }
 
-    "a buffer as a 'val', since it is made by code that runs" in {
-      err("val xs: []int = [1, 2, 3]") should include("is not a constant")
+    "a buffer as a 'val', since a view in storage that outlives every frame is never let go of" in {
+      err("val xs: []int = [1, 2, 3]") should include("plain data")
     }
 
     "elements of a type that has no values" in {

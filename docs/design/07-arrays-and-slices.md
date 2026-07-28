@@ -90,6 +90,17 @@ has none, so it can size an array but cannot *be* one; a `val` is storage, so it
 value only known while running, iterated, and reached into. What it may not be is written — see
 `§Ownership` below for the one thing that costs today.
 
+A table nobody wrote down is the same declaration with a call on the right of it, and it is filled
+before the program's own statements run:
+
+```
+private val crc_table: [256]u32 = build_crc_table()
+```
+
+`13 §7` is where the order those run in is settled. What matters here is that the element type is
+unchanged by the choice: a `val` holds plain data either way, so an array of references is not one of
+these however it is built.
+
 ## Storage sized while running
 
 Every form above fixes its length in the type, and that is the one thing a program reading a file

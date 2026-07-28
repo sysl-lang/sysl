@@ -13,7 +13,7 @@ import scala.collection.mutable
  *
  * `units` is supplied by the class: the files being analyzed together.
  */
-trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility with ModuleGraph {
+trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility with ModuleGraph with InitOrder {
 
   protected def units: List[Program]
 
@@ -211,12 +211,15 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // written as a trait's argument in a generic `impl` names the family the block covers, and no
     // value at run time has that type. It has no layout to emit — `Type.Abstract.llvm` says so by
     // refusing — so it is dropped here rather than reaching a backend that would have to invent one.
+    // Which `val` needs which is settled by what their initializers reach, so the order they are
+    // filled in can only be worked out once every body those initializers call has been analyzed —
+    // the same reason the module graph is held to being acyclic here rather than earlier.
     TProgram(
       structInsts.values.filterNot(abstracted).toList,
       enumInsts.values.filterNot(e => e.simple || abstracted(e)).toList,
       vtables.values.toList,
       externs,
-      tvals.toList,
+      orderVals(tvals.toList, tfuncs.toList, vtables.values.toList),
       tfuncs.toList,
       tmain,
     )
@@ -311,6 +314,10 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
    *
    * The initializer is read at the declared type, so an element written `0x428a2f98` in a `[64]u32`
    * needs no suffix — the same courtesy a `const` gets from writing its type, for the same reason.
+   *
+   * What the initializer *is* decides only how the storage gets filled: a constant tree is written
+   * into the object file, and anything else becomes code that runs once before the program's own
+   * statements. What is checked here is the **type**, which is the same either way.
    */
   private def analyzeVal(key: String): TVal = inDecl(key)(at(valDecls(key).pos) {
     val decl = valDecls(key)
@@ -319,25 +326,50 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
     if disagree(init.ty, ty) then
       err(s"cannot initialize '${qn(key)}': declared ${show(ty)} but the value is ${show(init.ty)}")
-    checkStatic(init, key)
-    TVal(key, ty, init)
+    checkPlain(ty, key)
+    TVal(key, ty, init, !isStatic(init))
   })
 
-  /** Holds a `val`'s initializer to being a value the object file can carry as it stands.
+  /** Holds a module-level `val` to **plain data** — numbers, characters, booleans, enums, and the
+   * structs and arrays built from those.
    *
-   * Storage that exists before anything runs must have something to be laid down *as*, and a
-   * constant tree is the only thing that qualifies: numbers, and arrays built from them. Everything
-   * outside that set needs code to run before `main` and a rule for what order those run in, which
-   * is the extension a computed table will ask for and not a gap in this one.
+   * The rule is about the two promises a `val` makes. It is read-only *at every depth* (`13 §7`), and
+   * a reference, a pointer, or a slice inside one is a route around that: the storage cannot be
+   * written but what it points at can, one dereference away from where the mistake could still be
+   * reported. And it exists for the whole run, so a counted value in one is never let go of — a leak
+   * the program has no way to spell the release of. A `string` is refused by the same test, being a
+   * view with an owner word, and that is the one thing this costs today.
    */
-  private def checkStatic(t: TExpr, key: String): Unit = t match
-    case _: TIntLit | _: TFloatLit | _: TBoolLit => ()
-    case TArrayLit(elems, _)                     => elems.foreach(checkStatic(_, key))
-    case TArrayFill(value, _)                    => checkStatic(value, key)
-    case other =>
-      at(other.pos.orElse(valDecls(key).pos))(err(
-        s"the value of '${qn(key)}' is not a constant: a 'val' is laid down before anything runs, " +
-          "so its value must be a number, or an array of them"))
+  private def checkPlain(ty: Type, key: String): Unit =
+    // The whole difference between a `val` and a `const` is that a `val` has an address (`13 §7`),
+    // and a value with no representation has nothing to put one on. The initializer would still run,
+    // which is the only thing such a declaration could have been for — and a statement says that
+    // without pretending there is storage.
+    if Type.zeroSized(ty) then
+      err(s"'${qn(key)}' cannot be a 'val': a ${show(ty)} value occupies nothing, so there is no " +
+        "storage for the name to stand for — write the call as a statement instead")
+    else if !plain(ty) then
+      err(s"'${qn(key)}' cannot be a 'val': its type is ${show(ty)}, and a 'val' holds plain data " +
+        "only — a reference, a pointer, a slice, or a string in storage that outlives every frame " +
+        "would be neither released nor held to being read-only")
+
+  private def plain(t: Type): Boolean = t match
+    case _: Type.Ptr | _: Type.Ref | _: Type.View | _: Type.Trait => false
+    case Type.Array(_, elem)                                      => plain(elem)
+    case s: Type.Struct                                           => s.fields.forall(f => plain(f._2))
+    case e: Type.Enum => e.variants.forall(_.fields.forall(f => plain(f._2)))
+    case c: Type.Constrained => plain(c.base)
+    case _                   => true
+
+  /** Whether an initializer is a value the object file can carry as it stands: numbers, and the
+   * arrays built from them. Everything else is code, which is what `13 §7`'s initialization order is
+   * about — this is the test that decides which of the two a declaration is.
+   */
+  private def isStatic(t: TExpr): Boolean = t match
+    case _: TIntLit | _: TFloatLit | _: TBoolLit => true
+    case TArrayLit(elems, _)                     => elems.forall(isStatic)
+    case TArrayFill(value, _)                    => isStatic(value)
+    case _                                       => false
 
   // --- definition-checked bounds -------------------------------------------------------
 

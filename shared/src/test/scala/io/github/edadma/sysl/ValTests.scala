@@ -249,10 +249,6 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       err("val k = [1, 2, 3]") should include("states its type")
     }
 
-    "a value that is not a constant" in {
-      err("f() -> int = 3\nval n: int = f()") should include("not a constant")
-    }
-
     "a value computed from a variable" in {
       err("var x = 1\nval n: int = x") should include("undefined name")
     }
@@ -265,18 +261,10 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       err("val k: [3]int = [1, 2]") should include("[3]int")
     }
 
-    // Storage that exists before anything runs has to be laid down as something. A string is three
-    // words including an owner, so there is nothing to write into the object file yet.
+    // Storage that outlives every frame holds plain data: a string is a view with an owner word, so
+    // one in a `val` would be a count nothing ever lets go of. The cost is recorded in `13 §7`.
     "a string, which is a view with an owner rather than a value" in {
-      err("val s: string = \"hi\"") should include("not a constant")
-    }
-
-    "a struct, which is the obvious next thing to allow and is not allowed yet" in {
-      err("struct P\n    x: int\nend P\nval p: P = P(1)") should include("not a constant")
-    }
-
-    "one built from another, since reading storage is not folding a value" in {
-      err("val a: [2]int = [1, 2]\nval b: int = a[0]") should include("not a constant")
+      err("val s: string = \"hi\"") should include("plain data")
     }
 
     // The line between the two declarations, from the other side: a `const` sizes an array because

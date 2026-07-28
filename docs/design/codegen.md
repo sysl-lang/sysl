@@ -50,6 +50,18 @@ before they appear and may be mutually recursive).
   carries the statements it runs (`13 §7`), and they are read in the module of the file that wrote
   them.
 
+- **A module-level `val` is a `private` global, filled either by the linker or by `main`**
+  (`13 §7`). A constant tree — numbers, and the arrays and repeats built from them — is written into
+  the object file as a `private constant` and nothing runs. Any other initializer is code: the
+  symbol becomes a `private global zeroinitializer` and the value is computed and stored in a
+  prologue `main` opens with, before the program's own statements. **Which one goes first is the
+  order their dependencies describe** — a `val` is filled after every `val` its initializer reads,
+  followed through the functions it calls and through a method table by taking every function the
+  trait's tables put in the slot. A cycle is reported at the declaration that closes it, and can
+  only ever be within one module, since a cross-module edge would need the module graph to cycle.
+  The type is held to **plain data** (no reference, pointer, slice, or `string`), which is what
+  keeps read-only-ness whole and keeps a `val` from being a count nothing releases.
+
 - **`import` shortens that path and grants nothing** (`13 §3`), in the five Scala forms:
   `import a.b.c`, `{c, d}`, `{c as e}`, `.*`, and `import a.b` for the module itself. A binding
   belongs to the **file** that wrote it — a sibling file of the same module does not get it — or to

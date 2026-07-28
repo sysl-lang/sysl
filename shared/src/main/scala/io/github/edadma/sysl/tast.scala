@@ -465,10 +465,12 @@ case class TVtable(name: String, traitName: String, forType: Type, boxed: Boolea
 case class TVSlot(target: String, recv: RecvMode, params: List[Type], retTy: Type)
 
 /** One module-level `val`: read-only storage laid down whole, under the key its module gives it.
- * The initializer is a constant tree, so it is written into the object file rather than computed —
- * there is no code to run before `main` and nothing to order.
+ *
+ * `computed` says which of the two ways it is filled. A constant tree is written straight into the
+ * object file and nothing runs; anything else is code, evaluated once before the program's own
+ * statements and stored, in an order the initializers' dependencies settle (`13 §7`).
  */
-case class TVal(symbol: String, ty: Type, init: TExpr)
+case class TVal(symbol: String, ty: Type, init: TExpr, computed: Boolean)
 
 /** A whole program: hoisted struct, enum, and function declarations, the method tables its trait
  * objects dispatch through, the externs it calls, the module-level `val`s it reads, plus the

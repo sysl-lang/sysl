@@ -11,17 +11,19 @@ import scala.collection.mutable
  *
  * The work is split across traits the way the analyzer's is: `Emitter` holds the buffers, block
  * state, and name counters, `ArcEmitter` the ownership runtime, `StringEmitter` and `ScalarEmitter`
- * the two ends of the value world, `PlaceEmitter` addressing and composite values, and
- * `ControlFlowEmitter` everything that makes a basic block. What stays here is the spine — the
- * module assembly, statements, and the expression dispatch the traits call back into.
+ * the two ends of the value world, `PlaceEmitter` addressing and composite values,
+ * `ControlFlowEmitter` everything that makes a basic block, and `StaticEmitter` the module-level
+ * storage that is laid down before any block exists. What stays here is the spine — the module
+ * assembly, statements, and the expression dispatch the traits call back into.
  */
-class Codegen private (program: TProgram) extends ControlFlowEmitter with VtableEmitter with WriterEmitter {
+class Codegen private (program: TProgram)
+    extends ControlFlowEmitter with VtableEmitter with WriterEmitter with StaticEmitter {
 
   // --- module --------------------------------------------------------------------------
 
   private def gen(): String = {
     val funcTexts  = program.funcs.map(genFunction)
-    val mainText   = genMain(program.main)
+    val mainText   = genMain(program.vals, program.main)
     // The tables come after the bodies because a table only exists for a type something erased, and
     // it may ask for an adapter, which the queue below is what emits.
     val vtableText = program.vtables.map(genVtable).mkString
@@ -85,10 +87,7 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     if boolStrs then
       out ++= "@.true = private constant [5 x i8] c\"true\\00\"\n"
       out ++= "@.false = private constant [6 x i8] c\"false\\00\"\n"
-    // A `val` is `private` because the whole program is one module here: nothing outside it can name
-    // one, so hiding the symbol costs nothing and lets the optimizer see every read of the table.
-    for v <- program.vals do
-      out ++= s"@${v.symbol} = private constant ${v.ty.llvm} ${constantValue(v.init)}\n"
+    out ++= genVals(program.vals)
     out ++= globals.toString
     out ++= vtableText
     if globals.nonEmpty || boolStrs || vtableText.nonEmpty || program.vals.nonEmpty then out ++= "\n"
@@ -102,41 +101,6 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
     for t <- funcTexts do out ++= t; out ++= "\n"
     out ++= mainText
     out.toString
-  }
-
-  /** A `val`'s initializer as a **constant expression** — text laid straight into the object file,
-   * with no instruction emitted for any of it.
-   *
-   * This is the one place a value is lowered without a basic block to put it in, which is why it is
-   * a separate walk rather than a call into `genExpr`: the ordinary lowering of a narrow float is an
-   * `fptrunc`, and of a repeat is a loop, and neither exists before `main` starts. The analyzer has
-   * already held the tree to the small set handled here.
-   */
-  private def constantValue(t: TExpr): String = t match
-    case TIntLit(v, _)  => v.toString
-    case TBoolLit(b)    => if b then "1" else "0"
-    case TFloatLit(bits, ty) => constantFloat(bits, ty)
-    case TArrayLit(elems, arrayTy) =>
-      val elem = arrayTy.elem.llvm
-      s"[${elems.map(e => s"$elem ${constantValue(e)}").mkString(", ")}]"
-    case TArrayFill(value, arrayTy) =>
-      val elem = arrayTy.elem.llvm
-      val v    = constantValue(value)
-      s"[${List.fill(arrayTy.length)(s"$elem $v").mkString(", ")}]"
-    case other => sys.error(s"unreachable constant ${other.getClass.getSimpleName}")
-
-  /** A float constant at the width it is stored at.
-   *
-   * LLVM's hex form always spells a `double`, and it refuses one that a narrower type could not hold
-   * exactly — so a `f32` constant is the source value rounded to a float *first* and then written
-   * back out as the double that float is. That is the same rounding the `fptrunc` in the ordinary
-   * path performs, done here instead of at run time.
-   */
-  private def constantFloat(bits: String, ty: Type): String = {
-    val d = java.lang.Double.longBitsToDouble(java.lang.Long.parseUnsignedLong(bits.drop(2), 16))
-
-    if ty == Type.Real then bits
-    else f"0x${java.lang.Double.doubleToLongBits(d.toFloat.toDouble)}%016X"
   }
 
   /** The arguments of a call, as an LLVM argument list.
@@ -229,10 +193,26 @@ class Codegen private (program: TProgram) extends ControlFlowEmitter with Vtable
       val n = freshTemp(); emit(s"$n = xor i1 $res, true"); n
   }
 
-  private def genMain(stmts: List[TStmt]): String = {
+  /** `main`, with the computed `val`s filled in ahead of the program's own statements.
+   *
+   * They are laid down here rather than in a constructor the platform runs, and that is the whole of
+   * the mechanism: the entry point is the one place that certainly runs first and it is already
+   * written. A `.init_array` entry would run before the runtime is up, be spelled differently on
+   * every target, and put the order somewhere a reader could not see it.
+   *
+   * Each one gets a region of its own, exactly as a statement does, so whatever its initializer
+   * allocated on the way to the value is let go of before the next one starts.
+   */
+  private def genMain(vals: List[TVal], stmts: List[TStmt]): String = {
     startFunction()
     pushTemps()
     pushOwned()
+
+    for v <- vals if v.computed do
+      pushTemps()
+      emit(s"store ${v.ty.llvm} ${genExpr(v.init)}, ptr @${v.symbol}")
+      popTemps()
+
     stmts.foreach(genStmt)
     releaseAll()
     emitTerm("ret i32 0")

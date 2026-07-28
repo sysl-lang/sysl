@@ -1,0 +1,59 @@
+package io.github.edadma.sysl
+
+/** The module-level storage a program lays down before it starts: the declaration line for each
+ * `val`, and the lowering of a constant tree into the text that fills one.
+ *
+ * It sits apart from the rest of codegen because it is the one lowering with **no basic block to put
+ * anything in**. Everywhere else an instruction is selected and emitted into the block being built;
+ * here there is no block yet, so a narrow float is rounded rather than `fptrunc`ed and a repeat is
+ * written out rather than looped. The analyzer has already held a constant initializer to the small
+ * set of trees that can be lowered this way (`ProgramWalk.isStatic`), which is what lets this fail
+ * loudly on anything else instead of guessing.
+ */
+trait StaticEmitter extends Emitter {
+
+  /** One declaration line per `val`.
+   *
+   * All of them are `private`, because the whole program is one LLVM module: nothing outside it can
+   * name one, so hiding the symbol costs nothing and lets the optimizer see every read of the table.
+   *
+   * A **computed** one is a `global` rather than a `constant`, because it *is* written — once, by
+   * the prologue `main` opens with. The zero it starts at is never read: `13 §7`'s ordering is what
+   * guarantees that every initializer able to see the storage has already run.
+   */
+  protected def genVals(vals: List[TVal]): String =
+    vals.map { v =>
+      if v.computed then s"@${v.symbol} = private global ${v.ty.llvm} zeroinitializer\n"
+      else s"@${v.symbol} = private constant ${v.ty.llvm} ${constantValue(v.init)}\n"
+    }.mkString
+
+  /** A `val`'s initializer as a **constant expression** — text laid straight into the object file,
+   * with no instruction emitted for any of it.
+   */
+  private def constantValue(t: TExpr): String = t match
+    case TIntLit(v, _)       => v.toString
+    case TBoolLit(b)         => if b then "1" else "0"
+    case TFloatLit(bits, ty) => constantFloat(bits, ty)
+    case TArrayLit(elems, arrayTy) =>
+      val elem = arrayTy.elem.llvm
+      s"[${elems.map(e => s"$elem ${constantValue(e)}").mkString(", ")}]"
+    case TArrayFill(value, arrayTy) =>
+      val elem = arrayTy.elem.llvm
+      val v    = constantValue(value)
+      s"[${List.fill(arrayTy.length)(s"$elem $v").mkString(", ")}]"
+    case other => sys.error(s"unreachable constant ${other.getClass.getSimpleName}")
+
+  /** A float constant at the width it is stored at.
+   *
+   * LLVM's hex form always spells a `double`, and it refuses one that a narrower type could not hold
+   * exactly — so a `f32` constant is the source value rounded to a float *first* and then written
+   * back out as the double that float is. That is the same rounding the `fptrunc` in the ordinary
+   * path performs, done here instead of at run time.
+   */
+  private def constantFloat(bits: String, ty: Type): String = {
+    val d = java.lang.Double.longBitsToDouble(java.lang.Long.parseUnsignedLong(bits.drop(2), 16))
+
+    if ty == Type.Real then bits
+    else f"0x${java.lang.Double.doubleToLongBits(d.toFloat.toDouble)}%016X"
+  }
+}
