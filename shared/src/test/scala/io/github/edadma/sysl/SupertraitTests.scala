@@ -288,6 +288,59 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) should include("both declare 'len'")
     }
 
+    // The same rule as the name collision above, seen from the other side: `Into[int]` and
+    // `Into[bool]` would be two `into`s for one type, so nothing could ever satisfy both. Refused at
+    // the declaration, because the `impl` would otherwise be told to write a block that is itself
+    // refused.
+    "one trait cannot be required at two argument lists" in {
+      err(
+        """trait Into[U]
+          |    into(self) -> U
+          |trait Both: Into[int] + Into[bool]
+          |    tag(self) -> int""".stripMargin,
+      ) should include("requires both 'Into[int]' and 'Into[bool]', and a type implements one trait once")
+    }
+
+    // Whether two requirements are the same promise is a question about types, not about spellings:
+    // `int` and `i32` are one type, so this is one requirement written twice and is accepted.
+    "and the two are compared as types, not as they were written" in {
+      run(
+        """trait Into[U]
+          |    into(self) -> U
+          |trait Both: Into[int] + Into[i32]
+          |    tag(self) -> int
+          |struct S
+          |    v: int
+          |impl Into[int] for S
+          |    into(self) -> int = self.v
+          |impl Both for S
+          |    tag(self) -> int = 1
+          |print(S(7).into() + S(0).tag())""".stripMargin,
+      ) shouldBe "8\n"
+    }
+
+    // Required directly *and* through another requirement, at the same arguments: one slot.
+    "a trait required directly and transitively is carried once" in {
+      run(
+        """trait Base
+          |    base(self) -> int
+          |trait L: Base
+          |    l(self) -> int
+          |trait D: L + Base
+          |    d(self) -> int
+          |struct T
+          |    v: int
+          |impl Base for T
+          |    base(self) -> int = 1
+          |impl L for T
+          |    l(self) -> int = 2
+          |impl D for T
+          |    d(self) -> int = 4
+          |var p: &D = T(0)
+          |print(p.base() + p.l() + p.d())""".stripMargin,
+      ) shouldBe "7\n"
+    }
+
     // The diamond is not a collision: one trait reached by two routes is taken once.
     "a trait required by two routes is carried once" in {
       run(
@@ -461,6 +514,48 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |    tag(self) -> int = 7
           |var o: &Tagged = 1i32""".stripMargin,
       ) should include("implements 'Display' by the compiler's own rule rather than through an 'impl'")
+    }
+
+    // The object-safety diagnostic has two names to get right and they are different names: the
+    // trait the offending member came from, and the object type the programmer actually wrote.
+    "a required trait's '&self' method names both the trait and the sigil to write" in {
+      val out = err(
+        """trait Counted
+          |    bump(&self) -> int
+          |trait Thing: Counted
+          |    id(self) -> int
+          |struct S
+          |    v: int
+          |impl Counted for S
+          |    bump(&self) -> int = self.v
+          |impl Thing for S
+          |    id(self) -> int = 1
+          |var s = S(2)
+          |var o: *Thing = &s""".stripMargin,
+      )
+
+      out should include("'bump' of 'Counted' takes '&self'")
+      out should include("'*Thing' points straight at a value, so write '&Thing' instead")
+    }
+
+    // A type that does not implement a required trait at all is a different failure from one whose
+    // membership the compiler provides, and saying the second where the first is true is a lie.
+    "a type missing a required trait is told that, not told about the compiler's rules" in {
+      val out = err(
+        """trait Named
+          |    name(self) -> string
+          |trait Greet: Named
+          |    greet(self) -> string
+          |struct P
+          |    v: int
+          |impl Greet for P
+          |    greet(self) -> string = "hi"
+          |var o: &Greet = P(1)""".stripMargin,
+      )
+
+      out should include("'Greet' requires 'Named', and P does not implement it — so there is no " +
+        "'name' for its table to point at")
+      out should not include "by the compiler's own rule"
     }
 
     "a method no trait in the closure declares is still refused" in {

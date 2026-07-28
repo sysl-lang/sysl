@@ -91,12 +91,19 @@ trait TraitObjects extends TypeResolution {
 
     if !vtables.contains(name) then
       val slots = traitMembers(tr.bound).map { (from, m) =>
-        // A required trait a *built-in* satisfies by the compiler's rule (`14 §5`) has no function
-        // to name, because its operator is an instruction. The trait's own membership was checked
-        // before this was reached; a required one is checked here, where the table is being built.
+        // The trait's own membership was checked before this was reached; a **required** one is
+        // checked here, where the table is being built, and the two ways it can fail want different
+        // things said. A built-in satisfies by the compiler's rule (`14 §5`) and has no function to
+        // name, because its operator is an instruction. Anything else simply has no implementation,
+        // which the `impl` was already told — so this says what the erasure cannot do and leaves the
+        // advice to the report that has it.
         if !conforms(from, ty) then
-          err(s"${show(ty)} implements '${qn(from.name)}' by the compiler's own rule rather than " +
-            s"through an 'impl', so there is no '${m.name}' for a slot of '${show(tr)}' to point at")
+          if satisfies(from, ty) then
+            err(s"${show(ty)} implements '${qn(from.name)}' by the compiler's own rule rather than " +
+              s"through an 'impl', so there is no '${m.name}' for a slot of '${show(tr)}' to point at")
+          else
+            err(s"'${show(tr)}' requires '${from.show}', and ${show(ty)} does not implement it — so " +
+              s"there is no '${m.name}' for its table to point at")
 
         val fname           = memberFuncName(ty, m.name)
         val (params, rtype) = funcInsts(fname)

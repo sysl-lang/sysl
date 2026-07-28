@@ -294,19 +294,26 @@ trait Hoisting extends TypeResolution {
    * every trait is registered — because `trait Ord: Eq` is ordinary whichever of the two is written
    * first, and asking during the walk that registers them would report the one below.
    *
-   * Three things are answered here, all of them about the declarations rather than about any use:
+   * Four things are answered here, all of them about the declarations rather than about any use:
    * that each required trait is a trait, applied to as many arguments as it declares; that the
-   * requirements do not come back around to the trait that made them; and that no two traits in the
-   * closure declare a member of one name. The last is the coherence rule one level up — a trait's
-   * members become the implementing type's, and a type's members are one namespace — so two traits
-   * that both declare `len` cannot be required together by a third.
+   * requirements do not come back around to the trait that made them; that one trait is not required
+   * at two different argument lists; and that no two traits in the closure declare a member of one
+   * name. The last two are one rule seen twice — a trait's members become the implementing type's,
+   * and a type's members are one namespace — so two traits that both declare `len` cannot be
+   * required together, and neither can `Into[int]` and `Into[bool]`, whose `into`s would be two
+   * members of one name for one type.
+   *
+   * The walk resolves each requirement rather than comparing spellings, because whether two are the
+   * same promise is a question about types: `Into[int]` and `Into[i32]` are one requirement written
+   * two ways. Each trait's own parameters stand in for themselves, which is what lets a requirement
+   * naming one resolve at the declaration at all.
    */
   protected def checkTraitSupers(): Unit =
     for (key, decl) <- traitDecls do
       currentPos = decl.pos
       inScope(declScope(key))(recover(()) {
         val declares = mutable.LinkedHashMap.empty[String, String]
-        val visited  = mutable.Set(key)
+        val visited  = mutable.LinkedHashMap(key -> Type.Bound(key, Nil))
 
         for m <- decl.methods do declares(m.name) = qn(key)
 
@@ -328,16 +335,27 @@ trait Hoisting extends TypeResolution {
                     err(s"a trait requires another of whatever type implements it, so 'Self' has no " +
                       s"meaning in '${s.show}' — it *is* the type doing the implementing")
 
+                  val bound = resolveBound(s, abstractSubst(tr.tparams, tr.bounds))
+
                   if path.contains(skey) then
                     err(s"trait '${qn(skey)}' requires itself, through " +
                       (path.reverse.dropWhile(_ != skey) ::: List(skey)).map(qn).mkString(" -> "))
-                  else if visited.add(skey) then
-                    for m <- sdecl.methods do
-                      for other <- declares.get(m.name) do
-                        err(s"'${qn(skey)}' and '$other' both declare '${m.name}', and a trait's " +
-                          s"members become the implementing type's — so '${qn(key)}' cannot require both")
-                      declares(m.name) = qn(skey)
-                    walk(skey, skey :: path)
+                  else
+                    visited.get(skey) match
+                      // One trait at two argument lists is the coherence rule refusing in advance:
+                      // a type implements a trait once, so nothing could ever satisfy both.
+                      case Some(first) if first.key != bound.key =>
+                        err(s"'${qn(key)}' requires both '${first.show}' and '${bound.show}', and a " +
+                          "type implements one trait once — so no type could satisfy both")
+                      case Some(_) =>
+                      case None =>
+                        visited(skey) = bound
+                        for m <- sdecl.methods do
+                          for other <- declares.get(m.name) do
+                            err(s"'${qn(skey)}' and '$other' both declare '${m.name}', and a trait's " +
+                              s"members become the implementing type's — so '${qn(key)}' cannot require both")
+                          declares(m.name) = qn(skey)
+                        walk(skey, skey :: path)
             }
 
         walk(key, List(key))

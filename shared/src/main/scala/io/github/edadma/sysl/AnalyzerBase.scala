@@ -932,13 +932,18 @@ trait AnalyzerBase {
    * makes `trait Pair[T]: Sink[T]` mean the `Sink` of whatever the pair was applied to. A cycle
    * terminates here rather than looping — it is reported once, at the declarations, by
    * `checkTraitSupers`.
+   *
+   * **A trait is taken once by name, not once per argument list**, which is the same rule
+   * `checkTraitSupers` enforces at the declaration: a type implements one trait once, so a closure
+   * holding `Into[int]` and `Into[bool]` would be laying out two slots for one member. Keying this
+   * walk any other way is how the table and the declaration check come to disagree.
    */
   protected def traitClosure(b: Type.Bound): List[Type.Bound] = {
     val seen = mutable.Set.empty[String]
     val acc  = mutable.ListBuffer.empty[Type.Bound]
 
     def walk(b: Type.Bound): Unit =
-      if seen.add(b.key) then
+      if seen.add(b.name) then
         for decl <- traitDecls.get(b.name) do
           val subst = decl.tparams.zip(b.args).toMap
 
