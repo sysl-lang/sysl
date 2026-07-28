@@ -16,7 +16,7 @@ import scala.collection.mutable
  * is checked in a second pass, once every declaration exists — and immediately after that, since a
  * block's imports are read while a body is being analyzed, long after.
  */
-trait ImportResolution extends AnalyzerBase {
+trait ImportResolution extends TraitLookup {
 
   /** Selectors whose module is known but whose target cannot be looked up yet: the key each one
    * stands for, the path as written, where to point if nothing answers to it, and the terms the
