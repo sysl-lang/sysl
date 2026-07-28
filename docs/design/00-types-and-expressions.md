@@ -372,6 +372,56 @@ context-sensitive stop rules, no separate parser-vocabulary registration. The ol
 operator-munching complexity (and its double-registration) existed *solely* to support custom
 operators; with those gone, operator lexing is trivial, and even a library lexer stays clean.
 
+### Continuing a line
+
+sysl ends a statement at the end of a line, so an expression that outgrows one needs a way to say
+"there is more". Two mechanisms do it, and between them there is nothing left to decide:
+
+- **A bracketed expression continues until it closes.** `(`, `[` and `{` suspend the off-side rule,
+  which is why an argument list, an array literal and a bound list have always been free to span
+  lines. This one is easy to forget, and it has been misdiagnosed in the guide programs more than
+  once — a long array literal and a nine-trait bound both looked like continuation problems and
+  neither was.
+- **An operator that cannot finish an expression carries the line.** A newline after `+`, `&&`,
+  `==`, `<<`, `!` or a compound assignment cannot have ended a statement, because something must
+  still follow, so the newline is suppressed and the next line continues the expression. That is
+  the whole rule, and it is a rule rather than a list.
+
+The rule decides the exclusions, which is the part worth stating:
+
+| excluded | because |
+|---|---|
+| `=`, `->` | already mean "an indented block starts here" — a body, a match arm |
+| `++`, `--`, `?` | postfix, so a line ending in one is a complete statement |
+| `..`, `..<`, `...` | can be complete: `s[..]` is the whole range, `int...` a variadic tail |
+
+**`*` is the case that had to be fixed rather than excluded**, and it is worth recording how. A
+wildcard import's text ends in a `*`, so while `.` and `*` lexed separately, continuing there
+swallowed the newline and joined the import to the declaration after it. Two answers were wrong:
+dropping multiplication from the set would have left the rule with a hole nobody could derive, and
+respelling the wildcard as `_` would have traded the spelling every other language uses — and the
+one Scala 3 deliberately moved *to*, away from `_` — for a token sysl already spends on the
+match-anything pattern. The right answer changed neither: **`.*` is one token.** A `.` is otherwise
+only ever followed by a name, so nothing else can produce that pair, and a line then never ends in a
+bare `*` that was really the end of a statement.
+| `.` | would work, but the chaining style worth having puts the dot at the *start* of the next line, which is the opposite mechanism and is not decided here |
+| `,`, `:`, `;` | separators; the one with a real customer (`,`) already continues, since an argument list is bracketed |
+
+A bracketed list may also **end in a comma**. That is what makes the multi-line layout worth using:
+with one element to a line the last line stops being different from the others, so an element can be
+added, removed or reordered without touching its neighbour and a diff shows only the line that
+changed. The comma is optional *after* an element and never instead of one, so `[,]`, `[, 1]` and
+`[1,, 2]` all stay errors. It applies to every comma-separated list — array literal, call arguments,
+parameters, type arguments, type parameters, an enum variant's payload, a variant or struct pattern,
+and an import selector list — because a rule that held for some of them would be a list to remember.
+
+**The indentation of a continuation line carries no meaning.** The suppressed newline is the one
+that would have measured it, so the next line may sit anywhere. The cost of that is the hazard every
+joining language has, brackets included: a continuation line that is *dedented* has its dedent
+swallowed too, so a trailing operator can hold a block open past where it looks like it closed. It
+is left as a hazard rather than guarded, because guarding means the indentation of a continuation
+line means something after all, and the point of continuing is that it does not.
+
 ---
 
 ## 10. Control flow is expression-oriented — `if`, `match`, and loops yield values
@@ -643,22 +693,10 @@ work:
   the maximum permitted `N`; whether `i1`/`u1` are allowed and how they relate to `bool`;
   and whether packed structs lay out an `i5` field in exactly 5 bits (the bitfield / hardware
   register payoff).
-- **Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`), and
-  the exact trailing-continuation operator set. The *lexing* mechanics are settled by adopting
-  `IndentationLexical` (see `front-end.md`); these remaining pieces are grammar decisions. Nothing
-  continues a line today, so an expression that outgrows its line has to become statements — see
-  the table of single-character symbols in `guide/bytecode`'s lexer, written as three early
-  returns for exactly that reason.
-  **Four programs have now reported it, and the pattern in what they report is the useful part.**
-  `guide/bytecode` broke a long condition into early returns; `guide/sha2` has a signature that is
-  exactly 107 characters with nowhere to break it; `guide/shapes` splits a four-term conjunction
-  into two named halves and a cross product into three. Every one of them is an *operator* wanting
-  to carry the line — `&&`, `+`, `-` — and none wants a general escape character. That is the
-  narrow version of the feature, and the fact that a bracketed expression already continues
-  (`IndentationLexical` joins on `(`, `[`, `{`, which is why every multi-line call in those
-  programs is fine) means the remaining hole is precisely: an operator at end of line, outside
-  brackets. Worth deciding as its own thing rather than waiting on the whole block-grammar
-  question it is currently filed under.
+- **Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`). The
+  *lexing* mechanics are settled by adopting `IndentationLexical` (see `front-end.md`); this
+  remaining piece is a grammar decision. The trailing-continuation operator set that used to be
+  filed here is settled — see § *Continuing a line* below.
 - ~~Zero-sized types~~ — **done**, see §12. A `unit` field is skipped in the layout with the
   indices behind it shifted, and a `unit` parameter is dropped from the signature, which is what
   makes `Result[unit, E]` writable. It was additive as predicted: everything §12 used to refuse

@@ -139,12 +139,68 @@ class SyslLexical
     "+", "-", "*", "/", "%", "<<", ">>",
     "++", "--",
     "(", ")", "[", "]", "{", "}", ".", "?",
+    // The wildcard import's tail is one token rather than a `.` and a `*`. A `.` is otherwise only
+    // ever followed by a name, so the pair is unambiguous — and lexing it together is what lets `*`
+    // stay in the continuation set below, since a line then never ends in a bare `*` that was
+    // really the end of a statement.
+    ".*",
     ",", "::", ":", "->",
     // Only ever a separator inside a three-clause `for` header (`00` §10). It is deliberately not a
     // statement terminator: a line ends a statement, and a token that could also end one would give
     // the language two answers to the same question.
     ";",
   )
+
+  /** The operators that carry an expression onto the next line.
+   *
+   * A bracketed expression already continues, because `(`, `[` and `{` suspend the off-side rule
+   * until they close. What was missing is the unbracketed case, and the rule is the narrowest one
+   * that covers it: **an operator that cannot finish an expression continues the line.** After any
+   * of these something must follow, so a newline there cannot have been the end of a statement and
+   * there is nothing to be ambiguous about.
+   *
+   * That rule decides the exclusions rather than a taste for which operators look right:
+   *
+   *   - **`=` and `->`** are left out although they are binary, because both already open an
+   *     indented block — a function body, a match arm — and a token cannot mean "the block starts
+   *     here" and "the line goes on" at once.
+   *   - **`++`, `--` and `?`** are postfix, so a line ending in one is a complete statement.
+   *   - **`..`, `..<` and `...`** are left out because they too can be complete: `s[..]` is the
+   *     whole range and `int...` is a variadic tail.
+   *
+   * **`*` needed the exception removed rather than taken.** A wildcard import is a whole statement
+   * whose text ends in a `*`, so continuing there joined the import to the declaration after it —
+   * eighteen tests said so. The fix is not to drop multiplication from the set, which would leave
+   * the rule with an arbitrary hole, and not to respell the wildcard: it is to lex `.*` as one
+   * token, above. A `.` is only ever followed by a name, so nothing else can produce that pair, and
+   * a line then never ends in a bare `*` that was really the end of a statement.
+   *   - **`.`** is left out for a different reason — it would work, but the continuation style
+   *     worth having for a call chain puts the dot at the *start* of the following line, which
+   *     needs the opposite mechanism. Deciding that is not part of this.
+   *   - **`,`, `:` and `;`** are separators, and the only one with a real customer (`,`) already
+   *     continues wherever it appears, since an argument list is bracketed.
+   *
+   * Prefix operators are in: `!`, `~` and the unary readings of `-`, `*` and `&` cannot finish an
+   * expression either, and leaving them out would make the rule a list to memorize instead of a
+   * rule.
+   *
+   * The one hazard is the one every joining language has, including the brackets sysl already
+   * joins on: a continuation line that is *dedented* has its dedent swallowed with the newline, so
+   * a trailing operator can silently hold a block open. It is written down here rather than
+   * guarded against, because guarding would mean the indentation of a continuation line carried
+   * meaning, and the point of continuing is that it does not.
+   */
+  private val continuationOperators = Set(
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+    "||", "&&", "!",
+    "==", "!=", "<", ">", "<=", ">=",
+    "|", "^", "&", "~",
+    "+", "-", "*", "/", "%", "<<", ">>",
+  )
+
+  override protected def isLineContinuationToken(tok: Token): Boolean = tok match
+    case Keyword(chars) => continuationOperators(chars)
+    case _              => false
 
   /** Materializes the token stream with each token's source position, so the parser can
    * memoize over a fixed `List` (not the stateful scanner — see docs/design/front-end.md)

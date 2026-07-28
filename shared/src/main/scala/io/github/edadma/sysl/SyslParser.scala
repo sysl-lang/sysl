@@ -179,7 +179,7 @@ class SyslParser(val source: Source) extends PackratParsers {
       // A call is the exception: what is wrong with `foo(…)` is nearly always `foo` — it does not
       // exist, or it does not take these arguments — so the callee's own position wins, and the
       // `(` is only the fallback for a callee that somehow has none.
-      here ~ (op("(") ~> repsep(expression, op(",")) <~ op(")")) ^^ { case p ~ args =>
+      here ~ (op("(") ~> commaList(expression) <~ op(")")) ^^ { case p ~ args =>
         (e: Expr) => Call(e, args).setPos(e.pos).setPos(p)
       } |
       here <~ op("?") ^^ (p => (e: Expr) => TryExpr(e).setPos(p)) |
@@ -193,6 +193,22 @@ class SyslParser(val source: Source) extends PackratParsers {
         op("(") ~> parenTail,
     )
 
+  /** A comma-separated list that may end in a comma.
+   *
+   * Every such list in sysl is bracketed, and a bracket suspends the off-side rule until it closes
+   * (`00 §9`), so a list is free to span lines. That is what makes the trailing comma worth having
+   * rather than a curiosity: with one element per line, the last line stops being different from
+   * the others, so an element can be added, removed or reordered without touching its neighbour,
+   * and a diff shows the line that changed and no other.
+   *
+   * The comma is optional only *after* an element, never instead of one — `[,]` and `f(,)` stay
+   * errors. That is why the empty case is a separate alternative rather than `repsep` with an
+   * optional comma hung off it, which would have accepted both.
+   */
+  private def commaList[T](p: Parser[T]): Parser[List[T]] = commaList1(p) | success(Nil)
+
+  private def commaList1[T](p: Parser[T]): Parser[List[T]] = rep1sep(p, op(",")) <~ opt(op(","))
+
   /** `self` is reserved, so it never lexes as an identifier; inside a method body it reads as an
    * ordinary name that the analyzer resolves to the receiver binding, and is undefined elsewhere.
    */
@@ -204,7 +220,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val arrayLit: PackratParser[Expr] =
     op("[") ~> expression ~ (op(";") ~> expression) <~ op("]") ^^ { case v ~ n => ArrayFill(v, n) } |
-      op("[") ~> repsep(expression, op(",")) <~ op("]") ^^ ArrayLit.apply
+      op("[") ~> commaList(expression) <~ op("]") ^^ ArrayLit.apply
 
   /** After `(`: `)` is unit, one expression is a grouping, more are a tuple. */
   private lazy val parenTail: PackratParser[Expr] =
@@ -383,15 +399,20 @@ class SyslParser(val source: Source) extends PackratParsers {
    * scoped to it, for a name wanted in one function only.
    */
   private lazy val importDecl: Parser[ImportDecl] =
-    op("import") ~> dottedName ~ opt(op(".") ~> importTail) ^^ {
+    op("import") ~> dottedName ~ opt(importTail) ^^ {
       case path ~ None                => ImportDecl(path)
       case path ~ Some(Left(_))       => ImportDecl(path, wildcard = true)
       case path ~ Some(Right(sels))   => ImportDecl(path, sels)
     }
 
+  /** The wildcard's `.*` is **one token**, which is why it is matched here rather than as a `.`
+   * followed by the multiplication operator. Nothing about the written form changes; what it buys
+   * is that a line never ends in a bare `*` that was really the end of a statement, so `*` can
+   * carry a line like every other binary operator (`SyslLexical`).
+   */
   private lazy val importTail: Parser[Either[Unit, List[ImportSelector]]] =
-    op("*") ^^^ Left(()) |
-      (op("{") ~> rep1sep(importSelector, op(",")) <~ op("}")) ^^ (Right(_))
+    op(".*") ^^^ Left(()) |
+      (op(".") ~> op("{") ~> commaList1(importSelector) <~ op("}")) ^^ (Right(_))
 
   private lazy val importSelector: Parser[ImportSelector] =
     at(ident ~ opt(op("as") ~> ident) ^^ { case n ~ a => ImportSelector(n, a) })
@@ -414,7 +435,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * a trait's — a trait takes its arguments the same way and in the same place.
    */
   private lazy val typeArgs: Parser[List[TypeRef]] =
-    op("[") ~> rep1sep(typeRef, op(",")) <~ op("]")
+    op("[") ~> commaList1(typeRef) <~ op("]")
 
   private lazy val softSync: Parser[Unit] =
     accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
@@ -433,7 +454,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * another of the parameters being declared.
    */
   private lazy val boundedTypeParams: Parser[(List[String], Map[String, List[BoundRef]])] =
-    op("[") ~> rep1sep(boundedTypeParam, op(",")) <~ op("]") ^^ { ps =>
+    op("[") ~> commaList1(boundedTypeParam) <~ op("]") ^^ { ps =>
       (ps.map(_._1), ps.collect { case (n, bs) if bs.nonEmpty => n -> bs }.toMap)
     }
 
@@ -528,7 +549,11 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val paramList: Parser[(List[Param], Boolean)] =
     op("...") ^^^ (Nil, true) |
-      repsep(param, op(",")) ~ opt(op(",") ~> op("...")) ^^ { case ps ~ dots => (ps, dots.isDefined) }
+      // The variadic marker is tried before the trailing comma, so `f(a: int, ...)` still reads the
+      // comma as the separator it is; `f(a: int,)` falls through to the trailing-comma case.
+      repsep(param, op(",")) ~ opt(op(",") ~> op("...")) <~ opt(op(",")) ^^ { case ps ~ dots =>
+        (ps, dots.isDefined)
+      }
 
   /** A function body is either an `= expr` short form (whose value is the return value) or an
    * indented block (whose trailing expression is the return value).
@@ -604,8 +629,8 @@ class SyslParser(val source: Source) extends PackratParsers {
    * member is an associated function.
    */
   private lazy val methodParams: Parser[(Option[RecvMode], List[Param])] =
-    receiver ~ rep(op(",") ~> param) ^^ { case r ~ ps => (Some(r), ps) } |
-      repsep(param, op(",")) ^^ (ps => (None, ps))
+    receiver ~ rep(op(",") ~> param) <~ opt(op(",")) ^^ { case r ~ ps => (Some(r), ps) } |
+      commaList(param) ^^ (ps => (None, ps))
 
   private lazy val receiver: Parser[RecvMode] =
     op("*") ~> op("self") ^^^ RecvMode.ByPtr |
@@ -638,7 +663,7 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   private lazy val enumVariant: Parser[EnumVariantDecl] =
     at(
-      ident ~ (op("(") ~> repsep(param, op(",")) <~ op(")")) ^^ { case n ~ fs => EnumVariantDecl(n, None, fs) } |
+      ident ~ (op("(") ~> commaList(param) <~ op(")")) ^^ { case n ~ fs => EnumVariantDecl(n, None, fs) } |
         ident ~ (op("=") ~> expression) ^^ { case n ~ v => EnumVariantDecl(n, Some(v), Nil) } |
         ident ^^ (n => EnumVariantDecl(n, None, Nil)),
     )
@@ -913,13 +938,13 @@ class SyslParser(val source: Source) extends PackratParsers {
       patternLit ^^ LitPattern.apply
 
   private lazy val variantPattern: Parser[Pattern] =
-    qualifiedName ~ (op("(") ~> repsep(pattern, op(",")) <~ op(")")) ^^ { case n ~ ps => VariantPattern(n, ps) }
+    qualifiedName ~ (op("(") ~> commaList(pattern) <~ op(")")) ^^ { case n ~ ps => VariantPattern(n, ps) }
 
   /** `S{field: sub, other}` — a named struct pattern. A bare `field` is shorthand for
    * `field: field`, binding the field to a variable of the same name.
    */
   private lazy val structPattern: Parser[Pattern] =
-    qualifiedName ~ (op("{") ~> repsep(fieldPattern, op(",")) <~ op("}")) ^^ { case n ~ fs => StructPattern(n, fs) }
+    qualifiedName ~ (op("{") ~> commaList(fieldPattern) <~ op("}")) ^^ { case n ~ fs => StructPattern(n, fs) }
 
   private lazy val fieldPattern: Parser[(String, Pattern)] =
     ident ~ opt(op(":") ~> pattern) ^^ { case n ~ p => (n, p.getOrElse(IdentPattern(n))) }
