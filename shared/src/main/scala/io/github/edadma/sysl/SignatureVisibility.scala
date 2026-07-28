@@ -68,7 +68,7 @@ trait SignatureVisibility extends TypeResolution {
     for (key, d) <- structDecls.toList do
       val own = d.tparams.toSet
 
-      expose(key, own, d.bounds, d.fields.map(f => (s"field '${f.name}'", f.typ, f.pos)))
+      expose(key, own, d.bounds, d.fields.map(f => (s"field '${f.name}'", f.typ, f.pos)) ::: defaults(d.tdefaults))
       for m <- d.members do exposeMember(key, own, m)
 
     for (key, d) <- enumDecls.toList do
@@ -77,13 +77,13 @@ trait SignatureVisibility extends TypeResolution {
         for v <- d.variants; f <- v.fields
         yield (s"the '${f.name}' of variant '${v.name}'", f.typ, f.pos)
 
-      expose(key, own, d.bounds, payload)
+      expose(key, own, d.bounds, payload ::: defaults(d.tdefaults))
       for m <- d.members do exposeMember(key, own, m)
 
     for (key, d) <- traitDecls.toList do
       val own = d.tparams.toSet
 
-      expose(key, own, d.bounds, Nil, d.supers)
+      expose(key, own, d.bounds, defaults(d.tdefaults), d.supers)
       for m <- d.methods do exposeMember(key, own, m)
 
     // An `extern` is here too: it is registered as a function, and a symbol the linker resolves is
@@ -91,6 +91,15 @@ trait SignatureVisibility extends TypeResolution {
     for (key, d) <- funcDecls.toList do
       expose(key, d.tparams.toSet, d.bounds, signature(d.params, d.retType))
   }
+
+  /** A **default** is exposed as surely as a field is, and less obviously: it is the one part of a
+    * signature a use does not write, so a caller that leaves the argument out ends up holding
+    * whatever the default named — a type they could not have written and cannot name. A default
+    * naming one of the declaration's own parameters names nothing anyone has to reach, which is
+    * what `skip` already covers.
+    */
+  private def defaults(tdefaults: Map[String, TypeRef]): List[(String, TypeRef, Option[Pos])] =
+    tdefaults.toList.sortBy(_._1).map((tp, ref) => (s"the default for '$tp'", ref, ref.pos))
 
   /** One top-level declaration, which is as visible as its own modifier made it. */
   private def expose(

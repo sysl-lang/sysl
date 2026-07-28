@@ -75,6 +75,15 @@ the trait, exactly as it does in a method's signature — so `impl Scale for P` 
 implementing type, so `Self` in one of their defaults is refused. Neither has a **trait object**: an
 object has forgotten which type it holds, so `&Scale` is refused and `&Scale[int]` is what to write.
 
+Two rules follow from a default being the one part of a signature a use does not write. It is
+**exposed** like a field, so `13 §2` applies: a public declaration may not default to a type that
+reaches less far than it does, or a caller who leaves the argument out ends up holding something they
+could not have written and cannot name. And a default may not **lead back** to the declaration it
+belongs to, directly or through another's, since each arrival applies the declaration to fewer
+arguments than it declares and so asks for the defaults again. A type fully applied inside a default
+is not that: nothing is filled, and naming a type inside itself through an indirection is as ordinary
+there as it is in a field.
+
 **Only those three declarations may carry one**, and the reason is §2's: a function's, a method's and
 an `impl` block's type parameters are *solved* from what they are given rather than written where
 they are used, so there is no argument list with a gap for a default to fill. What would be useful

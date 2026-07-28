@@ -357,6 +357,286 @@ class DefaultTypeParamTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
   }
 
+  /** `13 §2` says a declaration may not be more visible than the types it names. A default is one of
+    * those: it is not written at the use, so a caller that leaves the argument out ends up holding a
+    * type the default named — and if that type does not reach them, they are holding something they
+    * could not have written and cannot name.
+    */
+  "how far a default reaches" - {
+    "a struct may not default to a type that reaches less far than it does" in {
+      errIn(
+        ("m", "m.sysl",
+         """module m
+           |private struct Secret
+           |    n: int
+           |struct Holder[T = Secret]
+           |    v: T""".stripMargin),
+        ("", "main.sysl", "import m.Holder\nprint(1)"),
+      ) should include("'Holder' is public, but the default for 'T' names 'm.Secret', which is private")
+    }
+
+    "nor may a trait" in {
+      errIn(
+        ("m", "m.sysl",
+         """module m
+           |private struct Secret
+           |    n: int
+           |trait Sink[T = Secret]
+           |    put(self, x: T) -> int""".stripMargin),
+        ("", "main.sysl", "import m.Sink\nprint(1)"),
+      ) should include("'Sink' is public, but the default for 'T' names 'm.Secret', which is private")
+    }
+
+    "nor an enum" in {
+      errIn(
+        ("m", "m.sysl",
+         """module m
+           |private struct Secret
+           |    n: int
+           |enum Slot[T = Secret]
+           |    Empty
+           |    Full(value: T)""".stripMargin),
+        ("", "main.sysl", "import m.Slot\nprint(1)"),
+      ) should include("'Slot' is public, but the default for 'T' names 'm.Secret', which is private")
+    }
+
+    // A default naming one of the declaration's *own* parameters names nothing anyone has to reach.
+    "a default naming a sibling parameter reaches nowhere" in {
+      runIn(
+        ("m", "m.sysl", "module m\nstruct Pair[A, B = A]\n    x: A\n    y: B"),
+        ("", "main.sysl", "import m.Pair\nvar p: Pair[int] = Pair(3, 4)\nprint(p.x + p.y)"),
+      ) shouldBe "7\n"
+    }
+
+    /** A default is written where the declaration is, so it is resolved in **that** file's terms. A
+      * user who cannot see the type the default names still gets it filled in — which is the whole
+      * reason the rule above has to exist rather than the default simply failing to resolve.
+      */
+    "a default is resolved in the file that declares it" in {
+      runIn(
+        ("m", "m.sysl",
+         """module m
+           |struct Unit
+           |    n: int
+           |struct Holder[T = Unit]
+           |    v: T
+           |made() -> Holder = Holder(Unit(7))""".stripMargin),
+        ("", "main.sysl", "import m.made\nprint(made().v.n)"),
+      ) shouldBe "7\n"
+    }
+  }
+
+  "one default reaching another" - {
+    "a default may name a generic type that has defaults of its own" in {
+      run(
+        """struct Inner[U = int]
+          |    n: U
+          |struct Outer[T = Inner]
+          |    v: T
+          |var o: Outer = Outer(Inner(7))
+          |print(o.v.n)""".stripMargin,
+      ) shouldBe "7\n"
+    }
+
+    /** Each arrival applies the declaration to fewer arguments than it declares, so a default that
+      * leads back to its own declaration would ask for the defaults again forever. Caught rather
+      * than recursed into.
+      */
+    "a default may not lead back to its own declaration" in {
+      err("struct S[T = S]\n    v: int\nvar s: S = S(1)") should include("leads back to 'S'")
+    }
+
+    "nor around a longer way" in {
+      err(
+        """struct A[T = B]
+          |    v: int
+          |struct B[U = A]
+          |    w: int
+          |var a: A = A(1)""".stripMargin,
+      ) should include("leads back to")
+    }
+
+    // Applied in full, nothing is filled at all, so a type may name itself in a written argument
+    // exactly as a field may — the indirection is what makes it finite, and that rule is unchanged.
+    "a type fully applied inside its own default is not a cycle" in {
+      run(
+        """struct Node[T = int]
+          |    v: T
+          |    next: *Node[int]
+          |var n: Node = Node(7, null)
+          |print(n.v)""".stripMargin,
+      ) shouldBe "7\n"
+    }
+  }
+
+  "what the table does with one" - {
+    /** The slot list a table is built from and the one a call site indexes by are the same walk, and
+      * a defaulted requirement is where they could most easily disagree — one filling `Self`, the
+      * other not. Pinned on the emitted table rather than on the program's output, since a
+      * disagreement about order is exactly what running one call would fail to show.
+      */
+    "a defaulted requirement lays out one slot per member, in one order" in {
+      val out = ir(
+        """trait Tag[R = int]
+          |    tag(self, k: R) -> int
+          |trait Shown: Tag
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Tag for P
+          |    tag(self, k: int) -> int = self.v + k
+          |impl Shown for P
+          |    show(self) -> string = "p"
+          |var o: &Shown = P(5)
+          |print(o.tag(1))""".stripMargin,
+      )
+
+      out should include(
+        "@vt.ref.Shown.P = private constant [2 x ptr] [ptr @vt.adapt.ref.P.tag, ptr @vt.adapt.ref.P.show]",
+      )
+    }
+
+    "and the call reaches the required trait's member through it" in {
+      run(
+        """trait Tag[R = int]
+          |    tag(self, k: R) -> int
+          |trait Shown: Tag
+          |    show(self) -> string
+          |struct P
+          |    v: int
+          |impl Tag for P
+          |    tag(self, k: int) -> int = self.v + k
+          |impl Shown for P
+          |    show(self) -> string = "p"
+          |var o: &Shown = P(5)
+          |print(o.tag(1))""".stripMargin,
+      ) shouldBe "6\n"
+    }
+
+    /** Three deep, with `Self` at every step — the requirement is the implementing type all the way
+      * down rather than being rebound to whatever declared the next link.
+      */
+    "'Self' carries the whole length of a chain of requirements" in {
+      run(
+        """trait Scale[R = Self]
+          |    scale(self, k: R) -> Self
+          |trait Vector: Scale
+          |    dim(self) -> int
+          |trait Space: Vector
+          |    origin(self) -> int
+          |struct P
+          |    v: int
+          |impl Scale for P
+          |    scale(self, k: P) -> P = P(self.v * k.v)
+          |impl Vector for P
+          |    dim(self) -> int = 1
+          |impl Space for P
+          |    origin(self) -> int = 0
+          |f[T: Space](a: T, b: T) -> T = a.scale(b)
+          |print(f(P(6), P(7)).v)""".stripMargin,
+      ) shouldBe "42\n"
+    }
+  }
+
+  "what an implementation may be written for" - {
+    "a shape rather than a named type still fills 'Self'" in {
+      run(
+        """trait Size[R = Self]
+          |    size(self, other: R) -> int
+          |impl Size for []int
+          |    size(self, other: []int) -> int = self[0] + other[0]
+          |var a = [1, 2, 3]
+          |var b = [4, 5]
+          |print(a[0..<3].size(b[0..<2]))""".stripMargin,
+      ) shouldBe "5\n"
+    }
+
+    /** A conditional block's own parameters are solved, so its subject is the type applied to them —
+      * and `Self` in the trait's default is that, not the bare declaration.
+      */
+    "a conditional implementation fills 'Self' with its own subject" in {
+      run(
+        """trait Named
+          |    name(self) -> string
+          |trait Pairable[R = Self]
+          |    pair(self, other: R) -> string
+          |struct Box[T]
+          |    v: T
+          |impl[T: Named] Named for Box[T]
+          |    name(self) -> string = self.v.name()
+          |impl[T: Named] Pairable for Box[T]
+          |    pair(self, other: Box[T]) -> string = self.name() + other.name()
+          |struct P
+          |    n: string
+          |impl Named for P
+          |    name(self) -> string = self.n
+          |print(Box(P("a")).pair(Box(P("b"))))""".stripMargin,
+      ) shouldBe "ab\n"
+    }
+  }
+
+  "what inference does with one" - {
+    /** A default fills a **written** argument list. Inference solves from the arguments, and where it
+      * reaches an answer that answer is the type — the default is not a preference that overrides
+      * what the construction actually holds.
+      */
+    "a construction is inferred, not defaulted" in {
+      run(
+        """struct Pair[A, B = A]
+          |    x: A
+          |    y: B
+          |var p = Pair(1, true)
+          |print(p.y)""".stripMargin,
+      ) shouldBe "true\n"
+    }
+
+    "and the annotation that leaves the argument out still fills it" in {
+      err(
+        """struct Pair[A, B = A]
+          |    x: A
+          |    y: B
+          |var p: Pair[int] = Pair(1, true)
+          |print(p.y)""".stripMargin,
+      ) should include("bool")
+    }
+  }
+
+  "one implementation per trait per type" - {
+    /** `02`'s coherence rule reads the *filled* arguments, so the two spellings of one implementation
+      * are the one implementation — and writing both is the duplicate it looks like, not two
+      * implementations at different arguments.
+      */
+    "the bare and the written 'impl' are the same implementation" in {
+      err(
+        """trait Scale[R = Self]
+          |    scale(self, k: R) -> Self
+          |struct P
+          |    v: int
+          |impl Scale for P
+          |    scale(self, k: P) -> P = P(self.v * k.v)
+          |impl Scale[P] for P
+          |    scale(self, k: P) -> P = P(self.v + k.v)""".stripMargin,
+      ) should include("already implements")
+    }
+
+    "while two genuinely different arguments are two implementations" in {
+      run(
+        """trait Scale[R = Self]
+          |    scale(self, k: R) -> Self
+          |struct P
+          |    v: int
+          |impl Scale for P
+          |    scale(self, k: P) -> P = P(self.v * k.v)
+          |f[T: Scale](a: T, b: T) -> T = a.scale(b)
+          |struct Q
+          |    v: int
+          |impl Scale[int] for Q
+          |    scale(self, k: int) -> Q = Q(self.v + k)
+          |print(f(P(6), P(7)).v)""".stripMargin,
+      ) shouldBe "42\n"
+    }
+  }
+
   "what erasure does with one" - {
     /** An object has forgotten which type it holds, so there is no `Self` for a default to stand for.
       * The argument has to be written out, and saying that here is better than letting `Self` resolve

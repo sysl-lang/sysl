@@ -889,7 +889,11 @@ trait Hoisting extends TypeResolution {
         withDefaults(impl.traitName, tr.tparams, tr.tdefaults, written,
           selfBinding(sandboxed(resolveType(impl.forType, declared))))
 
-    for a <- args; abs <- mentionedParam(a) do
+    // Asked of what the block **wrote**, not of what the defaults filled in. A conditional block's
+    // subject is the type applied to its own parameters, so a default of `Self` names them by
+    // construction — `impl[T: Named] Pairable for Box[T]` supplies `Pairable[Box[T]]`, which is one
+    // implementation and not a family of them, and only an argument the author left open is.
+    for a <- written; abs <- mentionedParam(a) do
       err(s"'${abs.name}' is a type parameter of this 'impl', so it leaves which '${qn(impl.traitName)}' " +
         "this block implements open — write the type the trait is applied to")
 

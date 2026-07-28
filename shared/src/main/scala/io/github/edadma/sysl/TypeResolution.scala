@@ -137,6 +137,12 @@ trait TypeResolution extends ImportResolution {
   protected def leastArgs(tparams: List[String], tdefaults: Map[String, TypeRef]): Int =
     tparams.count(!tdefaults.contains(_))
 
+  /** The declarations whose defaults are being filled right now, so one that leads back to itself is
+    * caught rather than recursed into. The set is small and short-lived: a fill nests only where one
+    * default names another generic declaration that has defaults of its own.
+    */
+  private val filling = mutable.Set.empty[String]
+
   private def arityPhrase(tparams: List[String], tdefaults: Map[String, TypeRef]): String = {
     val least = leastArgs(tparams, tdefaults)
 
@@ -181,21 +187,30 @@ trait TypeResolution extends ImportResolution {
       noSelf: String = "there is no type here for it to stand for",
   ): List[Type] =
     if targs.length >= tparams.length || tdefaults.isEmpty then targs
+    else if !filling.add(key) then
+      // A default that leads back to the declaration it belongs to would fill forever, since each
+      // arrival applies the declaration to fewer arguments than it declares and so asks for the
+      // defaults again. Reported at the use, because a chain of them is a property of the
+      // declarations together rather than of any one of them.
+      err(s"filling a type argument of '${qn(key)}' from its default leads back to '${qn(key)}' — a " +
+        "default cannot stand in for a type that is still being worked out")
     else
-      inDecl(key) {
-        val filled = mutable.ListBuffer.from(targs)
+      try
+        inDecl(key) {
+          val filled = mutable.ListBuffer.from(targs)
 
-        for tp <- tparams.drop(targs.length) do
-          filled += tdefaults.get(tp).fold(Type.Unknown) { ref =>
-            if mentionsSelf(ref) && !self.contains(selfName) then
-              err(s"'$tp' defaults to '${ref.show}', which names the type implementing " +
-                s"'${qn(key)}', and $noSelf — write the argument")
+          for tp <- tparams.drop(targs.length) do
+            filled += tdefaults.get(tp).fold(Type.Unknown) { ref =>
+              if mentionsSelf(ref) && !self.contains(selfName) then
+                err(s"'$tp' defaults to '${ref.show}', which names the type implementing " +
+                  s"'${qn(key)}', and $noSelf — write the argument")
 
-            resolveType(ref, self ++ tparams.zip(filled))
-          }
+              resolveType(ref, self ++ tparams.zip(filled))
+            }
 
-        filled.toList
-      }
+          filled.toList
+        }
+      finally filling -= key
 
   /** A declaration's type parameters as its own body sees them: each standing in for itself, and
    * carrying what the declaration asked of it (`14 §4`).
