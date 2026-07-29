@@ -97,7 +97,7 @@ trait Literals extends TypeResolution {
   /** An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens,
    * narrows, or changes representation without being written.
    */
-  protected def convert(t: TExpr, to: Type): TExpr = {
+  protected def convert(t: TExpr, to: Type): TExpr = if to == Type.Str then encode(t) else {
     // A written conversion is licensed to reach a constrained value's base representation, so the
     // source kind is read through `underlying`: `f64(m)` unwraps a derived `Meters`, `int(age)` an
     // `Age`. The target of a scalar conversion is always a plain scalar, so only the source strips.
@@ -120,6 +120,27 @@ trait Literals extends TypeResolution {
 
     TCast(t, to)
   }
+
+  /** `string(c)` — one scalar value encoded as the bytes that spell it (`04`).
+   *
+   * It is the one conversion whose result is not a scalar, so it produces fresh bytes rather than a
+   * reinterpretation of the ones already there, and it allocates where every other conversion does
+   * not. The encoding is the one `str(c)` performs, which is why the two agree to the byte and why
+   * this needs nothing of its own underneath.
+   *
+   * Nothing else converts. A number has a *rendering* rather than an encoding — there is no one
+   * answer, as `f"…%x…"` shows — so it is sent to the form that renders, and a value already made of
+   * bytes is sent to the form that validates them.
+   */
+  private def encode(t: TExpr): TExpr = Type.underlying(t.ty) match
+    case Type.Char => TStr(t)
+    case Type.Str  => err("a 'string' conversion encodes a char, and this value is already a string")
+    case Type.Slice(Type.Byte) =>
+      err("a 'string' conversion encodes a char — bytes are already text or are not, so " +
+        "'from_utf8(b)' is what says which")
+    case other =>
+      err(s"a 'string' conversion encodes a char, and ${show(other)} is not one — 'str(x)' renders " +
+        "a value as text")
 
   /** Widens a value to the one width a renderer takes, leaving one that is already there alone.
    * The prelude carries one rendering per *kind* rather than one per type, so every integer meets

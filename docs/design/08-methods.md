@@ -208,17 +208,26 @@ What exists today, as compiler-provided members:
 | `[N]T`, `[]T`, `string` | `len -> usize` | property |
 | `string` | `bytes -> []u8` | property |
 | `string` | `chars -> Chars` | property |
+| `string` | `copy() -> string` | method |
+| `weak T` | `get() -> Option[&T]` | method |
 
-`chars` is the one of the three that is not a projection of the words already there: it hands back a
-cursor over the bytes, which `for` walks through `Iterate` (`14 §7`). It is compiler-provided rather
-than an `impl` on `string` for the same reason the other two are — a built-in has no body to write a
-member in — and the type it gives back is an ordinary prelude struct, so nothing about the member
-form is special.
+`chars` is the one of the properties that is not a projection of the words already there: it hands
+back a cursor over the bytes, which `for` walks through `Iterate` (`14 §7`). It is compiler-provided
+rather than an `impl` on `string` for the same reason the other two are — a built-in has no body to
+write a member in — and the type it gives back is an ordinary prelude struct, so nothing about the
+member form is special.
 
-What the earlier docs specify but which waits on an allocator surface — every operation that
-makes new bytes — is compiler-provided too, and lands as these same member forms when it lands:
-`string.from_utf8` and `char.try` as associated functions and `s.copy()` as a method (`04`, `00`). A user `struct` or `enum` is the case that declares its members in its own body;
-the built-ins are the case where the body is the language.
+**The last two rows are where the property/method line falls for a built-in, and they fall on
+opposite sides of it for the reasons §'s rule gives.** `copy()` allocates and walks the bytes, so it
+is written with the parentheses that say a call is happening; `get()` is a question about the world
+rather than a fact about the value, since two calls a moment apart may disagree (`03`). Reading
+either without the parentheses is told which it is and what to write, the way a user type's method
+is.
+
+A user `struct` or `enum` is the case that declares its members in its own body; the built-ins are
+the case where the body is the language. What is still specified and not built is `char.try` as an
+associated function (`00`) — a built-in has no name in call position, so it waits on the same
+question `string.from_utf8` waited on and was answered by becoming a free function.
 
 A compiler-provided member is reached **ahead of** the member table rather than through it, which is
 what puts these names out of reach for an `impl` (`02`): a member declared as `len` on a slice or

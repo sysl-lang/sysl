@@ -398,13 +398,13 @@ arity.
    through `printf`). `usize` / `isize` are fixed at 64 bits by a constant rather than by a
    target description. A narrower float constant is emitted as the `double` constant rounded
    down to it, which is correctly rounded except in the rare double-rounding case.
-2. **Every string is a literal or part of one.** The representation is the specified three
-   words and the operations over it are real, but nothing yet *makes* bytes: `from_utf8`,
-   `copy()`, concatenation, `str.builder`, `cstring`, and `string(c)` all need either an
-   allocator surface or methods, and none of them exists. So every string a program can hold
-   traces back to a literal, every owner word is null, and the validation `04` requires at
-   construction is done by the lexer rather than at run time. `s.chars` decodes what is already
-   validated; ordering is by byte with no collation, which is what `04` specifies.
+2. **~~Every string is a literal or part of one.~~** No longer a shortcut — every operation `04`
+   specifies is built. `from_utf8`, concatenation, `str(x)`, `s.copy()`, `string(c)`,
+   `str_builder()`, and `cstring(s)` all make bytes, so a string a program holds need not trace
+   back to a literal and its owner word need not be null. Only a **literal** is validated by the
+   lexer; bytes a program computed are validated at run time by `from_utf8`, which is where `04`
+   puts the check. `s.chars` decodes what is already valid either way, and ordering is by byte with
+   no collation, which is what `04` specifies.
 3. **All locals are `alloca`.** Every `var`, parameter, and loop variable gets a stack slot;
    reads `load`, writes `store`. Slots are hoisted into the entry block (names are unique per
    function, so one inside a loop does not grow the stack per iteration), but there is no

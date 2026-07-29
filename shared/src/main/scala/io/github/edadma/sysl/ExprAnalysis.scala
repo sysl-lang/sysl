@@ -612,6 +612,14 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         case Type.Str if f == "bytes"                   => TBytes(tr)
         case Type.Str if f == "chars"                   => callPrelude("chars_of", TBytes(tr))
 
+        // `copy` is the one compiler-provided member of a string that is a *method*, so reading it
+        // without the parentheses is told what a user type's method is told. The parentheses are
+        // what say it allocates and walks the bytes (`08 § Property or method`), which is exactly
+        // the information this line was missing.
+        case Type.Str if f == "copy" =>
+          err("'copy' is a method of 'string' — call it with 'copy()', since it allocates and " +
+            "copies the bytes rather than naming what is already there")
+
         // Everything about the object is behind `get()`, including whether there still is one, so a
         // weak reference has no fields of its own to offer and none of the referent's either.
         case w: Type.Weak =>

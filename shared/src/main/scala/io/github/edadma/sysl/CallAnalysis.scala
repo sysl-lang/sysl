@@ -202,6 +202,15 @@ trait CallAnalysis extends Literals with TraitObjects {
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
       case t: Type.Trait    => callTraitObject(tr, t, mname, args)
       case w: Type.Weak     => weakGet(w, tr, mname, args)
+
+      // `s.copy()` is the operation that stops a substring holding its parent buffer alive (`04`):
+      // the bytes are copied into a string that owns them, so what the result keeps is its own.
+      // Parentheses because it allocates and walks the bytes — `08 § Property or method` puts the
+      // O(1) projections on the other side of that line, and this is the case the line was drawn for.
+      case Type.Str if mname == "copy" =>
+        if args.nonEmpty then err("'copy' takes no arguments — it copies the string it is read off")
+        TFromBytes(TBytes(tr))
+
       case rty =>
         val (base, _) = memberKey(rty, mname)
         val chosen    = pickOverload(rty, base, mname, args)

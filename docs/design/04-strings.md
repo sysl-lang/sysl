@@ -1,21 +1,26 @@
 # Strings
 
-**Status:** representation and semantics decided and implemented; the API surface is sketched,
-and most of the part that makes new bytes is not built. This rests on the memory model (`03`) — a
-`string` is an immutable, validated `[]u8` and inherits its ownership rules from slices, so read
-that one first, and `07` for the view machinery it shares.
+**Status:** decided and implemented, including every operation that makes new bytes. This rests on
+the memory model (`03`) — a `string` is an immutable, validated `[]u8` and inherits its ownership
+rules from slices, so read that one first, and `07` for the view machinery it shares.
 
-What exists: the three-word representation, literals, `s.len`, `s[i]`, `s[a..b]` with both the
-bounds and the boundary checked, `s.bytes`, comparison by bytes, string literals as `match`
-patterns, **concatenation** — `a + b` and `s += t`, which allocate a fresh buffer — **`str(x)`**,
-which renders a primitive value into one, and **interpolation** — `s"…$x…"`, `raw"…"`, and
-`f"…${x}%d…"`, which desugar to concatenation, `str`, and printf-style formatting — and
-**`from_utf8`** with the `from_utf8_unchecked` primitive under it, which is the one route from bytes
-a program computed back to text, and **`s.chars`**, the cursor over the scalar values those bytes
-encode (`14 §7`). What does not: the rest of the operations that produce new bytes — `copy()`,
-`str.builder`, `cstring`, `string(c)` — since each needs either the raw-bytes surface or an
-allocator. A string is therefore no longer always traceable to a literal; a program can build one by
-joining, by rendering, or by validating bytes, and can walk what it built at either granularity.
+The three-word representation, literals, `s.len`, `s[i]`, `s[a..b]` with both the bounds and the
+boundary checked, `s.bytes`, comparison by bytes, string literals as `match` patterns,
+**concatenation** — `a + b` and `s += t`, which allocate a fresh buffer — **`str(x)`**, which
+renders a primitive value into one, **interpolation** — `s"…$x…"`, `raw"…"`, and `f"…${x}%d…"`,
+which desugar to concatenation, `str`, and printf-style formatting — **`from_utf8`** with the
+`from_utf8_unchecked` primitive under it, which is the one route from bytes a program computed back
+to text, and **`s.chars`**, the cursor over the scalar values those bytes encode (`14 §7`).
+
+The four that make new bytes are built too: **`s.copy()`**, which stops a substring holding its
+parent alive, **`string(c)`**, which encodes one scalar value, **`StrBuilder`**, which gathers text
+without rebuilding what it already has, and **`cstring(s)`**, which copies a string into the shape C
+reads. Three of them are the prelude's rather than the compiler's, for the reason `from_utf8` is:
+only the last line of each needs to be underneath the language.
+
+A string is therefore no longer always traceable to a literal; a program can build one by joining,
+by rendering, by gathering, or by validating bytes, and can walk what it built at either
+granularity.
 
 ## The decision in one paragraph
 
@@ -174,7 +179,7 @@ choice is right for a systems language; Swift's is right for an application lang
 | scalar values | `s.chars` | O(1) per step, total — no replacement characters |
 | copy out | `s.copy() -> string` | O(n), allocates; releases the parent |
 | concatenation | `a + b` | O(n), allocates |
-| repeated append | `str.builder` | amortized |
+| repeated append | `str_builder()` | amortized |
 
 **`s.chars` is what the iteration protocol was decided around** (`14 §7`), and it is the one row of
 this table that could not be a value or a view. Every row above yields a value; this one yields a
@@ -231,6 +236,40 @@ conversion the rest of the language refuses.
 
 `+` is the only arithmetic operator a string defines; `-`, `*`, and the rest are rejected the way
 they are for any type that does not define them.
+
+## Gathering text
+
+Concatenation allocates a fresh buffer each time, so building a string a piece at a time by `+=`
+copies everything it has so far on every step. `StrBuilder` is the form for that shape: it keeps one
+growable buffer, appends into it, and hands back a string when the gathering is done.
+
+```
+var b = str_builder()
+
+b.push("hello, ")
+b.push_char(',')
+b.push(str(n))
+
+var line = b.finish()
+```
+
+**The two ways in are the two that carry the guarantee.** A `push` takes a `string` and a
+`push_char` takes a `char`, and UTF-8 is closed under appending either — so `finish` hands back a
+plain `string` rather than something a caller has to validate. That is why a builder is **not** a
+`Writer`: a public `write` taking a `[]u8` would be `from_utf8_unchecked` with a longer name and
+none of its greppability. A value of some other type is pushed as `push(str(x))`, which spends the
+one allocation `str` was always going to spend, and still saves the quadratic copying that made a
+builder worth having.
+
+**`finish` copies rather than lending.** What comes out is an independent string, so a builder may
+go on being appended to and the string already taken out of it does not change. The alternative —
+handing over the buffer's storage and leaving the builder empty — would save a copy at the cost of a
+form whose meaning depends on how many times it has been called.
+
+It is spelled `str_builder()` rather than `str.builder` for the reason `from_utf8` is not
+`string.from_utf8`: only a `struct` or an `enum` has a name in call position (`08`), and a built-in
+is neither. Nothing is decided by the spelling; if built-ins ever carry associated functions this
+becomes `str.builder` with no change to what it does.
 
 ## Rendering a value
 
@@ -394,6 +433,21 @@ cstring(s) -> CString      // allocates a NUL-terminated copy; the caller owns i
 This is Go's `C.CString`, and it is explicit for the same reason: a length-carrying string can
 contain a NUL as an ordinary byte, so the conversion can fail or truncate and must be visible.
 
+**`CString` owns the copy, and that is what "the caller owns it" means here.** Go's version hands
+back a raw `*C.char` and requires a matching `C.free`; sysl has no manual free to match, so the
+result is a value whose bytes go when it does, like every other allocation in the language. It
+offers two things and nothing else: `cs.ptr`, the `*u8` a C function takes, and `cs.len`, the byte
+length *not* counting the terminator, so that it agrees with the `s.len` it came from.
+
+The hazard the explicitness exists for survives intact and is worth stating as an equation: for
+`cstring("a\0b")`, `cs.len` is 3 and C's `strlen(cs.ptr)` is 1. Both are right. Neither can be
+made to be the other, which is exactly why a conversion is written rather than inferred.
+
+The pointer is a `*T` and carries a `*T`'s rule: it is valid while the `CString` is held, and
+keeping it past that is the ordinary raw-pointer mistake rather than a new one. Passing
+`cstring(s).ptr` straight into a call is safe — the temporary lives for the statement — while
+storing that pointer and using it later is not.
+
 **The literal case needs no allocation at all, and it is spelled `c"…"`.** The compiler emits a NUL
 byte after every string literal in read-only data — it costs one byte and is not counted in `len` —
 so a literal is already sitting in memory in exactly the shape C reads. `c"%g"` is that constant's
@@ -426,8 +480,8 @@ Legal with `no alloc`: holding, passing, comparing, indexing, slicing, iterating
 releasing any string — including a heap-backed one handed in from outside, which frees itself
 through its own deallocation hook.
 
-Requires `alloc`: `from_utf8`, `copy()`, concatenation, `str.builder`, `cstring` — every
-operation that produces new bytes.
+Requires `alloc`: `from_utf8`, `copy()`, concatenation, `string(c)`, `str_builder()`, `cstring` —
+every operation that produces new bytes.
 
 A module that only ever uses literals sees only immortal strings, so its retain and release
 compile away entirely; one that is handed a heap-backed string pays ordinary refcount traffic

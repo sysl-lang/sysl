@@ -89,14 +89,23 @@ package io.github.edadma.sysl
  * one distinction a caller can act on: whether the input merely **ended** in the middle of a
  * sequence, which more bytes would fix, or holds one that no continuation could rescue.
  *
+ * **The four operations that make new bytes** (`04`) are the rest of what a `string` can do, and
+ * three of them are here rather than in the compiler for the reason `from_utf8` is: only the last
+ * line of each needs to be underneath the language. `StrBuilder` gathers text and hands back one
+ * string, over the same `Buf[u8]` `ByteSink` uses; `cstring` copies a string into the
+ * NUL-terminated shape C reads, and `CString` is what owns that copy, since a language with no
+ * manual free has to say who frees it. The fourth, `string(c)`, is a conversion the compiler
+ * already had the encoder for. `s.copy()` needs no declaration at all — it is bytes copied into a
+ * string that owns them, which is `from_utf8_unchecked` of a string's own bytes.
+ *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
  * reaches it, a **member of a non-generic type declared here** is held back by that same
  * reachability, and an `extern` is declared only if something calls it. Layout is the one exception,
  * and not one of this file's making — a non-generic type is instantiated eagerly wherever it is
- * declared, so `FormatSpec`'s, `ByteSink`'s and `Utf8Error`'s are emitted whether or not anything
- * renders or decodes. That is three type declarations with no code behind them, which is why the
- * rule is worth what it saves.
+ * declared, so every type declared here has its LLVM type emitted whether or not anything reaches
+ * it. Those lines name no storage and emit no instructions, which is why the rule is worth what it
+ * saves.
  */
 object Prelude {
 
@@ -576,6 +585,59 @@ object Prelude {
       |impl Writer for ByteSink
       |    write(*self, bytes: []u8)
       |        for b in bytes do self.bytes.push(b)
+      |
+      |struct StrBuilder
+      |    bytes: &Buf[u8]
+      |
+      |    len -> usize = self.bytes.len()
+      |
+      |    is_empty -> bool = self.bytes.is_empty()
+      |
+      |    push(*self, s: string)
+      |        for b in s.bytes do self.bytes.push(b)
+      |    end push
+      |
+      |    push_char(*self, c: char)
+      |        var cp = u32(c)
+      |
+      |        if cp < 128
+      |            self.bytes.push(u8(cp))
+      |        elif cp < 2048
+      |            self.bytes.push(u8(192 | (cp >> 6)))
+      |            self.bytes.push(u8(128 | (cp & 63)))
+      |        elif cp < 65536
+      |            self.bytes.push(u8(224 | (cp >> 12)))
+      |            self.bytes.push(u8(128 | ((cp >> 6) & 63)))
+      |            self.bytes.push(u8(128 | (cp & 63)))
+      |        else
+      |            self.bytes.push(u8(240 | (cp >> 18)))
+      |            self.bytes.push(u8(128 | ((cp >> 12) & 63)))
+      |            self.bytes.push(u8(128 | ((cp >> 6) & 63)))
+      |            self.bytes.push(u8(128 | (cp & 63)))
+      |    end push_char
+      |
+      |    clear(*self)
+      |        self.bytes.clear()
+      |
+      |    finish(self) -> string = from_utf8_unchecked(self.bytes.view())
+      |end StrBuilder
+      |
+      |str_builder() -> StrBuilder = StrBuilder(buf())
+      |
+      |struct CString
+      |    bytes: []u8
+      |
+      |    ptr -> *u8 = &self.bytes[0]
+      |
+      |    len -> usize = self.bytes.len - 1
+      |end CString
+      |
+      |cstring(s: string) -> CString
+      |    var b: []u8 = [0u8; s.len + 1]
+      |
+      |    for i in 0..<s.len do b[i] = s.bytes[i]
+      |
+      |    CString(b)
       |""".stripMargin
 
   /** The source the prelude's own declarations point into, so a diagnostic against one quotes the

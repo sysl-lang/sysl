@@ -269,16 +269,16 @@ trait TraitLookup extends MemberVisibility {
 
   /** Whether a member of that name is one the *compiler* provides for the type (`08`).
    *
-   * `len`, `bytes` and `chars` are members of built-ins that have no source body to declare them in,
-   * so they are reached ahead of the member table rather than through it. An `impl` for such a type
-   * could otherwise register a member of the same name that nothing would ever find, which is why
-   * this is asked at the declaration.
+   * `len`, `bytes`, `chars` and `copy` are members of built-ins that have no source body to declare
+   * them in, so they are reached ahead of the member table rather than through it. An `impl` for such
+   * a type could otherwise register a member of the same name that nothing would ever find, which is
+   * why this is asked at the declaration.
    */
   protected def builtinMember(t: Type, name: String): Boolean = (t, name) match
-    case (_: Type.Array | _: Type.View, "len") => true
-    case (Type.Str, "bytes" | "chars")         => true
-    case (_: Type.Weak, "get")                 => true
-    case _                                     => false
+    case (_: Type.Array | _: Type.View, "len")  => true
+    case (Type.Str, "bytes" | "chars" | "copy") => true
+    case (_: Type.Weak, "get")                  => true
+    case _                                      => false
 
   /** Every trait a bound promises: the traits it **requires**, transitively, and then itself
    * (`02 § A trait may require another trait`).
