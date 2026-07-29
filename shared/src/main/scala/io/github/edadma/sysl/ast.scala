@@ -74,6 +74,17 @@ case class TryExpr(expr: Expr) extends Expr
 
 case class Tuple(elements: List[Expr]) extends Expr
 
+/** One of a closure literal's parameters. Its type is written only where nothing else can supply
+ * one (`12 §5`), so the annotation is optional here in a way a declared function's never is.
+ */
+case class LambdaParam(name: String, typ: Option[TypeRef]) extends Positioned
+
+/** `x -> x + 1` — a closure literal (`12 §5`). The body is a statement list for the same reason a
+ * function's is: an indented block's trailing expression is its value, and the `= expr` short form
+ * is that list with one statement in it.
+ */
+case class Lambda(params: List[LambdaParam], body: List[Stmt]) extends Expr
+
 /** `[a, b, c]` — an array literal, whose length is how many elements were written. An empty
  * one has no element type of its own and takes it from the context.
  */
@@ -151,6 +162,9 @@ sealed trait TypeRef extends Positioned {
     case ArrayType(Some(_), elem)         => s"[…]${elem.show}"
     case TupleType(parts, false)          => s"(${parts.map(_.show).mkString(", ")})"
     case TupleType(parts, true)           => parts.map(_.show).mkString(", ")
+    case FnType(List(one), ret, true)     => s"${one.show} -> ${ret.show}"
+    case FnType(params, ret, true)        => s"(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
+    case FnType(params, ret, false)       => s"Fn(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
 }
 
 /** A named type, optionally applied to type arguments: `int`, `Box[int]`,
@@ -181,6 +195,26 @@ case class ResultList(values: List[Expr]) extends Expr
  * type in parentheses, and a product of one thing is the thing.
  */
 case class TupleType(parts: List[TypeRef], results: Boolean = false) extends TypeRef
+
+/** The type of a callable (`12 §6`) — the parameters it is called with and the result it yields.
+ *
+ * One node covers both spellings because they name the same thing. `Fn(int) -> int` writes the
+ * trait out; `int -> int` is the sugar a *parameter* may use, and `bare` records which was written
+ * so the analyzer can hold the sugar to the one position it is allowed in. Neither is a type on its
+ * own — a bare arrow becomes a bounded type parameter and a written `Fn` becomes a trait — so what
+ * reaches here is always resolved in the light of where it stands.
+ */
+case class FnType(params: List[TypeRef], ret: TypeRef, bare: Boolean) extends TypeRef {
+
+  /** The trait this names, written the way an ordinary applied trait is: the parameters and then
+   * the result, under the name that carries the arity (`Fn2[A, B, R]`).
+   *
+   * Every walk over written types goes through this rather than growing a case of its own, which is
+   * what keeps a callable's type from needing a second answer to questions — does it name this type
+   * parameter, does it mention `Self` — that the applied form already answers.
+   */
+  def asTrait: NamedType = NamedType(Type.Fn.base(params.length), params :+ ret).setPos(pos)
+}
 
 /** A trait as a **bound** names it: `Show`, or `From[int]` where the trait takes parameters of its
  * own. It is not a `TypeRef` — a trait is not a type, and the one thing that may stand here is a

@@ -15,7 +15,7 @@ package io.github.edadma.sysl
  * desugarings onto a `Display`, and what keeps them here is the sink each supplies — standard output
  * for `print`, a fresh buffer for `str` and `format` — neither of which the prelude can name yet.
  */
-trait SpecialForms extends CallAnalysis {
+trait SpecialForms extends Closures {
 
   /** `print(a, b, …)` — each value rendered by the prelude function its type reaches, a space
    * between and a newline at the end.

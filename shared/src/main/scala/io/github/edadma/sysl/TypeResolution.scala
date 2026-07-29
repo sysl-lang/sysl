@@ -90,6 +90,8 @@ trait TypeResolution extends ImportResolution {
     case WeakType(inner)                    => WeakType(spellSelf(inner, selfRef))
     case ArrayType(len, elem)               => ArrayType(len, spellSelf(elem, selfRef))
     case TupleType(parts, r)                => TupleType(parts.map(spellSelf(_, selfRef)), r)
+    case f: FnType =>
+      f.copy(params = f.params.map(spellSelf(_, selfRef)), ret = spellSelf(f.ret, selfRef))
 
   /** Whether a written type names any of the parameters being solved, and so is not yet a type.
    *
@@ -102,6 +104,7 @@ trait TypeResolution extends ImportResolution {
     case WeakType(inner)    => mentions(inner, tps)
     case ArrayType(_, elem) => mentions(elem, tps)
     case TupleType(parts, _) => parts.exists(mentions(_, tps))
+    case f: FnType          => mentions(f.asTrait, tps)
 
   /** Resolves one bound — a trait, with whatever arguments it was applied to — under the
    * substitution the declaration that wrote it is being read at.
@@ -281,6 +284,21 @@ trait TypeResolution extends ImportResolution {
     // field is — a `unit` part included, which the layout skips and the parts after it shift past.
     case TupleType(parts, false) => tupleType(parts.map(resolveType(_, subst)))
 
+    // A callable is not a type: it is a trait, and a trait stands where a type does only behind a
+    // mode sigil. The bare arrow is the sugar a **parameter** may use, and it never reaches here —
+    // a parameter reads it before resolving one — so what is left to say is that a slot needing a
+    // concrete type needs the box the `&` denotes (`12 §6`).
+    case f: FnType =>
+      checkFnArity(f)
+
+      if f.bare then
+        err(s"'${f.show}' is a callable a function is passed and does not keep, which only a " +
+          s"parameter may be — anywhere a concrete type is required, a callable is boxed, so " +
+          s"write '&Fn(${f.params.map(_.show).mkString(", ")}) -> ${f.ret.show}'")
+      else
+        err(s"'${f.show}' is a trait, and a trait is a type only behind a mode — write " +
+          s"'&${f.show}' for the boxed callable a concrete slot takes")
+
     // A result list reaches here only where a *type* was asked for, which is everywhere but a
     // function's result — and the fix is the type that has the same parts.
     case TupleType(parts, true) =>
@@ -393,6 +411,11 @@ trait TypeResolution extends ImportResolution {
    */
   private def traitObject(inner: TypeRef, subst: Map[String, Type], sigil: String): Option[Type.Trait] =
     inner match
+      // A callable behind a mode is a trait object of the call trait, and everything that makes one
+      // — object safety, the arguments, the table — is the same question asked of the same shape.
+      case f: FnType =>
+        checkFnArity(f)
+        at(f.pos)(traitObject(f.asTrait, subst, sigil))
       case NamedType(n, argRefs) if traitKey(n).isDefined && !(argRefs.isEmpty && subst.contains(n)) =>
         val key     = traitKey(n).get
         val decl    = traitDecls(key)
@@ -455,6 +478,17 @@ trait TypeResolution extends ImportResolution {
           s"has forgotten which type that is — so there is no $obj to form")
   }
 
+  /** Holds a written callable to an arity the prelude declares a call trait for.
+   *
+   * The limit is the prelude's and not the language's, so what it says is where to go next: a
+   * callable this wide is a signature nobody reads, and a struct of the arguments names them.
+   */
+  protected def checkFnArity(f: FnType): Unit =
+    if f.params.length > Type.Fn.maxArity then
+      at(f.pos)(err(s"a callable takes up to ${Type.Fn.maxArity} parameters and this one takes " +
+        s"${f.params.length} — a call this wide reads better with the arguments named, so pass a " +
+        "struct of them"))
+
   /** Whether a written type names `Self` anywhere inside it. */
   protected def mentionsSelf(t: TypeRef): Boolean = t match
     case NamedType(n, args) => n == selfName || args.exists(mentionsSelf)
@@ -463,6 +497,7 @@ trait TypeResolution extends ImportResolution {
     case WeakType(i)        => mentionsSelf(i)
     case ArrayType(_, e)    => mentionsSelf(e)
     case TupleType(parts, _) => parts.exists(mentionsSelf)
+    case f: FnType          => mentionsSelf(f.asTrait)
 
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
    * whatever type is currently being laid out.
@@ -941,6 +976,11 @@ trait TypeResolution extends ImportResolution {
         case t: Type.Tuple if t.targs.length == parts.length =>
           parts.zip(t.targs).foreach { case (r, a) => unify(r, a, tparams, sub) }
         case _ => ()
+    // A callable's parameters and result are matched through the trait they name, so a `&Fn(A) -> R`
+    // parameter binds `A` and `R` from a `&Fn(int) -> bool` argument exactly as any other applied
+    // trait binds its arguments. A closure's own type is a struct that says nothing about either, so
+    // what settles a *bare* arrow's parameters is the call's own inference and not this.
+    case f: FnType => unify(f.asTrait, actual, tparams, sub)
     // A trait never binds a type parameter. `f[T](p: *T)` handed a `*Writer` would otherwise
     // instantiate at a type with no layout, and the body could then write `var v: T` for a value
     // that cannot exist; leaving it unsolved reports the inference failure instead.
@@ -957,6 +997,10 @@ trait TypeResolution extends ImportResolution {
           argRefs.zip(s.targs).foreach { case (r, t) => unify(r, t, tparams, sub) }
         case e: Type.Enum if key.contains(e.base) && e.targs.length == argRefs.length =>
           argRefs.zip(e.targs).foreach { case (r, t) => unify(r, t, tparams, sub) }
+        // A trait applied to arguments binds them the way a generic type does — what a trait cannot
+        // do is bind a parameter to *itself*, which is the case above.
+        case t: Type.Trait if traitKey(n).contains(t.name) && t.args.length == argRefs.length =>
+          argRefs.zip(t.args).foreach { case (r, a) => unify(r, a, tparams, sub) }
         case _ => ()
 
   /** Solves a generic declaration's type arguments from the argument types, falling back to

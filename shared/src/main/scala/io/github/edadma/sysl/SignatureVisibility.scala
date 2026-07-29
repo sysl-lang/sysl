@@ -201,6 +201,9 @@ trait SignatureVisibility extends TypeResolution {
     case WeakType(inner)    => namesIn(inner, skip)
     case ArrayType(_, elem) => namesIn(elem, skip)
     case TupleType(parts, _) => parts.flatMap(namesIn(_, skip))
+    // A callable mentions the prelude's call trait, which is public and is nobody's to hide; what a
+    // signature can expose through one is its parameters and its result, so those are what is walked.
+    case f: FnType           => (f.params :+ f.ret).flatMap(namesIn(_, skip))
 
   /** The declaration a name in a type position stands for: a struct, an enum, or — behind a memory
    * mode, where a trait object writes one — a trait.

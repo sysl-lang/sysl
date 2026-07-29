@@ -151,6 +151,29 @@ object Type {
       throw new IllegalStateException(s"the trait '$name' reached codegen as a type of its own")
   }
 
+  /** The call trait a callable's type names (`12 §6`), which the prelude declares one of per arity.
+   *
+   * The arity is in the name for the reason a tuple's is in its base: one declaration cannot promise
+   * a `call` of an arity it does not know, so each arity is its own trait and each is written out.
+   * Nothing about that is visible in a program, which spells every one of them `Fn(A, B) -> R`.
+   */
+  object Fn {
+
+    /** The trait a callable of `n` parameters implements. */
+    def base(n: Int): String = s"Fn$n"
+
+    /** How many parameters the widest declared call trait takes. Past this the prelude has nothing
+     * to offer and the diagnostic says so, exactly as it does for a tuple too wide to compare.
+     */
+    val maxArity = 4
+
+    /** The parameter and result types of an applied call trait, or `None` for any other trait. The
+     * arguments are the parameters and then the result, so the split is the last one off the end.
+     */
+    def parts(name: String, args: List[Type]): Option[(List[Type], Type)] =
+      Option.when(Modules.bare(name).matches("""Fn\d+""") && args.nonEmpty)((args.init, args.last))
+  }
+
   /** The layout of a trait object: the method table for the type it forgot, and the value itself.
    * Two words rather than one, which is the whole of what a `dyn` keyword would have announced.
    */

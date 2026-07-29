@@ -890,6 +890,8 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
       TStructNew(want, ts)
 
+    case l: Lambda => analyzeLambda(l, expected)
+
     // `(a, b)` — a tuple, built exactly as a struct is: the parts are the fields, in the order they
     // were written. What each part is *wanted* at comes from the tuple being asked for, which is
     // what lets `var p: (i8, i8) = (1, 2)` narrow its literals the way a struct's fields do.

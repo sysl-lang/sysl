@@ -666,6 +666,7 @@ trait HoistMembers extends TypeResolution {
     case WeakType(inner)     => subjectHomes(inner)
     case ArrayType(_, elem)  => subjectHomes(elem)
     case TupleType(parts, _) => Set(None) ++ parts.flatMap(subjectHomes)
+    case f: FnType           => subjectHomes(f.asTrait)
 
   /** A resolution made only to ask where a name lives, which is not the place a name that resolves
    * to nothing is worth reporting from — a scalar and a block's own type parameter both answer

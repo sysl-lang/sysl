@@ -107,7 +107,40 @@ class SyslParser(val source: Source) extends PackratParsers {
    * value they are written after. An operand with no `match` behind it is that operand, so this
    * alternative is also the ordinary fall-through to `assignment`.
    */
-  lazy val expression: PackratParser[Expr] = at(ifExpr | whileExpr | loopExpr | forExpr | matchExpr)
+  lazy val expression: PackratParser[Expr] = at(lambda | ifExpr | whileExpr | loopExpr | forExpr | matchExpr)
+
+  /** `x -> x + 1` — a closure literal (`12 §5`).
+   *
+   * It sits at the top of the expression grammar because its body extends as far to the right as an
+   * expression can: `x -> x + 1` is a closure over the sum, not a closure over `x` added to `1`.
+   *
+   * Nothing else in the grammar begins with a name or a parenthesized list and then an arrow, so the
+   * commitment is the `->` and the alternatives below are reached by an ordinary backtrack. A match
+   * arm is not a competitor even though it is written with the same token: an arm's left side is a
+   * *pattern*, parsed by its own production, and only the arm's body is an expression.
+   */
+  private lazy val lambda: PackratParser[Expr] =
+    lambdaParams ~ (op("->") ~> lambdaBody) ^^ { case ps ~ b => Lambda(ps, b) }
+
+  /** One parameter with no parentheses, or a parenthesized list of them — including the empty list,
+   * which is the one arity that has nowhere else to be written (`12 §5`).
+   */
+  private lazy val lambdaParams: Parser[List[LambdaParam]] =
+    op("(") ~> commaList(lambdaParam) <~ op(")") |
+      at(ident ^^ (n => LambdaParam(n, None))) ^^ (List(_))
+
+  /** A closure's parameter: a name, and a type only where there is nothing to infer one from. The
+   * annotation is written inside the parentheses and nowhere else, so `x: int -> …` is not a second
+   * spelling of `(x: int) -> …` waiting to disagree with it.
+   */
+  private lazy val lambdaParam: Parser[LambdaParam] =
+    at(ident ~ opt(op(":") ~> typeRef) ^^ { case n ~ t => LambdaParam(n, t) })
+
+  /** A closure's body, which is a function's body without the `=`: an expression, or an indented
+   * block whose trailing expression is the value.
+   */
+  private lazy val lambdaBody: PackratParser[List[Stmt]] =
+    suite | expression ^^ (e => List(ExprStmt(e).setPos(e.pos)))
 
   private def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))
@@ -488,14 +521,37 @@ class SyslParser(val source: Source) extends PackratParsers {
    * genuine back-reference (`03`) is better read than punctuated.
    */
   private lazy val typeRef: Parser[TypeRef] =
+    at(coreType ~ opt(op("->") ~> typeRef) ^^ {
+      case t ~ None                        => t
+      case TupleType(parts, false) ~ Some(r) => FnType(parts, r, bare = true)
+      case t ~ Some(r)                     => FnType(List(t), r, bare = true)
+    })
+
+  /** A type with no arrow on it — everything a bare-arrow callable is written *out of*.
+   *
+   * The arrow is a suffix on this rather than an alternative among these, so `(A, B) -> C` reads its
+   * left side as the parenthesized list it looks like and only then learns it was a parameter list.
+   * That is what keeps one production for `(A, B)` whether a tuple or a callable was meant, and it
+   * is why the two cannot disagree about how a comma inside parentheses is read.
+   */
+  private lazy val coreType: Parser[TypeRef] =
     at(
-      op("*") ~> typeRef ^^ PtrType.apply |
-        op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
-        op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
+      // `Fn(A) -> R`, the callable's type written out (`12 §6`). It comes first because `Fn` is an
+      // ordinary identifier: without this the name alternative below would take it and leave the
+      // parameter list stranded.
+      (fnWord ~> op("(") ~> commaList(typeRef) <~ op(")")) ~ (op("->") ~> typeRef) ^^ {
+        case ps ~ r => FnType(ps, r, bare = false)
+      } |
+        // `() -> R` — a callable of no arguments. Empty parentheses are not a type, so this is the
+        // one place they may be written, and the arrow is what says so.
+        (op("(") ~> op(")") ~> op("->") ~> typeRef) ^^ (r => FnType(Nil, r, bare = true)) |
+        op("*") ~> coreType ^^ PtrType.apply |
+        op("&") ~> softSync ~> coreType ^^ (t => RefType(t, sync = true)) |
+        op("&") ~> coreType ^^ (t => RefType(t, sync = false)) |
         op("weak") ~> softSync ~> err("an atomic reference has no weak form yet — 'weak sync T' " +
           "wants the concurrency model of '06', which is not built") |
-        op("weak") ~> typeRef ^^ WeakType.apply |
-        (op("[") ~> opt(expression) <~ op("]")) ~ typeRef ^^ { case n ~ t => ArrayType(n, t) } |
+        op("weak") ~> coreType ^^ WeakType.apply |
+        (op("[") ~> opt(expression) <~ op("]")) ~ coreType ^^ { case n ~ t => ArrayType(n, t) } |
         tupleType |
         qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
     )
@@ -532,6 +588,12 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   private lazy val softSync: Parser[Unit] =
     accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
+
+  /** `Fn` stays a soft word for the reason `sync` does: it is only special immediately before a
+   * parenthesized parameter list, so a program with a type of its own named `Fn` still parses.
+   */
+  private lazy val fnWord: Parser[Unit] =
+    accept("'Fn'", { case t: lexical.Identifier if t.chars == "Fn" => () })
 
   /** A type-parameter list where a parameter may carry a trait bound: `[T, U: Show, V: Ord + Hash]`.
    * It yields the parameter names alongside a name-keyed map of the bounds, so an unbounded

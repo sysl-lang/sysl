@@ -46,6 +46,9 @@ object Modules {
   /** The module a key belongs to. */
   def moduleOf(key: String): String = split(key)._1
 
+  /** The declared name in a key, with the module it belongs to taken off. */
+  def bare(key: String): String = split(key)._2
+
   /** A key as a diagnostic spells it: the separator read back as the dot a programmer writes.
    *
    * Two keys can share a spelling — `geom`'s `Point.dist` and `geom.Point`'s `dist` both read as
