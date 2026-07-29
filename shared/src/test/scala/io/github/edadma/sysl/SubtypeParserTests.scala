@@ -91,9 +91,18 @@ class SubtypeParserTests extends AnyFreeSpec with ParseSupport {
   // An array bound may name a `const`, which is what `const` exists for; a `within` bound may not,
   // because the grammar takes a literal there. So a table's size and the range of the type that
   // indexes it are written down separately and nothing checks that the two agree.
-  "a within bound is a literal and may not name a const" in {
-    progError("""const n: usize = 8
-                |type Slot = new u8 within 0..<n
-                |""".stripMargin) should include("newline expected")
+  //
+  // Whether the restriction should stay is open (`16 § Open b`), but the message is not: the bare
+  // "newline expected" this used to give points past the end of the line and names neither the
+  // rule nor the name that broke it.
+  "a within bound is a literal, and says so where the name is written" in {
+    val e = progError("""const n: usize = 8
+                        |type Slot = new u8 within 0..<n
+                        |""".stripMargin)
+
+    e should include("a 'within' bound is a literal, and 'n' is a name")
+    e should not include "newline expected"
+
+    progError("type Slot = u8 within lo..9") should include("'lo' is a name")
   }
 }

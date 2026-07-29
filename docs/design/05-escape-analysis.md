@@ -252,11 +252,14 @@ differently:
 
 ## Deferred
 
-- **Escaping closures** are stated in `capabilities.md` as heap-boxed and are governed by this
-  same analysis; the closure design is now written (`12 §5–§8`, and `§5a` for the named form) and
-  not yet built. When it lands, the per-parameter "does the callee keep it" bit should cover
-  captured closures with no separate mechanism, and the buffer machinery promotion uses is the
-  representation an escaping closure needs.
+- ~~**Escaping closures.**~~ **Built (`12 §5–§8`, `§5a`), and this analysis was not asked to learn
+  anything.** A closure is a struct plus an implementation of its call trait, so an escaping one is
+  an escaping value of an ordinary type and the box it needs is the box any `&T` needs. The
+  per-parameter "does the callee keep it" bit was expected to have to cover captured closures and
+  does not have to: the positions requiring a boxed `&Fn` and the positions that escape are the
+  same set, so the *type* already says which representation was chosen and no analysis is consulted
+  (`12 §8`). What does compose here, with nothing added on either side, is an escaping closure over
+  a local array's slice — the array is promoted exactly as it would be without the closure.
 - **Precision of the result summary.** "Which parameters the result may view" is a set; the
   first implementation may collapse it to "any parameter," which costs precision only for a
   function that both takes a stack-backed slice and returns an unrelated fresh one. Refine if

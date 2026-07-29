@@ -916,9 +916,19 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   private lazy val whereClause: Parser[Expr] = whereKw ~> expression
 
-  /** A bound of a `within` range: a character literal, or a numeric literal with an optional sign. */
+  /** A bound of a `within` range: a character literal, or a numeric literal with an optional sign.
+   *
+   * A name is the thing somebody writes here and cannot: an array bound may be a `const`
+   * (`[max_tasks]Task`) and a range bound may not, so a table's size and the range of the type
+   * indexing it are written twice with nothing checking they agree (`13 §7`, `16 § Open b`). The
+   * restriction is not settled, but the message a bare grammar failure gives — "newline expected",
+   * pointing past the end of the line — is the wrong shape whether it stays or goes.
+   */
   private lazy val boundLit: Parser[Expr] =
-    charLit | op("-") ~> (floatLit | intLit) ^^ (Unary("-", _)) | floatLit | intLit
+    charLit | op("-") ~> (floatLit | intLit) ^^ (Unary("-", _)) | floatLit | intLit |
+      guard(ident) >> (n => err(s"a 'within' bound is a literal, and '$n' is a name — a constant cannot " +
+        "stand in a range yet, so the number has to be written out here as well as wherever the " +
+        "constant is used"))
 
   private lazy val newKw: Parser[Unit]    = softWord("new")
   private lazy val withinKw: Parser[Unit] = softWord("within")

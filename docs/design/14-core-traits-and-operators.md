@@ -515,11 +515,14 @@ exactly (`§5`), one row further down the catalog.
   trait is not built**: `b[a..b]` would want a range as the index argument, and a range is not yet a
   type a program can name.
 
-  **One customer this does not reach, and it is worth saying which.** `guide/png` reads a pixel as
-  `img.at(x, y)` — two indices, which a subscript taking one argument cannot spell. The shapes it
-  could take are a tuple (sysl has none), a variadic index (an index list is not a value), or a
-  second trait per arity. None of the three is obviously right and nothing is blocked on it, so the
-  two-argument accessor stays a method.
+  **The customer this did not reach is reached now, and by the first shape considered.** `guide/png`
+  reads a pixel as `img.at(x, y)` — two indices, which a subscript taking one argument cannot
+  spell. Three shapes were weighed: a tuple, which sysl did not then have; a variadic index, which
+  an index list cannot be; and a second trait per arity. **Tuples arrived (`00 §13`) and answered it
+  with nothing added here**, because the index is the trait's own argument: `impl Index[(int, int),
+  E]` reads by a pair, `IndexSet` writes by one, and `img[(x, y)]` is ordinary. The other two shapes
+  are not wanted — a per-arity trait is the tuple's arity written into a name, which is the trade
+  `00 §13` already made once and lost.
 
 - **~~The iteration protocol.~~ Built, and `s.chars` is what decided its shape.**
 

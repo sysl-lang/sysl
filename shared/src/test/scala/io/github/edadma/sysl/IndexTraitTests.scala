@@ -353,6 +353,24 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(e["answer"], e[false])""".stripMargin) shouldBe "42 0\n"
     }
 
+    // The index is the trait's own argument and is not held to being an integer, so a container
+    // read by a pair is read by a *tuple*, and the two-index accessor `14` said a subscript could
+    // not spell is ordinary. It needed nothing of `Index`: the shape arrived when tuples did.
+    "a container read by two indices is read by a tuple" in {
+      run("""struct Img
+            |    w: int
+            |    cells: [6]int
+            |impl Index[(int, int), int] for Img
+            |    index(self, at: (int, int)) -> int = self.cells[at.1 * self.w + at.0]
+            |impl IndexSet[(int, int), int] for Img
+            |    index_set(*self, at: (int, int), v: int)
+            |        self.cells[at.1 * self.w + at.0] = v
+            |var i = Img(3, [1, 2, 3, 4, 5, 6])
+            |print(i[(2, 1)])
+            |i[(0, 0)] = 60
+            |print(i[(0, 0)], i[(1, 0)])""".stripMargin) shouldBe "6\n60 2\n"
+    }
+
     // Two implementations, and an index that names neither: reported rather than resolved by a
     // preference rule, which is the same answer a call with the same ambiguity gets.
     "an index that names no implementation is reported" in {

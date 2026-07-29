@@ -216,11 +216,11 @@ be declared before it is used — a local is a sequenced statement, not a hoiste
 
 ---
 
-The rest of this chapter is design for a feature **not yet built**. A closure is a function
-value carrying an environment; the three questions it raises are how it is *written*, what
-*type* it has, and how *capture* interacts with the memory model. Each is answered so that the
-implementation, when it lands, has a target — and so that `05` and `capabilities.md`, which
-already assume closures, name something defined.
+The rest of this chapter is closures, and all of it is **built**. A closure is a function value
+carrying an environment; the three questions it raises are how it is *written*, what *type* it
+has, and how *capture* interacts with the memory model. The answers below are what the
+implementation does, and `05` and `capabilities.md`, which already assumed closures, name
+something that exists.
 
 ## 5. Closure literals — the arrow form
 
