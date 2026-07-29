@@ -325,7 +325,8 @@ implementation:
   array now moves the array to a buffer instead of being refused, so a program that means to return
   one writes the ordinary `var buf: [64]u8` and says nothing. What is still refused is storage the
   body did not declare: an array a caller passed by value, and an array that is a field of a value.
-  `--explain-escapes` is now meaningful and is the remaining unbuilt piece of `05`.
+  `--explain-escapes` became meaningful with it and is built too, so what `05` has left is its two
+  sanctioned deferrals rather than a piece of this.
 - ~~**Slicing a fixed array inside a `&Struct`**~~ (`05`) — **built.** It was never an escape: the
   storage is on the heap the moment the struct is, and the view names the box the walk to the field
   went through as its owner. A field of a struct on the *frame* is still refused, which is the
