@@ -42,6 +42,26 @@ case class Environment(
  * lives, so shadowing, assignment, and a closure inside a closure are the ordinary cases of rules
  * that already hold rather than three more things for the walk to get right.
  */
+object Closures {
+
+  /** What every closure struct's base name begins with. It holds a `$`, which no identifier and no
+   * module name may, so nothing a program can write collides with one — the same reason a tuple's
+   * base holds one (`00 §13`).
+   */
+  private val prefix = s"${Modules.sep}closure"
+
+  /** The base name of the struct one closure literal lowers to. */
+  def base(n: Int): String = s"$prefix$n"
+
+  /** Whether a type is the struct behind a closure literal — something a program wrote and did not
+   * name. What a reader is told about one has to say "closure" and "captures", never the name the
+   * compiler filed it under (`12 §6`).
+   */
+  def literal(t: Type): Boolean = t match
+    case s: Type.Struct => s.base.startsWith(prefix)
+    case _              => false
+}
+
 trait Closures extends CallAnalysis {
 
   /** How many closures have been lowered, which is what makes each one's name its own. */
@@ -90,10 +110,7 @@ trait Closures extends CallAnalysis {
     val captured = captures(body, names.toSet)
     val fields   = captured.map(n => (n, lookupOpt(n).get._2))
 
-    // The base name holds a `$`, which no identifier and no module name may, so nothing a program
-    // can write collides with one and nothing looks one up among the declarations — the same reason
-    // a tuple's base holds one (`00 §13`).
-    val struct = Type.Struct(s"${Modules.sep}closure$closureCount", Nil)
+    val struct = Type.Struct(Closures.base(closureCount), Nil)
 
     closureCount += 1
     struct.fields = fields

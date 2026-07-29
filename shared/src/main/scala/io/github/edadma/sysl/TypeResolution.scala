@@ -50,6 +50,26 @@ trait TypeResolution extends ImportResolution {
   /** The substitution that gives `Self` its meaning, for the one type it currently stands for. */
   protected def selfBinding(t: Type): Map[String, Type] = Map(selfName -> t)
 
+  /** Whether every declared type's fields are in, which is when a `&sync T` can be held to what
+   * `06` asks of `T`. It is false while the file is still being hoisted for the reason
+   * `implsHoisted` is: a type that reaches itself through a `&sync` field is being resolved at the
+   * moment its own field list is still empty, so asking then would find nothing in the way of
+   * anything.
+   */
+  protected var typesHoisted: Boolean = false
+
+  /** The pointees of `&sync T` types written before that question could be answered, each with the
+   * position to report against. Drained once, as soon as the answer is available.
+   */
+  protected val sharedChecks = mutable.ListBuffer.empty[(Type, Option[Pos])]
+
+  /** Holds a `&sync T` to `06`'s rule about what `T` may contain — now if the types are all in, and
+   * after hoisting if they are not.
+   */
+  protected def checkShared(inner: Type): Unit =
+    if typesHoisted then Sharing.complaint(inner).foreach(err)
+    else sharedChecks += ((inner, currentPos))
+
   /** `Self` standing in for itself, for the checks a trait's own declaration can run before any type
    * has implemented it. A requirement's arguments have to resolve for the declaration to be checked
    * at all, and here the implementing type is precisely what is not yet known — so it is treated as
@@ -261,9 +281,17 @@ trait TypeResolution extends ImportResolution {
     case PtrType(inner) =>
       traitObject(inner, subst, "*")
         .fold(Type.Ptr(addressable(underIndirection(resolveType(inner, subst)), "'*'")))(Type.Ptr.apply)
+    // An atomic reference promises that a second domain may hold the object, which is a promise
+    // about everything the object holds (`06 § &sync T`). A trait object is the one shape whose
+    // contents are not known here — the type it forgot is settled where a value is erased into one,
+    // and that is where it is asked.
     case RefType(inner, sync) =>
-      traitObject(inner, subst, "&")
+      val t = traitObject(inner, subst, "&")
         .fold(Type.Ref(addressable(underIndirection(resolveType(inner, subst)), "'&'"), sync))(Type.Ref(_, sync))
+
+      if sync && !t.inner.isInstanceOf[Type.Trait] then checkShared(t.inner)
+
+      t
 
     case WeakType(inner) =>
       traitObject(inner, subst, "weak")

@@ -94,9 +94,14 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
       err("var n = 1\nvar p = &n\nprint(p < p)") should include("'<' is not defined for *int")
     }
 
+    // Distinct in both directions, and the complaint says why rather than reporting two unrelated
+    // type names: what a reader wants to know is that atomicity is fixed at the allocation (`06`).
     "the two reference modes are distinct types" in {
       err("f(p: &int) -> &int = p\ng(p: &sync int) -> &int = f(p)") should
-        include("is &int, but &sync int was given")
+        include("'&int' and '&sync int' are distinct types, and neither converts to the other")
+
+      err("f(p: &sync int) -> int = 1\ng(p: &int) -> int = f(p)") should
+        include("Allocate int as a '&sync int' where it is constructed")
     }
   }
 

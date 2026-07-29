@@ -82,6 +82,10 @@ same choice every parameter makes, and it says how the method takes the instance
 | `&self` | `self: &T` | the **ARC reference** | operating on a shared heap object |
 | `&sync self` | `self: &sync T` | the atomic ARC reference | the same, across threads (`06`) |
 
+A `&sync self` is a `&sync T` like any other, so it is held to what `06` asks of a shared object:
+a member written with that receiver on a type nothing may share is a member no call could reach,
+and it is refused at the receiver rather than at the first call site.
+
 There is no `&mut self` and no `mut` anywhere, because sysl has no borrow checker to make one
 mean something. Mutation of a receiver is mutation through a place or a pointer, exactly as it
 is everywhere else in the language: `*self` hands the method a raw pointer whose pointee it may

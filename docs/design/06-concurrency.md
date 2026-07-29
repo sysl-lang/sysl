@@ -1,7 +1,8 @@
 # Concurrency
 
-**Status:** model decided. This closes the last item `03` left open. It rests on the memory
-model — the whole design follows from one fact about it, stated first.
+**Status:** model decided, and the half the language has to enforce is built — `&sync T` and what
+it may point at. The rest is library surface this document defers. It rests on the memory model —
+the whole design follows from one fact about it, stated first.
 
 ## The constraint that decides everything
 
@@ -55,13 +56,21 @@ What may cross is decided structurally, with no trait system and nothing to writ
 - a struct, enum, or fixed array whose every field is crossable;
 - an immortal slice or `string` — static data and literals, whose `owner` is null (`03`);
 - a heap-backed slice or `string`, which crosses **by copying its bytes**;
-- a `&sync T` (below).
+- a `&sync T` (below);
+- a `*T`, which carries no count to make atomic. It is the unsafe tier, and "How strong this is"
+  below already names it as one of the two ways a program shares on purpose — leaving it off this
+  list would have made that sentence untrue.
 
 What may not cross is a plain `&T`, a `weak T`, or any type containing one: those carry a
 non-atomic refcount, and two domains touching it is exactly the race the model exists to
 prevent. This is Swift's `Sendable`, derived the way Swift derives it for value types —
 structurally, from the fields — but without the protocol, because sysl needs no user-written
 conformances for it.
+
+**Where this rule is enforced is a channel**, and channels are library surface this document
+defers — so the crossing rule is specification and has no check behind it yet. What *is* built is
+the stricter rule the next section states, because that one has a place to be asked: the point a
+`&sync T` is written.
 
 ## `&sync T` — the deliberate exception
 
@@ -81,11 +90,44 @@ Rust — with the difference that here it is a sigil rather than a wrapper type,
 what it is and costs no ceremony (principle 3). `weak sync T` is the matching weak form and
 pairs only with `&sync T`.
 
+Mixing them is refused by the rule that two unrelated types do not convert, which is true and says
+nothing a reader wants to know — so it has a complaint of its own, naming the allocation as the
+place the choice was made and the spelling to make it at.
+
 For a `&sync T` to be sound, **`T` must itself be shareable**: every field crossable, and no
-plain `&T`, `weak T`, or heap-backed slice or string among them. A heap-backed string inside a
-shared object would put a non-atomic buffer refcount under two threads — the same race one
-level down. Immortal strings are fine, which covers the common case of a name or a fixed
-message.
+plain `&T`, `weak T`, slice, or string among them. A heap-backed string inside a shared object
+would put a non-atomic buffer refcount under two threads — the same race one level down.
+
+**An immortal string would be safe and is refused anyway, because nothing in the type says which
+kind it is.** An earlier draft of this paragraph said immortal strings were fine, "which covers the
+common case of a name or a fixed message" — and that sentence presupposed a distinction the
+language does not draw. A `string` is one type whether its bytes are a literal's or a buffer's;
+which it holds is a property of the value, decided at run time by whether the owner word is null
+(`03`). So the rule as drafted could not be applied to a *type*, and the strict half is what is
+enforced: a shared object holds no view at all. The same is true of `[]T`.
+
+What would lift it is not a rule about strings but the **read-only view type** `07 § Not yet`
+already wants — a `[]T` whose type records something about the storage it views. An immortal view
+is one such fact, and a view of a `&sync` buffer is another; both are the same missing thing, and
+neither should be invented here.
+
+**The walk stops at two places, and both are the same argument ARC already makes.** A `&sync U`
+inside a shared object is a leaf, because whatever *that* type reaches was settled where it was
+written; a `*U` is a leaf because it has no count. Everything else — fields, array elements, tuple
+parts, every variant's payload — is walked, and the complaint names the whole path to what is in
+the way, since naming only the type would leave a reader searching a struct they may not have
+written.
+
+**A trait object is asked where the type it forgot is known.** `&sync Show` says nothing about
+what it points at, so the question cannot be asked at the type; it is asked at each point a value
+is erased into one, and what it names is the concrete type. **A closure literal is asked about its
+captures** — it is a struct whose fields are exactly what it captured (`12 §8`), so it needs no
+rule of its own, only a complaint that says "closure" and "captures" rather than the name the
+compiler filed it under.
+
+**A generic pointee is a question about the argument, not the parameter.** `&sync Box[int]` shares
+and `&sync Box[&Inner]` does not, and each instantiation resolves the type again, so each is
+asked separately.
 
 **`&sync T` makes the reference safe to share, not the object safe to mutate.** This is the
 single most important sentence in the document. The refcount is atomic; the fields are still
@@ -165,8 +207,8 @@ guarantee the language cannot keep:
 
 | | Checked | Not checked |
 |---|---|---|
-| crossing a domain | which values may cross, structurally | — |
-| refcount races | `&T` cannot cross; `&sync T` is atomic | — |
+| crossing a domain | which values may cross, structurally | — *(specified; the check lands with channels)* |
+| refcount races | what a `&sync T` may hold, structurally | — |
 | **mutating shared state** | — | **use a `Mutex`; nothing enforces it** |
 | the kernel tier | — | `*T`, spinlocks, orderings — as in C |
 
@@ -191,3 +233,11 @@ to do it.
   one is a compare-and-swap loop against a strong count another thread may be driving to zero, and
   nothing can race with it until this chapter is. It is refused where it is written, naming this
   document. Whatever lands here has to say what an upgrade racing a release means.
+
+- **The teardown worklist is a plain global.** `arc.reap` drains a list threaded through the dead
+  objects' own count slots, which is correct while drops are single-threaded and is not once two
+  domains can drop `&sync` structures at the same time. It has to become thread-local before the
+  first thread is spawned; the comment on `ArcEmitter.core` says so where the code is.
+
+- **A view that records something about its storage.** Shared above, with `07 § Not yet` — the same
+  missing type is what an immortal string and a `&sync` buffer's slice both want.

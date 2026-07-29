@@ -280,6 +280,16 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       err(s"a weak reference does not keep ${show(w.inner)} alive, and nothing else here holds this " +
         s"one — so it would be gone before it could be read. Hold it in a '&${Type.show(w.inner)}' " +
         "first, and weaken that")
+
+    // Two references to the same type that differ only in whether the count is atomic. The
+    // fall-through below would report them as the unrelated types they are, which is true and says
+    // nothing about the one thing a reader wants to know: why the two do not convert (`06 § &sync T`).
+    case Type.Ref(want, sync) if t.ty == Type.Ref(want, !sync) =>
+      err(s"'&${show(want)}' and '&sync ${show(want)}' are distinct types, and neither converts to " +
+        "the other: a count is atomic or it is not from the moment the object is allocated, and a " +
+        s"conversion would put an ordinary retain beside an atomic one. Allocate ${show(want)} as a " +
+        s"'&${if sync then "sync " else ""}${show(want)}' where it is constructed")
+
     case _ => t
 
   private def analyzeValue(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr =

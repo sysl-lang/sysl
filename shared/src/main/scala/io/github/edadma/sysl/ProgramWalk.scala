@@ -88,6 +88,15 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // about two declarations at a time, and either may be written below the other.
     checkExposedTypes()
 
+    // And what each `&sync T` promises about its pointee, which waits for the same reason a bound
+    // does: a type that reaches itself through a `&sync` field is resolved while its own field list
+    // is still being filled, so the question is held until every field is in (`06 § &sync T`).
+    typesHoisted = true
+    for (inner, pos) <- sharedChecks.toList do
+      currentPos = pos
+      recover(())(Sharing.complaint(inner).foreach(err))
+    sharedChecks.clear()
+
     // A type's members lower to ordinary functions under mangled names, registered here so a
     // method call and an associated-function call resolve exactly as a free call does.
     val members = mutable.ListBuffer.empty[FuncDecl]

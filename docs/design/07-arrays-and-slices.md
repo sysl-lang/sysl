@@ -332,7 +332,10 @@ implementation:
   unspecified aggregate-promotion question and not this one.
 - **Slicing a `&sync` buffer.** A `[]T` does not record whether its owner's count is atomic, so
   it cannot carry an owner that needs the atomic path. Rejected with a diagnostic until slices
-  distinguish the two.
+  distinguish the two. `06 § &sync T` now has a second customer for the same missing type, arrived
+  at from the opposite side: a shared object may hold no `string` and no `[]T` either, because a
+  view records nothing about whether the bytes it points at are a literal's — and an immortal one
+  would have been safe to share.
 - **Slicing a `val`.** The same gap seen from the other side: a `[]T` permits writes and records
   nothing about whose elements it views, so a view of read-only storage would be a way of writing
   it — and the view outlives the expression that made it, so there is nowhere to catch that later.

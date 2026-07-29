@@ -61,7 +61,13 @@ trait TraitObjects extends TypeResolution {
    */
   private def implements(tr: Type.Bound, t: Type): Boolean = conforms(tr, t)
 
-  private def erase(t: TExpr, tr: Type.Trait, inner: Type, want: Type, boxed: Boolean): TExpr =
+  private def erase(t: TExpr, tr: Type.Trait, inner: Type, want: Type, boxed: Boolean): TExpr = {
+    // A `&sync Trait` has forgotten what it points at, so what `06` asks of the pointee cannot be
+    // asked where the type is written. It is asked here, which is the one place the type is known.
+    want match
+      case Type.Ref(_, true) => at(t.pos)(Sharing.complaint(inner).foreach(err))
+      case _                 => ()
+
     if !implements(tr.bound, inner) then
       // A type an implementation covers is told what that implementation asked of it, since the
       // reason it does not conform is a condition rather than an absence.
@@ -70,6 +76,7 @@ trait TraitObjects extends TypeResolution {
       at(t.pos)(err(s"a ${show(want)} needs a type that implements '${tr.bound.show}', and " +
         s"${show(inner)} does not$why"))
     else TErase(t, vtableFor(tr, inner, boxed), want).setPos(t.pos)
+  }
 
   /** The method table for one type seen as one trait, registered the first time it is needed.
    *
