@@ -98,6 +98,13 @@ package io.github.edadma.sysl
  * already had the encoder for. `s.copy()` needs no declaration at all — it is bytes copied into a
  * string that owns them, which is `from_utf8_unchecked` of a string's own bytes.
  *
+ * **`char_from_u32` is the fallible half of `u32` → `char`** (`00 §1`), and it is a free function
+ * for the reason `from_utf8` is one: a scalar has no member namespace to hang a `char.try` on. It
+ * needs no unchecked primitive to sit on top of — the guard it writes and the check `char(u)`
+ * already makes are the same two comparisons on the same value, so the cast on the far side of the
+ * guard can never trip and the optimizer folds it. Trading a primitive for a redundant compare in
+ * a cold branch is the better side of that bargain.
+ *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
  * reaches it, a **member of a non-generic type declared here** is held back by that same
@@ -452,6 +459,13 @@ object Prelude {
       |            print("panic:", msg)
       |            exit(1)
       |end Result
+      |
+      |char_from_u32(u: u32) -> Option[char]
+      |    if u > 0x10FFFFu32 || (u >= 0xD800u32 && u <= 0xDFFFu32) then
+      |        None
+      |    else
+      |        Some(char(u))
+      |end char_from_u32
       |
       |struct Utf8Error
       |    offset: usize

@@ -289,8 +289,9 @@ column of §3's table being empty and being usable. Decide with `14 §7`.
 
 **b. A `within` bound may not name a `const`.** An array bound may (`[max_tasks]Task`); a range bound
 takes a literal, so a table's size and the range of the type that indexes it are written twice with
-nothing checking they agree. `13 §7` records it from the other side. The diagnostic is a bare
-"newline expected", which is the wrong shape of message even if the restriction stays.
+nothing checking they agree. `13 §7` records it from the other side. What is open is the
+restriction; the **diagnostic** names the rule and the name, at the name, which is the right shape
+of message whether the restriction stays or goes.
 
 **c. Invariants on a generic struct.** Refused with a clear message. The question is what a clause
 over a field of type `T` could even mean when nothing about `T` is known — most useful invariants

@@ -167,8 +167,17 @@ default the definition-time pass already reported is not reported again by each 
 What a default cannot do is stand in for the checks that need the *implementing* type. A body whose
 result disagrees with its declared type for reasons only a concrete type settles is caught where
 every other concrete mistake in a generic body is — at each type it is materialized for. A trait
-with no implementations therefore gets its bounds checked and nothing more, which is the same reach
-the definition-time pass has over a generic function nothing instantiates.
+with no implementations therefore gets its bounds checked and nothing about any concrete type, which
+is the same reach the definition-time pass has over a generic function nothing instantiates.
+
+**A signature is checked at the trait too, for the same reason and by a weaker rule.** Every other
+kind of member lowers to a function, whose signature is resolved when it is hoisted; a trait's
+members lower to nothing, so without a pass of their own the only thing that ever reads them is the
+conformance check an `impl` runs — and a trait nobody implements could promise a type that does not
+exist. What is checked is that every **name** written in one stands for something: `Self` and the
+trait's own parameters stand in for themselves, since that is precisely what the signature means. It
+holds for every implementing type, so nothing here can ask which one, and everything that needs to
+know stays with the conformance check.
 
 ## A trait may ask for a property
 

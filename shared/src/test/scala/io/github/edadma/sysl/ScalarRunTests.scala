@@ -134,4 +134,57 @@ class ScalarRunTests extends AnyFreeSpec with RunSupport {
       run("print(u32('A'), char(9731))") shouldBe "65 ☃\n"
     }
   }
+
+  /** `00 §1` gives `u32` → `char` two spellings by how trustworthy the value is. `char(u)` traps;
+   * `char_from_u32(u)` answers. It is a free function because a scalar has no member namespace for
+   * the `char.try` an earlier draft named — the obstacle `string.from_utf8` met.
+   *
+   * The three ways a `u32` fails to be a scalar value are what the tests are built around: past
+   * `0x10FFFF`, and either end of the surrogate range, whose interior is easy to get right by
+   * accident and whose boundaries are not.
+   */
+  "the fallible way from a codepoint" - {
+    "a valid scalar value comes back, and is the character it names" in {
+      ask("9731") shouldBe "9731\n"
+
+      run("""char_from_u32(9731u32) match
+            |    Some(c) -> print(c)
+            |    None -> print("no")""".stripMargin) shouldBe "☃\n"
+    }
+
+    "the highest scalar value comes back" in {
+      ask("1114111") shouldBe "1114111\n"
+    }
+
+    "one past the highest does not" in {
+      ask("1114112") shouldBe "no\n"
+    }
+
+    "a surrogate does not, at either end of the range" in {
+      ask("55296") shouldBe "no\n"
+      ask("57343") shouldBe "no\n"
+    }
+
+    // The values either side of the hole are the ones a `<`/`<=` slip moves, so they are what tells
+    // a correct guard from one that is one off at each end. Neither is printable, so each is read
+    // back as its own codepoint rather than as a glyph.
+    "and the values either side of the surrogates do" in {
+      ask("55295") shouldBe "55295\n"
+      ask("57344") shouldBe "57344\n"
+    }
+
+    // The trapping cast is the other spelling, and it has to keep trapping — a value this answered
+    // `None` for must not come back from that one.
+    "the trapping spelling still traps on what this refuses" in {
+      exits("print(char(1114112u32))")
+    }
+  }
+
+  /** Round-trips one `u32` through the fallible constructor, reading a success back as its own
+   * codepoint so an unprintable answer is still something a test can compare.
+   */
+  private def ask(u: String): String =
+    run(s"""char_from_u32(${u}u32) match
+           |    Some(c) -> print(u32(c))
+           |    None -> print("no")""".stripMargin)
 }

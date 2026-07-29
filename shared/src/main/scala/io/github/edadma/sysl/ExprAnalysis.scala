@@ -173,9 +173,9 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     checkInto(v, c)
   }
 
-  /** A constrained subtype's name with a member selected from it. The name is a **type**, so
-   * reporting it as an undefined *name* — which is what fell out of analyzing the receiver — was
-   * the one thing about it that was certainly false.
+  /** A constrained subtype's name with a member selected from it. The name is a **type**, and this
+   * case exists so that it is never reported as an undefined *name* — which is what analyzing the
+   * receiver would fall out to, and the one thing about a declared type that is certainly false.
    *
    * Three things could have been meant. A method or a property is reached on a value, exactly as a
    * struct's is. `try` is the one everybody writes first, because a simple enum has one, and the
@@ -206,9 +206,9 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
            else ""))
   }
 
-  /** A trait's name with a member selected from it, which has the same shape of mistake and had the
-   * same wrong answer. A trait is not a value and is not a type on its own: what its members are
-   * reached through is a value of an implementing type, or a trait object.
+  /** A trait's name with a member selected from it, which is the same shape of mistake one type
+   * over. A trait is not a value and is not a type on its own: what its members are reached
+   * through is a value of an implementing type, or a trait object.
    */
   private def traitMember(key: String, f: String): Nothing =
     traitDecls(key).methods.find(_.name == f) match

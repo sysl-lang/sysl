@@ -229,9 +229,10 @@ either without the parentheses is told which it is and what to write, the way a 
 is.
 
 A user `struct` or `enum` is the case that declares its members in its own body; the built-ins are
-the case where the body is the language. What is still specified and not built is `char.try` as an
-associated function (`00`) — a built-in has no name in call position, so it waits on the same
-question `string.from_utf8` waited on and was answered by becoming a free function.
+the case where the body is the language. **A built-in has no name in call position for a member**,
+which is why the fallible `u32` → `char` constructor `00 §1` asks for is not the `char.try` that
+chapter first named: it met the same obstacle `string.from_utf8` met and took the same answer, a
+free function (`char_from_u32`). Nothing here is specified and unbuilt.
 
 A compiler-provided member is reached **ahead of** the member table rather than through it, which is
 what puts these names out of reach for an `impl` (`02`): a member declared as `len` on a slice or

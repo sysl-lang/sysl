@@ -88,6 +88,10 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // about two declarations at a time, and either may be written below the other.
     checkExposedTypes()
 
+    // And a trait's members are resolved, which nothing else does: they lower to no function, so
+    // this is the only pass that reads them before something implements the trait (`02 § Defaults`).
+    checkTraitSignatures()
+
     // And what each `&sync T` promises about its pointee, which waits for the same reason a bound
     // does: a type that reaches itself through a `&sync` field is resolved while its own field list
     // is still being filled, so the question is held until every field is in (`06 § &sync T`).

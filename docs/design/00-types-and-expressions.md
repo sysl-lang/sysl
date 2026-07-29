@@ -93,10 +93,13 @@ right rather than something that falls out of a general `within`-constraint.
      runtime-safety category as array-bounds and overflow checks (and strippable the same
      way with `--no-contracts`-style removal). This is the fast path for a value already
      known to be valid.
-  2. **`char.try(u) -> Option[char]`** *(constructor name provisional)* — a **fallible
-     constructor** returning `None` for an invalid scalar value. This is the required path
-     for untrusted input (decoding bytes off a wire, parsing). The caller must handle the
-     `None`.
+  2. **`char_from_u32(u) -> Option[char]`** — a **fallible constructor** returning `None`
+     for an invalid scalar value. This is the required path for untrusted input (decoding
+     bytes off a wire, parsing). The caller must handle the `None`.
+
+     It is a **free function**, not the `char.try` an earlier draft named: a scalar has no
+     member namespace for a `try` to live in (`08 § Built-in members`), which is the same
+     obstacle `string.from_utf8` met and answered the same way.
 
 ### Literals
 

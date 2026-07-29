@@ -278,14 +278,13 @@ class SharedObjectTests extends AnyFreeSpec with CodegenSupport with RunSupport 
                     |""".stripMargin) should include("'&sync Box[&Inner]' may be reached from two domains at once")
     }
 
-    // A trait's own signature is resolved when something implements it and not before — which is
-    // general and not about `&sync`: an unknown type in a trait nobody implements is accepted too.
-    // So the question is asked at the implementation, and reported against the trait's line, which
-    // is where the type that cannot be shared was written.
-    "a trait's signature is asked once something implements it" in {
+    // A trait's own signature is resolved where the trait is written (`02 § Defaults`), so a
+    // promise nothing can keep is refused there — with nothing implementing it, and again when
+    // something does.
+    "a trait's signature is asked at the trait, implemented or not" in {
       val declared = inner + "struct H\n    kid: &Inner\ntrait Registry\n    put(self, h: &sync H) -> int\n"
 
-      ir(declared + "var n = 1\nprint(n)") should include("define")
+      err(declared + "var n = 1\nprint(n)") should include("'&sync H' may be reached from two domains at once")
 
       err(declared + """struct R
                        |    n: int

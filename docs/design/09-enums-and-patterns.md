@@ -118,8 +118,9 @@ the conversion above, `int(c)`.
 the type carries no `==` and no `Display` of its own, so a value is turned into a position or a
 name to be looked at.
 
-These are for a **simple** enum. A data enum's value is a variant plus a payload, so a position, a
-name and a neighbour are each questions about only half of it, and asking one says so.
+These are for a **simple, non-generic** enum. A data enum's value is a variant plus a payload, so a
+position, a name and a neighbour are each questions about only half of it; a generic enum's name
+stands for no one value set until it is applied. Asking either says so.
 
 ## 3. Data enums — sum types
 

@@ -59,6 +59,31 @@ trait SignatureVisibility extends TypeResolution {
   private def within(outer: String, inner: String): Boolean =
     inner == outer || inner.startsWith(s"$outer.")
 
+  /** Resolves every type a **trait's** members name, which nothing else asks for.
+   *
+   * A struct's or an enum's members are lowered to functions, and a free function's signature is
+   * resolved when it is hoisted — so a name that stands for nothing is reported at the declaration
+   * in all three. A trait's members are lowered nowhere: they are a promise, and the only other
+   * thing that reads them is the conformance check an `impl` runs. Without this pass a trait
+   * nothing implements could promise a type that does not exist, and nobody would be told.
+   *
+   * `Self` and the trait's own parameters stand in for themselves, which is exactly what the
+   * signature means — it holds for every implementing type, so what can be checked here is the
+   * names, not what any one of them turns out to be. The conformance check still resolves both
+   * sides against a concrete `Self`, and this takes nothing away from it.
+   */
+  protected def checkTraitSignatures(): Unit =
+    for (key, t) <- traitDecls.toList do
+      val subst = abstractSubst(t.tparams, t.bounds) + (selfName -> abstractSelf)
+
+      inDecl(key) {
+        for m <- t.methods do
+          recover(())(at(m.pos) {
+            for p <- m.params do resolveType(p.typ, subst)
+            m.retType.foreach(resolveReturn(_, subst))
+          })
+      }
+
   /** Reports every type a declaration exposes that does not reach as far as the declaration does.
    *
    * It runs once every declaration is registered, because the question is about two of them at a
