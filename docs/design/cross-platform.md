@@ -25,6 +25,14 @@ Everything in that pipeline is a pure function over strings and data. Consequenc
 **All I/O is confined to a thin edge layer** — the CLI/driver: reading source files, resolving
 module paths, loading `sysl.conf`, writing output, command-line arguments, stdout, exit codes.
 
+**And one question that is not I/O but is just as platform-shaped: what machine is this?**
+Each platform describes the same machine in its own words — a JVM says `aarch64` / `Mac OS X`,
+Scala Native says `aarch64` / `darwin`, Node says `arm64` / `darwin` — so `hostMachine` is a
+per-platform function that hands back the two words verbatim, and the shared core turns the pair
+into a target (`targets.md`). Asking is at the edge; deciding is in the core, once, where the
+three platforms cannot drift apart. The compiler's own machine reaches the pipeline only as the
+default an invocation that names no target gets.
+
 ## The libraries at the edge
 
 Two of the author's own cross-published libraries cover the edge, and both are on Central:

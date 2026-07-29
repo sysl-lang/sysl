@@ -15,6 +15,16 @@ trait CodegenSupport extends Matchers { this: Assertions =>
       case Left(e)    => fail(e)
     }
 
+  /** The IR for a program built for a machine other than this one (`targets.md`). Reading the text
+   * is the whole of what a cross-target test can do — there is nothing here to run the result on —
+   * and it is enough, because what a target decides is what instructions come out.
+   */
+  protected def irFor(target: Target, src: String): String =
+    Compiler.compileToLlvm(src, "<input>", target) match {
+      case Right(out) => out
+      case Left(e)    => fail(e)
+    }
+
   /** The error message for a program that must be rejected. */
   protected def err(src: String): String =
     Compiler.compileToLlvm(src) match {

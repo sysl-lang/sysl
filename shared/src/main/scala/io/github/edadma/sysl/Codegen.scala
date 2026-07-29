@@ -16,7 +16,7 @@ import scala.collection.mutable
  * storage that is laid down before any block exists. What stays here is the spine — the module
  * assembly, statements, and the expression dispatch the traits call back into.
  */
-class Codegen private (program: TProgram, promotions: Escape.Promotions)
+class Codegen private (program: TProgram, promotions: Escape.Promotions, protected val target: Target)
     extends ControlFlowEmitter with VtableEmitter with WriterEmitter with StaticEmitter {
 
   // --- module --------------------------------------------------------------------------
@@ -34,6 +34,12 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     while runtimeQueue.nonEmpty do runtimeTexts += runtimeQueue.dequeue()()
 
     val out = new mutable.StringBuilder
+
+    // The module says which machine it is for, which is what makes an invocation naming a target
+    // mean anything downstream: LLVM derives the data layout from the triple, so stating it is also
+    // what keeps a module built for one machine from being read as a module for whatever read it.
+    out ++= s"target triple = \"${target.triple}\"\n\n"
+
     if traps then out ++= "declare void @llvm.trap()\n"
     if heap then
       out ++= "declare ptr @malloc(i64)\n"
@@ -46,6 +52,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
       out ++= "declare void @llvm.va_start.p0(ptr)\n"
       out ++= "declare void @llvm.va_end.p0(ptr)\n"
     if usesVaCopy then out ++= "declare void @llvm.va_copy.p0(ptr, ptr)\n"
+    if usesMemcpy then out ++= "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n"
 
     // An `extern` the program calls is declared here, unless the symbol is already declared — by the
     // runtime, whose own spelling of `malloc` is the one its code calls, or by an earlier `extern`,
@@ -954,6 +961,26 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
       emit(s"$r = va_arg ptr ${genExpr(ap)}, ${ty.llvm}")
       r
 
+    // The one place the C ABI is not the same on every machine, so the one place codegen reads the
+    // target (`targets.md`). All three answers are a `ptr`, and all three start from the address of
+    // the walk — what differs is whether the callee is handed that address, the value in it, or the
+    // address of a copy of it.
+    case TVaPass(ap) =>
+      val addr = genExpr(ap)
+
+      target.vaList match
+        case VaListAbi.Address => addr
+
+        case VaListAbi.Loaded =>
+          val r = freshTemp(); emit(s"$r = load ptr, ptr $addr"); r
+
+        case VaListAbi.Copied =>
+          usesMemcpy = true
+          val copy = emitAlloca(freshTemp(), Type.VaList.llvm)
+          emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align 8 $copy, ptr align 8 $addr, " +
+            s"i64 ${target.vaListBytes}, i1 false)")
+          copy
+
     case TVaCopy(dst, src) =>
       usesVaCopy = true
       // Both addresses are produced before either is used, so a copy onto a list read out of the
@@ -1016,7 +1043,11 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
 
 object Codegen {
 
-  /** Lowers a typed program to an LLVM IR module. */
-  def generate(program: TProgram, promotions: Escape.Promotions = Escape.Promotions.none): String =
-    new Codegen(program, promotions).gen()
+  /** Lowers a typed program to an LLVM IR module, for a given machine (`targets.md`). */
+  def generate(
+      program: TProgram,
+      promotions: Escape.Promotions = Escape.Promotions.none,
+      target: Target = Target.default,
+  ): String =
+    new Codegen(program, promotions, target).gen()
 }

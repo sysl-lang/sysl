@@ -4,9 +4,10 @@
 that lets one language span safe application code and allocator-free kernel/driver code. The
 mechanism spans three layers — project config (targets declare capabilities), the module
 system (propagation, per-module restriction), and the type system (`alloc` gates the memory
-modes). The fuller project-config and module-resolution design (the HOCON `sysl.conf` schema,
-target registry, and filename-axis platform selection) is a separate doc, still to be written;
-this one is the capability model.
+modes). **The target registry is now its own doc and is built — `targets.md`** — so what a
+target *is* and how one is named are settled; what is still to be written is the project-config
+and module-resolution half around it (the HOCON `sysl.conf` schema, per-target capability sets,
+and filename-axis platform selection). This one is the capability model.
 
 ## Two kinds of capability
 
@@ -128,8 +129,12 @@ allocator-free everywhere.
 
 - **Per-module `os` / `posix` restriction** — allow a module to assert `no posix` for symmetry
   with `no alloc`? Probably yes; secondary to `alloc`.
-- **Config / module-resolution details** — the HOCON `sysl.conf` schema, the target registry,
-  and filename-axis platform selection are a separate design doc, still to be written.
+- **Config / module-resolution details** — the HOCON `sysl.conf` schema, per-target capability
+  sets, and filename-axis platform selection are still to be written. **The target registry
+  itself is done (`targets.md`)**: a target is a value with a name, a triple, and the ABI facts
+  codegen reads, and `--target` selects one. What it deliberately does *not* carry is
+  capabilities — that is exactly the part a project has an opinion about, so it belongs to the
+  config rather than to the fixed table.
   **Expect the project config to be revisited repeatedly** as the language grows, and
   especially once external libraries and dependency management arrive. Design only the minimum
   that unblocks the work at hand (root, active target, capabilities, build flags, platform-file

@@ -682,17 +682,35 @@ it consumed is gone when the lender reads on — which is what `va_copy` is for,
 `va_start` still asks for a tail of the function's own while `va_arg` asks only for a walk, so a
 borrower reads a tail without having one.
 
-**Returning a `va_list` is refused outright**: it walks a tail that is gone by the time the caller
-has it. A `*va_list` is an ordinary raw pointer and is refused nowhere — it may be returned, held in
-a field, or carried in a struct, under `03`'s rules and nobody else's.
+**Returning a `va_list` is refused outright**, foreign or not: the type names the storage a walk
+lives in, and there is no value of it to hand back. A `*va_list` is an ordinary raw pointer and is
+refused nowhere — it may be returned, held in a field, or carried in a struct, under `03`'s rules
+and nobody else's.
 
-**An `extern` may take neither spelling**, and this is an ABI limit rather than a language one. C's
-`va_list` is a different type on every target — a pointer on Darwin arm64, an array of one struct on
-x86-64 System V, a struct passed indirectly on AAPCS64 — so what a call must hand a foreign
-`vprintf` differs per target, and there is no target registry to read the answer out of
-(`capabilities.md`, whose project-config half is still to be written). It is refused with a
-diagnostic that says so rather than lowered to whichever of the three happened to be right where the
-compiler was built (`§ Open g₂`).
+**An `extern` is written in C's spellings, and takes either.** A foreign declaration transcribes a C
+header, so it says what the header says: `va_list` is C's by-value parameter, the one `vprintf`
+takes, and `*va_list` is C's `va_list *`, the one a function that must advance its caller's own walk
+takes. The refusal above is about a *sysl* body, which could do nothing with a copy of a walk; a
+foreign body is C's, and C's `vprintf` is precisely a body that reads one.
+
+```
+extern vprintf(fmt: *u8, ap: va_list) -> i32
+
+log(fmt: *u8, ...) -> i32
+    var ap: va_list
+    va_start(ap)
+    var n = vprintf(fmt, &ap)
+    va_end(ap)
+    n
+end log
+```
+
+**The call writes `&ap` for either spelling**, because the address is the only thing sysl has and it
+is what both are formed from. What actually crosses over for the by-value one is a **target**
+question: C's `va_list` is a different type on every machine and is passed three different ways — the
+value in the storage on Darwin arm64, the storage's own address on x86-64 System V, the address of a
+fresh copy on AAPCS64. All three pass one pointer, so the difference cannot be recovered from the
+emitted types; the compiler reads it off the target it was told to build for (`targets.md`).
 
 ### The ellipsis reaches a member, and a nested function
 
@@ -773,11 +791,11 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
   `va_copy` is a fifth language form, and a walk is handed on as a `*va_list` — which turned out to
   need no rule of its own, because §2 already says a function is given something to advance by
   *type*. What is left of it is `g₂` below.
-- **g₂. A `va_list` across the foreign boundary.** An `extern` may take neither `va_list` nor
-  `*va_list`, because C spells the type differently on every target and there is nothing to read the
-  answer out of. This is the one piece of C's varargs surface sysl still cannot reach, and it is an
-  ABI question rather than a language one: it waits on the target registry `capabilities.md` says is
-  still to be written, and is then a per-target lowering rather than a decision.
+- ~~**g₂. A `va_list` across the foreign boundary.**~~ **Built** (§9, and `targets.md`). It was an
+  ABI question rather than a language one, and what it waited on was a target: an `extern` is now
+  written in C's own spellings, and what a call hands a by-value `va_list` is read off the machine
+  being built for. So `vprintf` is reachable from sysl, and C's varargs surface has nothing left in
+  it sysl cannot say.
 - ~~**h₂. A variadic method.**~~ **Built** (§9, *The ellipsis reaches a member*). A member is a
   function with a receiver in front, so the ellipsis reaches one under the rules a free function's
   tail already follows, and the receiver is what the tail anchors on. A trait may declare one; what

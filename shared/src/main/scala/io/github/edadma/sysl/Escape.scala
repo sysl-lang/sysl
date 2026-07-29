@@ -519,6 +519,7 @@ private class Escape(program: TProgram) {
     case TVaEnd(ap)                 => List(ap)
     case TVaArg(ap, _)              => List(ap)
     case TVaCopy(d, s)              => List(d, s)
+    case TVaPass(ap)                => List(ap)
     case TTry(v, _, _, _, _, _)     => List(v)
     case TField(r, _, _)            => List(r)
     case TIf(c, t, el, _)           => c :: t.result.toList ::: el.flatMap(_.result).toList

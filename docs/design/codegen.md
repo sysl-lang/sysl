@@ -395,8 +395,10 @@ arity.
 1. **The scalar table stops short of its widest members.** An integer wider than 64 bits and
    `f128` are diagnosed rather than lowered: printing them portably needs a runtime this
    stage does not have (`long double` is 64-bit on the arm64 Apple ABI, so `fp128` cannot go
-   through `printf`). `usize` / `isize` are fixed at 64 bits by a constant rather than by a
-   target description. A narrower float constant is emitted as the `double` constant rounded
+   through `printf`). `usize` / `isize` are fixed at 64 bits by a constant. There **is** a
+   target description now (`targets.md`) and this does not read it, for the reason `Layout` does
+   not: every target in the registry is 64-bit, and the registry refuses one that is not.
+   A narrower float constant is emitted as the `double` constant rounded
    down to it, which is correctly rounded except in the rare double-rounding case.
 2. **~~Every string is a literal or part of one.~~** No longer a shortcut — every operation `04`
    specifies is built. `from_utf8`, concatenation, `str(x)`, `s.copy()`, `string(c)`,

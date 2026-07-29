@@ -371,24 +371,28 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
 
     "a va_list cannot be returned" in {
       err("f(n: int, ...) -> va_list\n    var ap: va_list\n    ap\nend f\nprint(1)") should
-        include("a va_list cannot be returned")
+        include("a va_list cannot be returned from 'f'")
     }
 
-    // C spells `va_list` differently on every target — a pointer on Darwin arm64, an array of one
-    // struct on x86-64 System V, a struct passed indirectly on AAPCS64 — so what a call must hand a
-    // foreign `vprintf` is a target question, and sysl has no target registry to read it out of.
-    "an extern may take neither spelling, and says which question is open" in {
-      err("extern vprintf(fmt: *u8, ap: va_list) -> int\nprint(1)") should
-        include("a va_list is a parameter as '*va_list'")
+    // An `extern` transcribes a C header, so C's own spelling is what it is written in and the
+    // refusal above does not reach it. Which of the two was written decides what the call hands
+    // over, and that is `VariadicForeignTests`.
+    "an extern is written in C's spellings, and takes either" in {
+      ir("extern vprintf(fmt: *u8, ap: va_list) -> i32\nvar p: *u8 = null\nprint(vprintf(p, null))") should
+        include("declare i32 @vprintf(ptr, ptr)")
 
-      val ptr = err("extern vprintf(fmt: *u8, ap: *va_list) -> int\nprint(1)")
-
-      ptr should include("a va_list cannot cross into 'vprintf', which is foreign")
-      ptr should include("C spells 'va_list' differently on every target")
+      ir("extern vsomething(ap: *va_list) -> i32\nprint(vsomething(null))") should
+        include("declare i32 @vsomething(ptr)")
     }
 
-    "nor hand one back" in {
-      err("extern current() -> *va_list\nprint(1)") should include("cannot cross out of 'current'")
+    // A `*va_list` is an ordinary pointer, so handing one back is ordinary. The bare spelling is
+    // not: `va_list` names the storage a walk lives in, and there is no value of it to return.
+    "an extern may hand back the address of one, but not one" in {
+      ir("extern current() -> *va_list\nprint(current() == null)") should
+        include("declare ptr @current()")
+
+      err("extern current() -> va_list\nprint(1)") should
+        include("a va_list cannot be returned from 'current'")
     }
 
     "and it is not something to print" in {

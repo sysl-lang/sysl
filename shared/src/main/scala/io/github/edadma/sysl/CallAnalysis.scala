@@ -178,10 +178,25 @@ trait CallAnalysis extends Literals with TraitObjects {
     val (params, rtype) = funcInsts(name)
     // A variadic's tail has no declared parameter to be checked against and is analyzed below, so
     // both lists are cut to the parameters — which is also what keeps them aligned.
-    val declared = checkArgs(shown, params, args.take(params.length), pre.map(_.take(params.length)))
+    val checked  = checkArgs(shown, params, args.take(params.length), pre.map(_.take(params.length)))
+    val declared = externDecls.get(f.name).fold(checked)(vaPassed(checked, _))
 
     funcsUsed += name
     TCall(name, declared ::: args.drop(params.length).map(variadicArg), rtype)
+  }
+
+  /** The arguments of a foreign call, with each one headed for a C by-value `va_list` parameter
+   * turned into what the target's ABI passes there (`targets.md`).
+   *
+   * The address is what was checked and is what all three answers are formed from, so this wraps
+   * rather than replaces — and it happens here, once, because a foreign call is the only place a
+   * `va_list` leaves sysl's own convention behind.
+   */
+  private def vaPassed(args: List[TExpr], e: ExternDecl): List[TExpr] = {
+    val byValue = foreignVaByValue(e)
+
+    if byValue.isEmpty then args
+    else args.zipWithIndex.map((a, i) => if byValue(i) then TVaPass(a) else a)
   }
 
   /** How many arguments a callee accepts, said in the caller's own words.

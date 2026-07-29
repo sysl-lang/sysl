@@ -777,18 +777,21 @@ trait TypeResolution extends ImportResolution {
 
   /** Where a `va_list` may stand in a signature (`12 §9`).
    *
-   * A walk is handed on **by address**: `*va_list` is the parameter type, and `&ap` is what the
-   * caller writes. A bare `va_list` parameter is refused because a parameter is a by-value binding
-   * (`12 §2`) and a copy of a walk is not a walk — advancing it would advance nothing the caller
-   * could see, which is the one thing the form exists to do. Returning one is refused outright:
-   * it walks a tail that is gone by the time the caller has it.
+   * In a **sysl** signature a walk is handed on **by address**: `*va_list` is the parameter type,
+   * and `&ap` is what the caller writes. A bare `va_list` parameter is refused because a parameter
+   * is a by-value binding (`12 §2`) and a copy of a walk is not a walk — advancing it would advance
+   * nothing the caller could see, which is the one thing the form exists to do.
    *
-   * An **`extern`** may take neither spelling, and this is an ABI limit rather than a language one.
-   * C's `va_list` is a different type on every target — a pointer on Darwin arm64, an array of one
-   * struct on x86-64 System V, a struct passed indirectly on AAPCS64 — so what a call must hand a
-   * foreign `vprintf` differs per target, and sysl has no target registry to read the answer out of
-   * (`capabilities.md`). Refused with a diagnostic rather than lowered to whichever of the three
-   * happened to be right where it was built.
+   * An **`extern`** transcribes a C header, so it is written in C's spellings and both are allowed:
+   * `va_list` is C's by-value parameter, the one `vprintf` takes, and `*va_list` is C's `va_list *`,
+   * the one a function that must advance its caller's own walk takes. What a call actually hands
+   * the first of those is a different thing on every target and is `TVaPass`'s business
+   * (`targets.md`); the *call* writes `&ap` for either, because the address is the only thing sysl
+   * has and it is what both are formed from.
+   *
+   * **Returning a bare `va_list` is refused everywhere**, foreign or not: sysl has no by-value
+   * `va_list` at all — the type names the storage a walk lives in — so there would be nothing to
+   * put the result in. A `*va_list` return is an ordinary pointer and is allowed.
    */
   private def checkVaListPositions(
       name: String,
@@ -800,27 +803,35 @@ trait TypeResolution extends ImportResolution {
       case NamedType(n, Nil) => scalarType(n).contains(Type.VaList)
       case _                 => false
 
-    def isVaListPtr(t: TypeRef) = t match
-      case PtrType(inner) => isVaList(inner)
-      case _              => false
-
-    for p <- params do
+    for p <- params if !foreign do
       if isVaList(p.typ) then
         at(p.pos)(err(s"a va_list is a parameter as '*va_list', not as 'va_list' — a parameter is a " +
           s"by-value binding, and a copy of a walk advances nothing '$name''s caller can see, so " +
           "the walk is handed over by address and the call writes '&ap'"))
-      if foreign && isVaListPtr(p.typ) then
-        at(p.pos)(err(s"a va_list cannot cross into '$name', which is foreign — C spells 'va_list' " +
-          "differently on every target, so what a call must hand it is a target question sysl " +
-          "cannot answer yet"))
 
     for r <- ret do
       if isVaList(r) then
-        at(r.pos)(err(s"a va_list cannot be returned — it walks '$name''s own tail, which is gone once it returns"))
-      if foreign && isVaListPtr(r) then
-        at(r.pos)(err(s"a va_list cannot cross out of '$name', which is foreign — C spells 'va_list' " +
-          "differently on every target, so what it hands back is a target question sysl cannot answer yet"))
+        at(r.pos)(err(s"a va_list cannot be returned from '$name' — the type names the storage a " +
+          "walk lives in, and there is no value of it to hand back"))
   }
+
+  /** The type a foreign parameter has once it is a slot in a signature.
+   *
+   * Only one written type changes: a C `va_list` parameter takes the address of the walk, since
+   * that is what sysl has to give and what every target's answer is formed from. So an argument is
+   * checked as a `*va_list` whichever of C's two spellings the header used, and the difference
+   * between them — whether the callee receives the walk or a pointer to it — is carried by
+   * `TVaPass` rather than by the parameter's type.
+   */
+  protected def foreignParam(t: Type): Type = if t == Type.VaList then Type.Ptr(Type.VaList) else t
+
+  /** Which of a foreign declaration's parameters were written as C's by-value `va_list`, and so
+   * need what a call passes converted to the target's ABI (`targets.md`).
+   */
+  protected def foreignVaByValue(e: ExternDecl): Set[Int] =
+    e.params.zipWithIndex.collect {
+      case (Param(_, NamedType(n, Nil), _), i) if scalarType(n).contains(Type.VaList) => i
+    }.toSet
 
   /** Resolves a scalar type name: the named primitives and friendly aliases, or one of the
    * systematic `iN` / `uN` / `fN` width spellings.

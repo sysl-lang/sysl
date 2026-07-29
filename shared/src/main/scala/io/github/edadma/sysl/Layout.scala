@@ -11,9 +11,11 @@ package io.github.edadma.sysl
  * The numbers here are the ones **every 64-bit target the compiler supports agrees on**: scalars
  * are their own width and aligned to it, an address is eight bytes, an aggregate is laid out in
  * declaration order with each member on its own alignment and the whole rounded up to the widest
- * member's. That is C's rule and LLVM's, and it is why no `target datalayout` is emitted — the
- * module inherits the host's, and this model is the part of it these targets hold in common.
- * Nothing here is exposed to the language; `sizeof` is a separate question (`09 § Open`).
+ * member's. That is C's rule and LLVM's, which is why this object takes no `Target` (`targets.md`)
+ * — every target in the registry answers these questions the same way, and the registry refuses a
+ * 32-bit one precisely because this is where it would stop being true. The emitted module states
+ * its triple and LLVM derives the data layout from that, so nothing here has to be written down
+ * twice. Nothing here is exposed to the language; `sizeof` is a separate question (`09 § Open`).
  */
 object Layout {
 

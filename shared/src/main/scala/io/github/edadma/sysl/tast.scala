@@ -269,6 +269,17 @@ case class TVaEnd(ap: TExpr)   extends TExpr { def ty: Type = Type.Unit }
 case class TVaArg(ap: TExpr, ty: Type) extends TExpr
 case class TVaCopy(dst: TExpr, src: TExpr) extends TExpr { def ty: Type = Type.Unit }
 
+/** A walk handed to a **foreign** function whose C parameter is a `va_list` — `vprintf` and its
+ * family (`12 §9`).
+ *
+ * It holds the address of the walk, like the four forms above, and differs from passing that
+ * address in what the callee is given: C's `va_list` is a different type on every target and is
+ * passed three different ways, so this is the node that turns the one thing sysl has into what the
+ * target's C ABI wants. The result is a `ptr` whichever way that is, which is why the distinction
+ * cannot be left for codegen to rediscover from the types — see `VaListAbi`.
+ */
+case class TVaPass(ap: TExpr) extends TExpr { def ty: Type = Type.Ptr(Type.VaList) }
+
 /** Positional construction of a value struct. */
 case class TStructNew(struct: Type.Struct, args: List[TExpr]) extends TExpr { def ty: Type = struct }
 

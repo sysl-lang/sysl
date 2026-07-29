@@ -11,6 +11,12 @@ import scala.collection.mutable
  */
 trait Emitter {
 
+  /** The machine this module is being emitted for (`targets.md`). Almost nothing consults it —
+   * a 64-bit target's layout is the same everywhere sysl runs — and what does is the handful of
+   * places where the C ABI genuinely differs, each of which says so where it reads this.
+   */
+  protected def target: Target
+
   protected val globals  = new mutable.StringBuilder
   private var strId      = 0
   protected var boolStrs = false
@@ -31,6 +37,12 @@ trait Emitter {
    * separately because a function handed a `*va_list` may copy one without ever starting one.
    */
   protected var usesVaCopy = false
+
+  /** Whether anything copied a block of storage — today only a walk handed to a foreign function on
+   * a target that passes `va_list` indirectly (`VaListAbi.Copied`), which is why a module built for
+   * one machine declares `llvm.memcpy` and the same module built for another does not.
+   */
+  protected var usesMemcpy = false
 
   /** LLVM intrinsic `declare` lines the module turned out to need — the saturating
    * float-to-integer casts, each declared once under its overload-mangled name.
