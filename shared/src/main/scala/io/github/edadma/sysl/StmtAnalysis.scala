@@ -281,9 +281,9 @@ trait StmtAnalysis extends TypeResolution {
         val tv     = part.getOrElse(analyzeExpr(written, updateExpected(binSym, place.ty)))
         val d      = updateDispatch(binSym, place, tv)
 
-        if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then
+        if d.isEmpty && Type.repr(arithType(binSym, place.ty, tv.ty)) != Type.repr(place.ty) then
           err(s"'${m.op}' would change the type of ${describe(target)}")
-        TWrite(place, m.op, tv, d, invCheckFor(place))
+        TWrite(place, m.op, tv, d, invCheckFor(place), constraintOf(place.ty))
 
     // Each arm's position is the value it was written with, or — where one carrier supplied them
     // all — that carrier, since there is no separate expression to point at.

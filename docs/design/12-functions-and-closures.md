@@ -2,13 +2,12 @@
 
 **Status:** the top-level function surface is written against the implementation that already
 exists — keyword-less declarations, expression and block bodies, `return`, forward reference,
-recursion, and `extern` including its variadic `...` — and ratifies it. **Closures are not yet implemented, and neither are the
-nested functions of §5a**; the sections that describe
-them (§5 onward) are the design the rest of the docs already lean on — `05-escape-analysis.md`
-heap-boxes an escaping closure, and `capabilities.md` gates escaping closures behind `alloc` and
-inlines the non-escaping ones — written down here so that surface is decided before it is built,
-not after. Where a closure section commits to a spelling or a representation it says so; the
-*open* list at the end records what is deliberately left for later.
+recursion, and `extern` including its variadic `...` — and ratifies it. **Closures and the nested
+functions of §5a are built too**, so every section here describes something that exists; the rest of
+the docs lean on them — `05-escape-analysis.md` heap-boxes an escaping closure, and
+`capabilities.md` gates escaping closures behind `alloc` and inlines the non-escaping ones. Where a
+closure section commits to a spelling or a representation it says so; the *open* list at the end
+records what is deliberately left for later.
 
 This chapter rests on `03-memory-model.md` (a captured value follows the same copy/retain rules
 as any other), `02-traits.md` (a closure's type is a trait object, dispatched by the same

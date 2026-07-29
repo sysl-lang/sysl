@@ -126,14 +126,59 @@ whose operations are its representation's operations. **Use a struct for a quant
 of its own.** What has no answer today is the case in the middle: a type that wants most of its
 base's catalog and one row of its own. That is recorded as open below.
 
+### The catalog is the base's, and the range still holds
+
+"Everything the scalar could do" is the whole of `01`'s operator table and not a shortlist: the
+arithmetic operators, the remainder, the bitwise operators and the shifts, unary `-` and `~`, the
+comparisons, the compound assignments, `++` and `--`, and `str`. **A subtype narrows which values a
+type has, never which operations it has** — so membership in an operator's trait is a question about
+the *base*, which is how `Eq` and `Ord` were always read and how the rest are read now.
+
+For a **transparent** subtype that means more than convenience, because §1 makes it *the same type as*
+its base: `a < n` between an `Age` and an `int` is one comparison of two integers, and a literal
+beside one is an ordinary base value. `s * 100` on a `Small = int within 0..10` is 200 — the multiplier
+is not a `Small` and does not have to be, since what has to be in range is the product, and the
+product is checked where it is stored. A **derived** subtype is its own representation, so it mixes
+with the base only through the cast §2 requires, and its results are its own and checked as §4 says.
+
+What the base does not have, the subtype does not either, and the diagnostic names the subtype: unary
+`-` over an unsigned base, `~` over a float, `++` over a float or a `char`.
+
 ## 4. Where a constraint is checked
 
-At every point a value of the constrained type is **produced**, and nowhere else:
+At every point a value of the constrained type is **produced**, and nowhere else. A produce site is
+not a syntactic form to be listed but a consequence of what the type is: a value comes to have the
+type wherever it **flows into a slot the type is written on**, plus wherever an operation of the
+type's own **yields one**. So the sites are the slots, and the slots are enumerable:
 
-- a variable's initializer, and every later assignment to it
-- an argument at a call, and a function's returned value
+- a variable's initializer, and every later assignment to it — including one arm of a
+  multi-assignment, and a write through a pointer
+- an argument at a call, and a function's returned value — a plain function's, a method's, a nested
+  function's, or a closure's
 - an explicit cast, `T(x)`
-- a field written into a struct, when the field's type is constrained
+- a field written into a struct, at construction and at every later write, however the struct is
+  reached
+- an element of an array, at a literal and at every later write, through the array or through a view
+  of it
+- a part of a tuple, and the payload of an enum variant
+- an item entering a **generic** container instantiated at the type — the slot is written `T` there,
+  so the check follows the type *argument* and not the spelling
+
+And the two sites that are the type's own doing rather than a slot's:
+
+- an **operation on a derived subtype**, which §3 gives the base's catalog *producing itself* — so
+  `Slot(199) + Slot(1)` is a produce site and traps, and this is what keeps §3 and this section from
+  contradicting each other. A **transparent** subtype has no such site: its arithmetic happens at its
+  base and yields a base value, which is checked by the store that gives it the subtype again.
+- a **compound assignment** and an **increment**, which compute and store in one step and so are
+  checked between the two. `a += e` produces exactly what `a = a + e` produces, and the two agree by
+  construction: what the operator is applied to is a base value either way, so `t += 120` on a
+  `Temp = int within -100..100` holding `-50` is `70` and not a complaint that 120 is no temperature.
+
+The site that is closed by not existing is a declaration with no value: a constrained subtype has
+**no zero value**, whether or not its range contains zero, so `var a: Age` is refused and there is no
+unwritten value to check. Making that the type's rule rather than the range's means widening a range
+never silently changes whether a declaration compiles somewhere else.
 
 A value that already has the type is not re-checked when it is merely read, passed along, or copied —
 it could not have got there unchecked. Passing one to a *different* subtype over the same base **is**
@@ -214,7 +259,8 @@ cheap implementation checks the constructor and calls it done:
 
 - constructing the struct, including one built directly as an argument or as a returned value
 - assigning a whole struct over an existing one
-- **assigning a single field**, including a compound assignment (`w.hi += 1`)
+- **assigning a single field**, including a compound assignment (`w.hi += 1`) and an increment
+  (`w.hi++`), which is a write of one field and owed the same re-check
 - a field written through a pointer
 - a field written into an array element
 
@@ -303,8 +349,14 @@ to fit in a `u8`, so `int(slot)` is a widening the compiler could see is total. 
 that today. Related: two subtypes over one base where one range contains the other could convert
 without a check, and does not.
 
-**e. A produce site the checking does not reach.** The list in §4 is the set of places the
-implementation checks, arrived at by adding them as they came up rather than by deriving them from
-what a produce site *is*. That derivation has not been written down, so the list is evidence and not
-a proof of completeness. A pointer written through, an array element assigned, and a field of a
-struct inside a struct are each covered by a test; the general statement is not.
+**~~e. A produce site the checking does not reach.~~** **Closed.** The derivation is now written into
+§4 — a produce site is a slot the type is written on, or an operation of the type's own — and every
+site it names is covered twice over in `SubtypeProduceSiteTests`, once with a value the range accepts
+and once with the neighbouring value it does not, since a site with no check passes the first.
+
+Deriving it rather than listing it found what the list had missed, and it was not a slot: an
+**operation on a derived subtype**. §3 gives a derivation the base's catalog producing itself, which
+made every arithmetic operator a produce site nobody had written down, so `Slot(199) + Slot(1)` was a
+`Slot` holding 200 — and storing it into another `Slot` did not re-check, because a value that
+already has the type is not produced again. `type Slot = new u8 within 0..<200` is §1's own example
+row. The two forms that compute and store in one step, `a += e` and `a++`, were the other omission.

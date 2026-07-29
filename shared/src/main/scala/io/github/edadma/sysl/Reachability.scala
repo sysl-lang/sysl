@@ -109,10 +109,24 @@ object Reachability {
       // here — exactly as `TCheckedStore`'s is, for the same reason.
       case w: TWrite =>
         w.check.foreach((recv, _, invFn) => { calls += invFn; scan(recv) })
+        w.constraint.flatMap(_.predFn).foreach(calls += _)
         scan(w.place); scan(w.value); w.dispatch.foreach(scan)
       case c: TConstrainedCheck =>
         c.target.predFn.foreach(calls += _)
         scan(c.value)
+      // A compound assignment and an increment carry their constraint as a `Type`, which the case
+      // above skips, so the predicate they call is named here. **No program observes this today**,
+      // and the reason is worth writing down rather than discovering twice: a value can only come to
+      // have a `where`-carrying subtype through a site that checks it, so whatever produced the first
+      // one has already named the predicate — measured by removing these two lines, which leaves the
+      // suite green. They are here because the alternative to naming a function held as data is a
+      // call to a definition that was pruned, and that failure is a link error rather than a test.
+      case u: TUpdate =>
+        u.check.flatMap(_.predFn).foreach(calls += _)
+        scan(u.place); scan(u.value); u.dispatch.foreach(scan)
+      case i: TIncDec =>
+        i.check.flatMap(_.predFn).foreach(calls += _)
+        scan(i.place)
       // Standard output holds no state, so there is no value the prelude could have declared for it
       // and its table is laid out by codegen rather than analyzed. The one function in that table is
       // therefore named here, where nothing in the tree names it.

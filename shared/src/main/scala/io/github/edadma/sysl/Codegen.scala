@@ -138,7 +138,9 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
     (ty, dispatch) match
       case (_, Some(d))  => ownTemp(dispatchValue(d, ty, valueTy, cur, v, ty), ty)
       case (Type.Str, _) => ownTemp(strConcat(cur, v), Type.Str)
-      case _             => arith(op.dropRight(1), ty, cur, v)
+      // A constrained slot is arithmetic at the type it is laid out as, which is what the binary
+      // path does too — the subtype names a set of values, not a second way to add.
+      case _             => arith(op.dropRight(1), Type.underlying(ty), cur, v)
 
   /** Checks a struct value against its `invariant` function: read each stored field out of the
    * aggregate `v`, call `invFn`, and trap on a false result. The fields are handed over exactly as
@@ -279,6 +281,21 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
         for lo <- c.lo do trapUnless(compareValue(">=", base, v, lo.toBigInt.toString), "within")
         for hi <- c.hi do
           trapUnless(compareValue(if c.exclusiveHi then "<" else "<=", base, v, hi.toBigInt.toString), "within")
+
+  /** Everything a constrained subtype asks of a value: the `within` range, then the `where`
+   * predicate — a synthesised `i1`-returning function over the base value, which traps exactly as
+   * the range does when it answers false. Shared by the checking node and by the two forms that
+   * compute and store in one step, so a value cannot reach a constrained slot by a path that tests
+   * less of it than another.
+   */
+  protected def emitConstraintChecks(v: String, c: Type.Constrained): Unit = {
+    emitRangeChecks(v, c)
+
+    for pf <- c.predFn do
+      val r = freshTemp()
+      emit(s"$r = call i1 @$pf(${Type.underlying(c.base).llvm} $v)")
+      trapUnless(r, "where")
+  }
 
   private def fcmpConst(pred: String, wide: String, bound: BigDecimal): String = {
     val c = f"0x${java.lang.Double.doubleToLongBits(bound.toDouble)}%016X"
@@ -667,13 +684,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
 
     case TConstrainedCheck(value, target) =>
       val v = genExpr(value)
-      emitRangeChecks(v, target)
-      // A `where` predicate is a synthesised `i1`-returning function over the base value; it traps
-      // exactly as the range does when it answers false.
-      for pf <- target.predFn do
-        val r = freshTemp()
-        emit(s"$r = call i1 @$pf(${Type.underlying(target.base).llvm} $v)")
-        trapUnless(r, "where")
+      emitConstraintChecks(v, target)
       v
 
     case TStructInvCheck(value, struct, invFn) =>
@@ -724,11 +735,13 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
       storeInto(ty, p, v)
       v
 
-    case TUpdate(place, op, value, ty, dispatch) =>
+    case TUpdate(place, op, value, ty, dispatch, check) =>
       val p       = address(place)
       val cur     = freshTemp(); emit(s"$cur = load ${ty.llvm}, ptr $p")
       val v       = genExpr(value)
       val updated = combine(op, ty, value.ty, dispatch, cur, v)
+
+      for c <- check do emitConstraintChecks(updated, c)
 
       if containsRef(ty) then
         retainValue(ty, updated)
@@ -737,11 +750,14 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
       else emit(s"store ${ty.llvm} $updated, ptr $p")
       updated
 
-    case TIncDec(place, op, pre, ty) =>
+    case TIncDec(place, op, pre, ty, check) =>
       val w   = ty.llvm
       val p   = address(place)
       val cur = freshTemp(); emit(s"$cur = load $w, ptr $p")
       val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} $w $cur, 1")
+
+      for c <- check do emitConstraintChecks(nv, c)
+
       emit(s"store $w $nv, ptr $p")
       if pre then nv else cur
 

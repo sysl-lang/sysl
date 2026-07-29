@@ -140,12 +140,21 @@ case class TStore(place: TExpr, value: TExpr, ty: Type) extends TExpr
 
 /** A compound assignment `place op= value`, yielding the updated value. `dispatch` is present when
  * the operator is a trait method rather than an instruction (`14 §3`).
+ *
+ * `check` is present when the place holds a constrained subtype: the operation computes a value the
+ * place cannot be given unexamined, so the constraint is tested between the arithmetic and the store
+ * (`16 §4`). It is the same test a `TConstrainedCheck` makes; it lives here rather than in a
+ * wrapping node because the store is inside this one, and a value has to be refused before it lands.
  */
-case class TUpdate(place: TExpr, op: String, value: TExpr, ty: Type, dispatch: Option[TDispatch] = None)
+case class TUpdate(place: TExpr, op: String, value: TExpr, ty: Type, dispatch: Option[TDispatch] = None,
+                   check: Option[Type.Constrained] = None)
     extends TExpr
 
-/** `++`/`--`, prefix (new value) or postfix (old value). */
-case class TIncDec(place: TExpr, op: String, pre: Boolean, ty: Type) extends TExpr
+/** `++`/`--`, prefix (new value) or postfix (old value). `check` carries a constrained place's
+ * constraint, for the reason `TUpdate`'s does.
+ */
+case class TIncDec(place: TExpr, op: String, pre: Boolean, ty: Type, check: Option[Type.Constrained] = None)
+    extends TExpr
 
 case class TBinary(op: String, left: TExpr, right: TExpr, ty: Type) extends TExpr
 case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExpr
@@ -407,9 +416,14 @@ case class TExprStmt(expr: TExpr)                         extends TStmt
  *
  * The check is carried here rather than wrapped around a store node, as `TCheckedStore` wraps one,
  * because these writes are not expressions and there is nothing for a node to wrap.
+ *
+ * `constraint` is the compound arm's counterpart of `TUpdate.check` — a plain arm's value carries
+ * its own check, having been analyzed against the place's type, while a compound arm computes one
+ * here and so is checked here (`16 §4`).
  */
 case class TWrite(place: TExpr, op: String, value: TExpr, dispatch: Option[TDispatch],
-                  check: Option[(TExpr, Type.Struct, String)])
+                  check: Option[(TExpr, Type.Struct, String)],
+                  constraint: Option[Type.Constrained] = None)
 
 /** `a, b = b, a` — several places written from several values (`00 §2`).
  *

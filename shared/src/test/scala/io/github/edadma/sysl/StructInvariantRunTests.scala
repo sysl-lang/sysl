@@ -107,6 +107,25 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** An increment is a write of one field, so it owes the same re-check the compound form owes. It
+   * used not to: `++` was the one write that reached a field without going through the wrapper, so a
+   * `--` off the bottom of a bound left the struct holding a value its own invariant forbids.
+   */
+  "an increment of a field re-checks the invariant" - {
+    "a step that keeps the invariant proceeds" in {
+      run(Account + "var a = Account(5)\na.balance++\nprint(a.balance)") shouldBe "6\n"
+    }
+    "a step that breaks it traps" in {
+      exits(Account + "var a = Account(0)\na.balance--")
+    }
+    "and so does one written prefix" in {
+      exits(Account + "var a = Account(0)\n--a.balance")
+    }
+    "an increment through a pointer is checked too" in {
+      exits(Account + "var a = Account(0)\nvar p = &a\n(*p).balance--")
+    }
+  }
+
   "a field write through a pointer is checked" in {
     exits(Account + "var a = Account(5)\nvar p = &a\n(*p).balance = -2")
   }

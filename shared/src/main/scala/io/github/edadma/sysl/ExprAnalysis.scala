@@ -139,6 +139,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
   /** Wraps a base-typed value in the run-time check for a constrained subtype. */
   private def checkInto(v: TExpr, c: Type.Constrained): TExpr = TConstrainedCheck(v, c).setPos(v.pos)
 
+
   /** If `place` is a field of a struct that carries `invariant` clauses, wrap the write so the
    * struct's invariant is re-checked the moment the field changes; otherwise the write stands as it
    * is. The receiver of the field is the struct to re-read — the same node covers `s.f = v`, a
@@ -436,24 +437,27 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       val List(tl, provisional) = analyzeOperands(List(l, r), expected.filter(Type.isNumeric))
       val tr                    = operandRhs(op, tl, r, provisional)
 
-      operatorCall(op, tl, tr).getOrElse(TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty)))
+      operatorCall(op, tl, tr).getOrElse(produced(TBinary(op, tl, tr, arithType(op, tl.ty, tr.ty))))
 
+    // The operand's *base* decides which operators there are — a subtype narrows which values a type
+    // has, never which operations it has — so the match reads through it and the node is typed by
+    // `unaryType`, which keeps a derived result in its own type.
     case Unary("-", e) =>
       val t = analyzeExpr(e, expected.filter(Type.isNumeric))
-      prefixCall("-", t).getOrElse(t.ty match
-        case i: Type.Integer if i.signed => TUnary("-", t, i)
-        case f: Type.Floating            => TUnary("-", t, f)
-        case i: Type.Integer             => err(s"unary '-' is not defined for the unsigned type ${show(i)}")
-        case other                       => err(s"unary '-' is not defined for ${show(other)}"))
+      prefixCall("-", t).getOrElse(Type.underlying(t.ty) match
+        case i: Type.Integer if i.signed => produced(TUnary("-", t, unaryType(t.ty)))
+        case _: Type.Floating            => produced(TUnary("-", t, unaryType(t.ty)))
+        case _: Type.Integer => err(s"unary '-' is not defined for the unsigned type ${show(t.ty)}")
+        case _               => err(s"unary '-' is not defined for ${show(t.ty)}"))
 
     case Unary("!", e) =>
       TUnary("!", analyzeBool(e), Type.Bool)
 
     case Unary("~", e) =>
       val t = analyzeExpr(e, expected.filter(Type.isNumeric))
-      prefixCall("~", t).getOrElse(t.ty match
-        case i: Type.Integer => TUnary("~", t, i)
-        case other           => err(s"unary '~' is not defined for ${show(other)}"))
+      prefixCall("~", t).getOrElse(Type.underlying(t.ty) match
+        case _: Type.Integer => produced(TUnary("~", t, unaryType(t.ty)))
+        case _               => err(s"unary '~' is not defined for ${show(t.ty)}"))
 
     // Address-of yields a *raw* pointer: a place lives in a frame or inside another object, so
     // there is no refcount to take a share of. Reaching a `&T` means being handed one.
@@ -518,10 +522,14 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       val tv     = analyzeExpr(value, updateExpected(binSym, place.ty))
       val d      = updateDispatch(binSym, place, tv)
 
-      if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then
+      // What has to hold is that the result can be stored back. A constrained place is the one case
+      // where the arithmetic's type and the place's legitimately differ — a transparent subtype
+      // computes at its base — so the test is on the representation the two share, and what the
+      // difference costs is the check `constraintOf` asks for.
+      if d.isEmpty && Type.repr(arithType(binSym, place.ty, tv.ty)) != Type.repr(place.ty) then
         err(s"'$op' would change the type of ${describe(target)}")
 
-      withInvCheck(place, TUpdate(place, op, tv, place.ty, d))
+      withInvCheck(place, TUpdate(place, op, tv, place.ty, d, constraintOf(place.ty)))
 
     // The forms the compiler resolves by name rather than by looking a function up: `print` and
     // its two rendering companions, which are temporary and leave once a `Display` trait can carry
@@ -1102,12 +1110,19 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       case other           => err(s"a slice bound must be an integer, not ${show(other)}")
   }
 
+  /** `++`/`--` — a step of one, which the base decides the existence of and a constrained place
+   * then has to accept: the new value is checked between the addition and the store, so a counter
+   * declared over a range stops at the end of it rather than walking off.
+   *
+   * It is a write of one field when its place is one, so it owes a struct's `invariant` the same
+   * re-check the compound form owes — `s.lo++` can break `lo <= hi` exactly as `s.lo += 1` can.
+   */
   private def incDec(op: String, target: Expr, pre: Boolean): TExpr = {
     val place = analyzePlace(target, s"'$op'")
 
-    place.ty match
-      case i: Type.Integer => TIncDec(place, op, pre, i)
-      case other           => err(s"'$op' is not defined for ${show(other)}")
+    Type.underlying(place.ty) match
+      case _: Type.Integer => withInvCheck(place, TIncDec(place, op, pre, place.ty, constraintOf(place.ty)))
+      case _               => err(s"'$op' is not defined for ${show(place.ty)}")
   }
 
   /** `for name in seq` over storage that is already there: each element is copied out by index, and
@@ -1256,7 +1271,11 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       val op       = cmps(i).op
       val (a, b)   = (ts(i), ts(i + 1))
       val equality = op == "==" || op == "!="
-      if a.ty != b.ty then err(s"cannot compare ${show(a.ty)} with ${show(b.ty)}")
+      // Operands agree on their *representation*, which is the reading `arithType` takes: a
+      // transparent subtype is the same type as its base (`16 §1`), so `a < n` between an `Age` and
+      // an `int` is one comparison of two integers, while a derived subtype is its own
+      // representation and so still compares only with itself.
+      if Type.repr(a.ty) != Type.repr(b.ty) then err(s"cannot compare ${show(a.ty)} with ${show(b.ty)}")
       if !(if equality then Type.isEquatable(a.ty) else Type.isOrdered(a.ty)) then
         err(s"'$op' is not defined for ${show(a.ty)}")
 

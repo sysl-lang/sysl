@@ -58,10 +58,17 @@ trait Literals extends TypeResolution {
    * takes the type of a non-literal neighbour — which is what lets `n + 1` work for an `n` of
    * any width without the literal needing a suffix, and `p == null` work for any `*T`. The
    * non-literals are analyzed first precisely so their type is available to the literals.
+   *
+   * What it takes is the neighbour's **representation**, which for a transparent subtype is its base:
+   * the operator it is about to be an operand of is the base's, so the literal is a base value and
+   * has no range to satisfy. Reading `120` in `t + 120` as a `Temp` would refuse it for not being a
+   * temperature when what has to be one is the sum — and the sum is checked where it is stored. A
+   * derived subtype is its own representation, so a literal still may not stand beside one without
+   * the cast `16 §2` asks for.
    */
   protected def analyzeOperands(operands: List[Expr], expected: Option[Type]): List[TExpr] = {
     val fixed = operands.map(e => Option.when(!isLiteral(e))(analyzeExpr(e, expected)))
-    val ty    = fixed.flatten.headOption.map(_.ty).orElse(expected)
+    val ty    = fixed.flatten.headOption.map(t => Type.repr(t.ty)).orElse(expected)
 
     operands.zip(fixed).map {
       case (_, Some(t)) => t
@@ -170,6 +177,37 @@ trait Literals extends TypeResolution {
       case (Type.Str, "+")                                                                => result
       case _ => err(s"operator '$op' is not defined for ${show(a)}")
   }
+
+  /** The type a unary operator yields at `a`, by the rule `arithType` uses for a binary one: a
+   * transparent subtype's arithmetic happens at its base and yields the base, while a derived one's
+   * happens at itself and yields itself (`16 §3`).
+   */
+  protected def unaryType(a: Type): Type = a match
+    case c: Type.Constrained if c.derived => a
+    case _                                => Type.repr(a)
+
+  /** What a value has to satisfy to come to have type `t`, where `t` is a constrained subtype that
+   * asks anything of its values. A subtype with neither a range nor a predicate — `type Stamp = new
+   * i64`, which exists to be a distinct name — asks nothing, so producing one costs no instruction.
+   *
+   * This is the question `16 §4` is about, asked of a type rather than of a syntactic form: every
+   * site that gives a value this type consults it, so the set of checked sites is the set of sites
+   * that produce one, by construction rather than by a list somebody kept up to date.
+   */
+  protected def constraintOf(t: Type): Option[Type.Constrained] = t match
+    case c: Type.Constrained if c.lo.nonEmpty || c.hi.nonEmpty || c.predFn.nonEmpty => Some(c)
+    case _                                                                          => None
+
+  /** An operation whose *result* is a constrained subtype, checked where it is made. Only a derived
+   * subtype's own arithmetic produces one — a transparent subtype computes at its base, so its
+   * results are base values and the check waits for the store that gives one the subtype again.
+   *
+   * Without this, `16 §3` (a derivation's operators produce itself) and `16 §4` (every produce site
+   * is checked) could not both be true: `Slot(199) + Slot(1)` would be a `Slot` holding 200.
+   */
+  protected def produced(t: TExpr): TExpr = constraintOf(t.ty) match
+    case Some(c) => TConstrainedCheck(t, c).setPos(t.pos)
+    case None    => t
 
   /** Renders a decimal float literal as an LLVM hex double — the textual form that survives
    * the round-trip without losing bits.

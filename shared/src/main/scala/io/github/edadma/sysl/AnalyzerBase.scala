@@ -944,6 +944,7 @@ trait AnalyzerBase {
   protected def describe(target: Expr): String
   protected def indexes(traitName: String, receiver: Expr): Boolean
   protected def arithType(op: String, a: Type, b: Type): Type
+  protected def constraintOf(t: Type): Option[Type.Constrained]
   protected def updateExpected(op: String, placeTy: Type): Option[Type]
   protected def updateDispatch(op: String, place: TExpr, value: TExpr): Option[TDispatch]
   protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type], discarded: Boolean = false): TBlock

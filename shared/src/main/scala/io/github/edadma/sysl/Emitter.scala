@@ -144,6 +144,11 @@ trait Emitter {
   /** Traps unless a struct's `invariant` clauses hold of the value in `v` (`05`). */
   protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit
 
+  /** Traps unless `v` satisfies everything the constrained subtype `c` asks of its values — its
+   * `within` range and its `where` predicate (`16 §4`).
+   */
+  protected def emitConstraintChecks(v: String, c: Type.Constrained): Unit
+
   protected def startFunction(): Unit = {
     prologue = new mutable.StringBuilder
     body = new mutable.StringBuilder

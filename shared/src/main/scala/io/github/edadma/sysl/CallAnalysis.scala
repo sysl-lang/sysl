@@ -536,9 +536,9 @@ trait CallAnalysis extends Literals with TraitObjects {
       val (_, op, kind)    = CoreTraits.required(trName)
 
       kind match
-        case CoreTraits.Kind.Arith   => TBinary(op, self, ts.head, arithType(op, self.ty, ts.head.ty))
+        case CoreTraits.Kind.Arith   => produced(TBinary(op, self, ts.head, arithType(op, self.ty, ts.head.ty)))
         case CoreTraits.Kind.Compare => TCompare(List(self, ts.head), List(TCmp(op)))
-        case CoreTraits.Kind.Prefix  => TUnary(op, self, self.ty)
+        case CoreTraits.Kind.Prefix  => produced(TUnary(op, self, unaryType(self.ty)))
     }
 
   /** `x.m(…)` where `x` is a type parameter, during the definition-time pass of `14 §4`.
@@ -864,15 +864,20 @@ trait CallAnalysis extends Literals with TraitObjects {
    * may take a right-hand type of its own (`14 §7`), and there the place's type is the wrong thing
    * to read the value as: `c *= 2.0` on a complex number wants a `real`, and offering it `Complex`
    * would hand the literal a type it cannot be.
+   *
+   * A **transparent** subtype is homogeneous at its *base*, which `repr` is: what `t += 120` adds is
+   * an ordinary integer, and reading it as the subtype would check the step against a range that
+   * belongs to the total. `t += 120` on a `Temp = int within -100..100` holding -50 is 70, and
+   * refusing it because 120 is not a temperature is refusing the sum for what the addend is.
    */
   protected def updateExpected(op: String, placeTy: Type): Option[Type] =
     CoreTraits.infix.get(op) match
       // A parameter is the one place-type that may be either, and its bounds are what say which.
       case Some(trName) =>
         placeTy match
-          case a: Type.Abstract                        => Some(boundRhs(op, a).getOrElse(a))
-          case _ if CoreTraits.builtin(trName, placeTy) => Some(placeTy)
-          case _                                       => None
+          case a: Type.Abstract                         => Some(boundRhs(op, a).getOrElse(a))
+          case _ if CoreTraits.builtin(trName, placeTy) => Some(Type.repr(placeTy))
+          case _                                        => None
       case _ => Some(placeTy)
 
   protected def updateDispatch(op: String, place: TExpr, value: TExpr): Option[TDispatch] =

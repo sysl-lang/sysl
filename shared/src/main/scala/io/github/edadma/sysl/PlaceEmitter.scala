@@ -97,6 +97,8 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
         else
           val updated = combine(w.op, ty, w.value.ty, w.dispatch, cur, v)
 
+          for c <- w.constraint do emitConstraintChecks(updated, c)
+
           // A compound arm has already read what was in the slot, so the release is of that value
           // rather than of a second load — which is `TUpdate`'s arrangement, for its reason.
           if containsRef(ty) then

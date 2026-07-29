@@ -381,11 +381,14 @@ null-tolerant pair are each emitted only into a module that turns out to need th
 three string helpers — writing bytes by length, comparing two byte runs, and testing that an
 offset is not inside a character.
 A simple enum is plain `i32`; a data enum
-lowers to a value aggregate `%enum.Name = type { i32 tag, payload₁, … }` with one payload slot
-per data-carrying variant (each payload a named `%Name.Variant` aggregate). A pattern test is a
-tag `icmp` plus `extractvalue` reads of the payload fields (pure, so nested fields are read
-unconditionally and a failed outer tag simply ANDs a `false` through); bindings are stored into
-fresh slots only once the arm — and its guard — is taken. An instantiated generic name is
+lowers to a value aggregate `%enum.Name = type { i32 tag, [N x unit] }` — the tag and **one region
+every variant shares**, sized to the widest payload and counted in whatever unit the strictest
+variant must be aligned to, so `Pair(x: i64, y: i64)` beside `Small(c: u8)` gives
+`{ i32, [2 x i64] }`. Each variant's payload is its own named aggregate (`%Name.Variant`), and
+reading one spills the enum to a slot, walks to the region, and loads that aggregate out of it —
+a union has no `extractvalue` of its own. A pattern test is a tag `icmp` plus those reads (pure, so
+nested fields are read unconditionally and a failed outer tag simply ANDs a `false` through);
+bindings are stored into fresh slots only once the arm — and its guard — is taken. An instantiated generic name is
 flattened into its LLVM name — `Result[int, string]` becomes `%enum.Result.int.string` and
 `id[T]` at `int` becomes `@id.int` — which stays unambiguous because every name has a fixed
 arity.
@@ -420,11 +423,13 @@ arity.
    or branch ends; every function retains its parameters and returns a count already taken.
    That is correct but not minimal — a retain/release pair that provably cancels is still
    emitted, and a reference borrowed for the length of a call is still counted twice. Eliding
-   them is a later pass over the same placement, not a change to it. `weak` does not exist yet,
-   so a reference cycle is a leak; there are no methods; the deallocation hook is always the
-   built-in one, since there is no way yet to write an allocator; and a data enum still
-   reserves storage for *every* variant's payload at once (a value aggregate, no size
-   arithmetic) rather than sizing the box to the variant it holds.
+   them is a later pass over the same placement, not a change to it. What this item used to list
+   beside that has been built and is struck here rather than deleted, since the shortcut is the
+   claim and the claim has narrowed: ~~`weak` does not exist yet, so a reference cycle is a leak~~
+   (built — `03`, and the count is a third header word); ~~there are no methods~~ (built — `08`);
+   ~~a data enum reserves storage for every variant's payload at once~~ (it is a union — the tag
+   and one region sized to the widest payload). What remains is the **deallocation hook**, which is
+   always the compiler's own or null, since there is still no way to write an allocator.
 6. **Exhaustiveness is computed over all the arms at once**, as a matrix with one row per
    unguarded pattern and one column per value still being discriminated. A column whose type has
    a finite constructor set — an enum's variants, a struct's single shape, `bool`'s two values —

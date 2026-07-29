@@ -100,7 +100,15 @@ object CoreTraits {
    * `==` and `<`, so nothing here decides anything those did not already decide — `bool` has
    * equality and no ordering, a pointer compares by address and nothing else.
    */
-  def builtin(traitName: String, t: Type): Boolean = traitName match {
+  def builtin(traitName: String, subject: Type): Boolean = {
+    // A constrained subtype is asked about at its **base**: `16 §1` makes a transparent one the same
+    // type as its base, and `16 §3` gives a derived one the base's whole catalog, so a subtype
+    // narrows which values a type has and never which operations it has. `Eq` and `Ord` already read
+    // it this way through `isOrdered`; the rows below used to match the type as written, which left
+    // `%`, the bitwise operators, the shifts and unary `-` off a subtype that plainly has them.
+    val t = Type.underlying(subject)
+
+    traitName match {
     case "Add"                 => Type.isNumeric(t) || t == Type.Str
     case "Sub" | "Mul" | "Div" => Type.isNumeric(t)
 
@@ -137,6 +145,7 @@ object CoreTraits {
     case "Display" => Type.isNumeric(t) || t == Type.Str || t == Type.Char || t == Type.Bool
 
     case _ => false
+    }
   }
 
   /** The prelude function a built-in's `Hash` goes through, and the type its receiver widens to.
