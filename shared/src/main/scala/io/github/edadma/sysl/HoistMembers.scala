@@ -834,17 +834,18 @@ trait HoistMembers extends TypeResolution {
   ): List[MethodDecl] = {
     val declared  = tr.methods.map(_.name).toSet
     val inherited = mutable.ListBuffer.empty[MethodDecl]
+    val shown     = traitShown(impl)
 
     for tm <- tr.methods do
       impl.methods.find(_.name == tm.name) match
-        case Some(im) => checkSignature(home.label, qn(impl.traitName), tm, im, sig, scopeFor(tr.name))
+        case Some(im) => checkSignature(home.label, shown, tm, im, sig, scopeFor(tr.name))
         case None if tm.body.nonEmpty => inherited += tm
         case None =>
-          err(s"'${home.label}' does not implement '${qn(impl.traitName)}': ${kind(tm)} '${tm.name}' is missing")
+          err(s"'${home.label}' does not implement '$shown': ${kind(tm)} '${tm.name}' is missing")
 
     for im <- impl.methods do
       if !declared.contains(im.name) then
-        err(s"trait '${qn(impl.traitName)}' declares no ${kind(im)} '${im.name}', so this 'impl' cannot define it")
+        err(s"trait '$shown' declares no ${kind(im)} '${im.name}', so this 'impl' cannot define it")
 
     inherited.toList
   }
@@ -864,6 +865,14 @@ trait HoistMembers extends TypeResolution {
    * (`14 §1`) — the comparison is between *resolved* types, so it does not matter which spelling
    * either side chose.
    */
+  /** The trait an `impl` is for, as a message spells it — which for a call trait is the arrow the
+   * block was written with, not the arity-carrying declaration behind it (`12 §6`).
+   */
+  private def traitShown(impl: ImplDecl): String =
+    if Type.Fn.isCall(impl.traitName) && impl.traitArgs.nonEmpty then
+      s"Fn(${impl.traitArgs.init.map(_.show).mkString(", ")}) -> ${impl.traitArgs.last.show}"
+    else qn(impl.traitName)
+
   private def checkSignature(
       forType: String,
       traitName: String,

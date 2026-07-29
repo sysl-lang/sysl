@@ -445,6 +445,97 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  "the far corners" - {
+    "five closures deep, each capturing through the last" in {
+      run(apply + """print(apply(a -> apply(b -> apply(c -> apply(d -> apply(e ->
+                    |    e + a + b + c + d, d), c), b), a), 1))
+                    |""".stripMargin) shouldBe "5\n"
+    }
+
+    "one as a loop condition" in {
+      run("""var i = 0
+            |var go: &Fn(int) -> bool = k -> k < 3
+            |
+            |while go(i) do i = i + 1
+            |
+            |print(i)
+            |""".stripMargin) shouldBe "3\n"
+    }
+
+    "no parameters and no result" in {
+      run("""var noop: &Fn() -> unit = () -> print("noop")
+            |
+            |noop()
+            |""".stripMargin) shouldBe "noop\n"
+    }
+
+    "behind a raw pointer rather than a reference" in {
+      run("""struct Doubler
+            |    k: int
+            |
+            |impl Fn(int) -> int for Doubler
+            |    call(*self, a: int) -> int = a * self.k
+            |
+            |var d = Doubler(3)
+            |var raw: *Fn(int) -> int = &d
+            |
+            |print(raw(5))
+            |""".stripMargin) shouldBe "15\n"
+    }
+
+    "twenty thousand of them capturing a string, none of them leaked" in {
+      run("""var name = "abc"
+            |var total = 0
+            |
+            |for j in 0..<20000
+            |    var f: &Fn(int) -> int = k -> k + int(name.len)
+            |    total += f(0)
+            |
+            |print(total)
+            |""".stripMargin) shouldBe "60000\n"
+    }
+
+    "a module-level 'val' may not hold one, for the reason it holds no reference" in {
+      err("""val greeter: &Fn(int) -> string = k -> "x"
+            |""".stripMargin) should include("a 'val' holds plain data only")
+    }
+
+    "two of them are not compared" in {
+      err("""var f: &Fn(int) -> int = x -> x
+            |var g: &Fn(int) -> int = x -> x
+            |
+            |print(f == g)
+            |""".stripMargin) should include("'==' is not defined for &Fn(int) -> int")
+    }
+
+    "a type is callable at one arity, since its members are one namespace" in {
+      // `Fn(int) -> int` and `Fn(int, int) -> int` are two traits, and each would give the type a
+      // member named `call` — which `08`'s one-name-one-member rule refuses. sysl has no
+      // overloading, so this falls out rather than being a rule of its own.
+      err("""struct Twin
+            |    k: int
+            |
+            |impl Fn(int) -> int for Twin
+            |    call(*self, a: int) -> int = a
+            |
+            |impl Fn(int, int) -> int for Twin
+            |    call(*self, a: int, b: int) -> int = a + b
+            |""".stripMargin) should include("already has a member named 'call'")
+    }
+
+    "an implementation whose 'call' disagrees is told in the arrow it was written with" in {
+      val message = err("""struct Wrong
+                          |    k: int
+                          |
+                          |impl Fn(int) -> int for Wrong
+                          |    call(*self, a: string) -> int = 0
+                          |""".stripMargin)
+
+      message should include("trait 'Fn(int) -> int' declares int")
+      message should not include "Fn1"
+    }
+  }
+
   "what the representation must not quietly become" - {
     "two closures of one written shape are two types" in {
       val out = ir(apply + """print(apply(x -> x + 1, 1), apply(x -> x * 2, 1))

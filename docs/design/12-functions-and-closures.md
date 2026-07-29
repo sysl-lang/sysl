@@ -503,7 +503,13 @@ that points at the `&Fn` it should have been — never a silent box.
 **A program may implement the call trait itself**, which follows from `Fn` being a trait like any
 other and is worth saying because it is useful: a struct with an `impl Fn(int) -> int` is callable
 with `d(5)`, may be passed to a bare-arrow parameter, and may be erased into a `&Fn`. It is written
-with the arrow, the same way the type of a callable is written everywhere else.
+with the arrow, the same way the type of a callable is written everywhere else. **One arity per
+type**, since each would give it a member named `call` and a type's members are one namespace (`08`)
+— sysl has no overloading, so this falls out rather than being a rule of its own.
+
+**Anything whose type says it is callable may be called**, wherever it was read from: an element of
+an array of them, a part of a tuple, an item of a container, the result of another call. The head of
+a call is looked at rather than required to be a name.
 
 This split is not two mechanisms. `Fn` is the trait in both; the bare arrow is a bound over it,
 `&Fn` is a trait object of it, precisely the static/dynamic pair of `10` §6. The parameter
