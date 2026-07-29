@@ -108,6 +108,50 @@ class MethodParserTests extends AnyFreeSpec with ParseSupport {
     )
   }
 
+  // A property takes the `funcBody` a method takes, so the two block spellings parse to the same
+  // statements a method's would — which is the whole of the change, and the reason the one-expression
+  // form above is still one `ExprStmt`.
+  "a property may open a block, with an `=` or without one" in {
+    val bare =
+      """struct P
+        |    x: int
+        |    doubled -> int
+        |        var t = self.x
+        |        t * 2""".stripMargin
+
+    val equals =
+      """struct P
+        |    x: int
+        |    doubled -> int =
+        |        var t = self.x
+        |        t * 2""".stripMargin
+
+    val expected = List(
+      StructDecl(
+        "P",
+        Nil,
+        List(Param("x", NamedType("int"))),
+        List(
+          MethodDecl(
+            "doubled",
+            None,
+            isProperty = true,
+            Nil,
+            Nil,
+            Some(NamedType("int")),
+            List(
+              VarDecl("t", None, Some(Field(Ident("self"), "x"))),
+              ExprStmt(Binary("*", Ident("t"), i(2))),
+            ),
+          )
+        ),
+      )
+    )
+
+    prog(bare) shouldBe expected
+    prog(equals) shouldBe expected
+  }
+
   "an associated function has no receiver" in {
     val src =
       """struct P

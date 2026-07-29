@@ -76,6 +76,150 @@ class BufTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  // A list somebody *leaves*: taking an element out of the middle, and cutting a length down to a
+  // number. `remove` is written in terms of `truncate`, which is what `07 § Not yet` said it should
+  // be, and `clear` is `truncate(0)` — so all three shorten a buffer the one way.
+  "shortening one" - {
+    "truncate cuts the length down to what was asked for" in {
+      run(
+        """var b: &Buf[int] = buf()
+          |for i in 0..<5 do b.push(i)
+          |b.truncate(2)
+          |print(b.len(), b.at(0), b.at(1))""".stripMargin
+      ) shouldBe "2 0 1\n"
+    }
+
+    // Asking for a length there is not is a request to cut nothing, which is a no-op rather than a
+    // panic: unlike an index, a length past the end names no element and so cannot read one.
+    "a length past the end changes nothing" in {
+      run(
+        """var b: &Buf[int] = buf()
+          |for i in 0..<3 do b.push(i)
+          |b.truncate(9)
+          |b.truncate(3)
+          |print(b.len(), b.at(2))""".stripMargin
+      ) shouldBe "3 2\n"
+    }
+
+    "truncating to nothing is what clear does" in {
+      run(
+        """var b: &Buf[int] = buf()
+          |for i in 0..<4 do b.push(i)
+          |var had = b.cap()
+          |b.truncate(0)
+          |print(b.len(), b.is_empty(), b.cap() == had)""".stripMargin
+      ) shouldBe "0 true true\n"
+    }
+
+    "remove hands back the element it took out" in {
+      run(
+        """var b: &Buf[int] = buf()
+          |for i in 0..<5 do b.push(i * 10)
+          |print(b.remove(1), b.len(), b.at(0), b.at(1), b.at(2), b.at(3))""".stripMargin
+      ) shouldBe "10 4 0 20 30 40\n"
+    }
+
+    // The first and last elements are where an off-by-one in the shift shows: removing at 0 moves
+    // every survivor, and removing the last moves none.
+    "at either end" in {
+      run(
+        """var b: &Buf[int] = buf()
+          |for i in 0..<4 do b.push(i)
+          |print(b.remove(0), b.at(0), b.at(2), b.len())
+          |print(b.remove(2), b.at(0), b.at(1), b.len())""".stripMargin
+      ) shouldBe "0 1 3 3\n3 1 2 2\n"
+    }
+
+    "the only element" in {
+      run(
+        """var b: &Buf[int] = buf()
+          |b.push(7)
+          |print(b.remove(0), b.len(), b.is_empty())""".stripMargin
+      ) shouldBe "7 0 true\n"
+    }
+
+    // Every element removed one at a time, always at the front, so each removal shifts the whole
+    // remainder — the order it comes out in is the whole assertion.
+    "one at a time until there is nothing left" in {
+      run(
+        """var b: &Buf[int] = buf()
+          |for i in 0..<6 do b.push(i)
+          |var out = str_builder()
+          |while !b.is_empty() do out.push(str(b.remove(0)))
+          |print(out.finish(), b.len())""".stripMargin
+      ) shouldBe "012345 0\n"
+    }
+
+    // An element that holds something is handed to the caller *and* shifted past by its neighbours,
+    // so a count taken once and a count taken twice look identical until a buffer of references is
+    // churned. Removing from the front of a hundred thousand does both at every step.
+    "removing an element that holds something balances its count" in {
+      run(
+        """struct Cell
+          |    v: int
+          |end Cell
+          |
+          |var total = 0
+          |
+          |for round in 0..<100000
+          |    var b: &Buf[&Cell] = buf()
+          |    b.push(Cell(1))
+          |    b.push(Cell(2))
+          |    b.push(Cell(3))
+          |
+          |    var gone = b.remove(0)
+          |    total += gone.v + b.at(0).v + b.at(1).v
+          |
+          |print(total)""".stripMargin
+      ) shouldBe "600000\n"
+    }
+
+    "and a truncated one is let go of too" in {
+      run(
+        """var total = 0
+          |
+          |for round in 0..<100000
+          |    var b: &Buf[string] = buf()
+          |    for i in 0..<4 do b.push(s"item $i")
+          |    b.truncate(1)
+          |    total += int(b.at(0).len)
+          |
+          |print(total)""".stripMargin
+      ) shouldBe "600000\n"
+    }
+
+    // A copy of a `Buf` copies the two fields and not the allocation behind them, so what a copy
+    // keeps is the **count** it was taken at — the shift a removal makes lands in storage they
+    // share, and the copy reads the shifted elements at a length that no longer describes them.
+    // That is the same shallow copy `§ how a push is seen` is about, seen from the shortening side.
+    "a copy taken before a removal keeps the length, not the elements" in {
+      run(
+        """var p: &Buf[int] = buf()
+          |for i in 0..<3 do p.push(i)
+          |var c = *p
+          |print(p.remove(0), p.len(), p.at(0), c.len(), c.at(0), c.at(2))""".stripMargin
+      ) shouldBe "0 2 1 3 1 2\n"
+    }
+
+    "removing an index that names no element says which and how many there were" in {
+      panics(
+        """var b: &Buf[int] = buf()
+          |b.push(1)
+          |b.push(2)
+          |print(b.remove(2))""".stripMargin,
+        "past the 2 elements",
+      )
+    }
+
+    "and so does removing from an empty one" in {
+      panics(
+        """var b: &Buf[int] = buf()
+          |print(b.remove(0))""".stripMargin,
+        "past the 0 elements",
+      )
+    }
+  }
+
   "growth" - {
     "capacity doubles from nothing, and every element survives it" in {
       run(

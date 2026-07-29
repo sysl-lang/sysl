@@ -748,7 +748,11 @@ reason a generic numeric routine in sysl reads worse than the same routine writt
   traits themselves.
 - **A trait method with type parameters of its own.** An inherent member may declare them (`08`,
   `10 §4`); a trait's may not, and so neither may an `impl`'s, which must match what the trait
-  declares. Three questions come with allowing it and none is answered here: how a conformance
+  declares. The refusal is a **decision**, and the diagnostic says so — it names the table slot that
+  could not hold such a member rather than a feature the compiler has yet to write, and it points at
+  the inherent member that may declare them. It is also what closes `12 § Open b`'s second half: a
+  closure's type is a call trait, so a closure cannot be generic either, for this reason and not for
+  a reason of its own. Three questions come with allowing it and none is answered here: how a conformance
   comparison treats two signatures whose parameters are spelled differently, what a default body may
   assume of them, and — the one that decides the shape of the rest — that a generic method makes a
   trait unusable as a trait object, since no vtable slot can hold a function that does not exist
@@ -759,10 +763,11 @@ reason a generic numeric routine in sysl reads worse than the same routine writt
   the one thing here that would be genuinely useful (`[]byte` rendering differently from every other
   slice) and is deliberately not done: a rule for choosing between two implementations is easy to
   add later and impossible to remove.
-- **A property's body must be an expression.** `name -> T = expr` is the only spelling, so a property
-  cannot open an indented block the way a method's `= …`-less form can. That is `08`'s grammar rather
-  than anything about traits, and it bites a default property the same way it bites an inherent one.
-  Additive: the property form wants the `funcBody` a method already uses.
+- ~~**A property's body must be an expression.**~~ **Built** — a property takes the `funcBody` a
+  method takes, so `= expr`, an `=` opening a block, and a bare block are all spellings of it, in a
+  trait's default and in a type's own body alike. It was additive exactly as this item predicted, and
+  it was never a decision about traits or about properties: it was one parser alternative narrower
+  than the member beside it. See `08 § Properties`.
 - **`&Trait` is not yet gated on `alloc`.** `capabilities.md` puts a counted trait object behind the
   allocator capability, alongside `&T` itself. Neither is gated, because the capability system needs
   the project config and the module system, and both are still to be written — so this is the same

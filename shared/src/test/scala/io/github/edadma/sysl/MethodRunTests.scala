@@ -5,7 +5,7 @@ import org.scalatest.freespec.AnyFreeSpec
 /** Tier-2 runtime behavior of methods, properties, and associated functions: each receiver
  * mode passes the instance correctly, and a member lowered to a function runs like any call.
  */
-class MethodRunTests extends AnyFreeSpec with RunSupport {
+class MethodRunTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   "a value-receiver method reads the instance" in {
     val src =
@@ -60,6 +60,147 @@ class MethodRunTests extends AnyFreeSpec with RunSupport {
         |print(v.doubled, r.doubled)""".stripMargin
 
     run(src) shouldBe "42 10\n"
+  }
+
+  // A property is a function with the parameter list left off, so it takes the same body a method
+  // takes: an `= expr`, an `=` opening a block, or a block with no `=`. It was the one member whose
+  // body could not be written out, which is what `02 § Details still to settle` recorded.
+  "a property body may be a block" in {
+    val src =
+      """struct P
+        |    x: int
+        |    y: int
+        |
+        |    biggest -> int
+        |        var m = self.x
+        |        if self.y > m then m = self.y
+        |        m
+        |
+        |    total -> int =
+        |        var t = 0
+        |        for v in [self.x, self.y] do t += v
+        |        t
+        |end P
+        |
+        |var p = P(3, 8)
+        |print(p.biggest, p.total)""".stripMargin
+
+    run(src) shouldBe "8 11\n"
+  }
+
+  // A block body is what makes an early answer spellable, and `end <name>` closes a property exactly
+  // as it closes a method.
+  "and may return out of itself, under an end marker of its own" in {
+    val src =
+      """struct P
+        |    x: int
+        |
+        |    kind -> string
+        |        if self.x < 0 then return "negative"
+        |        if self.x == 0 then return "zero"
+        |        "positive"
+        |    end kind
+        |end P
+        |
+        |print(P(-4).kind, P(0).kind, P(9).kind)""".stripMargin
+
+    run(src) shouldBe "negative zero positive\n"
+  }
+
+  // The property whose body could not be written out bit a **default** property in a trait the same
+  // way, so the block reaches both halves: the trait's answer and the implementation's.
+  "a trait's default property and an impl's may each open one" in {
+    val src =
+      """trait Named
+        |    label -> string
+        |        var b = str_builder()
+        |        b.push("<")
+        |        b.push(self.tag)
+        |        b.push(">")
+        |        b.finish()
+        |
+        |    tag -> string
+        |end Named
+        |
+        |struct P
+        |    x: int
+        |    y: int
+        |end P
+        |
+        |impl Named for P
+        |    tag -> string
+        |        var s = str(self.x)
+        |        s + "," + str(self.y)
+        |
+        |var p = P(3, 8)
+        |print(p.label, p.tag)""".stripMargin
+
+    run(src) shouldBe "<3,8> 3,8\n"
+  }
+
+  // A property's declared result is one type and never a result list, so a comma in its body is the
+  // mistake it is — and the message names the list rather than the grammar.
+  "but its body is one value, not several" in {
+    err("""struct P
+          |    x: int
+          |    pair -> int = 1, 2
+          |end P
+          |
+          |print(P(1).pair)""".stripMargin) should include(
+      "a function's result list, and this function declares one result"
+    )
+  }
+
+  // Nothing about the body form is particular to a struct: a generic type's property is instantiated
+  // from the receiver's own arguments as a method is, and an enum's may take its own value apart.
+  "a block reaches a generic type's property and an enum's" in {
+    val src =
+      """struct Box[T: Display]
+        |    v: T
+        |
+        |    shown -> string
+        |        var b = str_builder()
+        |        b.push("[")
+        |        b.push(str(self.v))
+        |        b.push("]")
+        |        b.finish()
+        |end Box
+        |
+        |enum Shape
+        |    Circle(r: int)
+        |    Square(s: int)
+        |
+        |    area -> int
+        |        var a = 0
+        |        self match
+        |            Circle(r) -> a = r * r * 3
+        |            Square(s) -> a = s * s
+        |        a
+        |end Shape
+        |
+        |print(Box(7).shown, Box("hi").shown)
+        |print(Circle(2).area, Square(3).area)""".stripMargin
+
+    run(src) shouldBe "[7] [hi]\n12 9\n"
+  }
+
+  // A signature with no body is what a *trait* declares, so in a type's own body one is refused — and
+  // now refused identically whichever member it is, which is the point of a property taking the same
+  // body a method takes. The message is the grammar's own and is poor; it is poor for both, which is
+  // what this asserts.
+  "a property with no body is refused exactly as a method with none is" in {
+    val property = err("""struct P
+                         |    x: int
+                         |    doubled -> int
+                         |end P""".stripMargin)
+
+    val method = err("""struct P
+                       |    x: int
+                       |    doubled(self) -> int
+                       |end P""".stripMargin)
+
+    property should include("indent expected")
+    property shouldBe method
   }
 
   "an associated function is called through the type name" in {

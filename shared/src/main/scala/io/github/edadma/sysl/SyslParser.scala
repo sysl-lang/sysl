@@ -848,9 +848,15 @@ class SyslParser(val source: Source) extends PackratParsers {
           generics.defaults, variadic = variadic)
     }
 
+  /** A property takes the same `funcBody` a method does, so `name -> T` may be answered by an
+   * `= expr`, by an `=` opening an indented block, or by a block with no `=` at all. A property is a
+   * function with the parameter list left off, and having only the one-expression spelling made it
+   * the one member whose body could not be written out — which bit a default property in a trait
+   * the same way it bit an inherent one.
+   */
   private def propertyTail(name: String): Parser[MethodDecl] =
-    (op("->") ~> typeRef) ~ (op("=") ~> expression) <~ endName(name) ^^ {
-      case ret ~ e => MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), List(ExprStmt(e).setPos(e.pos)))
+    (op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
+      case ret ~ body => MethodDecl(name, None, isProperty = true, Nil, Nil, Some(ret), body)
     }
 
   /** The parenthesised part of a method: an optional receiver shorthand (`self`, `*self`,

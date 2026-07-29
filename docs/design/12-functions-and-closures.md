@@ -765,10 +765,18 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
   — capturing a copy of a `&T`'s pointee, or capturing by a distinct alias — as Swift's `[weak
   self]` / C++'s `[=]`/`[&]` do. The implicit default (§7) covers the common cases; a list is the
   escape hatch for the rest, deferred until real code needs it.
-- **b. Closures over generic and trait-bound parameters.** A closure that captures a value of a
-  generic function's type parameter, or that is itself generic, interacts with monomorphization
-  (`10`) in ways the top-level cases do not exercise yet. The static/dynamic split of §6 is the
-  frame; the corners are open.
+- ~~**b. Closures over generic and trait-bound parameters.**~~ **Closed, and neither half needed a
+  decision.** The first half — a closure that captures a value of a generic function's type parameter
+  — follows from §8's representation with nothing added: the closure is a struct whose field has that
+  type, so it is monomorphized with the body that holds it, once per instantiation, and the bound the
+  *enclosing* declaration carries is what an operator in the body dispatches through. An escaping one
+  is a `&Fn(T) -> T` returned out of a generic body, which is the same erasure §6 already describes.
+  The second half — a closure that is **itself** generic — is answered by `02`: a callable's type is
+  the prelude's `FnN` trait, and a trait's member may not declare type parameters of its own, because
+  no table slot can hold a function that does not exist until a call names its types. So there is
+  nothing for an arrow to declare them *for*, and this is `§10`'s currying situation again: a rule
+  elsewhere already decides it. This item was mis-filed as open — it asked whether the implementation
+  reached the corners, not what the language should do about them.
 - ~~**c. `FnMut` / `FnOnce`-style distinctions.**~~ **Settled by §8's representation.** Rust splits
   callables by how they use their captures; sysl has no move semantics, so the *consume* distinction
   never arose, and the *mutating* one falls out: a capture is a field, `call` takes its receiver by

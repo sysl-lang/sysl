@@ -147,8 +147,18 @@ reason.
 
 `Buf[T]` is the growable array, and it is **ordinary sysl in the prelude** rather than a type the
 compiler knows: a `[]T` field for the storage, a count of how much of it is live, and `push`, `pop`,
-`at`, `set`, `view`, `len`, `cap`, `clear`. That it can be written at all is the interesting part,
-and it is what the section above bought.
+`remove`, `truncate`, `at`, `set`, `view`, `len`, `cap`, `clear`. That it can be written at all is
+the interesting part, and it is what the section above bought.
+
+**Three of those shorten it, and they are one operation.** `truncate(n)` lowers the count to `n`,
+and does nothing where `n` is a length the buffer does not have — a length past the end names no
+element, so unlike an index there is nothing for it to read and nothing to stop the program about.
+`clear()` is `truncate(0)`. `remove(i)` shifts the survivors down over element `i`, hands that
+element back, and ends at `truncate` for the length; an `i` that names no element is the panic `at`
+gives, for `at`'s reason. What none of the three does is give storage back: the elements above the
+count are still values in a `[]T` that ARC owns, which is `§ Not yet`'s capacity-that-is-not-values
+seen from the shortening side — and it is also why a **copy** of a `Buf` taken before a removal
+reads the shifted elements at the length it was copied at.
 
 **Correcting what this document said.** The claim here was that a library could not reach a growable
 array — that it would need `sizeof` over a type parameter, a cast to reach the elements through it,
@@ -348,14 +358,15 @@ implementation:
   alternative — a `[80]T` parameter — copies the table at every call. A table small enough to copy
   escapes it, which is why the same program hands its eight initial values over as a `[8]T` and
   thinks nothing of it.
-- **A `Buf` grows and shrinks at its end and nowhere else.** `push`, `pop`, `clear`, and nothing
-  that takes an element out of the middle or cuts a length down to a number. Both are wanted by the
-  same kind of code and for the same reason: a list somebody *leaves*. `guide/scheduler` keeps three
-  of them — a lock's waiters, the locks a task holds, the tasks that are asleep — and takes an
-  element out of each by compacting the survivors down and then popping the tail off one at a time,
-  which is two loops for what is one operation, and the second loop is easy to forget (leaving the
-  last element in the buffer twice). What it wants is `remove(i)` and `truncate(n)`; neither is a
-  language question, and `truncate` is the one the other is written in terms of.
+- ~~**A `Buf` grows and shrinks at its end and nowhere else.**~~ **Built** — see `§ Growing one`.
+  `remove(i)` and `truncate(n)`, the second being the one the first is written in terms of, and
+  `clear` now written in terms of it too. What made the item worth doing was the shape of the code
+  that went without them: `guide/scheduler` keeps three lists somebody *leaves* — a lock's waiters,
+  the locks a task holds, the tasks that are asleep — and took an element out of each by compacting
+  the survivors down and then popping the tail off one at a time, which is two loops for what is one
+  operation, and the second loop is easy to forget (leaving the last element in the buffer twice).
+  Neither operation was a language question, which is why this item was mis-filed here: it asked
+  whether the prelude was complete, not what the language should be.
 - **An unchecked-index escape hatch** for hot loops, listed as likely-yes and deferred in `03`.
 - **Multi-dimensional shorthand.** `[3][3]f64` already works as an array of arrays; a distinct
   rectangular type is not planned.

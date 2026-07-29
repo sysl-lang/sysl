@@ -106,8 +106,17 @@ trait Hoisting extends HoistMembers {
             "work on — give it a 'self' parameter or drop the body"))
         // No implementation could supply one either, so the trait is where it is worth saying so.
         // A defaulted parameter is caught by this too, since carrying a default means having one.
+        //
+        // The refusal is a decision and not a gap (`02 § Details still to settle`), so the message
+        // says what it is about the trait rather than what the compiler has yet to do: a member with
+        // type parameters of its own could never sit in a vtable slot, because the function does not
+        // exist until a call names its types — and a trait that cannot be a trait object is a
+        // narrower thing than the trait somebody wrote. An inherent member may declare them (`08`),
+        // which is what the message points at.
         if m.tparams.nonEmpty then
-          at(m.pos)(err(s"generic methods are not supported yet — '${t.name}.${m.name}'"))
+          at(m.pos)(err(s"'${t.name}.${m.name}' declares type parameters of its own, which a trait's " +
+            "member may not — no table slot can hold a function that does not exist until a call " +
+            "names its types; an inherent member may declare them"))
     // A constrained subtype shares the type namespace, so a name clash is caught here; the base and
     // bounds are resolved and validated lazily, the first time the name is used as a type.
     case t: TypeDecl =>

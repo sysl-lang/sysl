@@ -313,7 +313,7 @@ class GenericTraitErrorTests extends AnyFreeSpec with RunSupport with CodegenSup
       err(
         """trait Get[T]
           |    pick[U](self, u: U) -> T""".stripMargin,
-      ) should include("generic methods are not supported yet — 'Get.pick'")
+      ) should include("'Get.pick' declares type parameters of its own, which a trait's member may not")
     }
 
     "an implementation still supplies every member the trait declares" in {

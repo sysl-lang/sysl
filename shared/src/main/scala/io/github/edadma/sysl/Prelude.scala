@@ -601,8 +601,25 @@ object Prelude {
       |        Some(self.elems[self.count])
       |    end pop
       |
+      |    truncate(*self, n: usize)
+      |        if n < self.count then self.count = n
+      |
       |    clear(*self)
-      |        self.count = 0usize
+      |        self.truncate(0usize)
+      |
+      |    remove(*self, i: usize) -> T
+      |        if i >= self.count
+      |            print("panic: index", i, "past the", self.count, "elements of a Buf")
+      |            exit(1)
+      |
+      |        var gone = self.elems[i]
+      |
+      |        for j in i..<self.count - 1usize
+      |            self.elems[j] = self.elems[j + 1usize]
+      |
+      |        self.truncate(self.count - 1usize)
+      |        gone
+      |    end remove
       |
       |    view(self) -> []T = self.elems[..<self.count]
       |end Buf

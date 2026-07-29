@@ -267,12 +267,13 @@ class DefaultTypeParamTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
 
     /** A trait's method is refused one step earlier and for a larger reason — it may not be generic
-      * at all yet — so the default never becomes the thing that is wrong with it. Pinned so that
-      * whichever of the two is lifted first, the other is still known to be here.
+      * at all, since no vtable slot could hold it — so the default never becomes the thing that is
+      * wrong with it. Pinned so that whichever of the two is lifted first, the other is still known
+      * to be here.
       */
     "a trait's method cannot be generic, so it cannot default one either" in {
       err("trait T\n    m[U = int](self, x: U) -> int") should include(
-        "generic methods are not supported yet",
+        "declares type parameters of its own, which a trait's member may not",
       )
     }
 

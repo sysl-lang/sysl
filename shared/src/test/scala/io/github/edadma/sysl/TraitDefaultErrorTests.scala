@@ -95,7 +95,7 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
       err(
         """trait Store
           |    put[T](self, item: T) -> int""".stripMargin
-      ) should include("generic methods are not supported yet")
+      ) should include("declares type parameters of its own, which a trait's member may not")
     }
   }
 

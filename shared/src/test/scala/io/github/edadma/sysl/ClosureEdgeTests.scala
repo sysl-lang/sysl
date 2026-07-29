@@ -352,6 +352,57 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "1\n"
     }
 
+    // `12 § Open b` asked whether a closure written *inside* a generic body — capturing a value whose
+    // type is the enclosing function's parameter — interacts with monomorphization in a way the
+    // top-level cases do not. It does not: the closure is a struct whose field has that type, so it is
+    // monomorphized with the function that holds it, once per instantiation. Two instantiations here,
+    // and the second is a float, so a struct laid out for the first would be measurably wrong.
+    "a closure inside a generic body captures the parameter's own type" in {
+      run("""bump[T: Add](x: T, by: T) -> T
+            |    var g = (y: T) -> y + by
+            |
+            |    g(x)
+            |
+            |print(bump(5, 7), bump(1.5, 0.25))
+            |""".stripMargin) shouldBe "12 1.75\n"
+    }
+
+    // The bound travels with it: `+` inside the body is dispatched through what the *enclosing*
+    // declaration asked of `T`, which is the only place the requirement is written.
+    "and the bound the enclosing declaration carries reaches the body" in {
+      run("""shown[T: Display](x: T) -> string
+            |    var f: &Fn(T) -> string = (v: T) -> str(v)
+            |
+            |    f(x)
+            |
+            |print(shown(42), shown(true), shown("s"))
+            |""".stripMargin) shouldBe "42 true s\n"
+    }
+
+    "a boxed one may be returned out of a generic body" in {
+      run("""adder[T: Add](by: T) -> &Fn(T) -> T = (y: T) -> y + by
+            |
+            |var i = adder(10)
+            |var f = adder(0.5)
+            |
+            |print(i(1), f(1.25))
+            |""".stripMargin) shouldBe "11 1.75\n"
+    }
+
+    // The other half of `12 § Open b` — a closure that is itself generic — needs no decision of its
+    // own, and this is the reason rather than the spelling: a callable's type is the prelude's `FnN`
+    // trait, and `02` refuses a trait member with type parameters because no vtable slot can hold a
+    // function that does not exist until a call names its types. So there is nothing for an arrow to
+    // declare them for. What the grammar says today is only that it cannot read one.
+    "a closure of its own may not be generic, because its call trait's member may not be" in {
+      err("""var f = [T](x: T) -> x
+            |""".stripMargin) should include("newline expected")
+
+      err("""trait Maps
+            |    over[T](self, x: T) -> T
+            |""".stripMargin) should include("which a trait's member may not")
+    }
+
     "'?' inside a body unwraps into the closure's own result" in {
       run("""find(n: int) -> Result[int, string]
             |    if n > 0 then Ok(n) else Err("no")

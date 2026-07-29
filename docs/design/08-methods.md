@@ -45,13 +45,14 @@ A member is told apart from a field by what follows its name, with no new keywor
 | Form | What it is | Called as |
 |---|---|---|
 | `name: type` | a **field** | `p.name` |
-| `name -> type = …` (no parens) | a **property** | `p.name` |
+| `name -> type …` (no parens) | a **property** | `p.name` |
 | `name(self…) …` | an **instance method** | `p.name(…)` |
 | `name(params…) …` (no `self`) | an **associated function** | `Point.name(…)` |
 
 The bodies are the ones functions already have (`03`, `07`): an `= expr` short form or an
-indented block whose trailing expression is the value. Nothing about a method body is new; only
-where it is written and what its first parameter may be.
+indented block whose trailing expression is the value. Nothing about a member's body is new — that
+holds for a property as much as for a method, since a property is a method with the parameter list
+left off — only where it is written and what its first parameter may be.
 
 ### Why the type body, not an `impl` block
 
@@ -139,6 +140,27 @@ A property's receiver is an implicit **borrow** — it reads the instance and do
 mutate it, so no sigil is written and none is needed. Inside the body, `self` is in scope and
 refers to the instance. A property is read-only for now; a settable property (a paired getter
 and setter, so `p.name = v` runs code) is a later addition and is noted under *Not yet*.
+
+**A property's body is the body a method has**, so all three spellings are available: `= expr`, an
+`=` opening an indented block, or a block with no `=` at all, with the trailing expression as the
+value either way and an optional `end <name>` closing it.
+
+```
+struct P
+    x: int
+    y: int
+
+    biggest -> int
+        var m = self.x
+        if self.y > m then m = self.y
+        m
+end P
+```
+
+There is nothing in a property that wants a narrower body than a method's — a property *is* a
+function with the parameter list left off — and having only the one-expression form made it the one
+member whose body could not be written out. That bit a **default** property in a trait as hard as an
+inherent one, which is where `02` recorded it.
 
 Dropping the body leaves the **signature** form, `name -> type`, which is what a trait writes to ask
 an implementation for a property (`02`). That the receiver is unwritten changes nothing about the

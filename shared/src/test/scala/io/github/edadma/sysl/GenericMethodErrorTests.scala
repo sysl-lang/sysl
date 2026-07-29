@@ -188,11 +188,19 @@ class GenericMethodErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "a trait declares no generic method, so nothing implementing one may either" - {
 
-    "a trait may not declare one yet" in {
+    // The refusal is a decision rather than a gap (`02 § Details still to settle`): a member with
+    // type parameters of its own could never occupy a vtable slot, since the function does not exist
+    // until a call names its types. So the message is about the trait, and it names the inherent
+    // member that may declare them.
+    "a trait may not declare one" in {
       err(
         """trait Mapper
           |    map[U](self, x: U) -> U""".stripMargin,
-      ) should include("generic methods are not supported yet — 'Mapper.map'")
+      ) should include(
+        "'Mapper.map' declares type parameters of its own, which a trait's member may not — no table " +
+          "slot can hold a function that does not exist until a call names its types; an inherent " +
+          "member may declare them"
+      )
     }
 
     "an 'impl' may not add parameters the trait did not declare" in {
