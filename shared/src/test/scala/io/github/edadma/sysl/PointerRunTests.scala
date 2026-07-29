@@ -273,4 +273,38 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err(src) should include("'p' of 'peek' is *Cell, but &Cell was given")
     }
   }
+
+  /** Where a pointer stops being a way to reach a run of values.
+   *
+   * `03` reserves `*T` for "genuine address work, not merely for having an indexable buffer", and
+   * the length is what decides which of the two a pointer is: a `*[N]T` carries one in its type, so
+   * a view of it is an ordinary view whose owner is null. A `*T` carries none, so there is nothing
+   * to check a subscript against and nothing to give a view its length.
+   *
+   * These pin where the line currently falls rather than where it should. A `*T` **plus a written
+   * length** is the shape C hands back from every function that returns a buffer, and sysl has no
+   * way to say it — see the memo's findings for the open question.
+   */
+  "a run of values is reached through a pointer that carries a length, and not through one that does not" - {
+    "a pointer to an array views and slices, because the length is in its type" in {
+      run("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+            |var p = &a
+            |print(p[..].len, p[1..<3].len, p[..][2])
+            |""".stripMargin) shouldBe "4 2 3\n"
+    }
+
+    "a pointer to one element is not a subscript away from the next" in {
+      err("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+            |var p = &a[0]
+            |print(p[2usize])
+            |""".stripMargin) should include("cannot index")
+    }
+
+    "and it cannot be given a length to be viewed with either" in {
+      err("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+            |var p = &a[0]
+            |print(p[0..<2].len)
+            |""".stripMargin) should include("cannot slice *byte")
+    }
+  }
 }

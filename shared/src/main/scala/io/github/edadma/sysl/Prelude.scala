@@ -633,7 +633,7 @@ object Prelude {
       |end CString
       |
       |cstring(s: string) -> CString
-      |    var b: []u8 = [0u8; s.len + 1]
+      |    var b: []u8 = [0u8; s.len + 1]   // one byte longer than the text, and the fill is the terminator
       |
       |    for i in 0..<s.len do b[i] = s.bytes[i]
       |
