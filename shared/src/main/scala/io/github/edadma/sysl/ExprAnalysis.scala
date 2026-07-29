@@ -428,7 +428,11 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       val tv     = analyzeExpr(value, updateExpected(binSym, place.ty))
       val d      = updateDispatch(binSym, place, tv)
 
-      if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then
+      // A transparent subtype's arithmetic yields its base, which is the same representation the
+      // place holds — the result flows back in with a range check, so it does not change the type.
+      // A real change of representation is caught in `arithType` before this, so `disagree` here
+      // rejects only what remains: a value that could not be stored back into the place at all.
+      if d.isEmpty && disagree(arithType(binSym, place.ty, tv.ty), place.ty) then
         err(s"'$op' would change the type of ${describe(target)}")
 
       withInvCheck(place, TUpdate(place, op, tv, place.ty, d))

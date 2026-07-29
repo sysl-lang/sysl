@@ -42,6 +42,20 @@ class WithinOverflowRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  // A left shift has no overflow intrinsic, so it is checked by shifting back: a bit pushed out of
+  // the top does not return, and a shift amount at or past the width is undefined and traps.
+  "a wide range shifted left detects lost bits" - {
+    "a shift that pushes bits out traps" in {
+      exits(UBig + "print(UBig(2000000000) << 2u32)")
+    }
+    "a shift that fits computes normally" in {
+      run(UBig + "print(UBig(1) << 3u32)") shouldBe "8\n"
+    }
+    "a shift amount at the width traps" in {
+      exits(UBig + "print(UBig(1) << 32u32)")
+    }
+  }
+
   // A narrow range can never overflow the representation on the way to the produce-site check, so it
   // stays on the plain path and the range check alone catches an out-of-range value.
   "a narrow range stays on the plain path" - {

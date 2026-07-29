@@ -130,6 +130,17 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     (ty, dispatch) match
       case (_, Some(d))  => ownTemp(dispatchValue(d, ty, valueTy, cur, v, ty), ty)
       case (Type.Str, _) => ownTemp(strConcat(cur, v), Type.Str)
+      // A compound assignment to a constrained place computes at the base — detecting overflow where
+      // the range invites it, just as the same operator written out would — then re-checks the range
+      // and predicate, since the result is produced into the place like any other value stored there.
+      case (c: Type.Constrained, _) =>
+        val bin = op.dropRight(1)
+        val res = Type.underlying(c) match
+          case it: Type.Integer if (bin == "+" || bin == "-" || bin == "*") && isRanged(c) => checkedArith(bin, it, cur, v)
+          case it: Type.Integer if bin == "<<" && isRanged(c)                               => checkedShl(it, cur, v)
+          case bt                                                                           => arith(bin, bt, cur, v)
+        checkConstrained(res, c)
+        res
       case _             => arith(op.dropRight(1), ty, cur, v)
 
   /** Checks a struct value against its `invariant` function: read each stored field out of the
@@ -144,6 +155,18 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     }
     val ok = freshTemp(); emit(s"$ok = call i1 @$invFn(${args.mkString(", ")})")
     trapUnless(ok, "invariant")
+
+  /** The checks a value must pass to be produced into a constrained type — its `within` range and
+   * its `where` predicate — trapping on a violation exactly where the value is made. Shared by an
+   * explicit produce site and by a compound assignment that lands its result back in the place.
+   */
+  protected def checkConstrained(v: String, c: Type.Constrained): Unit = {
+    emitRangeChecks(v, c)
+    for pf <- c.predFn do
+      val r = freshTemp()
+      emit(s"$r = call i1 @$pf(${Type.underlying(c.base).llvm} $v)")
+      trapUnless(r, "where")
+  }
 
   /** Every callee declared with a `...`, foreign or sysl's own, mapped to the LLVM function type a
    * call to it must name: result type, declared parameter types, ellipsis.
@@ -701,13 +724,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
 
     case TConstrainedCheck(value, target) =>
       val v = genExpr(value)
-      emitRangeChecks(v, target)
-      // A `where` predicate is a synthesised `i1`-returning function over the base value; it traps
-      // exactly as the range does when it answers false.
-      for pf <- target.predFn do
-        val r = freshTemp()
-        emit(s"$r = call i1 @$pf(${Type.underlying(target.base).llvm} $v)")
-        trapUnless(r, "where")
+      checkConstrained(v, target)
       v
 
     case TStructInvCheck(value, struct, invFn) =>
@@ -854,6 +871,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
       val lv = genExpr(l)
       val rv = genExpr(r)
       bt match
+        case it: Type.Integer if op == "<<" && isRanged(l.ty)  => checkedShl(it, lv, rv)
         case it: Type.Integer if overflowChecked(op, l, r, it) => checkedArith(op, it, lv, rv)
         case _                                                 => arith(op, bt, lv, rv)
 
