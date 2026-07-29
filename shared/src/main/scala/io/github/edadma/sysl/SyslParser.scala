@@ -358,6 +358,19 @@ class SyslParser(val source: Source) extends PackratParsers {
   lazy val statement: PackratParser[Stmt] =
     at(
       importDecl | implDecl | declaration | varDecl | returnStmt |
+        breakStmt | continueStmt | requireStmt | ensureStmt | multiAssign | resultListStmt | exprStmt,
+    )
+
+  /** A statement written on the same line as the keyword that introduces it.
+   *
+   * It is every statement **but** a result list, which is a whole line by construction: a branch
+   * written inline is part of a larger expression, so a comma after it belongs to whatever that
+   * expression is part of. Without this, `-> int, string = if c then 1 else 0, "x"` would read the
+   * comma as the *branch's* result list and leave the function one value.
+   */
+  private lazy val inlineStatement: PackratParser[Stmt] =
+    at(
+      importDecl | implDecl | declaration | varDecl | returnStmt |
         breakStmt | continueStmt | requireStmt | ensureStmt | multiAssign | exprStmt,
     )
 
@@ -493,6 +506,18 @@ class SyslParser(val source: Source) extends PackratParsers {
       case parts => success(TupleType(parts))
     }
 
+  /** A function's declared result: one type, or several separated by commas (`12 §5b`).
+   *
+   * A result list is a property of the signature and not a type, so it is spelled here rather than
+   * in `typeRef` — nothing that asks for a *type* can reach one, which is what keeps `-> int, int`
+   * and a field or a parameter apart with no rule of its own.
+   */
+  private lazy val resultRef: Parser[TypeRef] =
+    typeRef ~ rep(op(",") ~> typeRef) ^^ {
+      case t ~ Nil  => t
+      case t ~ more => TupleType(t :: more, results = true)
+    }
+
   /** The `[int, string]` argument list of an applied generic name, whether the name is a type's or
    * a trait's — a trait takes its arguments the same way and in the same place.
    */
@@ -583,8 +608,34 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   private lazy val exprStmt: PackratParser[Stmt] = expression ^^ (e => ExprStmt(e).setPos(e.pos))
 
+  /** `a, b` standing alone — a function's result list as its trailing expression. It is tried
+   * after the assignment form, which starts the same way and is settled by its `=`.
+   */
+  private lazy val resultListStmt: PackratParser[Stmt] =
+    expression ~ rep1(op(",") ~> expression) <~ endOfStatement ^^ { case e ~ more =>
+      ExprStmt(ResultList(e :: more).setPos(e.pos))
+    }
+
+  /** That the list just parsed really was a whole line.
+   *
+   * Without it the form is greedy across a comma that belongs to something outside: an inline
+   * `else` body is a statement, so `f(if c then a else b, x, y)` would read `b, x, y` as a result
+   * list and leave the call one argument. A result list is the last thing on its line by
+   * construction, so requiring that is exact rather than a heuristic.
+   */
+  private lazy val endOfStatement: Parser[Unit] =
+    guard(newline) | guard(dedent) | Parser(in =>
+      if in.atEnd then Success((), in) else Failure("end of statement expected", in))
+
   private lazy val returnStmt: PackratParser[Stmt] =
-    op("return") ~> opt(expression) ^^ Return.apply
+    op("return") ~> opt(resultValue) ^^ Return.apply
+
+  /** What a function hands back: one expression, or the several its result list declares. */
+  private lazy val resultValue: PackratParser[Expr] =
+    expression ~ rep(op(",") ~> expression) ^^ {
+      case e ~ Nil  => e
+      case e ~ more => ResultList(e :: more).setPos(e.pos)
+    }
 
   private lazy val breakStmt: PackratParser[Stmt] =
     op("break") ~> opt(labelRef) ~ opt(expression) ^^ { case lbl ~ v => Break(lbl, v) }
@@ -608,7 +659,7 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val funcDecl: PackratParser[Stmt] =
     ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
       val tp = tps.getOrElse(TypeParams.none)
-      (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
+      (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
         case ((params, variadic)) ~ ret ~ body =>
           FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults)
       }
@@ -648,7 +699,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * indented block (whose trailing expression is the return value).
    */
   private lazy val funcBody: PackratParser[List[Stmt]] =
-    op("=") ~> (suite | expression ^^ (e => List(ExprStmt(e).setPos(e.pos)))) | suite
+    op("=") ~> (suite | resultValue ^^ (e => List(ExprStmt(e).setPos(e.pos)))) | suite
 
   /** One parsed line of a struct body, before the three kinds are sorted into their own lists. */
   private enum StructPart:
@@ -703,7 +754,7 @@ class SyslParser(val source: Source) extends PackratParsers {
     )
 
   private def methodTail(name: String, generics: TypeParams): Parser[MethodDecl] =
-    (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ~ funcBody <~ endName(name) ^^ {
+    (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
       case (recv, params) ~ ret ~ body =>
         MethodDecl(name, recv, isProperty = false, generics.names, params, ret, body, generics.bounds,
           generics.defaults)
@@ -824,7 +875,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val methodSig: PackratParser[MethodDecl] =
     at(
-      ident ~ opt(boundedTypeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+      ident ~ opt(boundedTypeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ^^ {
         case name ~ tps ~ ((recv, params)) ~ ret =>
           val tp = tps.getOrElse(TypeParams.none)
           MethodDecl(name, recv, isProperty = false, tp.names, params, ret, Nil, tp.bounds, tp.defaults)
@@ -894,7 +945,7 @@ class SyslParser(val source: Source) extends PackratParsers {
     newline ~> indent ~> statements <~ dedent
 
   /** A single statement written on the same line as its control-flow keyword. */
-  private lazy val inlineBody: PackratParser[List[Stmt]] = statement ^^ (s => List(s))
+  private lazy val inlineBody: PackratParser[List[Stmt]] = inlineStatement ^^ (s => List(s))
 
   /** The body of a control-flow construct, Scala-style: the introducer keyword (`then` /
    * `do`) is required for a one-line body but optional before an indented block, since a

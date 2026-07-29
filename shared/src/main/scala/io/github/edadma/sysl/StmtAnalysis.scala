@@ -41,7 +41,11 @@ trait StmtAnalysis extends TypeResolution {
     stmts.reverse match
       case ExprStmt(e) :: initRev =>
         val init = initRev.reverse.flatMap(recoverStmt)
-        val tr   = analyzeExpr(e, expected, discarded)
+        // A block whose value *is* the enclosing function's result is the third place a result list
+        // may stand (`12 §5b`), which is what lets a branch or a nested block forward one.
+        val tr =
+          if wantsResults(expected) then analyzeMulti(e, expected)
+          else analyzeExpr(e, expected, discarded)
         TBlock(init, Some(tr), if discarded && tr.ty != Type.Never then Type.Unit else tr.ty)
       case (_: Return | _: Break | _: Continue) :: _ =>
         TBlock(stmts.flatMap(recoverStmt), None, Type.Never)
@@ -179,7 +183,7 @@ trait StmtAnalysis extends TypeResolution {
   private def spread(places: Int, values: List[Expr], subject: String): Option[(TStmt, List[TExpr])] =
     values match
       case List(one) if places > 1 =>
-        val tv = at(one.pos)(analyzeExpr(one, None))
+        val tv = at(one.pos)(analyzeMulti(one))
 
         Type.underlying(tv.ty) match
           case t: Type.Tuple if t.targs.length == places =>
@@ -187,6 +191,12 @@ trait StmtAnalysis extends TypeResolution {
             val read = t.fields.indices.toList.map(i => TField(TLoad(name, tv.ty), i, t.fields(i)._2))
 
             Some((TVarDecl(name, tv.ty, tv), read))
+
+          // A result list and a tuple are both taken apart here, and each is complained about in
+          // its own terms: a call that yields several things has *results*, and the type nobody
+          // wrote is not worth naming back at the reader.
+          case t: Type.Tuple if yieldsResults(tv) =>
+            at(one.pos)(err(s"$subject, and this yields ${quantity(t.targs.length, "result")}"))
 
           case t: Type.Tuple =>
             at(one.pos)(err(s"$subject, and a ${show(tv.ty)} has ${quantity(t.targs.length, "part")} " +
@@ -196,6 +206,12 @@ trait StmtAnalysis extends TypeResolution {
             at(one.pos)(err(s"$subject, and one ${show(other)} is not something to take apart — " +
               "only a tuple is"))
       case _ => None
+
+  /** Whether a value came from a call declaring a **result list** rather than one type. */
+  private def yieldsResults(t: TExpr): Boolean = t match
+    case c: TCall  => c.results
+    case c: TVCall => c.results
+    case _         => false
 
   private def multiAssign(m: MultiAssign): List[TStmt] = {
     val taken =
@@ -328,7 +344,7 @@ trait StmtAnalysis extends TypeResolution {
       List(TExprStmt(analyzeExpr(e, None, discarded = true)))
 
     case Return(opt) =>
-      val tv = opt.map(analyzeExpr(_, Some(retTy)))
+      val tv = opt.map(e => if retIsList then analyzeMulti(e, Some(retTy)) else analyzeExpr(e, Some(retTy)))
       tv match
         case Some(_) if retTy == Type.Unit    => err("cannot return a value from a function with no return type")
         case Some(t) if disagree(t.ty, retTy) => err(s"return type mismatch: expected ${show(retTy)}, got ${show(t.ty)}")

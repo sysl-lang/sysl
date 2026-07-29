@@ -88,7 +88,7 @@ trait TypeResolution extends ImportResolution {
     case PtrType(inner)                     => PtrType(spellSelf(inner, selfRef))
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
     case ArrayType(len, elem)               => ArrayType(len, spellSelf(elem, selfRef))
-    case TupleType(parts)                   => TupleType(parts.map(spellSelf(_, selfRef)))
+    case TupleType(parts, r)                => TupleType(parts.map(spellSelf(_, selfRef)), r)
 
   /** Whether a written type names any of the parameters being solved, and so is not yet a type.
    *
@@ -99,7 +99,7 @@ trait TypeResolution extends ImportResolution {
     case PtrType(inner)     => mentions(inner, tps)
     case RefType(inner, _)  => mentions(inner, tps)
     case ArrayType(_, elem) => mentions(elem, tps)
-    case TupleType(parts)   => parts.exists(mentions(_, tps))
+    case TupleType(parts, _) => parts.exists(mentions(_, tps))
 
   /** Resolves one bound — a trait, with whatever arguments it was applied to — under the
    * substitution the declaration that wrote it is being read at.
@@ -247,7 +247,10 @@ trait TypeResolution extends ImportResolution {
   protected def resolveReturn(t: TypeRef, subst: Map[String, Type]): Type = t match
     case NamedType(n, Nil) if n == neverName && !subst.contains(n) => Type.Never
     case NamedType(n, Nil) if n == unitName && !subst.contains(n)  => Type.Unit
-    case _                                                         => resolveType(t, subst)
+    // A result list is a property of *this* position and of no other, which is why it is read here
+    // rather than by `resolveType` — one that reached anywhere else is a mistake, and says so.
+    case TupleType(parts, true) => Type.Results(tupleType(parts.map(resolveType(_, subst))))
+    case _                      => resolveType(t, subst)
 
   private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
     case PtrType(inner) =>
@@ -270,7 +273,13 @@ trait TypeResolution extends ImportResolution {
 
     // A tuple holds its parts the way a struct holds its fields, so a part is resolved exactly as a
     // field is — a `unit` part included, which the layout skips and the parts after it shift past.
-    case TupleType(parts) => tupleType(parts.map(resolveType(_, subst)))
+    case TupleType(parts, false) => tupleType(parts.map(resolveType(_, subst)))
+
+    // A result list reaches here only where a *type* was asked for, which is everywhere but a
+    // function's result — and the fix is the type that has the same parts.
+    case TupleType(parts, true) =>
+      err(s"'${parts.map(_.show).mkString(", ")}' is a result list, which a signature has and a " +
+        s"value does not — write '(${parts.map(_.show).mkString(", ")})' for the type")
 
     case NamedType(n, argRefs) =>
       if argRefs.isEmpty && subst.contains(n) then subst(n)
@@ -446,7 +455,7 @@ trait TypeResolution extends ImportResolution {
     case PtrType(i)         => mentionsSelf(i)
     case RefType(i, _)      => mentionsSelf(i)
     case ArrayType(_, e)    => mentionsSelf(e)
-    case TupleType(parts)   => parts.exists(mentionsSelf)
+    case TupleType(parts, _) => parts.exists(mentionsSelf)
 
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
    * whatever type is currently being laid out.
@@ -912,7 +921,7 @@ trait TypeResolution extends ImportResolution {
       actual match
         case Type.Array(_, e) => unify(elem, e, tparams, sub)
         case _                => ()
-    case TupleType(parts) =>
+    case TupleType(parts, _) =>
       actual match
         case t: Type.Tuple if t.targs.length == parts.length =>
           parts.zip(t.targs).foreach { case (r, a) => unify(r, a, tparams, sub) }

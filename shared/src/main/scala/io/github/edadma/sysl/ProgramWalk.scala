@@ -489,12 +489,21 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       f: FuncDecl,
       subst: Map[String, Type],
       params: List[(String, Type)],
-      rtype: Type,
+      declaredResult: Type,
   ): TFunc = {
     resetFunction()
     // A member's body sees `Self` alongside whatever type parameters it was instantiated with, so
     // the one substitution answers both questions and nothing downstream has to know the difference.
     tsubst = subst ++ memberSelf.getOrElse(name, Map.empty)
+
+    // A result list is the signature's, and the body produces the tuple its parts lay out as — so
+    // the body is analyzed against that tuple, with the list itself recorded beside it as the one
+    // thing the tuple does not say: how the result is written, and what may stand in it.
+    val rtype = declaredResult match
+      case r: Type.Results => r.parts
+      case other           => other
+
+    retIsList = declaredResult.isInstanceOf[Type.Results]
     retTy = rtype
     variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
@@ -516,7 +525,8 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       else if f.name.endsWith("$inv") then
         err(s"an 'invariant' must be a 'bool', but this one is ${show(tbody.ty)}")
       else
-        err(s"function '${f.name}' should return ${show(rtype)}, but its body yields ${show(tbody.ty)}")
+        err(s"function '${f.name}' should return ${show(declaredResult)}, but its body yields " +
+          s"${show(tbody.ty)}")
 
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds)
   }

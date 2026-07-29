@@ -183,7 +183,7 @@ trait SignatureVisibility extends TypeResolution {
     case PtrType(inner)     => namesIn(inner, skip)
     case RefType(inner, _)  => namesIn(inner, skip)
     case ArrayType(_, elem) => namesIn(elem, skip)
-    case TupleType(parts)   => parts.flatMap(namesIn(_, skip))
+    case TupleType(parts, _) => parts.flatMap(namesIn(_, skip))
 
   /** The declaration a name in a type position stands for: a struct, an enum, or — behind a memory
    * mode, where a trait object writes one — a trait.

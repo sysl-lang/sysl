@@ -33,12 +33,29 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * that is already a `&T` passes through untouched.
    */
   protected def analyzeExpr(expr: Expr, expected: Option[Type], discarded: Boolean): TExpr = {
+    // Whether *this* expression is one of the three places a result list may stand (`12 §5b`).
+    // Taking the flag before anything below runs is what confines it to one expression: every
+    // subexpression is analyzed through this same funnel and sees it already spent.
+    val allowed = multiOk
+    multiOk = false
+
     // A discarded expression is by definition one nothing was expected of, so there is no context
     // to push down and the conversion cases below have nothing to say — what the flag carries is
     // the *absence* of a consumer, which only the branching forms act on.
-    val t = at(expr.pos)(
+    val raw = at(expr.pos)(
       if discarded then analyzeValue(expr, None, discarded = true) else analyzeExpected(expr, expected),
     ).setPos(expr.pos)
+
+    // A result list is unwrapped here into the tuple its parts lay out as, so nothing downstream —
+    // no other analysis, no pass, no emitter — ever holds one. Where a list is *not* allowed, this
+    // is the one place that knows it, and it is also the place with the whole expression to name.
+    val t = raw.ty match
+      case r: Type.Results if allowed => retyped(raw, r.parts)
+      case r: Type.Results =>
+        at(expr.pos)(err(s"this yields ${quantity(r.parts.targs.length, "result")}, and one value is " +
+          "wanted here — a result list is taken apart by a binding or an assignment that names " +
+          "every one of them"))
+      case _ => raw
 
     // A value whose type could not be worked out — a name whose declaration failed, a field of a
     // type that did not resolve, a call to a function with an unusable signature — abandons this
@@ -48,6 +65,25 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
     t
   }
+
+  /** Analyzes one expression in a place a **result list** may stand (`12 §5b`): the right side of
+   * a binding, the right side of a multiple assignment, and the result of a function whose own
+   * declared result is a list. The permission covers this expression and nothing inside it.
+   */
+  protected def analyzeMulti(expr: Expr, expected: Option[Type] = None): TExpr = {
+    multiOk = true
+
+    try analyzeExpr(expr, expected)
+    finally multiOk = false
+  }
+
+  /** The same call, typed at the tuple its result list lays out as. Only a call can carry a result
+   * list — nothing else reads a signature — so those are the two shapes there are.
+   */
+  private def retyped(t: TExpr, parts: Type.Tuple): TExpr = t match
+    case c: TCall  => c.copy(ty = parts, results = true).setPos(t.pos)
+    case c: TVCall => c.copy(ty = parts, results = true).setPos(t.pos)
+    case other     => sys.error(s"a result list arrived on a ${other.getClass.getSimpleName}")
 
   private def analyzeExpected(expr: Expr, expected: Option[Type]): TExpr = expected match
     // An `if`/`match`/loop yields its value through its branches — a loop's, through its `break`s
@@ -769,10 +805,38 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case _: RangeExpr =>
       err("a range is only allowed in a 'for' loop or a 'match' pattern")
 
+    // `a, b` where a function's result list is what is being produced. It builds the aggregate the
+    // caller takes apart — the same one a tuple builds, since a result list is a tuple's layout
+    // without a tuple's type.
+    case ResultList(values) =>
+      if !retIsList then
+        err("several values separated by commas are a function's result list, and this function " +
+          "declares one result — write the values it wants, or declare a result list")
+
+      val want = retTy.asInstanceOf[Type.Tuple]
+
+      if values.length != want.targs.length then
+        err(s"this function yields ${quantity(want.targs.length, "result")}, but " +
+          s"${supplied(values.length, "value")}")
+
+      val ts = values.zip(want.targs).map((v, w) => analyzeExpr(v, Some(w)))
+
+      for ((t, w) <- ts.zip(want.targs)) do
+        if disagree(t.ty, w) then
+          at(t.pos)(err(s"this result is declared ${show(w)}, but the value is ${show(t.ty)}"))
+
+      TStructNew(want, ts)
+
     // `(a, b)` — a tuple, built exactly as a struct is: the parts are the fields, in the order they
     // were written. What each part is *wanted* at comes from the tuple being asked for, which is
     // what lets `var p: (i8, i8) = (1, 2)` narrow its literals the way a struct's fields do.
     case Tuple(elems) =>
+      // A function declaring a result list yields several things and not one tuple (`12 §5b`), so
+      // the parentheses are refused where they would build the carrier the form says never exists.
+      if wantsResults(expected) then
+        err(s"this function yields ${quantity(elems.length, "result")} rather than a tuple — " +
+          s"write the values without the parentheses")
+
       val wanted = expected.map(Type.underlying) match
         case Some(t: Type.Tuple) if t.targs.length == elems.length => t.targs.map(Some(_))
         case _                                                     => elems.map(_ => None)

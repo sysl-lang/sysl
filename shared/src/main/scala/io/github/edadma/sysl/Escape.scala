@@ -214,8 +214,8 @@ private class Escape(program: TProgram) {
           case _: Type.Array => if viaPointer(base) then View.none else arrayRoot(base)
           case _             => views(base)
       case TLoad(name, _)       => confined.getOrElse(name, View.none)
-      case TCall(_, args, _)    => View.any(args.map(views))
-      case TVCall(_, _, args, _) => View.any(args.map(views))
+      case TCall(_, args, _, _)    => View.any(args.map(views))
+      case TVCall(_, _, args, _, _) => View.any(args.map(views))
       case TStructNew(_, args)  => View.any(args.map(views))
       case TStructInvCheck(v, _, _) => views(v)
       case TCheckedStore(store, _, _, _) => views(store)
@@ -343,7 +343,7 @@ private class Escape(program: TProgram) {
             case _: TLoad => ()
             case _        => if viewsFrame(v) then gets_out(v, "is stored somewhere the frame does not own")
 
-        case TCall(name, args, _) =>
+        case TCall(name, args, _, _) =>
           for (a, i) <- args.zipWithIndex do
             if viewsFrame(a) && kept(name, i) then gets_out(a, s"is passed to '$name', which holds on to it")
 
@@ -351,7 +351,7 @@ private class Escape(program: TProgram) {
         // summary to consult — the conservative answer is the only sound one, exactly as it is for
         // a function whose body this program does not have. A `Writer` is the exception, and only
         // because every implementation of one has been checked to borrow rather than keep.
-        case TVCall(recv, _, args, _) if !borrows(recv.ty) =>
+        case TVCall(recv, _, args, _, _) if !borrows(recv.ty) =>
           for a <- args do
             if viewsFrame(a) then gets_out(a, "is passed through a trait object, which may hold on to it")
 
@@ -466,11 +466,11 @@ private class Escape(program: TProgram) {
     case TLogical(_, l, r)          => List(l, r)
     case TCompare(ops, _)           => ops
     case TSeq(exprs)                => exprs
-    case TCall(_, args, _)          => args
+    case TCall(_, args, _, _)          => args
     // Which function a trait object's call reaches is a run-time word, so there is no parameter
     // list to ask whether an argument is kept — a callee that might keep anything is exactly what
     // `kept` already assumes of a name it does not recognise.
-    case TVCall(r, _, args, _)      => r :: args
+    case TVCall(r, _, args, _, _)   => r :: args
     case TErase(v, _, _)            => List(v)
     case TStructNew(_, args)        => args
     case TStructInvCheck(v, _, _)   => List(v)

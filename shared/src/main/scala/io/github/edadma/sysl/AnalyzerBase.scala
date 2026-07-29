@@ -562,6 +562,18 @@ trait AnalyzerBase {
   protected var retTy: Type                                                 = Type.Unit
   protected var tsubst: Map[String, Type]                                   = Map.empty
 
+  /** Whether the function being analyzed declared its result as a **list** (`12 §5b`) rather than
+   * as one type. `retTy` is the tuple its parts lay out as either way; this is what says whether
+   * the body writes `a, b` or `(a, b)`, and whether a call yielding a list may stand in its result.
+   */
+  protected var retIsList: Boolean = false
+
+  /** Set for exactly one expression by `analyzeMulti`, and consumed by the funnel the moment that
+   * expression is analyzed — so a call yielding several results is allowed where the form asked for
+   * one, and nowhere inside it.
+   */
+  protected var multiOk: Boolean = false
+
   /** Whether the function being analyzed declared a `...`, which is what `va_start` needs: there is
    * no tail to start walking in a function that does not have one. C's rule exactly.
    */
@@ -820,6 +832,7 @@ trait AnalyzerBase {
     loops = Nil
     ensureResultTy = None
     oldBuf = None
+    multiOk = false
   }
 
   protected def freshName(base: String): String =
@@ -867,6 +880,14 @@ trait AnalyzerBase {
       self: Map[String, Type],
   ): List[Type]
   protected def analyzeExpr(expr: Expr, expected: Option[Type] = None, discarded: Boolean = false): TExpr
+
+  /** Analyzes one expression in a place a **result list** may stand (`12 §5b`). */
+  protected def analyzeMulti(expr: Expr, expected: Option[Type] = None): TExpr
+
+  /** Whether a value produced *here* is the enclosing function's own result, which is the third
+   * place a result list may stand — and so covers a branch or a block that ends in one.
+   */
+  protected def wantsResults(expected: Option[Type]): Boolean = retIsList && expected.contains(retTy)
   protected def analyzeBool(e: Expr): TExpr
   protected def analyzePlace(target: Expr, what: String): TExpr
   protected def invCheckFor(place: TExpr): Option[(TExpr, Type.Struct, String)]

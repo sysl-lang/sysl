@@ -372,6 +372,25 @@ binding of the first result: a function that says it yields two things yields tw
 silently dropping one is how a caller ends up reading the wrong number. A result that is genuinely
 optional to the caller is a sign the function wants a struct.
 
+**The three places are enforced at one point, and the rest follows.** A result list is a type only
+between a signature and the expression that uses it: the moment a call is used somewhere a list is
+allowed, it becomes the tuple its parts lay out as, and everywhere else it is refused. So "nothing
+may store one" needs no rule about fields or containers or `Option` — a field cannot be *declared*
+as one (that position asks for a type, and a result list is not one), and a value cannot be held as
+one because the call was refused before anything could hold it. The permission covers one
+expression and nothing inside it, so `val a, b = f(g())` refuses `g` exactly as any other position
+would.
+
+**The callee writes the values without parentheses**, and `-> int, int = (1, 2)` is refused. It is
+the same claim from the other side: if the parentheses were allowed here they would build the
+carrier the form says never exists, and a reader would be entitled to ask what happened to it.
+
+**A comma binds to the whole line.** A result list is the last thing on its line by construction,
+which is what tells it apart from every other comma: an inline branch is part of a larger
+expression, so `-> int, string = if c then 1 else 0, "x"` reads as two results rather than as a
+branch whose `else` swallowed the comma. A one-line branch that wants to yield a list of its own
+writes the branch over several lines instead.
+
 **When to want a struct instead.** A result list is at its best where the components are few and
 obviously ordered — `divmod`, a quotient and a remainder, a value and a count. It is at its worst
 where they are several and alike, which is where the names carry the meaning: `guide/datetime` gets
@@ -390,7 +409,8 @@ lightweight answer, not the general one.
   `var a, b: int = f(x)` reads as though it types only `b`. Inference covers the ordinary case; the
   spelling for the case it does not is unsettled.
 - **Whether an `extern` may declare one.** C returns one value, so a multi-result extern would have
-  to mean a struct return, and that is an ABI question rather than a language one.
+  to mean a struct return, and that is an ABI question rather than a language one. Until it is
+  settled, an `extern` result is one type and a comma there does not parse.
 
 ## 6. The type of a callable — the `Fn` trait
 

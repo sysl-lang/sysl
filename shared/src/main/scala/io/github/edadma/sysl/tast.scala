@@ -223,7 +223,7 @@ case class TRender(value: TExpr, method: String, spec: TExpr, slot: Option[Int] 
 case class TCStrLit(value: String) extends TExpr { def ty: Type = Type.Ptr(Type.Integer(8, signed = false)) }
 
 /** A call to a user function. */
-case class TCall(name: String, args: List[TExpr], ty: Type) extends TExpr
+case class TCall(name: String, args: List[TExpr], ty: Type, results: Boolean = false) extends TExpr
 
 /** Forgets a value's type, keeping what its trait says can still be done to it (`02`): the operand
  * goes on pointing where it pointed, and the method table for the type it is losing rides beside it.
@@ -238,7 +238,8 @@ case class TErase(operand: TExpr, vtable: String, ty: Type) extends TExpr
  * declaration order, and the receiver's data word is the first argument — so which function runs is
  * read out of the table at run time rather than named here.
  */
-case class TVCall(receiver: TExpr, slot: Int, args: List[TExpr], ty: Type) extends TExpr
+case class TVCall(receiver: TExpr, slot: Int, args: List[TExpr], ty: Type, results: Boolean = false)
+    extends TExpr
 
 /** The three ABI primitives of a variadic body (`12 §9`), each holding the *address* of the
  * `va_list` it works on — they advance it rather than reading a copy of it, so what the analyzer

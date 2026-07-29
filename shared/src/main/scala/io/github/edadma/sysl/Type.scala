@@ -444,6 +444,25 @@ object Type {
     def shape(n: Int): String = "(" + "," * (n - 1) + ")"
   }
 
+  /** Several results as a **signature** carries them (`12 §5b`) — `-> int, int`.
+   *
+   * This is not a type any value has, and that is the whole design: a result list travels from
+   * callee to caller and is taken apart there, so it appears in the signature table and nowhere
+   * else. The analyzer's one funnel unwraps it into the tuple its parts lay out as the moment the
+   * call is used somewhere a result list is allowed, and complains where one is not — so nothing in
+   * the typed tree, and nothing in codegen, ever meets one.
+   */
+  final class Results(val parts: Tuple) extends Type {
+    def llvm: String = parts.llvm
+
+    override def equals(other: Any): Boolean = other match
+      case r: Results => r.parts == parts
+      case _          => false
+
+    override def hashCode: Int    = parts.hashCode * 31 + 1
+    override def toString: String = s"Results(${parts.name})"
+  }
+
   /** One variant of an enum.
    *
    *   - `tag` is the discriminant: a simple enum's integer value, or a data enum's 0-based
@@ -584,6 +603,7 @@ object Type {
    * `geom$Point` is shown as the `geom.Point` a program would write.
    */
   def show(t: Type): String = t match
+    case r: Results     => r.parts.targs.map(show).mkString(", ")
     case t: Tuple       => t.name
     case n: Named       => qualified(Modules.show(n.base), n.targs)
     case c: Constrained => Modules.show(c.name)

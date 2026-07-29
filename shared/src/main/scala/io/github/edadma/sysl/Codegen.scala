@@ -120,10 +120,6 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
       Option.unless(Type.zeroSized(a.ty))(s"${a.ty.llvm} $v")
     }
 
-  /** Checks a struct value against its `invariant` function: read each stored field out of the
-   * aggregate `v`, call `invFn`, and trap on a false result. The fields are handed over exactly as
-   * an ordinary call's arguments are — the callee borrows, so no count is taken here.
-   */
   /** What a compound assignment stores: a slot that holds a count — a string, or a struct with a
    * reference in it — builds a fresh value the slot will take a count for, and a slot of anything
    * else is arithmetic.
@@ -135,6 +131,10 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
       case (Type.Str, _) => ownTemp(strConcat(cur, v), Type.Str)
       case _             => arith(op.dropRight(1), ty, cur, v)
 
+  /** Checks a struct value against its `invariant` function: read each stored field out of the
+   * aggregate `v`, call `invFn`, and trap on a false result. The fields are handed over exactly as
+   * an ordinary call's arguments are — the callee borrows, so no count is taken here.
+   */
   protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit =
     val args = struct.fields.zipWithIndex.collect {
       case ((_, ft), i) if !Type.zeroSized(ft) =>
@@ -444,6 +444,9 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     // for diagnostics and throws its tree away, and monomorphization substitutes a concrete type
     // before anything is emitted.
     case _: Type.Abstract => sys.error("unreachable zero of a type parameter")
+    // A result list belongs to a signature. The analyzer's one funnel turns it into the tuple its
+    // parts lay out as before anything holds it, so codegen is only ever handed that tuple.
+    case _: Type.Results  => sys.error("unreachable zero of a result list")
     // A trait is only ever the pointee of a `*Trait` / `&Trait`, both handled above; resolving a
     // bare trait name is a diagnostic, so nothing of this type is ever laid out.
     case _: Type.Trait    => sys.error("unreachable zero of a trait")
@@ -894,7 +897,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     // A call to something declared `-> never` does not come back, so the block ends at it: what
     // follows in the same block is unreachable and `emit` drops it, which is exactly why a
     // diverging arm needs no special handling anywhere else.
-    case TCall(name, args, ty) =>
+    case TCall(name, args, ty, _) =>
       val argVals = argList(args)
       val callee  = calleeOf(name, ty)
       if Type.noValue(ty) then
@@ -916,7 +919,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
 
     // A call whose callee is a word in the object's table rather than a name. The data word goes in
     // front of the declared arguments, which is the shape every slot was built to.
-    case TVCall(receiver, slot, args, ty) =>
+    case TVCall(receiver, slot, args, ty, _) =>
       val obj     = genExpr(receiver)
       val table   = freshTemp(); emit(s"$table = extractvalue ${Type.fatPointer} $obj, 0")
       val data    = freshTemp(); emit(s"$data = extractvalue ${Type.fatPointer} $obj, 1")

@@ -148,7 +148,8 @@ sealed trait TypeRef extends Positioned {
     case ArrayType(None, elem)            => s"[]${elem.show}"
     case ArrayType(Some(IntLit(n, _)), e) => s"[$n]${e.show}"
     case ArrayType(Some(_), elem)         => s"[…]${elem.show}"
-    case TupleType(parts)                 => s"(${parts.map(_.show).mkString(", ")})"
+    case TupleType(parts, false)          => s"(${parts.map(_.show).mkString(", ")})"
+    case TupleType(parts, true)           => parts.map(_.show).mkString(", ")
 }
 
 /** A named type, optionally applied to type arguments: `int`, `Box[int]`,
@@ -166,10 +167,16 @@ case class RefType(inner: TypeRef, sync: Boolean) extends TypeRef
 /** `[N]T` — a fixed array — or `[]T`, a slice, when no length is written. */
 case class ArrayType(length: Option[Expr], elem: TypeRef) extends TypeRef
 
+/** `a, b` where a function's own result list is what is being produced (`12 §5b`) — the callee's
+ * side of the form. It is never a value: the analyzer accepts it only where the enclosing
+ * function's declared result is a list, and builds the aggregate the caller takes apart.
+ */
+case class ResultList(values: List[Expr]) extends Expr
+
 /** `(A, B)` — a tuple of two or more parts (`00 §13`). One part is never written here: `(T)` is a
  * type in parentheses, and a product of one thing is the thing.
  */
-case class TupleType(parts: List[TypeRef]) extends TypeRef
+case class TupleType(parts: List[TypeRef], results: Boolean = false) extends TypeRef
 
 /** A trait as a **bound** names it: `Show`, or `From[int]` where the trait takes parameters of its
  * own. It is not a `TypeRef` — a trait is not a type, and the one thing that may stand here is a
