@@ -105,4 +105,11 @@ class EnumAttrRunTests extends AnyFreeSpec with RunSupport {
   "a single-variant enum has endpoints that meet" in {
     run("enum One\n    Only\nprint(One::Pos(One::First), One::Pos(One::Last))") shouldBe "0 0\n"
   }
+
+  // `09 §2` says `::` is what keeps these out of the member namespace, and a variant named after an
+  // attribute is the case that would decide it if they shared one. `Last::First` reads across both
+  // spellings at once: the attribute on the left of `::`, the variant on the right of `.`.
+  "a variant named after an attribute does not shadow it" in {
+    run("enum Edge\n    First\n    Last\nprint(Edge::Pos(Edge::First), Edge::Pos(Edge.Last))") shouldBe "0 1\n"
+  }
 }

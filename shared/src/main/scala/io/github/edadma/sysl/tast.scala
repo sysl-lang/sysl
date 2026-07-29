@@ -301,7 +301,7 @@ case class TEnumFromInt(value: TExpr, en: Type.Enum) extends TExpr { def ty: Typ
 case class TEnumTry(value: TExpr, en: Type.Enum, optTy: Type.Enum,
                     some: Type.EnumVariant, none: Type.EnumVariant) extends TExpr { def ty: Type = optTy }
 
-/** A simple enum's type attribute with a runtime argument (`04`): `kind` names which one —
+/** A simple enum's type attribute with a runtime argument (`09 §2`): `kind` names which one —
  * `Pos` (a value's 0-based position), `Val` (the value at a position, trapping out of range),
  * `Succ`/`Pred` (the neighbouring value, trapping at the end), `Image` (a value's name as a
  * string), or `Value` (the value named by a string, trapping on no match). `arg` is the one

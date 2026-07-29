@@ -50,4 +50,19 @@ class TypeAttrRunTests extends AnyFreeSpec with RunSupport {
   "Range drives a for loop over First..Last inclusive" in {
     run(Prob + "var sum = 0\nfor i in Prob::Range do\n    sum = sum + i\nprint(sum)") shouldBe "45\n"
   }
+
+  // `16 §5` says `::` is what keeps these out of the member namespace. A member of the same name is
+  // the discriminating case: if the two shared a namespace one would have to win, and the chapter's
+  // claim is that the question never arises.
+  "an attribute is not a member, so a member of the same name does not shadow it" in {
+    run(
+      Age +
+        """trait Marked
+          |    First -> int
+          |impl Marked for Age
+          |    First -> int = 99
+          |var a = Age(7)
+          |print(Age::First, a.First)""".stripMargin
+    ) shouldBe "0 99\n"
+  }
 }

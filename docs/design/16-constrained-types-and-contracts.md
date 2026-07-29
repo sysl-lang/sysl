@@ -40,7 +40,7 @@ narrows the values nor makes a new type, so writing it can only be a mistake or 
 
 **The base is a scalar** — an integer, a float, or a `char`. A struct, an enum or an array base is
 rejected at the declaration: a constraint here is a check on a *value*, and the two mechanisms for
-narrowing an aggregate are the struct invariant of §5 and, for an enum, having fewer variants.
+narrowing an aggregate are the struct invariant of §6 and, for an enum, having fewer variants.
 
 **`..` is inclusive and `..<` excludes the upper bound**, matching the range expressions in `00`.
 The bounds are literals — an integer, a float, or a character, optionally signed. A bound outside the
@@ -146,13 +146,49 @@ rejects never reaches the predicate.
 A violated check **traps**: the program stops. It is not an error value, it is not catchable, and
 there is deliberately no `try` form that returns an `Option` — a constrained type states something
 its values are, and a value that is not one of them is a bug in the code that made it, not a
-condition to handle. Code that wants to *ask* whether a number is in range writes the comparison.
+condition to handle. Code that wants to *ask* whether a number is in range writes `T::Valid(x)`,
+the total membership test of §5, and then the ordinary cast.
 
-The absence is right and the way it is reported is not: a simple enum has `Color.try(n)`, so
-`Age.try(n)` is the first thing anyone writes, and what comes back is `undefined name 'Age'` — the
-one thing that is certainly false. `09` already answers this for an enum by name. Open **f** below.
+A simple enum *does* have `Color.try(n)` (`09 §2`), so `Age.try(n)` is the first thing a reader of
+this section writes. It is answered by name: the message says there is no `try`, why, and both of
+the forms above.
 
-## 5. Struct invariants
+## 5. What the type's own name offers: `::` attributes
+
+A constrained type's name is a type and not a value, so nothing is *read* from it. What it answers
+are **attributes**, written with `::` rather than `.` so that they stay out of the member namespace:
+`Age::First` cannot be confused with a field, a property or an associated function, and no `impl`
+can shadow one by declaring a member of that name.
+
+The set is small and closed, and every member of it is a question about integer bounds — so it is
+what a `within`-ranged integer subtype offers:
+
+| written | is | notes |
+|---|---|---|
+| `T::First` | the lower bound | a constant, no argument |
+| `T::Last` | the upper bound | one *below* the written bound where the range is exclusive |
+| `T::Valid(x)` | whether `x` is in range | a `bool`, and **total** — it never traps, which is what makes it the question form |
+| `T::Succ(x)` | the next value | traps at `T::Last` |
+| `T::Pred(x)` | the previous value | traps at `T::First` |
+| `T::Range` | the range itself | only as a `for` loop's iterable, `First..Last` inclusive |
+
+**`Valid` is the answer to "how do I ask instead of trapping".** §4 rules that a produce site traps
+because a value outside the range is a mistake and not a condition; `Valid` is how a program that
+holds a number and does not yet know puts the question, and a cast after a `Valid` that answered
+true is the ordinary way in.
+
+`Succ` and `Pred` **trap** rather than saturating or wrapping, on the same argument as the produce
+sites: a step past the end is not a value of the type, so making one is the mistake, and no single
+answer would be right for every caller.
+
+`Range` is meaningful only where an iterable is, and says so anywhere else. It names nothing a
+program can hold, because a range is not yet a type a program can name (`14`).
+
+A subtype over a float or a `char`, and one written with no range, have **no** attributes — each of
+these is a question about integer bounds, and there are none to ask about. The diagnostic names the
+base rather than the attribute, since the base is the part that would have to change.
+
+## 6. Struct invariants
 
 A struct body may carry `invariant <bool>` clauses among its fields. The clause is an expression over
 the struct's own fields, in scope by name:
@@ -189,7 +225,7 @@ what whole-struct assignment is for.
 
 Invariants on a **generic** struct are not supported and say so.
 
-## 6. Contracts on a function
+## 7. Contracts on a function
 
 ```
 half(x: int) -> int
@@ -226,7 +262,7 @@ Like a constraint, a violated contract traps. Contracts are checked in every bui
 "release mode drops them" switch, and adding one would make a program's meaning depend on how it was
 compiled.
 
-## 7. What this is not
+## 8. What this is not
 
 It is not verification. Nothing here is proved at compile time: a `require` is a branch and a trap, an
 invariant is a call to a synthesised predicate, a `within` is two comparisons. The compiler will not
@@ -265,12 +301,6 @@ so the machinery is there. Nobody has needed it.
 to fit in a `u8`, so `int(slot)` is a widening the compiler could see is total. Nothing exploits
 that today. Related: two subtypes over one base where one range contains the other could convert
 without a check, and does not.
-
-**f. A member access on a subtype's name has no diagnostic of its own.** `Age.try(200)` reports
-`undefined name 'Age'`, which is the one thing that is not true — the name is a type and the message
-belongs to the resolver that was looking for a value. An enum in the same position is answered by
-name (`enum 'Color' has no variant or associated function 'Bogus'`). Small, and it is the first
-thing a reader of §4 will try.
 
 **e. A produce site the checking does not reach.** The list in §4 is the set of places the
 implementation checks, arrived at by adding them as they came up rather than by deriving them from

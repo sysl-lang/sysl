@@ -75,12 +75,12 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
 
   /** A constrained cast traps rather than reporting, and `16 §4` says why: a value outside the range
    * is a bug in the code that made it, not a condition to handle. So there is no `T.try(x)` — but a
-   * simple enum has one, which makes it the first thing anyone writes here, and what comes back
-   * names the type as an undefined *name*. The message is pinned as it is, so that changing it is a
-   * deliberate act (`16 § Open f`).
+   * simple enum has one, which makes it the first thing anyone writes here. The whole of what the
+   * name answers instead is pinned in `TypeNameMemberTests`; here is only that the absence is real.
    */
-  "a subtype has no fallible cast, and says so badly" in {
-    err("type Age = int within 0..150\nprint(Age.try(200).is_some())") should include("undefined name 'Age'")
+  "a subtype has no fallible cast" in {
+    err("type Age = int within 0..150\nprint(Age.try(200).is_some())") should
+      include("'Age' is a constrained type and has no 'try'")
   }
 
   /** A derived scalar takes its base's whole catalog and may replace none of it.

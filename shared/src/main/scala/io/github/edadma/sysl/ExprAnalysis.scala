@@ -173,8 +173,57 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     checkInto(v, c)
   }
 
-  /** A type attribute `T::Attr` (`03`), with the arguments a call form supplied (empty for the
-   * bare form). Dispatched on the kind of type `T` is — a constrained subtype for now.
+  /** A constrained subtype's name with a member selected from it. The name is a **type**, so
+   * reporting it as an undefined *name* — which is what fell out of analyzing the receiver — was
+   * the one thing about it that was certainly false.
+   *
+   * Three things could have been meant. A method or a property is reached on a value, exactly as a
+   * struct's is. `try` is the one everybody writes first, because a simple enum has one, and the
+   * answer is that a constrained type deliberately does not: the cast checks and traps, and the
+   * question is asked with `Valid`. Anything else is a member the type does not have, and what it
+   * does have is spelled with `::`.
+   */
+  private def constrainedMember(key: String, written: String, f: String): Nothing = {
+    val c      = resolveConstrained(key)
+    val ranged = Type.underlying(c.base).isInstanceOf[Type.Integer] && c.lo.isDefined
+
+    memberDecls.get((key, f)) match
+      case Some(m) if m.isProperty =>
+        err(s"'$f' is a property of '${qn(key)}' — read it on a value, as 'value.$f'")
+      case Some(m) if m.receiver.isDefined =>
+        err(s"'$f' is a method of '${qn(key)}' — call it on a value, as 'value.$f(…)'")
+      case _ if f == "try" =>
+        err(s"'${qn(key)}' is a constrained type and has no 'try': a value outside its range is a " +
+          s"mistake in the code that produced it rather than a condition to handle, so '$written(x)' " +
+          "checks it and traps" +
+          (if ranged then s", and '$written::Valid(x)' asks the question without trapping" else ""))
+      case _ =>
+        err(s"'${qn(key)}' is a type, not a value, and has no member '$f'" +
+          (if ranged then
+             s" — what a constrained type offers under its own name is written with '::': " +
+               s"'$written::First', '$written::Last', '$written::Valid(x)', '$written::Succ(x)', " +
+               s"'$written::Pred(x)'"
+           else ""))
+  }
+
+  /** A trait's name with a member selected from it, which has the same shape of mistake and had the
+   * same wrong answer. A trait is not a value and is not a type on its own: what its members are
+   * reached through is a value of an implementing type, or a trait object.
+   */
+  private def traitMember(key: String, f: String): Nothing =
+    traitDecls(key).methods.find(_.name == f) match
+      case Some(m) if m.isProperty =>
+        err(s"'$f' is a property of the trait '${qn(key)}' — read it on a value of a type that " +
+          s"implements '${qn(key)}', or on a '&${qn(key)}'")
+      case Some(_) =>
+        err(s"'$f' is a member of the trait '${qn(key)}' — call it on a value of a type that " +
+          s"implements '${qn(key)}', or on a '&${qn(key)}'")
+      case None =>
+        err(s"'${qn(key)}' is a trait, not a value, and declares no member '$f'")
+
+  /** A type attribute `T::Attr`, with the arguments a call form supplied (empty for the bare form).
+   * Dispatched on the kind of type `T` is: a constrained subtype (`16 §5`) or a simple enum
+   * (`09 §2`), which are the two that have questions to answer about their own value sets.
    */
   private def typeAttr(key: String, attr: String, args: List[Expr]): TExpr =
     if constrainedDecls.contains(key) then constrainedAttr(resolveConstrained(key), key, attr, args)
@@ -582,6 +631,14 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         if lookupOpt(written).isEmpty && typeKey(written).exists(structDecls.contains) =>
       callAssociated(typeKey(written).get, mname, args, expected)
 
+    case Call(Field(Ident(written), mname), _)
+        if lookupOpt(written).isEmpty && typeKey(written).exists(constrainedDecls.contains) =>
+      constrainedMember(typeKey(written).get, written, mname)
+
+    case Call(Field(Ident(written), mname), _)
+        if lookupOpt(written).isEmpty && typeKey(written).isEmpty && traitKey(written).isDefined =>
+      traitMember(traitKey(written).get, mname)
+
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args, expected)
 
@@ -640,6 +697,14 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
           err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
         case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
         case None    => err(s"type '${qn(n)}' has no member '$f' — and '${qn(n)}' is a type, not a value")
+
+    case Field(Ident(written), f)
+        if lookupOpt(written).isEmpty && typeKey(written).exists(constrainedDecls.contains) =>
+      constrainedMember(typeKey(written).get, written, f)
+
+    case Field(Ident(written), f)
+        if lookupOpt(written).isEmpty && typeKey(written).isEmpty && traitKey(written).isDefined =>
+      traitMember(traitKey(written).get, f)
 
     // `T::Attr` — a type attribute read with no argument (`First`, `Last`). `T::Attr(x)` is a
     // `Call` over this node, handled beside the other call forms.

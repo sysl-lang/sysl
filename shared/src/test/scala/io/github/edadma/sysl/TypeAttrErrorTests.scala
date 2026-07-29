@@ -34,4 +34,13 @@ class TypeAttrErrorTests extends AnyFreeSpec with CodegenSupport {
   "Range outside a for loop is rejected" in {
     err(Age + "print(Age::Range)") should include("only meaningful as the iterable of a 'for' loop")
   }
+
+  // Every one of these is a question about integer bounds, so a subtype over another scalar has
+  // none of them (`16 §5`). The message names the *base*, which is the part that would have to
+  // change — naming the attribute would suggest a different one might work.
+  "a subtype over a non-integer base has no attributes, and the message names the base" in {
+    val e = err("type Meters = new f64\nprint(Meters::First)")
+
+    e should include("needs an integer subtype, not real")
+  }
 }

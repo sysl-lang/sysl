@@ -95,6 +95,32 @@ This closes C's other enum hole — "every int is silently a valid enum value" �
   the declared constants, a `match` on one is exhaustive when it covers every named variant *or*
   carries a catch-all — the same rule as a data enum (§8).
 
+**The enum's own name answers a fixed set of `::` attributes**, in the same spelling and for the
+same reason a constrained subtype's does (`16 §5`): `::` keeps them out of the member namespace, so
+`Color::First` cannot collide with a variant, an associated function or a member an `impl` added.
+
+| written | is | traps |
+|---|---|---|
+| `T::First` / `T::Last` | the first and last variant | no |
+| `T::Pos(v)` | a value's **0-based position** in the declaration | no |
+| `T::Val(i)` | the value at position `i` | on a position past the last, or below zero |
+| `T::Succ(v)` / `T::Pred(v)` | the neighbouring value | at the last / at the first |
+| `T::Image(v)` | the variant's **name**, as a `string` | no |
+| `T::Value(s)` | the value a name stands for | on a name no variant has |
+
+**Position is not the discriminant, and that distinction is the reason `Pos` and `Val` exist.**
+Discriminants may be explicit, non-contiguous and not zero-based, so an ordinal has to be looked up
+rather than computed; `Pos` and `Val` are the two directions of that lookup, and `Succ`/`Pred` walk
+the declaration order rather than adding one. Going the other way — a value's *discriminant* — is
+the conversion above, `int(c)`.
+
+`Image` and `Value` are the printed-name pair, and they are what makes a simple enum observable:
+the type carries no `==` and no `Display` of its own, so a value is turned into a position or a
+name to be looked at.
+
+These are for a **simple** enum. A data enum's value is a variant plus a payload, so a position, a
+name and a neighbour are each questions about only half of it, and asking one says so.
+
 ## 3. Data enums — sum types
 
 A data variant names an ordered, typed payload — `Circle(radius: int)`, `Rect(w: int, h: int)`

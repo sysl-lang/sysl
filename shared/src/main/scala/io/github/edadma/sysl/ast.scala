@@ -62,7 +62,7 @@ case class Call(callee: Expr, args: List[Expr]) extends Expr
 case class Index(receiver: Expr, index: Expr)   extends Expr
 case class Field(receiver: Expr, name: String)  extends Expr
 
-/** `T::Attr` — a type attribute (`03`): metadata a type exposes under a name, reached with `::`
+/** `T::Attr` — a type attribute (`16 §5`, `09 §2`): metadata a type exposes under a name, with `::`
  * rather than `.` because it belongs to the type itself, not to a value of it. `Age::First`,
  * `Day::Succ(d)`. The receiver is a type name; a bare `Attr` reads a value, and `Attr(args)` is a
  * `Call` over this node, exactly as an enum's associated function is a `Call` over a `Field`.
