@@ -532,19 +532,27 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
           declare(n, struct.fields(i)._2) ->
             TField(TDeref(self, struct), struct.slot(i), struct.fields(i)._2)
         }.toMap
+      // A body written like a function's is one, so its leading contract clauses are its own
+      // (`16`). They are analyzed *after* it rather than before, because an `ensure` names `result`
+      // and a closure's result is what its body turned out to yield — which is the one thing a
+      // declared function knows in advance and this does not.
+      val (contracts, rest) = body.span { case _: Require | _: Ensure => true; case _ => false }
+
       // A closure whose result the context did not fix is analyzed with nothing expected, so what
       // its body yields is what it yields — the only reading under which `x -> x * 2` has a result
       // at all.
       val tbody = declaredResult match
-        case Some(Type.Unit) => analyzeValueBlock(body, None, discarded = true)
-        case want            => analyzeValueBlock(body, want)
+        case Some(Type.Unit) => analyzeValueBlock(rest, None, discarded = true)
+        case want            => analyzeValueBlock(rest, want)
 
       val result = declaredResult.getOrElse(if tbody.result.isDefined then tbody.ty else Type.Unit)
 
       if declaredResult.exists(r => r != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, r)) then
         err(s"this closure should yield ${show(declaredResult.get)}, but its body yields ${show(tbody.ty)}")
 
-      (TFunc(name, tparams, result, tbody, variadic = false, Nil, Nil, Nil), result)
+      val (requires, ensures, olds) = analyzeContracts(result, contracts)
+
+      (TFunc(name, tparams, result, tbody, variadic = false, requires, ensures, olds), result)
     finally
       scopes = savedScopes
       used.clear(); used ++= savedUsed

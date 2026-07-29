@@ -289,6 +289,20 @@ class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should include("pass a struct of them")
     }
 
+    "and four is the widest one that is not" in {
+      run("""four(f: (int, int, int, int) -> int) -> int = f(1, 2, 3, 4)
+            |
+            |print(four((a, b, c, d) -> a + b + c + d))
+            |""".stripMargin) shouldBe "10\n"
+    }
+
+    "a chained bare arrow is refused by the rule that has no currying" in {
+      // `§10` says a bare arrow type has a single domain, and the inner arrow here is a *result* —
+      // a concrete slot — so the one rule about where a bare arrow may stand covers it.
+      err("""curry(f: int -> int -> int) -> int = 0
+            |""".stripMargin) should include("write '&Fn(int) -> int'")
+    }
+
     "a local that is not callable, called anyway, is its own mistake" in {
       err("""var n = 5
             |
@@ -301,6 +315,128 @@ class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |
             |print(take(x -> x))
             |""".stripMargin) should include("'x' has no type here")
+    }
+  }
+
+  "a closure is a function, so what a function's body may hold it may hold" - {
+    "a match is a body" in {
+      run("""var m: &Fn(int) -> int = x -> x match
+            |    0 -> 100
+            |    else x
+            |
+            |print(m(0), m(4))
+            |""".stripMargin) shouldBe "100 4\n"
+    }
+
+    "a name bound by a match arm is captured like any other" in {
+      run("""apply(f: int -> int, x: int) -> int = f(x)
+            |
+            |enum Shape
+            |    Circle(r: int)
+            |    Square(s: int)
+            |
+            |var sh = Circle(3)
+            |
+            |sh match
+            |    Circle(r) -> print(apply(x -> x + r, 1))
+            |    Square(s) -> print(s)
+            |""".stripMargin) shouldBe "4\n"
+    }
+
+    "'return' leaves the closure, not the function around it" in {
+      run("""var g: &Fn(int) -> int = x ->
+            |    if x > 0 then return 1
+            |    0
+            |
+            |print(g(5), g(-5))
+            |""".stripMargin) shouldBe "1 0\n"
+    }
+
+    "'break' does not reach a loop outside it" in {
+      // The loops a body may name are the ones it opened. A closure written inside a loop is still
+      // a function, and `break` in a function that is not looping is the mistake it always was.
+      err("""apply(f: int -> int, x: int) -> int = f(x)
+            |
+            |for i in 0..<3
+            |    print(apply(x -> if x > 1 then break else x, i))
+            |""".stripMargin) should include("'break' is only allowed inside a loop")
+    }
+
+    "leading contract clauses are its own" in {
+      run("""var f: &Fn(int) -> int = x ->
+            |    require x > 0, "positive"
+            |    ensure result > x, "grew"
+            |    x * 2
+            |
+            |print(f(3))
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    "and a broken one stops the program" in {
+      exits("""var f: &Fn(int) -> int = x ->
+              |    require x > 0, "positive"
+              |    x * 2
+              |
+              |print(f(-1))
+              |""".stripMargin)
+    }
+
+    "a closure formed inside a loop is a fresh one each time round" in {
+      run("""var total = 0
+            |
+            |for i in 0..<3
+            |    var h: &Fn(int) -> int = x -> x + i
+            |    total += h(0)
+            |
+            |print(total)
+            |""".stripMargin) shouldBe "3\n"
+    }
+
+    "an escaping closure over a local array's slice keeps the elements alive" in {
+      // The array is promoted to the heap by the escape analysis of `05`, and the closure's capture
+      // is a view of what moved — so the slice is still good after the frame that declared it is
+      // gone. Nothing here is closure machinery; that it composes is the point.
+      run("""made() -> &Fn(int) -> int
+            |    var a = [1, 2, 3]
+            |    var v = a[..]
+            |
+            |    x -> x + v[1]
+            |
+            |var f = made()
+            |
+            |print(f(10))
+            |""".stripMargin) shouldBe "12\n"
+    }
+  }
+
+  "a program may make a type of its own callable" - {
+    "written with the arrow, like every other callable type" in {
+      run("""struct Doubler
+            |    k: int
+            |
+            |impl Fn(int) -> int for Doubler
+            |    call(*self, a: int) -> int = a * self.k
+            |
+            |var d = Doubler(3)
+            |
+            |print(d(5))
+            |""".stripMargin) shouldBe "15\n"
+    }
+
+    "and it reaches both of the places a closure does" in {
+      run("""struct Doubler
+            |    k: int
+            |
+            |impl Fn(int) -> int for Doubler
+            |    call(*self, a: int) -> int = a * self.k
+            |
+            |apply(f: int -> int, x: int) -> int = f(x)
+            |
+            |var d = Doubler(3)
+            |var boxed: &Fn(int) -> int = d
+            |
+            |print(apply(d, 5), boxed(5))
+            |""".stripMargin) shouldBe "15 15\n"
     }
   }
 

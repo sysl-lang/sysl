@@ -331,6 +331,14 @@ writing it is an error rather than a no-op.
 - **A nested function that is recursive, capturing *and* escaping is a reference cycle.** The boxed
   closure holds a capture that refers to the box. That is `03`'s `weak` problem arriving by a new
   route, and it should be decided with `weak` rather than ahead of it.
+
+  *Observed while building §5–§8, and it narrows this sharply:* the paragraph above says **nothing
+  outside the body can name a nested function**, and a value nothing can name is a value nothing can
+  store or return — so a nested function cannot escape at all, and the cycle cannot arise. What
+  would re-open it is letting a nested function be *used as a callable value* the way §5 lets a
+  top-level one be (`xs.map(inner)`), which is the thing to decide rather than the cycle itself. If
+  it may not, recursion is a call on the receiver the body already has and mutual recursion is a
+  call on a sibling through one shared environment, and neither takes a count of anything.
 - **Whether one shadows a top-level function of the same name.** Ordinary lexical scoping says yes;
   whether that is wanted for *functions*, where a shadowed name is harder to notice than a shadowed
   variable, is a separate question.
@@ -469,6 +477,11 @@ the type** (`03`). A callable you merely pass down is free and unmarked; a calla
 a box, and the `&` is where you see the cost. A bare arrow in a concrete slot is a compile error
 that points at the `&Fn` it should have been — never a silent box.
 
+**A program may implement the call trait itself**, which follows from `Fn` being a trait like any
+other and is worth saying because it is useful: a struct with an `impl Fn(int) -> int` is callable
+with `d(5)`, may be passed to a bare-arrow parameter, and may be erased into a `&Fn`. It is written
+with the arrow, the same way the type of a callable is written everywhere else.
+
 This split is not two mechanisms. `Fn` is the trait in both; the bare arrow is a bound over it,
 `&Fn` is a trait object of it, precisely the static/dynamic pair of `10` §6. The parameter
 position can afford the static side because it introduces the type parameter; the stored position
@@ -520,6 +533,33 @@ compile error** — there is nothing to box into — on the same footing as `&T`
 arrays, and an escaping local-array slice, all of which `capabilities.md` gates identically. A
 `no alloc` program may still use the inlined `map`-shaped closures freely, because those never
 allocate.
+
+**Building it settled that no analysis is needed here at all**, and the sentence above is why: the
+positions requiring `&Fn` and the positions that escape are the same set, so the *type* already says
+which representation was chosen. A closure at a bare-arrow parameter is a struct passed by value; a
+closure reaching a slot that spells `&Fn` is boxed by the same coercion that boxes anything into a
+counted reference, and erased by the same one that makes any other trait object. Escape analysis is
+not consulted, and adding it would be asking a second mechanism to agree with the first.
+
+### What a closure is, underneath
+
+A closure literal is **a struct and an implementation** — nothing else, and nothing new:
+
+- its **fields are its captures**, in the order the body first names them, so a value is copied and
+  a `&T` is retained by the ordinary field-by-field construction of a struct, which is why §7 needed
+  no rule of its own;
+- its **`impl` is of the call trait for its arity**, and the body becomes that implementation's one
+  member, `call(*self, …)`.
+
+The receiver is `*self` rather than `self` so that a call neither copies the environment nor retains
+every `&T` in it. It also decides `§ Open c` in passing: a closure that writes through a captured
+name writes to its own field, so the write is still there at the next call, and a *mutating* closure
+is an ordinary `Fn` whose captures happen to be mutable rather than a trait of its own.
+
+The call traits are declared one per arity — a declaration cannot promise a `call` of an arity it
+does not know — which is the same reason a tuple's arity is part of its name (`00` §13). Nothing
+about that is visible in a program: every one of them is spelled `Fn(A, B) -> R`, in a written type
+and in a diagnostic alike.
 
 ## 9. Variadic functions
 
@@ -604,15 +644,15 @@ worth adding **beside** it later (`§ Open i`), never instead of it.
   generic function's type parameter, or that is itself generic, interacts with monomorphization
   (`10`) in ways the top-level cases do not exercise yet. The static/dynamic split of §6 is the
   frame; the corners are open.
-- **c. `FnMut` / `FnOnce`-style distinctions.** Rust splits callables by how they use their
-  captures (read, mutate, consume). sysl has no move semantics, so the *consume* distinction does
-  not arise; whether a *mutating* closure (one that captures a `*T` or `&T` and writes through it)
-  needs a separate trait, or is just an ordinary `Fn` whose captures happen to be mutable, is open
-  and waits on real mutating-closure code.
-- **d. The bare-arrow type in a `var` annotation.** §6 makes the bare arrow a parameter-only
-  sugar and requires `&Fn` in concrete slots. Whether an explicitly annotated local `var f: int
-  -> int = …` should be rejected (forcing `&Fn` or inference `var f = …`) or specially permitted
-  is a small corner left until the closure implementation exercises it.
+- ~~**c. `FnMut` / `FnOnce`-style distinctions.**~~ **Settled by §8's representation.** Rust splits
+  callables by how they use their captures; sysl has no move semantics, so the *consume* distinction
+  never arose, and the *mutating* one falls out: a capture is a field, `call` takes its receiver by
+  address, so a closure that writes through a captured name writes to its own field and the write is
+  still there at the next call. A mutating closure is an ordinary `Fn`, and there is no second trait.
+- ~~**d. The bare-arrow type in a `var` annotation.**~~ **Rejected**, as §6 said it should be: an
+  annotated local is a concrete slot like any other, so it takes `&Fn`, and the diagnostic names the
+  box the arrow should have been. Permitting it would have made the same spelling mean an inlined
+  callable in one position and a boxed one in another.
 - **e. Named associated functions and methods as first-class values.** §5 lets a top-level
   function be used as a callable. Whether `Point.origin` or `p.dist` (an associated function, a
   bound method) may likewise be passed as an `Fn` — and how a bound method carries its receiver —

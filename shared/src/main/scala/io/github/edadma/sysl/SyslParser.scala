@@ -994,14 +994,26 @@ class SyslParser(val source: Source) extends PackratParsers {
    * implementation, and the opt-in it states is the point of writing it.
    */
   private lazy val implDecl: PackratParser[Stmt] =
-    op("impl") ~> opt(boundedTypeParams) ~ qualifiedName ~ opt(typeArgs) ~ (op("for") ~> typeRef) >> {
-      case tps ~ tname ~ targs ~ forType =>
+    op("impl") ~> opt(boundedTypeParams) ~ implTrait ~ (op("for") ~> typeRef) >> {
+      case tps ~ ((tname, targs)) ~ forType =>
         val tp = tps.getOrElse(TypeParams.none)
 
         (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
-          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs.getOrElse(Nil), tp.defaults)
+          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs, tp.defaults)
         }
     }
+
+  /** The trait an `impl` is of: a name and its arguments, or a callable written as one (`12 §6`).
+   *
+   * The arrow spelling is here so that the arity-carrying declaration behind a call trait stays out
+   * of programs entirely — a type made callable by hand is written `impl Fn(int) -> int for Doubler`,
+   * the same way the type of one is written everywhere else.
+   */
+  private lazy val implTrait: Parser[(String, List[TypeRef])] =
+    (fnWord ~> op("(") ~> commaList(typeRef) <~ op(")")) ~ (op("->") ~> typeRef) ^^ {
+      case ps ~ r => (Type.Fn.base(ps.length), ps :+ r)
+    } |
+      qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => (n, args.getOrElse(Nil)) }
 
   private lazy val implBody: PackratParser[List[MethodDecl]] =
     newline ~> indent ~> opt(newlines) ~> repsep(noVisibility ~> member, newlines) <~ opt(newlines) <~ dedent
