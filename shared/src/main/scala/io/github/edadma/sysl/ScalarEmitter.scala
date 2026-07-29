@@ -40,6 +40,14 @@ trait ScalarEmitter extends StringEmitter {
           case _   => sys.error(s"unreachable arith '$op'")
       case other => sys.error(s"unreachable arith on ${other.llvm}")
 
+    // A zero divisor has no defined result — unlike overflow, which wraps at the width — so integer
+    // `/` and `%` trap rather than run an `sdiv`/`urem` whose behaviour LLVM leaves undefined.
+    ty match
+      case _: Type.Integer if op == "/" || op == "%" =>
+        val nz = freshTemp(); emit(s"$nz = icmp ne ${ty.llvm} $rv, 0")
+        trapUnless(nz, "div")
+      case _ =>
+
     val r = freshTemp(); emit(s"$r = $instr ${ty.llvm} $lv, $rv"); r
   }
 
