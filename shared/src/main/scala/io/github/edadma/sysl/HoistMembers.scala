@@ -276,11 +276,17 @@ trait HoistMembers extends TypeResolution {
         genericSelf(fd.name) = (home.selfRef, currentScope)
         if home.outer.nonEmpty then genericOuter(fd.name) = home.outer
       else
-        out += fd
-        if home.fixed.nonEmpty then memberSelf(fd.name) = home.fixed
-        funcInsts(fd.name) =
+        // The signature is resolved *before* the member joins the list of bodies to analyze, so a
+        // type in it that does not resolve leaves the member out rather than half in: what the walk
+        // takes off that list it looks the signature up for, and a member on it with none is a
+        // crash where a diagnostic belongs.
+        val signature =
           (fd.params.map(p => (p.name, resolveType(p.typ, home.fixed))),
            fd.retType.map(resolveReturn(_, home.fixed)).getOrElse(Type.Unit))
+
+        out += fd
+        if home.fixed.nonEmpty then memberSelf(fd.name) = home.fixed
+        funcInsts(fd.name) = signature
 
     lowered.toList
   }

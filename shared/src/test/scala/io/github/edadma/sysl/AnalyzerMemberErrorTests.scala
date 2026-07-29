@@ -902,6 +902,20 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("a member of this name would hide it")
     }
 
+    // A member whose signature does not resolve used to be put on the list of bodies to analyze
+    // anyway, and the walk then looked up a signature that was never registered. Every one of these
+    // is a mistake the programmer should be told about, in the position it was written.
+    "a member whose signature does not resolve is reported, not crashed on" in {
+      err("struct P\n    v: int\n    ping(self, x: Nope) -> int = 1") should include("unknown type 'Nope'")
+
+      err("struct P\n    v: int\n    ping(self) -> Nope = 1") should include("unknown type 'Nope'")
+
+      err("""enum Step
+            |    Idle
+            |    Work
+            |    at(self, x: Nope) -> int = 1""".stripMargin) should include("unknown type 'Nope'")
+    }
+
     // The trait writes `Self` and the impl writes a type that is not the implementing one, so the
     // two signatures differ — which is the check `Self` exists to make possible.
     "an impl whose result differs from the trait's 'Self' is rejected" in {
