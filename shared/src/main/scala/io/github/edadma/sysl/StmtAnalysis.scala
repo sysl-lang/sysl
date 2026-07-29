@@ -30,15 +30,27 @@ trait StmtAnalysis extends TypeResolution {
    * scope is: an inner block's nested functions are not the outer block's.
    */
   protected def inBlock[R](stmts: List[Stmt])(body: => R): R = {
-    val savedPending = pendingNested
-    val savedNested  = nestedFuncs
+    val savedPending  = pendingNested
+    val savedNested   = nestedFuncs
+    val savedDeclares = blockDeclares
 
     pendingNested = stmts.collect { case f: FuncDecl => f }
+    // Every name the block binds, whether or not it has been reached yet — which is what lets a use
+    // written above a declaration be told that rather than told the name stands for nothing.
+    // Accumulated rather than replaced: a name bound further down an *enclosing* block is still one
+    // this block was written above, and a body nested inside this one is written above it too.
+    blockDeclares = savedDeclares ++ stmts.collect {
+      case VarDecl(n, _, _)      => List(n)
+      case ValDecl(n, _, _, _)   => List(n)
+      case MultiDecl(ns, _, _)   => ns
+      case ConstDecl(n, _, _, _) => List(n)
+    }.flatten
 
     try body
     finally
       pendingNested = savedPending
       nestedFuncs = savedNested
+      blockDeclares = savedDeclares
   }
 
   /** The body of a value block, using whatever scope the caller has established — a match arm

@@ -363,7 +363,12 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
                 case None =>
                   valKey(name) match
                     case Some(key) => TGlobal(key, valType(key))
-                    case None      => err(s"undefined name '${qn(name)}'")
+                    // A name the block binds further down is a different mistake from one that
+                    // stands for nothing, and the difference is what the reader has to fix.
+                    case None if blockDeclares(name) =>
+                      err(s"'$name' is declared below this, and a name is in scope from where it " +
+                        "is bound onward")
+                    case None => err(s"undefined name '${qn(name)}'")
 
     case Binary(op @ ("&&" | "||"), l, r) =>
       TLogical(op, analyzeBool(l), analyzeBool(r))
@@ -586,8 +591,14 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case Call(Index(Field(_, mname), _), _) if memberDecls.exists((k, d) => k._2 == mname && d.tparams.nonEmpty) =>
       err(s"'$mname' cannot be given type arguments at a call; write the type on what receives the result")
 
+    // Anything that *is* a callable may be called, wherever it was read from — an element of an
+    // array of them, a part of a tuple, a container's item (`12 §6`). The head of a call is looked
+    // at rather than required to be a name, and only what turns out not to be callable is refused.
+    case Call(callee, args) if probe(analyzeExpr(callee)).exists(t => callableOf(t.ty).isDefined) =>
+      callCallable(analyzeExpr(callee), args, expected)
+
     case Call(_, _) =>
-      err("the thing being called must be a name")
+      err("the thing being called must be a name, or something whose type says it is callable")
 
     case f: Field if throughModule(f).isDefined =>
       analyzeValueAt(throughModule(f).get, expected)

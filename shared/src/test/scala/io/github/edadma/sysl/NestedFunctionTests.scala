@@ -338,6 +338,121 @@ class NestedFunctionTests extends AnyFreeSpec with RunSupport with CodegenSuppor
           |""".stripMargin) should include("'go' takes 2 arguments, but 1 argument was given")
   }
 
+  "the edge cases" - {
+    "a group inside an 'if' branch, and another inside its 'else'" in {
+      run("""branchy(n: int) -> int
+            |    if n > 0
+            |        pos(k: int) -> int = k * 2
+            |
+            |        pos(n)
+            |    else
+            |        neg(k: int) -> int = k * 3
+            |
+            |        neg(n)
+            |
+            |print(branchy(4), branchy(-4))
+            |""".stripMargin) shouldBe "8 -12\n"
+    }
+
+    "three-way mutual recursion" in {
+      run("""three(n: int) -> string
+            |    a(k: int) -> string = if k == 0 then "a" else b(k - 1)
+            |    b(k: int) -> string = if k == 0 then "b" else c(k - 1)
+            |    c(k: int) -> string = if k == 0 then "c" else a(k - 1)
+            |
+            |    a(n)
+            |
+            |print(three(0), three(1), three(2), three(3))
+            |""".stripMargin) shouldBe "a b c a\n"
+    }
+
+    "contract clauses of its own" in {
+      run("""guarded(n: int) -> int
+            |    go(k: int) -> int
+            |        require k > 0, "positive"
+            |        k * 2
+            |
+            |    go(n)
+            |
+            |print(guarded(3))
+            |""".stripMargin) shouldBe "6\n"
+    }
+
+    "and a broken one stops the program" in {
+      exits("""guarded(n: int) -> int
+              |    go(k: int) -> int
+              |        require k > 0, "positive"
+              |        k * 2
+              |
+              |    go(n)
+              |
+              |print(guarded(-1))
+              |""".stripMargin)
+    }
+
+    "it writes through a captured reference" in {
+      run("""struct Cell
+            |    v: int
+            |
+            |viaref() -> int
+            |    var c: &Cell = Cell(1)
+            |
+            |    inc()
+            |        c.v = c.v + 5
+            |
+            |    inc()
+            |    inc()
+            |    c.v
+            |
+            |print(viaref())
+            |""".stripMargin) shouldBe "11\n"
+    }
+
+    "a nested function and a closure in one block capture the same name differently" in {
+      // The one program that shows both rules at once: the nested function reaches the variable and
+      // the closure took a copy of it when it was formed, so the second `bump` moves one and not
+      // the other. Either rule applied to both would give 16 or 6 for both.
+      run("""mixed(n: int) -> int
+            |    var total = n
+            |
+            |    bump(k: int)
+            |        total = total + k
+            |
+            |    bump(1)
+            |
+            |    var f: &Fn(int) -> int = k -> k + total
+            |
+            |    bump(10)
+            |    print(total)
+            |    f(0)
+            |
+            |print(mixed(5))
+            |""".stripMargin) shouldBe "16\n6\n"
+    }
+
+    "a capture written below the group is told which mistake it is" in {
+      err("""bad() -> int
+            |    go() -> int = later
+            |
+            |    var later = 1
+            |
+            |    go()
+            |""".stripMargin) should include("'later' is declared below this")
+    }
+
+    "and the group is still callable, so one bad body is one message" in {
+      val message = err("""bad() -> int
+                          |    go() -> int = later
+                          |
+                          |    var later = 1
+                          |
+                          |    go()
+                          |""".stripMargin)
+
+      message should not include "undefined function 'go'"
+    }
+  }
+
   "a group that captures nothing carries nothing" in {
     // The environment is a struct like any other, and one over no names is empty — a nested function
     // that captures nothing really is the ordinary static function `§5a` says it is.

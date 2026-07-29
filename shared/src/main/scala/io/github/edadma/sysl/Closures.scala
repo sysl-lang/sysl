@@ -177,17 +177,20 @@ trait Closures extends CallAnalysis {
     val inside = lowered.map((f, fname) => f.name -> Nested(fname, self)).toMap
     val outer  = lowered.map((f, fname) => f.name -> Nested(fname, here)).toMap
 
+    // The names are bound **before** any body is analyzed, so a body that does not analyze leaves
+    // the group callable and the block is told about its one mistake rather than about that one and
+    // an undefined name at every call.
+    nestedFuncs = nestedFuncs ++ outer
+
     for (f, fname) <- lowered do
       val (params, result) = funcInsts(fname)
 
-      at(f.pos) {
+      recover(())(at(f.pos) {
         val (func, _) = analyzeNested(fname, params.tail, Some(result), f.body,
           Some(Environment(env, captured, byReference = true, fixed(captured))), inside)
 
         closureFuncs += func
-      }
-
-    nestedFuncs = nestedFuncs ++ outer
+      })
 
     // The environment holds addresses, so nothing in it is counted and nothing is copied: it is a
     // row of pointers into the frame it was built in, which is sound exactly because a nested

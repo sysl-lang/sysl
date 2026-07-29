@@ -517,6 +517,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     val savedNested   = nestedFuncs
     val savedPending  = pendingNested
     val savedOuter    = outerNested
+    val savedDeclares = blockDeclares
 
     try
       resetFunction()
@@ -551,6 +552,9 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       // said rather than reported as a name that stands for nothing.
       nestedFuncs = siblings
       outerNested = (savedNested.keySet ++ savedOuter) -- siblings.keySet
+      // The block around this body is where a name it could not capture would have been bound, so
+      // its bindings are what a "declared below this" message is measured against.
+      blockDeclares = savedDeclares
 
       // A body written like a function's is one, so its leading contract clauses are its own
       // (`16`). They are analyzed *after* it rather than before, because an `ensure` names `result`
@@ -589,6 +593,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       nestedFuncs = savedNested
       pendingNested = savedPending
       outerNested = savedOuter
+      blockDeclares = savedDeclares
   }
 
   /** Analyzes one body against a signature it is handed, rather than one looked up in `funcInsts`.

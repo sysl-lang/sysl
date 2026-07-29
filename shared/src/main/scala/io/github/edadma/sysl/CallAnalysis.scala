@@ -15,6 +15,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       params: List[(String, Type)],
       args: List[Expr],
       pre: Option[List[TExpr]],
+      positional: Boolean = false,
   ): List[TExpr] = {
     // An argument analyzed against a parameter that was still being solved was analyzed without an
     // expected type, so a value headed for a `&T` parameter is boxed here instead of at its own
@@ -48,11 +49,14 @@ trait CallAnalysis extends Literals with TraitObjects {
     // whatever the argument's type is, and an expression that never arrives is the one thing
     // inference must not conclude a slot from. A diverging argument against a *written* parameter
     // is untouched — it is dead code, and that parameter still has a layout.
-    for (t, (pname, pty)) <- ts.zip(params) do
+    // A callable's parameters have no names a program wrote — the call trait's are the prelude's —
+    // so what a mismatch there names is the *position*, which is the only thing the caller can see.
+    for ((t, (pname, pty)), i) <- ts.zip(params).zipWithIndex do
+      val which = if positional then s"the ${ordinal(i + 1)} argument of $what" else s"'$pname' of '$what'"
+
       at(t.pos):
-        if disagree(t.ty, pty) then err(s"'$pname' of '$what' is ${show(pty)}, but ${show(t.ty)} was given")
-        else if pty == Type.Never then
-          err(s"cannot pass an expression that never returns as '$pname' of '$what'")
+        if disagree(t.ty, pty) then err(s"$which is ${show(pty)}, but ${show(t.ty)} was given")
+        else if pty == Type.Never then err(s"cannot pass an expression that never returns as $which")
 
     ts
   }
@@ -268,13 +272,18 @@ trait CallAnalysis extends Literals with TraitObjects {
             checkMemberVisible(base, chosen, m)
             val fname           = memberFuncName(rty, chosen)
             val (params, rtype) = funcInsts(fname)
+            // A closure's `call` is not a method a program wrote, so a complaint about one names
+            // the callable and the argument's position rather than the member behind it (`12 §6`).
+            val callable = mname == "call" && callableOf(rty).isDefined
+            val shown    = if callable then "this callable" else s"method '$fname'"
             if args.length != params.length - 1 then
-              err(s"method '$fname' takes ${quantity(params.length - 1, "argument")}, " +
+              err(s"$shown takes ${quantity(params.length - 1, "argument")}, " +
                 s"but ${supplied(args.length, "argument")}")
             val recvArg  = buildReceiver(m.receiver.get, tr)
             val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             funcsUsed += fname
-            TCall(fname, checkArgs(fname, params, args, Some(recvArg :: restArgs)), rtype)
+            TCall(fname, checkArgs(if callable then shown else fname, params, args,
+                                   Some(recvArg :: restArgs), callable), rtype)
           // Neither of the two remaining kinds takes a receiver, and they are not the same mistake:
           // a property is this call with the parentheses dropped, an associated function is not
           // reached through a value at all.
@@ -610,16 +619,19 @@ trait CallAnalysis extends Literals with TraitObjects {
         // from its receiver, so no signature reaching here contains one.
         val subst: Map[String, Type] = traitDecls(from.name).tparams.zip(from.args).toMap
         val params                   = m.params.map(p => (p.name, resolveType(p.typ, subst)))
-        val fname                    = s"${from.name}.$mname"
+        // A boxed callable's `call` is the same non-member the inlined one's is, and reads the same
+        // way in a message — the arity-carrying trait behind it is the compiler's business.
+        val callable = Type.Fn.isCall(from.name)
+        val fname    = if callable then "this callable" else s"method '${from.name}.$mname'"
 
         if args.length != params.length then
-          err(s"method '$fname' takes ${quantity(params.length, "argument")}, " +
+          err(s"$fname takes ${quantity(params.length, "argument")}, " +
             s"but ${supplied(args.length, "argument")}")
 
         val ts    = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
         val rtype = m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit)
 
-        TVCall(recv, slot, checkArgs(fname, params, args, Some(ts)), rtype)
+        TVCall(recv, slot, checkArgs(fname, params, args, Some(ts), callable), rtype)
   }
 
   /** `obj.p` on a `*Trait` or a `&Trait` — a property read through the table, which is the same

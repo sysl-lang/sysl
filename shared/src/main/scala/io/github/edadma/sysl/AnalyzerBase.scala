@@ -595,6 +595,11 @@ trait AnalyzerBase {
    */
   protected var outerNested: Set[String] = Set.empty
 
+  /** Every name the block being analyzed binds, reached or not, so that a use written above the
+   * declaration is told which of the two mistakes it is.
+   */
+  protected var blockDeclares: Set[String] = Set.empty
+
   // Per-function state, reset at each function boundary.
   protected var scopes: List[mutable.LinkedHashMap[String, (String, Type)]] = Nil
   protected val used                                                        = mutable.HashSet.empty[String]
@@ -876,6 +881,7 @@ trait AnalyzerBase {
     nestedFuncs = Map.empty
     pendingNested = Nil
     outerNested = Set.empty
+    blockDeclares = Set.empty
   }
 
   protected def freshName(base: String): String =
@@ -944,6 +950,9 @@ trait AnalyzerBase {
   protected def autoDeref(t: TExpr): TExpr
   protected def isPlace(t: TExpr): Boolean
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String
+
+  /** The call trait a value of this type implements, where it implements one (`12 §6`). */
+  protected def callableOf(t: Type): Option[Type.Bound]
 
   /** The nested functions of one block, lowered together (`12 §5a`). */
   protected def lowerNestedGroup(group: List[FuncDecl]): List[TStmt]

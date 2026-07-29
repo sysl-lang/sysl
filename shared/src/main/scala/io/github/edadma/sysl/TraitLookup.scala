@@ -496,6 +496,13 @@ trait TraitLookup extends MemberVisibility {
    */
   protected def quantity(n: Int, noun: String): String = if n == 1 then s"1 $noun" else s"$n ${noun}s"
 
+  /** A position as a message spells it: `1st`, `2nd`, `3rd`, `4th`. */
+  protected def ordinal(n: Int): String = n match
+    case 1 => "1st"
+    case 2 => "2nd"
+    case 3 => "3rd"
+    case _ => s"${n}th"
+
   /** `a`, `a and b`, `a, b and c` — a list read aloud, for a diagnostic naming everything a type
    * does implement when it does not implement the one that was asked for.
    */
