@@ -45,6 +45,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     if usesVarargs then
       out ++= "declare void @llvm.va_start.p0(ptr)\n"
       out ++= "declare void @llvm.va_end.p0(ptr)\n"
+    if usesVaCopy then out ++= "declare void @llvm.va_copy.p0(ptr, ptr)\n"
 
     // An `extern` the program calls is declared here, unless the symbol is already declared — by the
     // runtime, whose own spelling of `malloc` is the one its code calls, or by an earlier `extern`,
@@ -952,6 +953,14 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
       val r = freshTemp()
       emit(s"$r = va_arg ptr ${genExpr(ap)}, ${ty.llvm}")
       r
+
+    case TVaCopy(dst, src) =>
+      usesVaCopy = true
+      // Both addresses are produced before either is used, so a copy onto a list read out of the
+      // same expression cannot see a half-written destination.
+      val d = genExpr(dst)
+      val s = genExpr(src)
+      emit(s"call void @llvm.va_copy.p0(ptr $d, ptr $s)"); ""
 
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)

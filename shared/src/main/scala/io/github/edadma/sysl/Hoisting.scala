@@ -222,7 +222,7 @@ trait Hoisting extends HoistMembers {
       funcInsts(key) =
         (e.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
          e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
-      checkSignatureRules(e.name, e.params, e.retType, e.variadic)
+      checkSignatureRules(e.name, e.params, e.retType, e.variadic, foreign = true)
       for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
         err(s"'$s' is not a symbol a linker can resolve")
 
@@ -432,38 +432,6 @@ trait Hoisting extends HoistMembers {
     superChecks.clear()
   }
 
-  /** The rules a declared signature must satisfy whichever declaration form it came from, checked
-   * after the name is registered so a failure reports the mistake without also erasing the
-   * declaration it is about.
-   */
-  private def checkSignatureRules(
-      name: String,
-      params: List[Param],
-      ret: Option[TypeRef],
-      variadic: Boolean,
-  ): Unit = {
-    // C reads a variadic call's arguments relative to the last named parameter, so there has to be
-    // one; `f(...)` is not a callable declaration in any C either.
-    if variadic && params.isEmpty then err(s"'$name' needs at least one named parameter before '...'")
-    checkNoVaList(name, params, ret)
-  }
-
-  /** A `va_list` may be a local, which is all a function needs to walk its own tail — but not a
-   * parameter or a result, because handing one to another function is C's `vprintf` shape and its
-   * calling convention is not implemented (`12 §Open g`). Refused with a diagnostic rather than
-   * lowered to something that would pass the wrong thing.
-   */
-  private def checkNoVaList(name: String, params: List[Param], ret: Option[TypeRef]): Unit = {
-    def isVaList(t: TypeRef) = t match
-      case NamedType(n, Nil) => scalarType(n).contains(Type.VaList)
-      case _                 => false
-
-    for p <- params if isVaList(p.typ) do
-      at(p.pos)(err(s"a va_list cannot be a parameter yet — '$name' would have to pass its tail on, " +
-        "which is not supported"))
-    for r <- ret if isVaList(r) do
-      at(r.pos)(err(s"a va_list cannot be returned — it walks '$name''s own tail, which is gone once it returns"))
-  }
 
   /** Structs, enums, and the built-in scalars share one type namespace, so a name may name at
    * most one of them. `never` is in it too: it names a type, so nothing else may.

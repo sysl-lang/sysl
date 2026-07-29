@@ -156,12 +156,7 @@ trait CallAnalysis extends Literals with TraitObjects {
 
     val shown = qn(f.name)
 
-    if variadic then
-      if args.length < f.params.length then
-        err(s"function '$shown' takes at least ${quantity(f.params.length, "argument")}, " +
-          s"but ${supplied(args.length, "argument")}")
-    else if args.length != f.params.length then
-      err(s"function '$shown' takes ${quantity(f.params.length, "argument")}, but ${supplied(args.length, "argument")}")
+    checkArity(s"function '$shown'", f.params.length, variadic, args.length)
 
     // An extern is declared in the output only if something reaches it, which is what keeps an
     // unused one — the prelude's `exit`, in a program that never panics — out of the module.
@@ -189,6 +184,19 @@ trait CallAnalysis extends Literals with TraitObjects {
     TCall(name, declared ::: args.drop(params.length).map(variadicArg), rtype)
   }
 
+  /** How many arguments a callee accepts, said in the caller's own words.
+   *
+   * A `...` turns the count into a floor: the declared parameters are still all required, and what
+   * follows them is the tail, which no declaration bounds. Every call form asks this the same way,
+   * so a member and a free function report the mistake in the same shape.
+   */
+  protected def checkArity(shown: String, want: Int, variadic: Boolean, got: Int): Unit =
+    if variadic then
+      if got < want then
+        err(s"$shown takes at least ${quantity(want, "argument")}, but ${supplied(got, "argument")}")
+    else if got != want then
+      err(s"$shown takes ${quantity(want, "argument")}, but ${supplied(got, "argument")}")
+
   /** One argument in a variadic extern's tail.
    *
    * There is no declared parameter to check it against, so what stands in for one is the rule C
@@ -202,7 +210,7 @@ trait CallAnalysis extends Literals with TraitObjects {
    * because unlike a declared parameter (`12 §1`) there is no written type saying what the callee
    * agreed to receive.
    */
-  private def variadicArg(a: Expr): TExpr = {
+  protected def variadicArg(a: Expr): TExpr = {
     val t = analyzeExpr(a)
 
     at(t.pos):
@@ -276,14 +284,15 @@ trait CallAnalysis extends Literals with TraitObjects {
             // the callable and the argument's position rather than the member behind it (`12 §6`).
             val callable = mname == "call" && callableOf(rty).isDefined
             val shown    = if callable then "this callable" else s"method '$fname'"
-            if args.length != params.length - 1 then
-              err(s"$shown takes ${quantity(params.length - 1, "argument")}, " +
-                s"but ${supplied(args.length, "argument")}")
+            checkArity(shown, params.length - 1, m.variadic, args.length)
+            // A member's tail begins where its declared parameters stop, and the receiver holds one
+            // of the slots — so the cut is one past what a free function's would be.
+            val (declared, tail) = args.splitAt(params.length - 1)
             val recvArg  = buildReceiver(m.receiver.get, tr)
-            val restArgs = args.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+            val restArgs = declared.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             funcsUsed += fname
-            TCall(fname, checkArgs(if callable then shown else fname, params, args,
-                                   Some(recvArg :: restArgs), callable), rtype)
+            TCall(fname, checkArgs(if callable then shown else fname, params, declared,
+                                   Some(recvArg :: restArgs), callable) ::: tail.map(variadicArg), rtype)
           // Neither of the two remaining kinds takes a receiver, and they are not the same mistake:
           // a property is this call with the parentheses dropped, an associated function is not
           // reached through a value at all.
@@ -323,8 +332,14 @@ trait CallAnalysis extends Literals with TraitObjects {
         val supplied = args.map(probeType)
         val from = s"'$mname' comes from ${quantity(cands.length, "implementation")} of one trait on $subject"
 
+        // A candidate that takes a `...` is answered for by its declared parameters alone: the tail
+        // stands at none, so what it may be told apart by stops where they do (`12 §9`).
         val fits = cands.filter { c =>
-          params(c).exists(ps => ps.length == supplied.length && ps.zip(supplied).forall((p, s) => s.contains(p)))
+          params(c).exists { ps =>
+            val counted = if variadicMember(owner, c) then supplied.length >= ps.length else supplied.length == ps.length
+
+            counted && ps.zip(supplied).forall((p, s) => s.contains(p))
+          }
         }
 
         fits match
@@ -333,6 +348,12 @@ trait CallAnalysis extends Literals with TraitObjects {
             err(s"$from, and none of them takes (${supplied.map(_.fold("?")(show)).mkString(", ")}) — " +
               "write the argument at the type of the implementation that was meant")
           case _ => err(s"$from, and the arguments do not say which was meant")
+
+  /** Whether one of a type's members takes a `...`, asked of the member table rather than of the
+   * lowered signature — a tail is not something a parameter list records.
+   */
+  private def variadicMember(owner: String, mname: String): Boolean =
+    memberDecls.get((owner, mname)).exists(_.variadic)
 
   /** `value.m(…)`, where the receiver's type names each candidate's instantiation. */
   protected def pickOverload(rty: Type, base: String, mname: String, args: List[Expr]): String =
@@ -382,13 +403,14 @@ trait CallAnalysis extends Literals with TraitObjects {
   ): TExpr = {
     val shown = qn(fd.name)
 
-    if args.length != fd.params.length - 1 then
-      err(s"method '$shown' takes ${quantity(fd.params.length - 1, "argument")}, " +
-        s"but ${supplied(args.length, "argument")}")
+    checkArity(s"method '$shown'", fd.params.length - 1, m.variadic, args.length)
 
+    // The tail stands at no parameter, so it is kept out of the inference as well as out of the
+    // check: what solves the member's own type parameters is the arguments that have one to solve.
+    val (passed, tail) = args.splitAt(fd.params.length - 1)
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.tail.map(p => spell(p.typ))
-    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, args, m.bounds)
+    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds)
     val own = inDecl(fd.name)(solve(
       shown,
       m.tparams,
@@ -396,7 +418,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
-      args.map(isLiteral),
+      passed.map(isLiteral),
     ))
 
     inDecl(fd.name)(checkParamBounds(shown, m.tparams, fd.bounds, own))
@@ -405,7 +427,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     val (params, rtype) = funcInsts(name)
     val recvArg         = buildReceiver(m.receiver.get, recv)
 
-    TCall(name, checkArgs(shown, params, args, Some(recvArg :: provisional)), rtype)
+    TCall(name, checkArgs(shown, params, passed, Some(recvArg :: provisional)) ::: tail.map(variadicArg), rtype)
   }
 
   /** `5.display(out, fmt)` — the rendering a built-in's `Display` membership provides (`14 §5`).
@@ -526,12 +548,11 @@ trait CallAnalysis extends Literals with TraitObjects {
             err(s"'$mname' is an associated function of '${tr.show}', so it has no receiver — a value " +
               "cannot be the thing it is called on")
           val params = m.params.map(p => (p.name, resolveType(p.typ, self)))
-          if args.length != params.length then
-            err(s"method '$fname' takes ${quantity(params.length, "argument")}, " +
-              s"but ${supplied(args.length, "argument")}")
-          val ts    = args.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
+          checkArity(s"method '$fname'", params.length, m.variadic, args.length)
+          val (declared, tail) = args.splitAt(params.length)
+          val ts    = declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
           val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
-          TCall(fname, recv :: checkArgs(fname, params, args, Some(ts)), rtype)
+          TCall(fname, recv :: (checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg)), rtype)
         }
 
   /** The first member of that name one of a parameter's bounds declares, with the substitution its
@@ -867,11 +888,11 @@ trait CallAnalysis extends Literals with TraitObjects {
           case None =>
             val fname           = s"$tname.$chosen"
             val (params, rtype) = funcInsts(fname)
-            if args.length != params.length then
-              err(s"associated function '$fname' takes ${quantity(params.length, "argument")}, but ${supplied(args.length, "argument")}")
-            val ts = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+            checkArity(s"associated function '$fname'", params.length, m.variadic, args.length)
+            val (declared, tail) = args.splitAt(params.length)
+            val ts = declared.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             funcsUsed += fname
-            TCall(fname, checkArgs(fname, params, args, Some(ts)), rtype)
+            TCall(fname, checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg), rtype)
       case Some(m) if m.isProperty =>
         err(s"'$mname' is a property of '$tname' — read it on a value, as 'value.$mname'")
       case Some(_) => err(s"'$mname' is an instance method of '$tname' — call it on a value, not the type")
@@ -899,13 +920,12 @@ trait CallAnalysis extends Literals with TraitObjects {
   ): TExpr = {
     val shown = qn(fd.name)
 
-    if args.length != fd.params.length then
-      err(s"associated function '$shown' takes ${quantity(fd.params.length, "argument")}, " +
-        s"but ${supplied(args.length, "argument")}")
+    checkArity(s"associated function '$shown'", fd.params.length, m.variadic, args.length)
 
+    val (passed, tail) = args.splitAt(fd.params.length)
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.map(p => spell(p.typ))
-    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, args, m.bounds)
+    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, passed, m.bounds)
     val targs = inDecl(fd.name)(solve(
       shown,
       fd.tparams,
@@ -913,7 +933,7 @@ trait CallAnalysis extends Literals with TraitObjects {
       provisional.map(_.ty),
       fd.retType.map(spell),
       expected,
-      args.map(isLiteral),
+      passed.map(isLiteral),
     ))
 
     val (ownerTps, ownTps)   = fd.tparams.splitAt(fd.tparams.length - m.tparams.length)
@@ -928,7 +948,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     val (params, rtype) = funcInsts(name)
 
     funcsUsed += name
-    TCall(name, checkArgs(fd.name, params, args, Some(provisional)), rtype)
+    TCall(name, checkArgs(fd.name, params, passed, Some(provisional)) ::: tail.map(variadicArg), rtype)
   }
 
   /** Passes the receiver in the mode the method's `self` declared, inserting the same conversion

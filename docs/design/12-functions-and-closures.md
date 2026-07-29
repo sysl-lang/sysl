@@ -326,6 +326,10 @@ one's locals and parameters as well as its own. Nothing outside the body can nam
 so `13`'s visibility levels do not apply to one — there is nothing for `private` to restrict, and
 writing it is an error rather than a no-op.
 
+It states its own signature, so it may also take a `...` and walk its own tail (§9): the environment
+holds the first parameter slot the way a method's receiver does, and the tail anchors after what the
+program wrote.
+
 ### One environment per block, and the three things that follow from it
 
 **The nested functions of a block share one environment**, and each is a member of it. That is what
@@ -630,8 +634,9 @@ know which it is reaching, and it means the two share their implementation rathe
   argument, which is not a thing sysl expressions can hold, so it is a type argument — the same
   position every other generic puts one in.
 - **`va_end(ap)`** finishes with it.
+- **`va_copy(dst, src)`** starts `dst` where `src` has reached, so a tail can be walked twice.
 
-These four are **language forms, not library functions**, in the same category as `sizeof`: each is
+These five are **language forms, not library functions**, in the same category as `sizeof`: each is
 an ABI primitive that no sysl body could implement, so there is nothing to put in the prelude. That
 is the line the "no functions built into the compiler" rule actually draws — `va_arg` is on the
 right side of it because no program could write `va_arg`. `print` was on the wrong side, and is
@@ -643,6 +648,80 @@ is there. The tail carries no type information, so there is nothing to check aga
 one place in sysl where getting it wrong is undiagnosed, and it is why a *safe* variadic (a
 homogeneous `...T` collected into a slice, or a heterogeneous `...&Show` over trait objects) is
 worth adding **beside** it later (`§ Open i`), never instead of it.
+
+### Handing a walk on
+
+C's other half of this is `vprintf`: a function receives the tail and does not read it itself but
+passes it to somebody who does. The parameter type is **`*va_list`**, and the call writes `&ap`:
+
+```
+report(n: int, ap: *va_list) -> int
+    var total = 0
+    for i in 0..<n
+        total += va_arg[int](ap)
+    total
+end report
+
+log(n: int, ...) -> int
+    var ap: va_list
+    va_start(ap)
+    var t = report(n, &ap)
+    va_end(ap)
+    t
+end log
+```
+
+**A bare `va_list` parameter is refused, and §2 is why.** A parameter is a value binding, and a copy
+of a walk is not a walk: the callee would advance its own copy and the caller would see nothing
+happen — which is the one thing the form exists to do. §2 already says how a function is given
+something to advance: it takes it by *type*, as a `*T`. So this needs no rule of its own, and the
+diagnostic on `ap: va_list` names the spelling that works.
+
+Two things follow, and both are the point. The borrower **advances the lender's own list**, so what
+it consumed is gone when the lender reads on — which is what `va_copy` is for, exactly as in C. And
+`va_start` still asks for a tail of the function's own while `va_arg` asks only for a walk, so a
+borrower reads a tail without having one.
+
+**Returning a `va_list` is refused outright**: it walks a tail that is gone by the time the caller
+has it. A `*va_list` is an ordinary raw pointer and is refused nowhere — it may be returned, held in
+a field, or carried in a struct, under `03`'s rules and nobody else's.
+
+**An `extern` may take neither spelling**, and this is an ABI limit rather than a language one. C's
+`va_list` is a different type on every target — a pointer on Darwin arm64, an array of one struct on
+x86-64 System V, a struct passed indirectly on AAPCS64 — so what a call must hand a foreign
+`vprintf` differs per target, and there is no target registry to read the answer out of
+(`capabilities.md`, whose project-config half is still to be written). It is refused with a
+diagnostic that says so rather than lowered to whichever of the three happened to be right where the
+compiler was built (`§ Open g₂`).
+
+### The ellipsis reaches a member, and a nested function
+
+A member is a function with a receiver in front, so a `...` reaches one under exactly these rules:
+
+```
+struct Log
+    prefix: int
+
+    note(self, n: int, ...) -> int
+        var ap: va_list
+        va_start(ap)
+        …
+    end note
+end Log
+```
+
+The receiver is a parameter once the member is lowered, and it is therefore what a tail anchors on —
+so `only(self, ...)` is a complete declaration while a receiverless `make(...)` has nothing named
+before its ellipsis and is refused, exactly as `f(...)` is. The same holds for an associated
+function, a member of a generic type, a member with type parameters of its own, and a **nested
+function** (`§5a`), whose environment holds the first parameter slot the way a receiver does.
+
+A **trait** may declare one, and an implementation must agree about it: a `...` is part of what a
+caller may write, so having one where the trait has none is a different promise rather than a wider
+one. What such a trait cannot be is a **trait object**. A call to a variadic names the callee's whole
+function type — that is how it says where the declared parameters stop — and a slot in a method table
+is a word that names none. A bound still reaches the method, because that call knows which function
+it is reaching. This is object safety in the shape `02` already gives it, alongside the `Self` rule.
 
 ## 10. What is deliberately absent
 
@@ -690,13 +769,19 @@ worth adding **beside** it later (`§ Open i`), never instead of it.
   other direction — a sysl function exported under a chosen symbol, C's side of the same seam — has
   no spelling. It is the same question as how a sysl function's symbol is decided at all, which the
   module system (`13`) settles, so it waits for that rather than growing a second mechanism here.
-- **g. `va_copy`, and a `va_list` that crosses a call.** §9 covers reading a tail in the function
-  that received it. Passing an `ap` on to another function (C's `vprintf` shape) and duplicating one
-  (`va_copy`) are the rest of C's surface here, and both belong — they are simply not built yet.
-- **h₂. A variadic method.** §9's ellipsis reaches a free function and an `extern`; a method's
-  parameter list is a separate production (it carries a receiver) and does not take one, so
-  `add(self, n: int, ...)` is a parse error. C has no methods, so no C capability is denied — but the
-  inconsistency with a free function is a gap rather than a decision.
+- ~~**g. `va_copy`, and a `va_list` that crosses a call.**~~ **Built** (§9, *Handing a walk on*).
+  `va_copy` is a fifth language form, and a walk is handed on as a `*va_list` — which turned out to
+  need no rule of its own, because §2 already says a function is given something to advance by
+  *type*. What is left of it is `g₂` below.
+- **g₂. A `va_list` across the foreign boundary.** An `extern` may take neither `va_list` nor
+  `*va_list`, because C spells the type differently on every target and there is nothing to read the
+  answer out of. This is the one piece of C's varargs surface sysl still cannot reach, and it is an
+  ABI question rather than a language one: it waits on the target registry `capabilities.md` says is
+  still to be written, and is then a per-target lowering rather than a decision.
+- ~~**h₂. A variadic method.**~~ **Built** (§9, *The ellipsis reaches a member*). A member is a
+  function with a receiver in front, so the ellipsis reaches one under the rules a free function's
+  tail already follows, and the receiver is what the tail anchors on. A trait may declare one; what
+  it cannot then be is a trait object, for the reason object safety gives.
 - **i. A *safe* variadic beside the C-faithful one.** A homogeneous `...T` collected into a slice
   (Go's, Swift's) or a heterogeneous `...&Show` over trait objects would be checked, which §9's
   cannot be. It is additive and wanted; the trait-object half waits on dynamic dispatch (`02`).

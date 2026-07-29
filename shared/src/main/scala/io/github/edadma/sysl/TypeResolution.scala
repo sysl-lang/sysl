@@ -504,6 +504,13 @@ trait TypeResolution extends ImportResolution {
       if m.params.exists(p => mentionsSelf(p.typ)) || m.retType.exists(mentionsSelf) then
         err(s"'${m.name}' of '$shown' mentions 'Self' away from its receiver, and an erased value " +
           s"has forgotten which type that is — so there is no $obj to form")
+      // A variadic call names the callee's whole function type, which is how it says where the
+      // declared parameters stop; a table slot is one word and names nothing. A bound still reaches
+      // such a method, because that call knows which function it is reaching.
+      if m.variadic then
+        err(s"'${m.name}' of '$shown' takes a '...', and a call to one names the whole function " +
+          s"type it is reaching — a slot in a method table is a word and names none, so there is " +
+          s"no $obj to form")
   }
 
   /** Holds a written callable to an arity the prelude declares a call trait for.
@@ -750,6 +757,70 @@ trait TypeResolution extends ImportResolution {
   private val constTypes       = mutable.HashMap.empty[String, Type]
   private val constLits        = mutable.HashMap.empty[String, Expr]
   private val constsInProgress = mutable.LinkedHashSet.empty[String]
+
+  /** The rules a declared signature must satisfy whichever declaration form it came from, checked
+   * after the name is registered so a failure reports the mistake without also erasing the
+   * declaration it is about.
+   */
+  protected def checkSignatureRules(
+      name: String,
+      params: List[Param],
+      ret: Option[TypeRef],
+      variadic: Boolean,
+      foreign: Boolean = false,
+  ): Unit = {
+    // C reads a variadic call's arguments relative to the last named parameter, so there has to be
+    // one; `f(...)` is not a callable declaration in any C either.
+    if variadic && params.isEmpty then err(s"'$name' needs at least one named parameter before '...'")
+    checkVaListPositions(name, params, ret, foreign)
+  }
+
+  /** Where a `va_list` may stand in a signature (`12 §9`).
+   *
+   * A walk is handed on **by address**: `*va_list` is the parameter type, and `&ap` is what the
+   * caller writes. A bare `va_list` parameter is refused because a parameter is a by-value binding
+   * (`12 §2`) and a copy of a walk is not a walk — advancing it would advance nothing the caller
+   * could see, which is the one thing the form exists to do. Returning one is refused outright:
+   * it walks a tail that is gone by the time the caller has it.
+   *
+   * An **`extern`** may take neither spelling, and this is an ABI limit rather than a language one.
+   * C's `va_list` is a different type on every target — a pointer on Darwin arm64, an array of one
+   * struct on x86-64 System V, a struct passed indirectly on AAPCS64 — so what a call must hand a
+   * foreign `vprintf` differs per target, and sysl has no target registry to read the answer out of
+   * (`capabilities.md`). Refused with a diagnostic rather than lowered to whichever of the three
+   * happened to be right where it was built.
+   */
+  private def checkVaListPositions(
+      name: String,
+      params: List[Param],
+      ret: Option[TypeRef],
+      foreign: Boolean,
+  ): Unit = {
+    def isVaList(t: TypeRef) = t match
+      case NamedType(n, Nil) => scalarType(n).contains(Type.VaList)
+      case _                 => false
+
+    def isVaListPtr(t: TypeRef) = t match
+      case PtrType(inner) => isVaList(inner)
+      case _              => false
+
+    for p <- params do
+      if isVaList(p.typ) then
+        at(p.pos)(err(s"a va_list is a parameter as '*va_list', not as 'va_list' — a parameter is a " +
+          s"by-value binding, and a copy of a walk advances nothing '$name''s caller can see, so " +
+          "the walk is handed over by address and the call writes '&ap'"))
+      if foreign && isVaListPtr(p.typ) then
+        at(p.pos)(err(s"a va_list cannot cross into '$name', which is foreign — C spells 'va_list' " +
+          "differently on every target, so what a call must hand it is a target question sysl " +
+          "cannot answer yet"))
+
+    for r <- ret do
+      if isVaList(r) then
+        at(r.pos)(err(s"a va_list cannot be returned — it walks '$name''s own tail, which is gone once it returns"))
+      if foreign && isVaListPtr(r) then
+        at(r.pos)(err(s"a va_list cannot cross out of '$name', which is foreign — C spells 'va_list' " +
+          "differently on every target, so what it hands back is a target question sysl cannot answer yet"))
+  }
 
   /** Resolves a scalar type name: the named primitives and friendly aliases, or one of the
    * systematic `iN` / `uN` / `fN` width spellings.

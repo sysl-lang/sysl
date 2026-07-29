@@ -514,6 +514,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       body: List[Stmt],
       environment: Option[Environment] = None,
       siblings: Map[String, Nested] = Map.empty,
+      variadic: Boolean = false,
   ): (TFunc, Type) = {
     val savedScopes   = scopes
     val savedUsed     = used.toSet
@@ -536,7 +537,9 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       resetFunction()
       retTy = declaredResult.getOrElse(Type.Unknown)
       retIsList = false
-      variadicFn = false
+      // A nested function states its own signature, so a `...` on one is its own tail to walk; a
+      // closure literal has no way to write one, and is handed `false` (`12 §5a`, §9).
+      variadicFn = variadic
 
       // The receiver comes first, so the closure's own environment is the argument every call
       // already passes and the parameters after it are the ones a program wrote.
@@ -589,7 +592,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
       val (requires, ensures, olds) = analyzeContracts(result, contracts)
 
-      (TFunc(name, tparams, result, tbody, variadic = false, requires, ensures, olds), result)
+      (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds), result)
     finally
       scopes = savedScopes
       used.clear(); used ++= savedUsed

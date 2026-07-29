@@ -81,6 +81,13 @@ trait SignatureVisibility extends TypeResolution {
           recover(())(at(m.pos) {
             for p <- m.params do resolveType(p.typ, subst)
             m.retType.foreach(resolveReturn(_, subst))
+            // And the rules about where a `va_list` may stand, which an implementation would meet
+            // when its member is lowered — a promise nothing keeps has no lowering to meet them at.
+            // The receiver stands in the list because it is a parameter once the member is lowered,
+            // and it is what a `...` on a method anchors its tail on.
+            val recv = m.recvMode.map(_ => Param("self", NamedType(selfName, Nil))).toList
+
+            checkSignatureRules(s"${qn(key)}.${m.name}", recv ::: m.params, m.retType, m.variadic)
           })
       }
 

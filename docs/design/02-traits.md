@@ -511,6 +511,10 @@ made into an object when every method:
 - **does not take `&self`, for a `*Trait` only.** `&self` asks for its receiver inside a box, and a
   raw object points straight at a value. A `&Trait` carries one, so it accepts such a method; the
   diagnostic says which sigil to write.
+- **takes no `...`.** A call to a variadic names the callee's *whole* function type, because that is
+  how it says where the declared parameters stop and the tail begins (`12 §9`); a slot in a table is
+  one word and names none. A bound still reaches such a method, since that call knows which function
+  it is reaching — so a variadic trait method is for bounds, exactly as a `Self`-mentioning one is.
 
 The middle rule excludes **every trait in the operator catalog** — `add(self, rhs: Self) -> Self`
 first among them — and that is the right answer rather than a limitation: `14`'s traits describe an

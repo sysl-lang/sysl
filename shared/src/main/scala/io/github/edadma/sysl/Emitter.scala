@@ -27,6 +27,11 @@ trait Emitter {
    */
   protected var usesVarargs = false
 
+  /** Whether anything duplicated a walk, which `llvm.va_copy` is declared for. It is asked
+   * separately because a function handed a `*va_list` may copy one without ever starting one.
+   */
+  protected var usesVaCopy = false
+
   /** LLVM intrinsic `declare` lines the module turned out to need — the saturating
    * float-to-integer casts, each declared once under its overload-mangled name.
    */

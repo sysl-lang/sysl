@@ -525,8 +525,8 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
     // The forms the compiler resolves by name rather than by looking a function up: `print` and
     // its two rendering companions, which are temporary and leave once a `Display` trait can carry
-    // them, and the four primitives no sysl body could implement — the unchecked byte-to-string
-    // conversion and the three a variadic body needs — which stay. What each one means is in
+    // them, and the five primitives no sysl body could implement — the unchecked byte-to-string
+    // conversion and the four a variadic body needs — which stay. What each one means is in
     // `SpecialForms`; the dispatch is here so it reads in the order the match tries.
     case Call(Ident("print"), args)                         => printCall(args)
     case Call(Ident("str"), args)                           => strCall(args)
@@ -535,6 +535,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case Call(Ident("va_start"), args)                      => vaStart(args)
     case Call(Ident("va_end"), args)                        => vaEnd(args)
     case Call(Ident("va_arg"), args)                        => vaArg(args, expected)
+    case Call(Ident("va_copy"), args)                       => vaCopy(args)
 
     // `old(e)` is a contextual keyword read only while an `ensure` is being analyzed; the guard is
     // what lets `old` stay an ordinary name outside a postcondition.
@@ -1291,9 +1292,12 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case _ => false
 
   /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
-  protected def analyzePlace(target: Expr, what: String): TExpr = {
-    val t = analyzeExpr(target)
+  protected def analyzePlace(target: Expr, what: String): TExpr = requirePlace(analyzeExpr(target), target, what)
 
+  /** The same demand made of an expression **already analyzed**, for a form that had to see the type
+   * before it knew whether a place was what it wanted at all.
+   */
+  protected def requirePlace(t: TExpr, target: Expr, what: String): TExpr = {
     // A **captured** name reaches storage the walk below cannot see the binding of — a field of the
     // environment, or the frame slot one points at — so being written once is asked of the name it
     // was declared under rather than of the expression it turned into (`12 §7`).

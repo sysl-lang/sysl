@@ -2,8 +2,10 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** A **sysl** function that takes a `...`, and the three forms its body reads the tail with
- * (`12-functions-and-closures.md` §9).
+/** A **sysl** function that takes a `...`, and the forms its body reads the tail with
+ * (`12-functions-and-closures.md` §9). Lending a walk to another function and duplicating one are
+ * the same chapter and live in `VariadicForwardTests`; a member that takes a `...` is in
+ * `VariadicMethodTests`.
  *
  * The calling side is the same rule an `extern`'s tail follows and is tested with it; what is new
  * here is the *receiving* side — `va_list`, `va_start`, `va_arg`, `va_end` — which is C's, with the
@@ -214,6 +216,34 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
       run(src) shouldBe "42 42\n"
     }
 
+    // A nested function states its own signature (`12 §5a`), so a `...` on one is its own tail —
+    // the environment holds the first parameter slot, exactly as a method's receiver does, and the
+    // tail anchors after what the program wrote.
+    "a nested function may be variadic, and still reach what it captured" in {
+      val src =
+        """outer(base: int) -> int
+          |    inner(n: int, ...) -> int
+          |        var ap: va_list
+          |        va_start(ap)
+          |        var t = 0
+          |        for i in 0..<n
+          |            var v: int = va_arg(ap)
+          |            t += v
+          |        va_end(ap)
+          |        t + base
+          |    end inner
+          |    inner(2, 1, 2) + inner(0)
+          |end outer
+          |print(outer(10))""".stripMargin
+
+      run(src) shouldBe "23\n"
+    }
+
+    "and it needs something named before the ellipsis like any other" in {
+      err("outer() -> int\n    inner(...) -> int = 1\n    inner(1)\nend outer\nprint(outer())") should
+        include("'inner' needs at least one named parameter before '...'")
+    }
+
     "a variadic function may recurse" in {
       val src =
         """countdown(n: int, ...) -> int
@@ -329,12 +359,14 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
     }
   }
 
-  // Handing a `va_list` to another function is C's `vprintf` shape, and its calling convention is
-  // not implemented — so it is refused outright rather than lowered to something that would pass
-  // the wrong thing (`12 §Open g`).
-  "what is not supported yet says so" - {
-    "a va_list cannot be a parameter" in {
-      err("f(ap: va_list) -> int = 1\nprint(1)") should include("a va_list cannot be a parameter yet")
+  // A walk is handed on by address (`12 §9`, *Handing a walk on*), and the spellings that would
+  // mean something else are each refused for their own reason.
+  "where a va_list may and may not stand" - {
+    "a bare va_list parameter names the spelling that works" in {
+      val out = err("f(ap: va_list) -> int = 1\nprint(1)")
+
+      out should include("a va_list is a parameter as '*va_list', not as 'va_list'")
+      out should include("the call writes '&ap'")
     }
 
     "a va_list cannot be returned" in {
@@ -342,20 +374,21 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
         include("a va_list cannot be returned")
     }
 
-    "an extern cannot take one either" in {
+    // C spells `va_list` differently on every target — a pointer on Darwin arm64, an array of one
+    // struct on x86-64 System V, a struct passed indirectly on AAPCS64 — so what a call must hand a
+    // foreign `vprintf` is a target question, and sysl has no target registry to read it out of.
+    "an extern may take neither spelling, and says which question is open" in {
       err("extern vprintf(fmt: *u8, ap: va_list) -> int\nprint(1)") should
-        include("a va_list cannot be a parameter yet")
+        include("a va_list is a parameter as '*va_list'")
+
+      val ptr = err("extern vprintf(fmt: *u8, ap: *va_list) -> int\nprint(1)")
+
+      ptr should include("a va_list cannot cross into 'vprintf', which is foreign")
+      ptr should include("C spells 'va_list' differently on every target")
     }
 
-    // A method's parameter list is its own production (it carries a receiver), so `...` does not
-    // reach it. C has no methods, so no C capability is being denied — but the inconsistency with a
-    // free function is a gap, and it is a parse error rather than a silently dropped ellipsis.
-    "a method cannot be variadic yet, and says so rather than ignoring it" in {
-      progError(
-        """struct S
-          |    v: int
-          |    add(self, n: int, ...) -> int = self.v + n""".stripMargin,
-      ) should not be empty
+    "nor hand one back" in {
+      err("extern current() -> *va_list\nprint(1)") should include("cannot cross out of 'current'")
     }
 
     "and it is not something to print" in {

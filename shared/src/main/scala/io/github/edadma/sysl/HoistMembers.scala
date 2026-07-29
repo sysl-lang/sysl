@@ -288,6 +288,13 @@ trait HoistMembers extends TypeResolution {
         if home.fixed.nonEmpty then memberSelf(fd.name) = home.fixed
         funcInsts(fd.name) = signature
 
+      // A member is a function with a receiver in front, so the rules a signature is held to are
+      // the same ones — asked of the *lowered* form, where the receiver is a parameter like any
+      // other, which is what lets `add(self, ...)` anchor its tail on `self` while a receiverless
+      // `make(...)` has nothing to anchor on. Asked after the member is registered, so a mistake
+      // here does not also erase the member it is about.
+      recover(())(at(m.pos)(checkSignatureRules(fd.name, fd.params, fd.retType, fd.variadic)))
+
     lowered.toList
   }
 
@@ -909,6 +916,12 @@ trait HoistMembers extends TypeResolution {
     if tm.params.length != im.params.length then
       err(s"method '${im.name}' of 'impl $traitName for $forType' takes ${im.params.length} " +
         s"parameters, but the trait declares ${tm.params.length}")
+    // A `...` is part of what a caller may write, so an implementation that has one where the trait
+    // has none — or the other way about — is a different promise, not a wider one.
+    if tm.variadic != im.variadic then
+      err(s"method '${im.name}' of 'impl $traitName for $forType' " +
+        s"${if im.variadic then "takes" else "does not take"} a '...', but trait '$traitName' " +
+        s"declares ${if tm.variadic then "one" else "none"}")
 
     // The two signatures were written in two files — the trait's and the block's — so each side is
     // resolved where it was written, under that file's module and its imports. A `Point` in the
@@ -948,6 +961,7 @@ trait HoistMembers extends TypeResolution {
       m.retType,
       m.body,
       home.bounds ++ m.bounds,
+      m.variadic,
     ).setPos(m.pos)
   }
 
@@ -1000,6 +1014,7 @@ trait HoistMembers extends TypeResolution {
       // which is the one promise every implementation of it makes.
       bounds = tr.bounds +
         (selfName -> List(BoundRef(tr.name, tr.tparams.map(NamedType(_, Nil))))),
+      variadic = m.variadic,
     ).setPos(m.pos)
   /** Checks that every bound a declaration writes names a trait and applies it to as many arguments
    * as it declares, whichever declaration form wrote it — a function, a struct, an enum, a trait. A

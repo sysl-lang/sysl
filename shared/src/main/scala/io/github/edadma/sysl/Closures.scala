@@ -10,7 +10,7 @@ import scala.collection.mutable
  * the environment, and from inside a sibling's body, where it is the receiver that body already
  * has. That is what makes mutual recursion a call on the receiver rather than a capture.
  */
-case class Nested(fname: String, env: TExpr)
+case class Nested(fname: String, env: TExpr, variadic: Boolean = false)
 
 /** The environment a body reads its captures out of (`12 §7`, `§5a`).
  *
@@ -157,6 +157,9 @@ trait Closures extends CallAnalysis {
         if f.tparams.nonEmpty then
           err(s"'${f.name}' is declared inside a function body and cannot be generic — the type " +
             "arguments would have nowhere to come from, since nothing outside the body calls it")
+        // A nested function states its own signature (`12 §5a`), so it is held to the same rules as
+        // any other — including where a `va_list` may stand and what a `...` must have before it.
+        checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       }
 
     // A sibling is reached through the shared receiver rather than captured, so the names of the
@@ -191,8 +194,8 @@ trait Closures extends CallAnalysis {
       (f, fname)
     }
 
-    val inside = lowered.map((f, fname) => f.name -> Nested(fname, self)).toMap
-    val outer  = lowered.map((f, fname) => f.name -> Nested(fname, here)).toMap
+    val inside = lowered.map((f, fname) => f.name -> Nested(fname, self, f.variadic)).toMap
+    val outer  = lowered.map((f, fname) => f.name -> Nested(fname, here, f.variadic)).toMap
 
     // The names are bound **before** any body is analyzed, so a body that does not analyze leaves
     // the group callable and the block is told about its one mistake rather than about that one and
@@ -204,7 +207,7 @@ trait Closures extends CallAnalysis {
 
       recover(())(at(f.pos) {
         val (func, _) = analyzeNested(fname, params.tail, Some(result), f.body,
-          Some(Environment(env, captured, byReference = true, fixed(captured))), inside)
+          Some(Environment(env, captured, byReference = true, fixed(captured))), inside, f.variadic)
 
         closureFuncs += func
       })
@@ -236,13 +239,15 @@ trait Closures extends CallAnalysis {
   protected def callNested(n: Nested, written: String, args: List[Expr]): TExpr = {
     val (params, result) = funcInsts(n.fname)
 
-    if args.length != params.length - 1 then
-      err(s"'$written' takes ${quantity(params.length - 1, "argument")}, but ${supplied(args.length, "argument")}")
+    checkArity(s"'$written'", params.length - 1, n.variadic, args.length)
 
-    val supplied2 = args.zip(params.tail).map((a, p) => analyzeExpr(a, Some(p._2)))
+    // The environment holds the first slot, so a tail begins one past where a free function's does
+    // — the same arithmetic a method's receiver makes.
+    val (declared, tail) = args.splitAt(params.length - 1)
+    val supplied2        = declared.zip(params.tail).map((a, p) => analyzeExpr(a, Some(p._2)))
 
     funcsUsed += n.fname
-    TCall(n.fname, checkArgs(written, params, args, Some(n.env :: supplied2)), result)
+    TCall(n.fname, checkArgs(written, params, declared, Some(n.env :: supplied2)) ::: tail.map(variadicArg), result)
   }
 
   /** `xs.map(square)` — a declared function where a callable is wanted (`12 §5`).

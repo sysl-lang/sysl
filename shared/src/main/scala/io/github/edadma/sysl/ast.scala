@@ -275,6 +275,7 @@ case class MethodDecl(
     bounds: Map[String, List[BoundRef]] = Map.empty,
     tdefaults: Map[String, TypeRef] = Map.empty,
     vis: Visibility = Visibility.Public,
+    variadic: Boolean = false,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the

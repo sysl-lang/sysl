@@ -2,12 +2,13 @@ package io.github.edadma.sysl
 
 /** The call forms the compiler resolves by name.
  *
- * A call is normally a name looked up among the program's declarations. These seven are not: the
- * analyzer recognizes `print`, `str`, `format`, `from_utf8_unchecked`, `va_start`, `va_end`, and
- * `va_arg` before it gets that far. Collecting them in one file is deliberate — it is the whole of
- * what the language knows that a program could not have told it, and the list is meant to shrink.
+ * A call is normally a name looked up among the program's declarations. These eight are not: the
+ * analyzer recognizes `print`, `str`, `format`, `from_utf8_unchecked`, `va_start`, `va_end`,
+ * `va_arg`, and `va_copy` before it gets that far. Collecting them in one file is deliberate — it is
+ * the whole of what the language knows that a program could not have told it, and the list is meant
+ * to shrink.
  *
- * The three `va_*` forms belong here permanently. Each is an **ABI primitive** that no sysl body
+ * The four `va_*` forms belong here permanently. Each is an **ABI primitive** that no sysl body
  * could implement, in the same category as `sizeof`, so there is nothing to put in the prelude
  * (`12` §9). `from_utf8_unchecked` is permanent for the same reason from the other direction: every
  * safe route to a `string` carries the UTF-8 guarantee, so the one operation that sets it aside can
@@ -277,6 +278,18 @@ trait SpecialForms extends Closures {
   /** `va_end(ap)` finishes with one. */
   protected def vaEnd(args: List[Expr]): TExpr = TVaEnd(vaList("va_end", args))
 
+  /** `va_copy(dst, src)` starts `dst` where `src` has reached, so the tail can be walked twice.
+   *
+   * It is what makes lending a walk usable: the callee advances the list it was handed, so a body
+   * that wants to go on reading its own hands over a copy. C's rule that the destination must not
+   * already be in use, and must be ended in its turn, is C's here too — nothing in a `va_list` says
+   * which state it is in.
+   */
+  protected def vaCopy(args: List[Expr]): TExpr = {
+    if args.length != 2 then err("'va_copy' takes two arguments, the va_list to start and the one to copy")
+    TVaCopy(vaListArg("va_copy", args.head), vaListArg("va_copy", args(1)))
+  }
+
   /** `va_arg[T](ap)` takes the next argument as a `T` and advances.
    *
    * C writes the type as a second argument, which is not something a sysl expression can hold, so
@@ -293,16 +306,27 @@ trait SpecialForms extends Closures {
     TVaArg(ap, vaArgType(ty))
   }
 
-  /** The `va_list` one of the three forms works on, as its address. Each works on the list itself
-   * rather than a copy — `va_arg` advances it — so the argument is a place whose address is handed
-   * over, exactly as `&ap` would be.
-   */
   private def vaList(what: String, args: List[Expr]): TExpr = {
     if args.length != 1 then err(s"'$what' takes exactly one argument, the va_list it walks")
-    val place = analyzePlace(args.head, s"'$what'")
-    if place.ty != Type.VaList then err(s"'$what' needs a va_list, not ${show(place.ty)}")
+    vaListArg(what, args.head)
+  }
 
-    TAddrOf(place, Type.Ptr(place.ty))
+  /** The `va_list` a form works on, as its address. Each works on the list itself rather than on a
+   * copy — `va_arg` advances it — so what is handed over is where it lives.
+   *
+   * Two spellings reach that, and they are the same thing seen from the two sides of a call. A
+   * `va_list` is a body's own walk, and its address is taken here exactly as `&ap` would take it. A
+   * **`*va_list`** is a walk some other function lent (`12 §9`, *Handing a walk on*): it is already
+   * the address, so it is passed along as it stands, and it need not be a place — a pointer
+   * arriving as a parameter, out of a struct, or straight from a call all say the same thing.
+   */
+  private def vaListArg(what: String, arg: Expr): TExpr = {
+    val t = analyzeExpr(arg)
+
+    t.ty match
+      case Type.Ptr(Type.VaList) => t
+      case Type.VaList           => TAddrOf(requirePlace(t, arg, s"'$what'"), Type.Ptr(Type.VaList))
+      case other                 => err(s"'$what' needs a va_list, not ${show(other)}")
   }
 
   /** Checks that a type is one a variadic tail can be *read* as.

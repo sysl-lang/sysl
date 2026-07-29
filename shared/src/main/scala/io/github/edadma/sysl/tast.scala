@@ -253,16 +253,21 @@ case class TErase(operand: TExpr, vtable: String, ty: Type) extends TExpr
 case class TVCall(receiver: TExpr, slot: Int, args: List[TExpr], ty: Type, results: Boolean = false)
     extends TExpr
 
-/** The three ABI primitives of a variadic body (`12 §9`), each holding the *address* of the
- * `va_list` it works on — they advance it rather than reading a copy of it, so what the analyzer
- * hands over is the place, exactly as `&ap` would.
+/** The ABI primitives of a variadic body (`12 §9`), each holding the *address* of the `va_list` it
+ * works on — they advance it rather than reading a copy of it, so what the analyzer hands over is
+ * the place, exactly as `&ap` would. A `*va_list` a caller lent is already that address and is
+ * handed over as it stands.
  *
  * `TVaArg` carries the type it reads, which the analyzer took from the context the value is used
  * in; there is nothing in the tail to check that against, which is what makes it as unsafe as C's.
+ *
+ * `TVaCopy` takes a second walk over the same tail from where the first has reached, which is what
+ * a body needs before lending its walk to somebody who will advance it.
  */
 case class TVaStart(ap: TExpr) extends TExpr { def ty: Type = Type.Unit }
 case class TVaEnd(ap: TExpr)   extends TExpr { def ty: Type = Type.Unit }
 case class TVaArg(ap: TExpr, ty: Type) extends TExpr
+case class TVaCopy(dst: TExpr, src: TExpr) extends TExpr { def ty: Type = Type.Unit }
 
 /** Positional construction of a value struct. */
 case class TStructNew(struct: Type.Struct, args: List[TExpr]) extends TExpr { def ty: Type = struct }

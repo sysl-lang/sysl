@@ -843,9 +843,9 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   private def methodTail(name: String, generics: TypeParams): Parser[MethodDecl] =
     (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
-      case (recv, params) ~ ret ~ body =>
+      case (recv, params, variadic) ~ ret ~ body =>
         MethodDecl(name, recv, isProperty = false, generics.names, params, ret, body, generics.bounds,
-          generics.defaults)
+          generics.defaults, variadic = variadic)
     }
 
   private def propertyTail(name: String): Parser[MethodDecl] =
@@ -856,10 +856,18 @@ class SyslParser(val source: Source) extends PackratParsers {
   /** The parenthesised part of a method: an optional receiver shorthand (`self`, `*self`,
    * `&self`, `&sync self`) followed by ordinary `name: type` parameters. With no receiver the
    * member is an associated function.
+   *
+   * Either shape may end in the same trailing `...` a free function's list takes (`12 §9`), and for
+   * the same reason: a member is a function with a receiver in front, so an ellipsis reaching one
+   * and not the other would be a difference in the grammar with nothing behind it. With a receiver
+   * the ellipsis is tried after the parameters, so `add(self, n: int, ...)` still reads its commas
+   * as the separators they are.
    */
-  private lazy val methodParams: Parser[(Option[RecvMode], List[Param])] =
-    receiver ~ rep(op(",") ~> param) <~ opt(op(",")) ^^ { case r ~ ps => (Some(r), ps) } |
-      commaList(param) ^^ (ps => (None, ps))
+  private lazy val methodParams: Parser[(Option[RecvMode], List[Param], Boolean)] =
+    receiver ~ rep(op(",") ~> param) ~ opt(op(",") ~> op("...")) <~ opt(op(",")) ^^ {
+      case r ~ ps ~ dots => (Some(r), ps, dots.isDefined)
+    } |
+      paramList ^^ { case (ps, variadic) => (None, ps, variadic) }
 
   private lazy val receiver: Parser[RecvMode] =
     op("*") ~> op("self") ^^^ RecvMode.ByPtr |
@@ -974,9 +982,10 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val methodSig: PackratParser[MethodDecl] =
     at(
       ident ~ opt(boundedTypeParams) ~ (op("(") ~> methodParams <~ op(")")) ~ opt(op("->") ~> resultRef) ^^ {
-        case name ~ tps ~ ((recv, params)) ~ ret =>
+        case name ~ tps ~ ((recv, params, variadic)) ~ ret =>
           val tp = tps.getOrElse(TypeParams.none)
-          MethodDecl(name, recv, isProperty = false, tp.names, params, ret, Nil, tp.bounds, tp.defaults)
+          MethodDecl(name, recv, isProperty = false, tp.names, params, ret, Nil, tp.bounds, tp.defaults,
+            variadic = variadic)
       },
     )
 
