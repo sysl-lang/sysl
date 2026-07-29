@@ -556,6 +556,23 @@ trait AnalyzerBase {
    */
   protected val variantOwner = mutable.LinkedHashMap.empty[String, String]
 
+  /** The bodies of the closures met so far, lowered where they were written (`12 §5`).
+   *
+   * A closure is analyzed inline rather than queued, because its result type is what its body
+   * yields and nothing else can say what that is. So its function is finished at the moment the
+   * literal is read, and waits here to be added to the program with the rest of them.
+   */
+  protected val closureFuncs = mutable.ListBuffer.empty[TFunc]
+
+  /** Inside a closure's body, the captured names — keyed by the unique name the scope gave each —
+   * paired with the field read that reaches one (`12 §7`).
+   *
+   * A capture is declared in the closure's scope like any other name, so shadowing and assignment
+   * need no rule of their own; what this adds is where the storage is. Reading a name consults it
+   * after the scope has answered, which is why an inner binding of the same name still wins.
+   */
+  protected var capturedFields: Map[String, TExpr] = Map.empty
+
   // Per-function state, reset at each function boundary.
   protected var scopes: List[mutable.LinkedHashMap[String, (String, Type)]] = Nil
   protected val used                                                        = mutable.HashSet.empty[String]
@@ -833,6 +850,7 @@ trait AnalyzerBase {
     ensureResultTy = None
     oldBuf = None
     multiOk = false
+    capturedFields = Map.empty
   }
 
   protected def freshName(base: String): String =
@@ -901,4 +919,22 @@ trait AnalyzerBase {
   protected def autoDeref(t: TExpr): TExpr
   protected def isPlace(t: TExpr): Boolean
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String
+
+  /** `value.name(args)` where `name` is a field holding a callable rather than a method (`12 §6`). */
+  protected def callableField(
+      rty: Type,
+      name: String,
+      recv: TExpr,
+      args: List[Expr],
+      expected: Option[Type],
+  ): Option[TExpr]
+
+  /** Analyzes a body inside the analysis of another one, giving back what it yields (`12 §5`). */
+  protected def analyzeNested(
+      name: String,
+      params: List[(String, Type)],
+      declaredResult: Option[Type],
+      body: List[Stmt],
+      environment: Option[(Type.Struct, List[String])] = None,
+  ): (TFunc, Type)
 }

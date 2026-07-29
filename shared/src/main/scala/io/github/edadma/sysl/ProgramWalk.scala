@@ -224,8 +224,8 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       enumInsts.values.filterNot(e => e.simple || abstracted(e)).toList,
       vtables.values.toList,
       externs,
-      orderVals(tvals.toList, tfuncs.toList, vtables.values.toList),
-      tfuncs.toList,
+      orderVals(tvals.toList, (tfuncs ++ closureFuncs).toList, vtables.values.toList),
+      (tfuncs ++ closureFuncs).toList,
       tmain,
     )
   }
@@ -478,6 +478,86 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     val (params, rtype) = funcInsts(name)
 
     analyzeBodyWith(name, f, subst, params, rtype)
+  }
+
+  /** Analyzes a body **inside** the analysis of another one, and gives back what it yields as well
+   * as what it lowered to.
+   *
+   * A closure's body is written in the middle of its enclosing function and has to be analyzed
+   * there, because that is where the names it captures are still in scope and where a diagnostic
+   * about it belongs. But a body is analyzed against per-function state — the scope stack, the
+   * unique-name set, the declared result, the loops a `break` may name — and every one of those
+   * belongs to the function being interrupted. So the state is put aside and given back, which is
+   * the whole of what makes a body nested inside another body possible.
+   *
+   * **The result type comes from the body**, not from a signature, which is what lets a closure be
+   * written with nothing to infer a result from (`12 §5`): the parameters come from the context
+   * asking for a callable and the result comes from what the body does.
+   */
+  protected def analyzeNested(
+      name: String,
+      params: List[(String, Type)],
+      declaredResult: Option[Type],
+      body: List[Stmt],
+      environment: Option[(Type.Struct, List[String])] = None,
+  ): (TFunc, Type) = {
+    val savedScopes   = scopes
+    val savedUsed     = used.toSet
+    val savedReadOnly = readOnlyLocals.toSet
+    val savedImports  = importStack
+    val savedLoops    = loops
+    val savedEnsure   = ensureResultTy
+    val savedOld      = oldBuf
+    val savedMulti    = multiOk
+    val savedRet      = retTy
+    val savedRetList  = retIsList
+    val savedVariadic = variadicFn
+    val savedCaptures = capturedFields
+
+    try
+      resetFunction()
+      retTy = declaredResult.getOrElse(Type.Unknown)
+      retIsList = false
+      variadicFn = false
+
+      // The receiver comes first, so the closure's own environment is the argument every call
+      // already passes and the parameters after it are the ones a program wrote.
+      val receiver = environment.map((struct, _) => ("self", Type.Ptr(struct)))
+      val tparams  = (receiver.toList ::: params).map { case (n, t) => (declare(n, t), t) }
+
+      for (struct, names) <- environment do
+        val self = TLoad("self", Type.Ptr(struct))
+
+        capturedFields = names.zipWithIndex.map { (n, i) =>
+          declare(n, struct.fields(i)._2) ->
+            TField(TDeref(self, struct), struct.slot(i), struct.fields(i)._2)
+        }.toMap
+      // A closure whose result the context did not fix is analyzed with nothing expected, so what
+      // its body yields is what it yields — the only reading under which `x -> x * 2` has a result
+      // at all.
+      val tbody = declaredResult match
+        case Some(Type.Unit) => analyzeValueBlock(body, None, discarded = true)
+        case want            => analyzeValueBlock(body, want)
+
+      val result = declaredResult.getOrElse(if tbody.result.isDefined then tbody.ty else Type.Unit)
+
+      if declaredResult.exists(r => r != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, r)) then
+        err(s"this closure should yield ${show(declaredResult.get)}, but its body yields ${show(tbody.ty)}")
+
+      (TFunc(name, tparams, result, tbody, variadic = false, Nil, Nil, Nil), result)
+    finally
+      scopes = savedScopes
+      used.clear(); used ++= savedUsed
+      readOnlyLocals.clear(); readOnlyLocals ++= savedReadOnly
+      importStack = savedImports
+      loops = savedLoops
+      ensureResultTy = savedEnsure
+      oldBuf = savedOld
+      multiOk = savedMulti
+      retTy = savedRet
+      retIsList = savedRetList
+      variadicFn = savedVariadic
+      capturedFields = savedCaptures
   }
 
   /** Analyzes one body against a signature it is handed, rather than one looked up in `funcInsts`.

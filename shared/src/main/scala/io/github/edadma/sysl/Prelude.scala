@@ -195,6 +195,21 @@ object Prelude {
       |trait Iterate[E]
       |    next(*self) -> Option[E]
       |
+      |trait Fn0[R]
+      |    call(*self) -> R
+      |
+      |trait Fn1[A, R]
+      |    call(*self, a: A) -> R
+      |
+      |trait Fn2[A, B, R]
+      |    call(*self, a: A, b: B) -> R
+      |
+      |trait Fn3[A, B, C, R]
+      |    call(*self, a: A, b: B, c: C) -> R
+      |
+      |trait Fn4[A, B, C, D, R]
+      |    call(*self, a: A, b: B, c: C, d: D) -> R
+      |
       |hash_u64(v: u64) -> u64
       |    var h = v + 0x9e3779b97f4a7c15u64
       |    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64

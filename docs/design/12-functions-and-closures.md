@@ -233,9 +233,10 @@ x -> x + 1                    // one parameter: no parentheses
 () -> next_id()               // none: empty parentheses
 
 xs.map(x -> x * 2)            // the everyday use, at a call site
-xs.each(x ->                  // block body by indentation, like any function
+
+var log_both = x ->           // block body by indentation, like any function
     log(x)
-    print(x))
+    print(x)
 ```
 
 - **One parameter drops its parentheses** — `x -> …` — because that is the overwhelmingly common
@@ -244,7 +245,12 @@ xs.each(x ->                  // block body by indentation, like any function
   the same one the function-*type* spelling uses (§6), so a closure and the type it inhabits look
   alike.
 - **The body is an expression or an indented block**, exactly as a named function's is (§1); the
-  block's trailing expression is the result.
+  block's trailing expression is the result. An **indented block reaches as far as the off-side rule
+  does**, which is to say not inside an argument list: a bracket suspends indentation until it closes
+  (`00` §9), so there is no block for a body to be there and a closure passed straight to a call
+  takes the expression form. Binding it to a name first is what a multi-statement one is written as.
+  *(An earlier draft of this chapter showed `xs.each(x -> …)` over three indented lines. That does
+  not parse and never could have under `00` §9; the example above is the shape that does.)*
 - **Parameter types are inferred** from the context the closure is passed into — `xs.map(x -> x *
   2)` gives `x` the element type of `xs` — so they are written only when there is nothing to infer
   them from, in which case an annotation `(x: int) -> …` supplies them.

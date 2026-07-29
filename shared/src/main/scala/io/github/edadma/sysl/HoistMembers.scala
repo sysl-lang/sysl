@@ -145,6 +145,40 @@ trait HoistMembers extends TypeResolution {
    * The declarations come back so that a caller with something further to do with them — a generic
    * `impl`, whose members are checked at their definition — needs no second walk to find them.
    */
+  /** Turns each bare-arrow parameter into the bounded type parameter it is sugar for (`12 §6`).
+   *
+   * `map(self, f: A -> B)` is `map[$F: Fn(A) -> B](self, f: $F)`, and the rewrite happens at the
+   * declaration so that *everything* after it — resolving the signature, inferring the argument,
+   * monomorphizing the body, emitting the direct call — is the generic machinery that already
+   * exists. The parameter is a bound and not a type, which is what makes the closure inlinable and
+   * the call direct, and it is the whole reason the arrow is available in a parameter and nowhere
+   * else.
+   *
+   * The added name holds a `$`, so nothing a program can write collides with it and a diagnostic
+   * that has to name one reads as the synthetic thing it is. `None` where no parameter wrote an
+   * arrow, so a declaration that did not use the sugar is left exactly as it was.
+   */
+  protected def callBounds(
+      tparams: List[String],
+      params: List[Param],
+  ): Option[(List[String], List[Param], Map[String, List[BoundRef]])] = {
+    val added = mutable.ListBuffer.empty[(String, List[BoundRef])]
+
+    val rewritten = params.map { p =>
+      p.typ match
+        case a: FnType if a.bare =>
+          checkFnArity(a)
+
+          val tp = s"${Modules.sep}F${tparams.length + added.length}"
+
+          added += ((tp, List(BoundRef(Type.Fn.base(a.params.length), a.params :+ a.ret).setPos(a.pos))))
+          p.copy(typ = NamedType(tp).setPos(a.pos)).setPos(p.pos)
+        case _ => p
+    }
+
+    Option.when(added.nonEmpty)((tparams ::: added.map(_._1).toList, rewritten, added.toMap))
+  }
+
   private def hoistMemberList(
       home: MemberHome,
       members: List[MethodDecl],
@@ -152,7 +186,11 @@ trait HoistMembers extends TypeResolution {
   ): List[FuncDecl] = {
     val lowered = mutable.ListBuffer.empty[FuncDecl]
 
-    for m <- members do
+    for original <- members do
+      val m = callBounds(original.tparams, original.params).fold(original) { (tps, ps, bs) =>
+        original.copy(tparams = tps, params = ps, bounds = original.bounds ++ bs).setPos(original.pos)
+      }
+
       currentPos = m.pos.orElse(currentPos)
 
       // A member's parameters and its type's are two lists that end up in one signature, so a name

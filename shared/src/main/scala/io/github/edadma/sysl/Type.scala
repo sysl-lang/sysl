@@ -167,11 +167,14 @@ object Type {
      */
     val maxArity = 4
 
+    /** Whether a trait name is one of the call traits, whatever module qualified it. */
+    def isCall(name: String): Boolean = Modules.bare(name).matches("""Fn\d+""")
+
     /** The parameter and result types of an applied call trait, or `None` for any other trait. The
      * arguments are the parameters and then the result, so the split is the last one off the end.
      */
     def parts(name: String, args: List[Type]): Option[(List[Type], Type)] =
-      Option.when(Modules.bare(name).matches("""Fn\d+""") && args.nonEmpty)((args.init, args.last))
+      Option.when(isCall(name) && args.nonEmpty)((args.init, args.last))
   }
 
   /** The layout of a trait object: the method table for the type it forgot, and the value itself.
@@ -318,7 +321,12 @@ object Type {
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem)              => s"[]${show(elem)}"
     case Abstract(n, _)           => n
-    case Trait(n, args)           => qualified(Modules.show(n), args)
+    // A call trait is spelled the way it is written rather than the way it is filed, so nothing a
+    // reader is told names the arity-carrying declaration behind it (`12 §6`).
+    case Trait(n, args) =>
+      Fn.parts(n, args) match
+        case Some((ps, r)) => s"Fn(${ps.map(show).mkString(", ")}) -> ${show(r)}"
+        case None          => qualified(Modules.show(n), args)
     case other                    => other.llvm
 
   /** Whether a type carries no value at run time: `unit`, whose only value is nothing at all, and

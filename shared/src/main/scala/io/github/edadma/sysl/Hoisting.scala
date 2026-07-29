@@ -186,7 +186,10 @@ trait Hoisting extends HoistMembers {
    * it. Reporting the mistake must not also remove the thing it is about.
    */
   protected def hoistFunc(stmt: Stmt): Unit = stmt match
-    case f: FuncDecl =>
+    case original: FuncDecl =>
+      val f = callBounds(original.tparams, original.params).fold(original) { (tps, ps, bs) =>
+        original.copy(tparams = tps, params = ps, bounds = original.bounds ++ bs).setPos(original.pos)
+      }
       val key = Modules.qualify(currentModule, f.name)
 
       if funcDecls.contains(key) then err(s"function '${f.name}' is already declared")

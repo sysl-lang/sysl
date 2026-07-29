@@ -101,6 +101,11 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case Some(o) if Type.erased(o) =>
       expr match
         case NullLit() => analyzeValue(expr, Some(o))
+        // A closure is the other exception, and for the opposite reason to `null`'s: it has no type
+        // of its own to be analyzed at and then erased, since what it takes is exactly what the
+        // object's arguments say (`12 §5`). So the object is pushed down, and the erasure that
+        // follows boxes the struct the literal became.
+        case _: Lambda => coerce(analyzeValue(expr, Some(o)), o)
         case _         => coerce(analyzeValue(expr, None), o)
 
     case Some(r: Type.Ref) =>
@@ -319,9 +324,21 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case Ident("None") if lookupOpt("None").isEmpty && expected.exists(_.isInstanceOf[Type.Weak]) =>
       TZero(expected.get)
 
+    // A declared function standing where a callable is wanted is one, with nothing captured
+    // (`12 §5`). It is asked for only where the context says a callable, so a bare function name
+    // anywhere else is still the mistake it was.
+    case Ident(name)
+        if lookupOpt(name).isEmpty && funcKey(name).isDefined &&
+          expected.flatMap(callableSignature).isDefined =>
+      val (ptypes, result) = expected.flatMap(callableSignature).get
+
+      functionAsCallable(name, ptypes, result, expr.pos)
+
     case Ident(name) =>
       lookupOpt(name) match
-        case Some((u, ty)) => TLoad(u, ty)
+        // A captured name is a name the scope knows and the frame does not hold: what it reaches is
+        // the field of the closure the body is now a member of (`12 §7`).
+        case Some((u, ty)) => capturedFields.getOrElse(u, TLoad(u, ty))
         case None =>
           variantKey(name) match
             case Some(key) => constructVariant(key, Nil, expected)
@@ -477,8 +494,22 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(enumDecls.contains) =>
       enumFromInt(typeKey(name).get, args)
 
+    // A local that is callable is called, and it wins over a declaration of the same name for the
+    // reason the nearest binding always does. It is asked whether it is callable rather than merely
+    // whether it is a local, so a name that shadows a function with something uncallable still
+    // reaches the function — which is what it did before there were closures, and no program that
+    // relied on it is silently rerouted.
+    case Call(Ident(name), args) if lookupOpt(name).exists((_, t) => callableOf(t).isDefined) =>
+      callCallable(analyzeExpr(Ident(name).setPos(expr.pos)), args, expected)
+
     case Call(Ident(name), args) if funcKey(name).isDefined =>
       callFunction(funcDecls(funcKey(name).get), args, expected)
+
+    // A local that is not callable, called anyway, is a different mistake from a name that stands
+    // for nothing — the name was found, and what it holds is not a thing a call reaches.
+    case Call(Ident(name), _) if lookupOpt(name).isDefined =>
+      err(s"'$name' is ${show(lookupOpt(name).get._2)} and is not callable — a callable is a " +
+        "closure, or a value of a type that implements the call trait")
 
     case Call(Ident(name), _) =>
       err(s"undefined function '$name'")

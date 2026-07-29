@@ -80,19 +80,63 @@ trait CallAnalysis extends Literals with TraitObjects {
       tparams: List[String],
       ptypes: List[TypeRef],
       args: List[Expr],
+      bounds: Map[String, List[BoundRef]] = Map.empty,
   ): List[TExpr] = {
     val tps  = tparams.toSet
     val want = inDecl(decl)(ptypes.map(r => Option.unless(mentions(r, tps))(resolveType(r, Map.empty))))
+    val at   = args.zip(want.padTo(args.length, None))
 
-    args.zip(want.padTo(args.length, None)).map { (a, e) =>
-      e match
-        case Some(_) => analyzeExpr(a, e)
-        case None =>
-          literalDefault(a) match
-            case Some(ty) => standIn(ty).setPos(a.pos)
-            case None     => analyzeExpr(a)
+    // A **callable** argument is the one shape that has no type of its own to be analyzed at: a
+    // closure's parameters come from the context, and a bare function name is a callable only where
+    // one is asked for. So the pass runs twice — everything else first, then the callables against
+    // the bound that the first pass has by then made concrete.
+    val first = at.map { (a, e) =>
+      if callableArg(a) then None
+      else
+        Some(e match
+          case Some(_) => analyzeExpr(a, e)
+          case None =>
+            literalDefault(a) match
+              case Some(ty) => standIn(ty).setPos(a.pos)
+              case None     => analyzeExpr(a))
+    }
+
+    // What the first pass settles. `map[A, B](xs: []A, out: []B, f: A -> B)` gets both from the two
+    // slices, and only then is `Fn(A) -> B` a thing a closure can be read against — which is why
+    // this is a partial solution rather than the real one, made here and thrown away.
+    val partial = scala.collection.mutable.Map.empty[String, Type]
+
+    for case (r, Some(t)) <- ptypes.zip(first) do inDecl(decl)(unify(r, t.ty, tps, partial))
+
+    at.zip(first).zipWithIndex.map { case (((a, _), done), i) =>
+      done.getOrElse(analyzeExpr(a, inDecl(decl)(callBound(ptypes.lift(i), tps, bounds, partial.toMap))))
     }
   }
+
+  /** Whether an argument is one whose type the *context* has to supply (`12 §5`, `§6`). */
+  private def callableArg(a: Expr): Boolean = a match
+    case _: Lambda => true
+    case Ident(n)  => lookupOpt(n).isEmpty && funcKey(n).isDefined
+    case _         => false
+
+  /** The call trait a callable argument is being asked for, read off the bound of the parameter it
+   * stands at, under whatever the other arguments have already settled.
+   *
+   * `None` where the bound still names a parameter nothing has determined, which leaves the closure
+   * to report that its parameters have no types — the honest answer, since they have none.
+   */
+  private def callBound(
+      ptype: Option[TypeRef],
+      tps: Set[String],
+      bounds: Map[String, List[BoundRef]],
+      partial: Map[String, Type],
+  ): Option[Type] =
+    for
+      tp  <- ptype.collect { case NamedType(n, Nil) if tps(n) => n }
+      ref <- bounds.getOrElse(tp, Nil).find(b => Type.Fn.isCall(b.name))
+      if !ref.args.exists(r => mentions(r, tps -- partial.keySet))
+      b = resolveBound(ref, partial)
+    yield Type.Trait(b.name, b.args)
 
   /** A node that carries a type and no value, for a literal inference reads before anything has
    * analyzed it. `checkArgs` replaces every one of them.
@@ -122,7 +166,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     val (name, pre) =
       if f.tparams.isEmpty then (f.name, None)
       else
-        val provisional = provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args)
+        val provisional = provisionalArgs(f.name, f.tparams, f.params.map(_.typ), args, f.bounds)
         // The parameter types being matched against are the declaration's, written in the
         // declaration's terms — so a `Pair[T]` there is that module's `Pair` whichever module the
         // call was written in.
@@ -241,6 +285,7 @@ trait CallAnalysis extends Literals with TraitObjects {
             builtinMethod(rty, mname, tr, args)
               .orElse(builtinDisplay(rty, mname, tr, args))
               .orElse(builtinHash(rty, mname, tr, args))
+              .orElse(callableField(rty, mname, tr, args, expected))
               .getOrElse(err(s"type '$base' has no method '$mname'"))
   }
 
@@ -334,7 +379,7 @@ trait CallAnalysis extends Literals with TraitObjects {
 
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.tail.map(p => spell(p.typ))
-    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, args)
+    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, args, m.bounds)
     val own = inDecl(fd.name)(solve(
       shown,
       m.tparams,
@@ -848,7 +893,7 @@ trait CallAnalysis extends Literals with TraitObjects {
 
     val spell       = genericSelf.get(fd.name).fold((r: TypeRef) => r)((ref, _) => spellSelf(_, ref))
     val ptypes      = fd.params.map(p => spell(p.typ))
-    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, args)
+    val provisional = provisionalArgs(fd.name, fd.tparams, ptypes, args, m.bounds)
     val targs = inDecl(fd.name)(solve(
       shown,
       fd.tparams,

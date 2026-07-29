@@ -75,6 +75,25 @@ class ClosureParserTests extends AnyFreeSpec with ParseSupport {
     }
   }
 
+  "a block body reaches as far as the off-side rule does" - {
+    "a closure bound to a name takes one" in {
+      prog("""var f = x ->
+             |    log(x)
+             |    x
+             |""".stripMargin).head shouldBe a[VarDecl]
+    }
+
+    "inside an argument list it does not, because a bracket suspends indentation" in {
+      // `00 §9` — a bracket suspends the off-side rule until it closes, so the lexer emits no
+      // indent inside one and there is no block for the body to be. The fix is a name to bind the
+      // closure to, and the limit is recorded in `12 §5` rather than worked around here.
+      progError("""xs.each(x ->
+                  |    log(x)
+                  |    print(x))
+                  |""".stripMargin) should include("newline expected")
+    }
+  }
+
   "what the arrow does not take over" - {
     "a parenthesized list with no arrow after it is still a tuple" in {
       expr("(x, y)") shouldBe Tuple(List(Ident("x"), Ident("y")))
