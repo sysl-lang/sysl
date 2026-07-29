@@ -312,13 +312,19 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
             |print(A(0).twice(1.0))""".stripMargin) shouldBe "2\n202\n"
     }
 
-    // The scalars are `Mul` at themselves and at nothing else (`14 §5`, `01`'s no-promotion rule),
-    // and a second argument list is not a way in.
+    // The scalars are `Mul` at themselves and at nothing else (`14 §5`, `01`'s no-promotion rule).
     "a built-in still cannot be given an operator implementation" in {
+      err("""impl Mul for int
+            |    mul(self, k: int) -> int = self""".stripMargin) should include("the compiler provides")
+    }
+
+    // A second argument list is not a way in either, and it never reaches that rule: `Mul` is the
+    // prelude's and so is `int`, so a program has nowhere to write the block at all (`02`).
+    "and a second argument list does not open one" in {
       err("""struct C
             |    v: int
             |impl Mul[C] for int
-            |    mul(self, c: C) -> int = self""".stripMargin) should include("the compiler provides")
+            |    mul(self, c: C) -> int = self""".stripMargin) should include("so this one has no home")
     }
   }
 

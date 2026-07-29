@@ -334,6 +334,11 @@ trait HoistMembers extends TypeResolution {
             "an implementation and cannot be given a second one")
         writtenShapes((impl.traitName, h)) = outer.label
 
+    // Last of the checks about the block as a whole, because every one above it is more specific:
+    // a block with no home is often also one the prelude has already written, and being told which
+    // implementation already covers the type is the more useful half of that.
+    checkCoherence(impl, outer.label)
+
     // The first implementation of a trait for a type files its members under the names they were
     // written with; each one after it under names that differ, since a type's members are one
     // namespace whatever brought them (`08`). Nothing outside the hoist reads the suffix: every way
@@ -585,6 +590,89 @@ trait HoistMembers extends TypeResolution {
            MemberHome(shape, ref.show, shapeSymbol(ty), head, ref, order, impl.bounds, Set.empty, "field",
              Map.empty))
   }
+
+  /** Where an `impl` may be written (`02 § Coherence`): **the module that declares the trait, or one
+   * that declares a type named in the subject**, and nowhere else.
+   *
+   * An `impl` is unnamed, so resolving a bound means *searching* for one — and this is the rule that
+   * bounds the search to two modules, both of which anything naming the trait and the type already
+   * depends on. What it forbids is the case with no home, a foreign trait for a foreign type, where
+   * two unrelated modules could each supply a different implementation and no rule picks one.
+   *
+   * The prelude is a module of its own for this purpose even though its declarations are keyed under
+   * the root like a rootless program's, so which file a declaration came from is what decides rather
+   * than the key. A program at the project root is therefore as foreign to `Eq` as any named module
+   * is.
+   */
+  private def checkCoherence(impl: ImplDecl, label: String): Unit = {
+    val home     = if Prelude.declares(impl) then None else Some(currentModule)
+    val declarer = declaringModule(impl.traitName)
+    val subject  = subjectHomes(impl.forType)
+
+    if home != declarer && !subject(home) then
+      err(s"an 'impl' may be written only in the module that declares the trait or in one that " +
+        s"declares a type named in the subject, and '${qn(impl.traitName)}' ${whose(declarer)} " +
+        s"while ${subjectPhrase(subject, label)} — so this one has no home. A trait of your own, or " +
+        "a type of your own in what it is written for, gives it one")
+  }
+
+  private def subjectPhrase(homes: Set[Option[String]], label: String): String =
+    if homes == Set(None) then s"nothing in '$label' is declared outside the prelude"
+    else s"'$label' names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
+
+  /** Which module licenses what a key names, or `None` for the prelude's.
+   *
+   * Asked of the **declaration** rather than of `preludeNames`, which holds a prelude enum's variant
+   * names beside its type names — so a program declaring a `struct Ok` of its own would have been
+   * told its own type was the prelude's.
+   */
+  private def declaringModule(key: String): Option[String] = {
+    val decl: Option[Positioned] = structDecls.get(key)
+      .orElse(enumDecls.get(key))
+      .orElse(traitDecls.get(key))
+      .orElse(constrainedDecls.get(key))
+
+    decl match
+      case Some(d) if Prelude.declares(d) => None
+      case Some(_)                        => Some(Modules.moduleOf(key))
+      // A name nothing declares is a built-in, which has no module of its own and is the prelude's.
+      case None                           => None
+  }
+
+  /** Every module the **subject** of an `impl` belongs to: its own where it is a declared type, and
+   * every one its parts belong to where it is composed (`02 § Coherence`).
+   *
+   * A composed type is the module's when anything named in it is — `[]Point` belongs where `Point`
+   * does, `[]int` to nobody. Without that a module could not so much as print a slice of its own
+   * struct, and the compiler's own advice ("write an `impl Display for []Point`") would name a block
+   * the rule then refused.
+   *
+   * It reads the subject **as written** rather than as resolved, because a generic subject has no
+   * one instantiation to be: `implTarget` answers `Unknown` for `Box[T]`, and the arguments — which
+   * are exactly what may carry a local type — would be lost with it.
+   */
+  private def subjectHomes(ref: TypeRef): Set[Option[String]] = ref match
+    case NamedType(written, args) =>
+      Set(quietly(typeKey(written)).flatMap(declaringModule)) ++ args.flatMap(subjectHomes)
+    case PtrType(inner)      => subjectHomes(inner)
+    case RefType(inner, _)   => subjectHomes(inner)
+    case ArrayType(_, elem)  => subjectHomes(elem)
+    case TupleType(parts, _) => Set(None) ++ parts.flatMap(subjectHomes)
+
+  /** A resolution made only to ask where a name lives, which is not the place a name that resolves
+   * to nothing is worth reporting from — a scalar and a block's own type parameter both answer
+   * `None` here, and a name the file may not reach was reported where the subject was resolved.
+   */
+  private def quietly(lookup: => Option[String]): Option[String] =
+    try lookup
+    catch
+      case _: AnalyzerError => None
+      case _: Poisoned      => None
+
+  private def whose(module: Option[String]): String = module match
+    case None                         => "belongs to the prelude"
+    case Some(m) if m == Modules.root => "is declared at the project root"
+    case Some(m)                      => s"is declared in module '$m'"
 
   /** What a diagnostic calls every type of a shape at once. */
   private def everyShape(head: String): String =

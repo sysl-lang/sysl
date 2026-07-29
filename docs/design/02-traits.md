@@ -74,10 +74,10 @@ An `impl` is **unnamed**: nothing at a use site says which one to apply, so reso
 that search needs a bound, or it would have to range over every module in the program — which is
 exactly the property that makes separate compilation impossible.
 
-**An `impl Trait for Type` may appear only in the module that declares `Trait`, or the module that
-declares `Type`.** Resolving a bound therefore inspects exactly those two modules, both of which
-any module naming both the trait and the type already depends on. No global search, and no
-dependency edge that the source does not show.
+**An `impl Trait for Type` may appear only in the module that declares `Trait`, or in one that
+declares a type named in `Type`.** Resolving a bound therefore inspects the modules a use site
+already depends on to write the trait and the type down. No global search, and no dependency edge
+that the source does not show.
 
 This is Rust's orphan rule, and it costs nothing the chapter already promised:
 
@@ -102,12 +102,28 @@ writing `impl Eq for (int, string)` is the ordinary orphan case — both halves 
 `impl MyTrait for (int, string)` is permitted, because the trait is local. No exception is needed;
 the rule needed a sentence saying where a nameless type lives.
 
-**Not built: nothing enforces the rule.** `Eq` and `Option` are both the prelude's, and a user
-module writing `impl[T: Eq] Eq for Option[T]` — a foreign trait for a foreign type, the case with
-no home — is accepted today. The rule matters exactly when a program is more than one module and
-two of them supply the same `impl`, which is the case that has not arisen yet; what it costs
-meanwhile is that a program can quietly depend on an implementation the chapter says it may not
-write. Pinned by an ignored test in `ImplShapeErrorTests`.
+**A composed type is the module's when anything named in it is.** `impl Display for []Point` is
+licensed by `Point` — the block is written where `Point` is, and nowhere else could have written it
+— while `impl Display for []int` names nothing outside the prelude and has no home. This is the half
+the paragraphs above left to be settled, and it is settled this way because the strict reading takes
+something the language cannot do without: with it, a module could not so much as print a slice of
+its own struct, and the compiler's own advice — *write an `impl Display for []Point`* — would name a
+block the rule then refused. Rust reaches the same answer by its covered-type rule.
+
+The reach of that is smaller than it looks, because a **generic named type has one implementation
+covering every instantiation** (below): there is no `impl Eq for Option[Point]` to be licensed, only
+`impl[T] Eq for Option[T]`, which names nothing local. So the sentence buys the composed types —
+slices, arrays, tuples — and leaves the prelude's generic enums to the prelude, which is the right
+split: a slice of your struct is your business, and `Option` is not.
+
+**A type parameter is not a local type**, so `impl[T: Display] Display for []T` is refused however
+its bound is written. That is the case with two unrelated modules each supplying a different row for
+one type, which is what the rule exists to stop; making every printable slice printable is the
+prelude's to do, and the prelude's own rows for tuples are written exactly that way.
+
+**Open: whether a trait *argument* licenses a block.** Rust counts one — `impl ForeignTrait<Local>
+for i32` is allowed there — and sysl does not, so `impl Mul[Complex] for int` has no home. Nothing
+has wanted it yet, and allowing it later breaks no program that compiles today.
 
 ## Defaults — a trait may answer as well as ask
 

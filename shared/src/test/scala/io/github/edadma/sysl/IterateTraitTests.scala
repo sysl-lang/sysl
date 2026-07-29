@@ -282,12 +282,14 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
     // built-in subscript is not: an `impl Iterate` for a slice type registers a `next` a program
     // may call, and the loop still reads the elements the slice already has.
     "an 'Iterate' for a slice does not take over the built-in walk" in {
-      run("""impl Iterate[int] for []int
-            |    next(*self) -> Option[int] = Some(99)
-            |var xs = [1, 2, 3]
-            |for x in xs[..] do print(x)
+      run("""struct N
+            |    v: int
+            |impl Iterate[N] for []N
+            |    next(*self) -> Option[N] = Some(N(99))
+            |var xs = [N(1), N(2), N(3)]
+            |for x in xs[..] do print(x.v)
             |var s = xs[..]
-            |print(s.next().unwrap())""".stripMargin) shouldBe "1\n2\n3\n99\n"
+            |print(s.next().unwrap().v)""".stripMargin) shouldBe "1\n2\n3\n99\n"
     }
 
     // `05` — a cursor is a value, so one that views a local array is subject to the same escape

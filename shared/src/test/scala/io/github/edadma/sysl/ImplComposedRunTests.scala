@@ -57,16 +57,18 @@ class ImplComposedRunTests extends AnyFreeSpec with RunSupport {
 
     "renders through Display, so print and f-strings reach it" in {
       run(
-        """trait Nothing
-          |    nothing(self)
-          |impl Display for []int
+        """struct N
+          |    v: int
+          |impl Display for N
+          |    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.v), out, fmt)
+          |impl Display for []N
           |    display(self, out: *Writer, fmt: FormatSpec)
           |        out.write("[".bytes)
           |        for i in 0..<self.len do
           |            if i > 0usize then out.write(", ".bytes)
           |            self[i].display(out, FormatSpec(0, -1, false))
           |        out.write("]".bytes)
-          |var a = [3, 1, 4]
+          |var a = [N(3), N(1), N(4)]
           |print(a[0..])
           |print(f"${a[0..]}%8s|")""".stripMargin,
       ) shouldBe "[3, 1, 4]\n[3, 1, 4]|\n"
@@ -277,10 +279,12 @@ class ImplComposedRunTests extends AnyFreeSpec with RunSupport {
 
     "str renders one through its Display exactly as print does" in {
       run(
-        """impl Display for []int
+        """struct N
+          |    v: int
+          |impl Display for []N
           |    display(self, out: *Writer, fmt: FormatSpec)
           |        display_int(i64(self.len), out, fmt)
-          |var a = [1, 2, 3]
+          |var a = [N(1), N(2), N(3)]
           |var s = str(a[0..])
           |print(s)""".stripMargin,
       ) shouldBe "3\n"

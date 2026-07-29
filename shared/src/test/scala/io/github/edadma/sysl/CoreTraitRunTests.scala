@@ -312,17 +312,25 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
             |""".stripMargin) should include("'==' is not defined for Option[byte]")
     }
 
-    // What it costs to write by hand, and that the payload's own equality is what answers it.
-    "though the implementation it wants is writable" in {
-      run("""impl[T: Eq] Eq for Option[T]
-            |    eq(self, rhs: Option[T]) -> bool = self match
-            |        Some(a) -> rhs match
-            |            Some(b) -> a == b
-            |            None -> false
-            |        None -> rhs.is_none()
-            |var a: Option[u8] = Some(3u8)
-            |var b: Option[u8] = Some(4u8)
-            |var c: Option[u8] = None
+    // What it costs to write by hand, and that the payload's own equality is what answers it. The
+    // enum is the program's own, because `Option` is not: `Eq` and `Option` are both the prelude's,
+    // and an `impl` for a generic type covers every instantiation at once — so there is no
+    // `Option[MyType]` to give the block a home, and only the prelude could write this row.
+    "though the implementation it wants is writable for an enum of its own" in {
+      run("""enum Maybe[T]
+            |    Just(v: T)
+            |    Nothing
+            |impl[T: Eq] Eq for Maybe[T]
+            |    eq(self, rhs: Maybe[T]) -> bool = self match
+            |        Just(a) -> rhs match
+            |            Just(b) -> a == b
+            |            Nothing -> false
+            |        Nothing -> rhs match
+            |            Just(b) -> false
+            |            Nothing -> true
+            |var a: Maybe[u8] = Just(3u8)
+            |var b: Maybe[u8] = Just(4u8)
+            |var c: Maybe[u8] = Nothing
             |print(a == a, a == b, a == c, c == c)
             |""".stripMargin) shouldBe "true false false true\n"
     }

@@ -14,7 +14,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * knows how to be. So whichever is written second is refused, and the diagnostic says which is
  * already there.
  */
-class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport {
+class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   private val show  = "trait Show\n    show(self) -> string\n"
   private val other = "trait Other\n    show(self) -> int\n"
@@ -160,17 +160,20 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport {
   "the block's bounds decide which slices conform" - {
 
     // The advice a type with no implementation gets — write one — is the wrong advice here: an
-    // implementation covers this slice already, and writing a second is exactly what it may not do.
-    // So the condition is what the diagnostic names.
+    // implementation covers this value already, and writing a second is exactly what it may not do.
+    // So the condition is what the diagnostic names. The covering block is written for a generic
+    // type of the program's own rather than for a slice, because `Display` for every slice is a
+    // block only the prelude has a home for (`02 § Coherence`).
     "so print names the condition rather than an 'impl' that would be refused" in {
       err(
-        s"""impl[T: Display] Display for []T
+        s"""struct Row[T]
+           |    v: T
+           |impl[T: Display] Display for Row[T]
            |    display(self, out: *Writer, fmt: FormatSpec) = out.write("x".bytes)
            |struct P
            |    v: int
-           |var a = [P(1)]
-           |print(a[0..])""".stripMargin,
-      ) should include("cannot print a []P value — the 'impl' that covers it asks 'Display' of P, " +
+           |print(Row(P(1)))""".stripMargin,
+      ) should include("cannot print a Row[P] value — the 'impl' that covers it asks 'Display' of P, " +
         "which does not implement it")
     }
 
@@ -194,16 +197,98 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  /** `02 § Coherence` says an `impl Trait for Type` may appear only in the module that declares
-   * `Trait` or the module that declares `Type`, and that a foreign trait for a foreign type is the
-   * case with no home. `Eq` and `Option` are both the prelude's, so a user module implementing one
-   * for the other is exactly that case — and it is accepted today, which means nothing enforces the
-   * rule the chapter states.
+  /** `02 § Coherence` — an `impl` may be written only where the trait is declared or where a type
+   * named in its subject is, so that resolving a bound inspects two modules rather than every one.
+   *
+   * The refusals are the whole of it: an accepted block proves nothing that a program without the
+   * rule would not also accept.
    */
-  "an implementation of a foreign trait for a foreign type has no home" ignore {
-    err("""impl[T: Eq] Eq for Option[T]
-          |    eq(self, rhs: Option[T]) -> bool = self.is_some() == rhs.is_some()
-          |print(1)
-          |""".stripMargin) should include("may appear only in the module that declares")
+  "an 'impl' with no home" - {
+    "a foreign trait for a foreign type is refused" in {
+      err("""impl[T: Eq] Eq for Option[T]
+            |    eq(self, rhs: Option[T]) -> bool = self.is_some() == rhs.is_some()
+            |print(1)
+            |""".stripMargin) should include(
+        "an 'impl' may be written only in the module that declares the trait or in one that " +
+          "declares a type named in the subject, and 'Eq' belongs to the prelude while nothing in " +
+          "'Option' is declared outside the prelude — so this one has no home")
+    }
+
+    // A catalog trait the compiler already provides for a built-in is refused one step earlier
+    // (`14 §5`), so the trait here is one it does not — the complaint is then this rule's.
+    "a built-in is foreign too, so the prelude's traits are out of reach for it" in {
+      err("""impl Iterate[int] for int
+            |    next(*self) -> Option[int] = None
+            |print(1)
+            |""".stripMargin) should include("so this one has no home")
+    }
+
+    "and so is a slice, whose element settles nothing when it is a built-in too" in {
+      err("""impl Display for []int
+            |    display(self, out: *Writer, fmt: FormatSpec) = out.write("x".bytes)
+            |print(1)
+            |""".stripMargin) should include("nothing in '[]int' is declared outside the prelude")
+    }
+
+    // A shape's parameter stands for no declaration, so a block over every slice at once names
+    // nothing local however its bound is written — which is what puts `Display` for every slice out
+    // of a program's reach and leaves it the prelude's.
+    "a shape over the prelude's own trait has no home either" in {
+      err("""impl[T: Display] Display for []T
+            |    display(self, out: *Writer, fmt: FormatSpec) = out.write("x".bytes)
+            |print(1)
+            |""".stripMargin) should include("nothing in '[]T' is declared outside the prelude")
+    }
+
+    "a tuple is the prelude's, so a foreign trait for one is the ordinary case" in {
+      err("""impl Iterate[int] for (int, string)
+            |    next(*self) -> Option[int] = None
+            |print(1)
+            |""".stripMargin) should include("so this one has no home")
+    }
+  }
+
+  /** The two ways a block does have one, which are what keeps the rule from taking anything the
+   * chapter promised to leave.
+   */
+  "an 'impl' the rule leaves alone" - {
+    "the trait is the program's own, so any type may be given it" in {
+      run("""trait Show
+            |    show(self) -> string
+            |impl Show for []int
+            |    show(self) -> string = str(self.len)
+            |var a = [1, 2, 3]
+            |print(a[0..].show())
+            |""".stripMargin) shouldBe "3\n"
+    }
+
+    // The half `02` left to the implementation to settle: a composed type is the module's when
+    // anything named in it is. Without it a module could not print a slice of its own struct, and
+    // the compiler's own advice would name a block the rule then refused.
+    "and a type of the program's own inside the subject is enough" in {
+      run("""struct P
+            |    v: int
+            |impl Display for []P
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.len), out, fmt)
+            |var a = [P(1), P(2)]
+            |print(a[0..])
+            |""".stripMargin) shouldBe "2\n"
+    }
+
+    "however deeply it is buried" in {
+      ir("""struct P
+           |    v: int
+           |impl Display for [][]P
+           |    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.len), out, fmt)
+           |print(1)
+           |""".stripMargin) should include("@main")
+    }
+
+    "and the prelude writes what nothing else has a home for" in {
+      run("""var t = (1, "a")
+            |var u = (1, "a")
+            |print(t == u)
+            |""".stripMargin) shouldBe "true\n"
+    }
   }
 }

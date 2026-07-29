@@ -330,12 +330,17 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
     }
 
     // A shape reaches the fill by a different key than a named type does, so it is asked separately.
+    // The trait is the program's own, because the prelude's would leave the block with no home:
+    // `02 § Coherence` licenses an `impl` by its trait or by a type named in its subject, and `[]T`
+    // names neither.
     "including one written for a shape" in {
-      run("""impl[T] Mul for []T
-            |    mul(self, rhs: []T) -> []T = rhs
+      run("""trait Times[Rhs = Self]
+            |    times(self, rhs: Rhs) -> Rhs
+            |impl[T] Times for []T
+            |    times(self, rhs: []T) -> []T = rhs
             |var a = [1, 2]
             |var b = [3, 4]
-            |print((a[0..] * b[0..])[1])""".stripMargin) shouldBe "4\n"
+            |print(a[0..].times(b[0..])[1])""".stripMargin) shouldBe "4\n"
     }
   }
 }

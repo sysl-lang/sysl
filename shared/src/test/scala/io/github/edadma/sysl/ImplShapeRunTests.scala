@@ -130,31 +130,41 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
       ) shouldBe "2\n3\n"
     }
 
-    "renders through Display, so print and f-strings reach it" in {
+    // The trait is the program's own: `Display` is the prelude's and so is every slice, so a shape
+    // block for it has no home (`02 § Coherence`) and only the prelude may write one. What the shape
+    // still buys a program is exactly this — one block covering every slice whose element conforms.
+    "a conditional shape's member reaches its element through the bound" in {
       run(
-        s"""impl[T: Display] Display for []T
-           |    display(self, out: *Writer, fmt: FormatSpec)
-           |        out.write("[".bytes)
-           |        for i in 0..<self.len do
-           |            if i > 0usize then out.write(", ".bytes)
-           |            self[i].display(out, FormatSpec(0, -1, false))
-           |        out.write("]".bytes)
-           |var a = [3, 1, 4]
-           |var b = ["x", "y"]
-           |print(a[0..])
-           |print(f"${"$"}{b[0..]}%8s|")""".stripMargin,
-      ) shouldBe "[3, 1, 4]\n[x, y]|\n"
+        """trait Render
+          |    render(self) -> string
+          |impl[T: Display] Render for []T
+          |    render(self) -> string
+          |        var out = "["
+          |        for i in 0..<self.len do
+          |            if i > 0usize then out = out + ", "
+          |            out = out + str(self[i])
+          |        out + "]"
+          |var a = [3, 1, 4]
+          |var b = ["x", "y"]
+          |print(a[0..].render())
+          |print(b[0..].render())""".stripMargin,
+      ) shouldBe "[3, 1, 4]\n[x, y]\n"
     }
 
     // An operator is a trait method, so it resolves the way a call does — which is the whole reason
     // a member is named by one rule rather than by a name each site builds for itself.
-    "carries an operator, dispatched to the instantiated member" in {
+    // An operator is one of the prelude's catalog traits, so a *shape* carrying one is the prelude's
+    // to write (its tuple rows are exactly that). What a program may write is the composed type
+    // spelled out, which its own element type gives a home to.
+    "a composed type carries an operator, dispatched to the instantiated member" in {
       run(
-        """impl[T: Eq] Eq for []T
+        """struct N
+          |    v: int
+          |impl Eq for []N
           |    eq(self, rhs: Self) -> bool = self.len == rhs.len
-          |var a = [1, 2]
-          |var b = [3, 4]
-          |var c = [5]
+          |var a = [N(1), N(2)]
+          |var b = [N(3), N(4)]
+          |var c = [N(5)]
           |print(a[0..] == b[0..])
           |print(a[0..] == c[0..])""".stripMargin,
       ) shouldBe "true\nfalse\n"
