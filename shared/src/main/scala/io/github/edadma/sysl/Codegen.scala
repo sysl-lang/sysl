@@ -530,6 +530,48 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
 
   // --- expressions ---------------------------------------------------------------------
 
+  /** Whether an integer `+`/`-`/`*` needs the overflow-detecting form. Arithmetic on raw integers is
+   * defined to wrap, so it is only in play when an operand was produced through a ranged (`within`)
+   * type — the opt-in that makes arithmetic checked — and only then when the exact result the
+   * operands' ranges allow can fall outside the base width. A range whose results always fit the
+   * width stays on the plain path, so the common case (a small counter, an index) costs nothing.
+   */
+  private def overflowChecked(op: String, l: TExpr, r: TExpr, bt: Type.Integer): Boolean =
+    (op == "+" || op == "-" || op == "*") && (isRanged(l.ty) || isRanged(r.ty)) && {
+      val (alo, ahi) = interval(l, bt)
+      val (blo, bhi) = interval(r, bt)
+      val (rlo, rhi) = op match
+        case "+" => (alo + blo, ahi + bhi)
+        case "-" => (alo - bhi, ahi - blo)
+        case "*" =>
+          val corners = List(alo * blo, alo * bhi, ahi * blo, ahi * bhi)
+          (corners.min, corners.max)
+        case _ => sys.error(s"unreachable overflowChecked '$op'")
+      rlo < baseMin(bt) || rhi > baseMax(bt)
+    }
+
+  /** A ranged constrained integer — a `within` type — is the opt-in that makes arithmetic checked;
+   * a predicate-only subtype or a bare `new` derivation bounds no magnitude and does not qualify. */
+  private def isRanged(t: Type): Boolean = t match
+    case c: Type.Constrained => (c.lo.isDefined || c.hi.isDefined) && Type.underlying(c).isInstanceOf[Type.Integer]
+    case _                   => false
+
+  /** The exact value interval an operand can hold: a literal is its own value; a ranged type is its
+   * declared bounds (`..<` excludes the top); anything else spans the whole base width. */
+  private def interval(e: TExpr, bt: Type.Integer): (BigInt, BigInt) = e match
+    case TIntLit(v, _) => (v, v)
+    case _ =>
+      e.ty match
+        case c: Type.Constrained if isRanged(c) =>
+          val lo = c.lo.map(_.toBigInt).getOrElse(baseMin(bt))
+          val hi = c.hi.map(h => if c.exclusiveHi then h.toBigInt - 1 else h.toBigInt).getOrElse(baseMax(bt))
+          (lo, hi)
+        case _ => (baseMin(bt), baseMax(bt))
+
+  private def baseMin(t: Type.Integer): BigInt = if t.signed then -(BigInt(2).pow(t.bits - 1)) else BigInt(0)
+  private def baseMax(t: Type.Integer): BigInt =
+    if t.signed then BigInt(2).pow(t.bits - 1) - 1 else BigInt(2).pow(t.bits) - 1
+
   /** Lowers an expression, returning the register or immediate holding its value (empty for a
    * unit-typed expression, whose value is never read).
    */
@@ -805,8 +847,15 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
 
     case TBinary(op, l, r, _) =>
       // Arithmetic runs at the base representation — a derived type keeps its own identity in the
-      // analyzer but is added, multiplied, and divided as the base it is laid out as.
-      arith(op, Type.underlying(l.ty), genExpr(l), genExpr(r))
+      // analyzer but is added, multiplied, and divided as the base it is laid out as. When an operand
+      // was produced through a ranged type and the result could leave the base width, the operation
+      // is overflow-detecting so a wrap cannot slip past the produce-site range check.
+      val bt = Type.underlying(l.ty)
+      val lv = genExpr(l)
+      val rv = genExpr(r)
+      bt match
+        case it: Type.Integer if overflowChecked(op, l, r, it) => checkedArith(op, it, lv, rv)
+        case _                                                 => arith(op, bt, lv, rv)
 
     case TUnary("-", operand, ty) if Type.underlying(ty).isInstanceOf[Type.Integer] =>
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = sub ${ty.llvm} 0, $v"); r

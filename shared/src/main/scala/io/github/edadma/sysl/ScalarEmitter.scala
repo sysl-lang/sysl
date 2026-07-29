@@ -51,6 +51,29 @@ trait ScalarEmitter extends StringEmitter {
     val r = freshTemp(); emit(s"$r = $instr ${ty.llvm} $lv, $rv"); r
   }
 
+  /** Integer `+`, `-`, `*` where the operands' declared ranges allow a result the base width cannot
+   * hold, so a plain instruction would wrap before the range check at the produce site could see it.
+   * The overflow-detecting intrinsic traps on a representation overflow, so what the range check then
+   * examines is the true result. Raw integer arithmetic is defined to wrap and never reaches here;
+   * a range narrow enough that its results always fit the width stays on the plain path above.
+   */
+  protected def checkedArith(op: String, ty: Type.Integer, lv: String, rv: String): String = {
+    val name = op match
+      case "+" => "add"
+      case "-" => "sub"
+      case "*" => "mul"
+      case _   => sys.error(s"unreachable checkedArith '$op'")
+    val fn = s"llvm.${if ty.signed then "s" else "u"}$name.with.overflow.${ty.llvm}"
+    satDecls += s"declare {${ty.llvm}, i1} @$fn(${ty.llvm}, ${ty.llvm})"
+
+    val pair = freshTemp(); emit(s"$pair = call {${ty.llvm}, i1} @$fn(${ty.llvm} $lv, ${ty.llvm} $rv)")
+    val v    = freshTemp(); emit(s"$v = extractvalue {${ty.llvm}, i1} $pair, 0")
+    val ovf  = freshTemp(); emit(s"$ovf = extractvalue {${ty.llvm}, i1} $pair, 1")
+    val ok   = freshTemp(); emit(s"$ok = xor i1 $ovf, true")
+    trapUnless(ok, "overflow")
+    v
+  }
+
   /** The `icmp` / `fcmp` predicate for an operator at a type. `char` compares by scalar
    * value, so it uses the unsigned predicates over its `i32` representation.
    */
