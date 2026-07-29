@@ -151,7 +151,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val (ownerV, first, len) = base.ty match
       case Type.Ref(array @ Type.Array(n, _), _) =>
         val r = genExpr(base)
-        val p = freshTemp(); emit(s"$p = getelementptr ${boxName(array)}, ptr $r, i32 0, i32 2")
+        val p = freshTemp(); emit(s"$p = getelementptr ${boxName(array)}, ptr $r, i32 0, i32 $headerFields")
         (r, p, n.toString)
       case s: Type.View =>
         val v = genExpr(base)
@@ -236,7 +236,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
     val e1   = freshTemp(); emit(s"$e1 = getelementptr ${elem.llvm}, ptr null, i64 1")
     val esz  = freshTemp(); emit(s"$esz = ptrtoint ptr $e1 to i64")
-    val h1   = freshTemp(); emit(s"$h1 = getelementptr $bn, ptr null, i32 0, i32 3")
+    val h1   = freshTemp(); emit(s"$h1 = getelementptr $bn, ptr null, i32 0, i32 ${headerFields + 1}")
     val hsz  = freshTemp(); emit(s"$hsz = ptrtoint ptr $h1 to i64")
 
     val mul   = freshTemp(); emit(s"$mul = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 $n, i64 $esz)")
@@ -256,9 +256,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     emit(s"store i64 1, ptr $p")
     val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
     emit(s"store ptr ${dropBufFn(elem)}, ptr $hook")
-    val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr $p, i32 0, i32 2")
+    val wc   = freshTemp(); emit(s"$wc = getelementptr $bn, ptr $p, i32 0, i32 2")
+    emit(s"store i64 1, ptr $wc")
+    val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
     emit(s"store i64 $n, ptr $lenp")
-    val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr $p, i32 0, i32 3")
+    val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr $p, i32 0, i32 ${headerFields + 1}")
 
     (p, data)
   }
@@ -367,6 +369,61 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     emitTerm(s"br label %$endL")
     emitLabel(endL)
     val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot"); r
+  }
+
+  /** Weakens a reference: the same address, counted in the box's third word instead of its first
+   * (`03`). The strong count is untouched, which is the whole point — the edge this makes keeps
+   * nothing alive.
+   *
+   * The value is registered as an owned temporary so the region that produced it gives the weak
+   * share back, exactly as it would for a reference. What ends up holding it long-term is the slot
+   * it is stored into, which takes a share of its own when it is written.
+   */
+  protected def genDowngrade(value: TExpr, weakTy: Type.Weak): String = {
+    val v = genExpr(value)
+    retainValue(weakTy, v)
+    ownTemp(v, weakTy)
+  }
+
+  /** `w.get()` — asks the box whether the object is still there. A live one comes back with a count
+   * taken for the caller, so what the `Some` carries is an ordinary owned reference; a dead one
+   * gives a null address, which is the `None`.
+   *
+   * A trait object is rebuilt around the answer rather than reused: the method table it was carrying
+   * is a constant that says nothing about whether the object is alive, so it is put back beside the
+   * address only on the arm where there is one.
+   */
+  protected def genUpgrade(value: TExpr, optTy: Type.Enum, some: Type.EnumVariant,
+                           none: Type.EnumVariant): String = {
+    weakHeap = true
+    val fat  = value.ty.asInstanceOf[Type.Weak].inner.isInstanceOf[Type.Trait]
+    val v    = genExpr(value)
+    val addr = if fat then { val b = freshTemp(); emit(s"$b = extractvalue ${Type.fatPointer} $v, 1"); b } else v
+
+    val got   = freshTemp(); emit(s"$got = call ptr @arc.upgrade(ptr $addr)")
+    val live  = freshTemp(); emit(s"$live = icmp ne ptr $got, null")
+    val slot  = emitAlloca(freshTemp(), optTy.llvm)
+    val someL = freshLabel("weak.live")
+    val noneL = freshLabel("weak.gone")
+    val endL  = freshLabel("weak.end")
+
+    emitTerm(s"br i1 $live, label %$someL, label %$noneL")
+    emitLabel(someL)
+    val strong =
+      if !fat then got
+      else
+        val tbl = freshTemp(); emit(s"$tbl = extractvalue ${Type.fatPointer} $v, 0")
+        val f0  = freshTemp(); emit(s"$f0 = insertvalue ${Type.fatPointer} undef, ptr $tbl, 0")
+        val f1  = freshTemp(); emit(s"$f1 = insertvalue ${Type.fatPointer} $f0, ptr $got, 1")
+        f1
+    emit(s"store ${optTy.llvm} ${enumValue(optTy, some, List(strong))}, ptr $slot")
+    emitTerm(s"br label %$endL")
+    emitLabel(noneL)
+    emit(s"store ${optTy.llvm} ${enumValue(optTy, none, Nil)}, ptr $slot")
+    emitTerm(s"br label %$endL")
+    emitLabel(endL)
+    val r = freshTemp(); emit(s"$r = load ${optTy.llvm}, ptr $slot")
+    ownTemp(r, optTy)
   }
 
   /** Reads every field of a variant's payload out of an enum value. */

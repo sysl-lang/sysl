@@ -201,6 +201,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     receiverType(tr.ty) match
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
       case t: Type.Trait    => callTraitObject(tr, t, mname, args)
+      case w: Type.Weak     => weakGet(w, tr, mname, args)
       case rty =>
         val (base, _) = memberKey(rty, mname)
         val chosen    = pickOverload(rty, base, mname, args)
@@ -391,6 +392,22 @@ trait CallAnalysis extends Literals with TraitObjects {
       funcsUsed += fname
       TCall(fname, List(self), Type.Integer(64, signed = false))
     }
+
+  /** `w.get()` — the one thing a `weak T` can be asked (`03`).
+   *
+   * It yields an ordinary `Option[&T]`, so everything downstream of it — matching, `unwrap`, `?` —
+   * is the surface `Option` already has, and nothing about a weak reference reaches further into
+   * the language than this call.
+   */
+  private def weakGet(w: Type.Weak, recv: TExpr, mname: String, args: List[Expr]): TExpr = {
+    if mname != "get" then
+      err(s"a ${show(w)} has no method '$mname' — a weak reference may be gone, so 'get()' is the " +
+        s"only thing to ask one, and what it hands back is what has methods")
+    if args.nonEmpty then err(s"'get' takes no arguments")
+
+    val optTy = instantiateEnum("Option", List(w.strong))
+    TUpgrade(recv, optTy, optTy.variant("Some").get, optTy.variant("None").get)
+  }
 
   /** `5.add(3)`, `x.lt(y)` — a core-trait method on a type whose membership the compiler provides.
    *

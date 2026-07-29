@@ -564,6 +564,13 @@ trait HoistMembers extends TypeResolution {
               "particular type behaves — so it is written for that type, not for an object over it")
           case Type.Ptr(inner)       => err(modeIsNotAType("*", inner))
           case Type.Ref(inner, sync) => err(modeIsNotAType(if sync then "&sync " else "&", inner))
+          // The third mode, refused for the same reason with a sharper consequence: a member call
+          // reaches through a `*T` and a `&T`, and through a `weak T` it reaches nothing at all, so
+          // a member written here would have no way to be called.
+          case Type.Weak(inner) =>
+            err(s"'weak ${show(inner)}' is a way of holding a ${show(inner)} rather than a type of " +
+              s"its own — and nothing goes through one but 'get()', so a member written here could " +
+              s"never be called. Write the 'impl' for ${show(inner)}, which 'get()' hands back")
           case Type.VaList => err("a va_list is an ABI primitive, not something to implement a trait for")
           // The subject is the block's own parameter, which stands for any type at all — so the block
           // would be saying how every type behaves, which is what a trait's own defaults are for.
@@ -656,6 +663,7 @@ trait HoistMembers extends TypeResolution {
       Set(quietly(typeKey(written)).flatMap(declaringModule)) ++ args.flatMap(subjectHomes)
     case PtrType(inner)      => subjectHomes(inner)
     case RefType(inner, _)   => subjectHomes(inner)
+    case WeakType(inner)     => subjectHomes(inner)
     case ArrayType(_, elem)  => subjectHomes(elem)
     case TupleType(parts, _) => Set(None) ++ parts.flatMap(subjectHomes)
 

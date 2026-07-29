@@ -181,6 +181,20 @@ object Type {
     def llvm: String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
   }
 
+  /** `weak T` — a reference that does not keep its referent alive (`03`).
+   *
+   * It addresses the same box a `&T` does and is the same width, so a weak edge costs a program
+   * nothing beyond the count it takes in the box's third header word. What separates the two is
+   * what may be done with one: nothing at all, until `get()` has asked the box whether the object
+   * is still there and handed back an `Option[&T]`.
+   */
+  case class Weak(inner: Type) extends Type {
+    def llvm: String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
+
+    /** The reference this weakens, which is what `get()` yields and what makes one. */
+    def strong: Ref = Ref(inner, sync = false)
+  }
+
   /** `[N]T` — N elements of `T`, laid out end to end with no header. An array *is* its
    * elements: copying one copies all of them, and its length is part of its type, which is what
    * lets every index be checked against a constant.
@@ -274,6 +288,7 @@ object Type {
     case Unknown                  => "?"
     case Ptr(inner)               => s"*${show(inner)}"
     case Ref(inner, sync)         => s"&${if sync then "sync " else ""}${show(inner)}"
+    case Weak(inner)              => s"weak ${show(inner)}"
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem)              => s"[]${show(elem)}"
     case Abstract(n, _)           => n
@@ -309,6 +324,7 @@ object Type {
     case n: Named         => n.targs.exists(mentionsAbstract)
     case Ptr(inner)       => mentionsAbstract(inner)
     case Ref(inner, _)    => mentionsAbstract(inner)
+    case Weak(inner)      => mentionsAbstract(inner)
     case Array(_, elem)   => mentionsAbstract(elem)
     case Slice(elem)      => mentionsAbstract(elem)
     case _                => false
@@ -587,6 +603,7 @@ object Type {
     case Ptr(inner)       => s"ptr.${mangleOne(inner)}"
     case Ref(inner, false) => s"ref.${mangleOne(inner)}"
     case Ref(inner, true)  => s"sync.${mangleOne(inner)}"
+    case Weak(inner)       => s"weak.${mangleOne(inner)}"
     case Array(n, elem)    => s"arr$n.${mangleOne(elem)}"
     case Slice(elem)       => s"slice.${mangleOne(elem)}"
     case Trait(n, args)    => mangled(n, args)

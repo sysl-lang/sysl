@@ -115,7 +115,7 @@ class StringCodegenTests extends AnyFreeSpec with CodegenSupport {
     val out = ir("""print("a" + "b")""")
 
     out should include("declare ptr @malloc(i64)")
-    out should include("store ptr @arc.free")
+    out should include("store ptr null, ptr %hook")
     out should include("define private void @arc.release_maybe(ptr %p) {")
   }
 

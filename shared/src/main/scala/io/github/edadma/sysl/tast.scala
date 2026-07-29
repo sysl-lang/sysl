@@ -37,6 +37,18 @@ case class TNullLit(ty: Type) extends TExpr
  */
 case class TBox(value: TExpr, refTy: Type.Ref) extends TExpr { def ty: Type = refTy }
 
+/** Weakens a reference, because a `weak T` was expected where a `&T` was written (`03`). The
+ * object's weak count goes up and its strong count does not, so the edge this makes does not keep
+ * the object alive.
+ */
+case class TDowngrade(value: TExpr, weakTy: Type.Weak) extends TExpr { def ty: Type = weakTy }
+
+/** `w.get()` — asks the box whether the object is still there, and takes a count if it is.
+ * `optTy` is the `Option[&T]` handed back, with `some`/`none` its two variants.
+ */
+case class TUpgrade(value: TExpr, optTy: Type.Enum, some: Type.EnumVariant, none: Type.EnumVariant)
+    extends TExpr { def ty: Type = optTy }
+
 /** The zero value of a type: what a declaration with no initializer starts at. */
 case class TZero(ty: Type) extends TExpr
 

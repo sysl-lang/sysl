@@ -54,11 +54,16 @@ trait Emitter {
   protected val runtimeQueue = mutable.Queue.empty[() => String]
 
   /** Which parts of the ARC runtime the module turned out to need: the heap at all, the atomic
-   * pair a `&sync` uses, and the null-tolerant pair a slice's owner needs.
+   * pair a `&sync` uses, the null-tolerant pair a slice's owner needs, and the weak trio.
+   *
+   * The weak *header word* is not on this list, because every box carries it whether or not
+   * anything weakly refers to one (`03 § What it costs`) — what is optional is the three functions
+   * that read it, and only a program holding a `weak T` calls those.
    */
   protected var heap      = false
   protected var syncHeap  = false
   protected var maybeHeap = false
+  protected var weakHeap  = false
 
   // Per-function emission state, reset at each function boundary.
   private var prologue   = new mutable.StringBuilder

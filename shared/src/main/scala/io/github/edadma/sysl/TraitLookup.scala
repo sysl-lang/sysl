@@ -277,6 +277,7 @@ trait TraitLookup extends MemberVisibility {
   protected def builtinMember(t: Type, name: String): Boolean = (t, name) match
     case (_: Type.Array | _: Type.View, "len") => true
     case (Type.Str, "bytes" | "chars")         => true
+    case (_: Type.Weak, "get")                 => true
     case _                                     => false
 
   /** Every trait a bound promises: the traits it **requires**, transitively, and then itself

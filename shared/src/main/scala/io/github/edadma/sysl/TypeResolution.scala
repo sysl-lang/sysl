@@ -87,6 +87,7 @@ trait TypeResolution extends ImportResolution {
     case NamedType(n, args)                 => NamedType(n, args.map(spellSelf(_, selfRef)))
     case PtrType(inner)                     => PtrType(spellSelf(inner, selfRef))
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
+    case WeakType(inner)                    => WeakType(spellSelf(inner, selfRef))
     case ArrayType(len, elem)               => ArrayType(len, spellSelf(elem, selfRef))
     case TupleType(parts, r)                => TupleType(parts.map(spellSelf(_, selfRef)), r)
 
@@ -98,6 +99,7 @@ trait TypeResolution extends ImportResolution {
     case NamedType(n, args) => tps(n) || args.exists(mentions(_, tps))
     case PtrType(inner)     => mentions(inner, tps)
     case RefType(inner, _)  => mentions(inner, tps)
+    case WeakType(inner)    => mentions(inner, tps)
     case ArrayType(_, elem) => mentions(elem, tps)
     case TupleType(parts, _) => parts.exists(mentions(_, tps))
 
@@ -259,6 +261,10 @@ trait TypeResolution extends ImportResolution {
     case RefType(inner, sync) =>
       traitObject(inner, subst, "&")
         .fold(Type.Ref(addressable(underIndirection(resolveType(inner, subst)), "'&'"), sync))(Type.Ref(_, sync))
+
+    case WeakType(inner) =>
+      traitObject(inner, subst, "weak")
+        .fold(Type.Weak(addressable(underIndirection(resolveType(inner, subst)), "'weak'")))(Type.Weak.apply)
 
     // An array holds its elements, so it is no indirection at all and a type cannot contain an
     // array of itself. A slice only points at them, so it breaks a cycle exactly as `*T` does.
@@ -454,6 +460,7 @@ trait TypeResolution extends ImportResolution {
     case NamedType(n, args) => n == selfName || args.exists(mentionsSelf)
     case PtrType(i)         => mentionsSelf(i)
     case RefType(i, _)      => mentionsSelf(i)
+    case WeakType(i)        => mentionsSelf(i)
     case ArrayType(_, e)    => mentionsSelf(e)
     case TupleType(parts, _) => parts.exists(mentionsSelf)
 
@@ -814,6 +821,7 @@ trait TypeResolution extends ImportResolution {
         case n: Type.Enum     => instantiateEnum(n.base, n.targs.map(substParams(_, subst)))
         case Type.Ptr(inner)      => Type.Ptr(substParams(inner, subst))
         case Type.Ref(inner, syn) => Type.Ref(substParams(inner, subst), syn)
+        case Type.Weak(inner)     => Type.Weak(substParams(inner, subst))
         case Type.Array(n, elem)  => Type.Array(n, substParams(elem, subst))
         case Type.Slice(elem)     => Type.Slice(substParams(elem, subst))
         case other                => other
@@ -913,6 +921,13 @@ trait TypeResolution extends ImportResolution {
         case Type.Ref(t, s) if s == sync => unify(inner, t, tparams, sub)
         case _: Type.Ref                 => ()
         case t                           => unify(inner, t, tparams, sub)
+    // A `weak T` parameter also accepts a `&T`, which the call weakens, so the payload type is
+    // matched against either shape — the same leniency `&T` gets one case up, for the same reason.
+    case WeakType(inner) =>
+      actual match
+        case Type.Weak(t)  => unify(inner, t, tparams, sub)
+        case Type.Ref(t, _) => unify(inner, t, tparams, sub)
+        case _             => ()
     case ArrayType(None, elem) =>
       actual match
         case Type.Slice(e) => unify(elem, e, tparams, sub)
@@ -992,6 +1007,12 @@ trait TypeResolution extends ImportResolution {
     // A zeroed view owns nothing and names no elements, which is exactly the empty slice — and,
     // for a string, the empty string, which is well-formed UTF-8 the way anything empty is.
     case _: Type.View        => true
+    // A weak reference that never had an object and one whose object is gone are the same state,
+    // and a program can already reach the second — so the zeroed slot is not a value it would
+    // otherwise be spared, it is the value `None` writes and `get()` reads back (`03`). This is the
+    // one place `weak T` parts company with `&T`, which has no zero because there is no such thing
+    // as a reference to nothing.
+    case _: Type.Weak        => true
     // A zero-sized type has exactly one value, so it is trivially its own zero — there is nothing
     // to produce and nowhere to put it. Without this a struct would lose its zero value by gaining
     // a field that costs nothing, which is the opposite of what zero-sized means.

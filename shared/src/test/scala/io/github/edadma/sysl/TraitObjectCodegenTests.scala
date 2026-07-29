@@ -134,7 +134,7 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     "of a counted object steps over the box header first" in {
       val body = defineOf(ir(counted), "vt.adapt.ref.S.v")
 
-      body should include("%t1 = getelementptr %arc.S, ptr %d, i32 0, i32 2")
+      body should include("%t1 = getelementptr %arc.S, ptr %d, i32 0, i32 3")
       body should include("%t2 = load %struct.S, ptr %t1")
     }
   }
@@ -240,8 +240,10 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     "counts the box in its second word, and nothing else" in {
       val body = mainOf(ir(counted))
 
-      body should include("%t23 = extractvalue { ptr, ptr } %t22, 1")
-      body should include("call void @arc.release(ptr %t23)")
+      // The temporary is named by a regex rather than by number: what the assertion is about is
+      // that the *second* word is what is released, and the numbering moves whenever the box header
+      // does.
+      body should include regex raw"%t(\d+) = extractvalue \{ ptr, ptr \} %t\d+, 1\n  call void @arc\.release\(ptr %t\1\)"
     }
   }
 }

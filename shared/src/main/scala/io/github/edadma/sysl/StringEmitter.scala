@@ -40,7 +40,7 @@ trait StringEmitter extends Emitter {
 
   /** Joins two strings into a fresh one. The result owns a new `StrBuf` — an ordinary ARC box
    * (`03`) whose payload is the two halves' bytes laid end to end — so it carries a count of its
-   * own and frees itself through `@arc.free` like every other heap object. UTF-8 is closed under
+   * own and returns its storage through `@arc.release` like every other heap object. UTF-8 is closed under
    * concatenation, so the validity invariant needs no re-checking. Both operands are copied out,
    * so neither is retained; the caller records the result as an owned temporary.
    */
@@ -146,7 +146,7 @@ object StringEmitter {
       |""".stripMargin
 
   /** Concatenation. A `StrBuf` sized for both halves is allocated the way every ARC box is — a
-   * refcount set to one, the deallocation hook (`@arc.free`, since raw bytes hold no references),
+   * refcount set to one, no deallocation hook (raw bytes hold no references),
    * then the payload — with the header size taken portably from `%arc.header` so a 32-bit target
    * lays it out the same way. The two halves are copied in a byte at a time, and the returned
    * view names the buffer as its owner, the first payload byte as its start, and the summed
@@ -162,7 +162,9 @@ object StringEmitter {
       |  %p = call ptr @malloc(i64 %size)
       |  store i64 1, ptr %p
       |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
-      |  store ptr @arc.free, ptr %hook
+      |  store ptr null, ptr %hook
+      |  %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      |  store i64 1, ptr %share
       |  %bytes = getelementptr %arc.header, ptr %p, i32 1
       |  br label %acond
       |acond:
@@ -197,7 +199,7 @@ object StringEmitter {
       |""".stripMargin
 
   /** Copies a run of bytes into a fresh owning string. A `StrBuf` sized for the bytes is
-   * allocated the way every ARC box is — a refcount of one, the `@arc.free` hook, then the
+   * allocated the way every ARC box is — a refcount of one, no hook — raw bytes hold no references — then the
    * payload — with the header size taken portably from `%arc.header`. Every `str(x)` that renders
    * into a scratch buffer finishes through here, so the allocation and copy live in one place.
    */
@@ -210,7 +212,9 @@ object StringEmitter {
       |  %p = call ptr @malloc(i64 %size)
       |  store i64 1, ptr %p
       |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
-      |  store ptr @arc.free, ptr %hook
+      |  store ptr null, ptr %hook
+      |  %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      |  store i64 1, ptr %share
       |  %bytes = getelementptr %arc.header, ptr %p, i32 1
       |  br label %cond
       |cond:
@@ -317,7 +321,9 @@ object StringEmitter {
       |  %p = call ptr @malloc(i64 %size)
       |  store i64 1, ptr %p
       |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
-      |  store ptr @arc.free, ptr %hook
+      |  store ptr null, ptr %hook
+      |  %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      |  store i64 1, ptr %share
       |  %bytes = getelementptr %arc.header, ptr %p, i32 1
       |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr @sysl.str.g, double %v)
       |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
@@ -344,7 +350,9 @@ object StringEmitter {
       |  %p = call ptr @malloc(i64 %size)
       |  store i64 1, ptr %p
       |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
-      |  store ptr @arc.free, ptr %hook
+      |  store ptr null, ptr %hook
+      |  %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      |  store i64 1, ptr %share
       |  %bytes = getelementptr %arc.header, ptr %p, i32 1
       |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr %fmt, i64 %v)
       |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
@@ -369,7 +377,9 @@ object StringEmitter {
       |  %p = call ptr @malloc(i64 %size)
       |  store i64 1, ptr %p
       |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
-      |  store ptr @arc.free, ptr %hook
+      |  store ptr null, ptr %hook
+      |  %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      |  store i64 1, ptr %share
       |  %bytes = getelementptr %arc.header, ptr %p, i32 1
       |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr %fmt, double %v)
       |  %v0 = insertvalue { ptr, ptr, i64 } undef, ptr %p, 0
@@ -413,7 +423,9 @@ object StringEmitter {
       |  %p = call ptr @malloc(i64 %size)
       |  store i64 1, ptr %p
       |  %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
-      |  store ptr @arc.free, ptr %hook
+      |  store ptr null, ptr %hook
+      |  %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      |  store i64 1, ptr %share
       |  %bytes = getelementptr %arc.header, ptr %p, i32 1
       |  %w = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %bytes, i64 %cap, ptr %fmt, ptr %cstr)
       |  call void @free(ptr %cstr)

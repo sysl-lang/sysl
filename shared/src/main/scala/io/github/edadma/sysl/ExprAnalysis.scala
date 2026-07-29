@@ -108,6 +108,17 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         case NullLit() => err(s"a ${show(r)} always points at a live object — an absent one is Option[${show(r)}]")
         case _         => coerce(analyzeValue(expr, Some(r.inner)), r)
 
+    // Unlike a `&T`, a `weak T` does not ask the expression for the payload: what it takes is a
+    // reference something *else* is keeping alive, so pushing the payload type down would invite a
+    // construction whose only holder is the weak edge that cannot hold it. The expression is asked
+    // for whatever it is, and `coerce` decides — including refusing that case by name.
+    case Some(w: Type.Weak) =>
+      expr match
+        case NullLit() =>
+          err(s"'null' is a raw pointer, and an empty ${show(w)} is written 'None' — the same thing " +
+            "'get()' hands back for one")
+        case _ => coerce(analyzeValue(expr, Some(w)), w)
+
     // A value produced into a transparent constrained subtype is analyzed at the subtype's base — so
     // a literal and arithmetic type as that base — and then checked into the subtype. A value that
     // does not agree with the base is left unwrapped for the caller to diagnose, and one that already
@@ -228,7 +239,8 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
   }
 
   /** Whether a context of this type converts what it is given rather than simply requiring it. */
-  private def converts(want: Type): Boolean = Type.erased(want) || want.isInstanceOf[Type.Ref]
+  private def converts(want: Type): Boolean =
+    Type.erased(want) || want.isInstanceOf[Type.Ref] || want.isInstanceOf[Type.Weak]
 
   /** What an array form's elements should be analyzed as, given what the form itself is expected to
    * produce. A `string` is not on the list: its elements are bytes, but writing one is a validity
@@ -244,15 +256,26 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case _: IfExpr | _: MatchExpr | _: While | _: For => true
     case _                                            => false
 
-  /** The two conversions a context may apply to a value that does not already have its type: a
-   * `T` the context wanted by reference is boxed, and something concrete where a trait object was
-   * wanted is erased into one. Nothing else coerces — any other mismatch is left for the caller to
-   * diagnose, where the message can name the parameter or the variable it is about.
+  /** The three conversions a context may apply to a value that does not already have its type: a
+   * `T` the context wanted by reference is boxed, a `&T` the context wanted weakly is weakened, and
+   * something concrete where a trait object was wanted is erased into one. Nothing else coerces —
+   * any other mismatch is left for the caller to diagnose, where the message can name the parameter
+   * or the variable it is about.
+   *
+   * A `T` where a `weak T` was wanted goes through both: the value is boxed and the reference that
+   * comes back is weakened. What that makes is an edge to an object nothing else holds, which dies
+   * before the statement ends — so it is refused rather than built, and the message says to hold
+   * the object somewhere first.
    */
   protected def coerce(t: TExpr, expected: Type): TExpr = expected match
     case _ if Type.erased(expected)     => eraseTo(t, expected)
     case r: Type.Ref if t.ty == r.inner => TBox(t, r).setPos(t.pos)
-    case _                              => t
+    case w: Type.Weak if t.ty == w.strong => TDowngrade(t, w).setPos(t.pos)
+    case w: Type.Weak if t.ty == w.inner =>
+      err(s"a weak reference does not keep ${show(w.inner)} alive, and nothing else here holds this " +
+        s"one — so it would be gone before it could be read. Hold it in a '&${Type.show(w.inner)}' " +
+        "first, and weaken that")
+    case _ => t
 
   private def analyzeValue(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr =
     at(expr.pos)(analyzeValueAt(expr, expected, discarded)).setPos(expr.pos)
@@ -289,6 +312,12 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       ensureResultTy match
         case Some(ty) => TResult(ty)
         case None     => err("'result' is only meaningful inside an 'ensure' of a value-returning function")
+
+    // A weak reference whose object is gone and one that never had an object are the same state,
+    // so the empty weak reference is spelled the way that state reads everywhere else: `None`, the
+    // very thing `get()` will hand back for it (`03`).
+    case Ident("None") if lookupOpt("None").isEmpty && expected.exists(_.isInstanceOf[Type.Weak]) =>
+      TZero(expected.get)
 
     case Ident(name) =>
       lookupOpt(name) match
@@ -582,6 +611,12 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
         case Type.Str if f == "bytes"                   => TBytes(tr)
         case Type.Str if f == "chars"                   => callPrelude("chars_of", TBytes(tr))
+
+        // Everything about the object is behind `get()`, including whether there still is one, so a
+        // weak reference has no fields of its own to offer and none of the referent's either.
+        case w: Type.Weak =>
+          err(s"a ${show(w)} may be gone, so nothing is read off one directly — 'get()' hands back " +
+            s"'Option[&${Type.show(w.inner)}]', and '$f' is read off what is inside it")
 
         // Any other type reaches its own members too, since an `impl` may be written for one and a
         // trait may ask for a property. A name none of them supplies is the older complaint, which

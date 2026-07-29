@@ -45,7 +45,7 @@ trait VtableEmitter extends ArcEmitter {
           if !vt.boxed then "%d"
           else
             val p = freshTemp()
-            emit(s"$p = getelementptr ${boxName(vt.forType)}, ptr %d, i32 0, i32 2")
+            emit(s"$p = getelementptr ${boxName(vt.forType)}, ptr %d, i32 0, i32 $headerFields")
             p
 
         // The receiver is *borrowed* here, not owned: the implementation retains its parameters on

@@ -198,6 +198,7 @@ trait SignatureVisibility extends TypeResolution {
       (if skip(name) then Nil else List((name, n.pos))) ::: args.flatMap(namesIn(_, skip))
     case PtrType(inner)     => namesIn(inner, skip)
     case RefType(inner, _)  => namesIn(inner, skip)
+    case WeakType(inner)    => namesIn(inner, skip)
     case ArrayType(_, elem) => namesIn(elem, skip)
     case TupleType(parts, _) => parts.flatMap(namesIn(_, skip))
 

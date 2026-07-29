@@ -208,16 +208,18 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
       out should include("load i64")
       out should include("call void @arc.release")
-      out should include("call void @free(ptr %p)")
+      // The hook empties the buffer and returns; the storage goes back through `arc.destroy`, which
+      // is what a weak reference to the box would still be reading until it does.
+      out should include("ret void")
     }
 
-    // Elements that hold nothing need no walk at all, so the hook is the plain free — a buffer of
-    // bytes costs a destructor call and nothing else.
-    "and elements that hold nothing get the plain free instead" in {
+    // Elements that hold nothing need no walk at all, so there is no hook to install — a buffer of
+    // bytes costs one null in its header and nothing else.
+    "and elements that hold nothing get no hook at all" in {
       val out = ir("""f(n: usize) -> []u8 = [0; n]
                      |print(f(2usize).len)""".stripMargin)
 
-      out should include("store ptr @arc.free")
+      out should include("store ptr null, ptr")
       out should not include "arc.dropbuf"
     }
 

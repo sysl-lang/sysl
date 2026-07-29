@@ -50,13 +50,21 @@ class MemoryModeParserTests extends AnyFreeSpec with ParseSupport {
       )
     }
 
-    // `03 § weak T` describes a third mode — a non-owning reference that degrades to `None` when
-    // its referent goes — and nothing implements it: `weak` is in the reserved words and has no
-    // production in the type grammar, so the declaration stops at the colon. Pinned here so the
-    // gap is a fact the suite states rather than one a reader has to discover from a design
-    // document that describes the feature in the present tense.
-    "'weak' is reserved and is not yet a type" in {
-      progError("var w: weak Node = a") should include("newline expected")
+    // `03 § weak T` — the third mode, written as a reserved word rather than a sigil.
+    "'weak' applies to a type the way the sigils do" in {
+      prog("var w: weak Node = a") shouldBe
+        List(VarDecl("w", Some(WeakType(NamedType("Node"))), Some(Ident("a"))))
+    }
+
+    "and nests inside the others, since what it weakens is a type like any other" in {
+      prog("var w: []weak Node = a") shouldBe
+        List(VarDecl("w", Some(ArrayType(None, WeakType(NamedType("Node")))), Some(Ident("a"))))
+    }
+
+    // An atomic object has no weak form yet (`03 § weak sync T`), and the refusal is at the
+    // spelling so a reader is told which chapter it waits on rather than "newline expected".
+    "'weak sync T' says which chapter it is waiting for" in {
+      progError("var w: weak sync Node = a") should include("wants the concurrency model of '06'")
     }
 
     "'sync' stays an ordinary name, so a type may be called it" in {

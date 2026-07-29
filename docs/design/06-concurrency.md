@@ -187,3 +187,7 @@ to do it.
 - **Cancellation and shutdown.** Structured lifetimes for threads and channels — who wakes a
   blocked receiver, and how a server drains — is a library design question that should be
   settled before the first server is written on top of this.
+- **`weak sync T`.** `weak T` is built (`03`) and its atomic counterpart is not, because upgrading
+  one is a compare-and-swap loop against a strong count another thread may be driving to zero, and
+  nothing can race with it until this chapter is. It is refused where it is written, naming this
+  document. Whatever lands here has to say what an upgrade racing a release means.

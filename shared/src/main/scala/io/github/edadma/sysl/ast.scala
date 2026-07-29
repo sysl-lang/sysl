@@ -145,6 +145,7 @@ sealed trait TypeRef extends Positioned {
     case NamedType(n, args)               => s"$n[${args.map(_.show).mkString(", ")}]"
     case PtrType(inner)                   => s"*${inner.show}"
     case RefType(inner, sync)             => s"&${if sync then "sync " else ""}${inner.show}"
+    case WeakType(inner)                  => s"weak ${inner.show}"
     case ArrayType(None, elem)            => s"[]${elem.show}"
     case ArrayType(Some(IntLit(n, _)), e) => s"[$n]${e.show}"
     case ArrayType(Some(_), elem)         => s"[…]${elem.show}"
@@ -163,6 +164,9 @@ case class PtrType(inner: TypeRef) extends TypeRef
 
 /** `&T`, or `&sync T` when the refcount is atomic. */
 case class RefType(inner: TypeRef, sync: Boolean) extends TypeRef
+
+/** `weak T` — a reference that does not keep its referent alive (`03`). */
+case class WeakType(inner: TypeRef) extends TypeRef
 
 /** `[N]T` — a fixed array — or `[]T`, a slice, when no length is written. */
 case class ArrayType(length: Option[Expr], elem: TypeRef) extends TypeRef

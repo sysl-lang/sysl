@@ -203,8 +203,8 @@ type annotations. Clean bodies, honest boundaries.
 
 ARC cannot reclaim a reference cycle (A holds B, B holds A). The tool for back-references is
 **`weak T`**: a non-owning reference that does *not* keep its referent alive. When the last
-strong `&T` is gone, the object is freed and every `weak T` to it becomes empty. Because a weak
-reference may already be gone, **accessing it yields `Option[&T]`** — a live strong reference
+strong `&T` is gone, the object is destroyed and every `weak T` to it becomes empty. Because a
+weak reference may already be gone, **accessing it yields `Option[&T]`** — a live strong reference
 or `None` — and the compiler makes you handle the `None`, so a weak reference can never dangle.
 
 Cycles are uncommon, but back-references do occur in systems code — a child's pointer to its
@@ -212,16 +212,105 @@ parent, the back-link of an intrusive doubly-linked list, a process's pointer to
 process. `weak T` expresses those safely; reach for it only when you have a genuine
 back-reference. Needs an allocator.
 
-**Not built.** `weak` is in the reserved words and has no production in the type grammar, so
-`var w: weak Node` stops at the colon. Everything above is the design and none of it is the
-compiler, which matters because a program that wants it has no way to *say* that an edge does not
-own — it can only arrange never to leave the cycle standing. `guide/scheduler` is written that
-way and is the shape that wants this most: a blocked task holds the lock it waits for while that
-lock's wait list holds the task, and an owner and the lock it holds are a second loop. Its run
-loop takes both apart — every wait ends in a wakeup, every lock in a release — so the memory
-comes back; the same program *stalled* leaves the whole graph in place and nothing says so.
-Until this lands, "a cycle is broken before the program lets go of it" is a property a program
-asserts about itself rather than one the language checks.
+### A weak reference is made where one is asked for
+
+`weak T` is a **type**, written like the other two modes and in the same places:
+
+```
+struct Node
+    value: int
+    parent: weak Node
+    kids: []&Node
+end Node
+```
+
+There is no operator that makes one, and none is wanted. A `&T` becomes a `weak T` wherever a
+`weak T` is what the context asked for — a field of a struct being constructed, an argument, a
+declared local, a returned value — which is exactly the rule that already makes a `&T` out of a
+`T`. So `&` and `weak` both live at the boundaries a program annotates, and a body stays free of
+either.
+
+The conversion goes one way. A `weak T` is not a `&T` and never silently becomes one, because
+becoming one is the operation that can fail.
+
+What a weak reference may **not** be made from is a value with nowhere else to live. `weak T` is a
+type, so `Node(1)` written where one is expected would be boxed and then weakened — leaving the
+weak edge as the object's only holder, and the object dead before the statement ended. That is
+refused by name, with the advice to hold it in a `&T` first.
+
+### An empty one is written `None`
+
+A weak reference whose object is gone and one that never had an object are the same state, so they
+are spelled the same way:
+
+```
+var w: weak Node = None                 // nothing yet
+var root: &Node = Node(1, None)         // a node with no parent
+k.up = None                             // and a parent forgotten
+```
+
+`None` here is not an `Option` — it is the empty value of the weak reference itself, chosen because
+it is exactly what `get()` will hand back for one. It is also the **zero value** of `weak T`, so a
+struct with a weak field still has one and `var n: Node` is still a declaration. That is the one
+place `weak T` parts company with `&T`, which has no zero because there is no such thing as a
+reference to nothing.
+
+### Reading one is a question, and it is `get()`
+
+```
+match child.parent.get()
+    Some(p) -> print(p.value)
+    None    -> print("orphaned")
+```
+
+`get()` yields `Option[&T]`: a live strong reference, with a count taken for the caller, or
+`None` if the object is gone. Nothing else may be done to a `weak T` — no field selection, no
+method call, no `==`. Every road to the object goes through the `Option`, which is what makes
+"a weak reference never dangles" a fact about the language rather than a promise about the
+programmer.
+
+It is spelled with parentheses, unlike `.len` and `.chars`, and the difference is real: a
+property is a **fact about the value**, and `len` is the same answer every time it is asked.
+`get()` is a **question about the world** — two calls a moment apart may disagree, and the answer
+costs a count. sysl puts the parentheses on the second kind.
+
+Because `weak T` is a mode rather than a type of its own, it is not something an `impl` may be
+written for — and unlike the other two modes, that refusal has a consequence rather than only a
+principle behind it: a member call reaches through a `*T` and a `&T`, and through a weak reference
+it reaches nothing, so a member written there could never be called. For the same reason there is
+no `==` on weak references and no `Display` for one. Both are written on what `get()` hands back.
+
+Everything a `&T` may point at, a `weak T` may be taken of: a struct, a scalar, an array, one
+instantiation of a generic type, a trait object, and a type parameter (`weak T` inside a generic
+function, settled by a `&T` argument).
+
+### What it costs, and where
+
+Every heap object carries **three header words** rather than two: the strong count, the
+deallocation hook, and a weak count. The weak count is the number of weak references plus one
+for the strong references *collectively*, so it reaches zero only after both the last strong
+reference and the last weak one are gone. When the strong count reaches zero the object is
+destroyed — its payload's references are given back — but the storage is returned only when the
+weak count follows it down. That is what a `get()` on a dead object reads: storage that is still
+there, with a strong count of zero in it.
+
+The header is the same three words for **every** object, whether or not anything weakly
+references it, and that is deliberate: releasing a reference is type-erased — a slice's owner
+word has no static type to consult — so one layout is what makes the release path exist at all.
+Two layouts would mean a discriminator in the header to tell them apart, which is the word it was
+trying to save. The cost is eight bytes on an allocation that already cost a `malloc`.
+
+The alternative was a **side table** keyed by object address, which keeps the header at two words
+and pays a hash lookup on every weak operation and on every death. It is the wrong trade for a
+language that puts its costs where a reader can see them: the header word is paid once per object
+and is visible in the layout, the table would be paid per operation and visible nowhere.
+
+### `weak sync T` waits for concurrency
+
+An atomic-refcount object (`&sync T`) has no weak form yet. Upgrading is a compare-and-swap loop
+against a count that another thread may be driving to zero underneath it, and there is nothing
+to race with until `06` is built — so `weak sync T` is refused, naming the chapter, rather than
+given an implementation nothing can exercise.
 
 ## References are never null
 
@@ -360,4 +449,8 @@ greppable as everything else here.
   language's inclusive/exclusive meanings, `.len` as a field until methods exist).
 - **Unchecked-index escape hatch** — an opt-out of bounds checking for hot loops (default
   checked). Likely yes, deferred.
-- **`weak` runtime** — the exact weak-tracking representation (side table vs in-box header).
+- ~~`weak` runtime~~ — **done**, above: an in-box header word, uniform across every object, with
+  the weak count holding one share on behalf of the strong references collectively. The side
+  table was refused for putting the cost per-operation and out of sight.
+- **`weak sync T`** — an atomic weak reference, which wants the compare-and-swap upgrade and
+  something to race with. Waits on `06`.

@@ -77,14 +77,14 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
       out ++= s"${e.llvm} = type { i32, [$count x $unit] }\n"
     if program.enums.nonEmpty then out ++= "\n"
 
-    // A box is the refcount, the function that frees it, and the payload — so ARC works the
-    // same everywhere, and an object frees itself into whichever heap made it.
+    // A box is the strong count, the function that destroys it, the weak count, and the payload —
+    // so ARC works the same everywhere, and an object frees itself into whichever heap made it.
     for (name, payload) <- boxes do
-      out ++= s"$name = type { i64, ptr, ${payload.llvm} }\n"
+      out ++= s"$name = type { i64, ptr, i64, ${payload.llvm} }\n"
     // A buffer is the same box with the element count in front of elements there may be any number
     // of, so the hook — which is reached with no static type — can still find them all.
     for (name, elem) <- bufs do
-      out ++= s"$name = type { i64, ptr, i64, [0 x ${elem.llvm}] }\n"
+      out ++= s"$name = type { i64, ptr, i64, i64, [0 x ${elem.llvm}] }\n"
     if boxes.nonEmpty || bufs.nonEmpty then out ++= "\n"
 
     if boolStrs then
@@ -99,6 +99,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     if heap then out ++= ArcEmitter.core
     if syncHeap then out ++= ArcEmitter.atomic
     if maybeHeap then out ++= ArcEmitter.maybe
+    if weakHeap then out ++= ArcEmitter.weak
     for t <- runtimeTexts do out ++= t; out ++= "\n"
 
     for t <- funcTexts do out ++= t; out ++= "\n"
@@ -426,6 +427,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     // A trait object is two words, so its zero is a zeroed pair rather than a null address — and,
     // like every null pointer, calling through one is the programmer's business.
     case _: Type.Ptr | _: Type.Ref if Type.erased(ty) => "zeroinitializer"
+    case Type.Weak(inner) => if inner.isInstanceOf[Type.Trait] then "zeroinitializer" else "null"
     case _: Type.Ptr      => "null"
     case _: Type.Ref      => "null"
     case _: Type.Struct   => "zeroinitializer"
@@ -968,6 +970,12 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
 
     case TEnumTry(value, en, optTy, some, none) =>
       genEnumTry(value, en, optTy, some, none)
+
+    case TDowngrade(value, weakTy) =>
+      genDowngrade(value, weakTy)
+
+    case TUpgrade(value, optTy, some, none) =>
+      genUpgrade(value, optTy, some, none)
 
     case TEnumAttr(kind, en, arg, _) =>
       genEnumAttr(kind, en, arg)

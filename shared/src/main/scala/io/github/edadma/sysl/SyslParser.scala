@@ -483,12 +483,18 @@ class SyslParser(val source: Source) extends PackratParsers {
    * arguments (`Box[int]`, `Result[T, string]`). `sync` stays a soft keyword — it is only
    * special immediately after `&`, and the `&sync T` alternative is tried first so that a
    * reference to a type actually named `sync` still parses.
+   *
+   * `weak` is a reserved word rather than a sigil, since a mode a program reaches for only for a
+   * genuine back-reference (`03`) is better read than punctuated.
    */
   private lazy val typeRef: Parser[TypeRef] =
     at(
       op("*") ~> typeRef ^^ PtrType.apply |
         op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
         op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
+        op("weak") ~> softSync ~> err("an atomic reference has no weak form yet — 'weak sync T' " +
+          "wants the concurrency model of '06', which is not built") |
+        op("weak") ~> typeRef ^^ WeakType.apply |
         (op("[") ~> opt(expression) <~ op("]")) ~ typeRef ^^ { case n ~ t => ArrayType(n, t) } |
         tupleType |
         qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },

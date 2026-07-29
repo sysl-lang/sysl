@@ -18,13 +18,20 @@ trait ArcEmitter extends Emitter {
    */
   protected def containsRef(t: Type): Boolean = t match
     case _: Type.Ref         => true
+    case _: Type.Weak        => true
     case _: Type.View        => true // the owner word, which may or may not be there
     case Type.Array(_, elem) => containsRef(elem)
     case s: Type.Struct      => s.fields.exists(f => containsRef(f._2))
     case e: Type.Enum        => e.variants.exists(_.fields.exists(f => containsRef(f._2)))
     case _                   => false
 
-  /** The LLVM name of the box that holds a `T` on the heap: the refcount, the deallocation
+  /** Where a box's own contents begin, once the three header words — the strong count, the
+   * destruction hook, and the weak count (`03 § What it costs`) — are behind them. A buffer's
+   * element count sits here and its elements one further on.
+   */
+  protected val headerFields = 3
+
+  /** The LLVM name of the box that holds a `T` on the heap: the two counts, the deallocation
    * hook, and the payload.
    */
   protected def boxName(payload: Type): String = {
@@ -41,6 +48,12 @@ trait ArcEmitter extends Emitter {
     val b = freshTemp(); emit(s"$b = extractvalue ${Type.fatPointer} $v, 1"); b
   }
 
+  /** The address a weak reference counts against: the box itself, or — behind a trait object —
+   * the second of its two words.
+   */
+  private def weakBox(ty: Type.Weak, v: String): String =
+    if ty.inner.isInstanceOf[Type.Trait] then erasedBox(v) else v
+
   /** Takes a share of everything a value refers to. A bare reference is one refcount; an
    * aggregate delegates to a per-type helper that walks its reference-carrying fields.
    */
@@ -56,6 +69,7 @@ trait ArcEmitter extends Emitter {
       heap = true
       syncHeap ||= sync
       emit(s"call void @arc.retain${if sync then "_sync" else ""}(ptr $v)")
+    case w: Type.Weak        => weakHeap = true; emit(s"call void @arc.weak_retain(ptr ${weakBox(w, v)})")
     case w: Type.View        => emit(s"call void @arc.retain_maybe(ptr ${owner(w, v)})")
     case t if containsRef(t) => emit(s"call void @${valueHelper(t, retain = true)}(${t.llvm} $v)")
     case _                   => ()
@@ -71,6 +85,7 @@ trait ArcEmitter extends Emitter {
       heap = true
       syncHeap ||= sync
       emit(s"call void @arc.release${if sync then "_sync" else ""}(ptr $v)")
+    case w: Type.Weak        => weakHeap = true; emit(s"call void @arc.weak_release(ptr ${weakBox(w, v)})")
     case w: Type.View        => emit(s"call void @arc.release_maybe(ptr ${owner(w, v)})")
     case t if containsRef(t) => emit(s"call void @${valueHelper(t, retain = false)}(${t.llvm} $v)")
     case _                   => ()
@@ -89,17 +104,16 @@ trait ArcEmitter extends Emitter {
    * makes releasing a reference type-erased — a slice's owner has no static type to consult.
    */
   protected def dropFn(payload: Type): String = {
-    if !containsRef(payload) then "@arc.free"
+    if !containsRef(payload) then "null"
     else
       val m  = Type.mangle(payload)
       val bn = boxName(payload)
 
       "@" + request(s"arc.drop.$m") {
         inFunction(s"define private void @arc.drop.$m(ptr %p)") {
-          val pa = freshTemp(); emit(s"$pa = getelementptr $bn, ptr %p, i32 0, i32 2")
+          val pa = freshTemp(); emit(s"$pa = getelementptr $bn, ptr %p, i32 0, i32 $headerFields")
           val v  = freshTemp(); emit(s"$v = load ${payload.llvm}, ptr $pa")
           releaseValue(payload, v)
-          emit("call void @free(ptr %p)")
           emitTerm("ret void")
         }
       }
@@ -193,8 +207,12 @@ trait ArcEmitter extends Emitter {
     emit(s"store i64 1, ptr $p")
     val hook = freshTemp(); emit(s"$hook = getelementptr $bn, ptr $p, i32 0, i32 1")
     emit(s"store ptr ${dropFn(inner)}, ptr $hook")
+    // One weak share stands for every strong reference together, so the storage outlives the
+    // object exactly as long as some weak reference is still asking about it (`03`).
+    val wc = freshTemp(); emit(s"$wc = getelementptr $bn, ptr $p, i32 0, i32 2")
+    emit(s"store i64 1, ptr $wc")
 
-    val slot = freshTemp(); emit(s"$slot = getelementptr $bn, ptr $p, i32 0, i32 2")
+    val slot = freshTemp(); emit(s"$slot = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
     retainValue(inner, v)
     emit(s"store ${inner.llvm} $v, ptr $slot")
 
@@ -217,22 +235,21 @@ trait ArcEmitter extends Emitter {
    * the storage. Elements that hold nothing need no walk, so the plain free is the hook.
    */
   protected def dropBufFn(elem: Type): String = {
-    if !containsRef(elem) then "@arc.free"
+    if !containsRef(elem) then "null"
     else
       val m  = Type.mangle(elem)
       val bn = bufName(elem)
 
       "@" + request(s"arc.dropbuf.$m") {
         inFunction(s"define private void @arc.dropbuf.$m(ptr %p)") {
-          val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr %p, i32 0, i32 2")
+          val lenp = freshTemp(); emit(s"$lenp = getelementptr $bn, ptr %p, i32 0, i32 $headerFields")
           val n    = freshTemp(); emit(s"$n = load i64, ptr $lenp")
-          val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr %p, i32 0, i32 3")
+          val data = freshTemp(); emit(s"$data = getelementptr $bn, ptr %p, i32 0, i32 ${headerFields + 1}")
 
           eachElement(elem, data, n) { ep =>
             val ev = freshTemp(); emit(s"$ev = load ${elem.llvm}, ptr $ep")
             releaseValue(elem, ev)
           }
-          emit("call void @free(ptr %p)")
           emitTerm("ret void")
         }
       }
@@ -281,7 +298,7 @@ trait ArcEmitter extends Emitter {
     operand.ty match
       case Type.Ref(inner, _) =>
         val r = freshTemp()
-        emit(s"$r = getelementptr ${boxName(inner)}, ptr $p, i32 0, i32 2")
+        emit(s"$r = getelementptr ${boxName(inner)}, ptr $p, i32 0, i32 $headerFields")
         r
       case _ => p
   }
@@ -388,9 +405,21 @@ object ArcEmitter {
    * work rather than recursing, so teardown depth is O(1) regardless of structure depth. The
    * worklist is a plain global, which is correct while drops are single-threaded; concurrent drops
    * of `&sync` structures across threads will need it thread-local.
+   *
+   * **The storage outlives the object when something weak still asks about it.** The strong count
+   * reaching zero destroys the object — the payload's references are given back — but the bytes
+   * come back only when the weak count follows, and the weak count holds one share on behalf of
+   * every strong reference together (`03 § What it costs`). So a `get()` on a dead object reads
+   * storage that is still there and finds a strong count of zero in it.
+   *
+   * That share is also what makes the worklist safe. A queued object has its strong slot on loan
+   * as the list's link, and a weak release arriving in that window cannot free it, because the
+   * share the strong references left behind has not been given back yet — `arc.destroy` is what
+   * gives it back, after the hook has run and the link is no longer needed. The slot is put back
+   * to zero before the hook runs, so nothing ever reads a link where a count should be.
    */
   val core: String =
-    """%arc.header = type { i64, ptr }
+    """%arc.header = type { i64, ptr, i64 }
       |
       |@arc.worklist = internal global ptr null
       |@arc.draining = internal global i1 false
@@ -407,7 +436,28 @@ object ArcEmitter {
       |entry:
       |  %h = getelementptr %arc.header, ptr %p, i32 0, i32 1
       |  %f = load ptr, ptr %h
+      |  %none = icmp eq ptr %f, null
+      |  br i1 %none, label %after, label %run
+      |run:
       |  call void %f(ptr %p)
+      |  br label %after
+      |after:
+      |  call void @arc.unshare(ptr %p)
+      |  ret void
+      |}
+      |
+      |define private void @arc.unshare(ptr %p) {
+      |entry:
+      |  %w = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      |  %c = load i64, ptr %w
+      |  %n = sub i64 %c, 1
+      |  store i64 %n, ptr %w
+      |  %z = icmp eq i64 %n, 0
+      |  br i1 %z, label %gone, label %kept
+      |gone:
+      |  call void @free(ptr %p)
+      |  ret void
+      |kept:
       |  ret void
       |}
       |
@@ -428,6 +478,7 @@ object ArcEmitter {
       |step:
       |  %next = load ptr, ptr %q
       |  store ptr %next, ptr @arc.worklist
+      |  store i64 0, ptr %q
       |  call void @arc.destroy(ptr %q)
       |  br label %loop
       |finish:
@@ -451,10 +502,55 @@ object ArcEmitter {
       |  ret void
       |}
       |
-      |define private void @arc.free(ptr %p) {
+      |""".stripMargin
+
+  /** The three functions a `weak T` needs, emitted only into a module that holds one.
+   *
+   * `upgrade` is the whole of what separates a weak reference from a dangling one: it reads the
+   * strong count, and a zero there means the object has already been destroyed, so the caller is
+   * handed nothing instead of an address. A live count is taken, which is why the answer is a
+   * reference the caller owns rather than one it has to be careful with.
+   */
+  val weak: String =
+    """define private void @arc.weak_retain(ptr %p) {
       |entry:
-      |  call void @free(ptr %p)
+      |  %empty = icmp eq ptr %p, null
+      |  br i1 %empty, label %done, label %live
+      |live:
+      |  %w = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      |  %c = load i64, ptr %w
+      |  %n = add i64 %c, 1
+      |  store i64 %n, ptr %w
       |  ret void
+      |done:
+      |  ret void
+      |}
+      |
+      |define private void @arc.weak_release(ptr %p) {
+      |entry:
+      |  %empty = icmp eq ptr %p, null
+      |  br i1 %empty, label %done, label %live
+      |live:
+      |  call void @arc.unshare(ptr %p)
+      |  ret void
+      |done:
+      |  ret void
+      |}
+      |
+      |define private ptr @arc.upgrade(ptr %p) {
+      |entry:
+      |  %empty = icmp eq ptr %p, null
+      |  br i1 %empty, label %gone, label %check
+      |check:
+      |  %c = load i64, ptr %p
+      |  %z = icmp eq i64 %c, 0
+      |  br i1 %z, label %gone, label %live
+      |live:
+      |  %n = add i64 %c, 1
+      |  store i64 %n, ptr %p
+      |  ret ptr %p
+      |gone:
+      |  ret ptr null
       |}
       |
       |""".stripMargin

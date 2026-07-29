@@ -10,10 +10,10 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
   private val point = "struct Point\n    x: int\n    y: int\n"
 
-  "a box is the count, the deallocation hook, and the payload" in {
+  "a box is the strong count, the deallocation hook, the weak count, and the payload" in {
     val out = ir(point + "var p: &Point = Point(1, 2)")
 
-    out should include("%arc.Point = type { i64, ptr, %struct.Point }")
+    out should include("%arc.Point = type { i64, ptr, i64, %struct.Point }")
     out should include("declare ptr @malloc(i64)")
     out should include("declare void @free(ptr)")
   }
@@ -23,7 +23,16 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     out should include regex raw"%t\d+ = call ptr @malloc\(i64 %t\d+\)"
     out should include regex raw"store i64 1, ptr %t\d+"
-    out should include("store ptr @arc.free, ptr")   // a payload holding nothing needs no destructor
+    out should include("store ptr null, ptr")   // a payload holding nothing needs no destructor
+  }
+
+  // The weak count starts at one because the strong references hold one share between them
+  // (`03 § What it costs`), so the storage lives exactly until the object and every weak reference
+  // to it are both gone.
+  "and its weak count starts at the one share the strong references hold together" in {
+    val out = ir(point + "var p: &Point = Point(1, 2)")
+
+    out should include regex raw"%t\d+ = getelementptr %arc\.Point, ptr %t\d+, i32 0, i32 2\n  store i64 1, ptr %t\d+"
   }
 
   "the same construction with no expectation stays a value" in {
@@ -56,13 +65,15 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
     out should include regex raw"call void @arc\.release\(ptr %t\d+\)\n  ret ptr %t\d+"
   }
 
-  "a destructor lets go of what the payload held, then calls through the hook" in {
+  "a destructor lets go of what the payload held, and leaves the storage to whoever is last" in {
     val src = "struct Node\n    value: int\n    next: Option[&Node]\nvar n: &Node = Node(1, None)"
     val out = ir(src)
 
     out should include("define private void @arc.drop.Node(ptr %p) {")
     out should include("call void @arc.dispose.Node(%struct.Node %t2)")
-    out should include regex raw"call void @arc\.dispose\.Node[^\n]*\n  call void @free\(ptr %p\)"
+    // The hook releases and returns; giving the storage back is `arc.destroy`'s, after it, because
+    // a weak reference may still be asking about the object the hook has just emptied.
+    out should include regex raw"call void @arc\.dispose\.Node[^\n]*\n  ret void"
     out should include("store ptr @arc.drop.Node, ptr")
   }
 
