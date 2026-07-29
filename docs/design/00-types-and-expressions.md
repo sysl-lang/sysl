@@ -137,6 +137,7 @@ a, b = b, a                              // a swap, with no temporary to name
 xs[i], xs[j] = xs[j], xs[i]              // the one every sort writes
 lo, hi, mid = 0, n, n / 2
 p.x, p.y = p.y, p.x
+a, b += 1, 2                             // compound forms multi-assign too
 ```
 
 **The right side is evaluated in full, into temporaries, before any assignment happens.** That is
@@ -152,22 +153,53 @@ that rule the form would be a way of accidentally calling something twice.
 dereference — the same set a single `=` accepts, and the types must match pairwise. The two sides
 must be the same length, which is a compile-time check.
 
+The one place that set is *smaller* than a single `=`'s is an element of a container, where `b[i] =
+v` is a call to `index_set` rather than a store (`14`). Such an element has no address for the
+locating phase to find, and the call both reads and writes, so there is nothing to separate into the
+two halves this form's ordering rule is about. It is refused, with a diagnostic saying so; a program
+that wants one writes that assignment on its own line.
+
+**A binding takes the same comma list**: `val a, b = 1, 2` and `var lo, hi = 0, n` name several
+things at once, with each part's type inferred from its own value. The right side is produced before
+any name is bound, so a value there still names whatever the enclosing scope calls one of them — the
+binding does not shadow itself half way through its own right-hand side. It is a **local** form: a
+module member states its type (`13 §2`) and there is nowhere here to write one (`12 §5b`), so a
+multiple `val` at the top of a file is a diagnostic rather than a quiet local of the entry point.
+The same spelling takes a result list and a tuple apart — see §13.
+
 **It is a statement, not an expression**, and this is the decision that keeps the feature small. A
 single assignment yields the assigned value, which is what lets `a = b = c = 0` chain; a
-multi-assignment would have to yield *several* values, and the only thing that could be is a tuple.
-Sysl has none (`§ Open j`), and this form exists precisely so that the useful nine-tenths of what
-tuples are reached for costs no type at all. So a multi-assignment does not nest, does not appear in
-a condition, and has no value to discard.
+multi-assignment would have to yield *several* values, and the only thing that could be is a tuple
+(§13). Building one here would mean allocating a product type for a form whose whole point is that
+several places change at once — so a multi-assignment does not nest, does not appear in a condition,
+and has no value to discard. A program that wants the pair as a value writes the tuple and says so.
 
-**Compound forms do not multi-assign.** `a, b += 1, 2` is refused: a compound assignment reads its
-place before writing it, and the rule above says every right-hand value is computed before any
-write — the two together are a sentence nobody should have to work out. Write the two statements.
+**Compound forms multi-assign too**, and they need no rule of their own — only the one above, read
+carefully. A compound assignment reads its place before it writes it, so the reads join the other
+reads: **every place is located, then every place a compound form touches is read, then the whole
+right side is produced, and only then does anything land.** So `a, b += b, a` adds the old `b` to
+`a` and the old `a` to `b`, which is what a reader of a form whose whole promise is simultaneity
+expects, and every operand of every arm sees the values the statement started with.
 
-Counted values need no special care and it is worth saying why. Each right-hand value is evaluated
-and retained into its temporary before any store happens, so swapping two `&T`s never lets either
-count reach zero in between — the transient the naive `t = a; a = b; b = t` shape has to be careful
-about does not arise, because there is no window in which a reference has been overwritten but its
-replacement has not been taken.
+The reason to spell the phases out rather than leave the form to two statements is that the two
+statements are the version that surprises: `a += b` followed by `b += a` folds the new `a` into `b`,
+and nothing on the page says so. One line that means what it looks like is worth more than a rule
+against writing it.
+
+**A struct's `invariant` is re-checked once, after every write has landed** (`05`), and not after
+each one in turn. This is the same rule as everything else here, applied to the checks: the form
+promises that the places change together, and an invariant relating two fields is exactly what it
+is for. Checking field by field would refuse `s.lo, s.hi = 6, 8` on a `Span` that held `1..5`,
+because for an instant `lo` would be `6` and `hi` still `5` — a state the program never asked for
+and cannot observe. A struct whose fields are all written by one statement is therefore checked
+once, whichever of them were written.
+
+**Counted values are where the ordering rule stops being free**, and it is worth saying exactly what
+it costs. Writing into a place lets go of what was there, and in a swap what was there is precisely
+the value the other arm is still holding — so a lowering that merely *read* everything first would
+free a `&T` between reading it and storing it. The rule is therefore that **every read takes a count
+for the statement**, given back when the statement ends. `s, t = t, s` on two strings, and
+`s, t += t, s`, are each correct for that reason and not for a weaker one.
 
 ### Statement position discards a block's value
 

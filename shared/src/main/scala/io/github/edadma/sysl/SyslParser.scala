@@ -335,8 +335,20 @@ class SyslParser(val source: Source) extends PackratParsers {
   lazy val statement: PackratParser[Stmt] =
     at(
       importDecl | implDecl | declaration | varDecl | returnStmt |
-        breakStmt | continueStmt | requireStmt | ensureStmt | exprStmt,
+        breakStmt | continueStmt | requireStmt | ensureStmt | multiAssign | exprStmt,
     )
+
+  /** `a, b = b, a` — a comma list of places, a comma list of values (`00 §2`).
+   *
+   * It comes before `exprStmt` and after everything else, and it needs **two or more** targets to
+   * commit: with one it would be an ordinary assignment written the long way round, which
+   * `expression` already reads. Nothing below a statement admits a bare comma, so the first one is
+   * enough to tell the two apart with no lookahead to speak of.
+   */
+  private lazy val multiAssign: PackratParser[Stmt] =
+    (logicalOr <~ op(",")) ~ rep1sep(logicalOr, op(",")) ~ assignOp ~ rep1sep(expression, op(",")) ^^ {
+      case first ~ rest ~ o ~ values => MultiAssign(o, first :: rest, values)
+    }
 
   /** `require <cond> [, "message"]` / `ensure <cond> [, "message"]` — a design-by-contract
    * clause. Only meaningful at the top of a function body; the analyzer rejects one that
@@ -491,8 +503,21 @@ class SyslParser(val source: Source) extends PackratParsers {
     at(qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => BoundRef(n, args.getOrElse(Nil)) })
 
   private lazy val varDecl: PackratParser[Stmt] =
-    op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
-      case n ~ t ~ e => VarDecl(n, t, e)
+    multiDecl("var", mutable = true) |
+      op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
+        case n ~ t ~ e => VarDecl(n, t, e)
+      }
+
+  /** `val a, b = …` / `var a, b = …` — a binding that names several things (`00 §2`).
+   *
+   * Two or more names, and an initializer, are both required: one name is the ordinary form, and a
+   * multiple binding with nothing to take apart names nothing. The parts carry no type annotation,
+   * which is `12 §5b`'s open question rather than an oversight — inference covers what the form is
+   * for, and there is no spelling yet for the case it does not.
+   */
+  private def multiDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
+    (op(keyword) ~> ident <~ op(",")) ~ rep1sep(ident, op(",")) ~ (op("=") ~> rep1sep(expression, op(","))) ^^ {
+      case first ~ rest ~ values => MultiDecl(first :: rest, mutable, values)
     }
 
   /** `const name: type = value` (`13 §7`). Both halves are mandatory, which is what tells it apart
@@ -515,9 +540,10 @@ class SyslParser(val source: Source) extends PackratParsers {
    * applied there.
    */
   private lazy val valDecl: PackratParser[Stmt] =
-    op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
-      case n ~ t ~ v => ValDecl(n, t, v)
-    }
+    multiDecl("val", mutable = false) |
+      op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
+        case n ~ t ~ v => ValDecl(n, t, v)
+      }
 
   private lazy val exprStmt: PackratParser[Stmt] = expression ^^ (e => ExprStmt(e).setPos(e.pos))
 
@@ -920,7 +946,7 @@ class SyslParser(val source: Source) extends PackratParsers {
   /** One clause of a three-clause `for` header: a `var` declaration or a bare expression, which for
    * the step is the assignment or increment that advances the loop.
    */
-  private lazy val forClause: PackratParser[Stmt] = at(varDecl | exprStmt)
+  private lazy val forClause: PackratParser[Stmt] = at(varDecl | multiAssign | exprStmt)
 
   // --- match ---------------------------------------------------------------------------
 

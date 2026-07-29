@@ -104,6 +104,12 @@ object Reachability {
       case c: TCall           => calls += c.name; c.args.foreach(scan)
       case s: TStructInvCheck => calls += s.invFn; scan(s.value)
       case s: TCheckedStore   => calls += s.invFn; scan(s.store); scan(s.recv)
+      // A multi-assignment's arm carries its re-check as data rather than as a node, so the
+      // predicate's name is a `String` the shape cannot tell from any other and has to be read out
+      // here — exactly as `TCheckedStore`'s is, for the same reason.
+      case w: TWrite =>
+        w.check.foreach((recv, _, invFn) => { calls += invFn; scan(recv) })
+        scan(w.place); scan(w.value); w.dispatch.foreach(scan)
       case c: TConstrainedCheck =>
         c.target.predFn.foreach(calls += _)
         scan(c.value)

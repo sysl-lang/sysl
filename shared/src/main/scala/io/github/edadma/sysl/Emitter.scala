@@ -113,6 +113,15 @@ trait Emitter {
   /** Lowers one statement for its effects. */
   protected def genStmt(stmt: TStmt): Unit
 
+  /** The value a compound assignment stores: what its operator makes of the place's current value
+   * and the value on the right, whether that is an instruction or a trait method (`14 §3`).
+   */
+  protected def combine(op: String, ty: Type, valueTy: Type, dispatch: Option[TDispatch],
+                        cur: String, v: String): String
+
+  /** Traps unless a struct's `invariant` clauses hold of the value in `v` (`05`). */
+  protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit
+
   protected def startFunction(): Unit = {
     prologue = new mutable.StringBuilder
     body = new mutable.StringBuilder

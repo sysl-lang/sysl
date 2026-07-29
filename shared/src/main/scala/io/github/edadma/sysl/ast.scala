@@ -311,6 +311,24 @@ case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = 
 case class ValDecl(name: String, typ: Option[TypeRef], value: Expr, vis: Visibility = Visibility.Public)
     extends Stmt
 
+/** `a, b = b, a` — several places written from several values in one step (`00 §2`).
+ *
+ * It is a statement rather than an expression, and that is what keeps it small: a single assignment
+ * yields the value it stored, so a multiple one would have to yield several, and there is nothing an
+ * expression could be that carries several values without becoming a tuple by another name.
+ *
+ * `op` is the operator that was written. Only `=` means anything here — a compound form is read so
+ * that the rule against it can be explained rather than left to a parse failure.
+ */
+case class MultiAssign(op: String, targets: List[Expr], values: List[Expr]) extends Stmt
+
+/** `val a, b = …` / `var a, b = …` — one binding that names several things at once (`00 §2`).
+ *
+ * The names are declared only after every value has been produced, so a value on the right may
+ * still name whatever the surrounding scope calls one of them.
+ */
+case class MultiDecl(names: List[String], mutable: Boolean, values: List[Expr]) extends Stmt
+
 case class ExprStmt(expr: Expr)                                    extends Stmt
 
 /** `['label] while cond body [else elseBody]` as an **expression**. A `break expr` in the body

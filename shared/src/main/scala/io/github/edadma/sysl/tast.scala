@@ -372,6 +372,27 @@ sealed trait TStmt
 case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
 
+/** One write of a multi-assignment: the place, the operator that was written, the value, the trait
+ * method a compound operator lowers to when it is not an instruction (`14 §3`), and the `invariant`
+ * re-check the receiver needs once the write lands (`05`).
+ *
+ * The check is carried here rather than wrapped around a store node, as `TCheckedStore` wraps one,
+ * because these writes are not expressions and there is nothing for a node to wrap.
+ */
+case class TWrite(place: TExpr, op: String, value: TExpr, dispatch: Option[TDispatch],
+                  check: Option[(TExpr, Type.Struct, String)])
+
+/** `a, b = b, a` — several places written from several values (`00 §2`).
+ *
+ * The order of events is the whole content of the form, and it is phases rather than one write at a
+ * time. Every place's own subexpressions are computed first, and once, so an index that calls
+ * something calls it a single time. Then everything the statement *reads* is read — what a compound
+ * arm finds in its place, and then the whole right side — which is what makes a swap a swap instead
+ * of two statements that leave both variables holding the same thing, and what makes every operand
+ * of every arm see the values the statement started with. Only then does anything land.
+ */
+case class TMultiAssign(writes: List[TWrite]) extends TStmt
+
 /** `while cond body [else …]` as an expression. `body` runs for effect each iteration; a `break`
  * in it carries the loop's value, and `elseBlock` (if present) supplies the value on normal
  * completion. `ty` is the loop's result type — `unit` when nothing carries a value.
@@ -393,7 +414,7 @@ case class TFor(name: String, varTy: Type, lo: TExpr, hi: TExpr, inclusive: Bool
 /** `for init; cond; step [else …]` — the three-clause loop. An absent condition is `true`, and the
  * step is what `continue` runs before the next test.
  */
-case class TCFor(init: Option[TStmt], cond: Option[TExpr], step: Option[TStmt], body: List[TStmt],
+case class TCFor(init: List[TStmt], cond: Option[TExpr], step: List[TStmt], body: List[TStmt],
                  elseBlock: Option[TBlock], ty: Type) extends TExpr
 
 /** `for name in seq [else …]` over an array or a slice. The loop variable is a *copy* of each

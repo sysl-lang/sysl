@@ -141,6 +141,14 @@ trait Hoisting extends HoistMembers {
       declScope(key) = currentScope
       recordAccess(key, v.vis)
 
+    // The same rule, meeting a form that cannot satisfy it: a binding that names several things has
+    // nowhere to write a type for any of them (`12 §5b`), so it can only ever be a local. Saying so
+    // here is what stops one at the top of a file from quietly becoming a local of the entry point,
+    // where every other `val` written there is a module member.
+    case m: MultiDecl if !m.mutable =>
+      at(m.pos)(err("a module-level 'val' states its type, and a binding that names several things " +
+        s"has nowhere to write one — declare ${m.names.map(n => s"'$n'").mkString(" and ")} separately"))
+
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
     // — the duplicate check goes with the resolution, in `hoistImpl`. The module it was written in
     // travels with it, since that is what the trait it names and the type it is for resolve under.

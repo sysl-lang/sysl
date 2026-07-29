@@ -167,7 +167,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     currentModule = mainScope.module
     currentImports = mainScope.imports
     currentFile = mainScope.file
-    val tmain = mainStmts.map(recoverStmt)
+    val tmain = mainStmts.flatMap(recoverStmt)
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An
     // instantiation of a member the definition-time pass already reported is dropped rather than

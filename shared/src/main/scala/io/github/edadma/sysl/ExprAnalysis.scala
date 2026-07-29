@@ -92,13 +92,22 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * is. The receiver of the field is the struct to re-read — the same node covers `s.f = v`, a
    * compound `s.f op= v`, and a through-pointer `(*p).f = v`, since each analyses to a field place.
    */
-  private def withInvCheck(place: TExpr, store: TExpr): TExpr = place match
+  private def withInvCheck(place: TExpr, store: TExpr): TExpr =
+    invCheckFor(place) match
+      case Some((recv, s, fn)) => TCheckedStore(store, recv, s, fn).setPos(store.pos)
+      case None                => store
+
+  /** The struct a write through `place` obliges a re-check of, if any: what to re-read, its type,
+   * and the predicate to call. Split out from the wrapper above because a multi-assignment's writes
+   * are statements rather than expressions, so there is nothing there for a node to wrap.
+   */
+  protected def invCheckFor(place: TExpr): Option[(TExpr, Type.Struct, String)] = place match
     case TField(recv, _, _) =>
       recv.ty match
         case s: Type.Struct if structDecls.get(s.base).exists(d => d.invariants.nonEmpty && d.tparams.isEmpty) =>
-          TCheckedStore(store, recv, s, invKey(s.base)).setPos(store.pos)
-        case _ => store
-    case _ => store
+          Some((recv, s, invKey(s.base)))
+        case _ => None
+    case _ => None
 
   /** `Name(value)` — an explicit cast into a constrained subtype. The operand is taken at the
    * subtype's base and checked; a value whose base does not agree is a mistake the message names.
@@ -678,10 +687,10 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     // the condition — which reads that binding — and closes after the `else`, which may too.
     case CFor(label, init, cond, step, body, elseOpt) =>
       pushScope()
-      val tinit        = init.map(recoverStmt)
+      val tinit        = init.toList.flatMap(recoverStmt)
       val tcond        = cond.map(analyzeBool)
-      val (tbody, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
-      val tstep        = step.map(recoverStmt)
+      val (tbody, ctx) = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
+      val tstep        = step.toList.flatMap(recoverStmt)
       val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       popScope()
       // With no condition the loop cannot finish on its own, so its type is what its `break`s
@@ -706,7 +715,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
           val last      = if c.exclusiveHi then hi - 1 else hi
           pushScope()
           val u         = declare(name, i)
-          val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
+          val (tb, ctx) = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
           popScope()
           val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
           TFor(u, i, TIntLit(lo.toBigInt, i), TIntLit(last.toBigInt, i), inclusive = true, tb, telse,
@@ -721,7 +730,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
             case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
           pushScope()
           val u            = declare(name, vty)
-          val (tb, ctx)    = analyzeLoopBody(expected, label)(body.map(recoverStmt))
+          val (tb, ctx)    = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
           popScope()
           val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
           TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
@@ -804,7 +813,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
                       elseOpt: Option[List[Stmt]], expected: Option[Type], discarded: Boolean): TExpr = {
     pushScope()
     val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
+    val (tb, ctx) = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
     popScope()
     val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
     TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
@@ -830,7 +839,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
     pushScope()
     val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(body.map(recoverStmt))
+    val (tb, ctx) = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
     popScope()
     val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
     val bind      = TVariantPattern(opt, opt.variant("Some").get, List(TBindPattern(u, elem)))
@@ -866,7 +875,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * Whatever goes wrong while typing the receiver is left for the ordinary path to report, in the
    * place the programmer wrote it.
    */
-  private def indexes(traitName: String, receiver: Expr): Boolean =
+  protected def indexes(traitName: String, receiver: Expr): Boolean =
     probe(autoDeref(analyzeExpr(receiver)).ty)
       .exists(t => Type.element(t).isEmpty && indexes(traitName, t))
 
@@ -1019,7 +1028,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       case None        => t
 
   /** How a diagnostic names an assignment target. */
-  private def describe(target: Expr): String = target match
+  protected def describe(target: Expr): String = target match
     case Ident(n)      => s"'$n'"
     case Field(_, f)   => s"field '$f'"
     case Unary("*", _) => "the place it points at"

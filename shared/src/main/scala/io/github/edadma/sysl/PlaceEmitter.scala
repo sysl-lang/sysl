@@ -43,6 +43,72 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       emit(s"store ${other.ty.llvm} ${genExpr(other)}, ptr $slot")
       slot
 
+  /** Writes `v` into the place at `p`. A slot that holds a count takes one for the value arriving
+   * and lets go of the one leaving, in that order, so assigning something to itself never briefly
+   * drops the last count.
+   */
+  protected def storeInto(ty: Type, p: String, v: String): Unit =
+    if containsRef(ty) then
+      val old = freshTemp(); emit(s"$old = load ${ty.llvm}, ptr $p")
+      retainValue(ty, v)
+      emit(s"store ${ty.llvm} $v, ptr $p")
+      releaseValue(ty, old)
+    else emit(s"store ${ty.llvm} $v, ptr $p")
+
+  /** `a, b = b, a` (`00 §2`), in the phases the form promises.
+   *
+   * Locating every place comes first, so an index that calls something calls it once and the calls
+   * happen in written order. Then everything the statement reads is read — what each compound arm
+   * finds in its place, and then the whole right side — and because no store has happened yet, every
+   * operand of every arm sees the values the statement started with. The writes come left to right.
+   *
+   * **Every `invariant` re-check waits until all of them have landed**, and once per struct however
+   * many of its fields were written. A struct whose invariant relates two fields is exactly what
+   * this form is for, and checking after each field in turn would trap on the half-written state on
+   * the way to a perfectly good one — `s.lo, s.hi = 6, 8` on a `Span` that was `1..5` would be
+   * refused for the moment `lo` was `6` and `hi` still `5`.
+   */
+  protected def genMultiAssign(writes: List[TWrite]): Unit = {
+    val addrs = writes.map(w => if Type.zeroSized(w.place.ty) then "" else address(w.place))
+
+    // Every read takes a count for the statement, which is what a form that reads everything before
+    // it writes anything needs and a single assignment does not. Writing into the first place lets
+    // go of what was there, and in a swap what was there is exactly the value the second arm is
+    // holding — so without a count of its own that value can be freed between being read and being
+    // stored. The statement's counts go back at the end of the statement, as every temporary's do.
+    def held(v: String, ty: Type): String = {
+      retainValue(ty, v)
+      ownTemp(v, ty)
+    }
+
+    val curs = writes.zip(addrs).map { (w, p) =>
+      if w.op == "=" || p.isEmpty then ""
+      else
+        val c = freshTemp(); emit(s"$c = load ${w.place.ty.llvm}, ptr $p")
+        held(c, w.place.ty)
+    }
+    val vals = writes.map(w => held(genExpr(w.value), w.value.ty))
+
+    for ((w, p), (cur, v)) <- writes.zip(addrs).zip(curs.zip(vals)) do
+      if p.nonEmpty then
+        val ty = w.place.ty
+
+        if w.op == "=" then storeInto(ty, p, v)
+        else
+          val updated = combine(w.op, ty, w.value.ty, w.dispatch, cur, v)
+
+          // A compound arm has already read what was in the slot, so the release is of that value
+          // rather than of a second load — which is `TUpdate`'s arrangement, for its reason.
+          if containsRef(ty) then
+            retainValue(ty, updated)
+            emit(s"store ${ty.llvm} $updated, ptr $p")
+            releaseValue(ty, cur)
+          else emit(s"store ${ty.llvm} $updated, ptr $p")
+
+    for (recv, struct, invFn) <- writes.flatMap(_.check).distinct do
+      emitInvCheck(genExpr(recv), struct, invFn)
+  }
+
   /** Where a written field index lands in the emitted aggregate, once the zero-sized fields before
    * it are dropped.
    */

@@ -124,7 +124,18 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
    * aggregate `v`, call `invFn`, and trap on a false result. The fields are handed over exactly as
    * an ordinary call's arguments are — the callee borrows, so no count is taken here.
    */
-  private def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit =
+  /** What a compound assignment stores: a slot that holds a count — a string, or a struct with a
+   * reference in it — builds a fresh value the slot will take a count for, and a slot of anything
+   * else is arithmetic.
+   */
+  protected def combine(op: String, ty: Type, valueTy: Type, dispatch: Option[TDispatch],
+                        cur: String, v: String): String =
+    (ty, dispatch) match
+      case (_, Some(d))  => ownTemp(dispatchValue(d, ty, valueTy, cur, v, ty), ty)
+      case (Type.Str, _) => ownTemp(strConcat(cur, v), Type.Str)
+      case _             => arith(op.dropRight(1), ty, cur, v)
+
+  protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit =
     val args = struct.fields.zipWithIndex.collect {
       case ((_, ft), i) if !Type.zeroSized(ft) =>
         val r = freshTemp(); emit(s"$r = extractvalue ${struct.llvm} $v, ${struct.slot(i)}")
@@ -478,6 +489,9 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     case TExprStmt(expr) =>
       genExpr(expr)
 
+    case TMultiAssign(writes) =>
+      genMultiAssign(writes)
+
     case TReturn(opt) =>
       opt match
         case Some(t) =>
@@ -694,27 +708,14 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions)
     case TStore(place, value, ty) =>
       val v = genExpr(value)
       val p = address(place)
-      if containsRef(ty) then
-        // The new value is retained before the old is released, so assigning something to
-        // itself does not briefly drop the last count.
-        val old = freshTemp(); emit(s"$old = load ${ty.llvm}, ptr $p")
-        retainValue(ty, v)
-        emit(s"store ${ty.llvm} $v, ptr $p")
-        releaseValue(ty, old)
-      else emit(s"store ${ty.llvm} $v, ptr $p")
+      storeInto(ty, p, v)
       v
 
     case TUpdate(place, op, value, ty, dispatch) =>
       val p       = address(place)
       val cur     = freshTemp(); emit(s"$cur = load ${ty.llvm}, ptr $p")
       val v       = genExpr(value)
-      // A slot that holds a count — a string, or a struct with a reference in it — retains the fresh
-      // value for the slot and releases what was there before, exactly like a plain assignment; a
-      // slot of anything else just overwrites.
-      val updated = (ty, dispatch) match
-        case (_, Some(d))  => ownTemp(dispatchValue(d, ty, value.ty, cur, v, ty), ty)
-        case (Type.Str, _) => ownTemp(strConcat(cur, v), Type.Str)
-        case _             => arith(op.dropRight(1), ty, cur, v)
+      val updated = combine(op, ty, value.ty, dispatch, cur, v)
 
       if containsRef(ty) then
         retainValue(ty, updated)

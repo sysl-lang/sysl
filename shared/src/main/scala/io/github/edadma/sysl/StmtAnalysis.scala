@@ -40,18 +40,18 @@ trait StmtAnalysis extends TypeResolution {
   protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type], discarded: Boolean = false): TBlock =
     stmts.reverse match
       case ExprStmt(e) :: initRev =>
-        val init = initRev.reverse.map(recoverStmt)
+        val init = initRev.reverse.flatMap(recoverStmt)
         val tr   = analyzeExpr(e, expected, discarded)
         TBlock(init, Some(tr), if discarded && tr.ty != Type.Never then Type.Unit else tr.ty)
       case (_: Return | _: Break | _: Continue) :: _ =>
-        TBlock(stmts.map(recoverStmt), None, Type.Never)
+        TBlock(stmts.flatMap(recoverStmt), None, Type.Never)
       case _ =>
-        TBlock(stmts.map(recoverStmt), None, Type.Unit)
+        TBlock(stmts.flatMap(recoverStmt), None, Type.Unit)
 
   /** A statement sequence used only for its effects (a loop body): a fresh scope, no value. */
   protected def analyzeStmts(stmts: List[Stmt]): List[TStmt] = {
     pushScope()
-    val r = stmts.map(recoverStmt)
+    val r = stmts.flatMap(recoverStmt)
     popScope()
     r
   }
@@ -126,7 +126,7 @@ trait StmtAnalysis extends TypeResolution {
    * The statement it stands in for is a no-op: nothing is emitted from a program that has an
    * error, so the substitute only has to be well-formed enough for the walk to continue.
    */
-  protected def recoverStmt(stmt: Stmt): TStmt = {
+  protected def recoverStmt(stmt: Stmt): List[TStmt] = {
     // A statement abandoned part-way may have opened a scope or entered a loop that it never got
     // to close, so both are wound back to where the statement started. Without this an inner
     // block's bindings would stay visible after it, and the analyzer would be *more* permissive
@@ -138,7 +138,7 @@ trait StmtAnalysis extends TypeResolution {
       while scopes.length > depth do popScope()
       loops = outer
       bindFailed(stmt)
-      TExprStmt(TUnitLit())
+      List(TExprStmt(TUnitLit()))
     }(analyzeStmt(stmt))
   }
 
@@ -151,17 +151,100 @@ trait StmtAnalysis extends TypeResolution {
   private def bindFailed(stmt: Stmt): Unit = stmt match
     case VarDecl(name, _, _)    => declare(name, Type.Unknown)
     case ValDecl(name, _, _, _) => declareReadOnly(name, Type.Unknown)
+    case MultiDecl(names, mutable, _) =>
+      for n <- names do if mutable then declare(n, Type.Unknown) else declareReadOnly(n, Type.Unknown)
     case _                      =>
 
-  private def analyzeStmt(stmt: Stmt): TStmt = at(stmt.pos)(analyzeStmtAt(stmt))
+  private def analyzeStmt(stmt: Stmt): List[TStmt] = at(stmt.pos)(analyzeStmtAt(stmt))
 
-  private def analyzeStmtAt(stmt: Stmt): TStmt = stmt match
+  /** `a, b = b, a` and `a, b += 1, 2` (`00 §2`).
+   *
+   * Every place is analyzed before any value, which is what fixes each value's expected type: a
+   * literal on the right takes the width of the place it is heading for, exactly as it does after a
+   * single `=`. Each arm is then checked by the rule its own operator already has — the plain form
+   * wants a value the place can hold, the compound one wants an operator that does not change the
+   * place's type — so the form adds no rule of its own beyond the two sides being the same length.
+   * The ordering it promises is a run-time matter and belongs to codegen.
+   */
+  private def multiAssign(m: MultiAssign): TStmt = {
+    if m.targets.length != m.values.length then
+      err(s"this assignment has ${m.targets.length} places on the left and ${m.values.length} " +
+        s"${if m.values.length == 1 then "value" else "values"} on the right")
+
+    // `b[i] = v` on a container is a call to `index_set` rather than a store (`14`), so it has no
+    // address for the phase that locates the places to find and no reading of it separates what it
+    // reads from what it writes. Saying that is worth more than the "needs something with an
+    // address" the ordinary path would reach.
+    for t <- m.targets do
+      t match
+        case Index(receiver, _) if indexes("IndexSet", receiver) =>
+          at(t.pos)(err("an element set through 'Index' is a call rather than a store, so it cannot be " +
+            "one place of a multiple assignment — write that one on its own"))
+        case _ =>
+
+    val what   = if m.op == "=" then "assignment" else s"'${m.op}'"
+    val places = m.targets.map(analyzePlace(_, what))
+
+    val writes =
+      for ((target, place), value) <- m.targets.zip(places).zip(m.values)
+      yield at(value.pos) {
+        if m.op == "=" then
+          val tv = analyzeExpr(value, Some(place.ty))
+
+          if tv.ty == Type.Never || disagree(tv.ty, place.ty) then
+            err(s"cannot assign ${show(tv.ty)} to ${describe(target)} of type ${show(place.ty)}")
+          TWrite(place, m.op, tv, None, invCheckFor(place))
+        else
+          val binSym = m.op.dropRight(1)
+          val tv     = analyzeExpr(value, updateExpected(binSym, place.ty))
+          val d      = updateDispatch(binSym, place, tv)
+
+          if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then
+            err(s"'${m.op}' would change the type of ${describe(target)}")
+          TWrite(place, m.op, tv, d, invCheckFor(place))
+      }
+
+    TMultiAssign(writes)
+  }
+
+  /** `val a, b = …` / `var a, b = …` (`00 §2`).
+   *
+   * The names are declared only once every value has been analyzed, so a value may still name
+   * whatever the enclosing scope calls one of them — the binding does not shadow itself half way
+   * through its own right-hand side.
+   */
+  private def multiDecl(m: MultiDecl): List[TStmt] = {
+    for (n, i) <- m.names.zipWithIndex do
+      if m.names.indexOf(n) != i then err(s"'$n' is named twice in one binding")
+
+    if m.names.length != m.values.length then
+      err(s"this binding names ${m.names.length} things and has ${m.values.length} " +
+        s"${if m.values.length == 1 then "value" else "values"} to give them")
+
+    val tvs =
+      for v <- m.values
+      yield
+        val tv = at(v.pos)(analyzeExpr(v, None))
+        if tv.ty == Type.Never then at(v.pos)(err("cannot bind a name to an expression that never returns"))
+        tv
+
+    for (name, tv) <- m.names.zip(tvs)
+    yield TVarDecl(if m.mutable then declare(name, tv.ty) else declareReadOnly(name, tv.ty), tv.ty, tv)
+  }
+
+  /** Most statements are one statement. The two comma forms are the exception, and the only reason
+   * this hands back a list: a binding that names several things is several declarations.
+   */
+  private def analyzeStmtAt(stmt: Stmt): List[TStmt] = stmt match
+    case m: MultiAssign => List(multiAssign(m))
+    case m: MultiDecl   => multiDecl(m)
+
     // An import binds a name for the statements after it and emits nothing. It is read here rather
     // than gathered ahead of the block because it takes effect where it is written, as Scala's
     // does — the code above it has not imported anything.
     case i: ImportDecl =>
       importInBlock(i)
-      TExprStmt(TUnitLit())
+      List(TExprStmt(TUnitLit()))
 
     case VarDecl(name, typOpt, Some(init)) =>
       val declared = typOpt.map(rt)
@@ -173,7 +256,7 @@ trait StmtAnalysis extends TypeResolution {
       val declTy = declared.getOrElse(ti.ty)
       if declared.isDefined && disagree(ti.ty, declTy) then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
-      TVarDecl(declare(name, declTy), declTy, ti)
+      List(TVarDecl(declare(name, declTy), declTy, ti))
 
     // A local `val` is a `var` that may not be assigned to again — same frame, same lifetime, same
     // code. Only the binding differs, so the two share everything below this line, and the read-only
@@ -185,16 +268,16 @@ trait StmtAnalysis extends TypeResolution {
       val declTy = declared.getOrElse(ti.ty)
       if declared.isDefined && disagree(ti.ty, declTy) then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
-      TVarDecl(declareReadOnly(name, declTy), declTy, ti)
+      List(TVarDecl(declareReadOnly(name, declTy), declTy, ti))
 
     case VarDecl(name, typOpt, None) =>
       val ty = typOpt.map(rt).getOrElse(err(s"'$name' needs either a type or an initial value"))
       if !hasZero(ty) then err(s"${show(ty)} has no zero value, so '$name' needs an initial value")
-      TVarDecl(declare(name, ty), ty, TZero(ty))
+      List(TVarDecl(declare(name, ty), ty, TZero(ty)))
 
     // A statement's value is nobody's, so whatever branching it contains is analyzed knowing that.
     case ExprStmt(e) =>
-      TExprStmt(analyzeExpr(e, None, discarded = true))
+      List(TExprStmt(analyzeExpr(e, None, discarded = true)))
 
     case Return(opt) =>
       val tv = opt.map(analyzeExpr(_, Some(retTy)))
@@ -203,7 +286,7 @@ trait StmtAnalysis extends TypeResolution {
         case Some(t) if disagree(t.ty, retTy) => err(s"return type mismatch: expected ${show(retTy)}, got ${show(t.ty)}")
         case None if retTy != Type.Unit       => err(s"this function must return a ${show(retTy)} value")
         case _                                =>
-      TReturn(tv)
+      List(TReturn(tv))
 
     // `break value` records its type against the loop it targets — the nearest, or the one a
     // `'label` names — which unites it with that loop's other breaks and its `else` to fix the
@@ -213,15 +296,15 @@ trait StmtAnalysis extends TypeResolution {
       val (ctx, depth) = resolveLoop("break", label)
       val tv           = opt.map(e => analyzeExpr(e, ctx.expected))
       ctx.breakTys += tv.map(_.ty).getOrElse(Type.Unit)
-      TBreak(tv, depth)
+      List(TBreak(tv, depth))
 
     case Continue(label) =>
       val (_, depth) = resolveLoop("continue", label)
-      TContinue(depth)
+      List(TContinue(depth))
 
     // A constant is a declaration that was hoisted and folded into its uses (`13 §7`), so where the
     // walk meets one among the entry point's statements there is nothing left to run.
-    case _: ConstDecl => TExprStmt(TUnitLit())
+    case _: ConstDecl => List(TExprStmt(TUnitLit()))
 
     case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl | _: TypeDecl =>
       err("functions, structs, enums, traits, impls, externs, and types may only be declared at the top level")

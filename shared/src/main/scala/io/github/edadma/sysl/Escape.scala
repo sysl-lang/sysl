@@ -295,6 +295,13 @@ private class Escape(program: TProgram) {
         forEachStmt(stmts) {
           case TVarDecl(name, _, init)                  => bind(name, views(init))
           case TExprStmt(TStore(TLoad(name, _), v, _))  => bind(name, views(v))
+          // A multi-assignment's arms are stores, and one landing in a plain local binds that local
+          // to what it was given for the same reason a single one does.
+          case TMultiAssign(writes) =>
+            for w <- writes do
+              w.place match
+                case TLoad(name, _) => bind(name, views(w.value))
+                case _              =>
           case _                                        =>
         }
 
@@ -306,6 +313,14 @@ private class Escape(program: TProgram) {
       case TReturn(Some(v))  => returned(v)
       case TVarDecl(_, _, e) => escaping(e)
       case TExprStmt(e)      => escaping(e)
+      // Each arm is a store, so each is walked as one: a view that lands anywhere but a plain local
+      // of this body has left it, exactly as it would after a single `=`.
+      case TMultiAssign(writes) =>
+        for w <- writes do
+          escaping(w.value)
+          w.place match
+            case _: TLoad => escaping(w.place)
+            case _        => if viewsFrame(w.value) then gets_out(w.value, "is stored somewhere the frame does not own")
       // A `break value` carries the value out of the loop; walk it for the escape sites it may
       // contain. Whether it then leaves the frame is decided where the loop's own value is used.
       case TBreak(Some(v), _)   => escaping(v)
@@ -397,6 +412,8 @@ private class Escape(program: TProgram) {
         case TVarDecl(_, _, e) => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TReturn(Some(e))  => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TBreak(Some(e), _)   => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
+        case TMultiAssign(writes) =>
+          for w <- writes; e <- List(w.place, w.value); b <- blocks(e) do forEachStmt(b.stmts)(f)
         case _                 =>
 
   /** The `break` values that belong to a loop with these body statements — those in its body but
@@ -408,6 +425,7 @@ private class Escape(program: TProgram) {
     case TExprStmt(e)      => ownBreaksInExpr(e)
     case TVarDecl(_, _, e) => ownBreaksInExpr(e)
     case TReturn(Some(e))  => ownBreaksInExpr(e)
+    case TMultiAssign(writes) => writes.flatMap(w => ownBreaksInExpr(w.place) ::: ownBreaksInExpr(w.value))
     case _                 => Nil
   }
 
@@ -428,7 +446,7 @@ private class Escape(program: TProgram) {
     // The init and the step are statements of the loop's own scope, so they are walked as part of
     // the block its body makes rather than as expressions beside it.
     case TCFor(init, _, step, body, el, _) =>
-      TBlock(init.toList ::: body ::: step.toList, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
+      TBlock(init ::: body ::: step, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TFor(_, _, _, _, _, body, el, _) => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TForEach(_, _, _, body, el, _)   => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TIterate(_, _, _, _, _, body, el, _) =>

@@ -1,7 +1,5 @@
 package io.github.edadma.sysl
 
-import scala.collection.mutable
-
 /** The semantic pass: it resolves names, checks types, and turns the untyped `Program` into
  * a typed `TProgram` that codegen lowers directly. All diagnostics live here; codegen trusts
  * the tree it is handed.

@@ -869,6 +869,12 @@ trait AnalyzerBase {
   protected def analyzeExpr(expr: Expr, expected: Option[Type] = None, discarded: Boolean = false): TExpr
   protected def analyzeBool(e: Expr): TExpr
   protected def analyzePlace(target: Expr, what: String): TExpr
+  protected def invCheckFor(place: TExpr): Option[(TExpr, Type.Struct, String)]
+  protected def describe(target: Expr): String
+  protected def indexes(traitName: String, receiver: Expr): Boolean
+  protected def arithType(op: String, a: Type, b: Type): Type
+  protected def updateExpected(op: String, placeTy: Type): Option[Type]
+  protected def updateDispatch(op: String, place: TExpr, value: TExpr): Option[TDispatch]
   protected def analyzeBlockBody(stmts: List[Stmt], expected: Option[Type], discarded: Boolean = false): TBlock
   protected def coerce(t: TExpr, expected: Type): TExpr
   protected def autoDeref(t: TExpr): TExpr
