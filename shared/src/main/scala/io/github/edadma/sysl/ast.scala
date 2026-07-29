@@ -190,8 +190,13 @@ case class BoundRef(name: String, args: List[TypeRef] = Nil) extends Positioned 
   def show: String = if args.isEmpty then name else s"$name[${args.map(_.show).mkString(", ")}]"
 }
 
-/** One `name: type` binding, shared by function parameters and struct fields. */
-case class Param(name: String, typ: TypeRef) extends Positioned
+/** One `name: type` binding, shared by function parameters and struct fields.
+ *
+ * `vis` is a **field's** — how far the field may be read from (`08 § Visibility`). A function
+ * parameter is named by nobody outside the signature it is written in, so it carries the unmarked
+ * default and the grammar gives it no place to write anything else.
+ */
+case class Param(name: String, typ: TypeRef, vis: Visibility = Visibility.Public) extends Positioned
 
 /** How an instance member takes its receiver — the memory-mode sigil written before `self`.
  * A property receiver is implicit and not spelled, so it is absent here (a property carries no
@@ -216,6 +221,10 @@ enum RecvMode:
  * `tparams` and `bounds` are the member's **own** type parameters, which are not the type's: a
  * method of a `Box[T]` that also takes a `[U]` is generic over `U` at each call, while `T` is fixed
  * by the receiver. A property has none — there would be nothing at the read to fix them with.
+ *
+ * `vis` is how far the member may be named from (`08 § Visibility`). The unmarked default means
+ * *its type's* reach rather than public, so `Public` here is "said nothing" and not "said public" —
+ * which is why a trait's member and an `impl`'s, neither of which may say anything, carry it too.
  */
 case class MethodDecl(
     name: String,
@@ -227,6 +236,7 @@ case class MethodDecl(
     body: List[Stmt],
     bounds: Map[String, List[BoundRef]] = Map.empty,
     tdefaults: Map[String, TypeRef] = Map.empty,
+    vis: Visibility = Visibility.Public,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the

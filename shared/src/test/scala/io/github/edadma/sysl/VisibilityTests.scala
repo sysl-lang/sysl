@@ -444,7 +444,8 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
         "'loud' is public, but the bound on 'T' names 'Show', which is private to 'main.sysl'")
     }
 
-    // Fields have no visibility of their own, so a field of a reachable struct is reachable.
+    // A field carries its own reach, so it is named as one and asked at its own — public here,
+    // since it said nothing and the struct it belongs to is public.
     "a field of a public struct" in {
       errIn(("", "main.sysl",
         """private struct Point
@@ -452,7 +453,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
           |struct Line
           |    a: Point
           |print(1)
-          |""".stripMargin)) should include("'Line' is public, but field 'a' names 'Point'")
+          |""".stripMargin)) should include("'Line.a' is public, but its type names 'Point'")
     }
 
     "the payload of a public enum's variant" in {

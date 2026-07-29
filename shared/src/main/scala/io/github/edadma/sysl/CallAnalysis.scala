@@ -208,8 +208,10 @@ trait CallAnalysis extends Literals with TraitObjects {
 
         memberDecls.get((base, chosen)) match
           case Some(m) if m.receiver.isDefined && m.tparams.nonEmpty =>
+            checkMemberVisible(base, chosen, m)
             callGenericMethod(genericMembers((base, chosen)), m, targs, tr, args, expected)
           case Some(m) if m.receiver.isDefined =>
+            checkMemberVisible(base, chosen, m)
             val fname           = memberFuncName(rty, chosen)
             val (params, rtype) = funcInsts(fname)
             if args.length != params.length - 1 then
@@ -776,6 +778,7 @@ trait CallAnalysis extends Literals with TraitObjects {
 
     memberDecls.get((tname, chosen)) match
       case Some(m) if m.receiver.isEmpty && !m.isProperty =>
+        checkMemberVisible(tname, chosen, m)
         genericMembers.get((tname, chosen)) match
           case Some(fd) => callGenericAssociated(tname, fd, m, args, expected)
           case None =>
@@ -878,6 +881,12 @@ trait CallAnalysis extends Literals with TraitObjects {
 
     if args.length != decl.fields.length then
       err(s"struct '${qn(name)}' has ${quantity(decl.fields.length, "field")}, but ${supplied(args.length, "value")}")
+
+    // The positional constructor writes every field, so a restricted one puts it out of reach
+    // (`08 § Visibility`) — a private field a caller could still set by position would restrict
+    // nothing worth restricting.
+    checkEveryFieldVisible(name, decl.fields.map(_.name), "the constructor",
+      "build it through an associated function of its own")
 
     val (targs, pre) =
       if decl.tparams.isEmpty then (Nil, None)

@@ -50,6 +50,11 @@ trait Hoisting extends HoistMembers {
       for m <- s.members do checkSolvedDefaults("the method", s"${s.name}.${m.name}", m.tdefaults)
       declScope(key) = currentScope
       recordAccess(key, s.vis)
+      // A field's and a member's reach is settled here beside the type's rather than where the
+      // members are lowered, because both are compared against the type's own — and against the
+      // types they name, which is a pass that runs before any member is lowered.
+      for f <- s.fields do at(f.pos)(recordMemberAccess(key, f.name, f.vis, s"${s.name}.${f.name}"))
+      for m <- s.members do at(m.pos)(recordMemberAccess(key, m.name, m.vis, s"${s.name}.${m.name}"))
       if Prelude.declares(s) then preludeNames += key
     case e: EnumDecl =>
       val key = Modules.qualify(currentModule, e.name)
@@ -64,6 +69,7 @@ trait Hoisting extends HoistMembers {
       for m <- e.members do checkSolvedDefaults("the method", s"${e.name}.${m.name}", m.tdefaults)
       declScope(key) = currentScope
       recordAccess(key, e.vis)
+      for m <- e.members do at(m.pos)(recordMemberAccess(key, m.name, m.vis, s"${e.name}.${m.name}"))
       if Prelude.declares(e) then preludeNames += key
       // Variant names are unique **within a module** rather than across the program: a bare
       // `Circle(5)` resolves against the module it is written in, so two modules may each name a
@@ -85,6 +91,10 @@ trait Hoisting extends HoistMembers {
       traitDecls(key) = t.copy(name = key).setPos(t.pos)
       declScope(key) = currentScope
       recordAccess(key, t.vis)
+      // A trait's members take no modifier of their own, so each is recorded at the trait's reach —
+      // which is what makes "how far does this member go" one question with one answer, whether it
+      // was asked about a trait's member, a type's, or a type's field.
+      for m <- t.methods do recordMemberAccess(key, m.name, Visibility.Public, s"${t.name}.${m.name}")
       if Prelude.declares(t) then preludeNames += key
       checkBoundNames(t.name, t.bounds)
       for m <- t.methods do
@@ -247,43 +257,6 @@ trait Hoisting extends HoistMembers {
           (s.fields.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))), Type.Bool)
 
     case _ =>
-
-  /** Records how far a declaration is visible, for the modifier it was written with (`13 §2`).
-   *
-   * A public declaration records nothing: the unmarked default is the common case, and a table that
-   * held an entry for it would be a table with an entry per declaration in every program. What is
-   * stored is the answer rather than the modifier — the file, and the module a `private[M]` resolved
-   * to — because the question is asked at every use and the modifier alone cannot answer it.
-   *
-   * A `private[M]` naming no enclosing module is reported and then left public, so the mistake is
-   * one diagnostic at the declaration rather than one at every use of it.
-   */
-  protected def recordAccess(key: String, vis: Visibility): Unit = vis match
-    case Visibility.Public    => ()
-    case Visibility.File      => declAccess(key) = Access(currentFile, None)
-    case Visibility.Scoped(m) => recover(())(declAccess(key) = Access(currentFile, Some(enclosing(m))))
-
-  /** Which module a `private[M]` names: the **innermost** enclosing one whose last segment is `M`,
-   * counting the declaring module itself (`13 §2`).
-   *
-   * Reading outward from the declaration is what disambiguates a repeated segment — `private[geom]`
-   * inside `geom.mesh.geom.tri` is the nearer `geom` — and taking the answer from where the
-   * declaration sits is what keeps moving a subtree elsewhere from changing what its own
-   * annotations mean. There is deliberately no way to name an unrelated module, so a visibility
-   * scope is always a contiguous subtree containing the declaration.
-   */
-  private def enclosing(m: String): String = {
-    val parts = if currentModule.isEmpty then Nil else currentModule.split('.').toList
-
-    parts.lastIndexOf(m) match
-      case -1 if parts.isEmpty =>
-        err(s"this file is at the project root, whose module has no name, so there is no '$m' " +
-          "to widen to — 'private' on its own is this file")
-      case -1 =>
-        err(s"'$m' is not '$currentModule' or one of its ancestors, and 'private[M]' widens to a " +
-          "module the declaration is already inside")
-      case i => parts.take(i + 1).mkString(".")
-  }
 
   /** Checks what every trait **requires** of the types that implement it, in a pass of its own once
    * every trait is registered — because `trait Ord: Eq` is ordinary whichever of the two is written

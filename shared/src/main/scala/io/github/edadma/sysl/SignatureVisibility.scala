@@ -68,7 +68,8 @@ trait SignatureVisibility extends TypeResolution {
     for (key, d) <- structDecls.toList do
       val own = d.tparams.toSet
 
-      expose(key, own, d.bounds, d.fields.map(f => (s"field '${f.name}'", f.typ, f.pos)) ::: defaults(d.tdefaults))
+      expose(key, own, d.bounds, defaults(d.tdefaults))
+      for f <- d.fields do exposeField(key, own, f)
       for m <- d.members do exposeMember(key, own, m)
 
     for (key, d) <- enumDecls.toList do
@@ -110,18 +111,33 @@ trait SignatureVisibility extends TypeResolution {
       supers: List[BoundRef] = Nil,
   ): Unit = exposeIn(key, Modules.split(key)._2, reachOf(key), tparams, bounds, parts, supers)
 
-  /** One member of a type or of a trait, which is as visible as the thing it belongs to: a member
-   * carries no modifier of its own (`13 § Open f`), and there would be nothing for one to widen to
-   * if it did.
+  /** One member of a type or of a trait, asked at **its own** reach (`08 § Visibility`).
+   *
+   * That is the type's where the member said nothing, since an unmarked member inherits it, and
+   * narrower where it restricted itself — so a `private` helper method may name a `private` type
+   * that the public method beside it may not.
    */
   private def exposeMember(owner: String, tparams: Set[String], m: MethodDecl): Unit =
     exposeIn(
       owner,
       s"${Modules.split(owner)._2}.${m.name}",
-      reachOf(owner),
+      reachOf(memberAccessKey(owner, m.name)),
       tparams ++ m.tparams + selfName,
       m.bounds,
       signature(m.params, m.retType),
+    )
+
+  /** One field, which carries a modifier for the same reason a member does and is asked the same
+   * question: a caller who can read the field can hold whatever type it named.
+   */
+  private def exposeField(owner: String, tparams: Set[String], f: Param): Unit =
+    exposeIn(
+      owner,
+      s"${Modules.split(owner)._2}.${f.name}",
+      reachOf(memberAccessKey(owner, f.name)),
+      tparams,
+      Map.empty,
+      List(("its type", f.typ, f.pos)),
     )
 
   private def signature(params: List[Param], ret: Option[TypeRef]): List[(String, TypeRef, Option[Pos])] =

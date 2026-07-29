@@ -190,8 +190,8 @@ visible there.
 **It reaches everything a caller has to be able to write**, which is more than a parameter and a
 result: a struct's fields and an enum variant's payload, since neither has a visibility of its own; a
 type *argument*, since `Box[Point]` names `Point` as much as a bare `Point` does; a trait behind a
-memory mode, which is an object over it; a member of a type or a trait, which carries no modifier and
-is therefore as visible as the thing it belongs to; and a **bound**, since a trait a caller cannot
+memory mode, which is an object over it; a member of a type or a trait, which is as visible as the
+thing it belongs to unless it narrows itself (`08 § Visibility`); and a **bound**, since a trait a caller cannot
 name leaves it unable to say what is being asked of it.
 
 **An `impl` block is outside the rule, in both directions.** Implementing a private trait for a
@@ -685,11 +685,11 @@ reaches; a clash is reported at whichever was written second.
   always a contiguous subtree. What is left open is how scoped-private interacts with re-export
   (b) — whether a facade module may forward a name it can see but its own importers cannot — which
   cannot be pinned before (b) is.
-- **f. Visibility below the top level.** §2 governs a *top-level* declaration. Whether a type's
-  **member** can be restricted — a helper method that is not part of what the type offers — is
-  open, and is the same question as (c) one level down: both are about a boundary that is not the
-  file or the module. A member written with a modifier is a parse error today, which is the right
-  refusal for something not yet designed but a poor way to say so.
+- **f. Visibility below the top level — settled for members, open for modules.** §2 governs a
+  *top-level* declaration, and a type's **fields and inherent members** now take the same four
+  reaches: `08 § Visibility` has the rules, of which the load-bearing one is that an unmarked member
+  sits at its type's reach and a modifier may only narrow. What is left of this item is (c) — a
+  whole *module* private to its parent — which is the same question one level up.
 - **g. What the file level buys the backend.** §2 notes that a bare `private` is the level at which
   mangling can be skipped and LLVM `internal` linkage applies. Neither is done: the compiler emits
   one module for the whole program, so `internal` would be correct but would buy nothing

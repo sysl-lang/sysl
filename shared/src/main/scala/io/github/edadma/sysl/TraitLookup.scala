@@ -12,7 +12,7 @@ import scala.collection.mutable
  * It sits between `AnalyzerBase` and everything else so that every trait mixed into the
  * analyzer sees these without having to name them.
  */
-trait TraitLookup extends AnalyzerBase {
+trait TraitLookup extends MemberVisibility {
 
   /** One `impl Trait for Type` block, as everything downstream of the hoist reads it.
    *

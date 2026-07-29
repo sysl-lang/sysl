@@ -340,6 +340,80 @@ rule, which `02` deliberately does not have. A **property** takes no arguments a
 resolved this way at all: two implementations both supplying one make it unreadable, which is
 reported where it is read.
 
+## Visibility
+
+`13 §2` gives a top-level declaration four reaches: public, `private[ancestor]`,
+`private[own_module]`, and a bare `private` meaning the file that declares it. A type's **fields**
+and its **inherent members** take the same modifiers, in the same spellings, written before the
+declaration exactly as they are at the top level.
+
+```
+struct Counter
+    private n: int
+
+    value(self) -> int = self.n
+
+    private[stats] bump(*self) = self.n += 1
+
+    make() -> Counter = Counter(0)
+end Counter
+```
+
+### A member starts at its type's reach, and a modifier only narrows
+
+An unmarked member is **as visible as the type it belongs to** — not public. That is what `13 §2`
+already says about a member, and adding the modifier changes only what a member may say about
+itself, never what silence means. A `private struct Node`'s members are file-private whether or not
+any of them says so, and a public type's are public until one says otherwise.
+
+A modifier may therefore only **narrow**. A `private[oskit]` member of a `private[oskit.arch]`
+struct names a region larger than anything that can reach the struct at all, so it is refused rather
+than quietly clamped: the reader of that line would otherwise be told something about the member
+that is not true. This is the mirror of `13 §2`'s "a declaration may not be more visible than the
+types it names", asked about the type a member *belongs to* rather than about the types it mentions.
+
+### Every way of reading a field is restricted, and the constructor is one of them
+
+A modifier decides who may **read** a field, and a field is read three ways: by selecting it, by
+naming it in a pattern, and — the one that is easy to miss — by writing the **positional
+constructor**, since `Point(1, 2)` names every field of `Point` in order.
+
+| Written | Reads | Needs visible |
+|---|---|---|
+| `p.x`, `p.x = 5` | one field | that field |
+| `Point{x: a}` | the fields it names | those fields |
+| `Point(a, b)` (pattern) | every field, in order | every field |
+| `Point(1, 2)` (constructor) | every field, in order | every field |
+
+The last is the consequential one, and it is deliberate. A private field a caller could still set by
+position would restrict nothing worth restricting: an invariant that a constructor can be made to
+break is not an invariant. A struct with a restricted field is therefore built from outside through
+an **associated function**, which is what that form is for and what the diagnostic names.
+
+Rust answers this the same way and for the same reason. The alternative — exempting the constructor
+— leaves `private` on a field meaning only "you may not read it back", and nothing useful rests on
+that.
+
+### A member a trait declares carries no modifier
+
+A `trait`'s members and an `impl` block's have no visibility of their own, and a modifier written on
+either is refused. A trait's member is as visible as the trait: it is part of what the trait asks
+for, and a requirement a caller cannot name is one they cannot ask about. An `impl`'s member
+supplies what the trait declared, so its reach was settled where the trait was written. This is the
+same sentence `13 §2` writes about an `impl` block itself, which takes no modifier because it
+declares no name of its own.
+
+An enum's variants and their payload fields carry none either, for the reason `13 §2` gives: a
+variant belongs to a type nobody outside may name, and a variant a caller may construct is one they
+may take apart.
+
+### A restricted member states its own types
+
+`13 §2`'s "a declaration may not be more visible than the types it names" is asked of each member
+and each field at **its own** reach rather than at its type's. So a `private` field of a public
+struct may name a `private` type — nothing outside the file can reach the field, so nothing leaks —
+while a public method of that same struct may not, exactly as a public function may not.
+
 ## Not yet
 
 - **Settable properties.** A property is read-only. A getter/setter pair, so that `p.name = v`
@@ -347,8 +421,5 @@ reported where it is read.
 - **Static (type-level) properties and stored associated constants.** Associated *functions*
   exist; a type-level constant or computed property (`int.max`, `Point.origin` without the call)
   is deferred with settable properties, since both turn on the same accessor machinery.
-- **Method visibility.** Everything is visible for now; applying `13`'s levels — public by
-  default, `private` for the declaring file, `private[M]` for a module or an ancestor subtree — to
-  methods and to individual fields waits on the module system being built.
 - **Default trait method bodies and trait-level invariants** — those are `02`'s open items, not
   this document's.

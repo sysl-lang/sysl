@@ -108,6 +108,10 @@ trait PatternAnalysis extends TypeResolution {
           if args.length != s.fields.length then
             err(s"struct '${qn(s.base)}' has ${quantity(s.fields.length, "field")}, " +
               s"but ${supplied(args.length, "sub-pattern")}")
+          // Naming every field is reading every field, so the positional pattern needs each of them
+          // visible — the same rule the positional constructor is held to (`08 § Visibility`).
+          checkEveryFieldVisible(s.base, s.fields.map(_._1), "this pattern",
+            "match the fields it does offer by name, as 'Name{…}'")
           TStructPattern(s, args.zip(s.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
         case other =>
           err(s"'$name(…)' matches an enum variant or a struct, but the value is ${show(other)}" + heldBehind(other))
@@ -137,6 +141,7 @@ trait PatternAnalysis extends TypeResolution {
           }
           for (fname, _) <- fieldPats do
             if !s.fields.exists(_._1 == fname) then err(s"struct '${qn(s.base)}' has no field '$fname'")
+            else checkFieldVisible(s.base, fname)
           val byName = fieldPats.toMap
           TStructPattern(
             s,

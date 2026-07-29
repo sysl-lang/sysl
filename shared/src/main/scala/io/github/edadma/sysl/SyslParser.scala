@@ -725,9 +725,29 @@ class SyslParser(val source: Source) extends PackratParsers {
    * or a `->` (a property) after the name; an `invariant` clause next — it is the contextual word
    * `invariant` followed by an expression; and a bare field falls through to `param` (so a field
    * may still be named `invariant`, since `invariant: type` matches neither of the first two).
+   *
+   * A field and a member may each carry a **visibility modifier** (`08 § Visibility`), written in
+   * the same place and the same spellings a top-level declaration writes one. An `invariant` clause
+   * declares no name, so like an `impl` block it takes none.
    */
   private lazy val structItem: Parser[StructPart] =
-    member ^^ (StructPart.Mem(_)) | invariantClause ^^ (StructPart.Inv(_)) | param ^^ (StructPart.Fld(_))
+    restrictedMember ^^ (StructPart.Mem(_)) |
+      invariantClause ^^ (StructPart.Inv(_)) |
+      visibility ~ param ^^ { case v ~ f => StructPart.Fld(f.copy(vis = v).setPos(f.pos)) }
+
+  /** A member of a type's own body, which is the one kind that may say how far it is visible. */
+  private lazy val restrictedMember: PackratParser[MethodDecl] =
+    visibility ~ member ^^ { case v ~ m => m.copy(vis = v).setPos(m.pos) }
+
+  /** The refusal a trait's member and an `impl`'s share (`08 § Visibility`). Both are reached at the
+   * reach the *trait* has — one asks for the member and the other supplies what was asked — so
+   * there is nothing here for a modifier to decide, and saying that is worth more than the
+   * "newline expected" a grammar with no place for one would give.
+   */
+  private lazy val noVisibility: Parser[Unit] =
+    op("private") ~> err("a trait's members and an 'impl' block's carry no visibility of their own — a " +
+      "trait's member is as visible as the trait, and an implementation supplies what the trait asked for") |
+      success(())
 
   /** `invariant <bool>` among a struct's fields: a condition every value of the struct must satisfy,
    * re-checked whenever the struct is built or one of its fields is written. Bare field names are in
@@ -800,7 +820,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * so `Circle(radius: int)` — a header with nothing after it — falls through to `enumVariant`.
    */
   private lazy val enumItem: Parser[Either[EnumVariantDecl, MethodDecl]] =
-    member ^^ (Right(_)) | enumVariant ^^ (Left(_))
+    restrictedMember ^^ (Right(_)) | enumVariant ^^ (Left(_))
 
   private lazy val enumVariant: Parser[EnumVariantDecl] =
     at(
@@ -867,7 +887,7 @@ class SyslParser(val source: Source) extends PackratParsers {
    * to `methodSig` and a bare property signature to `propertySig`. A signature of either kind asks
    * an implementation for that member; one written with a body supplies a default instead.
    */
-  private lazy val traitMember: PackratParser[MethodDecl] = member | methodSig | propertySig
+  private lazy val traitMember: PackratParser[MethodDecl] = noVisibility ~> (member | methodSig | propertySig)
 
   /** A trait method signature: a header with no `= body`. The receiver and parameters parse
    * exactly as a real method's do, so a signature and its implementation are compared shape for
@@ -916,7 +936,7 @@ class SyslParser(val source: Source) extends PackratParsers {
     }
 
   private lazy val implBody: PackratParser[List[MethodDecl]] =
-    newline ~> indent ~> opt(newlines) ~> repsep(member, newlines) <~ opt(newlines) <~ dedent
+    newline ~> indent ~> opt(newlines) ~> repsep(noVisibility ~> member, newlines) <~ opt(newlines) <~ dedent
 
   /** An optional `end Name` marker closing a declaration block, Scala-style. `end` is a soft
    * keyword; the trailing name must equal the declaration's own name, or it is a parse error.

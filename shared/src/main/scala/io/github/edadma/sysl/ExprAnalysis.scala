@@ -561,7 +561,9 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
-          if idx >= 0 then TField(tr, idx, s.fields(idx)._2)
+          if idx >= 0 then
+            checkFieldVisible(s.base, f)
+            TField(tr, idx, s.fields(idx)._2)
           else readProperty(tr, s, f)
 
         // An enum has no fields to shadow a member, so every name read off one is a property.
@@ -870,6 +872,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
     memberDecls.get((base, chosen)) match
       case Some(m) if m.isProperty =>
+        checkMemberVisible(base, chosen, m)
         val fname      = memberFuncName(ty, chosen)
         val (_, rtype) = funcInsts(fname)
         funcsUsed += fname
