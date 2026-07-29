@@ -189,6 +189,7 @@ class SyslParser(val source: Source) extends PackratParsers {
   private lazy val postfixTail: PackratParser[Expr => Expr] =
     here ~ (op("[") ~> expression <~ op("]")) ^^ { case p ~ idx => (e: Expr) => Index(e, idx).setPos(p) } |
       here ~ (op(".") ~> ident) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
+      here ~ (op(".") ~> (tupleIndex | nestedTupleIndex)) ^^ { case p ~ n => (e: Expr) => Field(e, n).setPos(p) } |
       here ~ (op("::") ~> ident) ^^ { case p ~ n => (e: Expr) => TypeAttr(e, n).setPos(p) } |
       // A call is the exception: what is wrong with `foo(…)` is nearly always `foo` — it does not
       // exist, or it does not take these arguments — so the callee's own position wins, and the
@@ -199,6 +200,28 @@ class SyslParser(val source: Source) extends PackratParsers {
       here <~ op("?") ^^ (p => (e: Expr) => TryExpr(e).setPos(p)) |
       here <~ op("++") ^^ (p => (e: Expr) => PostIncDec("++", e).setPos(p)) |
       here <~ op("--") ^^ (p => (e: Expr) => PostIncDec("--", e).setPos(p))
+
+  /** `t.0` — a tuple's part, selected by position. It is a `Field` because it *is* one: a tuple's
+   * fields are named for their positions, so nothing downstream needs a second form of selection.
+   * A suffix (`t.0u8`) is not an index, since what follows the dot names a part rather than
+   * denoting a number.
+   */
+  private lazy val tupleIndex: Parser[String] =
+    accept("tuple index", { case t: lexical.IntLit if t.suffix.isEmpty => t.value.toString })
+
+  /** `t.0.1` — the nested selection that the lexer reads as one number, since `0.1` is a float
+   * before it is two indices (`00 §13`). Fatal rather than a backtrack: nothing else can be meant
+   * by a float immediately after a `.`, and the fix is worth naming where it happened.
+   */
+  private lazy val nestedTupleIndex: Parser[Nothing] = Parser { in =>
+    in.first match
+      case t: lexical.FloatLit if t.suffix.isEmpty && t.text.matches("""\d+\.\d+""") =>
+        val Array(outer, inner) = t.text.split('.')
+
+        Error(s"'.${t.text}' reads as a number rather than as two tuple indices — " +
+          s"write '(x.$outer).$inner' to select part $inner of part $outer", in)
+      case _ => Failure("tuple index expected", in)
+  }
 
   lazy val primary: PackratParser[Expr] =
     at(
@@ -454,8 +477,21 @@ class SyslParser(val source: Source) extends PackratParsers {
         op("&") ~> softSync ~> typeRef ^^ (t => RefType(t, sync = true)) |
         op("&") ~> typeRef ^^ (t => RefType(t, sync = false)) |
         (op("[") ~> opt(expression) <~ op("]")) ~ typeRef ^^ { case n ~ t => ArrayType(n, t) } |
+        tupleType |
         qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
     )
+
+  /** `(A, B)` — a tuple type. A single part is refused rather than read as a grouping, because the
+   * two spellings would then differ by a comma and mean different things; `(T)` is the shape
+   * somebody writes when they mean a one-tuple, and there is no such type (`00 §13`).
+   */
+  private lazy val tupleType: Parser[TypeRef] =
+    (op("(") ~> commaList1(typeRef) <~ op(")")) >> {
+      case List(one) =>
+        err(s"'(${one.show})' is a type in parentheses, and a tuple has two or more parts — " +
+          s"a product of one thing is that thing, so write '${one.show}'")
+      case parts => success(TupleType(parts))
+    }
 
   /** The `[int, string]` argument list of an applied generic name, whether the name is a type's or
    * a trait's — a trait takes its arguments the same way and in the same place.
@@ -995,6 +1031,7 @@ class SyslParser(val source: Source) extends PackratParsers {
     patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
       structPattern |
       variantPattern |
+      tuplePattern |
       wildcard ^^^ WildcardPattern |
       qualifiedName ^^ IdentPattern.apply |
       patternLit ^^ LitPattern.apply
@@ -1007,6 +1044,16 @@ class SyslParser(val source: Source) extends PackratParsers {
    */
   private lazy val structPattern: Parser[Pattern] =
     qualifiedName ~ (op("{") ~> commaList(fieldPattern) <~ op("}")) ^^ { case n ~ fs => StructPattern(n, fs) }
+
+  /** `(a, b)` — a tuple pattern. Two or more sub-patterns for the same reason the type takes two
+   * or more parts, and a single one is refused where the type refuses it rather than being read as
+   * a pattern in parentheses, which sysl has no use for.
+   */
+  private lazy val tuplePattern: Parser[Pattern] =
+    (op("(") ~> commaList1(pattern) <~ op(")")) >> {
+      case List(_) => err("a tuple pattern matches two or more parts — one part is not a tuple")
+      case parts   => success(TuplePattern(parts))
+    }
 
   private lazy val fieldPattern: Parser[(String, Pattern)] =
     ident ~ opt(op(":") ~> pattern) ^^ { case n ~ p => (n, p.getOrElse(IdentPattern(n))) }

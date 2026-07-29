@@ -88,6 +88,7 @@ trait TypeResolution extends ImportResolution {
     case PtrType(inner)                     => PtrType(spellSelf(inner, selfRef))
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
     case ArrayType(len, elem)               => ArrayType(len, spellSelf(elem, selfRef))
+    case TupleType(parts)                   => TupleType(parts.map(spellSelf(_, selfRef)))
 
   /** Whether a written type names any of the parameters being solved, and so is not yet a type.
    *
@@ -98,6 +99,7 @@ trait TypeResolution extends ImportResolution {
     case PtrType(inner)     => mentions(inner, tps)
     case RefType(inner, _)  => mentions(inner, tps)
     case ArrayType(_, elem) => mentions(elem, tps)
+    case TupleType(parts)   => parts.exists(mentions(_, tps))
 
   /** Resolves one bound — a trait, with whatever arguments it was applied to — under the
    * substitution the declaration that wrote it is being read at.
@@ -265,6 +267,10 @@ trait TypeResolution extends ImportResolution {
         case Some(v)                           => err(s"an array cannot have $v elements")
         case None => err("an array length must be a constant — a literal, or a 'const' naming one")
       Type.Array(n, addressable(resolveType(elem, subst), "an array"))
+
+    // A tuple holds its parts the way a struct holds its fields, so a part is resolved exactly as a
+    // field is — a `unit` part included, which the layout skips and the parts after it shift past.
+    case TupleType(parts) => tupleType(parts.map(resolveType(_, subst)))
 
     case NamedType(n, argRefs) =>
       if argRefs.isEmpty && subst.contains(n) then subst(n)
@@ -440,6 +446,7 @@ trait TypeResolution extends ImportResolution {
     case PtrType(i)         => mentionsSelf(i)
     case RefType(i, _)      => mentionsSelf(i)
     case ArrayType(_, e)    => mentionsSelf(e)
+    case TupleType(parts)   => parts.exists(mentionsSelf)
 
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
    * whatever type is currently being laid out.
@@ -753,6 +760,29 @@ trait TypeResolution extends ImportResolution {
         s
   }
 
+  /** The one canonical tuple over these parts, registered so codegen lays its aggregate down.
+   *
+   * It is memoized beside the struct instantiations because it *is* one — `(int, string)` written
+   * twice is one type, for the same reason `Box[int]` written twice is, and the field list is a
+   * consequence of the parts rather than something a second instantiation could disagree about.
+   */
+  protected def tupleType(parts: List[Type]): Type.Tuple =
+    // A tuple over a type **parameter** is not registered, and that is not an optimization. The key
+    // is the type's spelling, and a parameter spells the same whatever an `impl` asked of it — so a
+    // registered `(A, B)` would be handed back to the next block that wrote one, carrying the first
+    // block's bounds. Nothing lays a value out at one of these, so nothing needs it kept.
+    if parts.exists(Type.mentionsAbstract) then new Type.Tuple(parts)
+    else
+      val key = Type.qualified(Type.Tuple.base(parts.length), parts)
+
+      structInsts.get(key) match
+        case Some(t: Type.Tuple) => t
+        case _ =>
+          val t = new Type.Tuple(parts)
+
+          structInsts(key) = t
+          t
+
   /** A type with type parameters replaced by what a particular instantiation was made with — the
    * substitution `resolveType` performs on a *reference*, performed on a type that is already
    * resolved.
@@ -770,6 +800,7 @@ trait TypeResolution extends ImportResolution {
       t match
         case a: Type.Abstract => subst.getOrElse(a.name, a)
         case n: Type.Named if n.targs.isEmpty => n
+        case t: Type.Tuple    => tupleType(t.targs.map(substParams(_, subst)))
         case n: Type.Struct   => instantiateStruct(n.base, n.targs.map(substParams(_, subst)))
         case n: Type.Enum     => instantiateEnum(n.base, n.targs.map(substParams(_, subst)))
         case Type.Ptr(inner)      => Type.Ptr(substParams(inner, subst))
@@ -881,6 +912,11 @@ trait TypeResolution extends ImportResolution {
       actual match
         case Type.Array(_, e) => unify(elem, e, tparams, sub)
         case _                => ()
+    case TupleType(parts) =>
+      actual match
+        case t: Type.Tuple if t.targs.length == parts.length =>
+          parts.zip(t.targs).foreach { case (r, a) => unify(r, a, tparams, sub) }
+        case _ => ()
     // A trait never binds a type parameter. `f[T](p: *T)` handed a `*Writer` would otherwise
     // instantiate at a type with no layout, and the body could then write `var v: T` for a value
     // that cannot exist; leaving it unsolved reports the inference failure instead.

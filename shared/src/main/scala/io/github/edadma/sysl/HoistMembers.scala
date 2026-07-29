@@ -588,15 +588,18 @@ trait HoistMembers extends TypeResolution {
 
   /** What a diagnostic calls every type of a shape at once. */
   private def everyShape(head: String): String =
-    if head == "[]" then "every slice" else s"every array of ${head.drop(1).dropRight(1)}"
+    if head == "[]" then "every slice"
+    else if head.startsWith("(") then s"every tuple of ${head.count(_ == ',') + 1} parts"
+    else s"every array of ${head.drop(1).dropRight(1)}"
 
   /** The symbol a shape's members are emitted under, which is the mangling of the types it covers
    * with the arguments left off — so an instantiation appends them and arrives back where the type
    * written out in full would have started.
    */
   private def shapeSymbol(t: Type): String = t match
-    case _: Type.Slice => "slice"
+    case _: Type.Slice    => "slice"
     case Type.Array(n, _) => s"arr$n"
+    case t: Type.Tuple    => s"tuple${t.targs.length}"
     case other            => Type.mangle(other)
 
   /** Why a block declaring type parameters has nothing to apply them to: the subject is a type that

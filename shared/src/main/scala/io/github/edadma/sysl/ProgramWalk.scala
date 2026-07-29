@@ -233,18 +233,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
   /** Whether a named type was instantiated at something that is not a type — a parameter standing
    * in for itself, or a type built out of one.
    */
-  private def abstracted(t: Type.Named): Boolean = {
-    def mentions(x: Type): Boolean = x match
-      case _: Type.Abstract    => true
-      case n: Type.Named       => n.targs.exists(mentions)
-      case Type.Ptr(inner)     => mentions(inner)
-      case Type.Ref(inner, _)  => mentions(inner)
-      case Type.Array(_, elem) => mentions(elem)
-      case Type.Slice(elem)    => mentions(elem)
-      case _                   => false
-
-    t.targs.exists(mentions)
-  }
+  private def abstracted(t: Type.Named): Boolean = t.targs.exists(Type.mentionsAbstract)
 
   // --- the files of a module -----------------------------------------------------------
 

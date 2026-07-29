@@ -301,6 +301,43 @@ object Prelude {
       |    display_pad(buf[0..<n], out, fmt)
       |end display_char
       |
+      |impl[A: Eq, B: Eq] Eq for (A, B)
+      |    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1
+      |
+      |impl[A: Eq, B: Eq, C: Eq] Eq for (A, B, C)
+      |    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1 && self.2 == rhs.2
+      |
+      |impl[A: Ord, B: Ord] Ord for (A, B)
+      |    lt(self, rhs: Self) -> bool
+      |        if self.0 < rhs.0 then return true
+      |        if rhs.0 < self.0 then return false
+      |        self.1 < rhs.1
+      |    end lt
+      |
+      |impl[A: Ord, B: Ord, C: Ord] Ord for (A, B, C)
+      |    lt(self, rhs: Self) -> bool
+      |        if self.0 < rhs.0 then return true
+      |        if rhs.0 < self.0 then return false
+      |        if self.1 < rhs.1 then return true
+      |        if rhs.1 < self.1 then return false
+      |        self.2 < rhs.2
+      |    end lt
+      |
+      |impl[A: Hash, B: Hash] Hash for (A, B)
+      |    hash(self) -> u64 = hash_u64(self.0.hash() * 0x100000001b3u64 ^ self.1.hash())
+      |
+      |impl[A: Hash, B: Hash, C: Hash] Hash for (A, B, C)
+      |    hash(self) -> u64 =
+      |        hash_u64((self.0.hash() * 0x100000001b3u64 ^ self.1.hash()) * 0x100000001b3u64 ^ self.2.hash())
+      |
+      |impl[A: Display, B: Display] Display for (A, B)
+      |    display(self, out: *Writer, fmt: FormatSpec) =
+      |        display_pad(("(" + str(self.0) + ", " + str(self.1) + ")").bytes, out, fmt)
+      |
+      |impl[A: Display, B: Display, C: Display] Display for (A, B, C)
+      |    display(self, out: *Writer, fmt: FormatSpec) =
+      |        display_pad(("(" + str(self.0) + ", " + str(self.1) + ", " + str(self.2) + ")").bytes, out, fmt)
+      |
       |printb(b: bool) = prints(if b then "true" else "false")
       |
       |printc(ch: char)

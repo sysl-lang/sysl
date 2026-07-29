@@ -206,10 +206,16 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
   }
 
   "the rules the form still owes" - {
+    // One value for several places is the one length mismatch that has another reading — the value
+    // may be a tuple to take apart (§13) — so it is complained about in those terms, and every
+    // other mismatch keeps the plain count.
     "the two sides must be the same length" in {
       err(fn("""var a = 1
                |var b = 2
-               |a, b = 1""".stripMargin)) should include("2 places on the left and 1 value on the right")
+               |a, b = 1, 2, 3""".stripMargin)) should include("2 places on the left and 3 values on the right")
+      err(fn("""var a = 1
+               |var b = 2
+               |a, b = 1""".stripMargin)) should include("one int is not something to take apart")
     }
 
     "a binding names as many things as it is given" in {
@@ -436,13 +442,14 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
         List(printStmt(Ident("a"), Assign("=", Ident("b"), i(1)), i(2)))
     }
 
-    // A comma inside parentheses is the *other* comma form — `(a, b)` is a tuple (§13), which the
-    // parser has always built and the analyzer does not yet accept. Worth pinning so the two are
-    // not confused: putting a multi-assignment in parentheses does not make it an expression, it
-    // makes it a tuple of something else.
+    // A comma inside parentheses is the *other* comma form — `(a, b)` is a tuple (§13). Worth
+    // pinning so the two are not confused: putting a multi-assignment in parentheses does not make
+    // it an expression, it makes it a tuple of something else.
     "and parentheses around one read as a tuple, not as this" in {
       prog("var x = (a, b)") shouldBe List(VarDecl("x", None, Some(Tuple(List(Ident("a"), Ident("b"))))))
-      err("var x = (1, 2)\nprint(x)\n") should include("tuples are not supported yet")
+      run("""var x = (1, 2)
+            |print(x.0, x.1)
+            |""".stripMargin) shouldBe "1 2\n"
     }
   }
 

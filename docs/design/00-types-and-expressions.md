@@ -803,16 +803,23 @@ knowing which of the three the right side is, which is the point of spelling the
   be, and inventing `(x,)` to work around that would be a wart bought for nothing, since a
   one-element product is the element. Swift removed its one-tuples for the same reason. There is no
   zero-tuple either — that is `unit` (§12), which already has the job.
-- **Positional access, `t.0` and `t.1`.** Written like a field because it is one; the name is an
-  index because there is nothing else to call it. **A nested access needs parentheses** —
-  `(t.0).1`, not `t.0.1` — because `0.1` lexes as a float and the tokenizer will not be made to
-  guess. That is Rust's wart, and taking the parentheses instead of the guesswork is the trade.
+- **Positional access, `t.0` and `t.1`.** Written like a field because it is one — a tuple's fields
+  *are* named for their positions — so a part is a **place** like any other field, and `t.0 = 5`
+  and `t.1 += 1` write through one. **A nested access needs parentheses** — `(t.0).1`, not
+  `t.0.1` — because `0.1` lexes as a float and the tokenizer will not be made to guess. That is
+  Rust's wart, and taking the parentheses instead of the guesswork is the trade; what makes it
+  affordable is that the compiler recognizes the float that lands after a `.` and names the
+  parentheses to write.
 - **Laid out as a struct with those fields in that order.** Nothing new for `Layout`, nothing new
   for the ABI, and a tuple containing a `&T` retains and releases exactly as a struct field does
-  (`03`).
+  (`03`). A `unit` part is skipped by the layout with the parts behind it shifting past, exactly as
+  a `unit` field is (§12).
 - **Destructured by pattern**, in a `match` arm and at a binding: `(a, b)` binds both, `(a, _)`
   binds one, and a nested tuple pattern nests. This is `09`'s positional struct pattern with the
   name left off, so it needs no new pattern machinery.
+- **Each arity is its own type**, and there is no way to be generic over how many parts a tuple
+  has. So a pair and a triple are two *shapes* in `02`'s sense — an `impl` covers one of them at a
+  time, and `impl[A, B] T for (A, B)` says nothing about a triple.
 
 ### Who owns a tuple's traits
 
@@ -828,10 +835,16 @@ the prelude is where its catalog rows live. So:
 - **A user may not write `impl Eq for (int, string)`**, because the trait and the type are both the
   prelude's. That is the existing rule producing the expected answer, not a new one.
 
-The one implementation consequence is that structural rows are **generated per arity** rather than
-written once, because sysl has no way to be generic over arity and is not getting one. The prelude
-declares them up to a stated maximum; beyond it a program writes a struct, which it should have been
-doing anyway.
+The one implementation consequence is that structural rows are **written per arity** rather than
+once, because sysl has no way to be generic over arity and is not getting one. **The stated maximum
+is three.** Beyond it a program writes a struct, which it should have been doing anyway — and the
+compiler says so in those words rather than reporting a missing membership, since the fix is a type
+with a name and not a fourth `impl`.
+
+None of these rows is compiler-generated. They are eight ordinary `impl` blocks in the prelude,
+written in sysl over `(A, B)` and `(A, B, C)` and reached by `02`'s existing shape rule — which is
+the strongest form the claim above could take: the prelude owns a tuple's catalog because it can
+simply *write* it.
 
 ## Open at the basics level (not yet decided)
 

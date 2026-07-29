@@ -188,6 +188,9 @@ trait TraitLookup extends AnalyzerBase {
    * `5.show()` resolve exactly as `p.show()` does, with no separate machinery for the built-ins.
    */
   protected def memberOwner(t: Type): (String, List[Type]) = t match
+    // A tuple is filed under the whole of itself, exactly as `[]int` is: the type an `impl` written
+    // out in full is for. Its *shape* — every tuple of that arity — is the separate key below.
+    case t: Type.Tuple => (Type.show(t), Nil)
     case n: Type.Named => (n.base, n.targs)
     case other         => (Type.show(other), Nil)
 
@@ -211,6 +214,10 @@ trait TraitLookup extends AnalyzerBase {
   protected def shapeOwner(t: Type): Option[(String, List[Type])] = t match
     case Type.Slice(elem)    => Some(("[]", List(elem)))
     case Type.Array(n, elem) => Some((s"[$n]", List(elem)))
+    // A tuple's shape is its **arity**, since that is the whole of what an implementation can be
+    // written for at once: there is no way to be generic over how many parts a tuple has, so a
+    // pair and a triple are two shapes and the prelude writes one implementation for each.
+    case t: Type.Tuple       => Some((Type.Tuple.shape(t.targs.length), t.targs))
     case _                   => None
 
   /** Where a member of that name is filed for a type: under the type's own key, or — when only a
@@ -451,7 +458,24 @@ trait TraitLookup extends AnalyzerBase {
           .headOption
       yield s"the 'impl' that covers it asks '${unmet.show}' of ${show(arg)}, which does not implement it"
 
-    wrongArgs.headOption.orElse(unmetCondition)
+    wrongArgs.headOption.orElse(unmetCondition).orElse(tooWide(tr, t))
+
+  /** Why a **tuple** does not implement one of the traits the prelude provides structurally: not
+   * because of what its parts are, but because of how many there are.
+   *
+   * Arity is a shape (`00 §13`), and there is no way to be generic over one — so the prelude writes
+   * an implementation per arity and stops somewhere. Saying where it stopped is the whole of the
+   * advice, since the fix is not another `impl` but a type with a name.
+   */
+  private def tooWide(tr: Type.Bound, t: Type): Option[String] = t match
+    case tup: Type.Tuple =>
+      for
+        widest <- (2 to 16).filter(n => implsOf(tr.name, Type.Tuple.shape(n)).nonEmpty).lastOption
+        if tup.targs.length > widest
+      yield s"the prelude provides '${Modules.show(tr.name)}' for tuples of up to " +
+        s"${quantity(widest, "part")} and this one has ${tup.targs.length}, so a product this wide " +
+        "wants a struct of its own"
+    case _ => None
 
   /** The same, for a trait that takes no arguments. */
   protected def unmetBound(traitName: String, t: Type): Option[String] =

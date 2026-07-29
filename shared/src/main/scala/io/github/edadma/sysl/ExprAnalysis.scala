@@ -512,6 +512,17 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         case _ if Type.erased(tr.ty) =>
           readTraitObjectProperty(tr, Type.erasedTrait(tr.ty).get, f)
 
+        // A tuple's parts are named for their positions, so `t.0` arrives here as an ordinary field
+        // selection. An index past the end is worth its own complaint: nothing about "no property
+        // '3'" tells a reader that what they wrote was one part too far.
+        case t: Type.Tuple =>
+          val idx = t.fieldIndex(f)
+          if idx >= 0 then TField(tr, idx, t.fields(idx)._2)
+          else if f.forall(_.isDigit) then
+            err(s"${show(t)} has ${quantity(t.fields.length, "part")}, so there is no '.$f' — " +
+              s"the parts are numbered from 0")
+          else readProperty(tr, t, f)
+
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
           if idx >= 0 then TField(tr, idx, s.fields(idx)._2)
@@ -758,7 +769,24 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case _: RangeExpr =>
       err("a range is only allowed in a 'for' loop or a 'match' pattern")
 
-    case _: Tuple => err("tuples are not supported yet")
+    // `(a, b)` — a tuple, built exactly as a struct is: the parts are the fields, in the order they
+    // were written. What each part is *wanted* at comes from the tuple being asked for, which is
+    // what lets `var p: (i8, i8) = (1, 2)` narrow its literals the way a struct's fields do.
+    case Tuple(elems) =>
+      val wanted = expected.map(Type.underlying) match
+        case Some(t: Type.Tuple) if t.targs.length == elems.length => t.targs.map(Some(_))
+        case _                                                     => elems.map(_ => None)
+
+      val ts = elems.zip(wanted).map((e, w) => analyzeExpr(e, w))
+
+      // A `unit` part is let through for the reason a `unit` field is (`00 §12`): the layout skips
+      // it. `never` is refused for the reason it is refused everywhere but a result — a part that
+      // is never produced is a part nothing can give the tuple.
+      for t <- ts do
+        if t.ty == Type.Never then
+          at(t.pos)(err("a tuple part has to be a value, and this expression never produces one"))
+
+      TStructNew(tupleType(ts.map(_.ty)), ts)
 
   /** `value.name` where `name` is not a field: a computed property, which reads with no
    * parentheses and so is spelled exactly as a field is, with an implicit by-value receiver.

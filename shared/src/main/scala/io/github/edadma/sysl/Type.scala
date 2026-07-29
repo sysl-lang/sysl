@@ -300,6 +300,19 @@ object Type {
    */
   def zeroSized(t: Type): Boolean = t == Unit
 
+  /** Whether a type is built out of something that is not a type — a parameter standing in for
+   * itself, or anything holding one. Such a type is a step in a definition-time walk (`14 §4`)
+   * rather than something a value is ever laid out at, so nothing keyed on it may outlive the walk.
+   */
+  def mentionsAbstract(t: Type): Boolean = t match
+    case _: Abstract      => true
+    case n: Named         => n.targs.exists(mentionsAbstract)
+    case Ptr(inner)       => mentionsAbstract(inner)
+    case Ref(inner, _)    => mentionsAbstract(inner)
+    case Array(_, elem)   => mentionsAbstract(elem)
+    case Slice(elem)      => mentionsAbstract(elem)
+    case _                => false
+
   def isNumeric(t: Type): Boolean = underlying(t) match
     case _: Integer | _: Floating => true
     case _                        => false
@@ -371,7 +384,7 @@ object Type {
    * already in place. Identity is therefore `(base, targs)` — the display name identifies the
    * instantiation, and the field list is a consequence of it rather than part of it.
    */
-  final class Struct(val base: String, val targs: List[Type]) extends Named {
+  class Struct(val base: String, val targs: List[Type]) extends Named {
     var fields: List[(String, Type)] = Nil
 
     def name: String = qualified(base, targs)
@@ -398,6 +411,37 @@ object Type {
 
     override def hashCode: Int  = (base, targs).hashCode
     override def toString: String = s"Struct($name)"
+  }
+
+  /** A tuple — a positional product with no declaration and no module (`00 §13`).
+   *
+   * **A tuple is a struct**, and not by analogy: it carries the same field list, so it lays out the
+   * same way, retains and releases the same way, and is destructured by the same
+   * `TStructPattern`. Its fields are named for their positions, which is what makes `t.0` an
+   * ordinary field selection rather than a form of its own.
+   *
+   * What it is not is *declared*. Its base name holds a `$`, which no identifier and no module name
+   * may, so nothing a program can write collides with it and nothing looks it up among the
+   * declarations. The **arity is part of the base**, so each arity is its own key — that is what
+   * lets the prelude write one implementation per arity (`impl[A, B] Eq for (A, B)`) and have the
+   * two not collide, which a shared base would not.
+   */
+  final class Tuple(elems: List[Type]) extends Struct(Tuple.base(elems.length), elems) {
+    fields = elems.zipWithIndex.map((t, i) => (i.toString, t))
+
+    override def name: String     = s"(${targs.map(show).mkString(", ")})"
+    override def toString: String = s"Tuple($name)"
+  }
+
+  object Tuple {
+
+    /** The base name a tuple of `n` parts is keyed under. */
+    def base(n: Int): String = s"${Modules.sep}tuple$n"
+
+    /** The key an `impl` written for **every** tuple of `n` parts is filed under, spelled the way
+     * the shape reads: `(,)` for a pair, `(,,)` for a triple.
+     */
+    def shape(n: Int): String = "(" + "," * (n - 1) + ")"
   }
 
   /** One variant of an enum.
@@ -540,6 +584,7 @@ object Type {
    * `geom$Point` is shown as the `geom.Point` a program would write.
    */
   def show(t: Type): String = t match
+    case t: Tuple       => t.name
     case n: Named       => qualified(Modules.show(n.base), n.targs)
     case c: Constrained => Modules.show(c.name)
     case other          => friendly.getOrElse(other, canonicalName(other))

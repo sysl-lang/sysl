@@ -112,6 +112,19 @@ trait PatternAnalysis extends TypeResolution {
         case other =>
           err(s"'$name(…)' matches an enum variant or a struct, but the value is ${show(other)}" + heldBehind(other))
 
+    // A tuple pattern is the positional struct pattern with the name off (`00 §13`), which is why it
+    // ends as the same node: a tuple's parts are its fields, and matching every one of them is what
+    // the positional form already means.
+    case TuplePattern(args) =>
+      ty match
+        case t: Type.Tuple if args.length == t.fields.length =>
+          TStructPattern(t, args.zip(t.fields).map { case (a, (_, fty)) => analyzePattern(a, fty) })
+        case t: Type.Tuple =>
+          err(s"${show(t)} has ${quantity(t.fields.length, "part")}, but " +
+            s"${supplied(args.length, "sub-pattern")}")
+        case other =>
+          err(s"'(…)' matches a tuple, but the value is ${show(other)}" + heldBehind(other))
+
     // The named form matches a struct by field name, in any order, and may leave fields unlisted —
     // those are unconstrained. Both source forms end as one `TStructPattern` with a sub-pattern per
     // field in declaration order, a wildcard filling any field the pattern did not mention.

@@ -166,8 +166,42 @@ trait StmtAnalysis extends TypeResolution {
    * place's type — so the form adds no rule of its own beyond the two sides being the same length.
    * The ordering it promises is a run-time matter and belongs to codegen.
    */
-  private def multiAssign(m: MultiAssign): TStmt = {
-    if m.targets.length != m.values.length then
+  /** The values a comma form on the left is given, where the right side is **one** thing carrying
+   * several (`00 §13`) — the third of the three feeds one comma syntax has.
+   *
+   * The one thing is evaluated once, into a name no program can write, and each part is read back
+   * out of it. That is what keeps `a, b = f()` a single call, and it costs the form nothing else:
+   * the hidden binding is an ordinary local, so it is counted, released and walked exactly as a
+   * written one is.
+   *
+   * `None` where the right side is a list rather than one carrier, which is every other case.
+   */
+  private def spread(places: Int, values: List[Expr], subject: String): Option[(TStmt, List[TExpr])] =
+    values match
+      case List(one) if places > 1 =>
+        val tv = at(one.pos)(analyzeExpr(one, None))
+
+        Type.underlying(tv.ty) match
+          case t: Type.Tuple if t.targs.length == places =>
+            val name = declare(s"${Modules.sep}parts", tv.ty)
+            val read = t.fields.indices.toList.map(i => TField(TLoad(name, tv.ty), i, t.fields(i)._2))
+
+            Some((TVarDecl(name, tv.ty, tv), read))
+
+          case t: Type.Tuple =>
+            at(one.pos)(err(s"$subject, and a ${show(tv.ty)} has ${quantity(t.targs.length, "part")} " +
+              "to give them"))
+
+          case other =>
+            at(one.pos)(err(s"$subject, and one ${show(other)} is not something to take apart — " +
+              "only a tuple is"))
+      case _ => None
+
+  private def multiAssign(m: MultiAssign): List[TStmt] = {
+    val taken =
+      spread(m.targets.length, m.values, s"this assignment has ${m.targets.length} places on the left")
+
+    if taken.isEmpty && m.targets.length != m.values.length then
       err(s"this assignment has ${m.targets.length} places on the left and ${m.values.length} " +
         s"${if m.values.length == 1 then "value" else "values"} on the right")
 
@@ -185,26 +219,35 @@ trait StmtAnalysis extends TypeResolution {
     val what   = if m.op == "=" then "assignment" else s"'${m.op}'"
     val places = m.targets.map(analyzePlace(_, what))
 
+    // A part read out of a carrier is already analyzed, so what is left for the arm is the check
+    // the written form performs after analyzing its own value. The two are kept together here so
+    // that neither feed can end up with a rule the other does not have.
+    def value(target: Expr, place: TExpr, part: Option[TExpr], written: Expr): TWrite =
+      if m.op == "=" then
+        val tv = part.getOrElse(analyzeExpr(written, Some(place.ty)))
+
+        if tv.ty == Type.Never || disagree(tv.ty, place.ty) then
+          err(s"cannot assign ${show(tv.ty)} to ${describe(target)} of type ${show(place.ty)}")
+        TWrite(place, m.op, tv, None, invCheckFor(place))
+      else
+        val binSym = m.op.dropRight(1)
+        val tv     = part.getOrElse(analyzeExpr(written, updateExpected(binSym, place.ty)))
+        val d      = updateDispatch(binSym, place, tv)
+
+        if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then
+          err(s"'${m.op}' would change the type of ${describe(target)}")
+        TWrite(place, m.op, tv, d, invCheckFor(place))
+
+    // Each arm's position is the value it was written with, or — where one carrier supplied them
+    // all — that carrier, since there is no separate expression to point at.
+    val written = taken.fold(m.values)(_ => List.fill(m.targets.length)(m.values.head))
+    val parts   = taken.fold(m.values.map(_ => None))(_._2.map(Some(_)))
+
     val writes =
-      for ((target, place), value) <- m.targets.zip(places).zip(m.values)
-      yield at(value.pos) {
-        if m.op == "=" then
-          val tv = analyzeExpr(value, Some(place.ty))
+      for (((target, place), part), w) <- m.targets.zip(places).zip(parts).zip(written)
+      yield at(w.pos)(value(target, place, part, w))
 
-          if tv.ty == Type.Never || disagree(tv.ty, place.ty) then
-            err(s"cannot assign ${show(tv.ty)} to ${describe(target)} of type ${show(place.ty)}")
-          TWrite(place, m.op, tv, None, invCheckFor(place))
-        else
-          val binSym = m.op.dropRight(1)
-          val tv     = analyzeExpr(value, updateExpected(binSym, place.ty))
-          val d      = updateDispatch(binSym, place, tv)
-
-          if d.isEmpty && arithType(binSym, place.ty, tv.ty) != place.ty then
-            err(s"'${m.op}' would change the type of ${describe(target)}")
-          TWrite(place, m.op, tv, d, invCheckFor(place))
-      }
-
-    TMultiAssign(writes)
+    taken.map(_._1).toList :+ TMultiAssign(writes)
   }
 
   /** `val a, b = …` / `var a, b = …` (`00 §2`).
@@ -217,26 +260,31 @@ trait StmtAnalysis extends TypeResolution {
     for (n, i) <- m.names.zipWithIndex do
       if m.names.indexOf(n) != i then err(s"'$n' is named twice in one binding")
 
-    if m.names.length != m.values.length then
+    val taken = spread(m.names.length, m.values, s"this binding names ${m.names.length} things")
+
+    if taken.isEmpty && m.names.length != m.values.length then
       err(s"this binding names ${m.names.length} things and has ${m.values.length} " +
         s"${if m.values.length == 1 then "value" else "values"} to give them")
 
-    val tvs =
+    val tvs = taken.fold {
       for v <- m.values
       yield
         val tv = at(v.pos)(analyzeExpr(v, None))
         if tv.ty == Type.Never then at(v.pos)(err("cannot bind a name to an expression that never returns"))
         tv
+    }(_._2)
 
-    for (name, tv) <- m.names.zip(tvs)
-    yield TVarDecl(if m.mutable then declare(name, tv.ty) else declareReadOnly(name, tv.ty), tv.ty, tv)
+    taken.map(_._1).toList ::: (
+      for (name, tv) <- m.names.zip(tvs)
+      yield TVarDecl(if m.mutable then declare(name, tv.ty) else declareReadOnly(name, tv.ty), tv.ty, tv)
+    )
   }
 
   /** Most statements are one statement. The two comma forms are the exception, and the only reason
    * this hands back a list: a binding that names several things is several declarations.
    */
   private def analyzeStmtAt(stmt: Stmt): List[TStmt] = stmt match
-    case m: MultiAssign => List(multiAssign(m))
+    case m: MultiAssign => multiAssign(m)
     case m: MultiDecl   => multiDecl(m)
 
     // An import binds a name for the statements after it and emits nothing. It is read here rather
