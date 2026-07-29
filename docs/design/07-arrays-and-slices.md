@@ -317,6 +317,10 @@ implementation:
   one writes the ordinary `var buf: [64]u8` and says nothing. What is still refused is storage the
   body did not declare: an array a caller passed by value, and an array that is a field of a value.
   `--explain-escapes` is now meaningful and is the remaining unbuilt piece of `05`.
+- ~~**Slicing a fixed array inside a `&Struct`**~~ (`05`) — **built.** It was never an escape: the
+  storage is on the heap the moment the struct is, and the view names the box the walk to the field
+  went through as its owner. A field of a struct on the *frame* is still refused, which is the
+  unspecified aggregate-promotion question and not this one.
 - **Slicing a `&sync` buffer.** A `[]T` does not record whether its owner's count is atomic, so
   it cannot carry an owner that needs the atomic path. Rejected with a diagnostic until slices
   distinguish the two.

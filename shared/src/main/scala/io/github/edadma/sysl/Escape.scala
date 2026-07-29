@@ -210,8 +210,10 @@ private class Escape(program: TProgram) {
       case TSlice(base, _, _, _, _) =>
         base.ty match
           // A view of a `*T` region is the programmer's problem, like every `*T` — it is
-          // outside this analysis exactly as it is outside every other guarantee.
-          case _: Type.Array => if viaPointer(base) then View.none else arrayRoot(base)
+          // outside this analysis exactly as it is outside every other guarantee. Storage inside a
+          // counted object is not the frame's either: it is on the heap already, and the view names
+          // the box that holds it as its owner, so it outlives this body by construction.
+          case _: Type.Array => if viaPointer(base) || viaReference(base) then View.none else arrayRoot(base)
           case _             => views(base)
       case TLoad(name, _)       => confined.getOrElse(name, View.none)
       case TCall(_, args, _, _)    => View.any(args.map(views))
@@ -275,6 +277,20 @@ private class Escape(program: TProgram) {
       case TDeref(operand, _) => operand.ty.isInstanceOf[Type.Ptr]
       case TField(r, _, _)    => viaPointer(r)
       case TIndex(r, _, _)    => viaPointer(r)
+      case _                  => false
+
+    /** Whether the storage an array place names lives inside a **counted object** — a fixed array
+     * that is a field of a `&Struct`, or an element of one.
+     *
+     * Such storage is on the heap already, so there is nothing to promote and nothing to refuse:
+     * the view is built with the box as its owner and takes a count of it, exactly as a view of a
+     * `&[N]T` does. The question is about the root for the same reason `viaPointer`'s is — what
+     * matters is what the walk started from, not what its last step was.
+     */
+    private def viaReference(e: TExpr): Boolean = e match
+      case TDeref(operand, _) => operand.ty.isInstanceOf[Type.Ref]
+      case TField(r, _, _)    => viaReference(r)
+      case TIndex(r, _, _)    => viaReference(r)
       case _                  => false
 
     /** Propagates through the function's own locals to a fixpoint, then looks for the places a

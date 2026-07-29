@@ -164,7 +164,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       // it moved into is exactly what a view of it must count against, and the whole promotion
       // comes down to naming that buffer here instead of `null`. Nothing makes a `*T` region safe;
       // that is what `*T` is.
-      case Type.Array(n, _)             => (promotedOwner(base), address(base), n.toString)
+      // Storage this frame owns, storage inside a box the walk went through, or a `*T` region.
+      case Type.Array(n, _) =>
+        val (own, addr) = addressOwned(base)
+        (own, addr, n.toString)
       case Type.Ptr(Type.Array(n, _))   => ("null", genExpr(base), n.toString)
       case other                        => sys.error(s"unreachable slice of ${other.llvm}")
 
@@ -229,6 +232,65 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     case TLoad(name, _)  => promotedBoxes.getOrElse(name, "null")
     case TIndex(r, _, _) => promotedOwner(r)
     case _               => "null"
+
+  /** The dereference a place walk bottoms out at, following **receivers only**.
+   *
+   * A place is a chain of field and element steps over something with an address, and the thing at
+   * the end of that chain is what decides who owns the storage. The index *expressions* along the
+   * way are not part of the chain — `g.rows[p.i]` reaches `p` while it works out which row, and `p`
+   * owns nothing here — so this follows the receiver of each step and nothing else.
+   *
+   * An element step is followed only through an array, because an array's elements are its own
+   * storage. Through a slice they are somebody else's, and the slice already carries who.
+   */
+  private def spineRoot(place: TExpr): Option[TDeref] = place match
+    case TField(r, _, _)                                => spineRoot(r)
+    case TIndex(r, _, _) if r.ty.isInstanceOf[Type.Array] => spineRoot(r)
+    case d: TDeref                                      => Some(d)
+    case _                                              => None
+
+  /** The address of an array place together with whatever keeps its storage alive: the box it lives
+   * inside, the buffer a promotion moved it to, or nothing at all for storage on the frame.
+   *
+   * A place rooted at a **counted reference** is the box's, so the reference is evaluated once here
+   * and the walk to the field continues from the payload it addresses — which is what lets a view of
+   * a fixed array inside a `&Struct` name that box as its owner (`05`). Reaching for it structurally
+   * rather than watching what the ordinary walk happened to compute is what keeps a `&Struct` inside
+   * another `&Struct` honest: the box that owns the storage is the **innermost** one on the chain,
+   * and the ordinary walk evaluates the outermost first.
+   */
+  protected def addressOwned(place: TExpr): (String, String) =
+    spineRoot(place) match
+      case Some(root @ TDeref(operand, inner)) if operand.ty.isInstanceOf[Type.Ref] =>
+        val box = genExpr(operand)
+        val at  = freshTemp()
+        emit(s"$at = getelementptr ${boxName(inner)}, ptr $box, i32 0, i32 $headerFields")
+        (box, addressUnder(place, root, at))
+
+      case _ => (promotedOwner(place), address(place))
+
+  /** The rest of a place walk, once its root has been evaluated and reached. Every step is the one
+   * `address` takes; what differs is only where the chain starts.
+   */
+  private def addressUnder(place: TExpr, root: TDeref, at: String): String = place match
+    case p if p eq root                          => at
+    case TField(r, _, ty) if Type.zeroSized(ty)  => addressUnder(r, root, at)
+
+    case TField(r, index, _) =>
+      val base = addressUnder(r, root, at)
+      val x    = freshTemp()
+      emit(s"$x = getelementptr ${r.ty.llvm}, ptr $base, i32 0, i32 ${fieldSlot(r.ty, index)}")
+      x
+
+    case TIndex(r, index, _) =>
+      val Type.Array(n, elem) = r.ty: @unchecked
+      val base = addressUnder(r, root, at)
+      val i    = widen64(index)
+      boundsCheck(i, n.toString)
+      val x = freshTemp(); emit(s"$x = getelementptr ${elem.llvm}, ptr $base, i64 $i")
+      x
+
+    case other => address(other)
 
   protected def genBuffer(elem: Type, n: String): (String, String) = {
     val bn = bufName(elem)

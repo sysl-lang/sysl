@@ -5,8 +5,9 @@ calls for when it gives slices an owner word: which escapes are detected, how th
 call boundary, and what happens when something escapes that has nothing to keep it alive. A local
 array a view of which gets out is now moved to the heap as described below, so the programs that
 used to be refused compile and run. What is still a diagnostic is storage the body did not declare —
-an array a caller passed **by value**, and an array that is a **field** of a value, the second being
-the *Deferred* section's unspecified promotion-of-aggregates. Under `no alloc` every promotion
+an array a caller passed **by value**, and an array that is a **field** of a struct on the frame,
+the second being the *Deferred* section's unspecified promotion-of-aggregates. A field of a
+`&Struct` is neither: it is on the heap already, and is the section below. Under `no alloc` every promotion
 becomes an error again, which is the paragraph below; capabilities are not built, so today every
 promotable escape promotes. `--explain-escapes` is built and reports every promotion. The
 approximations the analysis takes are the ones *Deferred* permits.
@@ -113,7 +114,8 @@ is walked through while a field step is not: an element of a local array of arra
 array's storage, so the whole array moves and the element goes with it, whereas a field belongs to a
 struct and moving it would be the *Deferred* section's unspecified choice between moving the field
 and moving the struct. An array a caller passed **by value** is not this body's to move either — it
-is the caller's layout — so both of those stay diagnostics, and the message says which it is.
+is the caller's layout — so both of those stay diagnostics, and the message says which it is. A
+field of a `&Struct` reaches neither question: nothing moves, because nothing is on the frame.
 
 Only arrays that are *both* sliced *and* escaped are promoted. An array that is only read, or
 whose slices stay in the frame, keeps its stack slot.
@@ -219,15 +221,34 @@ local array can dangle exactly as in C, and that is the opt-out the mode exists 
 Taking a `*T` to a local **does not** promote it — promotion follows slices, which carry
 their length and their owner, not raw addresses.
 
-## Not yet
+## A fixed array inside a `&T` is not a frame's to lose
 
-**A fixed array inside a `&T` has no owner word to hand out.** Slicing a `&[N]T` works, because the
-buffer that reference counts *is* the array; slicing a fixed array **field** of a `&Struct` does
-not, because the view is built with a null owner and would dangle as soon as the last reference to
-the struct went away. So it is refused as a frame-local view would be, which is sound but says the
-wrong thing — the storage is on the heap, and what is missing is the walk from the field back to
-the box that owns it. Until that exists, storage a view must outlive is declared `&[N]T` in its own
-right rather than as a field.
+Slicing a fixed array that is a **field** of a `&Struct` is not an escape at all, and never was: the
+storage is on the heap the moment the struct is, so there is nothing to promote. What a view of it
+needs is the *box* as its owner, and the box is exactly what the walk to the field went through —
+the reference is dereferenced to reach the payload, and the value that dereference computed is the
+owner. Recording it there is the whole of the mechanism, and it is what keeps the expression that
+named the struct from being evaluated twice.
+
+The owner is decided by the **root** of the walk rather than by its last step, so
+`g.rows[i][0..<2]` keeps it: an index on the way to the array changes which elements the view names
+and not who owns them. This is the same rule the `*T` test follows, for the same reason.
+
+The root is found by following **receivers only**, and two cases turn on that. An index
+*expression* is not part of the chain, so `g.rows[p.i]` reaching a `&Pick` while it works out which
+row does not make `p` the owner. And where a `&Struct` holds another, the box that owns the storage
+is the **innermost** one on the chain — `o.inner.cells[..]` is the `Inner` box's, not the `Outer`
+box's, which matters the moment `o.inner` is given a different `Inner` and the view is all that
+holds the old one.
+
+So there are three roots a view of a fixed array can have, and each answers the ownership question
+differently:
+
+| the array is | the view's owner is |
+|---|---|
+| a local of this body | the buffer promotion moved it into, or nothing if it never escapes |
+| storage inside a `&T` | that box |
+| reached through a `*T` | nothing — a `*T` region is nobody's to keep alive |
 
 ## Deferred
 
@@ -240,8 +261,9 @@ right rather than as a field.
   first implementation may collapse it to "any parameter," which costs precision only for a
   function that both takes a stack-backed slice and returns an unrelated fresh one. Refine if
   it bites.
-- **Promotion of aggregates.** A local struct containing an array, where only the array's
+- **Promotion of aggregates.** A **local** struct containing an array, where only the array's
   slice escapes, could promote the array alone or the whole struct. The cheaper choice is the
-  array; not yet specified, so a field's escaping view is still a diagnostic.
+  array; not yet specified, so a field of a struct *on the frame* is still a diagnostic — unlike a
+  field of a `&Struct`, which is on the heap already and is the section above.
 - **A declaration has no position**, so the report names the escaping view and not the array's own
   line. Giving statements positions is a change across the tree rather than a change here.

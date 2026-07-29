@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * owner to keep it alive, so the compiler has to find every route by which one could still be
  * reached after the frame returns — and let the rest through untouched.
  */
-class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
+class EscapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   /** What promotion does **not** reach, and why each is a different question rather than the same
    * one unfinished.
@@ -43,6 +43,146 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport {
       err("""take(a: [4]int) -> []int = a[0..<2]
             |print(take([1, 2, 3, 4]).len)
             |""".stripMargin) should include("1:29")
+    }
+  }
+
+  /** A fixed array **inside a counted object** is the case that looks like the two above and is not
+   * one of them (`05 § Not yet`, now built). Nothing is moved, because the storage is on the heap
+   * already; what the view needs is the box, and the walk to the field went through it.
+   */
+  "a view of a fixed array inside a '&Struct' is not an escape at all" - {
+
+    "so it may be returned, and reads correctly after the reference is gone" in {
+      run("""struct Frame
+            |    bytes: [8]u8
+            |    n: int
+            |view(b: &Frame) -> []u8 = b.bytes[0..<4usize]
+            |make() -> []u8
+            |    var b: &Frame = Frame([1, 2, 3, 4, 5, 6, 7, 8], 8)
+            |    return view(b)
+            |end make
+            |var s = make()
+            |print(s.len, s[0], s[3])
+            |""".stripMargin) shouldBe "4 1 4\n"
+    }
+
+    // The view holds a count of the box, so the struct comes back when the last view of it does —
+    // a view that took no count would fault here, and one that took a count nobody gave back would
+    // hold two hundred thousand structs at once.
+    "and the box comes back when the last view of it does" in {
+      run("""struct Frame
+            |    bytes: [8]u8
+            |    n: int
+            |make() -> []u8
+            |    var b: &Frame = Frame([1, 2, 3, 4, 5, 6, 7, 8], 8)
+            |    return b.bytes[0..<4usize]
+            |end make
+            |var i = 0
+            |while i < 200000
+            |    var t = make()
+            |    if t[0] != 1 then
+            |        print("wrong")
+            |        exit(1)
+            |    i += 1
+            |print("ok")
+            |""".stripMargin) shouldBe "ok\n"
+    }
+
+    "a field of a field is the same walk, one step longer" in {
+      run("""struct Inner
+            |    cells: [4]int
+            |struct Outer
+            |    inner: Inner
+            |grab() -> []int
+            |    var o: &Outer = Outer(Inner([9, 8, 7, 6]))
+            |    return o.inner.cells[1..<3]
+            |end grab
+            |var s = grab()
+            |print(s.len, s[0], s[1])
+            |""".stripMargin) shouldBe "2 8 7\n"
+    }
+
+    // The owner is named by the *root* of the walk rather than by its last step, so an index on the
+    // way to the array does not lose it — the same rule `viaPointer` follows for the same reason.
+    "and an index step on the way to it keeps the owner" in {
+      run("""struct Grid
+            |    rows: [2][3]int
+            |row(g: &Grid, i: usize) -> []int = g.rows[i][0..<2]
+            |take() -> []int
+            |    var g: &Grid = Grid([[1, 2, 3], [4, 5, 6]])
+            |    return row(g, 1usize)
+            |end take
+            |var s = take()
+            |print(s[0], s[1])
+            |""".stripMargin) shouldBe "4 5\n"
+    }
+
+    // Writing through the view reaches the struct's own storage, since the view *is* that storage
+    // rather than a copy of it.
+    "a write through the view lands in the struct" in {
+      run("""struct Frame
+            |    bytes: [4]u8
+            |    n: int
+            |var b: &Frame = Frame([1, 2, 3, 4], 4)
+            |var s = b.bytes[..]
+            |s[0] = 9u8
+            |print(b.bytes[0])
+            |""".stripMargin) shouldBe "9\n"
+    }
+
+    // The box that owns the storage is the *innermost* one on the chain, and the ordinary walk
+    // evaluates the outermost first — so naming the owner is structural rather than a matter of
+    // watching what the walk computed. This is what tells the two apart: the outer struct's field
+    // is overwritten, leaving the view as the only thing holding the inner box, and two hundred
+    // thousand allocations then churn the heap under it.
+    "the owner is the innermost box on the chain, not the first one reached" in {
+      run("""struct Inner
+            |    cells: [4]int
+            |struct Outer
+            |    inner: &Inner
+            |var o: &Outer = Outer(Inner([9, 8, 7, 6]))
+            |var s = o.inner.cells[..]
+            |o.inner = Inner([0, 0, 0, 0])
+            |var i = 0
+            |while i < 200000
+            |    var junk: &Inner = Inner([1, 1, 1, 1])
+            |    if junk.cells[0] != 1 then exit(1)
+            |    i += 1
+            |print(s[0], s[1], s[2], s[3])
+            |""".stripMargin) shouldBe "9 8 7 6\n"
+    }
+
+    // An index *expression* is not part of the chain, however many boxes it reaches through: it
+    // decides which element, not who owns it.
+    "and a box reached while working out an index does not become the owner" in {
+      run("""struct Pick
+            |    i: usize
+            |struct Grid
+            |    rows: [2][3]int
+            |pull() -> []int
+            |    var g: &Grid = Grid([[1, 2, 3], [4, 5, 6]])
+            |    var p: &Pick = Pick(1usize)
+            |    return g.rows[p.i][0..<2]
+            |end pull
+            |var s = pull()
+            |var i = 0
+            |while i < 200000
+            |    var t = pull()
+            |    if t[0] != 4 then exit(1)
+            |    i += 1
+            |print(s[0], s[1])
+            |""".stripMargin) shouldBe "4 5\n"
+    }
+
+    // The three roots are told apart, and only the box-rooted one is new: a `*T` region is still
+    // nobody's to keep alive, and a promoted local still names the buffer it moved into.
+    "while a view of a '*T' region still owns nothing" in {
+      ir("""struct Frame
+           |    bytes: [4]u8
+           |peek(p: *Frame) -> []u8 = p.bytes[..]
+           |var f = Frame([1, 2, 3, 4])
+           |print(peek(&f).len)
+           |""".stripMargin) should include("insertvalue { ptr, ptr, i64 } zeroinitializer, ptr null, 0")
     }
   }
 
