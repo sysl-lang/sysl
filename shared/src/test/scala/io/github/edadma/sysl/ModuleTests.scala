@@ -124,13 +124,13 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
     "a module that runs nothing still compiles" in {
       val out = irOf("a.sysl" -> "f() -> int = 1")
 
-      out should include("define i32 @main()")
+      out should include("define i32 @main(")
       out should not include "define i32 @f()"
     }
 
     "and a module of no files at all is the empty program" in {
       Compiler.compile(Nil) match {
-        case Right(out) => out should include("define i32 @main()")
+        case Right(out) => out should include("define i32 @main(")
         case Left(e)    => fail(e)
       }
     }
@@ -311,7 +311,7 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       )
 
       out should include("define i32 @double(i32 %n.param)")
-      out should include("define i32 @main()")
+      out should include("define i32 @main(")
     }
 
     "and holds exactly what the single-file spelling holds" in {

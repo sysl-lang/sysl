@@ -23,7 +23,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
 
   private def gen(): String = {
     val funcTexts  = program.funcs.map(genFunction)
-    val mainText   = genMain(program.vals, program.main)
+    val mainText   = genMain(program.vals, program.main, program.entry)
     // The tables come after the bodies because a table only exists for a type something erased, and
     // it may ask for an adapter, which the queue below is what emits.
     val vtableText = program.vtables.map(genVtable).mkString
@@ -167,18 +167,29 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
       name -> s"${if Type.noValue(retTy) then "void" else retTy.llvm} (${(params :+ "...").mkString(", ")})"
     }.toMap
 
-  /** The symbol a called name resolves to, which differs from the name only for an `extern` given a
-   * link name. Everything a program defines is emitted under its own name.
+  /** The symbol a called name resolves to, which differs from the name for an `extern` given a link
+   * name and for the program's own `main`. Everything else is emitted under its own name.
+   *
+   * `main` is renamed because the emitted entry point *is* `@main`: the platform starts the program
+   * there, and a sysl function of that name would be a second definition of one symbol. The reserved
+   * name it takes instead holds two separators, which no key can (`Modules.qualify` writes one), so it
+   * cannot collide with anything a program or a module could be called.
    */
+  private val entrySymbol = s"${Modules.sep}${Modules.sep}main"
+
   private val symbols: Map[String, String] =
-    program.externs.collect { case e if e.symbol != e.name => e.name -> e.symbol }.toMap
+    program.externs.collect { case e if e.symbol != e.name => e.name -> e.symbol }.toMap ++
+      program.entry.map(_.func -> entrySymbol)
+
+  /** What a definition and every call to it name. */
+  private def symbolOf(name: String): String = symbols.getOrElse(name, name)
 
   /** What a `call` names. For an ordinary function that is the result type, which is all LLVM
    * needs; for a variadic one it is the callee's *whole* function type, because the argument list
    * alone does not say where the declared parameters stop and the ellipsis begins.
    */
   private def calleeOf(name: String, ty: Type): String =
-    val symbol = symbols.getOrElse(name, name)
+    val symbol = symbolOf(name)
 
     variadics.get(name) match
       case Some(fnTy) => s"$fnTy @$symbol"
@@ -218,17 +229,23 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
       val n = freshTemp(); emit(s"$n = xor i1 $res, true"); n
   }
 
-  /** `main`, with the computed `val`s filled in ahead of the program's own statements.
+  /** `@main`, which is three things in the order the language puts them: the computed `val`s, the
+   * program's own top-level statements, and the `main` it declared if it declared one.
    *
-   * They are laid down here rather than in a constructor the platform runs, and that is the whole of
-   * the mechanism: the entry point is the one place that certainly runs first and it is already
-   * written. A `.init_array` entry would run before the runtime is up, be spelled differently on
-   * every target, and put the order somewhere a reader could not see it.
+   * The `val`s are laid down here rather than in a constructor the platform runs, and that is the
+   * whole of the mechanism: the entry point is the one place that certainly runs first and it is
+   * already written. A `.init_array` entry would run before the runtime is up, be spelled differently
+   * on every target, and put the order somewhere a reader could not see it.
    *
    * Each one gets a region of its own, exactly as a statement does, so whatever its initializer
    * allocated on the way to the value is let go of before the next one starts.
+   *
+   * **The signature is C's**, whether or not anything asks for the arguments, because this is the
+   * function the platform's own start-up code calls and that code passes two values. Taking them here
+   * is what lets a declared `main(args: []string)` be handed a slice: the pair is converted by an
+   * ordinary prelude call, and neither `argc` nor `argv` appears in a sysl signature anywhere.
    */
-  private def genMain(vals: List[TVal], stmts: List[TStmt]): String = {
+  private def genMain(vals: List[TVal], stmts: List[TStmt], entry: Option[TEntry]): String = {
     startFunction()
     promoted = promotions(None)
     pushTemps()
@@ -240,9 +257,26 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
       popTemps()
 
     stmts.foreach(genStmt)
+
+    // The declared `main` runs in a region of its own, so the slice its arguments came in is released
+    // when it returns — the same handover an ordinary call makes, since a callee takes a count for
+    // each parameter on entry and gives it back at its own return.
+    for e <- entry do
+      pushTemps()
+      val args = e.argsFn.map { fn =>
+        val slice = Type.Slice(Type.Str)
+        val r     = freshTemp()
+
+        emit(s"$r = call ${slice.llvm} @$fn(i32 %argc, ptr %argv)")
+        s"${slice.llvm} ${ownTemp(r, slice)}"
+      }
+
+      emit(s"call void @$entrySymbol(${args.getOrElse("")})")
+      popTemps()
+
     releaseAll()
     emitTerm("ret i32 0")
-    finishFunction("define i32 @main()")
+    finishFunction("define i32 @main(i32 %argc, ptr %argv)")
   }
 
   /** A function owns its parameters and returns its result with a count already taken, so a
@@ -436,7 +470,7 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
 
     val declared = Type.stored(f.params).map { case (name, ty) => s"${ty.llvm} %$name.param" }
     val params   = (declared ++ Option.when(f.variadic)("...")).mkString(", ")
-    finishFunction(s"define ${f.retTy.llvm} @${f.name}($params)")
+    finishFunction(s"define ${f.retTy.llvm} @${symbolOf(f.name)}($params)")
   }
 
   private def zero(ty: Type): String = ty match

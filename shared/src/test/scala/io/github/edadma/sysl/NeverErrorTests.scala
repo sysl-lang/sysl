@@ -142,7 +142,7 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "a value branch beside a unit one is still a statement" in {
-      ir("var n = 0\nif true then n = 1 else print(2)\nprint(n)") should include("define i32 @main()")
+      ir("var n = 0\nif true then n = 1 else print(2)\nprint(n)") should include("define i32 @main(")
     }
   }
 

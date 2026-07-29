@@ -55,7 +55,7 @@ class CStringTests extends AnyFreeSpec with ParseSupport with CodegenSupport wit
     "an interior NUL is refused" in {
       err("""var a = c"a\0b"""") should include("cannot contain one")
       ir("""var a = "a\0b"
-           |print(a.bytes.len)""".stripMargin) should include("define i32 @main()")
+           |print(a.bytes.len)""".stripMargin) should include("define i32 @main(")
     }
 
     "a NUL is still refused when it ends the literal, where it would be silently redundant" in {

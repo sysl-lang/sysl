@@ -20,6 +20,12 @@ import scopt.OParser
  *   - `sysl emit-llvm <path>`  print the generated LLVM IR
  *   - `sysl targets`           list the machines sysl can build for
  *
+ * **Everything after a bare `--` belongs to the program being run**, not to sysl: it is passed
+ * straight through to the executable, which is what lets `sysl run prog.sysl -- -v file` reach a
+ * `main(args: []string)` without sysl having to decide whether `-v` was meant for it. The split is
+ * made before the options are parsed, which is why an argument that looks like one of sysl's own is
+ * still the program's.
+ *
  * `--explain-escapes` may be given to any of them: it reports, on stderr, every local array the
  * compiler moved to the heap and the view that forced it (`05`).
  *
@@ -33,6 +39,7 @@ case class Config(
     output: Option[String] = None,
     explainEscapes: Boolean = false,
     target: Option[String] = None,
+    programArgs: List[String] = Nil,
 )
 
 @main def sysl(args: String*): Unit = {
@@ -43,7 +50,8 @@ case class Config(
       programName("sysl"),
       cmd("run")
         .action((_, c) => c.copy(command = "run"))
-        .text("compile and run a sysl module, given its directory or a single file")
+        .text("compile and run a sysl module, given its directory or a single file; " +
+          "arguments after '--' go to the program")
         .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
       cmd("build")
         .action((_, c) => c.copy(command = "build"))
@@ -69,8 +77,10 @@ case class Config(
     )
   }
 
-  OParser.parse(parser, processArgs(args), Config()) match
-    case Some(cfg) => processExit(execute(cfg))
+  val (own, forwarded) = processArgs(args).span(_ != "--")
+
+  OParser.parse(parser, own, Config()) match
+    case Some(cfg) => processExit(execute(cfg.copy(programArgs = forwarded.drop(1).toList)))
     case None      => processExit(2)
 }
 
@@ -120,7 +130,7 @@ private def execute(cfg: Config): Int = {
       Toolchain.build(compiled, exe, target) match
         case Left(err) => deleteFile(exe); fail(err)
         case Right(_) =>
-          val result = exec(Seq(exe))
+          val result = exec(exe :: cfg.programArgs)
           deleteFile(exe)
           stdout(result.stdout)
           if result.stderr.nonEmpty then Console.err.print(result.stderr)

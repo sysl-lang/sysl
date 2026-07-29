@@ -536,6 +536,15 @@ case class TVSlot(target: String, recv: RecvMode, params: List[Type], retTy: Typ
  */
 case class TVal(symbol: String, ty: Type, init: TExpr, computed: Boolean)
 
+/** The `main` a program declared, which runs after its top-level statements (`13 §7`).
+ *
+ * `func` is the key the function is filed under, which is what makes it reachable; `argsFn` names the
+ * prelude function that turns the platform's `argc`/`argv` into the `[]string` it wants, and is
+ * absent for a `main` that takes no parameters — so a program that does not ask for its arguments
+ * carries none of the conversion.
+ */
+case class TEntry(func: String, argsFn: Option[String])
+
 /** A whole program: hoisted struct, enum, and function declarations, the method tables its trait
  * objects dispatch through, the externs it calls, the module-level `val`s it reads, plus the
  * top-level statements that make up `main`. Only data enums appear in `enums` — a simple enum
@@ -549,4 +558,5 @@ case class TProgram(
     vals: List[TVal],
     funcs: List[TFunc],
     main: List[TStmt],
+    entry: Option[TEntry] = None,
 )

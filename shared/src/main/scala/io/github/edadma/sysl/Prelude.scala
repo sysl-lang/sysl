@@ -98,6 +98,21 @@ package io.github.edadma.sysl
  * already had the encoder for. `s.copy()` needs no declaration at all — it is bytes copied into a
  * string that owns them, which is `from_utf8_unchecked` of a string's own bytes.
  *
+ * **`args_of` is how a program's arguments become a `[]string`**, and it is here for the reason
+ * `from_utf8` is: every line of it is ordinary sysl. What the platform hands the entry point is C's
+ * `argc` and `argv` — a count and a vector of NUL-terminated byte runs — and what a sysl program
+ * asks for is a slice of strings, so something has to walk the one and build the other. Doing it in
+ * the prelude is what keeps the pair out of every sysl signature: a `main(args: []string)` is called
+ * with the result of this, and the two foreign types are named in one place instead of in each
+ * program that wants its arguments.
+ *
+ * Each run's length is found by looking for the terminator rather than by calling `strlen`, so the
+ * conversion asks the platform for nothing beyond the two values it was handed. The bytes are then
+ * **validated and copied**: a `string` owns what it holds, so an argument outlives the vector it
+ * came from and nothing a program does to it reaches memory the platform still owns. An argument
+ * that is not UTF-8 stops the program the way `unwrap` does, with the offset of the byte that made
+ * it ill-formed — `04` puts that check at the boundary, and this is one.
+ *
  * **`char_from_u32` is the fallible half of `u32` → `char`** (`00 §1`), and it is a free function
  * for the reason `from_utf8` is one: a scalar has no member namespace to hang a `char.try` on. It
  * needs no unchecked primitive to sit on top of — the guard it writes and the check `char(u)`
@@ -667,6 +682,27 @@ object Prelude {
       |    for i in 0..<s.len do b[i] = s.bytes[i]
       |
       |    CString(b)
+      |
+      |args_of(argc: i32, argv: **u8) -> []string
+      |    var out: Buf[string] = buf()
+      |    var i = 0
+      |
+      |    while i < int(argc)
+      |        var p = argv[i]
+      |        var n = 0usize
+      |
+      |        while p[n] != 0u8
+      |            n += 1usize
+      |
+      |        from_utf8(p[0..<n]) match
+      |            Ok(s) -> out.push(s)
+      |            Err(e) ->
+      |                print("panic: command-line argument", i, "is not UTF-8 at byte", e.offset)
+      |                exit(1)
+      |
+      |        i += 1
+      |
+      |    out.view()
       |""".stripMargin
 
   /** The source the prelude's own declarations point into, so a diagnostic against one quotes the

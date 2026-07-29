@@ -455,6 +455,62 @@ A program in which no file carries a statement is a complete program that does n
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,
 which is what it should compile to — a library is not an error.
 
+### `main` — the named half of the entry point
+
+A program may also declare a function called `main`, and it runs after the statements above:
+
+```
+main(args: []string)
+    for a in args[1..]
+        print(a)
+```
+
+Both halves are real and neither replaces the other. The top-level statements are the program's
+**initialization**: they are where a top-level `var` lives, they are what the `val` order below is
+settled against, and an unqualified name in them is read in their own file's module. `main` is what
+runs once that is done. A program may write either, both, or neither, and one that writes both runs
+them in that order — statements first, `main` after.
+
+**What `main` gets at that a statement cannot is the arguments.** A statement at the top of a file
+has nowhere to receive them: it is not a call, so it has no parameter list, and a program's arguments
+are not a module-level anything — they are what this run of this program was started with. A named
+function does have a parameter list, which is the whole reason for the form.
+
+The two signatures are these, and there are no others:
+
+```
+main()
+main(args: []string)
+```
+
+A `main` that asks for nothing is for the program that has work to do and no arguments to read; it
+costs nothing, since the conversion below is reached only by the other one.
+
+**`args` is a slice of `string`.** What the platform hands a program is C's pair — a count, and a
+vector of NUL-terminated byte runs — and neither of those appears in a sysl signature anywhere. The
+pair is converted by the prelude's `args_of`, which finds each run's end, validates its bytes, and
+**copies** them into strings the program owns: an argument therefore outlives the vector it came from
+and holds no memory the platform is still responsible for. The zeroth element is the program's own
+path, because that is what the platform passes and withholding it would be inventing a different
+convention than every other language's.
+
+**An argument that is not UTF-8 stops the program**, with the offset of the byte that made it
+ill-formed. `04` puts the validation of bytes computed at run time at the boundary they arrive
+through, and this is one of those boundaries; a `string` that might not be text would push the
+question into every program instead. A program that genuinely needs the raw bytes wants an
+`args_bytes() -> [][]u8` beside this, which nothing has asked for yet.
+
+**`main` names one function in a program**, wherever it is written. Two of them — even in two
+different modules, where nothing else would collide — is an error naming both, for the reason C
+reserves the name: it is not a name the program calls, it is the name the *platform* calls, so two
+would leave which one the program **is** to whichever was emitted last. Otherwise it is an ordinary
+function: it may be called by the program too, and then it runs both times.
+
+**A result is not yet spelled.** `main() -> int` is refused rather than read as an exit status,
+because a program's exit status is a whole question — which values mean what, what a trap leaves
+behind, whether a `val` initializer can set one — and reading a result type as one now would answer
+it by accident. Until it is decided, a program that must choose its status calls `exit`.
+
 ### Constants
 
 A **`const` is a module member**:

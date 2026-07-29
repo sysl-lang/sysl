@@ -109,9 +109,11 @@ every function it could land in is taken: a slot of a method table stands for wh
 for that trait put there. Missing one would mean emitting a call to a function that was never
 written; keeping an extra costs a function nobody calls.
 
-The roots are what the program can start from — the statements it runs, the initializers that fill
-its `val`s before those (`13` §7), and the method tables a trait object dispatches through, a table
-being a constant a program reads a function pointer out of.
+The roots are what the program can start from — the statements it runs, the `main` it runs after
+those, the initializers that fill its `val`s before either (`13` §7), and the method tables a trait
+object dispatches through, a table being a constant a program reads a function pointer out of. A
+declared `main` is a root because nothing in the program calls it: what calls it is the entry point
+the compiler lays down, which is not a tree this walk reads.
 
 **The rule survives separate compilation**, and it is the roots that change rather than the rule.
 Today the whole program is compiled at once and nothing outside it can name anything in it, so every

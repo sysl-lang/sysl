@@ -225,6 +225,15 @@ trait Hoisting extends HoistMembers {
       checkSignatureRules(e.name, e.params, e.retType, e.variadic, foreign = true)
       for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
         err(s"'$s' is not a symbol a linker can resolve")
+      // `main` is where a program starts (`13 §7`), which makes it the one name that means something
+      // whatever it is attached to. An `extern` may take neither half of it: the **symbol** because
+      // this program defines it, so declaring it would be a second definition of one symbol and a
+      // link failure rather than anything a reader of this line could act on; and the **name**
+      // because a `main` that is not the one the program starts at would read as though it were.
+      if e.name == "main" then
+        err("'main' is where a program starts, so it is not a name an 'extern' may take")
+      if e.symbol == "main" then
+        err("'main' is where the platform starts this program, so an 'extern' may not name that symbol")
 
     // A `where` predicate becomes an ordinary function `<Type>$pred(value: Base) -> bool`, so it is
     // analyzed and emitted through the same path every function takes; the check site calls it by

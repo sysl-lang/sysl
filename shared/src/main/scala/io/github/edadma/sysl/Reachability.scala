@@ -33,17 +33,18 @@ object Reachability {
 
   /** The same program with everything unreachable dropped.
    *
-   * The roots are the three places the program can start from: the statements it runs, the
-   * initializers that fill its storage before those, and the method tables a trait object dispatches
-   * through — a table is a constant the program can read a function out of, so what it points at is
-   * reachable whatever can be proved about the calls themselves.
+   * The roots are the places the program can start from: the statements it runs, the `main` it runs
+   * after those, the initializers that fill its storage before either, and the method tables a trait
+   * object dispatches through — a table is a constant the program can read a function out of, so what
+   * it points at is reachable whatever can be proved about the calls themselves.
    *
    * The tables and the types are left alone. A table is reached by erasing a value into a trait
    * object, and a type is emitted for its layout rather than for anything that runs, so neither is
    * what this pass is about; both are their own question.
    */
   def prune(program: TProgram): TProgram = {
-    val live = reachedFrom(List(program.main, program.vals, program.vtables), program.funcs, program.vtables).calls
+    val roots = List(program.main, program.vals, program.vtables, program.entry)
+    val live  = reachedFrom(roots, program.funcs, program.vtables).calls
 
     program.copy(
       externs = program.externs.filter(e => live(e.name)),
@@ -127,6 +128,11 @@ object Reachability {
       case i: TIncDec =>
         i.check.flatMap(_.predFn).foreach(calls += _)
         scan(i.place)
+      // The entry point names its `main` and the conversion that makes its arguments, neither of
+      // which any tree calls: what calls them is the wrapper codegen lays down around them.
+      case e: TEntry =>
+        calls += e.func
+        e.argsFn.foreach(calls += _)
       // Standard output holds no state, so there is no value the prelude could have declared for it
       // and its table is laid out by codegen rather than analyzed. The one function in that table is
       // therefore named here, where nothing in the tree names it.

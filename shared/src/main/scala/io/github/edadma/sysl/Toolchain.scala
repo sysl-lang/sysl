@@ -43,19 +43,24 @@ object Toolchain {
    * There is one target here and not two: a program is built for the machine it is about to be run
    * on, so a cross target has nothing to run the result with and is not offered.
    */
-  def compileAndRun(source: String, name: String = "<input>"): Either[String, (Int, String)] =
-    runIr(Compiler.compileToLlvm(source, name))
+  def compileAndRun(source: String, name: String = "<input>",
+                    args: List[String] = Nil): Either[String, (Int, String)] =
+    runIr(Compiler.compileToLlvm(source, name), args)
 
   /** The same, for the files of one program. */
   def compileAndRun(sources: List[Source]): Either[String, (Int, String)] =
-    runIr(Compiler.compile(sources))
+    runIr(Compiler.compile(sources), Nil)
 
-  private def runIr(compiled: Either[String, String]): Either[String, (Int, String)] =
+  /** `args` are the words the program is started with, which reach it exactly as they would from a
+   * shell: the executable's own path arrives ahead of them as the zeroth, since that is what the
+   * platform passes and not something this could withhold.
+   */
+  private def runIr(compiled: Either[String, String], args: List[String]): Either[String, (Int, String)] =
     compiled.flatMap { ir =>
       val exe = createTempFile("sysl-", "")
 
       build(ir, exe).map { _ =>
-        val result = exec(Seq(exe))
+        val result = exec(exe :: args)
         deleteFile(exe)
         (result.exitCode, result.stdout)
       }

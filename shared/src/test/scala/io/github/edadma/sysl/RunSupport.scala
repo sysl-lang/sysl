@@ -19,6 +19,20 @@ trait RunSupport extends Matchers { this: Assertions =>
     }
   }
 
+  /** The same, started with arguments — what a `main(args: []string)` is handed. The zeroth is the
+   * executable's own path, which the platform supplies and no test can predict, so a test asserts
+   * about `args[1..]` or about the count.
+   */
+  protected def runWith(src: String, args: String*): String = {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    Toolchain.compileAndRun(src, "<input>", args.toList) match {
+      case Right((0, out))    => out
+      case Right((code, out)) => fail(s"program exited with $code:\n$out")
+      case Left(err)          => fail(err)
+    }
+  }
+
   /** The same, for a program written as several files. */
   protected def runOf(fs: (String, String)*): String =
     ran(fs.toList.map { case (name, text) => Source(name, text) })
@@ -50,6 +64,18 @@ trait RunSupport extends Matchers { this: Assertions =>
     Toolchain.compileAndRun(src) match {
       case Right((code, _)) => code should not be 0
       case Left(err)        => fail(err)
+    }
+  }
+
+  /** Asserts the exact status a program exits with, for the one thing that can choose it: a call to
+   * `exit`. `exits` above only asks whether the status was non-zero, which is all a trap has to say.
+   */
+  protected def exitsWith(src: String, code: Int): Unit = {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    Toolchain.compileAndRun(src) match {
+      case Right((c, _)) => c shouldBe code
+      case Left(err)     => fail(err)
     }
   }
 

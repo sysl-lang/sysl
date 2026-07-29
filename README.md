@@ -33,7 +33,11 @@ To see the language run end to end — source, through the compiler, to a native
 ```bash
 ./run-example.sh                     # examples/hello.sysl
 ./run-example.sh examples/hello.sysl # or name one
+./run-example.sh examples/args.sysl -- -n one two
 ```
+
+Anything after a `--` goes to the program rather than to sysl, which is what a `main(args: []string)`
+reads — the same convention `sysl run <path> -- <args>` follows.
 
 That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with clang.
 

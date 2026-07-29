@@ -30,6 +30,15 @@ A program is a sequence of statements and declarations. Non-declaration statemen
 body of `main`; function, struct, and enum declarations are hoisted (so they may be used
 before they appear and may be mutually recursive).
 
+- **The emitted `@main` is C's**, `i32 @main(i32 %argc, ptr %argv)`, because the function the
+  platform's own start-up code calls is passed two values — there is no crt0 of sysl's to write, and
+  a compiled program is an ordinary hosted C program that clang links libc to. The two are taken
+  whether or not anything asks for them, and a program that declares `main(args: []string)`
+  (`13 §7`) gets them as a slice through one call to the prelude's `args_of`. **A sysl `main` is
+  therefore emitted under a reserved symbol**, since the one it is written as is already taken by the
+  function the platform starts at; the reserved name holds two `$` separators, which no key can
+  (`Modules.qualify` writes one), so it cannot collide with any module's declaration.
+
 - **A program is a tree of modules, and a module a directory of files** (`13 §1`, `13 §6`). The
   driver takes a **project root** and walks it: each directory is a module named by its path from
   the root, each file declares that name in a `module a.b` header, and a header that disagrees with
@@ -63,9 +72,9 @@ before they appear and may be mutually recursive).
   keeps read-only-ness whole and keeps a `val` from being a count nothing releases.
 
 - **Only what the program can reach is emitted** (`15 §3`). `Reachability` runs last, over a typed
-  program every other pass has already read: it walks out from the statements `main` runs, the `val`
-  initializers that fill storage before those, and the method tables, and drops every function and
-  `extern` it never arrives at. Analysis is untouched by it — a body nothing calls is still checked,
+  program every other pass has already read: it walks out from the statements the entry point runs,
+  the `main` it runs after them, the `val` initializers that fill storage before either, and the
+  method tables, and drops every function and `extern` it never arrives at. Analysis is untouched by it — a body nothing calls is still checked,
   and a slice that escapes one is still rejected — which is what fixes the pass order. A call whose
   target is settled at run time is answered with *every* function the trait's tables put in that
   slot, so the walk over-approximates in the only direction that is safe.

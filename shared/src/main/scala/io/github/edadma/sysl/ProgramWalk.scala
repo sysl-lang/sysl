@@ -182,6 +182,11 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     currentFile = mainScope.file
     val tmain = inBlock(mainStmts)(mainStmts.flatMap(recoverStmt))
 
+    // The `main` the program runs after those statements, if it declared one. Read here rather than
+    // during hoisting because the conversion it may want is a prelude function, and marking one as
+    // reached has to happen before the loop below decides which of them are worth analyzing.
+    val tentry = recover(Option.empty[TEntry])(declaredEntry())
+
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An
     // instantiation of a member the definition-time pass already reported is dropped rather than
     // analyzed, for the reason that pass exists: the diagnostic naming the missing bound is the one
@@ -240,7 +245,62 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       orderVals(tvals.toList, (tfuncs ++ closureFuncs).toList, vtables.values.toList),
       (tfuncs ++ closureFuncs).toList,
       tmain,
+      tentry,
     )
+  }
+
+  /** The `main` the program declared, and how its arguments are made.
+   *
+   * A program's top-level statements are its entry point (`13 §7`) and go on being that. What a
+   * declared `main` adds is a *named* place to put the work those statements would otherwise do, and
+   * the one thing the statements cannot get at: the arguments the program was started with. So it is
+   * additive — the statements run first, in the order they were written, and `main` runs after them.
+   *
+   * **`main` names one function in a program**, wherever it is written, so a module may not have one
+   * of its own beside the one the program starts at. That is the same reservation C makes and for the
+   * same reason: it is not a name a program calls, it is the name the platform calls, and two of them
+   * would leave which one the program *is* to whichever was emitted last.
+   *
+   * The two signatures are `main()` and `main(args: []string)`. Nothing else: a result would be an
+   * exit status, which nothing in the language spells yet, and a parameter list of the platform's own
+   * `argc`/`argv` is exactly what `args_of` exists so that no program has to write.
+   */
+  private def declaredEntry(): Option[TEntry] = {
+    val declared = funcDecls.keys.filter(k => Modules.bare(k) == "main" && !externDecls.contains(k)).toList
+
+    declared match
+      case Nil => None
+      case key :: rest =>
+        val decl = funcDecls(key)
+
+        for extra <- rest do
+          at(funcDecls(extra).pos) {
+            recover(())(err(s"'main' is where a program starts, so there is one — " +
+              s"${Modules.show(key)} already declares it"))
+          }
+
+        at(decl.pos) {
+          if decl.tparams.nonEmpty then
+            err("'main' is called by the platform, which has no type arguments to give it")
+
+          val (params, ret) = funcInsts(key)
+
+          if !Type.noValue(ret) then
+            err(s"'main' yields nothing, so it may not result in ${show(ret)} — " +
+              "a program's exit status is not something a signature can say")
+          if decl.variadic then err("'main' is called with the arguments the platform has, not a list it reads")
+
+          params.map(_._2) match
+            case Nil                      => Some(TEntry(key, None))
+            case Type.Slice(Type.Str) :: Nil =>
+              val argsFn = Modules.qualify(Modules.root, "args_of")
+
+              funcsUsed += argsFn
+              Some(TEntry(key, Some(argsFn)))
+            case ts =>
+              err(s"'main' takes either nothing or one '[]string' of the program's arguments, " +
+                s"not (${ts.map(show).mkString(", ")})")
+        }
   }
 
   /** Whether a named type was instantiated at something that is not a type — a parameter standing
