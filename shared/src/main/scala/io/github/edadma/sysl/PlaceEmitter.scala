@@ -120,17 +120,21 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * own storage; a slice is indexed from the pointer it carries.
    */
   protected def elementAddr(receiver: TExpr, index: TExpr): String = {
+    // The length is what there is to check against, and a `*T` has none — so the pointer case
+    // yields no length and the check is skipped. That is the whole difference between `p[i]` and
+    // every other subscript, and it is `03`'s unchecked primitive doing what C's does.
     val (base, len, elem) = receiver.ty match
-      case Type.Array(n, e) => (address(receiver), n.toString, e)
+      case Type.Array(n, e) => (address(receiver), Some(n.toString), e)
       case w: Type.View =>
         val v = genExpr(receiver)
         val p = freshTemp(); emit(s"$p = extractvalue ${w.llvm} $v, 1")
         val l = freshTemp(); emit(s"$l = extractvalue ${w.llvm} $v, 2")
-        (p, l, w.elem)
-      case other => sys.error(s"unreachable index into ${other.llvm}")
+        (p, Some(l), w.elem)
+      case Type.Ptr(e) => (genExpr(receiver), None, e)
+      case other       => sys.error(s"unreachable index into ${other.llvm}")
 
     val i = widen64(index)
-    boundsCheck(i, len)
+    for l <- len do boundsCheck(i, l)
     val r = freshTemp(); emit(s"$r = getelementptr ${elem.llvm}, ptr $base, i64 $i"); r
   }
 
@@ -152,13 +156,13 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       case Type.Ref(array @ Type.Array(n, _), _) =>
         val r = genExpr(base)
         val p = freshTemp(); emit(s"$p = getelementptr ${boxName(array)}, ptr $r, i32 0, i32 $headerFields")
-        (r, p, n.toString)
+        (r, p, Some(n.toString))
       case s: Type.View =>
         val v = genExpr(base)
         val o = freshTemp(); emit(s"$o = extractvalue ${s.llvm} $v, 0")
         val p = freshTemp(); emit(s"$p = extractvalue ${s.llvm} $v, 1")
         val l = freshTemp(); emit(s"$l = extractvalue ${s.llvm} $v, 2")
-        (o, p, l)
+        (o, p, Some(l))
       // Storage this frame owns, or a `*T` region. A frame-backed array has no owner, so counting
       // it is a no-op — unless the escape analysis moved it to the heap, in which case the buffer
       // it moved into is exactly what a view of it must count against, and the whole promotion
@@ -167,9 +171,12 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
       // Storage this frame owns, storage inside a box the walk went through, or a `*T` region.
       case Type.Array(n, _) =>
         val (own, addr) = addressOwned(base)
-        (own, addr, n.toString)
-      case Type.Ptr(Type.Array(n, _))   => ("null", genExpr(base), n.toString)
-      case other                        => sys.error(s"unreachable slice of ${other.llvm}")
+        (own, addr, Some(n.toString))
+      case Type.Ptr(Type.Array(n, _)) => ("null", genExpr(base), Some(n.toString))
+      // A `*T` region: no owner to count and no length to check the end against. The analyzer has
+      // already insisted the end be written, since there is nothing here to supply one.
+      case _: Type.Ptr                => ("null", genExpr(base), None)
+      case other                      => sys.error(s"unreachable slice of ${other.llvm}")
 
     val start = lo.map(widen64).getOrElse("0")
 
@@ -177,17 +184,18 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // additionally has to name an element that exists, which is also what stops `hi + 1` from
     // wrapping past the end.
     val end = hi match
-      case None => len
+      case None => len.getOrElse(sys.error("unreachable open-ended slice of a pointer"))
       case Some(h) =>
         val v = widen64(h)
         if !inclusive then v
         else
-          val within = freshTemp(); emit(s"$within = icmp ult i64 $v, $len")
-          trapUnless(within, "bounds")
+          for l <- len do
+            val within = freshTemp(); emit(s"$within = icmp ult i64 $v, $l")
+            trapUnless(within, "bounds")
           val e = freshTemp(); emit(s"$e = add i64 $v, 1"); e
 
-    if hi.isDefined && !inclusive then
-      val fits = freshTemp(); emit(s"$fits = icmp ule i64 $end, $len")
+    for l <- len if hi.isDefined && !inclusive do
+      val fits = freshTemp(); emit(s"$fits = icmp ule i64 $end, $l")
       trapUnless(fits, "bounds")
 
     val ordered = freshTemp(); emit(s"$ordered = icmp ule i64 $start, $end")
@@ -196,8 +204,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // A substring has to be a string, so both ends must fall between characters. This runs after
     // the bounds checks, which is what makes reading the byte at either end safe.
     if sliceTy == Type.Str then
-      trapUnless(strBoundary(first, len, start), "boundary")
-      trapUnless(strBoundary(first, len, end), "boundary")
+      // A string is a view and so always has one; only a `*T` region does not.
+      val l = len.getOrElse(sys.error("unreachable string slice with no length"))
+
+      trapUnless(strBoundary(first, l, start), "boundary")
+      trapUnless(strBoundary(first, l, end), "boundary")
 
     val p = freshTemp(); emit(s"$p = getelementptr ${elem.llvm}, ptr $first, i64 $start")
     val n = freshTemp(); emit(s"$n = sub i64 $end, $start")

@@ -227,6 +227,9 @@ object Type {
   def element(t: Type): Option[Type] = t match
     case Array(_, e) => Some(e)
     case v: View     => Some(v.elem)
+    // A `*T` is a bare address, so its `i`th element is C's `p[i]` — unchecked, since there is no
+    // length in the type to check against (`03`).
+    case Ptr(e)      => Some(e)
     case _           => None
 
   /** The type a `*T` or `&T` points at, for the one level of automatic dereference that field

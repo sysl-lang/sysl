@@ -274,48 +274,139 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  /** Where a pointer stops being a way to reach a run of values.
+  /** A run of values reached through a pointer — `p[i]` and `p[0..<n]`, both C's and both unchecked.
    *
-   * `03` reserves `*T` for "genuine address work, not merely for having an indexable buffer", and
-   * the length is what decides which of the two a pointer is: a `*[N]T` carries one in its type, so
-   * a view of it is an ordinary view whose owner is null. A `*T` carries none, so there is nothing
-   * to check a subscript against and nothing to give a view its length.
-   *
-   * These pin where the line currently falls rather than where it should. A `*T` **plus a written
-   * length** is the shape C hands back from every function that returns a buffer, and sysl has no
-   * way to say it — see the memo's findings for the open question.
+   * `03` makes `*T` the one unchecked primitive, and this is what that buys: the shape every C
+   * function that fills a buffer hands back is a bare address plus a count the caller was told
+   * separately, and a language that cannot say it cannot be used where C is. The length is the
+   * programmer's assertion, exactly as `*p` already is.
    */
-  "a run of values is reached through a pointer that carries a length, and not through one that does not" - {
-    "a pointer to an array views and slices, because the length is in its type" in {
+  "a run of values is reached through a raw pointer, unchecked" - {
+    "the subscript reads what C's reads" in {
+      run("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+            |var p = &a[0]
+            |print(p[0usize], p[2usize], p[3usize])
+            |""".stripMargin) shouldBe "1 3 4\n"
+    }
+
+    "and writes through to the storage it names" in {
+      run("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+            |var p = &a[0]
+            |p[1usize] = 99u8
+            |print(a[1], p[1usize])
+            |""".stripMargin) shouldBe "99 99\n"
+    }
+
+    // The stride is the pointee's size, so a pointer into a table of structs walks it. This is the
+    // case that would silently read the wrong bytes if the element type were taken from anywhere
+    // but the pointer.
+    "a pointer to a struct strides by the struct" in {
+      run("""struct C
+            |    n: int
+            |    m: int
+            |var cs: [3]C = [C(1, 2), C(3, 4), C(5, 6)]
+            |var q = &cs[0]
+            |q[0usize].n = 77
+            |print(q[2usize].n, q[1usize].m, cs[0].n)
+            |""".stripMargin) shouldBe "5 4 77\n"
+    }
+
+    "and a pointer to a pointer indexes twice" in {
+      run("""go()
+            |    var a: [2]u8 = [1u8, 2u8]
+            |    var b: [2]u8 = [3u8, 4u8]
+            |    var t: [2]*u8 = [&a[0], &b[0]]
+            |    var pp = &t[0]
+            |    print(pp[1usize][0usize], pp[0usize][1usize])
+            |end go
+            |go()
+            |""".stripMargin) shouldBe "3 2\n"
+    }
+
+    // A `val` fixes the address, not what is at it — the same reading C's `T *const p` has, and the
+    // same one `*p = v` through a `val` pointer already had.
+    "a 'val' pointer still writes through, since what it fixes is the address" in {
+      run("""go()
+            |    var a: [2]u8 = [1u8, 2u8]
+            |    val vp = &a[0]
+            |    vp[0usize] = 9u8
+            |    print(a[0])
+            |end go
+            |go()
+            |""".stripMargin) shouldBe "9\n"
+    }
+
+    "a view of a region is taken by writing where it ends" in {
+      run("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+            |var p = &a[0]
+            |var v = p[1..<3]
+            |print(v.len, v[0usize], v[1usize])
+            |""".stripMargin) shouldBe "2 2 3\n"
+    }
+
+    // The whole point of the feature, end to end: a C function's `*u8`, a length it reported
+    // separately, and the bytes read back and turned into text.
+    "which is what makes a buffer a C function filled readable at all" in {
+      run("""extern "strlen" c_strlen(p: *u8) -> usize
+            |extern "getenv" c_getenv(n: *u8) -> *u8
+            |var home = c_getenv(c"HOME")
+            |var n = c_strlen(home)
+            |var bytes = home[0..<n]
+            |var s = from_utf8_unchecked(bytes)
+            |print(n == bytes.len, s.len == n, home[0usize] == 47u8)
+            |""".stripMargin) shouldBe "true true true\n"
+    }
+  }
+
+  /** The unchecked half, and the line it is drawn against. A pointer that *does* carry a length
+   * keeps every check it had — which is what makes "unchecked" a property of the type rather than
+   * of the syntax.
+   */
+  "and the check is what the pointer's type decides" - {
+    // Discriminating: both subscripts are written identically and lower differently. A `*T` gets a
+    // bare `getelementptr`; a `*[N]T` keeps the comparison and the trap.
+    "a subscript on a '*T' emits no check, and one on a '*[N]T' still does" in {
+      val out = mainOf(ir("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+                            |var p = &a[0]
+                            |var q = &a
+                            |print(p[2usize], q[2usize])
+                            |""".stripMargin))
+
+      // Both index by 2 into four elements, so a checked `p[2]` would emit a second comparison
+      // identical to the one `q[2]` emits. Exactly one is the whole assertion.
+      out.linesIterator.count(_.contains("icmp ult i64 2, 4")) shouldBe 1
+    }
+
+    "a pointer to an array views and slices with its length checked" in {
       run("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
             |var p = &a
             |print(p[..].len, p[1..<3].len, p[..][2])
             |""".stripMargin) shouldBe "4 2 3\n"
     }
 
-    // The receiver is dereferenced on the way in, so the complaint would otherwise name what the
-    // pointer points *at* — `byte` — when the rule being applied is about the pointer.
-    "a pointer to one element is not a subscript away from the next" in {
+    // There is nothing to supply the end from, so it has to be written. Left implicit it would be
+    // a view of unbounded length, which is the one thing worse than an unchecked one.
+    "a view of a '*T' must say where it ends" in {
       err("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
             |var p = &a[0]
-            |print(p[2usize])
-            |""".stripMargin) should include("a *byte points at one value and carries no length")
+            |print(p[..].len)
+            |""".stripMargin) should include("needs its end written")
     }
 
-    "and the complaint names the pointer rather than what it points at" in {
-      err("""struct C
-            |    n: int
-            |var c = C(1)
-            |var p = &c
-            |print(p[0usize])
-            |""".stripMargin) should include("a *C points at one value")
-    }
-
-    "and it cannot be given a length to be viewed with either" in {
+    "and an open high end is the same complaint" in {
       err("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
             |var p = &a[0]
-            |print(p[0..<2].len)
-            |""".stripMargin) should include("nothing to give a view its extent")
+            |print(p[1..].len)
+            |""".stripMargin) should include("needs its end written")
+    }
+
+    // `05`: a view of a `*T` region has nothing to keep alive, so its owner word is null and
+    // counting it is a no-op. Unchanged by the region now being reachable through a bare pointer.
+    "a view of a region owns nothing, because there is nothing to own" in {
+      ir("""view(p: *u8, n: usize) -> []u8 = p[0..<n]
+           |var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+           |print(view(&a[0], 2usize).len)
+           |""".stripMargin) should include("insertvalue { ptr, ptr, i64 } zeroinitializer, ptr null, 0")
     }
   }
 }

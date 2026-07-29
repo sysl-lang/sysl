@@ -709,13 +709,14 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         case Type.Array(_, e)           => e
         case Type.Ptr(Type.Array(_, e)) => e
 
-        // A pointer to an *array* was viewable one line up, because the length is in its type. A
-        // pointer to one value has none, and a view has to have an extent — so what is missing is
-        // said rather than left as "cannot slice", which reads like the operation does not exist.
-        case p: Type.Ptr =>
-          err(s"a ${show(p)} points at one value and carries no length, so there is nothing to give " +
-            s"a view its extent — a pointer to an array carries one in its type, and 'p[..]' on that " +
-            "is the view")
+        // A view of a `*T` region — the shape every C function that fills a buffer hands back. The
+        // pointer carries no length, so the end must be written and is taken on trust; that is the
+        // same trust `*p` already asks for, and the resulting view owns nothing (`05`).
+        case Type.Ptr(e) =>
+          if hi.isEmpty then
+            err(s"a ${show(tr.ty)} carries no length, so a view of one needs its end written — " +
+              "'p[0..<n]' with the number of elements that are really there")
+          e
 
         case other => err(s"cannot slice ${show(other)}")
 
@@ -727,7 +728,15 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
     case Index(receiver, index) =>
       val raw = analyzeExpr(receiver)
-      val tr  = autoDeref(raw)
+
+      // `p[i]` on a raw pointer is C's, unchecked: the pointer is a bare address, so the subscript
+      // is the address arithmetic C spells the same way. It is read off the *undereferenced*
+      // receiver — a pointer to an array keeps the checked form below, because that one has a
+      // length in its type to check against.
+      val tr = raw.ty match
+        case Type.Ptr(_: Type.Array) => autoDeref(raw)
+        case _: Type.Ptr             => raw
+        case _                       => autoDeref(raw)
 
       Type.element(tr.ty) match
         case Some(elem) =>
@@ -745,16 +754,6 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         // container is read by is the trait's own argument, and a type that indexes by something
         // else is implementing a different `Index` rather than misusing this one.
         case None if indexes("Index", tr.ty) => callMethodOn(raw, "index", List(index), expected)
-
-        // The receiver was dereferenced on the way in, so a raw pointer would otherwise be
-        // complained about under the name of what it points *at* — and `03`'s rule is about the
-        // pointer. A `*T` carries no length, which is exactly why it has no subscript: there would
-        // be nothing to check one against, and `03` reserves the mode for address work rather than
-        // for having an indexable buffer.
-        case None if raw.ty.isInstanceOf[Type.Ptr] =>
-          err(s"a ${show(raw.ty)} points at one value and carries no length, so a subscript would " +
-            s"have nothing to be checked against — '*p' reads the one it points at, and a run of " +
-            "values is reached through a slice or a pointer to an array")
 
         case None => err(s"cannot index ${show(tr.ty)}")
 
@@ -1137,6 +1136,10 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       recv.ty match
         case _: Type.Slice => true
         case Type.Str      => false
+        // What a pointer names is somewhere else, so its elements have an address whether or not
+        // the pointer itself is a place — the same reason a slice's do, and the same reason `*p`
+        // is a place.
+        case _: Type.Ptr   => true
         case _             => isPlace(recv)
     case _ => false
 
@@ -1173,6 +1176,9 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case TIndex(recv, _, _) =>
       recv.ty match
         case _: Type.View => false
+        // A `val *T` fixes the address, not what is at it — exactly as `*p = v` through one is
+        // already allowed. C's `T *const p` reads the same way.
+        case _: Type.Ptr  => false
         case _            => readOnly(recv)
     case _ => false
 

@@ -325,10 +325,20 @@ allocation or "pointer-ness":
 
 - **Arrays (`[N]T`) and slices** carry their length, so indexing is **bounds-checked in every
   context** — hosted or allocator-free kernel, over static, stack, or heap memory.
-- **`*T` carries no length**, so it is the one unchecked primitive.
+- **`*T` carries no length**, so it is the one unchecked primitive. `p[i]` reads the `i`th element
+  from it and `p[0..<n]` views `n` of them, both exactly as C does and both **unchecked** — there is
+  no length to check against, and supplying one is the programmer's assertion.
 
-The practical consequence: even low-level, allocator-free code stays bounds-safe by using
-slices; `*T` is reserved for genuine address work, not merely for having an indexable buffer.
+The practical consequence: even low-level, allocator-free code stays bounds-safe by *choosing*
+slices, and reaches for `*T` where it must — an MMIO window, a page table, a buffer a C function
+filled. That choice is the point. A pointer is where the language's guarantees stop, so it carries
+C's whole surface rather than a safer subset of it: anything C can do through a pointer, sysl can.
+
+An earlier draft of this chapter said `*T` was "reserved for genuine address work, not merely for
+having an indexable buffer", and refused the subscript on that ground. That was wrong and is
+reversed. The argument proves too much — it is an argument for the programmer to prefer a slice,
+which they can already do, and not an argument for the language to withhold the operation. A kernel
+that cannot write `p[i]` cannot be written.
 An array whose length the program computes needs an allocator, and so would a growable one; a fixed
 array and a view of one do not.
 

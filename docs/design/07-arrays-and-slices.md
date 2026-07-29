@@ -212,6 +212,15 @@ used.
 A failed check **traps**. It is the same runtime-safety category as the partial `char(u)`
 conversion, and it gets the same treatment.
 
+**A raw pointer is the one receiver with nothing to check against, and it is indexed anyway.**
+`p[i]` on a `*T` is C's subscript — the address arithmetic, unchecked — and `p[0..<n]` views a run
+of the region it points into, with the end written because nothing in the type can supply one. The
+resulting view owns nothing, since a `*T` region has nothing to keep alive (`05`). This is `03`'s
+unchecked primitive behaving like one: the check is a property of the *type*, so a `*[N]T`, whose
+length is in its type, keeps every check an array has. Reaching for a slice is how a program stays
+safe; reaching for a pointer is how it talks to hardware and to C, and the language supplies both
+rather than withholding the second.
+
 **A type with no elements of its own is indexed through a trait**, and everything above is about the
 built-in subscript rather than about `[]` as a token. A user type — the prelude's `Buf[T]`, a
 lookup table, anything a program writes — implements `Index` and is read with the same syntax
