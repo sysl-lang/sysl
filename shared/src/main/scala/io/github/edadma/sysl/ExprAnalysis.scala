@@ -708,7 +708,16 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         case w: Type.View               => w.elem
         case Type.Array(_, e)           => e
         case Type.Ptr(Type.Array(_, e)) => e
-        case other                      => err(s"cannot slice ${show(other)}")
+
+        // A pointer to an *array* was viewable one line up, because the length is in its type. A
+        // pointer to one value has none, and a view has to have an extent — so what is missing is
+        // said rather than left as "cannot slice", which reads like the operation does not exist.
+        case p: Type.Ptr =>
+          err(s"a ${show(p)} points at one value and carries no length, so there is nothing to give " +
+            s"a view its extent — a pointer to an array carries one in its type, and 'p[..]' on that " +
+            "is the view")
+
+        case other => err(s"cannot slice ${show(other)}")
 
       // Part of a string is a string, not a `[]u8` — the bytes between two character boundaries
       // are still well-formed UTF-8, which is what the check at those boundaries is for.
@@ -736,6 +745,16 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
         // container is read by is the trait's own argument, and a type that indexes by something
         // else is implementing a different `Index` rather than misusing this one.
         case None if indexes("Index", tr.ty) => callMethodOn(raw, "index", List(index), expected)
+
+        // The receiver was dereferenced on the way in, so a raw pointer would otherwise be
+        // complained about under the name of what it points *at* — and `03`'s rule is about the
+        // pointer. A `*T` carries no length, which is exactly why it has no subscript: there would
+        // be nothing to check one against, and `03` reserves the mode for address work rather than
+        // for having an indexable buffer.
+        case None if raw.ty.isInstanceOf[Type.Ptr] =>
+          err(s"a ${show(raw.ty)} points at one value and carries no length, so a subscript would " +
+            s"have nothing to be checked against — '*p' reads the one it points at, and a run of " +
+            "values is reached through a slice or a pointer to an array")
 
         case None => err(s"cannot index ${show(tr.ty)}")
 

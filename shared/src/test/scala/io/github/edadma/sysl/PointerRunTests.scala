@@ -293,18 +293,29 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "4 2 3\n"
     }
 
+    // The receiver is dereferenced on the way in, so the complaint would otherwise name what the
+    // pointer points *at* — `byte` — when the rule being applied is about the pointer.
     "a pointer to one element is not a subscript away from the next" in {
       err("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
             |var p = &a[0]
             |print(p[2usize])
-            |""".stripMargin) should include("cannot index")
+            |""".stripMargin) should include("a *byte points at one value and carries no length")
+    }
+
+    "and the complaint names the pointer rather than what it points at" in {
+      err("""struct C
+            |    n: int
+            |var c = C(1)
+            |var p = &c
+            |print(p[0usize])
+            |""".stripMargin) should include("a *C points at one value")
     }
 
     "and it cannot be given a length to be viewed with either" in {
       err("""var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
             |var p = &a[0]
             |print(p[0..<2].len)
-            |""".stripMargin) should include("cannot slice *byte")
+            |""".stripMargin) should include("nothing to give a view its extent")
     }
   }
 }
