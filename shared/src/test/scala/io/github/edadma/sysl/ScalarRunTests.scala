@@ -86,6 +86,35 @@ class ScalarRunTests extends AnyFreeSpec with RunSupport {
             |print(h + 0.25)
             |""".stripMargin) shouldBe "0.75\n"
     }
+
+    /** IEEE 754 leaves a `NaN` unequal to everything including itself, and makes `!=` the negation of
+     * `==` rather than the ordered comparison the other three are. So exactly one of the five answers
+     * true, and getting `!=` wrong is invisible in every test that does not use a `NaN` — which is why
+     * this is written as all five at once.
+     */
+    "a NaN is unequal to itself, and unordered against everything" in {
+      run("""var nan = 0.0 / 0.0
+            |print(nan != nan, nan == nan, nan < 1.0, nan > 1.0, nan <= 1.0, nan >= 1.0)
+            |""".stripMargin) shouldBe "true false false false false false\n"
+    }
+
+    "and unequal to an ordinary number, which is the same answer for the same reason" in {
+      run("""var nan = 0.0 / 0.0
+            |print(nan != 1.0, 1.0 != nan, nan == 1.0)
+            |""".stripMargin) shouldBe "true true false\n"
+    }
+
+    "while two ordinary floats still compare the ordinary way" in {
+      run("""print(1.5 != 2.5, 1.5 != 1.5, 1.5 == 1.5)
+            |""".stripMargin) shouldBe "true false true\n"
+    }
+
+    "the same holds at a narrower width" in {
+      run("""var z: f32 = 0.0
+            |var nan: f32 = z / z
+            |print(nan != nan, nan == nan)
+            |""".stripMargin) shouldBe "true false\n"
+    }
   }
 
   "for loops follow the width of their bounds" in {

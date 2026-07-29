@@ -682,9 +682,10 @@ exactly (`§5`), one row further down the catalog.
 - **c. `Ord` totality and `NaN`.** `Ord` on a float uses IEEE `<`, which is not a total order at
   `NaN`. §2 keeps the scalars on their native ordered comparisons rather than on the derived ones
   precisely so this stays today's behaviour; whether a separate total-order facility is ever wanted
-  (for sort keys) is deferred, not decided here. A neighbouring question this chapter does *not*
-  answer: `!=` on floats lowers to `fcmp one`, so `NaN != NaN` is false where IEEE says true. That
-  is a pre-existing scalar-semantics question for `01`, not a consequence of anything here.
+  (for sort keys) is deferred, not decided here. **The neighbouring defect this item used to record
+  is fixed**: `!=` on floats lowered to `fcmp one`, making `NaN != NaN` false where IEEE says true.
+  It is `fcmp une` now — IEEE makes `!=` the negation of `==` rather than the ordered comparison the
+  other three are, so exactly one of the six comparisons answers true at a `NaN`. `01` states it.
 - **d. ~~The `Writer` sink surface.~~ Settled — see `§2`.** One method on `[]u8`, a latched
   `failed` rather than a returned error, and the format specifier passed alongside the sink rather
   than folded into it. The last of those is Rust's `Formatter` capability without Rust's packaging:

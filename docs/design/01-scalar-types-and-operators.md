@@ -208,6 +208,12 @@ Key points:
 - **Equality reaches further than ordering.** `==` and `!=` are defined wherever `<` is, and
   additionally on `bool` and on the two pointer-shaped modes `*T` and `&T`, which compare by
   address. Ordering on an address is not defined — a bare address has no meaningful one.
+- **A float comparison is IEEE 754's, `NaN` and all.** A `NaN` is equal to nothing, itself included,
+  so `==`, `<`, `>`, `<=` and `>=` are all false at one — and `!=` is **true**, because IEEE makes it
+  the negation of `==` rather than a sixth ordered comparison. Exactly one of the six answers true,
+  which is the thing to check a lowering against: `!=` is `fcmp une` where the other five are the
+  ordered predicates. This is also why a float is not hashable (`14 §5`): a reflexivity a table
+  assumes is one `NaN` breaks.
 - **Chained comparisons** (level 4): `a < b < c` means `a < b && b < c`, short-circuiting;
   comparisons do not associate as plain left/right. The `&&` there is about *when* the later
   comparisons happen, not a rewrite — a middle operand is **evaluated once** and compared twice, so

@@ -62,9 +62,13 @@ trait ScalarEmitter extends StringEmitter {
         case "==" => "eq"; case "!=" => "ne"
         case "<"  => "slt"; case ">" => "sgt"; case "<=" => "sle"; case ">=" => "sge"
         case _    => sys.error(s"unreachable compare '$op'")
+    // IEEE 754 makes `!=` the negation of `==`, and a `NaN` is equal to nothing including itself —
+    // so `!=` is **unordered** or not equal (`une`), not ordered and not equal (`one`). Every other
+    // float comparison is the ordered one, which is what makes all four of `==`, `<`, `<=` and `>=`
+    // false at a `NaN` while `!=` is true.
     case _: Type.Floating =>
       op match
-        case "==" => "oeq"; case "!=" => "one"
+        case "==" => "oeq"; case "!=" => "une"
         case "<"  => "olt"; case ">" => "ogt"; case "<=" => "ole"; case ">=" => "oge"
         case _    => sys.error(s"unreachable compare '$op'")
     case other => sys.error(s"unreachable compare on ${other.llvm}")
