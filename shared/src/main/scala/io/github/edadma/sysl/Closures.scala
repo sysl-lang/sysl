@@ -2,6 +2,31 @@ package io.github.edadma.sysl
 
 import scala.collection.mutable
 
+/** A nested function declared in a block (`12 §5a`): the lowered name it is called by, and the
+ * environment its call is passed.
+ *
+ * The environment is a `*Env` expression rather than a name, because the same nested function is
+ * reached two ways — from the block that declared it, where it is the address of the local holding
+ * the environment, and from inside a sibling's body, where it is the receiver that body already
+ * has. That is what makes mutual recursion a call on the receiver rather than a capture.
+ */
+case class Nested(fname: String, env: TExpr)
+
+/** The environment a body reads its captures out of (`12 §7`, `§5a`).
+ *
+ * `byReference` is the one difference between the two things that have one. A **closure literal**
+ * captures by value, because it may outlive the frame it was written in: its fields hold copies and
+ * shares, and `§7` says so. A **nested function** captures by address, because it may not — nothing
+ * outside the body can name one, so it cannot be stored or returned, and a body of statements that
+ * could not assign to the variable it was written beside would not be worth the name it has.
+ */
+case class Environment(
+    struct: Type.Struct,
+    names: List[String],
+    byReference: Boolean,
+    fixed: Set[String],
+)
+
 /** Closures (`12 §5`–`§8`): the arrow literal, what it captures, and the type it inhabits.
  *
  * **A closure is a struct and an `impl`, and that is the whole reduction.** The struct's fields are
@@ -21,6 +46,10 @@ trait Closures extends CallAnalysis {
 
   /** How many closures have been lowered, which is what makes each one's name its own. */
   private var closureCount = 0
+
+  /** How many blocks of nested functions have been lowered, likewise. */
+  private var environmentCount = 0
+
 
   /** A closure literal (`12 §5`).
    *
@@ -70,8 +99,9 @@ trait Closures extends CallAnalysis {
     struct.fields = fields
     structInsts(struct.base) = struct
 
-    val name        = s"${Type.mangle(struct)}.call"
-    val (func, ret) = at(pos)(analyzeNested(name, names.zip(ptypes), result, body, Some((struct, captured))))
+    val name = s"${Type.mangle(struct)}.call"
+    val (func, ret) = at(pos)(analyzeNested(name, names.zip(ptypes), result, body,
+      Some(Environment(struct, captured, byReference = false, fixed(captured)))))
 
     closureFuncs += func
     funcInsts(name) = (func.params.map((n, t) => (n, t)), ret)
@@ -81,6 +111,118 @@ trait Closures extends CallAnalysis {
     // `&T` takes a share — which is what the ordinary field-by-field construction of a struct
     // already does, and the reason capture needed no rule of its own.
     TStructNew(struct, captured.map(n => analyzeExpr(Ident(n).setPos(pos)))).setPos(pos)
+  }
+
+  /** The nested functions of one block, lowered together (`12 §5a`).
+   *
+   * **They share one environment**, and that is the whole design. A nested function *is* a closure —
+   * capture follows §7 and representation follows §8, both unchanged — but the block's functions are
+   * members of one struct rather than one struct each, which is what makes the two halves of §5a's
+   * rule both true at once: every name is in scope throughout the block, so two may call each other,
+   * while what may be *captured* is settled at the position the group is written.
+   *
+   * A sibling call and a recursive call are then the same thing — a call on the receiver the body
+   * already has — so neither takes a share of anything, and §5a's reference cycle never forms.
+   *
+   * The environment is built where the first of them is written, which is also where the captures
+   * are read. Everything a nested function names from around it must therefore be declared above
+   * that point, and the diagnostic for a name declared below says so.
+   */
+  protected def lowerNestedGroup(group: List[FuncDecl]): List[TStmt] = {
+    val names = group.map(_.name)
+
+    for f <- group do
+      at(f.pos) {
+        if f.vis != Visibility.Public then
+          err(s"'${f.name}' is declared inside a function body, so nothing outside can name it and " +
+            "there is nothing for a visibility modifier to restrict")
+        if names.count(_ == f.name) > 1 then err(s"'${f.name}' is already declared in this block")
+        if f.tparams.nonEmpty then
+          err(s"'${f.name}' is declared inside a function body and cannot be generic — the type " +
+            "arguments would have nowhere to come from, since nothing outside the body calls it")
+      }
+
+    // A sibling is reached through the shared receiver rather than captured, so the names of the
+    // group are bound here and are not free in each other's bodies.
+    val bound    = names.toSet
+    val captured = group.flatMap(f => captures(f.body, bound ++ f.params.map(_.name))).distinct
+
+    // The field holds the **address** of the enclosing variable, not a copy of it — see
+    // `Environment`. That is what makes a nested function assigning to one of the block's locals
+    // assign to the block's local, which is the thing the form exists for.
+    val fields = captured.map(n => (n, Type.Ptr(lookupOpt(n).get._2)))
+    val env    = Type.Struct(s"${Modules.sep}env$environmentCount", Nil)
+
+    environmentCount += 1
+    env.fields = fields
+    structInsts(env.base) = env
+
+    val local = declare(s"${Modules.sep}env${environmentCount - 1}", env)
+    val here  = TAddrOf(TLoad(local, env), Type.Ptr(env))
+    val self  = TLoad("self", Type.Ptr(env))
+
+    // Every signature is registered before any body is analyzed, which is what lets one call another
+    // whichever order they are written in. A nested function states its parameters and its result
+    // (`12 §5a`), so there is nothing here to infer and nothing to wait for.
+    val lowered = group.map { f =>
+      val fname = s"${Type.mangle(env)}.${f.name}"
+
+      funcInsts(fname) = (
+        ("self", Type.Ptr(env)) :: f.params.map(p => (p.name, resolveType(p.typ, tsubst))),
+        f.retType.map(resolveReturn(_, tsubst)).getOrElse(Type.Unit),
+      )
+      (f, fname)
+    }
+
+    val inside = lowered.map((f, fname) => f.name -> Nested(fname, self)).toMap
+    val outer  = lowered.map((f, fname) => f.name -> Nested(fname, here)).toMap
+
+    for (f, fname) <- lowered do
+      val (params, result) = funcInsts(fname)
+
+      at(f.pos) {
+        val (func, _) = analyzeNested(fname, params.tail, Some(result), f.body,
+          Some(Environment(env, captured, byReference = true, fixed(captured))), inside)
+
+        closureFuncs += func
+      }
+
+    nestedFuncs = nestedFuncs ++ outer
+
+    // The environment holds addresses, so nothing in it is counted and nothing is copied: it is a
+    // row of pointers into the frame it was built in, which is sound exactly because a nested
+    // function cannot leave that frame.
+    // Read through the ordinary analysis rather than off the scope, so a name this block itself
+    // captured from further out is the field it reaches there, and the address taken is of the one
+    // variable rather than of a copy of it.
+    val addresses = captured.map { n =>
+      val place = analyzeExpr(Ident(n))
+
+      TAddrOf(place, Type.Ptr(place.ty))
+    }
+
+    List(TVarDecl(local, env, TStructNew(env, addresses)))
+  }
+
+  /** Which of a body's captures were bound by something written once, so that naming one inside the
+   * body reaches a `val` and not a variable that happens to hold the same value.
+   */
+  private def fixed(captured: List[String]): Set[String] =
+    captured.filter(n => lookupOpt(n).exists((u, _) => readOnlyLocals(u))).toSet
+
+  /** `inner(a)` — a call to a nested function, which is a call to its lowered name with the shared
+   * environment in front of the arguments it was written with.
+   */
+  protected def callNested(n: Nested, written: String, args: List[Expr]): TExpr = {
+    val (params, result) = funcInsts(n.fname)
+
+    if args.length != params.length - 1 then
+      err(s"'$written' takes ${quantity(params.length - 1, "argument")}, but ${supplied(args.length, "argument")}")
+
+    val supplied2 = args.zip(params.tail).map((a, p) => analyzeExpr(a, Some(p._2)))
+
+    funcsUsed += n.fname
+    TCall(n.fname, checkArgs(written, params, args, Some(n.env :: supplied2)), result)
   }
 
   /** `xs.map(square)` — a declared function where a callable is wanted (`12 §5`).

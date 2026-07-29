@@ -326,24 +326,47 @@ one's locals and parameters as well as its own. Nothing outside the body can nam
 so `13`'s visibility levels do not apply to one — there is nothing for `private` to restrict, and
 writing it is an error rather than a no-op.
 
-**Open here, and each is genuinely undecided:**
+### One environment per block, and the three things that follow from it
 
-- **A nested function that is recursive, capturing *and* escaping is a reference cycle.** The boxed
-  closure holds a capture that refers to the box. That is `03`'s `weak` problem arriving by a new
-  route, and it should be decided with `weak` rather than ahead of it.
+**The nested functions of a block share one environment**, and each is a member of it. That is what
+makes both halves of the rule above true at once: every name is in scope throughout the block,
+because they are members of one thing, while what may be *captured* is settled where the group is
+written.
 
-  *Observed while building §5–§8, and it narrows this sharply:* the paragraph above says **nothing
-  outside the body can name a nested function**, and a value nothing can name is a value nothing can
-  store or return — so a nested function cannot escape at all, and the cycle cannot arise. What
-  would re-open it is letting a nested function be *used as a callable value* the way §5 lets a
-  top-level one be (`xs.map(inner)`), which is the thing to decide rather than the cycle itself. If
-  it may not, recursion is a call on the receiver the body already has and mutual recursion is a
-  call on a sibling through one shared environment, and neither takes a count of anything.
-- **Whether one shadows a top-level function of the same name.** Ordinary lexical scoping says yes;
-  whether that is wanted for *functions*, where a shadowed name is harder to notice than a shadowed
-  variable, is a separate question.
-- **Whether a nested function may be generic.** `§ Open b` already holds the closure half of this;
-  a named one raises it in the same form and should be answered with it.
+- **A sibling call and a recursive call are the same call** — a call on the receiver the body
+  already has — so neither takes a share of anything and no cycle can form.
+- **The environment holds the *addresses* of the block's variables, not copies of them.** This is the
+  one place a nested function parts company with a closure literal, and the reason is that it may
+  not escape: a value nothing outside can name is a value nothing can store or return, so a row of
+  pointers into the frame is sound. It is also the whole point of the form — `swap` in the example
+  above assigns to `xs`, and a body of statements that could not assign to the variable it was
+  written beside would not be worth the name it has.
+- **Everything the group captures must be declared above it**, since that is where the environment
+  is formed. A call written above the group is told so.
+
+**A nested function is called where it is written and is not a value.** §5 lets a *top-level*
+function stand where a callable is expected, because it captures nothing and there is nothing to
+carry; a nested function's environment is the frame it was declared in, and a callable value is a
+way of carrying that frame out of itself. For the same reason a body reaches its **own** group and
+its own captures and no further: a closure written beside a nested function cannot call it, and
+neither can a nested function of an inner block. What several bodies share is a top-level function.
+
+**Open here:**
+
+- ~~**A nested function that is recursive, capturing *and* escaping is a reference cycle.**~~
+  **Cannot arise.** Nothing outside the body can name one, so it cannot be stored or returned, and
+  the shared environment means a recursive call takes no share of anything. `weak` is not needed
+  here after all.
+- ~~**Whether one shadows a top-level function of the same name.**~~ **Yes** — ordinary lexical
+  scoping, the same answer every other name in the language gets. A rule making functions the
+  exception would be a rule to remember for no gain.
+- ~~**Whether a nested function may be generic.**~~ **No.** Its type arguments would have nowhere to
+  come from: nothing outside the body calls it, so every call site is inside the body and the
+  declaration is already as specific as its uses. `§ Open b` still holds the closure half.
+- **Whether a nested function should be reachable from a closure or an inner block written beside
+  it.** Refused today, for the escape reason above. Both could be allowed by having the inner
+  environment carry the outer one, which is the same widening in each case; what it costs is that
+  a closure's captures would no longer all be values it owns.
 
 ## 5b. Several results — a list, not a tuple
 

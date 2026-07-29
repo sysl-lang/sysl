@@ -334,6 +334,15 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
       functionAsCallable(name, ptypes, result, expr.pos)
 
+    // A nested function is **called** where it is written and is not a value (`12 §5a`). Its
+    // environment is a row of addresses into the frame it was declared in, which is sound exactly
+    // because nothing can carry it out of that frame — and a callable value is a way of carrying it.
+    case Ident(name)
+        if lookupOpt(name).isEmpty && (nestedFuncs.contains(name) || outerNested(name)) =>
+      err(s"'$name' is a nested function, so it is called where it is written rather than passed — " +
+        "its environment is the frame it was declared in, and a callable value is a way of carrying " +
+        s"it out. Something that has to be passed is a closure of its own: 'var $name = x -> …'")
+
     case Ident(name) =>
       lookupOpt(name) match
         // A captured name is a name the scope knows and the frame does not hold: what it reaches is
@@ -501,6 +510,25 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     // relied on it is silently rerouted.
     case Call(Ident(name), args) if lookupOpt(name).exists((_, t) => callableOf(t).isDefined) =>
       callCallable(analyzeExpr(Ident(name).setPos(expr.pos)), args, expected)
+
+    // A nested function of an enclosing block (`12 §5a`), which shadows a top-level one of the same
+    // name for the reason the nearest binding always wins. The environment travels as the receiver,
+    // so a sibling call and a recursive call are the same call.
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty && nestedFuncs.contains(name) =>
+      callNested(nestedFuncs(name), name, args)
+
+    // One written below the call that names it. Its environment is formed where the first of the
+    // block's nested functions is written, so a call above that point has none to pass.
+    case Call(Ident(name), _) if lookupOpt(name).isEmpty && pendingNested.exists(_.name == name) =>
+      err(s"'$name' is declared below this call — the nested functions of a block share an " +
+        "environment formed where the first of them is written, so they may be called from there on")
+
+    // One belonging to a body this one is written inside. A body reaches its own group and no
+    // further, because what it would have to carry to reach further is the frame around it.
+    case Call(Ident(name), _) if lookupOpt(name).isEmpty && outerNested(name) =>
+      err(s"'$name' is a nested function of the body around this one, which reaches its own nested " +
+        "functions and its own captures and no further — a top-level function is what several " +
+        "bodies share")
 
     case Call(Ident(name), args) if funcKey(name).isDefined =>
       callFunction(funcDecls(funcKey(name).get), args, expected)
@@ -830,7 +858,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       pushScope()
       val tinit        = init.toList.flatMap(recoverStmt)
       val tcond        = cond.map(analyzeBool)
-      val (tbody, ctx) = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
+      val (tbody, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
       val tstep        = step.toList.flatMap(recoverStmt)
       val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       popScope()
@@ -856,7 +884,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
           val last      = if c.exclusiveHi then hi - 1 else hi
           pushScope()
           val u         = declare(name, i)
-          val (tb, ctx) = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
+          val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
           popScope()
           val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
           TFor(u, i, TIntLit(lo.toBigInt, i), TIntLit(last.toBigInt, i), inclusive = true, tb, telse,
@@ -871,7 +899,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
             case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
           pushScope()
           val u            = declare(name, vty)
-          val (tb, ctx)    = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
+          val (tb, ctx)    = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
           popScope()
           val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
           TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
@@ -1002,7 +1030,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
                       elseOpt: Option[List[Stmt]], expected: Option[Type], discarded: Boolean): TExpr = {
     pushScope()
     val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
+    val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
     popScope()
     val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
     TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
@@ -1028,7 +1056,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
     pushScope()
     val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(body.flatMap(recoverStmt))
+    val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
     popScope()
     val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
     val bind      = TVariantPattern(opt, opt.variant("Some").get, List(TBindPattern(u, elem)))
@@ -1179,6 +1207,14 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
   /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
   protected def analyzePlace(target: Expr, what: String): TExpr = {
     val t = analyzeExpr(target)
+
+    // A **captured** name reaches storage the walk below cannot see the binding of — a field of the
+    // environment, or the frame slot one points at — so being written once is asked of the name it
+    // was declared under rather than of the expression it turned into (`12 §7`).
+    target match
+      case Ident(n) if lookupOpt(n).exists((u, _) => readOnlyLocals(u)) =>
+        err(s"a 'val' is written once, so $what has nothing to write through")
+      case _ =>
 
     t match
       // A string is immutable, and it is worth saying so rather than reporting the absence of an

@@ -573,6 +573,28 @@ trait AnalyzerBase {
    */
   protected var capturedFields: Map[String, TExpr] = Map.empty
 
+  /** The nested functions in scope, by the name a program calls one by (`12 §5a`).
+   *
+   * A block's nested functions are lowered as a group, so what is in here is every one of them from
+   * the moment the first is written until the block ends — which is the "names are hoisted per
+   * block" half of §5a. It follows the block, so it is put aside and given back at a scope boundary
+   * the way the scope itself is.
+   */
+  protected var nestedFuncs: Map[String, Nested] = Map.empty
+
+  /** The nested functions this block has still to lower, which is what lets the group be found from
+   * the first of them and what lets a call written above them all say so.
+   */
+  protected var pendingNested: List[FuncDecl] = Nil
+
+  /** Nested functions of a body this one is written *inside*, kept so that naming one is refused for
+   * the reason it is refused rather than as an undefined name.
+   *
+   * A body nested in another reaches its own group and its own captures, and no further: a closure
+   * may outlive the frame around it, and a nested function's environment is that frame.
+   */
+  protected var outerNested: Set[String] = Set.empty
+
   // Per-function state, reset at each function boundary.
   protected var scopes: List[mutable.LinkedHashMap[String, (String, Type)]] = Nil
   protected val used                                                        = mutable.HashSet.empty[String]
@@ -851,6 +873,9 @@ trait AnalyzerBase {
     oldBuf = None
     multiOk = false
     capturedFields = Map.empty
+    nestedFuncs = Map.empty
+    pendingNested = Nil
+    outerNested = Set.empty
   }
 
   protected def freshName(base: String): String =
@@ -920,6 +945,9 @@ trait AnalyzerBase {
   protected def isPlace(t: TExpr): Boolean
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String
 
+  /** The nested functions of one block, lowered together (`12 §5a`). */
+  protected def lowerNestedGroup(group: List[FuncDecl]): List[TStmt]
+
   /** `value.name(args)` where `name` is a field holding a callable rather than a method (`12 §6`). */
   protected def callableField(
       rty: Type,
@@ -935,6 +963,7 @@ trait AnalyzerBase {
       params: List[(String, Type)],
       declaredResult: Option[Type],
       body: List[Stmt],
-      environment: Option[(Type.Struct, List[String])] = None,
+      environment: Option[Environment] = None,
+      siblings: Map[String, Nested] = Map.empty,
   ): (TFunc, Type)
 }

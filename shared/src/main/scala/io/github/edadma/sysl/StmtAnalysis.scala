@@ -17,9 +17,28 @@ trait StmtAnalysis extends TypeResolution {
    */
   protected def analyzeValueBlock(stmts: List[Stmt], expected: Option[Type], discarded: Boolean = false): TBlock = {
     pushScope()
-    val tb = analyzeBlockBody(stmts, expected, discarded)
+    val tb = inBlock(stmts)(analyzeBlockBody(stmts, expected, discarded))
     popScope()
     tb
+  }
+
+  /** Runs a block's statements with that block's own nested functions in view (`12 §5a`).
+   *
+   * A block is the unit a nested function is hoisted over, so the group is found here, from the
+   * statements themselves, rather than by looking ahead from the one being analyzed. What the block
+   * declares — the group, and the names it binds — is given back at the end for the same reason a
+   * scope is: an inner block's nested functions are not the outer block's.
+   */
+  protected def inBlock[R](stmts: List[Stmt])(body: => R): R = {
+    val savedPending = pendingNested
+    val savedNested  = nestedFuncs
+
+    pendingNested = stmts.collect { case f: FuncDecl => f }
+
+    try body
+    finally
+      pendingNested = savedPending
+      nestedFuncs = savedNested
   }
 
   /** The body of a value block, using whatever scope the caller has established — a match arm
@@ -55,7 +74,7 @@ trait StmtAnalysis extends TypeResolution {
   /** A statement sequence used only for its effects (a loop body): a fresh scope, no value. */
   protected def analyzeStmts(stmts: List[Stmt]): List[TStmt] = {
     pushScope()
-    val r = stmts.flatMap(recoverStmt)
+    val r = inBlock(stmts)(stmts.flatMap(recoverStmt))
     popScope()
     r
   }
@@ -370,8 +389,19 @@ trait StmtAnalysis extends TypeResolution {
     // walk meets one among the entry point's statements there is nothing left to run.
     case _: ConstDecl => List(TExprStmt(TUnitLit()))
 
-    case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl | _: TypeDecl =>
-      err("functions, structs, enums, traits, impls, externs, and types may only be declared at the top level")
+    // A function declared inside a body is a **nested function** (`12 §5a`), and the block's are
+    // lowered together the first time one is reached — so the ones after it in the same block have
+    // already been dealt with and contribute nothing further here.
+    case _: FuncDecl =>
+      if pendingNested.isEmpty then Nil
+      else
+        val group = pendingNested
+
+        pendingNested = Nil
+        lowerNestedGroup(group)
+
+    case _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl | _: TypeDecl =>
+      err("structs, enums, traits, impls, externs, and types may only be declared at the top level")
 
     // The leading clauses of a function body are split off before the body is analyzed, so any
     // that reach here sit after another statement or inside an inner block — both disallowed.

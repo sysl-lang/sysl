@@ -167,7 +167,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     currentModule = mainScope.module
     currentImports = mainScope.imports
     currentFile = mainScope.file
-    val tmain = mainStmts.flatMap(recoverStmt)
+    val tmain = inBlock(mainStmts)(mainStmts.flatMap(recoverStmt))
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An
     // instantiation of a member the definition-time pass already reported is dropped rather than
@@ -499,7 +499,8 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       params: List[(String, Type)],
       declaredResult: Option[Type],
       body: List[Stmt],
-      environment: Option[(Type.Struct, List[String])] = None,
+      environment: Option[Environment] = None,
+      siblings: Map[String, Nested] = Map.empty,
   ): (TFunc, Type) = {
     val savedScopes   = scopes
     val savedUsed     = used.toSet
@@ -513,6 +514,9 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     val savedRetList  = retIsList
     val savedVariadic = variadicFn
     val savedCaptures = capturedFields
+    val savedNested   = nestedFuncs
+    val savedPending  = pendingNested
+    val savedOuter    = outerNested
 
     try
       resetFunction()
@@ -522,16 +526,32 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
       // The receiver comes first, so the closure's own environment is the argument every call
       // already passes and the parameters after it are the ones a program wrote.
-      val receiver = environment.map((struct, _) => ("self", Type.Ptr(struct)))
+      val receiver = environment.map(e => ("self", Type.Ptr(e.struct)))
       val tparams  = (receiver.toList ::: params).map { case (n, t) => (declare(n, t), t) }
 
-      for (struct, names) <- environment do
-        val self = TLoad("self", Type.Ptr(struct))
+      for e <- environment do
+        val self = TLoad("self", Type.Ptr(e.struct))
 
-        capturedFields = names.zipWithIndex.map { (n, i) =>
-          declare(n, struct.fields(i)._2) ->
-            TField(TDeref(self, struct), struct.slot(i), struct.fields(i)._2)
+        capturedFields = e.names.zipWithIndex.map { (n, i) =>
+          val stored = e.struct.fields(i)._2
+          val field  = TField(TDeref(self, e.struct), e.struct.slot(i), stored)
+
+          // A by-reference environment holds the address of the frame's own variable, so what the
+          // name reaches is the variable itself — one dereference further, and a place, which is
+          // what lets a nested function assign to it.
+          val (ty, read) = stored match
+            case Type.Ptr(inner) if e.byReference => (inner, TDeref(field, inner))
+            case _                                => (stored, field)
+
+          (if e.fixed(n) then declareReadOnly(n, ty) else declare(n, ty)) -> read
         }.toMap
+      // A sibling is in scope throughout the group, so a body may call one written below it — which
+      // is the half of `12 §5a` that makes mutual recursion work. What a body does *not* reach is a
+      // nested function of the frame around it, and remembering their names is what lets that be
+      // said rather than reported as a name that stands for nothing.
+      nestedFuncs = siblings
+      outerNested = (savedNested.keySet ++ savedOuter) -- siblings.keySet
+
       // A body written like a function's is one, so its leading contract clauses are its own
       // (`16`). They are analyzed *after* it rather than before, because an `ensure` names `result`
       // and a closure's result is what its body turned out to yield — which is the one thing a
@@ -566,6 +586,9 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
       retIsList = savedRetList
       variadicFn = savedVariadic
       capturedFields = savedCaptures
+      nestedFuncs = savedNested
+      pendingNested = savedPending
+      outerNested = savedOuter
   }
 
   /** Analyzes one body against a signature it is handed, rather than one looked up in `funcInsts`.
