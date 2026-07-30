@@ -6,7 +6,7 @@ be unwound deliberately rather than discovered later.
 
 ## The pipeline
 
-`Compiler.compileToLlvm` = **parse → analyze → escape-check → codegen**:
+`Compiler.compileToLlvm` = **parse → analyze → escape-check → prune → codegen**:
 
 - **Parser** (`SyslParser`) — a packrat grammar over the lexer's token list, producing the
   untyped `ast.scala` tree.
@@ -15,8 +15,11 @@ be unwound deliberately rather than discovered later.
   (`tast.scala`). Every diagnostic lives here; codegen trusts the tree it is handed.
 - **Escape analysis** (`Escape`) — the one check that needs the whole call graph rather than one
   expression at a time, so it runs over the typed tree once the analyzer is finished (`05`).
-- **Codegen** (`Codegen`, with `Emitter` / `ArcEmitter` / `ScalarEmitter` / `StringEmitter` /
-  `ForeignEmitter`) — a straight lowering of the typed tree to textual LLVM IR. It selects
+- **Reachability** (`Reachability.prune`) — drops what the program cannot reach, over a typed tree
+  every other pass has already read. It is described under *What runs today* below; what matters
+  here is that it sits between the checking and the lowering, so no diagnostic depends on it.
+- **Codegen** (`Codegen`, and the `*Emitter` files it is split across) — a straight lowering of the
+  typed tree to textual LLVM IR. It selects
   instructions from the types the tree carries and lays out basic blocks; it makes no semantic
   decision of its own. The one thing it decides that the tree does not carry is what a call to a
   **foreign** function looks like, because that is a fact about the machine rather than about the
@@ -358,7 +361,9 @@ before they appear and may be mutually recursive).
 - **`print(a, b, …)`** — a **desugaring onto prelude functions**, not a builtin and not a user
   function. Each argument becomes a call to the renderer its static type reaches — `printi`,
   `printu`, `printr`, `printb`, `printc`, `prints` — widened to the width that renderer takes, with
-  `printc(' ')` between and `printc('\n')` at the end. Every one of those is sysl in the prelude
+  `printc(' ')` between and `printc('\n')` at the end. An integer **wider than 64 bits** is the one
+  that is not widened, because there is nothing to widen it to: it renders itself with `str` and the
+  string goes to `prints`. Every one of those is sysl in the prelude
   (`04`, *Printing*); the compiler knows the six names and the widening rule and emits no printing
   code of its own. They all write through one sink, `putbytes`, which walks a byte count rather
   than stopping at a terminator, because a sysl string may hold an interior NUL and every `%s`
@@ -377,11 +382,15 @@ place's address — a local's own slot, a loaded pointer value, or a `getelement
 either — and `store`s through it, which is one mechanism for `x = v`, `s.f = v`, `*p = v`, and
 `p.f = v` alike. `*T` and `&T` are both the opaque `ptr`; inside a mangled name a memory mode
 is spelled as a word (`ptr.` / `ref.` / `sync.`), since a sigil is not an LLVM name character.
-A `&T` addresses a **box** `%arc.T = type { i64, ptr, T }` — the count, the function that
-destroys it, then the payload — so reading through one is a `getelementptr` past the header.
+A `&T` addresses a **box** `%arc.T = type { i64, ptr, i64, T }` — a **three-word header** and then
+the payload, so reading through one is a `getelementptr` past it. The words are the strong count,
+the function that destroys the payload, and the **weak** count (`03`), and the header is named on its
+own (`%arc.header`) because the runtime walks it without knowing the payload's type.
 Both taking a share and giving one back are **type-independent** (`@arc.retain` /
 `@arc.release`): reaching zero calls through the hook, which is the per-payload-type function
-that releases whatever the payload held and then returns the storage. That indirection is what
+that releases whatever the payload held and then returns the storage — or, while a weak reference
+still names the box, releases the payload and leaves the storage for the last weak share to free.
+That indirection is what
 lets a slice release its owner, whose payload type its own type does not name. Walking an
 aggregate's reference-carrying fields is a helper emitted once per type rather than inlined,
 since a data enum needs a tag test per variant, and an array is walked with a loop rather than
@@ -409,10 +418,15 @@ arity.
 
 ## Deliberate shortcuts (unwind these as the language grows)
 
-1. **The scalar table stops short of its widest members.** An integer wider than 64 bits and
+1. **The scalar table stops short of its widest member.** ~~An integer wider than 64 bits~~ and
    `f128` are diagnosed rather than lowered: printing them portably needs a runtime this
    stage does not have (`long double` is 64-bit on the arm64 Apple ABI, so `fp128` cannot go
-   through `printf`). `usize` / `isize` are fixed at 64 bits by a constant. There **is** a
+   through `printf`). The integer half is **built** — the widths run to **128 bits**, and `u256` is
+   what the back end now refuses. What made it possible is that a wide integer does not need a
+   `printf` conversion at all: it renders itself through `str` and goes out as the string that came
+   back, which is the one scalar whose printing allocates. `f128` has no such route, since rendering
+   a float is `snprintf`'s job either way, and it stays the open question it was.
+   `usize` / `isize` are fixed at 64 bits by a constant. There **is** a
    target description now (`targets.md`) and this does not read it, for the reason `Layout` does
    not: every target in the registry is 64-bit, and the registry refuses one that is not.
    A narrower float constant is emitted as the `double` constant rounded
