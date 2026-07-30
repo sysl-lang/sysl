@@ -114,6 +114,37 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  "the renderer a built-in's Display reaches" - {
+
+    // The one thing an IR test has to say about this family, and nothing was saying it: which
+    // function `self.x.display(out, fmt)` lowers to is chosen by the *compiler* from `CoreTraits`,
+    // not resolved from source, so the emitted symbol is a name the compiler spells. That is the
+    // `putbytes`-in-emitted-IR defect class — a link failure rather than a diagnostic, and one no
+    // behavioural test can see, since the program runs identically either way until the linker
+    // refuses it.
+    "is emitted under the library's key, wherever the family lives" in {
+      val out = ir(point + "print(Point(1, 2))")
+
+      out should include(s"call void @${Library.key("display_int")}(")
+      out should not include "call void @display_int("
+    }
+
+    "and a rendering of each built-in reaches its own" in {
+      // One per branch of `CoreTraits.display`, because the table is what chooses and a wrong entry
+      // would be a call to a function that is not there rather than one that renders oddly.
+      val out = ir(
+        """struct B
+          |    v: bool
+          |impl Display for B
+          |    display(self, out: *Writer, fmt: FormatSpec)
+          |        self.v.display(out, fmt)
+          |print(B(true))
+          |""".stripMargin)
+
+      out should include(s"call void @${Library.key("display_bool")}(")
+    }
+  }
+
   "a writer a program wrote" - {
     // An ordinary erasure, so `write`'s `*self` lands in the slot with no adapter between — the
     // data word of a raw object already *is* the receiver it declared.

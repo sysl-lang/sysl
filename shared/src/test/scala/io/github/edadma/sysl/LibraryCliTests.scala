@@ -189,9 +189,17 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
       cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
 
-      LibraryArtifact.unpack(out, readBytes(out)) match
-        case Right((meta, _)) => meta should include(Std.module)
-        case Left(err)        => fail(err)
+      LibraryArtifact.unpack(out, readBytes(out)).flatMap(r => LibraryArtifact.read(out, r._1)) match
+        case Right((trees, syms)) =>
+          // Every symbol is the standard module's own. The renderers reach the prelude's
+          // `sysl_snprintf` and the prelude's `putbytes` under them, and **none of those is in
+          // here** — a library defines its own declarations and nobody else's, and the core library
+          // is the one place that rule is under the most pressure, since the whole of the rest of
+          // the library is what it was compiled against.
+          syms should not be empty
+          syms.filterNot(_.startsWith(s"${Std.module}${Modules.sep}")) shouldBe empty
+          trees.flatMap(_.module.map(_.show)).distinct shouldBe List(Std.module)
+        case Left(err) => fail(err)
 
       deleteFile(out)
     }

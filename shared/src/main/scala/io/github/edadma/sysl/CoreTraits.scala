@@ -179,16 +179,20 @@ object CoreTraits {
     case Type.Str  => Some(("hash_str", Type.Str))
     case _         => None
 
-  /** The prelude function a built-in's `Display` renders through (`14 §5`), which is the sink
+  /** The library function a built-in's `Display` renders through (`14 §5`), which is the sink
    * counterpart of the one `print` reaches for the same type.
    *
    * A built-in has no `impl` block and so no lowered `int.display` to call, exactly as it has no
-   * `int.add`; what it has is a rendering the prelude already writes, and naming it here is what
+   * `int.add`; what it has is a rendering the library already writes, and naming it here is what
    * lets a `Display` written for a struct render the struct's own fields.
+   *
+   * These are **spellings**, as everything in this table is. The family is in the standard module,
+   * so `display_int` is filed under `sysl$display_int` and a caller goes through `Library.key`
+   * before it can name one.
    */
   def display(t: Type): Option[(String, Type)] = t match
-    // Past 64 bits the renderer takes the digits rather than the number, because the prelude's own
-    // two go through `snprintf` and C has no conversion that wide. The padding is still the prelude's.
+    // Past 64 bits the renderer takes the digits rather than the number, because the library's own
+    // two go through `snprintf` and C has no conversion that wide. The padding is still the same.
     case i: Type.Integer if i.bits > 64 => Some(("display_wide", Type.Str))
     case i: Type.Integer if i.signed => Some(("display_int", Type.Integer(64, signed = true)))
     case _: Type.Integer             => Some(("display_uint", Type.Integer(64, signed = false)))

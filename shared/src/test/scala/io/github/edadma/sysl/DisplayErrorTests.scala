@@ -160,7 +160,8 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
             |    failed(*self) -> bool = false
             |var w: &Writer = S(0usize)
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
-        "'out' of 'display_int' is *sysl.Writer, but &sysl.Writer was given")
+        s"'out' of '${Modules.show(Library.key("display_int"))}' is *sysl.Writer, " +
+          "but &sysl.Writer was given")
     }
   }
 

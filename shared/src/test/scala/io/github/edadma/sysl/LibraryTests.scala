@@ -384,6 +384,61 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "a moved FUNCTION, which is what a renderer is" - {
+
+    "a program may declare one of its own over it, and both are reachable" in {
+      // The first functions to cross, and the first name a program could take for itself that the
+      // compiler also calls: `print(7)` goes to the library's `display_int` through `CoreTraits`,
+      // whatever a program means by the words. Before the move the clash refused line one.
+      run(
+        """display_int(n: long, out: *Writer, fmt: FormatSpec) = display_str("mine", out, fmt)
+          |
+          |struct P
+          |    x: int
+          |
+          |impl sysl.Display for P
+          |    display(self, out: *Writer, fmt: FormatSpec) = display_int(long(self.x), out, fmt)
+          |
+          |print(P(5))
+          |print(7)
+          |""".stripMargin) shouldBe "mine\n7\n"
+    }
+
+    "and the library's own is still reachable, by the path that names it" in {
+      run(
+        """display_int(n: long, out: *Writer, fmt: FormatSpec) = display_str("mine", out, fmt)
+          |
+          |struct P
+          |    x: int
+          |
+          |impl sysl.Display for P
+          |    display(self, out: *Writer, fmt: FormatSpec) =
+          |        sysl.display_int(long(self.x), out, fmt)
+          |
+          |print(P(5))
+          |""".stripMargin) shouldBe "5\n"
+    }
+
+    "and a rendering the compiler chose names the library's in a diagnostic, not the program's" in {
+      // Two functions spelled `display_int`; the one the message is about is the library's, and
+      // saying so is the whole of what the qualified rendering buys.
+      refused(
+        """display_int(n: long) -> int = n
+          |
+          |struct S
+          |    n: usize
+          |
+          |impl Writer for S
+          |    write(*self, bytes: []u8)
+          |        self.n += bytes.len
+          |    failed(*self) -> bool = false
+          |
+          |var w: &Writer = S(0usize)
+          |sysl.display_int(1, w, FormatSpec(0, -1, false))
+          |""".stripMargin) should include(s"'${Modules.show(Library.key("display_int"))}'")
+    }
+  }
+
   "the standard module is the library's, and a program may not add to it" - {
 
     "a file declaring it is refused" in {

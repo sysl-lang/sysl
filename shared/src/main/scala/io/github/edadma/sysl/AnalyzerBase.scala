@@ -52,8 +52,8 @@ trait AnalyzerBase {
    * are, so the key cannot answer it. The compilation that *builds* a library module is the one
    * case where the source is the library's without being the copy the compiler carries, and it has
    * to be, or the rest of the library could not name what it declares: the prelude's
-   * `display_pad(text, out: *Writer, …)` resolves `Writer` among the library's own, and while
-   * `lib/sysl/write.sysl` is being compiled that is the file in front of it.
+   * `impl Display for (A, B)` calls `display_pad` and resolves it among the library's own, and while
+   * `lib/sysl/render.sysl` is being compiled that is the file in front of it.
    */
   protected def libraryOwns(d: Positioned, module: String): Boolean =
     Library.owns(d) || building(module)
