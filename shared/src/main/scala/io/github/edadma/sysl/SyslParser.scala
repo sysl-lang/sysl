@@ -1260,6 +1260,18 @@ class SyslParser(val source: Source) extends PackratParsers {
   /** Parses this parser's source as a whole program. */
   def parseProgram: ParseResult[Program] =
     phrase(program)(reader(source.text))
+
+  /** The first token the lexer could make nothing of, and where it sits.
+   *
+   * A lexical error is reported ahead of whatever the grammar made of the tokens around it, because
+   * the parser's expectation is a *reaction* to the damage rather than a description of it: an
+   * unterminated string literal is a token the grammar has no rule for, so the failure surfaces
+   * wherever the longest partial match happened to stop — `print("oops` reported "newline expected"
+   * at the paren, having taken `print` alone as a complete statement. The lexer already knew the
+   * answer and said so; this is what carries it out.
+   */
+  def firstLexicalError: Option[(String, Position)] =
+    lexical.scanPositioned(source.text).collectFirst { case (lexical.ErrorToken(msg), at) => (msg, at) }
 }
 
 object SyslParser {
@@ -1273,7 +1285,11 @@ object SyslParser {
 
     p.parseProgram match {
       case p.Success(prog, _) => Right(prog)
-      case ns: p.NoSuccess    => Left(failedAt(source, ns.next.pos).render(ns.msg))
+      case ns: p.NoSuccess =>
+        p.firstLexicalError match {
+          case Some((msg, at)) => Left(Pos(source, at.line, at.column).render(msg))
+          case None            => Left(failedAt(source, ns.next.pos).render(ns.msg))
+        }
     }
   }
 

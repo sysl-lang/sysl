@@ -179,6 +179,72 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       out should include("--> t.sysl:4:6")
     }
 
+    /** A lexical error must say what the lexer knew, not what the grammar made of the wreckage.
+     * Every message in `SyslLexical` used to be unreachable this way: the token it produced matched
+     * no rule, so the reported failure was wherever the longest partial match stopped — `print("oops`
+     * said "newline expected" at the paren, because `print` alone is a complete statement. The lexer
+     * tests call the lexer directly and so could not see it.
+     */
+    "a lexical error reports itself rather than the grammar's reaction to it" in {
+      diag("print(\"oops\n") shouldBe
+        List(
+          "error: unterminated string literal",
+          " --> t.sysl:1:7",
+          "  |",
+          "1 | print(\"oops",
+          "  |       ^",
+        ).mkString("\n")
+    }
+
+    // The comment case is the one the lexer could not report on its own at all: an unclosed comment
+    // consumes to end of input, so every later token is gone and the grammar's complaint is about
+    // whatever the first line happened to end in.
+    "an unclosed block comment says so, at the delimiter that opened it" in {
+      val src =
+        """print(1)
+          |/* never closed
+          |print(2)
+          |""".stripMargin
+
+      diag(src) shouldBe
+        List(
+          "error: unclosed comment",
+          " --> t.sysl:2:1",
+          "  |",
+          "2 | /* never closed",
+          "  | ^",
+        ).mkString("\n")
+    }
+
+    "an unterminated character literal reports itself too" in {
+      diag("var c = '1\n") should include("error: unterminated character literal")
+    }
+
+    // An inner close satisfies only the comment it opened, so a nested comment left open reports the
+    // outer one — the case a depth counter gets wrong by treating the first `*/` as the end.
+    "a nested comment left open reports the outer one" in {
+      val src =
+        """print(1)
+          |/* outer /* inner */
+          |print(2)
+          |""".stripMargin
+      val out = diag(src)
+
+      out should include("error: unclosed comment")
+      out should include("--> t.sysl:2:1")
+    }
+
+    // Indentation made of both tabs and spaces on one line has no defensible width, so it is
+    // refused — and refused by the lexer, which is why it reaches a reader through the same route
+    // an unterminated literal does.
+    "indentation mixing tabs and spaces on one line is refused" in {
+      val src = "f(n: int) -> int\n\tif n > 0 then\n    \tn\n\telse\n\t    0\n"
+      val out = diag(src)
+
+      out should include("only tabs or spaces")
+      out should include("--> t.sysl:3:1")
+    }
+
     "an error about a prelude type still quotes the user's file" in {
       val src =
         """f() -> Option[int]

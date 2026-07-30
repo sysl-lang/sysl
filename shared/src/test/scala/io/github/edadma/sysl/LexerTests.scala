@@ -222,6 +222,101 @@ class LexerTests extends AnyFreeSpec with Matchers {
     l.bare("1 /* inline */ 2") shouldBe List(l.IntLit(1, None), l.IntLit(2, None))
   }
 
+  /** A block comment nests, and one that starts a line does not become that line's indentation.
+   * Both are properties of the `indentation` library underneath rather than of this lexer, which is
+   * exactly why they are asserted here: sysl is the consumer whose off-side rule breaks if either
+   * stops holding, and nothing else in the suite would notice.
+   */
+  "block comments" - {
+    "nest, so an inner close does not end the outer one" in withLexer { l =>
+      l.bare("1 /* outer /* inner */ still outer */ 2") shouldBe
+        List(l.IntLit(1, None), l.IntLit(2, None))
+    }
+
+    "nest to any depth" in withLexer { l =>
+      l.bare("1 /* a /* b /* c */ b */ a */ 2") shouldBe
+        List(l.IntLit(1, None), l.IntLit(2, None))
+    }
+
+    // The delimiters have no meaning inside a line comment, so a `/*` there opens nothing and the
+    // rest of the file is ordinary code.
+    "an opener inside a line comment opens nothing" in withLexer { l =>
+      l.bare("1 // /* not a comment\n2") shouldBe List(l.IntLit(1, None), l.IntLit(2, None))
+    }
+
+    "a comment spanning lines joins what surrounds it" in withLexer { l =>
+      l.bare("1 /* one\ntwo\nthree */ 2") shouldBe List(l.IntLit(1, None), l.IntLit(2, None))
+    }
+
+    // A file ending in a closed comment with no trailing newline is the shape an editor leaves
+    // behind, and the scanner has to reach end of input rather than look for one more line.
+    "one closing the file with no newline after it is still closed" in withLexer { l =>
+      l.bare("1\n/* done */") shouldBe List(l.IntLit(1, None))
+    }
+
+    // The comment occupies whole lines at column zero, so the lines it covers must contribute no
+    // indentation at all — a spurious Indent here would open a block around the statement after it.
+    "one spanning whole lines between statements opens no block" in withLexer { l =>
+      l.all("a\n/* one\ntwo\n*/\nb") shouldBe List(
+        l.Identifier("a"),
+        l.Newline,
+        l.Identifier("b"),
+        l.Newline,
+      )
+    }
+  }
+
+  "a comment before the code on a line does not become that line's indentation" - {
+    // The gap after `*/` is four spaces wider than the code's own indentation. If the line's
+    // indentation were measured from where the comment ended, `b` would look more deeply indented
+    // than it is and the block would gain a level it never asked for.
+    "an indented line opening with a block comment indents by its code" in withLexer { l =>
+      l.all("a\n    /* note */    b\nc") shouldBe List(
+        l.Identifier("a"),
+        l.Newline,
+        l.Indent,
+        l.Identifier("b"),
+        l.Newline,
+        l.Dedent,
+        l.Newline,
+        l.Identifier("c"),
+        l.Newline,
+      )
+    }
+
+    "a comment occupying a whole line contributes no indentation of its own" in withLexer { l =>
+      l.all("a\n        /* alone */\n    b\nc") shouldBe List(
+        l.Identifier("a"),
+        l.Newline,
+        l.Indent,
+        l.Identifier("b"),
+        l.Newline,
+        l.Dedent,
+        l.Newline,
+        l.Identifier("c"),
+        l.Newline,
+      )
+    }
+
+    // The first line of an indented block is the one that fixes the block's indentation, so a
+    // comment opening *that* line is the case with the most to lose.
+    "a comment opening the first line of a block still fixes the block's indentation" in withLexer { l =>
+      l.all("a\n    /* why */ b\n    c\nd") shouldBe List(
+        l.Identifier("a"),
+        l.Newline,
+        l.Indent,
+        l.Identifier("b"),
+        l.Newline,
+        l.Identifier("c"),
+        l.Newline,
+        l.Dedent,
+        l.Newline,
+        l.Identifier("d"),
+        l.Newline,
+      )
+    }
+  }
+
   "the off-side rule" - {
     "an indented block yields Newline / Indent / Dedent" in withLexer { l =>
       l.all("a\n    b\nc") shouldBe List(
