@@ -247,7 +247,7 @@ trait Closures extends CallAnalysis {
     val supplied2        = declared.zip(params.tail).map((a, p) => analyzeExpr(a, Some(p._2)))
 
     funcsUsed += n.fname
-    TCall(n.fname, checkArgs(written, params, declared, Some(n.env :: supplied2)) ::: tail.map(variadicArg), result)
+    TCall(n.fname, checkArgs(written, params, declared, Some(n.env :: supplied2)) ::: tail.map(variadicArg(_)), result)
   }
 
   /** `xs.map(square)` — a declared function where a callable is wanted (`12 §5`).

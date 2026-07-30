@@ -182,7 +182,11 @@ trait CallAnalysis extends Literals with TraitObjects {
     val declared = externDecls.get(f.name).fold(checked)(vaPassed(checked, _))
 
     funcsUsed += name
-    TCall(name, declared ::: args.drop(params.length).map(variadicArg), rtype)
+    // Only a free function can be an `extern`, so this is the one call form whose tail may be a
+    // foreign one — and the only one an aggregate may cross.
+    val foreign = externDecls.contains(f.name)
+
+    TCall(name, declared ::: args.drop(params.length).map(variadicArg(_, foreign)), rtype)
   }
 
   /** The arguments of a foreign call, with each one headed for a C by-value `va_list` parameter
@@ -220,12 +224,18 @@ trait CallAnalysis extends Literals with TraitObjects {
    * handed over as written is read back as garbage — so the widening happens here, in the tree,
    * where it is something a test can see rather than a detail of the emitter.
    *
-   * What may cross is what C can name on the other side: an integer, a float, a `char`, or a raw
-   * pointer. A `string`, a `&T`, a struct — every sysl layout C has no notion of — is refused,
-   * because unlike a declared parameter (`12 §1`) there is no written type saying what the callee
-   * agreed to receive.
+   * What may always cross is what C can name on the other side: an integer, a float, a `char`, or a
+   * raw pointer.
+   *
+   * An **aggregate** crosses to a *foreign* callee and not to a sysl one, and the asymmetry is not
+   * an oversight. C allows a struct in a variadic tail and hands it over under exactly the
+   * classification a declared parameter of the same type gets (`targets.md`), so a foreign call needs
+   * no rule of its own — whoever compiled the other side applies that classification too. A **sysl**
+   * variadic callee reads its own tail back with a walk (§9), and the walk is written for values that
+   * fit a register; an aggregate would have to be read back some other way, which is a question about
+   * the walk and not about the call.
    */
-  protected def variadicArg(a: Expr): TExpr = {
+  protected def variadicArg(a: Expr, foreign: Boolean = false): TExpr = {
     val t = analyzeExpr(a)
 
     at(t.pos):
@@ -233,6 +243,11 @@ trait CallAnalysis extends Literals with TraitObjects {
         case i: Type.Integer if i.bits < 32   => convert(t, Type.Integer(32, i.signed))
         case f: Type.Floating if f.bits < 64  => convert(t, Type.Real)
         case _: Type.Integer | _: Type.Floating | Type.Char | _: Type.Ptr => t
+        case other if CAbi.aggregate(other) && foreign => t
+        case other if CAbi.aggregate(other) =>
+          err(s"a ${show(other)} cannot be passed to a sysl function's '...' — a walk over the tail " +
+            "reads back one register at a time and an aggregate is not one, where a foreign callee " +
+            "takes it because C says which registers it arrives in")
         case other =>
           err(s"a ${show(other)} cannot be passed to '...' — a variadic argument must be an " +
             "integer, a float, a char, or a raw pointer")
@@ -307,7 +322,7 @@ trait CallAnalysis extends Literals with TraitObjects {
             val restArgs = declared.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             funcsUsed += fname
             TCall(fname, checkArgs(if callable then shown else fname, params, declared,
-                                   Some(recvArg :: restArgs), callable) ::: tail.map(variadicArg), rtype)
+                                   Some(recvArg :: restArgs), callable) ::: tail.map(variadicArg(_)), rtype)
           // Neither of the two remaining kinds takes a receiver, and they are not the same mistake:
           // a property is this call with the parentheses dropped, an associated function is not
           // reached through a value at all.
@@ -442,7 +457,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     val (params, rtype) = funcInsts(name)
     val recvArg         = buildReceiver(m.receiver.get, recv)
 
-    TCall(name, checkArgs(shown, params, passed, Some(recvArg :: provisional)) ::: tail.map(variadicArg), rtype)
+    TCall(name, checkArgs(shown, params, passed, Some(recvArg :: provisional)) ::: tail.map(variadicArg(_)), rtype)
   }
 
   /** `5.display(out, fmt)` — the rendering a built-in's `Display` membership provides (`14 §5`).
@@ -567,7 +582,7 @@ trait CallAnalysis extends Literals with TraitObjects {
           val (declared, tail) = args.splitAt(params.length)
           val ts    = declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
           val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
-          TCall(fname, recv :: (checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg)), rtype)
+          TCall(fname, recv :: (checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_))), rtype)
         }
 
   /** The first member of that name one of a parameter's bounds declares, with the substitution its
@@ -974,7 +989,7 @@ trait CallAnalysis extends Literals with TraitObjects {
             val (declared, tail) = args.splitAt(params.length)
             val ts = declared.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             funcsUsed += fname
-            TCall(fname, checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg), rtype)
+            TCall(fname, checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_)), rtype)
       case Some(m) if m.isProperty =>
         err(s"'$mname' is a property of '$tname' — read it on a value, as 'value.$mname'")
       case Some(_) => err(s"'$mname' is an instance method of '$tname' — call it on a value, not the type")
@@ -1030,7 +1045,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     val (params, rtype) = funcInsts(name)
 
     funcsUsed += name
-    TCall(name, checkArgs(fd.name, params, passed, Some(provisional)) ::: tail.map(variadicArg), rtype)
+    TCall(name, checkArgs(fd.name, params, passed, Some(provisional)) ::: tail.map(variadicArg(_)), rtype)
   }
 
   /** Passes the receiver in the mode the method's `self` declared, inserting the same conversion

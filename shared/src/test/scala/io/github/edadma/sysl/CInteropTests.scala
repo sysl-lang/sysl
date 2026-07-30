@@ -124,27 +124,17 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     * compiles and passes the wrong bytes is the failure mode these rule out.
     */
   "and the values cross correctly" - {
-    /** **A struct returned by value from C is read out of the wrong registers.** `div(7, 2)` is
-      * `{quot: 3, rem: 1}` and sysl reads `{3, 2}` — the 2 is the second argument, left in the
-      * register the second field was read from.
+    /** A struct returned by value has to be read out of the registers the *convention* puts it in,
+      * which is not where LLVM would put it if left alone: given a struct result it assigns one
+      * register per element, and `div_t` is eight bytes, which AAPCS64 packs into one. Reading field
+      * 1 out of the second register got `2` — the second argument, still sitting there.
       *
-      * The emitted IR is *internally* correct: the call's result is stored into the slot and the
-      * fields are read back from it. What is wrong is the **declaration**. Sysl declares
-      * `%struct.div_t @div(i32, i32)`, and LLVM applies no C classification to an aggregate of its
-      * own accord — it assigns one register per element. Clang, which does classify, declares
-      * `i64 @div(i32, i32)`: an 8-byte struct is *packed into one register* under AAPCS64. So sysl
-      * reads field 1 out of x1, where C never put it.
-      *
-      * `ldiv`, two `i64`s, is the instructive contrast and the reason this hid: clang declares
-      * `[2 x i64] @ldiv(...)`, and LLVM's naive per-element assignment lands on the same two
-      * registers, so a 16-byte struct happens to work. Testing only that one would have shown
-      * nothing.
-      *
-      * The fix is aggregate classification for the C boundary — AAPCS64's and SysV's — which is what
-      * `targets.md` already did for the scalar rows and did not do for aggregates. Until then a
-      * program that needs a struct back from C passes a pointer, which is checked below and correct.
+      * `ldiv`, two `i64`s, is the instructive contrast and the reason this hid for so long: clang
+      * declares `[2 x i64] @ldiv(...)`, LLVM's naive per-element assignment lands on the same two
+      * registers, and a 16-byte struct happens to work. A test written only against that one proves
+      * nothing, so any check here needs a struct **smaller than two registers**.
       */
-    "a struct returned by value comes back in its fields" ignore {
+    "a struct returned by value comes back in its fields" in {
       run("""struct div_t
             |    quot: i32
             |    rem: i32
@@ -153,9 +143,9 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(d.quot, d.rem)""".stripMargin) shouldBe "3 1\n"
     }
 
-    // The same bug read off the declaration rather than the answer, which is where it actually is.
+    // The same thing read off the declaration rather than off the answer, which is where it lives.
     // Both of these are what clang emits for the same two headers.
-    "a struct-returning extern is declared the way C classifies it" ignore {
+    "a struct-returning extern is declared the way C classifies it" in {
       ir("""struct div_t
            |    quot: i32
            |    rem: i32

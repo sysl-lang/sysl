@@ -26,9 +26,12 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
       ir("extern stop(code: int) -> never\nstop(1)") should include("declare void @stop(i32)")
     }
 
-    "pointers and views lower as they do everywhere else" in {
+    // A view is three words, which is more than any of the four conventions puts in registers, so
+    // the C boundary is the one place it does *not* lower as it does everywhere else: it is passed
+    // by address, exactly as C passes a struct of that size (`CAbi`).
+    "a pointer lowers as it does everywhere else, and a view as the ABI passes an aggregate" in {
       ir("extern f(p: *u8, s: string) -> *int\nvar b: u8 = 0\nprint(f(&b, \"hi\") == null)") should
-        include("declare ptr @f(ptr, { ptr, ptr, i64 })")
+        include("declare ptr @f(ptr, ptr)")
     }
 
     // The prelude declares `exit` for `unwrap` to stop with, and almost no program calls it. An

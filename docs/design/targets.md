@@ -31,18 +31,24 @@ of what makes it different from `build`.
 
 ## The registry
 
-| name | triple | `va_list` |
-|---|---|---|
-| `aarch64-macos` | `arm64-apple-macosx` | loaded |
-| `x86_64-macos` | `x86_64-apple-macosx` | address |
-| `aarch64-linux` | `aarch64-unknown-linux-gnu` | copied |
-| `x86_64-linux` | `x86_64-unknown-linux-gnu` | address |
-| `riscv64-linux` | `riscv64-unknown-linux-gnu` | loaded |
-| `x86_64-windows` | `x86_64-pc-windows-msvc` | loaded |
-| `aarch64-freestanding` | `aarch64-none-elf` | copied |
-| `x86_64-freestanding` | `x86_64-unknown-none-elf` | address |
-| `riscv64-freestanding` | `riscv64-unknown-elf` | loaded |
-| `x86-linux` | `i386-unknown-linux-gnu` | *32-bit — not yet supported* |
+| name | triple | `va_list` | floating registers |
+|---|---|---|---|
+| `aarch64-macos` | `arm64-apple-macosx` | loaded | yes |
+| `x86_64-macos` | `x86_64-apple-macosx` | address | yes |
+| `aarch64-linux` | `aarch64-unknown-linux-gnu` | copied | yes |
+| `x86_64-linux` | `x86_64-unknown-linux-gnu` | address | yes |
+| `riscv64-linux` | `riscv64-unknown-linux-gnu` | loaded | yes |
+| `x86_64-windows` | `x86_64-pc-windows-msvc` | loaded | yes |
+| `aarch64-freestanding` | `aarch64-none-elf` | copied | yes |
+| `x86_64-freestanding` | `x86_64-unknown-none-elf` | address | yes |
+| `riscv64-freestanding` | `riscv64-unknown-elf` | loaded | **no** |
+| `x86-linux` | `i386-unknown-linux-gnu` | *32-bit — not yet supported* | |
+
+**Bare-metal RISC-V is the one target with no floating registers to pass arguments in.** The hosted
+triple is built for the D extension and this one is not, which is clang's default for each — and
+since sysl hands its own triple to clang, the two have to make the same assumption about the same
+triple or the call disagrees. It reaches exactly one decision, whether a small aggregate of floating
+members is flattened into registers, and that is why it is recorded rather than derived.
 
 **`Freestanding` is a real answer, not a missing one.** A kernel or a bare-metal program has no
 operating system, and the ABI of a freestanding ELF target is fully specified; it differs from a
@@ -88,9 +94,48 @@ read it.
 
 ## What a target decides
 
-**One thing today, and it is a real one: how a walk over a variadic tail reaches a C function**
-(`12 §9`). C's `va_list` is a different type on every target and is passed three different ways,
-so the address of the walk — the only thing sysl has — crosses over as:
+Two things, and both of them are the same thing at bottom: **what a call to a C function looks
+like**. Sysl's own calls need no target's opinion, because both sides of one are this compiler and a
+convention they share is a convention by construction. A foreign callee was compiled by somebody
+else against a published document, and then the document is the only thing that can make the two
+agree.
+
+### How an aggregate crosses to a C function
+
+A scalar crosses as itself; an `i32` is one register everywhere. An aggregate does not, and **LLVM
+applies no C classification to one of its own accord** — given a struct type in a signature it
+assigns one register per element, which is not what any of the four conventions asks for. So a
+foreign declaration names the *coerced* types the convention specifies and the call converts each
+value into and out of that shape. The four:
+
+- **AAPCS64** asks first whether the aggregate is a homogeneous floating aggregate — up to four
+  members all of one floating width, however deeply nested — because those go in floating registers
+  whatever their size, so four doubles are registers and five are not. Otherwise it is size: eight
+  bytes or fewer in one register, sixteen or fewer in two, more than that in memory. It is the one
+  convention whose two directions differ: a **result** is named by the aggregate's exact width
+  (`i24` for three bytes, `i40` for five) and an **argument** by the whole register it travels in.
+- **System V** classifies one eightbyte at a time: a chunk every byte of which belongs to a floating
+  member goes in a floating register, anything else in an integer one, and past two chunks the whole
+  thing goes in memory. Two chunks are two *separate parameters*, where AAPCS64 passed one array of
+  two.
+- **RISC-V** flattens the narrow floating cases: one or two floating members travel as themselves,
+  and one floating member beside one integer member travels in one register of each. A pointer beside
+  a float is not that case.
+- **The Microsoft convention** is the simplest: one, two, four or eight bytes in one integer
+  register, anything else by address. No floating case at all.
+
+Two details are worth stating because no document states them and only the measurement finds them.
+System V names an integer chunk after **the member that starts it** when that member is all the chunk
+carries — the `u8` after an `i64` is an `i8`, not the register it will travel in. And both AAPCS64
+and RISC-V name a sixteen-byte aggregate `i128` rather than two `i64`s once it is aligned to sixteen.
+
+Only the boundary is affected. A struct handed over **by address** needs none of this, which is why
+that was the workaround while the boundary was broken, and a sysl-to-sysl call is untouched.
+
+### How a walk over a variadic tail reaches a C function
+
+C's `va_list` is a different type on every target and is passed three different ways (`12 §9`), so
+the address of the walk — the only thing sysl has — crosses over as:
 
 - **loaded** — the storage holds one pointer-sized value and the call passes *that value*. Darwin
   arm64, where `va_list` *is* `char *`; Windows x64; RISC-V.
@@ -116,6 +161,12 @@ bytes, an aggregate is laid out in declaration order with each member on its own
 the whole rounded up to the widest. That is C's rule and LLVM's. `Layout` therefore takes no
 `Target` — and the registry refuses a 32-bit one precisely because that is where the agreement
 would end.
+
+That is worth separating from the section above, because the two are easy to run together: **where a
+member sits inside an aggregate is one question and which register the aggregate travels in is
+another.** Every target answers the first identically, which is why `Layout` needs no target; all
+four disagree about the second, which is why the classification does. The classification is built
+*on* the layout — it asks which members share an eightbyte, and that is the layout's answer.
 
 **The storage a `va_list` occupies.** Sysl reserves the widest any target needs (32 bytes,
 AAPCS64's) for all of them. The waste is a few bytes of one stack slot in a variadic function,

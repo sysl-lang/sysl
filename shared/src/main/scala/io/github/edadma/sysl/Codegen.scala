@@ -17,7 +17,7 @@ import scala.collection.mutable
  * assembly, statements, and the expression dispatch the traits call back into.
  */
 class Codegen private (program: TProgram, promotions: Escape.Promotions, protected val target: Target)
-    extends ControlFlowEmitter with VtableEmitter with WriterEmitter with StaticEmitter {
+    extends ControlFlowEmitter with VtableEmitter with WriterEmitter with StaticEmitter with ForeignEmitter {
 
   // --- module --------------------------------------------------------------------------
 
@@ -62,9 +62,12 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
       (if heap then Set("malloc", "free") else Set.empty) ++
       (if usesSnprintf then Set("snprintf") else Set.empty)
 
+    // An aggregate does not cross to a foreign callee as itself: the convention the other side was
+    // compiled against says which registers it arrives in, so that is what the declaration names
+    // (`ForeignEmitter`).
     for e <- program.externs if declared.add(e.symbol) do
-      val params = e.params.filterNot(Type.zeroSized).map(_.llvm) ++ Option.when(e.variadic)("...")
-      out ++= s"declare ${e.retTy.llvm} @${e.symbol}(${params.mkString(", ")})\n"
+      val (ret, params) = foreignSignature(e.retTy, e.params, e.variadic)
+      out ++= s"declare $ret @${e.symbol}(${params.mkString(", ")})\n"
 
     for d <- satDecls do out ++= d + "\n"
     out ++= "\n"
@@ -159,13 +162,19 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
    * call to it must name: result type, declared parameter types, ellipsis.
    */
   private val variadics: Map[String, String] =
-    val fromExterns =
-      program.externs.filter(_.variadic).map(e => e.name -> (e.retTy, e.params.filterNot(Type.zeroSized).map(_.llvm)))
-    val fromFuncs   = program.funcs.filter(_.variadic).map(f => f.name -> (f.retTy, Type.stored(f.params).map(_._2.llvm)))
+    val fromExterns = program.externs.filter(_.variadic).map(e => e.name -> foreignFnType(e.retTy, e.params))
+    val fromFuncs   = program.funcs.filter(_.variadic).map { f =>
+      val params = Type.stored(f.params).map(_._2.llvm) :+ "..."
 
-    (fromExterns ++ fromFuncs).map { case (name, (retTy, params)) =>
-      name -> s"${if Type.noValue(retTy) then "void" else retTy.llvm} (${(params :+ "...").mkString(", ")})"
-    }.toMap
+      f.name -> s"${if Type.noValue(f.retTy) then "void" else f.retTy.llvm} (${params.mkString(", ")})"
+    }
+
+    (fromExterns ++ fromFuncs).toMap
+
+  /** The `extern`s a call may resolve to, so a foreign call is lowered by what the other side's
+   * convention asks for rather than by what sysl's own would be (`ForeignEmitter`).
+   */
+  private val foreigns: Map[String, TExtern] = program.externs.map(e => e.name -> e).toMap
 
   /** The symbol a called name resolves to, which differs from the name for an `extern` given a link
    * name and for the program's own `main`. Everything else is emitted under its own name.
@@ -190,10 +199,13 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
    */
   private def calleeOf(name: String, ty: Type): String =
     val symbol = symbolOf(name)
+    // A foreign result may be named by a type the sysl signature never mentions — a coerced
+    // aggregate, or `void` where the value comes back through an out-parameter.
+    val result = if foreigns.contains(name) then foreignResultType(ty) else if Type.noValue(ty) then "void" else ty.llvm
 
     variadics.get(name) match
       case Some(fnTy) => s"$fnTy @$symbol"
-      case None       => s"${if Type.noValue(ty) then "void" else ty.llvm} @$symbol"
+      case None       => s"$result @$symbol"
 
   /** One comparison, over two values the caller is holding: an instruction where the operand type
    * has one, the method its `Eq`/`Ord` supplies otherwise.
@@ -977,6 +989,11 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
 
     case TSeq(exprs) =>
       exprs.foreach(genExpr); ""
+
+    // A call to a foreign function is lowered under the other side's convention rather than sysl's
+    // own, which is a difference only an aggregate can see (`ForeignEmitter`).
+    case TCall(name, args, ty, _) if foreigns.contains(name) =>
+      genForeignCall(calleeOf(name, ty), args, ty)
 
     // A call to something declared `-> never` does not come back, so the block ends at it: what
     // follows in the same block is unreachable and `emit` drops it, which is exactly why a

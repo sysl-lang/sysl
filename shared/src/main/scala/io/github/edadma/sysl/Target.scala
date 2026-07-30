@@ -21,12 +21,25 @@ case class Target(
     os: Os,
     vaList: VaListAbi,
     vaListBytes: Int,
+    softFloat: Boolean = false,
 ) {
 
   /** How wide an address is, which is the one thing about a target the emitted code assumes
    * wholesale rather than asks about — see `Target.unsupported`.
    */
   def pointerBits: Int = cpu.bits
+
+  /** Whether floating-point values travel in floating-point registers. This is a question only
+   * RISC-V answers two ways: a hosted RISC-V system is built for the D extension and passes them
+   * there, and a bare-metal one is not and passes them as the integers they are laid out as. It is
+   * recorded here rather than derived because sysl hands its triple to clang, so the two have to
+   * make the same default assumption about the same triple or the call disagrees.
+   *
+   * It reaches exactly one decision: whether a small aggregate of floating members is **flattened**
+   * into registers (`CAbi`). A scalar needs nothing here — the backend applies the convention to
+   * those itself, from the same triple.
+   */
+  def hardFloat: Boolean = !softFloat
 
   /** Whether the compiler can lower for this target at all. A target it knows and cannot lower for
    * is worth naming: the diagnostic then says what is missing instead of leaving the name unknown,
@@ -98,8 +111,13 @@ object Target {
   val x86_64Freestanding: Target =
     Target("x86_64-freestanding", "x86_64-unknown-none-elf", Cpu.X86_64, Os.Freestanding, VaListAbi.Address, 24)
 
+  /** Bare-metal RISC-V is the one target with no floating-point registers to pass arguments in: the
+   * hosted triple is built for the D extension and this one is not, which is clang's default for
+   * each and so has to be sysl's.
+   */
   val riscv64Freestanding: Target =
-    Target("riscv64-freestanding", "riscv64-unknown-elf", Cpu.Riscv64, Os.Freestanding, VaListAbi.Loaded, 8)
+    Target("riscv64-freestanding", "riscv64-unknown-elf", Cpu.Riscv64, Os.Freestanding, VaListAbi.Loaded, 8,
+      softFloat = true)
 
   /** A 32-bit target is listed and cannot be built for. It is here rather than left out because the
    * limit is the compiler's and not the machine's — the emitted code assumes a 64-bit address in
