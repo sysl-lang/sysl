@@ -56,7 +56,8 @@ trait MemberExprAnalysis extends ExprSupport {
     // `T::Attr` — a type attribute read with no argument (`First`, `Last`). `T::Attr(x)` is a
     // `Call` over this node, handled beside the other call forms.
     case Field(receiver, f) =>
-      val tr = autoDeref(analyzeExpr(receiver))
+      val outer = analyzeExpr(receiver)
+      val tr    = autoDeref(outer)
       tr.ty match
         // A trait object has no fields: the layout is exactly what it forgot. What it still has is
         // whatever the trait declares, and a property is declared to be read exactly like this.
@@ -116,7 +117,16 @@ trait MemberExprAnalysis extends ExprSupport {
         // trait may ask for a property. A name none of them supplies is the older complaint, which
         // is the better one there: nothing about `x.foo` on an `int` says a property was meant.
         case other if hasMember(other, f) => readProperty(tr, other, f)
-        case other                        => err(s"cannot read field '$f' of ${show(other)}")
+
+        // Still a mode after the one automatic dereference, so the receiver carries more
+        // indirection than selection reaches through (`03 § Places`). Falling through to the line
+        // below names what is *left* after that dereference — a type the reader never wrote — and
+        // says the field does not exist, when it does and the shorthand simply stops short of it.
+        case _: Type.Ptr | _: Type.Ref =>
+          err(s"selection reaches through one level of indirection and ${show(outer.ty)} has more, " +
+            s"so the rest is written: '(*x).$f' reads '$f' off the ${show(tr.ty)} it leaves")
+
+        case other => err(s"cannot read field '$f' of ${show(other)}")
 
   /** `T::Attr` — an attribute of a type rather than of a value (`16`). */
   protected def typeAttrExpr(expr: TypeAttr): TExpr = expr match

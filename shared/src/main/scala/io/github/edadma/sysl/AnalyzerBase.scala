@@ -938,8 +938,8 @@ trait AnalyzerBase {
    */
   protected def wantsResults(expected: Option[Type]): Boolean = retIsList && expected.contains(retTy)
   protected def analyzeBool(e: Expr): TExpr
-  protected def analyzePlace(target: Expr, what: String): TExpr
-  protected def requirePlace(t: TExpr, target: Expr, what: String): TExpr
+  protected def analyzePlace(target: Expr, what: String, writes: Boolean = true): TExpr
+  protected def requirePlace(t: TExpr, target: Expr, what: String, writes: Boolean = true): TExpr
   protected def invCheckFor(place: TExpr): Option[(TExpr, Type.Struct, String)]
   protected def describe(target: Expr): String
   protected def indexes(traitName: String, receiver: Expr): Boolean

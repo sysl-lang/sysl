@@ -351,7 +351,7 @@ trait SpecialForms extends Closures {
 
     t.ty match
       case Type.Ptr(Type.VaList) => t
-      case Type.VaList           => TAddrOf(requirePlace(t, arg, s"'$what'"), Type.Ptr(Type.VaList))
+      case Type.VaList => TAddrOf(requirePlace(t, arg, s"'$what'", writes = false), Type.Ptr(Type.VaList))
       case other                 => err(s"'$what' needs a va_list, not ${show(other)}")
   }
 

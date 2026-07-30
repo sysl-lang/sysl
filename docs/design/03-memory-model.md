@@ -15,6 +15,19 @@ C-like risk. In a Minix-style OS that is the kernel's low-level core and the dri
 nowhere else — the servers, utilities, and applications never write `*T` and are segfault-proof
 by construction.
 
+**One hole in that guarantee is known and open, and it is recorded here rather than left to be
+discovered.** `s.bytes` reinterprets a string's three words as a `[]u8` without copying (`04`), so
+the view's elements are the string's own storage — and a `[]u8` permits writes. Writing one byte of
+a **literal's** bytes writes into read-only memory and kills the process, from a program containing
+no `*T` at all. Assigning to one where the view is named — `s.bytes[i] = v` — is refused, which
+closes the spelling somebody reaches by accident; `&s.bytes[i]` is left alone, because taking an
+address is entering the raw tier on purpose and it is how a string reaches a C function that wants a
+pointer and a length. What stays open is the view once it has been **bound to a name or passed on**,
+because a `[]T` records nothing about whose elements it views. That missing **read-only view type**
+is `07 § Not yet`'s, and
+this is its third and sharpest customer — the other two are refusals, where nothing unsound is
+built, and this one is a view the language already makes.
+
 ## Why runtime safety, not Rust's compile-time safety
 
 sysl gets memory safety from **ARC (automatic reference counting)** at runtime — a small,
@@ -128,9 +141,27 @@ written.
 
 ## Places: `&`, `*`, and selection
 
-A **place** is something with an address: a local or parameter, a dereference, and a field of
-either. Everything else — a call result, an arithmetic result, a freshly built struct — is a
-value with no address to take.
+A **place** is something with an address: a local or parameter, a dereference, an **element**, and
+a field of any of them. Everything else — a call result, an arithmetic result, a freshly built
+struct — is a value with no address to take.
+
+An element carries one wrinkle the other three do not. A slice's elements and a pointer's live
+wherever the storage is, which is somewhere the expression naming them is not, so they have an
+address whether or not what named them does. That is what makes `rows(g)[i] = v` write through to
+the grid rather than into the view the call handed back — the view is a temporary, the buffer it
+views is not, and it is the buffer the element is in. An **array's** elements *are* the array, so
+they are places exactly when the array is. A string's bytes are never one: writing a byte of UTF-8
+is how a string stops being UTF-8, and that is refused as immutability rather than as the absence
+of an address.
+
+The hazard on the other side of that rule is worth naming, because it is the one case where the
+address outlives what keeps it valid. If the temporary view is the **only** holder of its buffer —
+a call that builds a fresh one and hands it straight back — then the buffer is released at the end
+of the statement, and `&f()[i]` is a `*T` to freed storage before the next line runs. That is the
+unsafe tier behaving as this chapter already says it does: `&` yields a raw pointer, a raw pointer
+can dangle, and nothing promotes it (`05`). It is called out here rather than left implicit because
+it is the one dangle a *single statement* can produce, where every other one needs the pointer to be
+carried somewhere.
 
 - **`&place` yields a `*T`.** A place lives in a frame or inside another object, so there is
   no refcount to take a share of; address-of is C's operator with C's result. Reaching a `&T`

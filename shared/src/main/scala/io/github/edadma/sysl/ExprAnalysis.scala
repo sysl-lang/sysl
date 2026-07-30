@@ -347,7 +347,7 @@ trait ExprAnalysis
     // Address-of yields a *raw* pointer: a place lives in a frame or inside another object, so
     // there is no refcount to take a share of. Reaching a `&T` means being handed one.
     case Unary("&", e) =>
-      val place = analyzePlace(e, "'&'")
+      val place = analyzePlace(e, "'&'", writes = false)
       TAddrOf(place, Type.Ptr(place.ty))
 
     case Unary("*", e) =>
@@ -655,8 +655,11 @@ trait ExprAnalysis
   // --- places --------------------------------------------------------------------------
 
   /** Whether a typed expression denotes a **place** — something with an address, which can be
-   * assigned through and pointed at. A local, a dereference, and a field of either are places;
-   * anything computed (a call result, an arithmetic result, a freshly built struct) is not.
+   * assigned through and pointed at. A local, a dereference, an element, and a field of any of
+   * them are places; anything computed (a call result, an arithmetic result, a freshly built
+   * struct) is not.
+   *
+   * The element is the case with a condition on it, and the arm below says which way each falls.
    */
   protected def isPlace(t: TExpr): Boolean = t match
     case _: TLoad           => true
@@ -676,13 +679,20 @@ trait ExprAnalysis
         case _             => isPlace(recv)
     case _ => false
 
-  /** Analyzes something that must be a place — an assignment target or the operand of `&`. */
-  protected def analyzePlace(target: Expr, what: String): TExpr = requirePlace(analyzeExpr(target), target, what)
+  /** Analyzes something that must be a place — an assignment target or the operand of `&`.
+   *
+   * `writes` separates the two. Both need an address, but only one of them *is* a write: `&` hands
+   * back a `*T`, and what a program does with a raw pointer is the unsafe tier's business by the
+   * rule `03` states outright. So a place that may be addressed but not assigned to says no here
+   * and nothing there.
+   */
+  protected def analyzePlace(target: Expr, what: String, writes: Boolean = true): TExpr =
+    requirePlace(analyzeExpr(target), target, what, writes)
 
   /** The same demand made of an expression **already analyzed**, for a form that had to see the type
    * before it knew whether a place was what it wanted at all.
    */
-  protected def requirePlace(t: TExpr, target: Expr, what: String): TExpr = {
+  protected def requirePlace(t: TExpr, target: Expr, what: String, writes: Boolean = true): TExpr = {
     // A **captured** name reaches storage the walk below cannot see the binding of — a field of the
     // environment, or the frame slot one points at — so being written once is asked of the name it
     // was declared under rather than of the expression it turned into (`12 §7`).
@@ -696,8 +706,27 @@ trait ExprAnalysis
       // address: writing one byte of UTF-8 is how a string stops being UTF-8.
       case TIndex(recv, _, _) if recv.ty == Type.Str =>
         err("a string is immutable, so its bytes have no address to write through")
+
+      // `s.bytes` reinterprets the same three words as a `[]u8` (`04`), so its elements are the
+      // string's own storage and assigning to one is the line above by another route — with a
+      // literal's bytes in read-only memory, a segfault out of a program containing no `*T` at all.
+      //
+      // Only the *assignment* is refused. `&s.bytes[0]` is how a string reaches a C function that
+      // takes a pointer and a length, which is the whole of `printf("%.*s")`, and it is a `*T` the
+      // moment it is written — the tier where `03` says the guarantees stop. What neither reaches is
+      // the view once it has been bound to a name or passed on, because a `[]T` records nothing
+      // about whose elements it views; that is the read-only view type `07 § Not yet` waits on.
+      case TIndex(_: TBytes, _, _) if writes =>
+        err("a string is immutable, and 'bytes' views the string's own storage rather than a copy " +
+          "of it — so writing through one is writing the string. Bytes you may write are bytes of " +
+          "your own: copy them into a '[]u8' first")
+
       case _ =>
-        if !isPlace(t) then err(s"$what needs a variable, a field, or a dereference — something with an address")
+        // The enumeration names all four kinds rather than the three it used to: an element is a
+        // place too, and leaving it out told a reader of this line that `&buf[0]` — which this
+        // chapter's own pointer-difference example writes — was not something they could take.
+        if !isPlace(t) then
+          err(s"$what needs a variable, a field, an element, or a dereference — something with an address")
         // A `val` has an address, which is the whole difference between it and a `const` — what it
         // does not have is a writable one. `&` is refused along with assignment because a `*T` is a
         // licence to write, and handing one out would make the promise unkeepable one step away
