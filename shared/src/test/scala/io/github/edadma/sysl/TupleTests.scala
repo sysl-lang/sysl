@@ -321,12 +321,12 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
             |""".stripMargin) should include("which does not implement it")
     }
 
-    // Arity is a shape and nothing can be generic over one, so the prelude stops somewhere — and
+    // Arity is a shape and nothing can be generic over one, so the library stops somewhere — and
     // where it stopped is the only useful thing to say, since the fix is a struct rather than a
     // fourth implementation.
-    "and beyond the widest arity the prelude declares, the advice is a struct" in {
+    "and beyond the widest arity the library declares, the advice is a struct" in {
       err("print((1, 2, 3, 4) == (1, 2, 3, 4))") should include(
-        "the prelude provides 'Eq' for tuples of up to 3 parts and this one has 4",
+        "the library provides 'Eq' for tuples of up to 3 parts and this one has 4",
       )
     }
   }

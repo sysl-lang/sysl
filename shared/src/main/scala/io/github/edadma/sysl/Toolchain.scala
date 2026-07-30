@@ -59,27 +59,6 @@ object Toolchain {
     else Left(s"clang failed (exit ${result.exitCode}):\n${result.stderr.trim}")
   }
 
-  /** Bundles the members of a library into one `ar` archive — the container a `.syslib` is, and the
-   * same one a `.a` and an `.rlib` are. `r` replaces, `c` creates without complaining, `s` writes the
-   * symbol index the linker looks a needed symbol up in.
-   */
-  def archive(out: String, members: List[String]): Either[String, Unit] = {
-    deleteFile(out)
-
-    val result = exec(List("ar", "rc", out) ::: members)
-
-    if result.exitCode == 0 then Right(())
-    else Left(s"ar failed (exit ${result.exitCode}):\n${result.stderr.trim}")
-  }
-
-  /** One member's contents, read back out of an archive without unpacking it. */
-  def extract(archive: String, member: String): Either[String, String] = {
-    val result = exec(Seq("ar", "p", archive, member))
-
-    if result.exitCode == 0 then Right(result.stdout)
-    else Left(s"$archive has no '$member' member:\n${result.stderr.trim}")
-  }
-
   /** Compiles, links, and runs a source program, returning its exit code and captured
    * stdout — the end-to-end path the run-it test tier exercises.
    *

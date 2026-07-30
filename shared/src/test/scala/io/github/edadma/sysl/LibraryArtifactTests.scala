@@ -149,14 +149,14 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
     "declares the precompiled half rather than defining it a second time" in {
       // Defining it here as well is a duplicate symbol at the link, which is the failure this
       // whole mechanism exists to avoid.
-      val (ir, _) = linked("print(double(21))")
+      val (ir, _) = linked("print(demo.double(21))")
 
       ir should include("declare i32 @demo$double(i32)")
       ir should not include "define i32 @demo$double("
     }
 
     "defines a generic here, at each type the program uses it at" in {
-      val (ir, _) = linked("print(larger(3, 7))\nprint(larger(\"a\", \"b\"))")
+      val (ir, _) = linked("print(demo.larger(3, 7))\nprint(demo.larger(\"a\", \"b\"))")
 
       ir should include("define i32 @demo$larger.int(")
       ir should include regex """define \{ ptr, ptr, i64 \} @demo\$larger\.string\("""
@@ -165,7 +165,7 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
     "runs, with the precompiled body coming from the library's object file" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      linked("print(double(21))\nprint(larger(3, 7))")._2 shouldBe Right((0, "42\n7\n"))
+      linked("print(demo.double(21))\nprint(demo.larger(3, 7))")._2 shouldBe Right((0, "42\n7\n"))
     }
 
     "and the library carries no entry point of its own to collide with the program's" in {

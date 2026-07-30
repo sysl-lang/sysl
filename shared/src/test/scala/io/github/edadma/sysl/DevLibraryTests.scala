@@ -94,17 +94,23 @@ class DevLibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       case Left(e)   => fail(s"the demo library artifact does not decode: $e")
   }
 
+  /** `demo` is auto-imported for these tests alone. A shipped compiler auto-imports only the
+   * standard module, so the development library is scoped to the suite that needs it rather than
+   * claiming a module name in every compilation everyone runs.
+   */
+  private def withDemo[T](body: => T): T = AutoImport.including("demo")(body)
+
   private def ran(program: String): String = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    Toolchain.compileAndRun(List(Source("<input>", program)), library) match
+    withDemo(Toolchain.compileAndRun(List(Source("<input>", program)), library)) match
       case Right((0, out))    => out
       case Right((code, out)) => fail(s"program exited with $code:\n$out")
       case Left(err)          => fail(err)
   }
 
   private def refused(program: String): String =
-    Compiler.compileWith(List(Source("<input>", program)), library) match
+    withDemo(Compiler.compileWith(List(Source("<input>", program)), library)) match
       case Left(err) => err
       case Right(_)  => fail("the program compiled, and should not have")
 
@@ -268,8 +274,9 @@ class DevLibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     "compiles and links from source, exactly as the artifact does" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      val fromSource = Compiler.compile(librarySources ::: List(Source("<input>", "print(double(21))")))
-      val fromCodec  = Compiler.compileWith(List(Source("<input>", "print(double(21))")), library)
+      val fromSource =
+        withDemo(Compiler.compile(librarySources ::: List(Source("<input>", "print(double(21))"))))
+      val fromCodec = withDemo(Compiler.compileWith(List(Source("<input>", "print(double(21))")), library))
 
       fromCodec shouldBe fromSource
     }

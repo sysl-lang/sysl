@@ -423,7 +423,7 @@ trait HoistImpl extends ImplConformance {
   }
 
   protected def subjectPhrase(homes: Set[Option[String]], label: String): String =
-    if homes == Set(None) then s"nothing in '$label' is declared outside the prelude"
+    if homes == Set(None) then s"nothing in '$label' is declared outside the library"
     else s"'$label' names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
 
   /** Which module licenses what a key names, or `None` for the library's.
@@ -477,8 +477,12 @@ trait HoistImpl extends ImplConformance {
       case _: AnalyzerError => None
       case _: Poisoned      => None
 
+  /** What a diagnostic says about where a declaration lives. The library's own answers "the
+   * library's", not "the prelude's": part of it is a module a program can name and import, and
+   * naming the mechanism that supplies it tells a reader to look for something they cannot write.
+   */
   protected def whose(module: Option[String]): String = module match
-    case None                         => "belongs to the prelude"
+    case None                         => "is the library's"
     case Some(m) if m == Modules.root => "is declared at the project root"
     case Some(m)                      => s"is declared in module '$m'"
 

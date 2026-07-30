@@ -83,8 +83,8 @@ This is Rust's orphan rule, and it costs nothing the chapter already promised:
 
 - **Retrofitting still works.** `impl MyTrait for TheirType` lives with `MyTrait` — the trait's
   module licenses it. That is the retrofitting kept above, unchanged.
-- **`impl Show for int` still works**, and it is the prelude's `Show` that makes it legal: a
-  built-in has no module of its own, so a built-in type's owner key belongs to the prelude, and
+- **`impl Show for int` still works**, and it is the library's `Show` that makes it legal: a
+  built-in has no module of its own, so a built-in type's owner key belongs to the library, and
   every `impl` on one is licensed by its trait's module instead. A trait that could not cover
   `int` is a trait no library can be written against.
 - What it forbids is the case with no home: **a foreign trait implemented for a foreign type**,
@@ -95,16 +95,16 @@ interface change to that module, visible to everything downstream — the same r
 `given`/`using`-style implicit resolution out of scope (`13` §7): unrestricted search and separate
 compilation are not compatible.
 
-**A type with no declaration is the prelude's.** A tuple (`00 §13`) has no module to be local to,
+**A type with no declaration is the library's.** A tuple (`00 §13`) has no module to be local to,
 which looks like a type the rule has nothing to say about. It is the question `int` already answers:
-a built-in belongs to the prelude, so the prelude is where its catalog rows live and a user module
+a built-in belongs to the library, so the library is where its catalog rows live and a user module
 writing `impl Eq for (int, string)` is the ordinary orphan case — both halves foreign — while
 `impl MyTrait for (int, string)` is permitted, because the trait is local. No exception is needed;
 the rule needed a sentence saying where a nameless type lives.
 
 **A composed type is the module's when anything named in it is.** `impl Display for []Point` is
 licensed by `Point` — the block is written where `Point` is, and nowhere else could have written it
-— while `impl Display for []int` names nothing outside the prelude and has no home. This is the half
+— while `impl Display for []int` names nothing outside the library and has no home. This is the half
 the paragraphs above left to be settled, and it is settled this way because the strict reading takes
 something the language cannot do without: with it, a module could not so much as print a slice of
 its own struct, and the compiler's own advice — *write an `impl Display for []Point`* — would name a

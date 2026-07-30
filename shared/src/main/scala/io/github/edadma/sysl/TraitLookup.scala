@@ -526,7 +526,7 @@ trait TraitLookup extends MemberVisibility {
       for
         widest <- (2 to 16).filter(n => implsOf(tr.name, Type.Tuple.shape(n)).nonEmpty).lastOption
         if tup.targs.length > widest
-      yield s"the prelude provides '${Modules.show(tr.name)}' for tuples of up to " +
+      yield s"the library provides '${Modules.show(tr.name)}' for tuples of up to " +
         s"${quantity(widest, "part")} and this one has ${tup.targs.length}, so a product this wide " +
         "wants a struct of its own"
     case _ => None

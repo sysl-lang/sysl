@@ -702,7 +702,60 @@ is what "before anything else" has to mean if it means anything at all.
 A `const`, a `val`, and an enum variant share one namespace, since all three are values a bare name
 reaches; a clash is reported at whichever was written second.
 
-## 8. What is deliberately absent
+## 8. Separate compilation — a library is compiled once and linked
+
+A library is built into one file and linked against, rather than recompiled by everything that uses
+it:
+
+```
+sysl build-lib mylib -o mylib.syslib     # compile the library once
+sysl run prog.sysl --lib mylib.syslib    # link a program against it
+```
+
+**`--lib` takes either an artifact or a source tree**, and which one is read off the name. How a
+library shipped is the shipper's business; a program that depends on one should not have to write
+down which form it got. Given a source tree the library is simply *more modules* — its files carry
+the directory segments they were found under exactly as a program's do, and §1's rules do the rest.
+
+**An artifact has two halves, and the split is the whole design.** A declaration with no type
+parameters is compiled ahead of time into object code, by whoever built the library; a program that
+calls it *declares* the symbol and links the body. A **generic** has nothing to compile until a
+caller fixes its type arguments, so it crosses as the tree it was parsed into and is monomorphized
+in the consuming program. Rust's `.rlib` makes the same split, carrying MIR in `lib.rmeta` for
+exactly this reason.
+
+The metadata carries **every** declaration, not only the generic ones: a call into the precompiled
+half still has to be type-checked, and the tree is where the signature is. What the symbol list adds
+is which of those the consumer must declare rather than emit a second time.
+
+Three consequences worth stating, because each is a thing a reader would otherwise have to discover:
+
+- **An artifact is for one machine**, exactly as an `.rlib` is, because half of it is object code.
+  The tree half would travel anywhere; the object half is what pins it.
+- **A library carries no entry point.** A `main` of its own would collide with the one belonging to
+  whatever links it.
+- **Nothing is pruned when a library is built.** A program is lowered from `main` outwards because
+  what it cannot reach is dead; a library has no `main` and every public declaration is a potential
+  entry, so all of them are emitted and the *linker* discards what a given program never calls.
+
+A library is **analyzed before anything is written**. A library that does not check is broken once,
+by whoever built it; without that check the artifact ships anyway and every program that links
+against it is handed a diagnostic pointing into somebody else's source.
+
+**The container is ours rather than `ar`.** An `.rlib` is an `ar` archive holding `.o` members beside
+`lib.rmeta`, and that was the obvious thing to copy. It does not survive the platform tools: macOS
+`ar` runs `ranlib`, which silently drops a member that is not Mach-O, and suppressing the index only
+moves the failure to the linker, which reads every member and refuses. Rust gets away with it by
+wrapping the metadata in an object file with the section marked excluded — which needs an object
+writer *and* reader per platform to get back out. A `.syslib` is instead a text header, the metadata,
+and the object bytes.
+
+**What this does not yet reach:** a library function that reads a module-level `val` is left out of
+the precompiled half, because a `val`'s storage is written by the entry point and a library has none.
+Such a function is compiled in the consuming program instead, where the initialization it depends on
+happens. Lifting that needs a library initializer the program calls before `main`.
+
+## 9. What is deliberately absent
 
 - **No file-as-module.** The file is a contribution, not a unit; there is no per-file namespace
   and no import of a file. A module is always a directory (§1).
@@ -743,13 +796,16 @@ reaches; a clash is reported at whichever was written second.
   *module* can be marked private to its parent (an internal sub-module invisible to outside
   importers, as Rust's `mod` privacy and Scala's `private[parent] package` allow) is open, and
   interacts with (b).
-- **d. Separate compilation and module metadata.** Monomorphization and escape/capability
-  propagation need a module's bodies or a summary of them across the boundary (`05`,
-  `capabilities.md`); the on-disk form of that metadata, and whether modules compile separately or
-  the whole graph compiles together, is an implementation decision not settled here. The driver's
-  discovery order is part of this: §3 establishes that the module graph cannot be recovered from
-  file headers alone, so the build has to parse before it can order, and how that interleaves with
-  cycle reporting (§6) and caching is unsettled.
+- **d. Separate compilation — settled for libraries, open for the module graph.** §8 settles the
+  boundary a *library* crosses: the on-disk form is a `.syslib`, the split is object code for what is
+  determined and trees for what is generic, and a program links the first and monomorphizes the
+  second. What is left of this item is the **whole-graph** question — whether the modules *within*
+  one project compile separately and cache, rather than being compiled together every time. The
+  driver's discovery order is part of that: §3 establishes that the module graph cannot be recovered
+  from file headers alone, so a build has to parse before it can order, and how that interleaves with
+  cycle reporting (§6) and caching is unsettled. Escape and capability propagation across a library
+  boundary is also still open — §8 carries bodies, so the information is *there*, but nothing reads
+  it for those two passes yet.
 - **e. `private[M]` and re-export.** §2 settles what `M` may name (the declaring module or an
   ancestor, as a simple name, resolved innermost-outward) and therefore that a visibility scope is
   always a contiguous subtree. What is left open is how scoped-private interacts with re-export
@@ -760,19 +816,25 @@ reaches; a clash is reported at whichever was written second.
   reaches: `08 § Visibility` has the rules, of which the load-bearing one is that an unmarked member
   sits at its type's reach and a modifier may only narrow. What is left of this item is (c) — a
   whole *module* private to its parent — which is the same question one level up.
-- **g. What the file level buys the backend.** §2 notes that a bare `private` is the level at which
-  mangling can be skipped and LLVM `internal` linkage applies. Neither is done: the compiler emits
-  one module for the whole program, so `internal` would be correct but would buy nothing
-  measurable. It becomes worth doing exactly when (d) does — separate compilation is what makes an
-  external symbol cost something.
+- **g. What the file level buys the backend — now worth doing.** §2 notes that a bare `private` is
+  the level at which mangling can be skipped and LLVM `internal` linkage applies. Neither is done,
+  and the reason they bought nothing has gone: §8 makes a library a real object file, so a
+  file-private helper in one is an exported symbol that nothing may call and nothing will discard.
+  This is no longer waiting on a decision, only on the work.
 
-- **h. Where a standard library lives, and what is in it rather than in the prelude.** The prelude
-  is everything a program gets for free, and it is deliberately small: the printing surface, the
-  trait catalog, `Option`, `Result`, `Buf`, `ByteSink`. It is not a library — it has no module name,
-  a program cannot import a part of it, and nothing in it can be left out. So the first program to
-  want mathematics found none: `guide/fft` declares `sin`, `cos` and `sqrt` as C externs of its own
-  and writes its own absolute value, and every float program after it would do the same. Growing the
-  prelude is the wrong answer, because a prelude declaration is one every program carries a *layout*
-  for whether or not it is reached (see `14 §2`); what is wanted is a module a program imports, which
-  is this chapter's question rather than `14`'s. It is the same question as `14 §8 a`'s — which module
-  the trait catalog lives in once there is more than one — asked about a second body of code.
+- **h. What is in the standard library — the *where* is settled, the *what* is not.** A library now
+  has somewhere to live and a way to be reached: §8 is the mechanism, and `sysl` is the module name
+  every program is compiled against. What that module should *contain* is the open half, and it is
+  the question the whole exercise was for.
+
+  The pressure is real and predates the mechanism: the first program to want mathematics found none
+  — `guide/fft` declares `sin`, `cos` and `sqrt` as C externs of its own and writes its own absolute
+  value, and every float program after it would do the same.
+
+  What was wrong with growing the *prelude* instead is worth keeping, because it is the constraint on
+  the answer: a prelude declaration is one every program carries a **layout** for whether or not it is
+  reached (`14 §2`), which is why a prelude cannot simply become a standard library by getting
+  bigger. A library a program links against pays only for what it calls — §8's pruning and the
+  linker's discard between them — so the two are different things and the difference is measurable.
+  It is the same question as `14 §8 a`'s — which module the trait catalog lives in once there is more
+  than one — asked about a second body of code.

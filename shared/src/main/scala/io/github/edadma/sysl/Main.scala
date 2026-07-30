@@ -104,7 +104,11 @@ case class Config(
     case None      => processExit(2)
 }
 
-private def execute(cfg: Config): Int = {
+/** What a subcommand does, and the exit status it leaves. Visible to the package so a test can drive
+ * the driver rather than re-implementing it — the error paths here are the ones a user meets, and
+ * none of them is reachable from the compiler's own API.
+ */
+private[sysl] def execute(cfg: Config): Int = {
   if cfg.command == "targets" then return listTargets()
 
   val sources =
@@ -134,8 +138,9 @@ private def execute(cfg: Config): Int = {
   // names is read off the name, so a program that depends on a library need not know how it shipped.
   val (artifacts, roots) = cfg.libs.partition(LibraryArtifact.isArtifact)
 
-  // An artifact's object half is unpacked to a temporary file, because what links it is `clang` and
-  // clang takes a path. The tree half is decoded and joins the compilation as more modules.
+  // Both halves are read into memory here and neither touches the disk yet: everything below may
+  // still refuse the compilation, and a temporary file written before that has to be cleaned up on
+  // every one of those paths. The object half is materialized once there is a link to do.
   val unpacked =
     try artifacts.map(p => LibraryArtifact.unpack(p, readBytes(p)))
     catch case e: Exception => return fail(s"cannot read a library: ${e.getMessage}")
@@ -144,16 +149,10 @@ private def execute(cfg: Config): Int = {
     case Some(e) => return fail(e)
     case None    => ()
 
-  val objects = unpacked.collect { case Right((_, obj)) => obj }.map { obj =>
-    val path = createTempFile("sysl-lib-", ".o")
-    writeBytes(path, obj)
-    path
-  }
-
   val decoded = artifacts.zip(unpacked).collect { case (p, Right((meta, _))) => LibraryArtifact.read(p, meta) }
 
   decoded.collectFirst { case Left(e) => e } match
-    case Some(e) => objects.foreach(deleteFile); return fail(e)
+    case Some(e) => return fail(e)
     case None    => ()
 
   val collected =
@@ -182,39 +181,50 @@ private def execute(cfg: Config): Int = {
         else notes.foreach(Console.err.println)
       ir
 
-  cfg.command match
-    case "emit-llvm" =>
-      stdout(compiled); 0
+  // The compilation is settled, so the object halves are written where `clang` can be given a path
+  // to them. They exist only for the linker's sake and are cleaned up on every path out of here,
+  // including the ones that failed.
+  val objects = unpacked.collect { case Right((_, obj)) => obj }.map { obj =>
+    val path = createTempFile("sysl-lib-", ".o")
+    writeBytes(path, obj)
+    path
+  }
 
-    case "build" =>
-      val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
+  try
+    cfg.command match
+      case "emit-llvm" =>
+        stdout(compiled); 0
 
-      Toolchain.build(compiled, exe, target, objects) match
-        case Left(err) => fail(err)
-        case Right(_)  => Console.err.println(s"wrote $exe"); 0
+      case "build" =>
+        val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
 
-    case "run" =>
-      val exe = createTempFile("sysl-", "")
+        Toolchain.build(compiled, exe, target, objects) match
+          case Left(err) => fail(err)
+          case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
-      Toolchain.build(compiled, exe, target, objects) match
-        case Left(err) => deleteFile(exe); fail(err)
-        case Right(_) =>
-          val result = exec(exe :: cfg.programArgs)
-          deleteFile(exe)
-          stdout(result.stdout)
-          if result.stderr.nonEmpty then Console.err.print(result.stderr)
-          result.exitCode
+      case "run" =>
+        val exe = createTempFile("sysl-", "")
 
-    case other =>
-      fail(s"unknown command '$other'")
+        Toolchain.build(compiled, exe, target, objects) match
+          case Left(err) => deleteFile(exe); fail(err)
+          case Right(_) =>
+            val result = exec(exe :: cfg.programArgs)
+            deleteFile(exe)
+            stdout(result.stdout)
+            if result.stderr.nonEmpty then Console.err.print(result.stderr)
+            result.exitCode
+
+      case other =>
+        fail(s"unknown command '$other'")
+  finally objects.foreach(deleteFile)
 }
 
-/** `sysl build-lib <path> -o <artifact>` — a library's source written out as the tree a later
- * compilation decodes (`LibraryArtifact`).
+/** `sysl build-lib <path> -o <artifact>` — a library compiled once, into the two halves a program
+ * links against (`LibraryArtifact`).
  *
- * No target is involved and nothing is lowered: an artifact carries the library's **AST**, not
- * machine code, because a generic declaration has no compiled form until the program that calls it
- * fixes its type arguments. That is also why one artifact serves every target.
+ * The artifact is **for one machine**, exactly as an `.rlib` is, because half of it is object code.
+ * The other half is the tree, which would travel anywhere: a generic has no compiled form until the
+ * program that calls it fixes its type arguments, so it is monomorphized in that program instead.
  */
 private def buildLibrary(cfg: Config, sources: List[Source], target: Target): Int =
   LibraryArtifact.build(sources, target) match

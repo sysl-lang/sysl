@@ -210,8 +210,8 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
             |print(1)
             |""".stripMargin) should include(
         "an 'impl' may be written only in the module that declares the trait or in one that " +
-          "declares a type named in the subject, and 'Eq' belongs to the prelude while nothing in " +
-          "'Option' is declared outside the prelude — so this one has no home")
+          "declares a type named in the subject, and 'Eq' is the library's while nothing in " +
+          "'Option' is declared outside the library — so this one has no home")
     }
 
     // A catalog trait the compiler already provides for a built-in is refused one step earlier
@@ -227,7 +227,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
       err("""impl Display for []int
             |    display(self, out: *Writer, fmt: FormatSpec) = out.write("x".bytes)
             |print(1)
-            |""".stripMargin) should include("nothing in '[]int' is declared outside the prelude")
+            |""".stripMargin) should include("nothing in '[]int' is declared outside the library")
     }
 
     // A shape's parameter stands for no declaration, so a block over every slice at once names
@@ -237,7 +237,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
       err("""impl[T: Display] Display for []T
             |    display(self, out: *Writer, fmt: FormatSpec) = out.write("x".bytes)
             |print(1)
-            |""".stripMargin) should include("nothing in '[]T' is declared outside the prelude")
+            |""".stripMargin) should include("nothing in '[]T' is declared outside the library")
     }
 
     "a tuple is the prelude's, so a foreign trait for one is the ordinary case" in {

@@ -62,18 +62,42 @@ object Imports {
  * same position: an edge from every file to it would say nothing, and would make the library's own
  * files depend on themselves.
  *
- * **`sysl` is the real one** — the standard module every program is compiled against, which is why
- * every unqualified name in every program now goes through this. `demo` is beside it deliberately,
- * as the useless development library under `devlib/`: it is what proved the mechanism on a library
- * nothing depends on before the standard module was asked to rely on it, and it goes on holding that
- * proof rather than being retired the moment it worked. It is also what puts **two** wildcards in
- * front of every file `DevLibraryTests` compiles, which is the only thing that says a second
- * auto-import leaves the first alone.
+ * **`sysl` is the one a shipped compiler auto-imports** — the standard module every program is
+ * compiled against, which is why every unqualified name in every program goes through this. Nothing
+ * else is in the list, and that is a correctness point rather than tidiness: a name here is claimed
+ * for every file of every program, so a development library left in would silently wildcard-import
+ * any user library that happened to declare the same module name.
  */
 object AutoImport {
 
   /** The modules to bring in unqualified, if a compilation has them. */
-  val modules: List[String] = "demo" :: Library.modules
+  def modules: List[String] = Library.modules ::: extra
+
+  private var extra: List[String] = Nil
+
+  /** Runs `body` with `module` auto-imported as well — **for tests only**.
+   *
+   * `devlib/demo` is what proved this mechanism on a library nothing depends on, before the standard
+   * module was asked to rely on it, and it goes on holding that proof. Reaching it needs a second
+   * auto-imported module, which is also the only thing that says two of them leave each other alone
+   * — but a development library has no business in a shipped compiler's list, so it is scoped to the
+   * test that wants it instead of living in the constant.
+   *
+   * **This is process-global, and suites run in parallel.** A module named here is therefore visible
+   * to whatever else is compiling at the time. That is inert for almost everything, because
+   * `ProgramWalk.autoImported` keeps only modules the compilation actually has — a name for a module
+   * that is not there contributes nothing. It is *not* inert for another suite that declares a module
+   * of the same name, which must write its own references qualified rather than depend on whether
+   * this happened to be set. Threading the list through the compilation would remove the hazard, and
+   * is the right fix if a second caller ever wants this.
+   */
+  def including[T](module: String)(body: => T): T = {
+    val saved = extra
+
+    extra = extra :+ module
+    try body
+    finally extra = saved
+  }
 }
 
 /** The terms a name is read in: the module it is written in, what that file (or block) has
