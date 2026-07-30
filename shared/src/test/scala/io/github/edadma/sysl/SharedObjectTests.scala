@@ -29,6 +29,17 @@ class SharedObjectTests extends AnyFreeSpec with CodegenSupport with RunSupport 
             |""".stripMargin) shouldBe "7 0.5 m true\n"
     }
 
+    // `unit` is the fourth name on `§ Crossing copies`' list and the one nothing had asked about.
+    // It occupies no storage, so there is nothing for a domain to race over.
+    "a 'unit', which the crossable list names beside the three above" in {
+      run("""struct Marked
+            |    n: int
+            |    tag: unit
+            |var m: &sync Marked = Marked(7, ())
+            |print(m.n)
+            |""".stripMargin) shouldBe "7\n"
+    }
+
     "a fixed array of them" in {
       run("""struct Table
             |    cells: [4]int

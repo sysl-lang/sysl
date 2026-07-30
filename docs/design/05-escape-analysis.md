@@ -50,7 +50,10 @@ parameter escapes.
 Within one function, a slice value is tracked back to its origin. A slice whose origin is a
 **local array** escapes if it can be reached after the frame returns — that is, if it is:
 
-1. **returned**, directly or nested inside a returned struct, enum, or `Option`;
+1. **returned**, directly or nested inside whatever carries it back — a struct, an enum, an
+   `Option`, a **tuple** (`00 §13`), or one slot of a **multi-result list** (`12 §5`). The rule is
+   about reaching the caller rather than about which carrier does it, so what belongs here is the
+   language's list of carriers and not the subset that happened to get written down;
 2. **stored into anything that outlives the frame** — a global, a field reached through a
    `&T`, or an aggregate that is itself stored somewhere that outlives the frame;
 3. **passed as an argument that the callee keeps** (next section);
