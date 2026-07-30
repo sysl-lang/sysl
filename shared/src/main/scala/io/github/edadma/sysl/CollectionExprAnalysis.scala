@@ -110,10 +110,10 @@ trait CollectionExprAnalysis extends ExprSupport {
         // `Index` and is reaching for the neighbouring form is owed that rather than "cannot
         // slice", which reads as though their type were the wrong shape for an operation that
         // exists.
-        case other if indexes("Index", other) =>
-          err(s"${show(other)} is read by a subscript through 'Index', but slicing through the trait " +
-            "is not built: the index would have to be a range, and a range is not yet a type a " +
-            "program can name")
+        case other if indexes(Library.key("Index"), other) =>
+          err(s"${show(other)} is read by a subscript through '${qn(Library.key("Index"))}', but slicing " +
+            "through the trait is not built: the index would have to be a range, and a range is not yet " +
+            "a type a program can name")
 
         case other => err(s"cannot slice ${show(other)}")
 
