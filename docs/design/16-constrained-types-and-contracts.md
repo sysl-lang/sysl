@@ -226,12 +226,25 @@ what a `within`-ranged integer subtype offers:
 
 | written | is | notes |
 |---|---|---|
-| `T::First` | the lower bound | a constant, no argument |
-| `T::Last` | the upper bound | one *below* the written bound where the range is exclusive |
-| `T::Valid(x)` | whether `x` is in range | a `bool`, and **total** — it never traps, which is what makes it the question form |
-| `T::Succ(x)` | the next value | traps at `T::Last` |
-| `T::Pred(x)` | the previous value | traps at `T::First` |
-| `T::Range` | the range itself | only as a `for` loop's iterable, `First..Last` inclusive |
+| `T::First` | the lower bound | a `T`, a constant, no argument |
+| `T::Last` | the upper bound | a `T`; one *below* the written bound where the range is exclusive |
+| `T::Valid(x)` | whether `x` is in range | takes the **base**; a `bool`, and **total** — it never traps, which is what makes it the question form |
+| `T::Succ(x)` | the next value | a `T` from a `T`; traps at `T::Last` |
+| `T::Pred(x)` | the previous value | a `T` from a `T`; traps at `T::First` |
+| `T::Range` | the range itself | only as a `for` loop's iterable, `First..Last` inclusive, the variable a `T` |
+
+**Every attribute but `Valid` speaks the subtype.** A bound of `T` is a value of `T`, the step from
+one `T` is another, and the values `Range` walks are `T`'s. This is invisible on a transparent
+subtype, where `T` and its base agree anyway (§1) — it is what makes the set usable on a **derived**
+one, which is otherwise the only kind of type whose own attributes would have to be cast back into
+it. A `new` subtype exists to stay out of its base's traffic, and an attribute surface that handed
+back the base would make its own declaration the thing you had to undo to use it.
+
+`Valid` is the exception and the asymmetry is its job: it takes the **base**, because asking whether
+a value is a `T` is only a question about something that is not one yet. Handed a `T` it is refused,
+since the answer could only be yes. The numbers it can be asked about are therefore the ones the
+base can hold, and a subtype over a `u8` cannot be asked about `-1` — that is not a narrowing of the
+question, it is the base's range being what a base is.
 
 **`Valid` is the answer to "how do I ask instead of trapping".** §4 rules that a produce site traps
 because a value outside the range is a mistake and not a condition; `Valid` is how a program that

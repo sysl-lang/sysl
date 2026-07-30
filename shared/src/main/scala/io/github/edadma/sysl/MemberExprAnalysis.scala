@@ -210,18 +210,24 @@ trait MemberExprAnalysis extends ExprSupport {
 
     def noArgs(): Unit = if args.nonEmpty then err(s"'${qn(key)}::$attr' takes no arguments")
 
-    def oneArg(): TExpr =
+    def oneArg(want: Type): TExpr =
       if args.length != 1 then err(s"'${qn(key)}::$attr' takes exactly one argument")
-      val x = analyzeExpr(args.head, Some(base))
-      if disagree(x.ty, base) then err(s"'${qn(key)}::$attr' takes a ${show(base)}, not ${show(x.ty)}")
+      val x = analyzeExpr(args.head, Some(want))
+      if disagree(x.ty, want) then err(s"'${qn(key)}::$attr' takes a ${show(want)}, not ${show(x.ty)}")
       x
 
+    // Every attribute but `Valid` speaks the subtype, exactly as a simple enum's do below. A bound
+    // of `T` is a `T` and the step from one `T` is another, so a **derived** subtype can use its own
+    // attributes without casting through the base it was declared `new` to stay out of — and for a
+    // transparent one the two agree anyway (`repr`), so nothing about it changes. `Valid` is the one
+    // that takes the base, because asking whether a value is a `T` is only a question for something
+    // that is not yet one.
     attr match
-      case "First" => noArgs(); TIntLit(ranged._1.toBigInt, base)
-      case "Last"  => noArgs(); val (_, hi) = ranged; TIntLit((if c.exclusiveHi then hi - 1 else hi).toBigInt, base)
-      case "Valid" => val x = oneArg(); ranged; TConstrainedValid(x, c)
-      case "Succ"  => val x = oneArg(); ranged; TConstrainedStep(x, c, up = true, base)
-      case "Pred"  => val x = oneArg(); ranged; TConstrainedStep(x, c, up = false, base)
+      case "First" => noArgs(); TIntLit(ranged._1.toBigInt, c)
+      case "Last"  => noArgs(); val (_, hi) = ranged; TIntLit((if c.exclusiveHi then hi - 1 else hi).toBigInt, c)
+      case "Valid" => val x = oneArg(base); ranged; TConstrainedValid(x, c)
+      case "Succ"  => val x = oneArg(c); ranged; TConstrainedStep(x, c, up = true, c)
+      case "Pred"  => val x = oneArg(c); ranged; TConstrainedStep(x, c, up = false, c)
       case "Range" => err(s"'${qn(key)}::Range' is only meaningful as the iterable of a 'for' loop")
       case _       => err(s"'${qn(key)}' has no attribute '$attr'")
   }

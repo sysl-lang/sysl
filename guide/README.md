@@ -36,6 +36,7 @@ that quietly stopped running would otherwise look like a check that passed.
 | `kernel` | the same scheduler with no heap — a fixed table, indices for identity, intrusive lists |
 | `datetime` | a conversion that can succeed twice — wall clocks, timelines, and daylight saving |
 | `matrix` | an operator whose result is neither operand's type — a vector space, then Gaussian elimination |
+| `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts and struct invariants |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is
