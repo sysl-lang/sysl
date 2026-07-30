@@ -86,16 +86,30 @@ its own stack buffer, and so what keeps rendering allocation-free — and every 
 checked here to make sure its `write` really does let go. An implementation that keeps the bytes is
 rejected, naming the function; a caller may then pass one a frame-backed slice freely.
 
-**`Reader` is deliberately not a second exception, and the asymmetry is open.** Its `read` takes a
-`[]u8` to fill, so the same question arises in the other direction — and the answer today is the
-conservative one: reading into a local array through a `*Reader` promotes the array, and in a
-`no alloc` module it is refused. Reading through a *concrete* reader is unaffected, since a direct
-call consults the summary and `FdReader.read` keeps nothing; and the prelude's own `Lines` reads into
-a heap buffer, so nothing in the shipped surface pays for this. What makes `Writer`'s exception
-earned is a check that every `impl` lets the bytes go, and `read` does not let go — it hands the view
-*back*, which is a different promise needing a different check. Whether reading deserves that check
-is not settled here: rendering had to be allocation-free for `14 §2` to work at all, and nothing yet
-says reading does.
+**`Reader` is deliberately not a second exception.** Its `read` takes a `[]u8` to fill, so the same
+question arises in the other direction, and the answer today is the conservative one: reading into a
+local array through a `*Reader` promotes the array, and in a `no alloc` module it is refused.
+
+Two things bound how much that costs. Reading through a **concrete** reader is unaffected, since a
+direct call consults the summary and `FdReader.read` keeps nothing — and so is reading through a
+**bounded type parameter**, because monomorphization turns that into a direct call too. Only genuine
+erasure pays, and the prelude's own `Lines` reads into a heap buffer, so nothing in the shipped
+surface does. `[R: Reader]` is therefore both the faster shape and the one with no promotion in it,
+which is the usual relationship between the two and not a coincidence.
+
+The reason not to simply grant `Reader` the same exception is that **`Writer`'s is a name the
+compiler knows by heart**, and a second one is how that becomes four. The exception is not really
+about `Writer`: it is about a trait whose implementations all promise to let a borrowed buffer go,
+and that promise is something a trait could **declare** and every `impl` be checked against — with
+`Writer` as its first user rather than its special case. The analysis needs nothing new to support
+it. A summary already has two halves, what escapes and which parameters the result may view, and
+`read`'s contract is exactly "keeps nothing, and the result views the first parameter". The
+trait-object path does not lack that information; it discards it.
+
+So the open question is not "does `Reader` deserve the exception" but "should the exception be
+declarable at all", and it is worth answering only when something needs it — a `no alloc` module that
+genuinely cannot use a type parameter. Rendering *had* to be allocation-free for `14 §2` to work;
+nothing yet says reading does.
 
 **A function whose body is not available** — an `extern` (`12 §1`), which is the declaration form
 for exactly that — gets the pessimistic assumption: every parameter is kept, and the result views
