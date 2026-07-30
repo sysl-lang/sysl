@@ -155,6 +155,17 @@ trait Literals extends TypeResolution {
    */
   protected def widen(t: TExpr, to: Type): TExpr = if t.ty == to then t else TCast(t, to).setPos(t.pos)
 
+  /** The same, for the value a `Display` renderer is handed.
+   *
+   * One kind of value does not *widen* into its renderer: an integer past 64 bits has no width to
+   * widen to that would still hold it, so it arrives as the digits `str` writes and the prelude is
+   * left with the padding. Rendering it any other way would truncate silently, which is the one
+   * outcome a renderer must not have — the number would simply print as its low half.
+   */
+  protected def rendered(t: TExpr, to: Type): TExpr = Type.underlying(t.ty) match
+    case i: Type.Integer if i.bits > 64 => TStr(t)
+    case _                              => widen(t, to)
+
   /** The result type of an arithmetic or bitwise binary operator. Operands must already have
    * the same type — there is no implicit promotion, so a mixed-width expression is an error
    * asking for a conversion rather than a silent widening. `+` on two strings concatenates,

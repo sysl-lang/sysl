@@ -465,7 +465,7 @@ trait CallAnalysis extends Literals with TraitObjects {
         err(s"method 'Display.display' takes ${quantity(params.length, "argument")}, " +
           s"but ${supplied(args.length, "argument")}")
 
-      val self = widen(buildReceiver(RecvMode.ByValue, recv), to)
+      val self = rendered(buildReceiver(RecvMode.ByValue, recv), to)
 
       funcsUsed += fname
       TCall(fname, self :: checkArgs("Display.display", params, args, None), Type.Unit)

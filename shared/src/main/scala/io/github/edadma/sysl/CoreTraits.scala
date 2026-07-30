@@ -156,6 +156,11 @@ object CoreTraits {
    * and consecutive keys have none worth indexing by until they have been spread.
    */
   def hash(t: Type): Option[(String, Type)] = t match
+    // A value too wide for the mixer is mixed in two halves. Truncating instead would keep the law —
+    // equal values would still hash equal — and throw away every bit above the 64th, so a table keyed
+    // on values that differ only in their high half would put all of them in one bucket. That is the
+    // shape of a 128-bit identifier, which is the reason to have the width at all.
+    case i: Type.Integer if i.bits > 64 => Some(("hash_u128", Type.Integer(128, signed = false)))
     case _: Type.Integer | Type.Char => Some(("hash_u64", Type.Integer(64, signed = false)))
     // A `bool` is one bit, and one bit does not widen to a number in this language — the same
     // reason `display_bool` exists rather than a widening into the integer renderer.
@@ -171,6 +176,9 @@ object CoreTraits {
    * lets a `Display` written for a struct render the struct's own fields.
    */
   def display(t: Type): Option[(String, Type)] = t match
+    // Past 64 bits the renderer takes the digits rather than the number, because the prelude's own
+    // two go through `snprintf` and C has no conversion that wide. The padding is still the prelude's.
+    case i: Type.Integer if i.bits > 64 => Some(("display_wide", Type.Str))
     case i: Type.Integer if i.signed => Some(("display_int", Type.Integer(64, signed = true)))
     case _: Type.Integer             => Some(("display_uint", Type.Integer(64, signed = false)))
     case _: Type.Floating            => Some(("display_real", Type.Real))

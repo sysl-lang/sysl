@@ -29,6 +29,24 @@ class ExpressionParserTests extends AnyFreeSpec with ParseSupport {
       expr("a = b = c") shouldBe
         Assign("=", Ident("a"), Assign("=", Ident("b"), Ident("c")))
     }
+
+    // `01` gives the three bitwise operators three levels of their own, in C's order. Only the
+    // tightest of them is pinned above, against comparison; these are the two boundaries between
+    // them, which a single level for all three would read the same way as left association.
+    "the three bitwise operators keep three levels, and-tightest" in {
+      expr("a | b ^ c") shouldBe Binary("|", Ident("a"), Binary("^", Ident("b"), Ident("c")))
+      expr("a ^ b & c") shouldBe Binary("^", Ident("a"), Binary("&", Ident("b"), Ident("c")))
+      expr("a | b ^ c & d") shouldBe
+        Binary("|", Ident("a"), Binary("^", Ident("b"), Binary("&", Ident("c"), Ident("d"))))
+    }
+
+    "and binds tighter than or" in {
+      expr("a || b && c") shouldBe Binary("||", Ident("a"), Binary("&&", Ident("b"), Ident("c")))
+    }
+
+    "prefix negation applies to the whole postfix chain, so `-a.b` is `-(a.b)`" in {
+      expr("-a.b") shouldBe Unary("-", Field(Ident("a"), "b"))
+    }
   }
 
   "comparison chains" - {
@@ -50,6 +68,15 @@ class ExpressionParserTests extends AnyFreeSpec with ParseSupport {
 
     "an open-ended range" in {
       expr("a..") shouldBe RangeExpr(Some(Ident("a")), None, inclusive = true)
+    }
+
+    "a range binds tighter than a comparison, which is the level above it" in {
+      expr("x == a..b") shouldBe
+        Compare(List(Ident("x"), RangeExpr(Some(Ident("a")), Some(Ident("b")), inclusive = true)), List("=="))
+    }
+
+    "and does not associate, so a chain of two has no reading" in {
+      progError("var r = a..b..c") should not be empty
     }
   }
 

@@ -22,7 +22,7 @@ are for aarch64 (LP64, little-endian, 64-bit pointers).
 | `u16` | `ushort` | 2 | unsigned 16-bit |
 | `u32` | `uint` | 4 | unsigned 32-bit |
 | `u64` | `ulong` | 8 | unsigned 64-bit |
-| `iN` / `uN` | — | ⌈N/8⌉ min | arbitrary width, any `N ≥ 1` (`i5`, `u12`, `i128`, …); standalone odd-width storage/alignment is an open item |
+| `iN` / `uN` | — | see below | arbitrary width, any `N ≥ 1` (`i5`, `u12`, `i128`, …); the back end lowers up to 128 |
 | `isize` | — | 8 (pointer width) | signed pointer-width; **distinct type**, not an alias |
 | `usize` | — | 8 (pointer width) | unsigned pointer-width; **distinct type**, not an alias |
 
@@ -30,6 +30,14 @@ are for aarch64 (LP64, little-endian, 64-bit pointers).
 - `iN` / `uN` is an open family (`00` §5); the fixed-width aliases are common-width names over
   it. On the LP64 ABI each alias matches its C namesake's width; `isize` / `usize` match
   `size_t` / `ptrdiff_t` on *every* target.
+- **A width is stored the way the target stores it**, which for a width that is not a whole number of
+  bytes is not `⌈N/8⌉`: the alignment rounds up to that of the smallest width the data layout names,
+  and the stride rounds up to that alignment. So `u8`→1, `u12`→2 aligned 2, `u20`→4 aligned 4,
+  `u96`→16 aligned 16, `u128`→16 aligned 16.
+- **Past 64 bits, two operations change where they happen** — division becomes a compiler-rt call,
+  and the decimal rendering becomes the language's own, since C has no `printf` length modifier that
+  wide. A `%d` on such a value is refused by name rather than narrowed, and `str` renders it. `Hash`
+  mixes the two halves rather than truncating to the low one.
 
 ### Floating-point (closed IEEE set)
 
@@ -38,9 +46,14 @@ are for aarch64 (LP64, little-endian, 64-bit pointers).
 | `f16` | — | 2 | binary16 |
 | `f32` | — | 4 | binary32 |
 | `f64` | `real` | 8 | binary64 |
-| `f128` | — | 16 | binary128 (quad; soft-float on aarch64) |
+| `f128` | — | 16 | binary128 (quad; soft-float on aarch64) — **specified, not built** |
 
 Not an arbitrary-width family — only these four (`00` §6). `bfloat` deliberately excluded.
+
+Three of the four are lowered. `f128` is refused by name, and what it waits on is rendering rather
+than arithmetic: every float reaches the screen through `snprintf`, which has no portable quad
+conversion — and on Darwin's arm64 `long double` *is* `double`, so `%Lf` would print a wrong number
+rather than fail. See `00` §6.
 
 ### Other primitives
 
@@ -148,11 +161,16 @@ rests on applies to representation changes too.
 | float → float | `f32(x)`, `real(x)` | rounds to nearest |
 | `char` → integer | `u32(c)` | total — every `char` is an integer |
 | integer → `char` | `char(u)` | **partial** — traps on a value that is not a Unicode scalar value (`00` §1) |
+| `char` → `string` | `string(c)` | total — the one character UTF-8-encoded into a fresh string (`04`) |
 
-Everything else is rejected: there is no conversion to or from `bool` (`int(true)` is an
-error, and so is `bool(0)`), and none between a scalar and `string`. `usize` / `isize` are
-distinct types, so moving between them and a fixed-width integer of the same size is still
-written — on a target where the widths differ it is a real narrowing, which is exactly why.
+Everything else is rejected: there is no conversion to or from `bool` (`int(true)` is an error, and so
+is `bool(0)`), and **no number converts to or from a `string`** — `str(x)` renders one and
+`from_utf8` / the `strconv` surface reads one, neither of them spelled as a conversion. The last row
+is the one exception and is a narrow one: a `char` is a single Unicode scalar value, so encoding it is
+total and needs nothing said about failure, which is what makes it a conversion rather than a parse.
+`usize` / `isize` are distinct types, so moving between them and a fixed-width integer of the same
+size is still written — on a target where the widths differ it is a real narrowing, which is exactly
+why.
 
 ## Operator precedence
 

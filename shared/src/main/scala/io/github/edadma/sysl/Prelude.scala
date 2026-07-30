@@ -238,6 +238,8 @@ object Prelude {
       |    h = (h ^ (h >> 27u64)) * 0x94d049bb133111ebu64
       |    h ^ (h >> 31u64)
       |
+      |hash_u128(v: u128) -> u64 = hash_u64(u64(v)) * 0x100000001b3u64 ^ hash_u64(u64(v >> 64))
+      |
       |hash_bool(b: bool) -> u64 = hash_u64(if b then 1u64 else 0u64)
       |
       |hash_str(s: string) -> u64
@@ -310,6 +312,8 @@ object Prelude {
       |    var k = sysl_snprintf(&buf[0], 24usize, c"%llu", n)
       |    display_digits(buf[0..<usize(k)], out, fmt)
       |end display_uint
+      |
+      |display_wide(s: string, out: *Writer, fmt: FormatSpec) = display_digits(s.bytes, out, fmt)
       |
       |display_real(x: real, out: *Writer, fmt: FormatSpec)
       |    var buf: [64]u8

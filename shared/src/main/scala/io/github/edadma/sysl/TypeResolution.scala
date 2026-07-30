@@ -842,6 +842,12 @@ trait TypeResolution extends ImportResolution {
   /** `i5`, `u12`, `f32` — a family letter followed by a width. The integer family is open,
    * so it is recognised by shape rather than listed; a width the back end cannot lower is a
    * diagnostic, not an unknown name.
+   *
+   * The integer limit is 128 rather than LLVM's own `2^23 - 1` because 128 is where the *rest* of
+   * the toolchain stops agreeing: a division at a wider width has no compiler-rt routine behind it,
+   * and the decimal rendering is written once at the widest width there is. It is a statement about
+   * what the back end lowers, not about what `00 §5` permits — the maximum the language allows is
+   * still that chapter's open question.
    */
   protected def widthType(name: String): Option[Type] = {
     val digits = name.drop(1)
@@ -855,8 +861,8 @@ trait TypeResolution extends ImportResolution {
         if bits == 16 || bits == 32 || bits == 64 then Some(Type.Floating(bits))
         else if bits == 128 then err("'f128' is not lowered yet — the widest float is 'f64'")
         else err(s"'$name' is not an IEEE floating-point width; they are f16, f32, and f64")
-      else if bits >= 1 && bits <= 64 then Some(Type.Integer(bits, signed = name.head == 'i'))
-      else err(s"'$name' is wider than the 64 bits the back end lowers")
+      else if bits >= 1 && bits <= 128 then Some(Type.Integer(bits, signed = name.head == 'i'))
+      else err(s"'$name' is wider than the 128 bits the back end lowers")
   }
 
   protected def plain(name: String, targs: List[Type], ty: Type): Type =

@@ -25,7 +25,7 @@ object Layout {
   def size(t: Type): Int = Type.underlying(t) match
     case Type.Bool                       => 1
     case Type.Char                       => 4
-    case i: Type.Integer                 => math.max(1, i.bits / 8)
+    case i: Type.Integer                 => intAlloc(i)
     case f: Type.Floating                => f.bits / 8
     case Type.Unit | Type.Never          => 0
     case Type.VaList                     => 32
@@ -43,7 +43,7 @@ object Layout {
   def align(t: Type): Int = Type.underlying(t) match
     case Type.Bool                       => 1
     case Type.Char                       => 4
-    case i: Type.Integer                 => math.max(1, i.bits / 8)
+    case i: Type.Integer                 => intAlign(i)
     case f: Type.Floating                => f.bits / 8
     case Type.Unit | Type.Never          => 1
     case Type.VaList                     => 8
@@ -54,6 +54,23 @@ object Layout {
     case s: Type.Struct                  => aggregate(s.stored.map(_._2))._2
     case e: Type.Enum                    => if e.simple then align(e.underlying) else enumAlign(e)
     case other                           => sys.error(s"unreachable alignment of ${other.llvm}")
+
+  /** What an integer of any width costs, which for a width that is not a whole number of bytes is
+   * not `bits / 8`.
+   *
+   * LLVM rounds an integer's **alignment** up to that of the smallest one its data layout names — so
+   * a `u12` is aligned like a `u16` and a `u96` like a `u128` — and then rounds the stride up to that
+   * alignment. Both have to be computed the way LLVM computes them, because the only reason this
+   * object exists is to state a union's width in the emitted text: an under-estimate here is a
+   * payload region narrower than the value a variant stores into it, which no later pass can catch.
+   */
+  private def intAlign(i: Type.Integer): Int = {
+    var a = 1
+    while a < 16 && a * 8 < i.bits do a *= 2
+    a
+  }
+
+  private def intAlloc(i: Type.Integer): Int = roundUp((i.bits + 7) / 8, intAlign(i))
 
   /** The size and alignment of members laid end to end, each on its own alignment and the whole
    * rounded up to the widest one — the layout LLVM gives the aggregate these members are emitted as.

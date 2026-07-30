@@ -331,6 +331,28 @@ Semantics generalize the existing integer rules with no special cases:
 - **Wrapping** is at the declared width: `i5` arithmetic wraps mod `2^5`, matching "integer
   arithmetic wraps at the declared type width" already in force for `i8`…`i64`.
 
+**Where the back end currently stops is 128 bits**, and that is a statement about the toolchain
+rather than about the family. Up to 64 bits everything is a machine instruction; from 65 to 128 the
+arithmetic is still LLVM's own but a division becomes a compiler-rt call, and the decimal rendering
+becomes the language's own job — C's `printf` has no length modifier for an argument that wide, so a
+value past 64 bits renders through the digit loop sysl emits and is refused a `%d` (the diagnostic
+says so and names `str`). Past 128 there is neither a division routine nor a renderer, so a wider
+width is a diagnostic naming the limit. What the *maximum permitted* `N` should be is still open
+below; 128 is where the tools stop, not where the language was decided to.
+
+Two consequences worth stating, because both are places a width that is not a whole number of bytes
+could go wrong quietly:
+
+- **Storage follows LLVM's rule, not `N / 8`.** An integer's alignment rounds up to that of the
+  smallest width the target's data layout names, and its stride rounds up to that alignment — so a
+  `u12` occupies two bytes aligned to two, and a `u96` sixteen aligned to sixteen. This matters
+  wherever the compiler has to *state* a width rather than let LLVM derive it, which is a data enum's
+  shared payload region: under-reporting it there produces a region narrower than the value a variant
+  stores into, and nothing downstream can notice.
+- **Equal values must still hash equal.** A value too wide for the 64-bit mixer is mixed in halves
+  rather than truncated. Truncating would keep the law and throw away every bit above the 64th, which
+  puts every 128-bit identifier differing only in its high half into one bucket.
+
 Several details that arbitrary width raises are not yet settled — see below.
 
 ## 6. Floating-point types are a closed IEEE set (`fN`)
@@ -349,12 +371,22 @@ exist — there is no `f48` or `f96`. sysl exposes the four IEEE binary formats:
 Brain-float (`bfloat`) is **deliberately excluded** — it is not an IEEE type. It can be
 added later if a machine-learning use case calls for it.
 
-**aarch64 caveats.** `f128` is the standard `long double` on the aarch64 ABI and is fully
-supported, but there is essentially no hardware quad-precision arithmetic — LLVM lowers
-`f128` add/mul/div to **software routines** (compiler-rt soft-float). It is correct but far
-slower than `f64` and pulls in a runtime dependency, so it should not be reached for
-expecting `f64`-class speed. `f16` sits at the other end, with only partial hardware support
-(the FP16 extension).
+**aarch64 caveats.** `f128` is the standard `long double` on the aarch64 ABI, but there is
+essentially no hardware quad-precision arithmetic — LLVM lowers `f128` add/mul/div to **software
+routines** (compiler-rt soft-float). It is correct but far slower than `f64` and pulls in a runtime
+dependency, so it should not be reached for expecting `f64`-class speed. `f16` sits at the other end,
+with only partial hardware support (the FP16 extension).
+
+**`f128` is specified here and is NOT built** — the compiler refuses it by name, saying the widest
+float is `f64`. Three of the four widths are lowered. What blocks the fourth is not its arithmetic,
+which is LLVM's `fp128` and compiler-rt's, but **rendering one**: every float in this language reaches
+the screen through `snprintf`, and there is no portable conversion for a quad. Darwin's `long double`
+on arm64 *is* `double`, so `%Lf` would silently print the wrong number rather than fail; a correct
+`f128` therefore needs a quad-to-decimal routine written in the language, the way a 128-bit integer's
+digits are. That is the decision the width is waiting on — narrowing to `f64` for display is the one
+answer that must not be taken silently, since it would make the widest float print as the second
+widest. Until then the diagnostic names `f64` as the widest, which is true of the implementation and
+is what a reader needs.
 
 **Note on the sole `real` alias.** Only the default width, `f64`, gets a friendly alias, and
 it is deliberately named `real` — not `float`. `float` means 32-bit to the C / C++ / Rust /
@@ -854,11 +886,14 @@ simply *write* it.
 Recorded so they are not lost; each still needs a decision before the relevant lexer/parser
 work:
 
-- **Arbitrary-width integer details** (§5): storage size and alignment of a standalone
-  odd-width value (e.g. does an `i5` variable round up to a byte? to the next power of two?);
-  the maximum permitted `N`; whether `i1`/`u1` are allowed and how they relate to `bool`;
-  and whether packed structs lay out an `i5` field in exactly 5 bits (the bitfield / hardware
-  register payoff).
+- **Arbitrary-width integer details** (§5): ~~storage size and alignment of a standalone odd-width
+  value~~ — **that half is settled, and settled by deferring to the target**: an odd-width value is
+  stored the way LLVM stores it, aligned to the smallest named width at least as wide and strided to
+  that alignment, which is written into §5 above. What remains open is **the maximum permitted `N`**
+  (the back end stops at 128 today, which is a toolchain fact and not a ruling); whether `i1`/`u1`
+  are allowed and how they relate to `bool`; and whether packed structs lay out an `i5` field in
+  exactly 5 bits (the bitfield / hardware register payoff) — the one genuinely open storage question,
+  since it is about a *field* rather than a standalone value.
 - ~~**Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`).~~
   **Settled, and settled the same way for all of them:** an introducer is **required for a one-line
   body and optional before an indented block**, since the `Newline`+`Indent` the lexer emits already

@@ -34,8 +34,11 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
         include("'+' needs matching types, got byte and int")
     }
 
+    // `i128` is lowered — see `WideIntegerTests` — so what is left here is the integer width past
+    // where the back end stops and the float width the chapters promise and this compiler has not
+    // built. The two say different things, and neither should read like the other.
     "an unsupported width is named as such" in {
-      err("var x: i128 = 1") should include("wider than the 64 bits")
+      err("var x: i129 = 1") should include("wider than the 128 bits")
       err("var x: f128 = 1.0") should include("'f128' is not lowered yet")
     }
 

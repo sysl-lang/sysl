@@ -35,6 +35,57 @@ class LayoutTests extends AnyFreeSpec with Matchers with CodegenSupport with Run
     Layout.align(i64) shouldBe 8
   }
 
+  /** A width that is not a whole number of bytes is the case `bits / 8` gets wrong, and it was wrong
+   * here for every width already legal: LLVM rounds an integer's alignment up to that of the
+   * smallest one its data layout names and then rounds the stride up to *that*, so a `u12` costs two
+   * bytes aligned to two and a `u96` costs sixteen. Under-reporting either is how a union's payload
+   * region ends up narrower than the value a variant stores into it, and nothing downstream can
+   * notice — `Layout` is the only thing that ever says how wide the region is.
+   */
+  "an odd width costs what LLVM makes it cost, not its bit count over eight" in {
+    Layout.size(Type.Integer(1, false)) shouldBe 1
+    Layout.size(Type.Integer(5, false)) shouldBe 1
+    Layout.size(Type.Integer(12, false)) shouldBe 2
+    Layout.size(Type.Integer(20, false)) shouldBe 4
+    Layout.size(Type.Integer(96, false)) shouldBe 16
+    Layout.size(Type.Integer(128, false)) shouldBe 16
+
+    Layout.align(Type.Integer(5, false)) shouldBe 1
+    Layout.align(Type.Integer(12, false)) shouldBe 2
+    Layout.align(Type.Integer(20, false)) shouldBe 4
+    Layout.align(Type.Integer(96, false)) shouldBe 16
+    Layout.align(Type.Integer(128, false)) shouldBe 16
+  }
+
+  "a payload region wide enough for a variant of odd-width fields" in {
+    val out = ir("""enum Packed
+                   |    Four(a: u12, b: u12, c: u12, d: u12)
+                   |    One(v: u8)
+                   |
+                   |var p = Four(1, 2, 3, 4)
+                   |p match
+                   |    Four(a, b, c, d) -> print(a, b, c, d)
+                   |    One(v) -> print(v)""".stripMargin)
+
+    // Four fields each aligned to two bytes occupy eight, counted in the units the region is aligned
+    // to. Counting them as one byte apiece — which `bits / 8` does — gave `[4 x i8]`, half of what
+    // the variant writes. Asserting the width is what catches it: running the program below passes
+    // either way, because the tag and the region round up to eight bytes between them and the
+    // overflow lands in padding the enum was carrying anyway.
+    out should include("[4 x i16]")
+  }
+
+  "and the values come back out of one" in {
+    run("""enum Packed
+          |    Four(a: u12, b: u12, c: u12, d: u12)
+          |    One(v: u8)
+          |
+          |var p = Four(4095, 1, 4095, 2)
+          |p match
+          |    Four(a, b, c, d) -> print(a, b, c, d)
+          |    One(v) -> print(v)""".stripMargin) shouldBe "4095 1 4095 2\n"
+  }
+
   "an address is one word, and a view of one is three" in {
     Layout.size(Type.Ptr(u8)) shouldBe 8
     Layout.size(Type.Ref(u8, false)) shouldBe 8

@@ -52,6 +52,10 @@ trait SpecialForms extends Closures {
    * writes itself into standard output through the trait.
    */
   private def printOne(t: TExpr): TExpr = t.ty match
+    // A width past 64 bits has no printf conversion to be widened to, so it renders itself first
+    // and goes out as the string that came back. That is the one scalar whose printing allocates,
+    // and it allocates because C cannot be asked to do this one.
+    case i: Type.Integer if i.bits > 64  => callPrelude("prints", TStr(t))
     case i: Type.Integer if i.signed => callPrelude("printi", widen(t, Type.Integer(64, signed = true)))
     case _: Type.Integer             => callPrelude("printu", widen(t, Type.Integer(64, signed = false)))
     case _: Type.Floating            => callPrelude("printr", widen(t, Type.Real))
@@ -131,6 +135,17 @@ trait SpecialForms extends Closures {
   protected def formatCall(argExpr: Expr, spec: String): TExpr = {
     val t = analyzeExpr(argExpr)
     val c = FormatSpec.conversion(spec)
+
+    // A specifier is applied by `snprintf`, and C has no length modifier for an argument wider than
+    // `long long` — so the one thing that cannot be honoured here is a width past 64 bits. It is
+    // refused by name rather than silently narrowed, and the message names `str`, which renders such
+    // a value without a specifier because the language rather than libc writes its digits.
+    Type.underlying(t.ty) match
+      case i: Type.Integer if i.bits > 64 && FormatSpec.isInt(c) =>
+        err(s"'$spec' is applied by C's formatting, which has no conversion for the ${i.bits} bits " +
+          s"of ${show(t.ty)} — render it with 'str' instead")
+      case _ =>
+
     val ok =
       if FormatSpec.isInt(c) then t.ty.isInstanceOf[Type.Integer]
       else if FormatSpec.isFloat(c) then t.ty.isInstanceOf[Type.Floating]
@@ -177,7 +192,7 @@ trait SpecialForms extends Closures {
       CoreTraits.display(ty) match
         case Some((name, want)) =>
           funcsUsed += name
-          (name, widen(t, want), None)
+          (name, rendered(t, want), None)
 
         case None =>
           if !conforms("Display", ty) then

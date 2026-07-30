@@ -191,14 +191,18 @@ trait ScalarEmitter extends StringEmitter {
       emit(s"$r = call ${Type.Str.llvm} @$fn(i32 $cp)")
       r
 
+    // Rendered at whichever of the two widths holds the value: everything up to 64 bits goes
+    // through the renderer every program has always used, and only a value that cannot fit there
+    // pulls in the 128-bit one and the compiler-rt division behind it.
     case i: Type.Integer =>
       heap = true
       request("sysl.str.from_bytes")(StringEmitter.fromBytes)
-      val fn     = request("sysl.str.int")(StringEmitter.int)
-      val wide   = convert(i, Type.Integer(64, i.signed), genExpr(arg))
+      val bits   = if i.bits > 64 then 128 else 64
+      val fn     = request(StringEmitter.intName(bits))(StringEmitter.int(bits))
+      val wide   = convert(i, Type.Integer(bits, i.signed), genExpr(arg))
       val signed = if i.signed then "1" else "0"
       val r      = freshTemp()
-      emit(s"$r = call ${Type.Str.llvm} @$fn(i64 $wide, i1 $signed)")
+      emit(s"$r = call ${Type.Str.llvm} @$fn(i$bits $wide, i1 $signed)")
       r
 
     case f: Type.Floating =>

@@ -822,11 +822,13 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
           val tc = analyzeExpr(count)
 
           // A count is an index's twin, so it takes a transparent subtype for the same reason one
-          // does — and refuses a derived one for the same reason too.
-          if !Type.repr(tc.ty).isInstanceOf[Type.Integer] then
-            err(s"a repeat count is a number of elements, and ${show(tc.ty)} is not an integer")
+          // does — and refuses a derived one for the same reason too, and is held to the same width
+          // for the same reason: a truncated count would size the storage by a number nobody wrote.
+          val checked = Type.repr(tc.ty) match
+            case i: Type.Integer => checkedIndexWidth(tc, i)
+            case _ => err(s"a repeat count is a number of elements, and ${show(tc.ty)} is not an integer")
 
-          TBufFill(tv, tc, Type.Slice(tv.ty))
+          TBufFill(tv, checked, Type.Slice(tv.ty))
 
         case _ =>
           val n = constInt(count) match
@@ -900,7 +902,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
           // indexes without a cast. A derived one does not: `new` is nominal, and reaching the base
           // is exactly what a written conversion is for.
           Type.repr(ti.ty) match
-            case _: Type.Integer => TIndex(tr, ti, elem)
+            case i: Type.Integer => TIndex(tr, checkedIndexWidth(ti, i), elem)
             case other           => err(s"an index must be an integer, not ${show(other)}")
 
         // A type with no elements of its own is indexed through `Index`, whose one method the
@@ -1106,9 +1108,25 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     val t = analyzeExpr(e, Some(Type.Usize))
 
     t.ty match
-      case _: Type.Integer => t
+      case i: Type.Integer => checkedIndexWidth(t, i)
       case other           => err(s"a slice bound must be an integer, not ${show(other)}")
   }
+
+  /** An index or a slice bound, held to a width the bounds test can actually be made at.
+   *
+   * Reaching an element is `usize` arithmetic (`00 §7`), and a narrower index is *widened* into it —
+   * value-preserving, so nothing has to be written. A **wider** one cannot be: it would have to be
+   * truncated, and a truncated index is not the index that was written. At 128 bits `2^64 + 5` would
+   * arrive as 5 and pass the test on a six-element array — checked, and wrong, which is worse than
+   * unchecked. No array can hold more than `usize` elements, so a wider index is either a mistake or
+   * a narrowing the programmer means; either way it is written, exactly as `01`'s rule says a
+   * conversion that can lose information is.
+   */
+  private def checkedIndexWidth(t: TExpr, i: Type.Integer): TExpr =
+    if i.bits <= 64 then t
+    else
+      err(s"an index is reached at ${Type.pointerBits} bits and ${show(t.ty)} is wider, so it cannot " +
+        "be one without losing what it holds — write 'usize(i)' to say which value is meant")
 
   /** `++`/`--` — a step of one, which the base decides the existence of and a constrained place
    * then has to accept: the new value is checked between the addition and the store, so a counter

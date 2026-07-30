@@ -258,48 +258,66 @@ object StringEmitter {
       |""".stripMargin
 
   /** An integer as its decimal string, without libc. The digits are written from the end of a
-   * scratch buffer wide enough for the largest 64-bit magnitude plus a sign, dividing by ten each
-   * step; a negative signed value is turned into its magnitude first, which is correct even for
-   * `i64::MIN` because the negation wraps to the right unsigned bit pattern and the division that
-   * follows is unsigned. The `signed` flag distinguishes a two's-complement negative from a large
-   * unsigned value that happens to have its top bit set.
+   * scratch buffer wide enough for the largest magnitude of that width plus a sign, dividing by ten
+   * each step; a negative signed value is turned into its magnitude first, which is correct even for
+   * the type's minimum because the negation wraps to the right unsigned bit pattern and the division
+   * that follows is unsigned. The `signed` flag distinguishes a two's-complement negative from a
+   * large unsigned value that happens to have its top bit set.
+   *
+   * It is written once for every width because C's own formatting stops before the widest sysl
+   * integer does: `printf` has no length modifier for a 128-bit argument, so a value that needs one
+   * has to be rendered by the language rather than borrowed from libc. Divide and remainder at 128
+   * bits become compiler-rt calls, which is the whole cost of the width and is paid by the
+   * arithmetic in the program besides.
    */
-  val int: String =
-    """define private { ptr, ptr, i64 } @sysl.str.int(i64 %v, i1 %signed) {
-      |entry:
-      |  %isneg = icmp slt i64 %v, 0
-      |  %neg = and i1 %isneg, %signed
-      |  %negv = sub i64 0, %v
-      |  %mag = select i1 %neg, i64 %negv, i64 %v
-      |  %buf = alloca [21 x i8]
-      |  %end = getelementptr i8, ptr %buf, i64 21
-      |  br label %loop
-      |loop:
-      |  %cur = phi i64 [ %mag, %entry ], [ %q, %loop ]
-      |  %pos = phi ptr [ %end, %entry ], [ %pp, %loop ]
-      |  %pp = getelementptr i8, ptr %pos, i64 -1
-      |  %q = udiv i64 %cur, 10
-      |  %r = urem i64 %cur, 10
-      |  %rb = trunc i64 %r to i8
-      |  %digit = add i8 %rb, 48
-      |  store i8 %digit, ptr %pp
-      |  %more = icmp ne i64 %q, 0
-      |  br i1 %more, label %loop, label %sign
-      |sign:
-      |  br i1 %neg, label %addsign, label %finish
-      |addsign:
-      |  %sp = getelementptr i8, ptr %pp, i64 -1
-      |  store i8 45, ptr %sp
-      |  br label %finish
-      |finish:
-      |  %start = phi ptr [ %pp, %sign ], [ %sp, %addsign ]
-      |  %si = ptrtoint ptr %start to i64
-      |  %ei = ptrtoint ptr %end to i64
-      |  %len = sub i64 %ei, %si
-      |  %res = call { ptr, ptr, i64 } @sysl.str.from_bytes(ptr %start, i64 %len)
-      |  ret { ptr, ptr, i64 } %res
-      |}
-      |""".stripMargin
+  def int(bits: Int): String = {
+    val ty  = s"i$bits"
+    val buf = digitCapacity(bits)
+
+    s"""define private { ptr, ptr, i64 } @${intName(bits)}($ty %v, i1 %signed) {
+       |entry:
+       |  %isneg = icmp slt $ty %v, 0
+       |  %neg = and i1 %isneg, %signed
+       |  %negv = sub $ty 0, %v
+       |  %mag = select i1 %neg, $ty %negv, $ty %v
+       |  %buf = alloca [$buf x i8]
+       |  %end = getelementptr i8, ptr %buf, i64 $buf
+       |  br label %loop
+       |loop:
+       |  %cur = phi $ty [ %mag, %entry ], [ %q, %loop ]
+       |  %pos = phi ptr [ %end, %entry ], [ %pp, %loop ]
+       |  %pp = getelementptr i8, ptr %pos, i64 -1
+       |  %q = udiv $ty %cur, 10
+       |  %r = urem $ty %cur, 10
+       |  %rb = trunc $ty %r to i8
+       |  %digit = add i8 %rb, 48
+       |  store i8 %digit, ptr %pp
+       |  %more = icmp ne $ty %q, 0
+       |  br i1 %more, label %loop, label %sign
+       |sign:
+       |  br i1 %neg, label %addsign, label %finish
+       |addsign:
+       |  %sp = getelementptr i8, ptr %pp, i64 -1
+       |  store i8 45, ptr %sp
+       |  br label %finish
+       |finish:
+       |  %start = phi ptr [ %pp, %sign ], [ %sp, %addsign ]
+       |  %si = ptrtoint ptr %start to i64
+       |  %ei = ptrtoint ptr %end to i64
+       |  %len = sub i64 %ei, %si
+       |  %res = call { ptr, ptr, i64 } @sysl.str.from_bytes(ptr %start, i64 %len)
+       |  ret { ptr, ptr, i64 } %res
+       |}
+       |""".stripMargin
+  }
+
+  /** The renderer's symbol at a given width. The 64-bit one keeps the unqualified name it has always
+   * had, so the emitted text of every program that does not reach past 64 bits is unchanged.
+   */
+  def intName(bits: Int): String = if bits == 64 then "sysl.str.int" else s"sysl.str.int$bits"
+
+  /** Digits enough for the widest magnitude of `bits`, plus one for a sign. */
+  private def digitCapacity(bits: Int): Int = (BigInt(2).pow(bits) - 1).toString.length + 1
 
   /** A float as a string, rendered the way `print` renders one — `snprintf` with `%g`, so the two
    * agree to the byte. A sizing call learns the length, then the digits are written into a
