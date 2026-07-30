@@ -5,11 +5,17 @@ import org.scalatest.matchers.should.Matchers
 
 /** The AST codec reads back exactly the tree the parser produced (`13 § Open d`).
  *
- * **The prelude is the load-bearing case**, and deliberately so: it is 592 lines of real sysl using
+ * **The shipped library is the load-bearing case**, and deliberately so: it is real sysl using
  * nearly every declaration the language has — generic enums, traits with defaults and supertraits,
  * `impl` blocks, externs with link names, contracts, closures, patterns — so a node the codec cannot
  * carry shows up here rather than in a hand-written fixture that happens to avoid it. The small cases
- * below exist for the shapes the prelude does not reach and for the ways the format goes wrong.
+ * below exist for the shapes it does not reach and for the ways the format goes wrong.
+ *
+ * It is round-tripped in **both halves**, the prelude and the standard module, because the library is
+ * being drained from one into the other: whichever half holds a declaration is the half whose
+ * comparison is doing the work, and covering only the shrinking one would quietly stop testing most
+ * of the language. A count of lines or declarations is deliberately not asserted anywhere here for
+ * the same reason — it would measure the drain rather than the codec.
  *
  * **Structural equality alone is not enough to pin this.** A position is deliberately not a
  * constructor parameter, so `==` ignores it entirely — a codec that dropped every position would pass

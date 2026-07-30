@@ -130,8 +130,8 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
       ) shouldBe "2\n3\n"
     }
 
-    // The trait is the program's own: `Display` is the prelude's and so is every slice, so a shape
-    // block for it has no home (`02 § Coherence`) and only the prelude may write one. What the shape
+    // The trait is the program's own: `Display` is the library's and so is every slice, so a shape
+    // block for it has no home (`02 § Coherence`) and only the library may write one. What the shape
     // still buys a program is exactly this — one block covering every slice whose element conforms.
     "a conditional shape's member reaches its element through the bound" in {
       run(
@@ -153,7 +153,7 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
 
     // An operator is a trait method, so it resolves the way a call does — which is the whole reason
     // a member is named by one rule rather than by a name each site builds for itself.
-    // An operator is one of the prelude's catalog traits, so a *shape* carrying one is the prelude's
+    // An operator is one of the library's catalog traits, so a *shape* carrying one is the library's
     // to write (its tuple rows are exactly that). What a program may write is the composed type
     // spelled out, which its own element type gives a home to.
     "a composed type carries an operator, dispatched to the instantiated member" in {

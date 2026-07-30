@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Indexing a type the compiler has no elements for — `b[i]` through the prelude's `Index`.
+/** Indexing a type the compiler has no elements for — `b[i]` through the library's `Index`.
  *
  * `14 §7` filed this under associated types, on the reading that a subscript wants the element type
  * *and* the index type and neither is `Self`. That reading turned out to be wrong in one place, and
@@ -112,7 +112,7 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(firstOf(a))""".stripMargin) shouldBe "5\n"
     }
 
-    // `14 §3` — an operator is the trait's one method. `[]` is `Index`'s, and the prelude implements
+    // `14 §3` — an operator is the trait's one method. `[]` is `Index`'s, and the library implements
     // it for the one growable container it ships.
     "a Buf is read with a subscript" in {
       run("""var b: Buf[int] = buf()

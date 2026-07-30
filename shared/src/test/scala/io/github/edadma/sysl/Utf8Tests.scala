@@ -332,7 +332,7 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "what it costs a program that never decodes" - {
-    // The reachability rule the prelude relies on: neither the validator nor anything it reaches is
+    // The reachability rule the library relies on: neither the validator nor anything it reaches is
     // emitted for a program that does not call it.
     // The name is read off `Library.key` rather than written out, because the validator is in the
     // standard module and `@from_utf8` is no longer the symbol: spelled literally, this negative

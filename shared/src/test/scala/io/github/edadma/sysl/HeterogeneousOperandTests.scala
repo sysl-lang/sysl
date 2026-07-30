@@ -336,7 +336,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
     }
 
     // A shape reaches the fill by a different key than a named type does, so it is asked separately.
-    // The trait is the program's own, because the prelude's would leave the block with no home:
+    // The trait is the program's own, because the library's would leave the block with no home:
     // `02 § Coherence` licenses an `impl` by its trait or by a type named in its subject, and `[]T`
     // names neither.
     "including one written for a shape" in {

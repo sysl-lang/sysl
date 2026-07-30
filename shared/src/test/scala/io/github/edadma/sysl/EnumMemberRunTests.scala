@@ -7,7 +7,7 @@ import org.scalatest.freespec.AnyFreeSpec
  *
  * An enum receiver differs from a struct one in what it lowers to — a simple enum is an integer, a
  * data enum a tagged aggregate — so each receiver mode is checked against both, and the
- * `Option`/`Result` members the prelude now carries are exercised as the first real users of the
+ * `Option`/`Result` members the library now carries are exercised as the first real users of the
  * whole path.
  */
 class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
@@ -402,7 +402,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
     // the rest, so the whole printing surface does not land in every program.
     //
     // A **non-generic** prelude type's members are held back by the same reachability, which is
-    // what lets the prelude carry `ByteSink` at all: eager members would have put its three, and
+    // what lets the library carry `ByteSink` at all: eager members would have put its three, and
     // the two `Buf[u8]` members they reach, into every program that prints a number.
     "an unused prelude declaration costs nothing in the output" in {
       val out = Compiler.compileToLlvm("print(1)")

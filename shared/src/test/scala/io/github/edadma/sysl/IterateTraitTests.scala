@@ -3,7 +3,7 @@ package io.github.edadma.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** Walking a sequence a program has to produce a value at a time — `for x in cursor` through the
-  * prelude's `Iterate`, and `s.chars`, which is what decided the shape.
+  * library's `Iterate`, and `s.chars`, which is what decided the shape.
   *
   * The deciding question `14 §7` left open was whether iteration is something a *type* implements or
   * something `for` knows about, and `s.chars` is what settles it: a string cannot hand out a view of

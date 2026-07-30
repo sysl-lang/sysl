@@ -5,7 +5,7 @@ import org.scalatest.freespec.AnyFreeSpec
 /** Tier-2 runtime behaviour of a `FormatSpec` once it reaches a renderer (`14 §2`, `§8 d`).
  *
  * The spec has always been *delivered* — an `f"…"` hole hands its width, precision, and
- * justification to the `Display` it calls. What is under test here is that the prelude's own
+ * justification to the `Display` it calls. What is under test here is that the library's own
  * renderers now **act** on it, so a width means the same thing whether the value is an integer the
  * compiler renders or a struct that renders itself.
  *

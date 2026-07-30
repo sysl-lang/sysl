@@ -3,7 +3,7 @@ package io.github.edadma.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** Codegen of the module scaffolding and of the `print` desugaring: the preamble a module carries,
- * string interning, and which prelude renderer each type of value reaches.
+ * string interning, and which library renderer each type of value reaches.
  */
 class CodegenModuleTests extends AnyFreeSpec with CodegenSupport {
 

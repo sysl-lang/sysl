@@ -4,7 +4,7 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** `Buf[T]` — a growable array (`07 §Growing one`).
  *
- * It is **ordinary sysl in the prelude**, not a type the compiler knows, and that is the finding
+ * It is **ordinary sysl in the library**, not a type the compiler knows, and that is the finding
  * rather than an implementation note. Storage sized while running gave a library the one thing it
  * was missing: a `[]T` field is storage a container can make for itself and that ARC destroys on
  * its behalf, so no `Drop`, no `sizeof` over a parameter, and no pointer cast are needed.

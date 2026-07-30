@@ -86,7 +86,7 @@ class ScalarCodegenTests extends AnyFreeSpec with CodegenSupport {
     ir("var x = 2.5\nprint(x)") should include("""c"%g\00"""")
   }
 
-  // Encoding a code point is sysl in the prelude, not a runtime helper the compiler emits.
+  // Encoding a code point is sysl in the library, not a runtime helper the compiler emits.
   "printing a char goes to the prelude's encoder" in {
     val out = ir("print('A')")
 

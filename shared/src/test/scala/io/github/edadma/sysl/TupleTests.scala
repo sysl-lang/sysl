@@ -354,7 +354,7 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
     }
 
     // Each arity is its own key, so a pair's implementation says nothing about a triple's — which
-    // is what lets the prelude write one per arity without them colliding.
+    // is what lets the library write one per arity without them colliding.
     "an implementation for one arity does not cover another" in {
       err("""trait Tag
             |    tag(self) -> string

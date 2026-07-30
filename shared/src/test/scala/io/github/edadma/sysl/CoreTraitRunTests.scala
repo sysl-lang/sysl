@@ -3,7 +3,7 @@ package io.github.edadma.sysl
 import org.scalatest.freespec.AnyFreeSpec
 
 /** Tier-2 runtime behavior of the core trait catalog (`14 §1`, `§2`, `§5`): `Self`, the operator
- * traits the prelude declares, and the memberships the compiler provides for the built-in types.
+ * traits the library declares, and the memberships the compiler provides for the built-in types.
  *
  * The point of a membership is that it is invisible at run time — a scalar's `add` is the machine's
  * `add`, not a call — so what these check is that the *type system* now agrees a scalar satisfies a
@@ -302,7 +302,7 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       err(src) should include("'==' is not defined for Money")
     }
 
-    // The catalog's memberships are written one type at a time, and the prelude's own generic
+    // The catalog's memberships are written one type at a time, and the library's own generic
     // enums have none — so "is this the same link" over an `Option` is written by taking both
     // sides apart, even where the payload compares perfectly well on its own.
     "and an Option is not equatable, whatever it holds" in {
@@ -313,9 +313,9 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
     }
 
     // What it costs to write by hand, and that the payload's own equality is what answers it. The
-    // enum is the program's own, because `Option` is not: `Eq` and `Option` are both the prelude's,
+    // enum is the program's own, because `Option` is not: `Eq` and `Option` are both the library's,
     // and an `impl` for a generic type covers every instantiation at once — so there is no
-    // `Option[MyType]` to give the block a home, and only the prelude could write this row.
+    // `Option[MyType]` to give the block a home, and only the library could write this row.
     "though the implementation it wants is writable for an enum of its own" in {
       run("""enum Maybe[T]
             |    Just(v: T)

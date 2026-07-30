@@ -86,7 +86,7 @@ class GenericMemberRunTests extends AnyFreeSpec with RunSupport {
 
     // Box.get.int and Box.get.real — the member is compiled once per element type, exactly as a
     // free generic function is, not shared across the two instantiations. Only its own definitions
-    // are counted; the rest of the module is the ARC runtime and the prelude renderers `print`
+    // are counted; the rest of the module is the ARC runtime and the library renderers `print`
     // reached.
     out.map(_.linesIterator.count(l => l.startsWith("define") && l.contains("@Box.get."))) shouldBe Right(2)
   }

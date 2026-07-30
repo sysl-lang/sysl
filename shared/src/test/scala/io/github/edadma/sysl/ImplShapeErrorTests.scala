@@ -163,7 +163,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     // implementation covers this value already, and writing a second is exactly what it may not do.
     // So the condition is what the diagnostic names. The covering block is written for a generic
     // type of the program's own rather than for a slice, because `Display` for every slice is a
-    // block only the prelude has a home for (`02 § Coherence`).
+    // block only the library has a home for (`02 § Coherence`).
     "so print names the condition rather than an 'impl' that would be refused" in {
       err(
         s"""struct Row[T]
@@ -232,8 +232,8 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
 
     // A shape's parameter stands for no declaration, so a block over every slice at once names
     // nothing local however its bound is written — which is what puts `Display` for every slice out
-    // of a program's reach and leaves it the prelude's.
-    "a shape over the prelude's own trait has no home either" in {
+    // of a program's reach and leaves it the library's.
+    "a shape over the library's own trait has no home either" in {
       err("""impl[T: Display] Display for []T
             |    display(self, out: *Writer, fmt: FormatSpec) = out.write("x".bytes)
             |print(1)

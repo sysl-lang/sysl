@@ -259,7 +259,7 @@ class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
     // The specifier reaches `display_wide` the way it reaches any renderer that forwards it: through
     // a type that renders itself, since a built-in keeps the strict conversion check. The digits are
-    // the language's and the field is the prelude's, which is the split every other width has.
+    // the language's and the field is the library's, which is the split every other width has.
     "and the specifier it is handed pads the digits like any other number's" in {
       run("""struct Id
             |    v: u128

@@ -319,7 +319,7 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
     }
 
     // A second argument list is not a way in either, and it never reaches that rule: `Mul` is the
-    // prelude's and so is `int`, so a program has nowhere to write the block at all (`02`).
+    // library's and so is `int`, so a program has nowhere to write the block at all (`02`).
     "and a second argument list does not open one" in {
       err("""struct C
             |    v: int

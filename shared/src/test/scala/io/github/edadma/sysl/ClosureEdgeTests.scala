@@ -400,7 +400,7 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // The other half of `12 § Open b` — a closure that is itself generic — needs no decision of its
-    // own, and this is the reason rather than the spelling: a callable's type is the prelude's `FnN`
+    // own, and this is the reason rather than the spelling: a callable's type is the library's `FnN`
     // trait, and `02` refuses a trait member with type parameters because no vtable slot can hold a
     // function that does not exist until a call names its types. So there is nothing for an arrow to
     // declare them for. What the grammar says today is only that it cannot read one.
