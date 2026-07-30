@@ -52,6 +52,13 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       Target.all.map(_.vaListBytes).max shouldBe Layout.size(Type.VaList)
     }
 
+    // Bare-metal RISC-V is not built for the floating extension and every other target is, which is
+    // clang's default for each of these triples and therefore has to be sysl's — the two are handed
+    // the same triple and have to make the same assumption about it (`CAbi`).
+    "records which targets have floating registers to pass arguments in" in {
+      Target.all.filterNot(_.hardFloat).map(_.name) shouldBe List("riscv64-freestanding")
+    }
+
     // Two machines differing only in their OS are two targets, which is the point of recording the
     // OS at all: the processor does not settle the C ABI on its own.
     "tells one processor's systems apart" in {

@@ -15,9 +15,13 @@ be unwound deliberately rather than discovered later.
   (`tast.scala`). Every diagnostic lives here; codegen trusts the tree it is handed.
 - **Escape analysis** (`Escape`) — the one check that needs the whole call graph rather than one
   expression at a time, so it runs over the typed tree once the analyzer is finished (`05`).
-- **Codegen** (`Codegen`, with `Emitter` / `ArcEmitter` / `ScalarEmitter` / `StringEmitter`) — a
-  straight lowering of the typed tree to textual LLVM IR. It selects instructions from the types
-  the tree carries and lays out basic blocks; it makes no semantic decision of its own.
+- **Codegen** (`Codegen`, with `Emitter` / `ArcEmitter` / `ScalarEmitter` / `StringEmitter` /
+  `ForeignEmitter`) — a straight lowering of the typed tree to textual LLVM IR. It selects
+  instructions from the types the tree carries and lays out basic blocks; it makes no semantic
+  decision of its own. The one thing it decides that the tree does not carry is what a call to a
+  **foreign** function looks like, because that is a fact about the machine rather than about the
+  program: `CAbi` classifies an aggregate crossing the boundary and `ForeignEmitter` converts each
+  value into and out of the registers the convention names (`targets.md`).
 
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
 
@@ -201,7 +205,8 @@ before they appear and may be mutually recursive).
   is checked once at the trait, as a generic function over `Self` bounded by that trait, so it may
   assume exactly what the trait declares — and then **copied per implementing type** under that
   type's own `Type.method` name, which is why a call, a vtable slot, and the escape summary all find
-  an ordinary function. The prelude uses one: `Writer.failed` defaults to `false`.
+  an ordinary function. The prelude uses two: `Writer.failed` and `Reader.failed` both default to
+  `false`.
 - **Properties as trait members (`02`).** A trait asks for one by dropping the body from `08`'s
   property form (`size -> int`), and an `impl` supplies it. A property has a receiver it never
   spells — by value — so it needs nothing of its own at either dispatch: a bound licenses `x.size`

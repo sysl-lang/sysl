@@ -355,7 +355,7 @@ class VariadicMethodTests extends AnyFreeSpec with CodegenSupport with RunSuppor
 
     "the tail carries only what varargs can carry" in {
       err(s"""$acc\nvar a = Acc(1)\nprint(a.total(1, "one"))""") should
-        include("a string cannot be passed to '...'")
+        include("a string cannot be passed to a sysl function's '...'")
     }
 
     "and a narrow argument arrives promoted" in {
@@ -378,7 +378,8 @@ class VariadicMethodTests extends AnyFreeSpec with CodegenSupport with RunSuppor
            |end Acc""".stripMargin
 
       err(s"$decl\nprint(Acc.of().base)") should include("takes at least 1 argument")
-      err(s"""$decl\nprint(Acc.of(1, "x").base)""") should include("a string cannot be passed to '...'")
+      err(s"""$decl\nprint(Acc.of(1, "x").base)""") should
+        include("a string cannot be passed to a sysl function's '...'")
     }
   }
 

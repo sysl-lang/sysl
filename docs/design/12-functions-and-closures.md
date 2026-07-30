@@ -92,6 +92,15 @@ What crosses the boundary is the programmer's business. A scalar or a `*T` match
 of promise `*T` already is. Capability gating — an extern reaching libc plausibly needs `os` — is
 open (`§ Open h`).
 
+**What crosses it *by value* is not.** A struct, a tuple, a view, an enum — every aggregate — is
+handed over in whichever registers the machine's C convention names, which is not the same as the
+registers a sysl-to-sysl call would use and is not what LLVM does with an aggregate left to itself.
+So a foreign declaration is emitted in the *coerced* types that convention asks for and the call
+converts each value into and out of them; the shape a program wrote is unchanged, and where the
+coerced form is wider than the value the surplus is what the convention leaves unspecified. The four
+conventions and how each was measured are `targets.md`. Nothing about this is visible in a program,
+and nothing about it applies to a struct handed over behind a `*T`.
+
 **An extern may end in `...`.** C's ellipsis is the one arity in the language a declaration does not
 fix, and it exists for one reason: `printf`, `snprintf`, `execl`, `open` — the calls every C library
 reserves for a variable tail — cannot be declared at all without it, and a language whose only seam
@@ -112,11 +121,16 @@ ellipsis excuses nothing that comes before it, arity included, and the escape an
 the callee keeps every argument. What the ellipsis governs is only what follows:
 
 - **Only what C varargs can carry may be passed**: an integer, a float, a `char`, or a raw pointer.
-  A `string`, a `&T`, a struct, an enum, a slice — every sysl layout C has no notion of — is refused
-  *here* even though a **declared** parameter may take one, and the difference is the written type:
-  a declared parameter says what the callee agreed to receive, and a tail argument has nothing to
-  say it with. A `bool` is refused too, for a sharper reason: C would promote it to `int`, and sysl
-  has no conversion that says so (`01`), so there is nothing to promote it *with*.
+  An **aggregate** — a struct, an enum, a tuple, a view — may go there too, and travels under exactly
+  the classification a declared parameter of that type gets (`targets.md`), which is what C does with
+  one as well. What is refused *here* and not at a declared parameter is a `bool`: C would promote it
+  to `int`, and sysl has no conversion that says so (`01`), so there is nothing to promote it *with*.
+
+  **A sysl function's tail is narrower than a foreign one's, and only in this one respect.** An
+  aggregate crosses to a foreign callee because whoever compiled the other side applies the same
+  classification; it does not cross to a sysl one, because there it is the callee's *own* walk (§9)
+  that reads the tail back, and the walk reads one register at a time. The refusal says so rather than
+  saying the argument is unsuitable, since the same argument is fine one call away.
 - **A tail argument is passed already widened**, by C's default argument promotions: an integer
   narrower than 32 bits becomes `i32` or `u32` following its own signedness, and an `f16` or `f32`
   becomes `f64`. This is not something the ABI can be left to do — LLVM promotes nothing on its own,
@@ -625,6 +639,12 @@ signature or hand a tail onward to one.
 in the tail (an integer, a float, a `char`, a raw pointer), passed already widened by C's default
 argument promotions. One rule for a foreign callee and a sysl one means a caller does not have to
 know which it is reaching, and it means the two share their implementation rather than drifting.
+
+The **one** place the two differ is an aggregate, and the difference is a consequence of this section
+rather than a second rule: a foreign callee's aggregate is classified by its machine's C convention
+and read back by a compiler that applies the same one, where a sysl callee reads its tail with the
+walk below and the walk takes one register at a time. So the tail of a sysl variadic is scalars, and
+the refusal names the walk as the reason.
 
 **The receiving side is C's, spelled sysl's way.**
 

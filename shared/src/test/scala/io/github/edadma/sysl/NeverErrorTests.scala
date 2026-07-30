@@ -198,14 +198,30 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
         include("'fmt' of 'printf' is *byte, but int was given")
     }
 
-    // Every one of these is a sysl layout with no C counterpart. A *declared* parameter may take
-    // one — the type is written down, so the promise is explicit — but a tail argument has no
-    // written type to make that promise with.
-    "carries no string" in {
-      err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, \"hi\"))") should
-        include("a string cannot be passed to '...'")
+    // An **aggregate** does cross to a foreign callee, and under exactly the classification a
+    // declared parameter of that type gets (`targets.md`) — C allows a struct in a variadic tail and
+    // says which registers it arrives in, so there is nothing left for sysl to withhold. The shapes
+    // that are refused are the ones with no layout to hand over, or none C could read back.
+    "carries a string, a struct, a slice — every aggregate" in {
+      ir("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, \"hi\"))") should
+        include("declare i32 @printf(ptr, ...)")
+
+      ir("""extern printf(fmt: *u8, ...) -> int
+           |struct Point
+           |    x: int
+           |    y: int
+           |var p: *u8 = null
+           |print(printf(p, Point(1, 2)))""".stripMargin) should include("declare i32 @printf(ptr, ...)")
+
+      ir("""extern printf(fmt: *u8, ...) -> int
+           |var a: [3]int = [1, 2, 3]
+           |var p: *u8 = null
+           |print(printf(p, a))""".stripMargin) should include("declare i32 @printf(ptr, ...)")
     }
 
+    // A `&T` is a counted reference, and what a tail argument cannot carry is the *count*: a declared
+    // `&T` parameter says the callee borrows for the duration of the call, and there is nothing in a
+    // tail to say it with.
     "carries no reference" in {
       val src =
         """extern printf(fmt: *u8, ...) -> int
@@ -218,20 +234,10 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
       err(src) should include("a &Inner cannot be passed to '...'")
     }
 
-    "carries no struct" in {
-      val src =
-        """extern printf(fmt: *u8, ...) -> int
-          |struct Point
-          |    x: int
-          |    y: int
-          |var p: *u8 = null
-          |print(printf(p, Point(1, 2)))""".stripMargin
-
-      err(src) should include("a Point cannot be passed to '...'")
-    }
-
-    "carries no enum, simple or otherwise" in {
-      val src =
+    // A *simple* enum is an integer wearing a name, and C's promotions have nothing to say about a
+    // name — where a data enum is a tag and a payload, an aggregate like any other.
+    "carries no simple enum, though it carries a data one" in {
+      val simple =
         """extern printf(fmt: *u8, ...) -> int
           |enum Color
           |    Red
@@ -239,17 +245,14 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
           |var p: *u8 = null
           |print(printf(p, Red))""".stripMargin
 
-      err(src) should include("a Color cannot be passed to '...'")
-    }
+      err(simple) should include("a Color cannot be passed to '...'")
 
-    "carries no slice" in {
-      val src =
-        """extern printf(fmt: *u8, ...) -> int
-          |var a: [3]int = [1, 2, 3]
-          |var p: *u8 = null
-          |print(printf(p, a))""".stripMargin
-
-      err(src) should include("cannot be passed to '...'")
+      ir("""extern printf(fmt: *u8, ...) -> int
+           |enum Shape
+           |    Circle(r: int)
+           |    Square(s: int)
+           |var p: *u8 = null
+           |print(printf(p, Circle(2)))""".stripMargin) should include("declare i32 @printf(ptr, ...)")
     }
 
     // C promotes a `bool` to `int`, but sysl has no conversion that says so — nothing widens
@@ -268,7 +271,7 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "says what it would have taken" in {
-      err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, \"hi\"))") should
+      err("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, true))") should
         include("must be an integer, a float, a char, or a raw pointer")
     }
 

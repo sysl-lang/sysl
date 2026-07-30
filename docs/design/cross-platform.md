@@ -69,9 +69,14 @@ and `build` and `run` work from every platform's CLI.
 **What `exec` does not offer is a child that shares this process's standard input.** It closes the
 child's stdin and captures both output streams, which is exactly right for asking `clang` a question
 and wrong for `run`: a compiled program that reads standard input sees end of input immediately,
-whatever the CLI itself was given. Reading standard input is not a language gap — a program declares
-`extern "getchar"` and reads, needing nothing new (pinned in `ExternRunTests`) — it is a gap in what
-the runner hands the program it started. Closing it means an `exec` variant that **inherits** the
+whatever the CLI itself was given. Reading standard input is not a language gap — the prelude supplies
+`stdin()`, `Reader` and the `Lines` cursor over `read(2)` (`14 §2`), and needed nothing new from the
+language to do it — it is a gap in what the runner hands the program it started, and the only part of
+the reading surface no test can drive end to end. What the tests do instead is pass a path through
+`argv` and let the program open it, which exercises everything above the descriptor
+(`ReadingSurfaceTests`); the two facts left to standard input itself — that it is descriptor zero and
+that a cursor over an empty one ends rather than hangs — are checked directly. Closing the gap means
+an `exec` variant that **inherits** the
 parent's three streams and reports only a status, since a program sharing the terminal has nowhere to
 capture output *to*. By the policy below that belongs in `cross_platform`, not here.
 

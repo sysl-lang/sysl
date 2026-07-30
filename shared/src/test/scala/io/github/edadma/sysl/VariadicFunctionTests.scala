@@ -280,8 +280,12 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
       err(s"$sumInts\nprint(sum())") should include("takes at least 1 argument, but 0 arguments were given")
     }
 
-    "the tail carries only what varargs can carry" in {
-      err(s"$sumInts\nprint(sum(1, \"one\"))") should include("a string cannot be passed to '...'")
+    // A *sysl* callee's tail refuses an aggregate for a reason of its own, and the message says
+    // which: it is the callee's own walk that would have to read the value back. A foreign callee
+    // takes one, because there the convention says which registers it arrives in (`CAbi`).
+    "the tail carries only what a walk over it can read back" in {
+      err(s"$sumInts\nprint(sum(1, \"one\"))") should
+        include("a string cannot be passed to a sysl function's '...'")
     }
 
     "an ellipsis needs a named parameter before it" in {

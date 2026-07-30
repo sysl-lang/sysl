@@ -1,5 +1,7 @@
 package io.github.edadma.sysl
 
+import io.github.edadma.cross_platform.*
+
 import org.scalatest.Assertions
 import org.scalatest.matchers.should.Matchers
 
@@ -31,6 +33,25 @@ trait RunSupport extends Matchers { this: Assertions =>
       case Right((code, out)) => fail(s"program exited with $code:\n$out")
       case Left(err)          => fail(err)
     }
+  }
+
+  /** The same, given bytes for the program to read: they are written to a temporary file whose path
+   * arrives as `args[1]`, and the file is removed however the run ends.
+   *
+   * It is a file rather than standard input because the harness hands a compiled program a **closed**
+   * one — `cross_platform`'s `exec` offers no way to write to a child — so a test that wants real
+   * bytes to arrive passes a path and lets the program open it. That exercises everything above the
+   * file descriptor, which is all of the reading surface; only the choice of descriptor is left out.
+   */
+  protected def runReading(src: String, input: String): String = {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    val path = createTempFile("sysl-input-", ".txt")
+
+    writeFile(path, input)
+
+    try runWith(src, path)
+    finally deleteFile(path)
   }
 
   /** The same, for a program written as several files. */

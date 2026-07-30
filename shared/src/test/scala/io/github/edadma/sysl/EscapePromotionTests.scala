@@ -265,6 +265,19 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
                  |use()
                  |""".stripMargin)
     }
+
+    // `Writer` is the earned exception and `Reader` is not one, so reading into a local array through
+    // an erased reader promotes it. `05` records why the two directions differ and leaves the
+    // question open; this is what the answer is today.
+    "is read into through an erased reader, where a written one would not have been" in {
+      promotes("""use(r: *Reader) -> usize
+                 |    var room: [64]u8
+                 |    r.read(room[..]).len
+                 |end use
+                 |var s = stdin()
+                 |print(use(&s))
+                 |""".stripMargin)
+    }
   }
 
   /** The counts are what make promotion correct rather than merely compiling, and they are not
@@ -297,6 +310,18 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
            |    buf[0usize]
            |end use
            |print(use())
+           |""".stripMargin) should not include "call ptr @malloc"
+    }
+
+    // `Reader` is not `Writer`: a concrete reader is a direct call, so the summary applies and
+    // `FdReader.read` keeps nothing — the buffer stays where it was declared.
+    "and one read into through a reader whose body is known" in {
+      ir("""fill() -> usize
+           |    var r = stdin()
+           |    var room: [64]u8
+           |    r.read(room[..]).len
+           |end fill
+           |print(fill())
            |""".stripMargin) should not include "call ptr @malloc"
     }
 
