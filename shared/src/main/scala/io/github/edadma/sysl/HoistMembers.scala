@@ -351,6 +351,27 @@ trait HoistMembers extends TypeResolution {
     for other <- already.find(ti => suppliedBound(ti, impl.traitName, subject, mine).key == bound.key) do
       err(s"'${outer.label}' already implements '${showBound(bound, subject)}'" + secondImplementation(tr, other))
 
+    // **A result is not a selector.** An operator trait's last argument is what the operator gives
+    // back (`14 §7`), and `a * b` supplies the operands and nothing else — so two implementations that
+    // agree on the operands and differ only in the result leave a use with nothing to choose by.
+    // Refused here rather than at the use, because the use is where it would be too late to say which
+    // of the two the program meant.
+    if CoreTraits.selectsByOperand(impl.traitName) && bound.args.length > 1 then
+      val operands = bound.args.dropRight(1)
+
+      for
+        other <- already.find { ti =>
+          val theirs = suppliedBound(ti, impl.traitName, subject, mine)
+
+          theirs.args.length == bound.args.length && theirs.args.dropRight(1) == operands
+        }
+        theirs = suppliedBound(other, impl.traitName, subject, mine)
+      do
+        err(s"'${outer.label}' already implements '${showBound(theirs, subject)}', and this one differs " +
+          s"only in what it gives back — '${CoreTraits.required(impl.traitName)._2}' between " +
+          s"${show(subject)} and ${conjoin(operands.map(show))} would have two results to choose from " +
+          "and nothing at the use to choose with")
+
     // On a **generic** subject a defaulted argument list is not one promise but one per
     // instantiation, since the trait's own default names the type being asked about. A written
     // argument built out of that same type would coincide with it at one instantiation and not at

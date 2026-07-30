@@ -67,18 +67,48 @@ trait Add
 is the piece `02` and `08` needed before an operator trait could be written at all — an operator
 like `+` is homogeneous (`Self + Self -> Self`), and only `Self` can say that in a trait.
 
-**No associated types.** Rust's `Add` carries an associated `type Output`, so `+` may return a
-type other than the operands'. sysl does not: an operator trait's **result** is `Self`. This is not
-a loss the target code feels — the existing scalar rule is already exactly this: **no operator
-promotes** (`01`). `u8 + u8 -> u8`, never `-> u16`. Associated types remain deferred (`02` open
-item), and the operator that was supposed to need them does not: `Index` carries the element type
-as an ordinary trait argument, because the type it is written for settles it (`§7`).
+**No associated types — and the result did not need one.** Rust's `Add` carries an associated
+`type Output`, so `+` may return a type other than the operands'. sysl reaches the same expressiveness
+with the mechanism it already has: the result is an **ordinary trait argument defaulting to `Self`**.
+`Mul[Rhs = Self, Out = Self]` with `mul(self, rhs: Rhs) -> Out` is homogeneous wherever nothing says
+otherwise, and a dot product — which returns neither operand's type — is `impl Mul[Vec, real] for Vec`.
+Associated types remain deferred (`02` open item), and neither operator that was supposed to need them
+does: `Index` carries the element type as an argument for the same reason, because **the type the block
+is written for settles it** (`§7`).
 
-The **operands** are a separate question, and it was answered separately. A binary arithmetic trait
-takes the right-hand type as a parameter defaulting to `Self` (`§7`), so `add(self, rhs: Rhs) ->
-Self` is homogeneous wherever nothing says otherwise and `Vec3 * f64` is writable where something
-does. The scalars are homogeneous by rule, not by the shape of the trait: `01`'s operator table is
-what makes an `int` a member of `Mul[int]` and of no other `Mul`.
+The **operands** were answered by the same move, one parameter earlier. So a binary arithmetic trait
+takes two arguments, both defaulting to `Self`, and the four readings are one trait:
+
+| Written | Means | Example |
+|---|---|---|
+| `impl Mul for V` | `Mul[V, V]` | homogeneous — `V * V -> V` |
+| `impl Mul[real] for V` | `Mul[real, V]` | scaling — `V * real -> V` |
+| `impl Mul[V, real] for V` | as written | a dot product — `V * V -> real` |
+| `impl Mul[V, V] for M` | as written | a transform — `M * V -> V` |
+
+**A result is not a selector.** A use writes the operands and never the result — `a * b` asks to be
+*told* what comes back — so the operands choose the implementation and the implementation supplies the
+result. Two implementations agreeing on the operands and differing only in what they give back are
+refused where they are written, because a use would have nothing to choose between them with. This is
+the one rule the extra parameter added, and it is what keeps resolution determined rather than ranked
+(`02 § One implementation per argument list`).
+
+The scalars are homogeneous by rule, not by the shape of the trait: `01`'s operator table is what makes
+an `int` a member of `Mul[int, int]` and of no other `Mul`, and **no operator promotes** — `u8 + u8` is
+a `u8`, never a `u16`. A written argument cannot change that, because a scalar keeps its native
+instruction whatever a block elsewhere says (`§5`).
+
+**A compound assignment stays homogeneous, and now it has to be checked.** `a op= b` is `a = a op b`
+(`§2`), so an operator whose result is not the left operand's type has nothing to assign back: `v *=
+w` through a dot product is refused, naming the result it would have produced, rather than quietly
+changing what `v` holds.
+
+**One thing the result being an argument opened.** An operator trait at *written* arguments has no
+`Self` left in its signature — `Mul[real, real]` declares `mul(self, rhs: real) -> real` — so it is
+**object-safe**, and `&Mul[real, real]` is a formable trait object over types with quite different
+multiplications. Written bare it is `Mul[Self, Self]` and still is not, and the diagnostic says which
+spelling fixes it. The operator *token* does not reach through an object: dispatch is on a pair of
+types and an object has forgotten the left one, so the method is written out.
 
 ## 2. The core trait catalog
 
@@ -90,23 +120,27 @@ given their impls by the compiler (`§5`). A user type opts in with an ordinary 
 
 | Trait | Method | Operator |
 |---|---|---|
-| `Add[Rhs = Self]` | `add(self, rhs: Rhs) -> Self` | `+` |
-| `Sub[Rhs = Self]` | `sub(self, rhs: Rhs) -> Self` | `-` (binary) |
-| `Mul[Rhs = Self]` | `mul(self, rhs: Rhs) -> Self` | `*` |
-| `Div[Rhs = Self]` | `div(self, rhs: Rhs) -> Self` | `/` |
-| `Rem[Rhs = Self]` | `rem(self, rhs: Rhs) -> Self` | `%` |
-| `BitAnd[Rhs = Self]` | `bitand(self, rhs: Rhs) -> Self` | `&` (binary) |
-| `BitOr[Rhs = Self]` | `bitor(self, rhs: Rhs) -> Self` | `\|` |
-| `BitXor[Rhs = Self]` | `bitxor(self, rhs: Rhs) -> Self` | `^` |
-| `Shl[Rhs = Self]` | `shl(self, rhs: Rhs) -> Self` | `<<` |
-| `Shr[Rhs = Self]` | `shr(self, rhs: Rhs) -> Self` | `>>` |
+| `Add[Rhs = Self, Out = Self]` | `add(self, rhs: Rhs) -> Out` | `+` |
+| `Sub[Rhs = Self, Out = Self]` | `sub(self, rhs: Rhs) -> Out` | `-` (binary) |
+| `Mul[Rhs = Self, Out = Self]` | `mul(self, rhs: Rhs) -> Out` | `*` |
+| `Div[Rhs = Self, Out = Self]` | `div(self, rhs: Rhs) -> Out` | `/` |
+| `Rem[Rhs = Self, Out = Self]` | `rem(self, rhs: Rhs) -> Out` | `%` |
+| `BitAnd[Rhs = Self, Out = Self]` | `bitand(self, rhs: Rhs) -> Out` | `&` (binary) |
+| `BitOr[Rhs = Self, Out = Self]` | `bitor(self, rhs: Rhs) -> Out` | `\|` |
+| `BitXor[Rhs = Self, Out = Self]` | `bitxor(self, rhs: Rhs) -> Out` | `^` |
+| `Shl[Rhs = Self, Out = Self]` | `shl(self, rhs: Rhs) -> Out` | `<<` |
+| `Shr[Rhs = Self, Out = Self]` | `shr(self, rhs: Rhs) -> Out` | `>>` |
 | `Neg` | `neg(self) -> Self` | `-` (unary) |
 | `Not` | `not(self) -> Self` | `~` |
 
-The parameter defaults to `Self` (`10 §3`), so the homogeneous reading is what every one of these
-means where nothing says otherwise: `impl Mul for Point` is `impl Mul[Point] for Point`, and
-`[T: Mul]` asks for `Mul[T]`. Writing an argument is what asks for something else — `§7` has the
-case that wanted it, and what it is still short of.
+Both parameters default to `Self` (`10 §3`), so the homogeneous reading is what every one of these
+means where nothing says otherwise: `impl Mul for Point` is `impl Mul[Point, Point] for Point`, and
+`[T: Mul]` asks for `Mul[T, T]`. Writing an argument is what asks for something else — `§1` has the
+four readings side by side, and `§7` the two programs that wanted them.
+
+**The two prefix rows take no result parameter**, and nothing has asked them to: negation and
+complement are closed operations on the type they are written for. Adding one later is the same
+additive change adding the other two were, and would need a customer first.
 
 The compound-assignment forms (`+=`, `&=`, …) are **not** separate traits: `a += b` is defined
 as `a = a + b` and so requires exactly the trait `+` requires. There is no `AddAssign`.
@@ -567,16 +601,23 @@ exactly (`§5`), one row further down the catalog.
   does not reach the shape a vector space is made of: `Complex * f64`.
 
   The ten binary arithmetic and bitwise traits now take the right-hand type: `Mul` is
-  `Mul[Rhs = Self]` with `mul(self, rhs: Rhs) -> Self`, and the operator dispatches on the **pair**.
-  The default is what kept the change from touching anything already written — `impl Mul for Point`
-  still means `Mul[Point]`, and `[T: Mul]` still asks for `Mul[T]` — so `impl Mul[f64] for Vec3`
-  and `v * 2.0` are now ordinary code. `Eq` and `Ord` stay homogeneous: a comparison across two
+  `Mul[Rhs = Self, Out = Self]` with `mul(self, rhs: Rhs) -> Out`, and the operator dispatches on the
+  **pair**. The defaults are what kept the change from touching anything already written — `impl Mul
+  for Point` still means `Mul[Point, Point]`, and `[T: Mul]` still asks for `Mul[T, T]` — so
+  `impl Mul[f64] for Vec3` and `v * 2.0` are ordinary code. `Eq` and `Ord` stay homogeneous: a
+  comparison across two
   types raises questions about reflexivity and transitivity that nothing has asked, and the two
   traits provide six derived operators whose laws would all have to be restated.
 
-  **What is deliberately *not* here**: Rust carries both an `Rhs` parameter and an `Output`
-  associated type, and only the first is wanted. The result staying `Self` covers `Complex * f64`
-  and `Vec3 * f64` and does not cover a dot product, which returns neither operand's type.
+  **~~What is deliberately not here: an `Output`.~~ Built, and by the same mechanism** — a second
+  ordinary argument, `Out = Self`, not an associated type. The reasoning that left it out was that
+  `Rhs` covered `Complex * f64` and `Vec3 * f64`; what it did not cover is a **dot product**, which
+  returns neither operand's type, and `guide/matrix` is the program that could not be written without
+  one. A matrix applied to a vector is the same shape: `impl Mul[Vec, Vec] for Mat`.
+
+  The rule it added is that **the result does not select** — see `§1`. Everything else about the
+  catalog is unchanged, because both parameters default to `Self` and a use that writes neither means
+  what it always meant.
 
   **A built-in's membership is homogeneous, and that is `01`'s rule rather than a limitation.** An
   `int` is `Mul[int]` and is `Mul` at nothing else, because no scalar operator promotes; `2.0 * c`

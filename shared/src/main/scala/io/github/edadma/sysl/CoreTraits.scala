@@ -66,6 +66,17 @@ object CoreTraits {
   val prefix: Map[String, String] =
     required.collect { case (name, (_, op, Kind.Prefix)) => op -> name }
 
+  /** Whether a trait's implementations are told apart by an operand rather than by the whole argument
+   * list — which is to say, whether its last argument is the operator's **result** (`14 §7`).
+   *
+   * The ten binary arithmetic and bitwise traits are declared `[Rhs = Self, Out = Self]`, and a use
+   * writes neither: `a * b` fixes the operands and asks to be told the result. So the operands select
+   * and the result is what the selected implementation supplies — which is why two implementations
+   * agreeing on the operands are refused however their results differ.
+   */
+  def selectsByOperand(traitName: String): Boolean =
+    required.get(traitName).exists(_._3 == Kind.Arith)
+
   /** How each comparison is built from the one method its trait requires (`§2`): whether the
    * operands are swapped, and whether the result is negated.
    *

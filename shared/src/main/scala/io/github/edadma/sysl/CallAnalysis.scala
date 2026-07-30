@@ -721,9 +721,11 @@ trait CallAnalysis extends Literals with TraitObjects {
   protected def prefixCall(op: String, t: TExpr): Option[TExpr] =
     CoreTraits.prefix.get(op).flatMap(trName => traitOperator(trName, op, None, t))
 
-  private def traitOperator(trName: String, op: String, rhs: Option[TExpr], recv: TExpr): Option[TExpr] =
-    dispatchFor(trName, op, recv.ty, rhs.map(_.ty)).map { d =>
-      val self = opSubst(trName, recv.ty, rhs.map(_.ty))
+  private def traitOperator(trName: String, op: String, rhs: Option[TExpr], recv: TExpr): Option[TExpr] = {
+    val tr = opBound(trName, recv.ty, rhs.map(_.ty))
+
+    dispatchFor(trName, op, recv.ty, tr).map { d =>
+      val self = opSubst(trName, recv.ty, tr)
       val m    = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
 
       for b <- rhs do checkOperand(op, recv.ty, b, resolveType(m.params.head.typ, self))
@@ -737,6 +739,7 @@ trait CallAnalysis extends Literals with TraitObjects {
 
       if d.negate then TUnary("!", call, Type.Bool) else call
     }
+  }
 
   /** The trait an operator asks of its **pair** of operands: the catalog's binary arithmetic traits
    * take the right-hand type as an argument (`14 §7`), so `c * 2.0` asks for `Mul[f64]` while
@@ -744,15 +747,60 @@ trait CallAnalysis extends Literals with TraitObjects {
    *
    * A trait that takes no parameters — `Eq`, `Ord`, and the two prefix operators — is asked for
    * bare, which is what keeps a comparison homogeneous.
+   *
+   * **The result is an argument too, and a use cannot supply it.** `Mul[Rhs = Self, Out = Self]`
+   * declares two, and `a * b` names only the first: what `*` gives back is what the implementation
+   * says it gives back, which is the whole reason `Out` is carried as an argument rather than fixed
+   * to `Self`. So the operand is the **selector** and the matched implementation supplies the rest —
+   * `implByOperand` — and where nothing is written the defaults fill in, which is what keeps a
+   * built-in and a bounded type parameter answering exactly as they did when there was one parameter.
    */
-  private def opBound(trName: String, rhs: Option[Type]): Type.Bound =
-    Type.Bound(trName, if traitDecls.get(trName).exists(_.tparams.nonEmpty) then rhs.toList else Nil)
+  private def opBound(trName: String, subject: Type, rhs: Option[Type]): Type.Bound =
+    traitDecls.get(trName) match
+      case Some(d) if d.tparams.nonEmpty =>
+        val selector = rhs.toList
+
+        // A type parameter has no implementation to read the result off, so what supplies it is the
+        // parameter's own **bound** — the same prefix rule, asked of a promise instead of a block:
+        // `[T: Mul[T, real]]` is what tells a body multiplying two `T`s that it gets a `real`. The
+        // defaults fill in for a parameter whose bound named no arguments, which keeps a bare
+        // `[T: Mul]` the homogeneous reading it has always been.
+        val fromBound = subject match
+          case a: Type.Abstract =>
+            a.bounds.iterator
+              .flatMap(traitClosure(_, selfBinding(a)))
+              .find(b =>
+                b.name == trName && b.args.length == d.tparams.length &&
+                  Type.Bound(trName, selector ++ b.args.drop(selector.length)).key == b.key)
+          case _ => implByOperand(trName, subject, selector, d)
+
+        val found = fromBound
+          .getOrElse(Type.Bound(trName, sandboxed(withDefaults(trName, d.tparams, d.tdefaults, selector,
+            selfBinding(subject)))))
+
+        Type.Bound(found.name, found.args.map(asOperand(subject)))
+      case _ => Type.Bound(trName, Nil)
+
+  /** The subject put back where a bound named it, which is what keeps the *result* of one dispatched
+   * operator usable as the operand of the next.
+   *
+   * A trait's own bounds are resolved with the parameter's bounds dropped one level in, so that a
+   * bound reaching back around to its own parameter terminates. That leaves the `Self` in the closure
+   * a bare `T` carrying no promises — and reading a result off it would make `(x & y) ^ z` in a
+   * `[T: BitAnd + BitXor]` body fail at the `^`, the first operator whose operand came from another
+   * one rather than from a parameter. It is the same `T` either way, so the one with its bounds is the
+   * one to carry forward.
+   */
+  private def asOperand(subject: Type)(arg: Type): Type = (subject, arg) match
+    case (s: Type.Abstract, a: Type.Abstract) if a.name == s.name && a.bounds.isEmpty => s
+    case _                                                                            => arg
 
   /** The substitution a catalog method's signature is read under at an operand pair: `Self` is the
-   * left operand's type, and the trait's own parameter is the right one's.
+   * left operand's type, and the trait's parameters are the arguments the selected implementation
+   * turned out to be written at — which is what binds `Out` to a result the use site never named.
    */
-  private def opSubst(trName: String, lhs: Type, rhs: Option[Type]): Map[String, Type] =
-    selfBinding(lhs) ++ traitDecls.get(trName).toList.flatMap(_.tparams).zip(rhs.toList)
+  private def opSubst(trName: String, lhs: Type, tr: Type.Bound): Map[String, Type] =
+    selfBinding(lhs) ++ traitDecls.get(trName).toList.flatMap(_.tparams).zip(tr.args)
 
   /** Which method an operator on `ty` dispatches to, or `None` when the machine has an instruction
    * for it — the one dispatch rule of `14 §3`, in the form the operand-sharing lowerings need.
@@ -763,10 +811,12 @@ trait CallAnalysis extends Literals with TraitObjects {
    * with the member its `impl` produced. A type with no membership either way answers `None`, so the
    * diagnostic stays the one the scalar path already gives.
    */
-  private def dispatchFor(trName: String, op: String, ty: Type, rhs: Option[Type]): Option[TDispatch] = {
+  private def dispatchFor(trName: String, op: String, ty: Type, tr: Type.Bound): Option[TDispatch] = {
     val (swap, negate) = CoreTraits.derivation.getOrElse(op, (false, false))
     val method         = CoreTraits.required(trName)._1
-    val tr             = opBound(trName, rhs)
+    // The right operand as the diagnostics below name it — the selector argument, which is every
+    // argument but the result the implementation supplies.
+    val rhs            = tr.args.take(math.max(0, tr.args.length - 1)).headOption
 
     if CoreTraits.builtin(trName, ty) then None
     else
@@ -786,7 +836,7 @@ trait CallAnalysis extends Literals with TraitObjects {
           for why <- unmetBound(tr, ty) do
             val between = rhs.fold(show(ty))(r => s"${show(ty)} and ${show(r)}")
 
-            err(s"'$op' between $between needs '${tr.show}' — $why")
+            err(s"'$op' between $between needs '${showBound(tr, ty)}' — $why")
           None
   }
 
@@ -808,12 +858,13 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   protected def compareLink(op: String, l: TExpr, r: TExpr): TCmp = {
     val trName = CoreTraits.infix(op)
+    val tr     = opBound(trName, l.ty, Some(r.ty))
 
     TCmp(
       op,
-      dispatchFor(trName, op, l.ty, Some(r.ty)).map { d =>
+      dispatchFor(trName, op, l.ty, tr).map { d =>
         val m = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
-        checkOperand(op, l.ty, r, resolveType(m.params.head.typ, opSubst(trName, l.ty, Some(r.ty))))
+        checkOperand(op, l.ty, r, resolveType(m.params.head.typ, opSubst(trName, l.ty, tr)))
         d
       },
     )
@@ -883,10 +934,21 @@ trait CallAnalysis extends Literals with TraitObjects {
   protected def updateDispatch(op: String, place: TExpr, value: TExpr): Option[TDispatch] =
     for
       trName <- CoreTraits.infix.get(op)
-      d      <- dispatchFor(trName, op, place.ty, Some(value.ty))
+      tr = opBound(trName, place.ty, Some(value.ty))
+      d <- dispatchFor(trName, op, place.ty, tr)
     yield {
-      val m = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
-      checkOperand(op, place.ty, value, resolveType(m.params.head.typ, opSubst(trName, place.ty, Some(value.ty))))
+      val subst = opSubst(trName, place.ty, tr)
+      val m     = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
+
+      checkOperand(op, place.ty, value, resolveType(m.params.head.typ, subst))
+
+      // `a op= b` is `a = a op b` (`14 §2`), so an operator whose result is not the left operand's
+      // type has nothing to assign back. The compound form is refused rather than quietly changing
+      // what the place holds, and the reader is pointed at the spelling that says which type it means.
+      for want <- m.retType.map(resolveReturn(_, subst)) if disagree(want, place.ty) do
+        err(s"'$op=' updates ${show(place.ty)} in place, but '$op' between ${show(place.ty)} and " +
+          s"${show(value.ty)} gives ${show(want)} — write the assignment out to say where it goes")
+
       d
     }
 

@@ -93,6 +93,30 @@ trait TraitLookup extends MemberVisibility {
   protected def implAt(tr: Type.Bound, key: String, subject: Type, targs: List[Type]): Option[TraitImpl] =
     implsOf(tr.name, key).find(ti => suppliedBound(ti, tr.name, subject, targs).key == tr.key)
 
+  /** The whole argument list an implementation was written at, found from the arguments a *use*
+   * supplies rather than from all of them (`14 §7`).
+   *
+   * An operator is the one use that cannot name every argument: `a * b` fixes the right-hand type and
+   * says nothing about the result, because the result is what it is asking to be told. So the
+   * arguments a use has are a **prefix** — the selector — and the implementation supplies the tail.
+   * Two implementations agreeing on the selector are refused where they are written, so at most one
+   * is found here and this stays a lookup rather than a choice.
+   */
+  protected def implByOperand(trName: String, subject: Type, selector: List[Type], d: TraitDecl): Option[Type.Bound] = {
+    def matching(key: String, targs: List[Type]) =
+      implsOf(trName, key).view
+        .map(ti => suppliedBound(ti, trName, subject, targs))
+        .find(b =>
+          b.args.length == d.tparams.length &&
+            Type.Bound(trName, selector ++ b.args.drop(selector.length)).key == b.key)
+
+    if selector.length >= d.tparams.length then None
+    else
+      val (key, targs) = memberOwner(subject)
+
+      matching(key, targs).orElse(shapeOwner(subject).flatMap((k, ta) => matching(k, ta)))
+  }
+
   /** Whether the `impl` blocks have all been registered, which is what makes a bound answerable.
    *
    * A type's bounds are checked wherever it is applied, and the earliest applications — a function's
@@ -361,11 +385,23 @@ trait TraitLookup extends MemberVisibility {
    * see, since it is the one a bare bound does not cover.
    */
   protected def showBound(tr: Type.Bound, self: Type): String = {
-    val bare =
+    def filled(written: List[Type]) =
       for d <- traitDecls.get(tr.name) if d.tparams.nonEmpty
-      yield Type.Bound(tr.name, sandboxed(withDefaults(tr.name, d.tparams, d.tdefaults, Nil, selfBinding(self))))
+      yield Type.Bound(tr.name,
+        sandboxed(withDefaults(tr.name, d.tparams, d.tdefaults, written, selfBinding(self))))
 
-    if bare.exists(_.key == tr.key) then Modules.show(tr.name) else tr.show
+    // Trailing arguments a default would have supplied are dropped one at a time, longest first, so a
+    // bound is spelled as short as it can be and still mean what it means. `Mul[real]` on a type whose
+    // result is itself prints as written rather than as `Mul[real, Vec]`, and a `Mul` whose every
+    // argument is its default prints bare — the same rule, applied at each position instead of only
+    // to the whole list.
+    val shortest =
+      (0 to tr.args.length).find(n => filled(tr.args.take(n)).exists(_.key == tr.key))
+
+    shortest match
+      case Some(0) => Modules.show(tr.name)
+      case Some(n) => Type.Bound(tr.name, tr.args.take(n)).show
+      case None    => tr.show
   }
 
   /** Whether a type implements a trait **through a source `impl`** — conformance a table can point
@@ -443,7 +479,7 @@ trait TraitLookup extends MemberVisibility {
         (key, targs) <- List(memberOwner(t)) ::: shapeOwner(t).toList
         impls = implsOf(tr.name, key)
         if impls.nonEmpty && implAt(tr, key, t, targs).isEmpty
-      yield s"it implements ${conjoin(impls.map(ti => s"'${suppliedBound(ti, tr.name, t, targs).show}'"))}"
+      yield s"it implements ${conjoin(impls.map(ti => s"'${showBound(suppliedBound(ti, tr.name, t, targs), t)}'"))}"
 
     val unmetCondition =
       for

@@ -163,35 +163,35 @@ object Prelude {
       |    putbytes(buf[0..<usize(k)])
       |end printr
       |
-      |trait Add[Rhs = Self]
-      |    add(self, rhs: Rhs) -> Self
+      |trait Add[Rhs = Self, Out = Self]
+      |    add(self, rhs: Rhs) -> Out
       |
-      |trait Sub[Rhs = Self]
-      |    sub(self, rhs: Rhs) -> Self
+      |trait Sub[Rhs = Self, Out = Self]
+      |    sub(self, rhs: Rhs) -> Out
       |
-      |trait Mul[Rhs = Self]
-      |    mul(self, rhs: Rhs) -> Self
+      |trait Mul[Rhs = Self, Out = Self]
+      |    mul(self, rhs: Rhs) -> Out
       |
-      |trait Div[Rhs = Self]
-      |    div(self, rhs: Rhs) -> Self
+      |trait Div[Rhs = Self, Out = Self]
+      |    div(self, rhs: Rhs) -> Out
       |
-      |trait Rem[Rhs = Self]
-      |    rem(self, rhs: Rhs) -> Self
+      |trait Rem[Rhs = Self, Out = Self]
+      |    rem(self, rhs: Rhs) -> Out
       |
-      |trait BitAnd[Rhs = Self]
-      |    bitand(self, rhs: Rhs) -> Self
+      |trait BitAnd[Rhs = Self, Out = Self]
+      |    bitand(self, rhs: Rhs) -> Out
       |
-      |trait BitOr[Rhs = Self]
-      |    bitor(self, rhs: Rhs) -> Self
+      |trait BitOr[Rhs = Self, Out = Self]
+      |    bitor(self, rhs: Rhs) -> Out
       |
-      |trait BitXor[Rhs = Self]
-      |    bitxor(self, rhs: Rhs) -> Self
+      |trait BitXor[Rhs = Self, Out = Self]
+      |    bitxor(self, rhs: Rhs) -> Out
       |
-      |trait Shl[Rhs = Self]
-      |    shl(self, rhs: Rhs) -> Self
+      |trait Shl[Rhs = Self, Out = Self]
+      |    shl(self, rhs: Rhs) -> Out
       |
-      |trait Shr[Rhs = Self]
-      |    shr(self, rhs: Rhs) -> Self
+      |trait Shr[Rhs = Self, Out = Self]
+      |    shr(self, rhs: Rhs) -> Out
       |
       |trait Neg
       |    neg(self) -> Self

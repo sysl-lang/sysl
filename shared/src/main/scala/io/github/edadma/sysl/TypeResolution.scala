@@ -455,15 +455,14 @@ trait TypeResolution extends ImportResolution {
           val args = withDefaults(key, decl.tparams, decl.tdefaults, written, Map.empty)
 
           deferredBounds(key, decl.tparams, decl.bounds, args)
-          // Object safety is asked **first**, because a trait whose default names `Self` is usually
-          // one whose members do too — the whole operator catalog is — and "this trait cannot be
-          // erased" is the answer that trait wants, not "write the argument", which would be advice
-          // that does not help.
-          checkObjectSafe(key, args, sigil)
+          // A `Self` that arrived from one of *this* trait's own defaults is left to the check below,
+          // because there the fix is a spelling: writing the argument out. That now includes the
+          // operator catalog, which it did not when an operator's result was fixed to `Self` and no
+          // argument could rescue it — `&Mul[real, real]` is a formable object (`14 §7`).
+          checkObjectSafe(key, args, sigil, decl.tparams.drop(written.length).toSet)
 
           // An object has forgotten which type it holds, so a default that names one has nothing to
-          // stand for. It reaches here only for a trait that *is* erasable, where writing the
-          // argument really is the fix.
+          // stand for, and writing the argument is the fix.
           for tp <- decl.tparams.drop(written.length); ref <- decl.tdefaults.get(tp) if mentionsSelf(ref) do
             err(s"'$tp' defaults to '${ref.show}', which names the type implementing '${qn(key)}', " +
               "and an object has forgotten which type it holds — write the argument")
@@ -486,7 +485,12 @@ trait TypeResolution extends ImportResolution {
    * reference-counted box, which only the counted object has: `&Trait` carries one, so it accepts
    * such a method, and `*Trait` points straight at a value and does not.
    */
-  protected def checkObjectSafe(name: String, args: List[Type], sigil: String): Unit = {
+  protected def checkObjectSafe(
+      name: String,
+      args: List[Type],
+      sigil: String,
+      defaulted: Set[String] = Set.empty,
+  ): Unit = {
     val obj = s"'$sigil${Type.qualified(qn(name), args)}'"
 
     // A trait offers what it requires as well as what it declares, so a required trait that cannot
@@ -501,7 +505,17 @@ trait TypeResolution extends ImportResolution {
       if m.receiver.exists(_.isInstanceOf[RecvMode.ByRef]) && sigil == "*" then
         err(s"'${m.name}' of '$shown' takes '&self', so it needs its receiver inside a " +
           s"reference-counted box — $obj points straight at a value, so write '&${qn(name)}' instead")
-      if m.params.exists(p => mentionsSelf(p.typ)) || m.retType.exists(mentionsSelf) then
+      // A `Self` reaches a signature two ways and both have to be looked for. It may be **written**
+      // there — `other: *Self` — or it may arrive through one of the trait's own **arguments**, which
+      // is how the operator catalog carries it: `add(self, rhs: Rhs) -> Out` mentions no `Self` at
+      // all, and `Add`'s two defaults *are* `Self`, so a bound written bare hands both parameters the
+      // very type the object has forgotten. Reading only what was written would let `trait Word: Add`
+      // erase and give the object a slot whose argument type differs per implementing type.
+      // A parameter this application left to a default is not reported here: the caller says which
+      // those are, and reports them itself in the words that name the fix.
+      val viaArg = paramsBoundToSelf(from) -- (if from.name == name then defaulted else Set.empty)
+
+      if (m.params.map(_.typ) ++ m.retType).exists(t => mentionsAny(t, viaArg + selfName)) then
         err(s"'${m.name}' of '$shown' mentions 'Self' away from its receiver, and an erased value " +
           s"has forgotten which type that is — so there is no $obj to form")
       // A variadic call names the callee's whole function type, which is how it says where the
@@ -525,14 +539,28 @@ trait TypeResolution extends ImportResolution {
         "struct of them"))
 
   /** Whether a written type names `Self` anywhere inside it. */
-  protected def mentionsSelf(t: TypeRef): Boolean = t match
-    case NamedType(n, args) => n == selfName || args.exists(mentionsSelf)
-    case PtrType(i)         => mentionsSelf(i)
-    case RefType(i, _)      => mentionsSelf(i)
-    case WeakType(i)        => mentionsSelf(i)
-    case ArrayType(_, e)    => mentionsSelf(e)
-    case TupleType(parts, _) => parts.exists(mentionsSelf)
-    case f: FnType          => mentionsSelf(f.asTrait)
+  protected def mentionsSelf(t: TypeRef): Boolean = mentionsAny(t, Set(selfName))
+
+  /** Whether a written type names any of `names` anywhere inside it. `Self` is the one that matters
+   * for erasure, and a trait *parameter* matters exactly when `Self` is what was passed for it.
+   */
+  protected def mentionsAny(t: TypeRef, names: Set[String]): Boolean = t match
+    case NamedType(n, args)  => names(n) || args.exists(mentionsAny(_, names))
+    case PtrType(i)          => mentionsAny(i, names)
+    case RefType(i, _)       => mentionsAny(i, names)
+    case WeakType(i)         => mentionsAny(i, names)
+    case ArrayType(_, e)     => mentionsAny(e, names)
+    case TupleType(parts, _) => parts.exists(mentionsAny(_, names))
+    case f: FnType           => mentionsAny(f.asTrait, names)
+
+  /** Which of a trait's own type parameters were given `Self` at this application — the parameters a
+   * member may name and so mention the forgotten type without ever spelling it.
+   */
+  protected def paramsBoundToSelf(b: Type.Bound): Set[String] =
+    traitDecls.get(b.name).toList
+      .flatMap(_.tparams.zip(b.args))
+      .collect { case (tp, Type.Abstract(n, _)) if n == selfName => tp }
+      .toSet
 
   /** Resolves the pointee of a `*T` / `&T`, which is one level further from the layout of
    * whatever type is currently being laid out.

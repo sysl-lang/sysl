@@ -9,7 +9,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * types whose implementations return values that could not be confused, through one variable, one
  * parameter, or one array element.
  */
-class TraitObjectRunTests extends AnyFreeSpec with RunSupport {
+class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   /** Two shapes whose areas are far apart, so a call that reached the wrong one is obvious. */
   private val shape =
@@ -393,6 +393,51 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport {
           |print(total)""".stripMargin)
 
       out shouldBe "25600000\n"
+    }
+  }
+
+  /** An **operator trait** erased into an object, which the catalog could not be while an operator's
+    * result was fixed to `Self` (`14 §7`). Writing both arguments out leaves `mul(self, rhs: real) ->
+    * real` with no `Self` in it anywhere, so there is nothing about the signature a forgotten type
+    * would have been needed for — and two types with quite different multiplications then dispatch
+    * dynamically through one slot.
+    *
+    * The operator **token** does not reach through an object: `f * x` on a `&Mul[real, real]` is
+    * refused, because the catalog's dispatch is on a pair of *types* and an object has forgotten the
+    * one on the left. The method is what an object offers, so the call is written out.
+    */
+  /** Two multiplications far enough apart that a call reaching the wrong one is obvious. */
+  private val muls =
+    """struct Scale
+      |    k: real
+      |struct Shift
+      |    d: real
+      |impl Mul[real, real] for Scale
+      |    mul(self, x: real) -> real = self.k * x
+      |impl Mul[real, real] for Shift
+      |    mul(self, x: real) -> real = x + self.d
+      |""".stripMargin
+
+  "an operator trait at written arguments" - {
+    "is erasable, and the table picks the implementation" in {
+      run(muls + """apply(f: &Mul[real, real], x: real) -> real = f.mul(x)
+                   |var a: &Mul[real, real] = Scale(3.0)
+                   |var b: &Mul[real, real] = Shift(10.0)
+                   |print(apply(a, 2.0))
+                   |print(apply(b, 2.0))""".stripMargin) shouldBe "6\n12\n"
+    }
+
+    "and a row of them dispatches one slot per element" in {
+      run(muls + """var fs: [2]&Mul[real, real] = [Scale(2.0), Shift(1.0)]
+                   |var total = 0.0
+                   |for f in fs
+                   |    total += f.mul(4.0)
+                   |print(total)""".stripMargin) shouldBe "13\n"
+    }
+
+    "the operator token still needs both types, so it is refused on an object" in {
+      err(muls + """apply(f: &Mul[real, real], x: real) -> real = f * x""") should
+        include("'*' needs matching types")
     }
   }
 }

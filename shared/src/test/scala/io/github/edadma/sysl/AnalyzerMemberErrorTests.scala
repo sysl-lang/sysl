@@ -888,7 +888,10 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |impl Add for M
           |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
           |var a = M(1) + 2""".stripMargin
-      ) should include("'+' between M and int needs 'Add[int]' — it implements 'Add[M]'")
+        // The implementation it *does* have is spelled as the program wrote it: `impl Add for M` is
+        // the homogeneous one, so naming it `Add[M]` — or `Add[M, M]`, which is what it resolves to
+        // now that the result is an argument too — would spell out what a default supplied.
+      ) should include("'+' between M and int needs 'Add[int]' — it implements 'Add'")
     }
 
     // Member lookup finds an inherent member before it asks about a membership, so an `impl` of

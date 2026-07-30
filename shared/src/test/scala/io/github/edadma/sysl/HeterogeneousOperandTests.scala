@@ -5,13 +5,19 @@ import org.scalatest.freespec.AnyFreeSpec
 /** The heterogeneous operand of `14 §7`: the catalog's binary arithmetic traits take the right-hand
   * type as a parameter, so `Complex * f64` is an operator rather than a named method.
   *
-  * The result stays `Self`, and deliberately — that is what covers scaling a vector by a real and
-  * deliberately does not cover a dot product, which returns neither operand's type. `Eq` and `Ord`
-  * stay homogeneous for the same kind of reason: what a comparison across two types would promise
-  * about reflexivity and transitivity is a question nothing has asked.
+  * **The result is a second parameter, and the same shape answers it.** `Mul[Rhs = Self, Out = Self]`
+  * covers scaling a vector by a real, a dot product, and a matrix applied to a vector, none of which
+  * returns both operands' type. `Eq` and `Ord` stay homogeneous for a different kind of reason: what a
+  * comparison across two types would promise about reflexivity and transitivity is a question nothing
+  * has asked.
   *
-  * The parameter defaults to `Self` (`10 §3`), so nothing already written had to be respelled:
-  * `impl Mul for Point` is still `Mul[Point]`, and `[T: Mul]` still asks for `Mul[T]`.
+  * Both parameters default to `Self` (`10 §3`), so nothing already written had to be respelled:
+  * `impl Mul for Point` is still `Mul[Point, Point]`, and `[T: Mul]` still asks for `Mul[T, T]`.
+  *
+  * **What a use supplies is the operand, never the result** — `a * b` fixes the pair and asks to be
+  * told what comes back — so the operands select the implementation and the implementation supplies
+  * the result. Two implementations agreeing on the operands are therefore refused, and that refusal
+  * is the load-bearing half of the tests below.
   */
 class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
@@ -341,6 +347,173 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
             |var a = [1, 2]
             |var b = [3, 4]
             |print(a[0..].times(b[0..])[1])""".stripMargin) shouldBe "4\n"
+    }
+  }
+
+  /** The two products a vector space is made of, and neither returns both operands' type. These are
+    * what `14 §7` recorded as uncovered for as long as an operator's result was fixed to `Self`.
+    */
+  private val space =
+    """struct Vec2
+      |    x: real
+      |    y: real
+      |struct Mat2
+      |    a: real
+      |    b: real
+      |    c: real
+      |    d: real
+      |impl Mul[Vec2, real] for Vec2
+      |    mul(self, o: Vec2) -> real = self.x * o.x + self.y * o.y
+      |impl Mul[Vec2, Vec2] for Mat2
+      |    mul(self, o: Vec2) -> Vec2 = Vec2(self.a * o.x + self.b * o.y, self.c * o.x + self.d * o.y)
+      |impl Mul[real, Vec2] for Vec2
+      |    mul(self, k: real) -> Vec2 = Vec2(self.x * k, self.y * k)
+      |""".stripMargin
+
+  "an operator whose result is neither operand's type" - {
+    "a dot product is an operator, and it yields the scalar" in {
+      run(space + "print(Vec2(1.0, 2.0) * Vec2(3.0, 4.0))") shouldBe "11\n"
+    }
+
+    // Two implementations on one type whose *results* differ, told apart by their operands: `Vec2`
+    // multiplied by a `Vec2` is a number and by a `real` is a vector. Nothing but the right operand
+    // says which, which is the selection rule in one expression.
+    "the same type's other multiplication still gives back a vector" in {
+      run(space + """var v = Vec2(1.0, 2.0) * 3.0
+                    |print(v.x, v.y)""".stripMargin) shouldBe "3 6\n"
+    }
+
+    "a matrix applied to a vector yields a vector" in {
+      run(space + """var w = Mat2(1.0, 2.0, 3.0, 4.0) * Vec2(1.0, 2.0)
+                    |print(w.x, w.y)""".stripMargin) shouldBe "5 11\n"
+    }
+
+    // The result flows into the surrounding expression as any other value would — worth pinning
+    // separately, because a result read off the *receiver's* type would have type-checked here and
+    // then computed with the wrong one.
+    "the result composes, and it is the declared type rather than the receiver's" in {
+      run(space + """var m = Mat2(1.0, 0.0, 0.0, 1.0)
+                    |var u = Vec2(3.0, 4.0)
+                    |print((m * u) * u)""".stripMargin) shouldBe "25\n"
+    }
+
+    "and it is what a nested call is checked against" in {
+      run(space + """norm2(v: Vec2) -> real = v * v
+                    |print(norm2(Vec2(3.0, 4.0)))""".stripMargin) shouldBe "25\n"
+    }
+
+    // A result declared as something the operands do not mention at all — the shape that has no
+    // homogeneous reading whatsoever.
+    "a result mentioning neither operand" in {
+      run("""struct A
+            |    n: int
+            |struct B
+            |    n: int
+            |struct C
+            |    n: int
+            |impl Mul[B, C] for A
+            |    mul(self, o: B) -> C = C(self.n * o.n)
+            |print((A(6) * B(7)).n)""".stripMargin) shouldBe "42\n"
+    }
+  }
+
+  "a result is not a selector" - {
+    // The refusal the design rests on: `a * b` carries the operands and not the result, so two
+    // implementations agreeing on the operands leave the use with nothing to choose by. Accepting
+    // them would silently take whichever was written first.
+    "two implementations agreeing on the operands are refused" in {
+      val e = err("""struct V
+                    |    x: real
+                    |impl Mul[V, real] for V
+                    |    mul(self, o: V) -> real = self.x * o.x
+                    |impl Mul[V, V] for V
+                    |    mul(self, o: V) -> V = V(self.x * o.x)""".stripMargin)
+
+      e should include("differs only in what it gives back")
+      e should include("nothing at the use to choose with")
+    }
+
+    // The homogeneous spelling is one of the two, so writing it out beside a bare `impl` is the same
+    // collision by another name.
+    "a written result colliding with a defaulted one is the same refusal" in {
+      err("""struct V
+            |    x: real
+            |impl Mul for V
+            |    mul(self, o: V) -> V = V(self.x * o.x)
+            |impl Mul[V, real] for V
+            |    mul(self, o: V) -> real = self.x * o.x""".stripMargin) should
+        include("differs only in what it gives back")
+    }
+
+    "but differing operands remain two ordinary implementations" in {
+      run(space + """print(Vec2(1.0, 1.0) * Vec2(2.0, 3.0))
+                    |var s = Vec2(1.0, 1.0) * 2.0
+                    |print(s.x)""".stripMargin) shouldBe "5\n2\n"
+    }
+  }
+
+  "what the result being an argument does not change" - {
+    // A compound assignment is `a = a op b` (`14 §2`), so an operator whose result is not the place's
+    // type has nothing to assign back. Refused rather than quietly changing what the place holds.
+    "a compound assignment through a result that is not the place's type is refused" in {
+      val e = err(space + """var v = Vec2(1.0, 2.0)
+                            |v *= Vec2(3.0, 4.0)""".stripMargin)
+
+      e should include("'*=' updates Vec2")
+      e should include("gives real")
+    }
+
+    "while one whose result is the place's type still updates it" in {
+      run(space + """var v = Vec2(1.0, 2.0)
+                    |v *= 3.0
+                    |print(v.x, v.y)""".stripMargin) shouldBe "3 6\n"
+    }
+
+    // A method written to return something the trait's own arguments do not describe is still held to
+    // the declaration — the result being writable is not the same as its being unchecked.
+    "a method disagreeing with the result its own 'impl' declared is refused" in {
+      err("""struct V
+            |    x: real
+            |impl Mul[V, real] for V
+            |    mul(self, o: V) -> V = V(self.x * o.x)""".stripMargin) should
+        include("returns V, but trait 'Mul' declares real")
+    }
+
+    "an unwritten result still defaults to the implementing type" in {
+      err("""struct V
+            |    x: real
+            |impl Mul[V] for V
+            |    mul(self, o: V) -> real = self.x * o.x""".stripMargin) should
+        include("returns real, but trait 'Mul' declares V")
+    }
+
+    // A bound names the operands it needs and the result comes with the implementation, so a bounded
+    // body multiplying two `T`s gets a `T` — the homogeneous reading, unchanged.
+    "a bare bound is still the homogeneous one" in {
+      run("""twice[T: Mul](x: T) -> T = x * x
+            |print(twice(6))""".stripMargin) shouldBe "36\n"
+    }
+
+    // And a bound may name the result, which is what lets a bounded body use one it did not declare.
+    "a bound may name the result, and the body gets it" in {
+      run(space + """len2[T: Mul[T, real]](v: T) -> real = v * v
+                    |print(len2(Vec2(3.0, 4.0)))""".stripMargin) shouldBe "25\n"
+    }
+
+    /** The result of one dispatched operator feeding the next, inside a body whose parameter carries
+      * several bounds. This is the position that reads a result off a *bound* rather than off an
+      * operand, and a `T` recovered from a bound has had its own promises dropped one level in — so
+      * the second operator is the first thing that could fail to find them. `guide/sha2` is written
+      * out of exactly this shape.
+      */
+    "one operator's result is an operand of the next, under several bounds" in {
+      run("""two[T: BitAnd + BitXor](x: T, y: T) -> T = (x & y) ^ y
+            |print(two(6, 3))""".stripMargin) shouldBe "1\n"
+    }
+
+    "and it holds three deep, where each result feeds another trait's operator" in {
+      run("""mix[T: BitAnd + BitXor + BitOr](x: T, y: T, z: T) -> T = ((x & y) ^ z) | (x & z)
+            |print(mix(12, 10, 6))""".stripMargin) shouldBe "14\n"
     }
   }
 }

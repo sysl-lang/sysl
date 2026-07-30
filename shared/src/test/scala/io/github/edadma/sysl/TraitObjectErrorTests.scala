@@ -20,10 +20,25 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
       |""".stripMargin
 
   "object safety" - {
-    // The whole operator catalog is ruled out by this one, `add(self, rhs: Self) -> Self` first:
-    // a second `Self` would have to be the same type the receiver forgot.
-    "a 'Self' parameter is refused, which excludes the operator traits" in {
-      err("var s: *Add = 1") should include("mentions 'Self' away from its receiver")
+    // A bare `*Add` is `*Add[Self, Self]`, and both arguments would have to be the type the object
+    // forgot. The advice is a spelling rather than "this trait cannot be erased", because writing the
+    // arguments out really does rescue it now that an operator's result is an argument (`14 §7`) —
+    // `&Mul[real, real]` is a formable object, which `TraitObjectRunTests` dispatches through.
+    "an operator trait is refused bare, because its arguments default to 'Self'" in {
+      val e = err("var s: *Add = 1")
+
+      e should include("defaults to 'Self'")
+      e should include("write the argument")
+    }
+
+    // A built-in's membership is the compiler's rule rather than a table, so there is nothing to
+    // erase *it* through — but note which complaint arrives: the arguments being written left the
+    // signature with no `Self` in it at all, so object safety is no longer what stops this.
+    "an operator trait at written arguments is not what object safety refuses" in {
+      val e = err("var s: *Add[int, int] = 1")
+
+      e should not include "mentions 'Self' away from its receiver"
+      e should include("*Add[int, int]")
     }
 
     "so is a 'Self' result" in {
