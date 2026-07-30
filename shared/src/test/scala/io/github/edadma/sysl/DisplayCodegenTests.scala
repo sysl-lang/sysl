@@ -127,7 +127,9 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
             |var c: C
             |var w: *Writer = &c
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
-        "@vt.Writer.C = private constant [2 x ptr] [ptr @C.write, ptr @C.failed]")
+        // The table's symbol carries the trait's **key**, as every emitted name does, so it is read
+        // off the seam rather than spelled — and goes on saying the same thing after a move.
+        s"@vt.${Library.key("Writer")}.C = private constant [2 x ptr] [ptr @C.write, ptr @C.failed]")
     }
   }
 }

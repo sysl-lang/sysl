@@ -136,7 +136,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
             |var b: Bad
             |var w: *Writer = &b
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
-        "'Bad.write' keeps the bytes it is written, but a 'Writer' borrows them for the call")
+        "'Bad.write' keeps the bytes it is written, but a 'sysl.Writer' borrows them for the call")
     }
 
     "may keep what it copies out of them" in {
@@ -160,7 +160,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
             |    failed(*self) -> bool = false
             |var w: &Writer = S(0usize)
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
-        "'out' of 'display_int' is *Writer, but &Writer was given")
+        "'out' of 'display_int' is *sysl.Writer, but &sysl.Writer was given")
     }
   }
 

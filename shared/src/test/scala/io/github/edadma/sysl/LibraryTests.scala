@@ -283,16 +283,25 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |""".stripMargin) shouldBe "4\n"
     }
 
-    "the sink it names is still the prelude's, which a program may not declare over" in {
-      // The clash is what protects `Writer` until it moves, and this is the pin that says so — the
-      // marker for the next move, and for the test that becomes writable then: with `Writer` in the
-      // standard module a program may have one of its own, and `Display.display` must go on meaning
-      // the library's. That is the failure `FormatSpec` had, pointing the other way, and it cannot
-      // happen while this test passes.
-      Library.key("Writer") shouldBe "Writer"
-      Modules.moduleOf(Library.key("Writer")) shouldBe Modules.root
-
-      refused("trait Writer\n    log(self) -> int\n") should include("already declared")
+    "and the sink it names means the library's even where the program declares a 'Writer'" in {
+      // The clash protected `Writer` until it moved; this is the test that became writable when it
+      // did. If the trait's declared parameter types were resolved where the `impl` is written,
+      // `*Writer` in `Display.display` would bind whatever the program calls `Writer` — and the
+      // program below calls it something that cannot receive bytes at all, so the whole `display_*`
+      // family would fail inside the library against a type its source never named. That is the
+      // failure `FormatSpec` had, pointing the other way.
+      run(
+        """trait Writer
+          |    log(self) -> int
+          |
+          |struct P
+          |    x: int
+          |
+          |impl Display for P
+          |    display(self, out: *sysl.Writer, fmt: FormatSpec) = str(self.x).display(out, fmt)
+          |
+          |print(P(9))
+          |""".stripMargin) shouldBe "9\n"
     }
 
     "a program may declare a 'Display' of its own, and the library's is still what print asks for" in {
@@ -314,6 +323,26 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |print(P(5).describe())
           |print(P(5))
           |""".stripMargin) shouldBe "10\n5\n"
+    }
+
+    "a sink of the program's own is refused where the library's is asked for, and named apart" in {
+      // Two traits spelled `Writer` and one object type, so the message has one job: say which of
+      // the two the program handed over. Before the move this could not be written at all — the
+      // clash refused the declaration on its first line.
+      refused(
+        """trait Writer
+          |    log(self) -> int
+          |
+          |struct S
+          |    n: int
+          |
+          |impl Writer for S
+          |    log(self) -> int = self.n
+          |
+          |var s: S
+          |var w: *Writer = &s
+          |display_int(1, w, FormatSpec(0, -1, false))
+          |""".stripMargin) should include("*sysl.Writer")
     }
 
     "the bound that advice names is one a program can actually write" in {

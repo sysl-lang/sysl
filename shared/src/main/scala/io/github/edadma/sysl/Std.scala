@@ -26,15 +26,25 @@ package io.github.edadma.sysl
  * what breaks, and a leaf is what makes that measurement about the mechanism rather than about the
  * declaration.
  *
- * **`Display` is what a value's text is written through** (`14 §2`, `§6`): a rendering goes into a
- * sink rather than into a fresh `string`, so it costs no allocation and a `no alloc` module can
- * still log. It names two other things, and they are not in the same place — `FormatSpec` is here
- * beside it, and `Writer` is still the prelude's. That is the point of moving it second: it is the
- * first declaration whose signature reaches *out* of the standard module and back into what is left
- * of the prelude, which is the direction that had never been exercised. A name written here is
- * looked for among the library's own regardless of which of the two parts holds it, so neither
- * direction needs an import; the module a declaration sits in is not what decides whose names it can
- * see, and while the drain is in progress it could not be.
+ * **`Writer` and `Display` are the rendering surface** (`14 §2`, `§6`). A `Display` writes its
+ * value's text into a sink rather than returning a fresh `string`, so rendering costs no allocation
+ * and a `no alloc` module can still log; the sink is a `*Writer`, which is the trait object of `02`.
+ * `Writer` takes bytes rather than a `string` because that is the direction that is free — a `string`
+ * *is* a validated `[]u8` — and it reports failure by latching rather than by returning, so an
+ * implementation stays straight-line and `print(x)` stays a statement.
+ *
+ * `failed` carries a **default** of `false`, which is the library's own use of the mechanism `02`
+ * calls for: most sinks cannot fail, and one that cannot should not have to write down that it
+ * cannot. A sink that can — a bounded buffer, a device that goes away — overrides it, and nothing
+ * about the latch changes.
+ *
+ * The two crossed separately, and `Display` crossed first on purpose: while `Writer` was still the
+ * prelude's, `Display.display` was the one signature naming a declaration in each part, which is how
+ * the *sysl → prelude* direction got exercised before anything depended on it. A name written in
+ * either part is looked for among the library's own first, so neither direction needs an import —
+ * the module a declaration sits in is not what decides whose names it can see, and while the drain is
+ * in progress it could not be. What is left in the prelude now names both of these from there: the
+ * whole `display_*` family, and the `impl Writer` blocks.
  */
 object Std {
 
@@ -50,6 +60,10 @@ object Std {
       |    width: int
       |    prec: int
       |    left: bool
+      |
+      |trait Writer
+      |    write(*self, bytes: []u8)
+      |    failed(*self) -> bool = false
       |
       |trait Display
       |    display(self, out: *Writer, fmt: FormatSpec)

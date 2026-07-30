@@ -28,16 +28,10 @@ package io.github.edadma.sysl
  * — and that part lives in `CoreTraits`, because the open `iN` / `uN` families have no finite list
  * of scalars an `impl` could be written for.
  *
- * **`Writer`** (`14 §2`, `§6`) is the sink half of the rendering surface, the trait object of `02`
- * that everything a `Display` renders is written into. It takes bytes rather than a `string` because
- * that is the direction that is free — a `string` *is* a validated `[]u8` — and it reports failure by
- * latching rather than by returning, so an implementation stays straight-line and `print(x)` stays a
- * statement. `Display` itself is in the standard module and names this trait from there.
- *
- * `failed` carries a **default** of `false`, which is the prelude's own use of the mechanism `02`
- * calls for: most sinks cannot fail, and one that cannot should not have to write down that it
- * cannot. A sink that can — a bounded buffer, a device that goes away — overrides it, and nothing
- * about the latch changes.
+ * **The rendering surface itself — `Writer` and `Display` — is in the standard module**, and what is
+ * left here is everything written *against* it: the `display_*` family below, and the `impl Writer`
+ * blocks further down. Both are named from here without an import, because a name written in either
+ * part of the library is looked for among the library's own first.
  *
  * The `display_*` family is the sink counterpart of the `print*` family above: the same renderings,
  * into a `*Writer` instead of into standard output, and in the argument order `Display` declares.
@@ -292,10 +286,6 @@ object Prelude {
       |    for b in s.bytes
       |        h = (h ^ u64(b)) * 0x100000001b3u64
       |    h
-      |
-      |trait Writer
-      |    write(*self, bytes: []u8)
-      |    failed(*self) -> bool = false
       |
       |trait Reader
       |    read(*self, into: []u8) -> []u8

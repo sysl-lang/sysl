@@ -122,8 +122,12 @@ private class Escape(program: TProgram) {
 
     offenders.distinct.map { name =>
       Diagnostic.render(
-        s"'$name' keeps the bytes it is written, but a 'Writer' borrows them for the call — they " +
-          "may be a view of the caller's stack, so copy what the writer needs into storage of its own",
+        // The trait is named by its key, never spelled: a program with a `Writer` of its own reaches
+        // the library's only by path, and a message that spells it plainly names the wrong trait to
+        // the one reader who has to tell them apart.
+        s"'$name' keeps the bytes it is written, but a '${Modules.show(Library.key("Writer"))}' " +
+          "borrows them for the call — they may be a view of the caller's stack, so copy what the " +
+          "writer needs into storage of its own",
         None,
       )
     }
