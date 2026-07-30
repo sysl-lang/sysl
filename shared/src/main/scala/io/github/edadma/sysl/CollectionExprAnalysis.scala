@@ -152,7 +152,18 @@ trait CollectionExprAnalysis extends ExprSupport {
         // else is implementing a different `Index` rather than misusing this one.
         case None if indexes("Index", tr.ty) => callMethodOn(raw, "index", List(index), expected)
 
-        case None => err(s"cannot index ${show(tr.ty)}")
+        case None =>
+          tr.ty match
+            // A parameter has no implementation to find — `indexes` asks after one, and a bound is
+            // not that — so the subscript goes the way every other use of a parameter goes: to the
+            // member machinery, which answers from the bounds and complains through `boundErr` when
+            // they license nothing. A subscript **is** `Index`'s one method (`14 §3`), so this is
+            // the same question the dot form asks, and `10 §5` puts indexing among what an unbounded
+            // parameter may not do. Without this the definition-time pass dropped the complaint and
+            // the reader met it at whatever first instantiated the body, against a type the
+            // definition never named — which is the outcome §5 exists to prevent.
+            case _: Type.Abstract => callMethodOn(raw, "index", List(index), expected)
+            case other            => err(s"cannot index ${show(other)}")
 
 
   /** One end of a slice range: an index like any other, so any integer will do. */
