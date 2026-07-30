@@ -82,7 +82,19 @@ trait MethodCalls extends CallCore {
               .orElse(builtinDisplay(rty, mname, tr, args))
               .orElse(builtinHash(rty, mname, tr, args))
               .orElse(callableField(rty, mname, tr, args, expected))
-              .getOrElse(err(s"type '$base' has no method '$mname'"))
+              .getOrElse {
+                // A call reaches through one level of indirection and only one, exactly as selection
+                // does (`08 § Calling a method`). A receiver still carrying a mode after that has
+                // more than the shorthand walks, and the complaint below would name what is *left*
+                // — a type the reader never wrote — and report a missing method, when the method is
+                // there and what stopped short is the reach.
+                rty match
+                  case _: Type.Ptr | _: Type.Ref =>
+                    err(s"a method call reaches through one level of indirection and ${show(tr.ty)} " +
+                      s"has more, so the rest is written: '(*x).$mname(…)' calls '$mname' on the " +
+                      s"${show(rty)} it leaves")
+                  case _ => err(s"type '$base' has no method '$mname'")
+              }
   }
 
   /** Which of a type's members a written name means, where more than one implementation of one trait

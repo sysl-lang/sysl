@@ -304,6 +304,21 @@ trait TraitLookup extends MemberVisibility {
     case (_: Type.Weak, "get")                  => true
     case _                                      => false
 
+  /** The same question asked of a **shape** rather than of a type.
+   *
+   * A block matching every slice or every array at once has no `Self` to ask the type-keyed test
+   * above about — the element is still a parameter when the members are hoisted — so the one block
+   * that most needs asking is the one it cannot see. `impl[T] Sized for []T` declaring a `len` was
+   * accepted and then never found, since `xs.len` is answered ahead of the member table, which is
+   * exactly the outcome `08 § Built-in members` says is refused at the declaration.
+   *
+   * `len` is the whole list: it is the only member the compiler provides for a sequence, and the
+   * shapes that have one are the two written with brackets. A tuple's shape is its arity and has
+   * no compiler-provided member at all.
+   */
+  protected def builtinShapeMember(head: String, name: String): Boolean =
+    name == "len" && head.startsWith("[")
+
   /** Every trait a bound promises: the traits it **requires**, transitively, and then itself
    * (`02 § A trait may require another trait`).
    *
