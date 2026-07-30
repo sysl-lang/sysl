@@ -299,8 +299,8 @@ staying object-safe for a raw object (`02`), so a sink needs no allocator.
 
 **Which writers the prelude supplies: one, `ByteSink`.** The two that `print` and `str` themselves
 use are the compiler's, and the standard-output one has to be — it holds no state, and there is no
-struct with no fields to give it. Its `write` is the prelude's own `putbytes`, so the one function a
-freestanding target replaces is still that one.
+struct with no fields to give it. Its `write` is the prelude's own `putbytes`, which is one of the two
+seams a freestanding target replaces — the other being `FdReader.read`, below.
 
 The other was `07`'s *Not yet* until a `[]T` could be sized while running, and once `Buf[T]` existed
 it was a dozen lines of ordinary sysl:
@@ -328,6 +328,57 @@ now held back by the same reachability their module's free functions already wer
 that prints a number carries no more than it did. That rule is no longer the prelude's alone: a
 program's own declarations are filtered the same way, by a pass over the whole typed program that
 runs after everything that checks one (`15 §3`).
+
+### The `Reader` surface
+
+| Trait | Methods |
+|---|---|
+| `Reader` | `read(*self, into: []u8) -> []u8`, `failed(*self) -> bool = false` |
+
+`Writer` turned around, and deliberately the same shape: one method on bytes, a latch rather than a
+`Result`, `*self` on both so a reader can be stateful and still object-safe. What differs is the
+direction the bytes travel, and so the one question the return type has to answer — *how many
+arrived*.
+
+**It answers with the filled prefix, not with a count.** A slice already *is* a length and a pointer,
+so `got.len` is the count and `got` is what to look at; there is no way to be handed the one and
+forget to apply it to the other, which is the mistake `read(2)`'s own signature invites every time it
+is called. It costs nothing over returning a `usize` — a view is three words either way.
+
+Reading empty says **end of input** and says only that. Whether input ended *badly* is what `failed`
+answers, and the two are separate for the reason the latch exists at all: a caller who does not care
+should not have to ask, and a caller who does should not have to unwrap a `Result` at every read to
+find out. That mapping is also `read(2)`'s own — zero for the end, `-1` for a failure — so nothing is
+being conflated to make the surface tidy.
+
+**Which readers the prelude supplies: one, `FdReader`**, over `read(2)`, with `stdin()` naming the
+descriptor a program is started with so a caller does not have to know it is zero. It is the mirror
+of `ByteSink`, and it means the seams a freestanding target replaces are exactly two: `putbytes`'
+body and this one's.
+
+Above it sits **`Lines`**, the cursor `getline` belongs to, and `impl Iterate[string] for Lines`, so
+`for line in lines(&r)` is an ordinary `for`. Three things about it are worth writing down, because
+each was a decision and not a default:
+
+- **It borrows its reader rather than owning it.** A `for` iterates a *copy* of its iterator, so a
+  cursor holding an `FdReader` by value would latch a failure onto a copy the caller cannot reach,
+  and `failed` would be decorative. Borrowing leaves the reader named in the caller's scope, which is
+  what makes `r.failed()` answerable *after* the loop — the only moment the question matters. The
+  price is one line at the call site.
+- **It scans the slice `read` returned, not the one it offered.** Those are the same memory for a
+  reader that fills what it was given, so the distinction is free — and it is what lets a reader hand
+  back a view of a buffer of its own, never touching the offered one, and still be read correctly.
+  Taking the *length* from the answer and the *bytes* from the offer is how the two could disagree.
+- **A line is found with `memchr`, through `find_byte`.** libc's scans a word at a time where sysl's
+  loop could not, and `find_byte` is what pointer difference is for: `memchr` answers *where* with an
+  address, and an index is that address minus the first. A line that fits in one read is never
+  copied; only one spanning two reads is gathered, into a `Buf[u8]` that is then reused.
+
+`getline` yields a `string`, so bytes are validated where they arrive (`04`) and ill-formed input
+stops the program as an ill-formed argument does. That severity is affordable *because* the layer
+underneath is public: a caller who would rather inspect than trap reads bytes through `Reader` and
+validates them itself, which is what having two layers is for. A trailing `\r` leaves with the `\n`,
+so text written on either system reads the same — `bufio.Scanner`'s choice rather than C `getline`'s.
 
 ## 3. One dispatch rule for operators
 

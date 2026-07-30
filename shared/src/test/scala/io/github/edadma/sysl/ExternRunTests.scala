@@ -192,6 +192,11 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
    * the harness hands a compiled program a closed standard input — so every read here is at end of
    * input by construction, and a test that wanted to feed bytes in would need a runner that passes
    * its own stdin down.
+   *
+   * These are the raw form, and they stay raw on purpose: the prelude now supplies `Reader` and the
+   * `Lines` cursor over `read(2)` (`ReadingSurfaceTests`), and the point of keeping the bare `extern`
+   * pinned here is that it is still all a program needs. A surface built on top of the language does
+   * not change what the language asks for.
    */
   "reading standard input" - {
     "the end-of-input value is what C says it is" in {

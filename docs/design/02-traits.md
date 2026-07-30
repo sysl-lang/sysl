@@ -146,8 +146,9 @@ open. What it buys beyond convenience is that **a trait can grow**: adding a met
 does not break the implementations that already exist, which is the difference between a trait a
 library can evolve and one frozen at its first release. `14 §8 d` had to design around not having
 this — `FormatSpec` went into `Display`'s signature early precisely because adding a parameter later
-would have broken every `impl` — and the prelude now uses a default itself, for `Writer.failed`
-(most sinks cannot fail, and one that cannot should not have to say so).
+would have broken every `impl` — and the prelude now uses a default itself, for `Writer.failed` and
+`Reader.failed` alike (most sinks and most sources cannot fail, and one that cannot should not have to
+say so).
 
 **A default may assume of its receiver exactly what its own trait declares.** That is not a
 restriction bolted on; it is what a default *is*, since the body must serve every implementing type

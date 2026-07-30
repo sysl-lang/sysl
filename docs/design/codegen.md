@@ -205,7 +205,8 @@ before they appear and may be mutually recursive).
   is checked once at the trait, as a generic function over `Self` bounded by that trait, so it may
   assume exactly what the trait declares — and then **copied per implementing type** under that
   type's own `Type.method` name, which is why a call, a vtable slot, and the escape summary all find
-  an ordinary function. The prelude uses one: `Writer.failed` defaults to `false`.
+  an ordinary function. The prelude uses two: `Writer.failed` and `Reader.failed` both default to
+  `false`.
 - **Properties as trait members (`02`).** A trait asks for one by dropping the body from `08`'s
   property form (`size -> int`), and an `impl` supplies it. A property has a receiver it never
   spells — by value — so it needs nothing of its own at either dispatch: a bound licenses `x.size`

@@ -86,6 +86,17 @@ its own stack buffer, and so what keeps rendering allocation-free — and every 
 checked here to make sure its `write` really does let go. An implementation that keeps the bytes is
 rejected, naming the function; a caller may then pass one a frame-backed slice freely.
 
+**`Reader` is deliberately not a second exception, and the asymmetry is open.** Its `read` takes a
+`[]u8` to fill, so the same question arises in the other direction — and the answer today is the
+conservative one: reading into a local array through a `*Reader` promotes the array, and in a
+`no alloc` module it is refused. Reading through a *concrete* reader is unaffected, since a direct
+call consults the summary and `FdReader.read` keeps nothing; and the prelude's own `Lines` reads into
+a heap buffer, so nothing in the shipped surface pays for this. What makes `Writer`'s exception
+earned is a check that every `impl` lets the bytes go, and `read` does not let go — it hands the view
+*back*, which is a different promise needing a different check. Whether reading deserves that check
+is not settled here: rendering had to be allocation-free for `14 §2` to work at all, and nothing yet
+says reading does.
+
 **A function whose body is not available** — an `extern` (`12 §1`), which is the declaration form
 for exactly that — gets the pessimistic assumption: every parameter is kept, and the result views
 everything. A stack-backed slice therefore cannot be passed to one, which is correct: the foreign
