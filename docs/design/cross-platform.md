@@ -42,8 +42,10 @@ Two of the author's own cross-published libraries cover the edge, and both are o
   `listDirectory` with globs. This is what **module resolution** wants: module names follow the
   directory tree relative to the project root, and `relativeTo` / `normalize` / `startsWith` are
   exactly those operations.
-- **`cross_platform`** (`io.github.edadma:cross_platform:0.1.7`) — process-level operations
-  `path` doesn't cover: `processArgs`, `stdout`, `processExit`, plus `nameSeparator`.
+- **`cross_platform`** (`io.github.edadma:cross_platform:0.1.8`) — process-level operations
+  `path` doesn't cover: `processArgs`, `stdout`, `processExit`, `nameSeparator`, the temp-file
+  operations the toolchain glue writes its `.ll` through, and `exec` — running an external command
+  to completion and capturing what it printed.
 
 Both use the best implementation per platform (JVM `java.nio`, Node `fs`/`path`, Native NIO
 compat) behind one API.
@@ -56,17 +58,22 @@ codepoint (see `00-types-and-expressions.md` §1). Source files are UTF-8 on dis
 to `String` at the edge; the core only ever sees `String`. Tests should include a supplementary
 codepoint to keep this honest across platforms.
 
-## The known gap: process spawning
+## Process spawning — the gap that was closed, and the one still open
 
-Tier-2/3 tests must invoke external tools (`lli`, `clang`). **Neither library provides process
-spawning**, and it is genuinely hard to abstract (JVM `ProcessBuilder` vs Node `child_process`
-vs Native).
+Invoking an external tool was once the gap here: linking wants `clang`, and abstracting a spawn
+across JVM `ProcessBuilder`, Node `child_process` and Native is genuinely awkward. It is **no longer
+a gap** — `cross_platform` grew `exec`, which is what this chapter's own policy said the fix had to
+be, so the toolchain glue lives in `shared/` beside the compiler rather than in JVM-only test code,
+and `build` and `run` work from every platform's CLI.
 
-This is acceptable because **tests run on the JVM**: tool invocation lives in JVM-only test
-code (`jvm/src/test`), not in `shared/`. The pure core stays untouched by it.
-
-If the *shipped CLI* ever needs to invoke tools on all platforms, that is a real gap — and the
-fix is to **add process spawning to `cross_platform`**, not to work around it here.
+**What `exec` does not offer is a child that shares this process's standard input.** It closes the
+child's stdin and captures both output streams, which is exactly right for asking `clang` a question
+and wrong for `run`: a compiled program that reads standard input sees end of input immediately,
+whatever the CLI itself was given. Reading standard input is not a language gap — a program declares
+`extern "getchar"` and reads, needing nothing new (pinned in `ExternRunTests`) — it is a gap in what
+the runner hands the program it started. Closing it means an `exec` variant that **inherits** the
+parent's three streams and reports only a status, since a program sharing the terminal has nowhere to
+capture output *to*. By the policy below that belongs in `cross_platform`, not here.
 
 ## Library policy
 
@@ -76,10 +83,12 @@ the library and publish it — never work around it in sysl.**
 
 Current state of that policy:
 
-- `path` 0.0.6 and `cross_platform` 0.1.7 — on Central, used as-is.
-- `indentation` — Central has only **0.0.2**, which is what we depend on. Commits exist for
-  0.0.3 (`blockTriggerToken`) and 0.0.4 (`isLineContinuationToken`) but **were never tagged or
-  published**. We do not need `blockTriggerToken` (decided `None` in `front-end.md`). We *do*
-  eventually want `isLineContinuationToken` for trailing-operator line continuation — that will
-  be the first real trigger to publish an `indentation` release (with a proper tag and GitHub
-  release) and bump the dependency.
+- `path` 0.0.6, `cross_platform` 0.1.8 and `indentation` 0.0.5 — all three on Central, used as-is.
+- **`indentation` is the policy's worked example.** It sat at 0.0.2 while the commits for 0.0.3
+  (`blockTriggerToken`) and 0.0.4 (`isLineContinuationToken`) were written and never released, and
+  trailing-operator line continuation waited on that release rather than on a workaround here. The
+  release happened; `isLineContinuationToken` is what the lexer's line continuation now reads, and
+  `blockTriggerToken` is still unused because `front-end.md` decided `None` for it.
+- **Open against the policy: an inheriting `exec`.** See the section above — `run` cannot give a
+  program the standard input it was started with until `cross_platform` offers a spawn that passes
+  the streams down.

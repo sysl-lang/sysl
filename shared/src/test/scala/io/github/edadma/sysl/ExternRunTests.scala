@@ -184,6 +184,51 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** Standard input asks nothing of the language: `getchar` is an ordinary `extern` returning an
+   * `int`, and the negative value it hands back at end of input is an ordinary comparison. There is
+   * no read primitive to add, which is worth pinning because the absence looks like a gap.
+   *
+   * What these can assert is the *shape* of such a program and what it does on empty input, since
+   * the harness hands a compiled program a closed standard input — so every read here is at end of
+   * input by construction, and a test that wanted to feed bytes in would need a runner that passes
+   * its own stdin down.
+   */
+  "reading standard input" - {
+    "the end-of-input value is what C says it is" in {
+      val src =
+        """extern "getchar" get_char() -> int
+          |print(get_char())""".stripMargin
+
+      run(src) shouldBe "-1\n"
+    }
+
+    "a read loop over empty input completes without reading anything" in {
+      val src =
+        """extern "getchar" get_char() -> int
+          |var n = 0
+          |var c = get_char()
+          |while c >= 0
+          |    n += 1
+          |    c = get_char()
+          |print("bytes:", n)""".stripMargin
+
+      run(src) shouldBe "bytes: 0\n"
+    }
+
+    // A byte arriving as an `int` is a `char` by the checked conversion `01` describes, so building
+    // text out of input needs no separate path — the same conversion any other integer takes.
+    "an input byte becomes text through the conversion every integer takes" in {
+      val src =
+        """extern "getchar" get_char() -> int
+          |read_or(fallback: char) -> char
+          |    var c = get_char()
+          |    if c < 0 then fallback else char(u32(c))
+          |print(read_or('x'))""".stripMargin
+
+      run(src) shouldBe "x\n"
+    }
+  }
+
   "a call that does not return" - {
     "stops the program where it stands" in {
       val src =
