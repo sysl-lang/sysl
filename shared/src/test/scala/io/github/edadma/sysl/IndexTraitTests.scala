@@ -97,8 +97,8 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |print(firstOf(s))""".stripMargin
 
       err(src) should include(
-        "requires its type parameter 'C' to implement 'Get[usize, int]', but Buf[string] does not " +
-          "— it implements 'Get[usize, string]'")
+        s"requires its type parameter 'C' to implement 'Get[usize, int]', but " +
+          s"${Modules.show(Library.key("Buf"))}[string] does not — it implements 'Get[usize, string]'")
     }
 
     "and the same bound is met by the instantiation that does supply it" in {

@@ -146,7 +146,7 @@ open. What it buys beyond convenience is that **a trait can grow**: adding a met
 does not break the implementations that already exist, which is the difference between a trait a
 library can evolve and one frozen at its first release. `14 §8 d` had to design around not having
 this — `FormatSpec` went into `Display`'s signature early precisely because adding a parameter later
-would have broken every `impl` — and the prelude now uses a default itself, for `Writer.failed` and
+would have broken every `impl` — and the library now uses a default itself, for `Writer.failed` and
 `Reader.failed` alike (most sinks and most sources cannot fail, and one that cannot should not have to
 say so).
 
@@ -536,7 +536,7 @@ taking one of a temporary silently is how a program acquires a dangling pointer.
 Because the coercion applies per branch, an `if` or a `match` whose arms are *different concrete
 types* meets at one trait object, which is the point of having them.
 
-The prelude's **`Writer`** is the first trait the language itself forms objects of: `Display` renders
+The library's **`Writer`** is the first trait the language itself forms objects of: `Display` renders
 into a `*Writer` so that writing text costs no allocation (`14 §2`), and a program supplies its own
 sink with an ordinary `impl`. It is also the one trait the compiler knows a *contract* about beyond
 its signatures — a writer borrows the bytes it is handed rather than keeping them — and that is

@@ -96,7 +96,7 @@ local array through a `*Reader` promotes the array, and in a `no alloc` module i
 Two things bound how much that costs. Reading through a **concrete** reader is unaffected, since a
 direct call consults the summary and `FdReader.read` keeps nothing — and so is reading through a
 **bounded type parameter**, because monomorphization turns that into a direct call too. Only genuine
-erasure pays, and the prelude's own `Lines` reads into a heap buffer, so nothing in the shipped
+erasure pays, and the library's own `Lines` reads into a heap buffer, so nothing in the shipped
 surface does. `[R: Reader]` is therefore both the faster shape and the one with no promotion in it,
 which is the usual relationship between the two and not a coincidence.
 

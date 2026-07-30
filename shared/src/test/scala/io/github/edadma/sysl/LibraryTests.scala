@@ -585,6 +585,87 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "a moved GENERIC, which is what a growable sequence is" - {
+
+    // Every declaration that crossed before this one was monomorphic. A generic is emitted per
+    // instantiation, so what carries the module is the *stem* of the mangled name — nothing pinned
+    // that before, and a generic is exactly where a key could have been dropped without a failure.
+    "an instantiation a program asks for is keyed by the module the generic is declared in" in {
+      val out = Compiler.compileToLlvm(
+        """var b: Buf[int] = buf()
+          |b.push(7)
+          |print(b[0usize], b.len())""".stripMargin)
+
+      out.map(_.contains(s"%struct.${Library.key("Buf")}.int = type")) shouldBe Right(true)
+      out.map(_.contains(s"@${Library.key("Buf")}.push.int(")) shouldBe Right(true)
+      out.map(_.contains(s"@${Library.key("buf")}.int(")) shouldBe Right(true)
+      out.map(_.contains("@Buf.push.int(")) shouldBe Right(false)
+    }
+
+    // `Index` has NOT moved, so this impl block spans the two halves: a standard-module subject
+    // implementing a prelude trait. The lowered method is named under the *subject's* key.
+    "and its impl of a trait that has not moved is keyed under the subject, not the trait" in {
+      val out = Compiler.compileToLlvm(
+        """var b: Buf[int] = buf()
+          |b.push(7)
+          |print(b[0usize])""".stripMargin)
+
+      out.map(_.contains(s"@${Library.key("Buf")}.index.int(")) shouldBe Right(true)
+    }
+
+    "a program may declare a 'Buf' of its own, and what the library builds on still means the library's" in {
+      // `StrBuilder` is still in the prelude and holds a `&Buf[u8]`, so this is the cross-seam
+      // shape again — but with a *generic*, where the program's own is not even the same arity of
+      // thing. The library's `Buf` is what `str_builder()` gathers into whatever the word means here.
+      run(
+        """struct Buf[T]
+          |    only: T
+          |
+          |mine[T](v: T) -> Buf[T] = Buf(v)
+          |
+          |print(mine(4).only)
+          |
+          |var s = str_builder()
+          |s.push("hi")
+          |print(s.finish())
+          |""".stripMargin) shouldBe "4\nhi\n"
+    }
+
+    "and the library's own is still reachable beside it, by the path that names it" in {
+      run(
+        """struct Buf[T]
+          |    only: T
+          |
+          |var mine: Buf[int] = Buf(9)
+          |var theirs: sysl.Buf[int] = buf()
+          |
+          |theirs.push(3)
+          |print(mine.only, theirs[0usize], theirs.len())
+          |""".stripMargin) shouldBe "9 3 1\n"
+    }
+
+    "a sink the library supplies gathers a rendering that pads across the whole value" in {
+      // `ByteSink` is why `Buf` had to move with it: it is the writer a multi-part `Display`
+      // gathers into before its specifier can pad what the parts came to.
+      run(
+        """struct Pair
+          |    a: int
+          |    b: int
+          |
+          |impl sysl.Display for Pair
+          |    display(self, out: *Writer, fmt: FormatSpec)
+          |        var g = byte_sink()
+          |        var w: *Writer = &g
+          |        display_int(long(self.a), w, FormatSpec(0, -1, false))
+          |        display_str(":", w, FormatSpec(0, -1, false))
+          |        display_int(long(self.b), w, FormatSpec(0, -1, false))
+          |        display_str(from_utf8(g.text()).unwrap(), out, fmt)
+          |
+          |print(f"[${Pair(1, 2)}%6s]")
+          |""".stripMargin) shouldBe "[   1:2]\n"
+    }
+  }
+
   "a moved trait whose memberships the compiler supplies rather than a program declaring them" - {
 
     "a program may declare a 'Hash' of its own, and a built-in still satisfies the library's" in {

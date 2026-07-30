@@ -130,7 +130,7 @@ nothing is decided by it either: if built-ins ever carry associated functions, t
 **The division of labour is worth stating, because it is the whole reason `from_utf8` is not a
 built-in.** The compiler supplies exactly one primitive — `from_utf8_unchecked`, which is a `[]u8`
 taken as a `string` with nothing looked at — and the validator on top of it is ordinary sysl in the
-prelude. That is possible for the same reason `Buf[T]` is: nothing in a byte-by-byte scan needs
+library. That is possible for the same reason `Buf[T]` is: nothing in a byte-by-byte scan needs
 anything the language does not already offer. What no sysl body can do is the last line, because
 every safe route to a `string` already carries the guarantee.
 
@@ -322,7 +322,7 @@ print(n, 2.5, "done")     ⟶     printi(long(n))
 The prelude declares `printi`, `printu`, `printr`, `printb`, `printc`, and `prints`, and every one
 of them is sysl a program could have written. What the compiler knows is those six *names* and the
 rule that widens an argument to the width its renderer takes — an integer to `long` or `ulong` by
-its own signedness, a float to `real` — so that the prelude needs one function per kind rather than
+its own signedness, a float to `real` — so that the library needs one function per kind rather than
 one per width, which a language without overloading has no other way to arrange. That is the same
 kind of knowledge it already has of `Option`'s variant names, and it is the whole of it: the
 compiler implements no printing.

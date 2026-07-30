@@ -862,7 +862,7 @@ A tuple type has no declaration and so no module, which looks like `02`'s orphan
 to bite on. It is the same question `int` already answers: **a built-in type is the prelude's**, and
 the prelude is where its catalog rows live. So:
 
-- **The prelude provides `Eq`, `Ord`, `Hash` and `Display` structurally**, for each arity it
+- **The library provides `Eq`, `Ord`, `Hash` and `Display` structurally**, for each arity it
   declares, whenever every component has the row. Ordering is lexicographic — first component first
   — which is the only ordering a positional product has a claim to.
 - **A user may write `impl MyTrait for (int, string)`**, because their trait is local and that is

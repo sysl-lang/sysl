@@ -426,8 +426,8 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
       )
       val defined = out.map(_.linesIterator.filter(_.startsWith("define")).mkString("\n"))
 
-      defined.getOrElse("") should include("@ByteSink.text")
-      defined.getOrElse("") should include("@ByteSink.write")
+      defined.getOrElse("") should include(s"@${Library.key("ByteSink")}.text")
+      defined.getOrElse("") should include(s"@${Library.key("ByteSink")}.write")
     }
   }
 }

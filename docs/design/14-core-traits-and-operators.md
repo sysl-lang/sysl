@@ -254,7 +254,7 @@ and `print` and `str`, which are written with no specifier at all, hand over the
 a *struct* rather than more parameters precisely so that a fourth part can be added later without
 touching a single `impl`.
 
-**A specifier describes the field the whole value occupies**, and every renderer the prelude
+**A specifier describes the field the whole value occupies**, and every renderer the library
 supplies acts on it. They converge on one function, `display_pad`, which puts a finished run of
 bytes in that field — six renderers each growing their own padding would be six chances for `%8s`
 to mean something slightly different. `display_pad` is public for the same reason: an
@@ -297,9 +297,9 @@ Three decisions, each following Rust's experience rather than its packaging:
 `*self` on both methods is what makes a writer stateful — a counter, a latch, a buffer — while
 staying object-safe for a raw object (`02`), so a sink needs no allocator.
 
-**Which writers the prelude supplies: one, `ByteSink`.** The two that `print` and `str` themselves
+**Which writers the library supplies: one, `ByteSink`.** The two that `print` and `str` themselves
 use are the compiler's, and the standard-output one has to be — it holds no state, and there is no
-struct with no fields to give it. Its `write` is the prelude's own `putbytes`, which is one of the two
+struct with no fields to give it. Its `write` is the library's own `putbytes`, which is one of the two
 seams a freestanding target replaces — the other being `FdReader.read`, below.
 
 The other was `07`'s *Not yet* until a `[]T` could be sized while running, and once `Buf[T]` existed
@@ -312,20 +312,20 @@ struct ByteSink
     text(self) -> []u8 = self.bytes.view()
 ```
 
-It is in the prelude rather than left to each program because **an implementation that renders more
+It is in the library rather than left to each program because **an implementation that renders more
 than one part cannot honour its specifier without it**. A specifier describes the field the whole
 value occupies, so a `Complex` rendering `1`, `+`, `2`, `i` must pad what those four came to and not
 each of them; padding needs the finished bytes; and the finished bytes need somewhere to land. Every
 such implementation would write the same dozen lines, which is the definition of something that
-belongs in the prelude. What a program writes for itself is still an ordinary `impl Writer for
+belongs in the library. What a program writes for itself is still an ordinary `impl Writer for
 MyThing` — a counter, a device, a bounded buffer that latches — and that remains the case the trait
 exists for.
 
 The reason it was not there sooner is worth keeping, because it was not the design: **a member of a
-non-generic type used to be emitted whether or not anything called it**, so a prelude type with
-three methods put all three, and everything they reached, into every program. Prelude members are
+non-generic type used to be emitted whether or not anything called it**, so a library type with
+three methods put all three, and everything they reached, into every program. Library members are
 now held back by the same reachability their module's free functions already were, and a program
-that prints a number carries no more than it did. That rule is no longer the prelude's alone: a
+that prints a number carries no more than it did. That rule is no longer the library's alone: a
 program's own declarations are filtered the same way, by a pass over the whole typed program that
 runs after everything that checks one (`15 §3`).
 
@@ -351,7 +351,7 @@ should not have to ask, and a caller who does should not have to unwrap a `Resul
 find out. That mapping is also `read(2)`'s own — zero for the end, `-1` for a failure — so nothing is
 being conflated to make the surface tidy.
 
-**Which readers the prelude supplies: one, `FdReader`**, over `read(2)`, with `stdin()` naming the
+**Which readers the library supplies: one, `FdReader`**, over `read(2)`, with `stdin()` naming the
 descriptor a program is started with so a caller does not have to know it is zero. It is the mirror
 of `ByteSink`, and it means the seams a freestanding target replaces are exactly two: `putbytes`'
 body and this one's.
@@ -559,7 +559,7 @@ rather than quietly becoming a rendering that drops the width the programmer ask
 `x.display(out, fmt)` works on a **built-in** too, and has to: a `Display` for a struct renders the
 struct's own fields, and if `self.x.display(out, fmt)` on an `int` did not resolve, every such
 implementation would have to leave the allocation-free path to render a number. A built-in has no
-`impl` block, so what the call lowers to is the prelude renderer its membership provides — `5.add(3)`
+`impl` block, so what the call lowers to is the library renderer its membership provides — `5.add(3)`
 exactly (`§5`), one row further down the catalog.
 
 ## 7. What stays deferred
@@ -636,7 +636,7 @@ exactly (`§5`), one row further down the catalog.
   string cannot hand out a slice of them the way a container hands out a view of its storage —
   the decoding is what makes them. So there has to be something that carries a position and answers
   "the next one", and once there is, `for` accepting it is a smaller change than teaching `for` about
-  strings. It is compiler-provided (`08`), lowering to the prelude's `Chars` over the bytes; the
+  strings. It is compiler-provided (`08`), lowering to the library's `Chars` over the bytes; the
   string is well-formed by construction, so the decoding validates nothing that was already checked
   at the door.
 
@@ -767,7 +767,7 @@ exactly (`§5`), one row further down the catalog.
   still open is the *module* question `13` owns — which module the catalog lives in once there is
   more than one — not whether it is source.
 - **b. ~~Whether `str`/`print` desugar through the *same* `Display::display` for scalars.~~
-  Settled: the scalar keeps its own path.** `print(5)` still calls the prelude renderer for its
+  Settled: the scalar keeps its own path.** `print(5)` still calls the library renderer for its
   width and `str(5)` still builds the string directly, so a program that prints only numbers builds
   no sink and carries no method table. A scalar's `display` exists all the same, and is what
   `x.display(out, fmt)` reaches — the two agree to the byte, which is what made the choice free.

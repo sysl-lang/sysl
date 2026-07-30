@@ -205,7 +205,7 @@ before they appear and may be mutually recursive).
   is checked once at the trait, as a generic function over `Self` bounded by that trait, so it may
   assume exactly what the trait declares — and then **copied per implementing type** under that
   type's own `Type.method` name, which is why a call, a vtable slot, and the escape summary all find
-  an ordinary function. The prelude uses two: `Writer.failed` and `Reader.failed` both default to
+  an ordinary function. The library uses two: `Writer.failed` and `Reader.failed` both default to
   `false`.
 - **Properties as trait members (`02`).** A trait asks for one by dropping the body from `08`'s
   property form (`size -> int`), and an `impl` supplies it. A property has a receiver it never
@@ -281,7 +281,7 @@ before they appear and may be mutually recursive).
   program that prints only numbers builds no sink at all. A `Writer` **borrows** the bytes it is
   written — checked by escape analysis, which is what lets a renderer pass a slice of its own stack
   buffer through a trait object. A hole's format specifier travels to the `Display` it calls and is
-  **acted on** there: every prelude renderer pads through one `display_pad`, and an implementation
+  **acted on** there: every library renderer pads through one `display_pad`, and an implementation
   applies the same call to its own complete text.
 - **`Option[T]` / `Result[T, E]` and `?`.** Both come from the prelude as ordinary generic
   enums. The postfix `?` unwraps the success payload of one, or returns from the enclosing
@@ -451,7 +451,7 @@ arity.
    headed by a literal or a range drop out of it. The gap is reported as the values no row
    matches, written the way a pattern is. Guard expressions are evaluated after the pattern
    matches and its bindings are in scope, and a guarded arm is left out of the matrix entirely.
-7. **`print`'s renderers are the prelude's, not a `std` I/O surface**, and the desugaring picks a
+7. **`print`'s renderers are the library's, not a `std` I/O surface**, and the desugaring picks a
    *scalar's* by static type rather than through its `Display` — deliberately, so a program that
    prints only numbers builds no sink (`14 §8 b`). A related over-approximation shows up in the
    output: making a slice turns the ARC runtime on even where the owner is statically null, so a
@@ -502,7 +502,7 @@ arity.
     one — a field is layout, not behaviour — so it is settled at the definition (`10 §5`), and the
     diagnostic says so after finding that no trait declares a property of the name either.
 
-    A `FormatSpec` is now **acted on** as well as delivered. Every prelude renderer ends at one
+    A `FormatSpec` is now **acted on** as well as delivered. Every library renderer ends at one
     `display_pad`, so `f"${p}%8s"` puts a type's own text in a field of eight exactly as
     `f"${5}%8d"` does, and an implementation rendering parts pads its complete text with the same
     call. A specifier names the field the whole value occupies, so the parts are handed the neutral

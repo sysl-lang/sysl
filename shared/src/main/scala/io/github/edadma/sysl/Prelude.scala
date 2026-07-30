@@ -41,13 +41,6 @@ package io.github.edadma.sysl
  * status, which is what `11-error-handling.md` says a trap does under the `os` capability — and it
  * is the reason those two need no compiler support of their own.
  *
- * **`ByteSink` is the one writer supplied here**, and the reason it is supplied rather than left to
- * each program is `14 §2`'s rule that a specifier describes the field the *whole* value occupies: an
- * implementation rendering more than one part has to gather them before it can pad what they came
- * to, and gathering needs somewhere to put them. It is ordinary sysl over `Buf[u8]`, so it could not
- * be written at all until a `[]T` could be sized while running. The writer standing for standard
- * output stays the compiler's, because it holds no state and there is no struct with no fields.
- *
  * **The four operations that make new bytes** (`04`) are the rest of what a `string` can do, and
  * three of them are here rather than in the compiler because only the last line of each needs to be
  * underneath the language. `StrBuilder` gathers text and hands back one string, over the same
@@ -72,10 +65,13 @@ package io.github.edadma.sysl
  * that is not UTF-8 stops the program the way `unwrap` does, with the offset of the byte that made
  * it ill-formed — `04` puts that check at the boundary, and this is one.
  *
- * **The reading and text surfaces are in the standard module** — `Reader`, `FdReader` and `Lines`
- * on one side, `from_utf8`, `Utf8Error`, `Chars` and `char_from_u32` on the other — beside the
- * rendering surface and for the same reasons. What is left here is what they stand on: `sysl_read`
- * and `sysl_memchr` below, `Buf`, and the `Option` and `Result` their answers arrive in.
+ * **The reading, text and buffer surfaces are in the standard module** — `Reader`, `FdReader` and
+ * `Lines`; `from_utf8`, `Utf8Error`, `Chars` and `char_from_u32`; `Buf`, `buf` and the `ByteSink`
+ * every rendering gathers into — beside the rendering surface and for the same reasons. What is left
+ * here is what they stand on: `sysl_read` and `sysl_memchr` below, and the `Option` and `Result`
+ * their answers arrive in. `StrBuilder` and `args_of` above are written *against* the moved half,
+ * naming `Buf` and `from_utf8` without an import, because a name written in either part of the
+ * library is looked for among the library's own first.
  *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
@@ -315,95 +311,6 @@ object Prelude {
       |            print("panic:", msg)
       |            exit(1)
       |end Result
-      |
-      |struct Buf[T]
-      |    elems: []T
-      |    count: usize
-      |
-      |    len(self) -> usize = self.count
-      |
-      |    cap(self) -> usize = self.elems.len
-      |
-      |    is_empty(self) -> bool = self.count == 0usize
-      |
-      |    at(self, i: usize) -> T
-      |        if i >= self.count
-      |            print("panic: index", i, "past the", self.count, "elements of a Buf")
-      |            exit(1)
-      |        self.elems[i]
-      |    end at
-      |
-      |    set(*self, i: usize, v: T)
-      |        if i >= self.count
-      |            print("panic: index", i, "past the", self.count, "elements of a Buf")
-      |            exit(1)
-      |        self.elems[i] = v
-      |    end set
-      |
-      |    push(*self, v: T)
-      |        if self.count == self.elems.len
-      |            var bigger: []T = [v; if self.elems.len == 0usize then 8usize else self.elems.len * 2]
-      |
-      |            for i in 0..<self.count do bigger[i] = self.elems[i]
-      |
-      |            self.elems = bigger
-      |
-      |        self.elems[self.count] = v
-      |        self.count += 1usize
-      |    end push
-      |
-      |    pop(*self) -> Option[T]
-      |        if self.count == 0usize then return None
-      |
-      |        self.count -= 1usize
-      |        Some(self.elems[self.count])
-      |    end pop
-      |
-      |    truncate(*self, n: usize)
-      |        if n < self.count then self.count = n
-      |
-      |    clear(*self)
-      |        self.truncate(0usize)
-      |
-      |    remove(*self, i: usize) -> T
-      |        if i >= self.count
-      |            print("panic: index", i, "past the", self.count, "elements of a Buf")
-      |            exit(1)
-      |
-      |        var gone = self.elems[i]
-      |
-      |        for j in i..<self.count - 1usize
-      |            self.elems[j] = self.elems[j + 1usize]
-      |
-      |        self.truncate(self.count - 1usize)
-      |        gone
-      |    end remove
-      |
-      |    view(self) -> []T = self.elems[..<self.count]
-      |end Buf
-      |
-      |impl[T] Index[usize, T] for Buf[T]
-      |    index(self, i: usize) -> T = self.at(i)
-      |
-      |impl[T] IndexSet[usize, T] for Buf[T]
-      |    index_set(*self, i: usize, v: T) = self.set(i, v)
-      |
-      |buf[T]() -> Buf[T]
-      |    var b: Buf[T] = Buf([], 0usize)
-      |
-      |    b
-      |
-      |struct ByteSink
-      |    bytes: &Buf[u8]
-      |
-      |    text(self) -> []u8 = self.bytes.view()
-      |end ByteSink
-      |
-      |byte_sink() -> ByteSink = ByteSink(buf())
-      |
-      |impl Writer for ByteSink
-      |    write(*self, bytes: []u8)
-      |        for b in bytes do self.bytes.push(b)
       |
       |struct StrBuilder
       |    bytes: &Buf[u8]

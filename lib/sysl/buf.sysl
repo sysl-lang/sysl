@@ -1,0 +1,111 @@
+module sysl
+
+// A sequence that grows, over a `[]T` it replaces when it runs out.
+//
+// It is ordinary sysl rather than a built-in because a `[]T` that can be sized while running is all
+// it needs: `push` allocates a slice twice the size and copies, so the amortized cost is the one a
+// growable sequence has anywhere, and none of it is underneath the language.
+//
+// The bounds-checked members panic rather than returning an `Option`, which is the same bargain
+// `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
+// handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
+// asks on purpose.
+struct Buf[T]
+    elems: []T
+    count: usize
+
+    len(self) -> usize = self.count
+
+    cap(self) -> usize = self.elems.len
+
+    is_empty(self) -> bool = self.count == 0usize
+
+    at(self, i: usize) -> T
+        if i >= self.count
+            print("panic: index", i, "past the", self.count, "elements of a Buf")
+            exit(1)
+        self.elems[i]
+    end at
+
+    set(*self, i: usize, v: T)
+        if i >= self.count
+            print("panic: index", i, "past the", self.count, "elements of a Buf")
+            exit(1)
+        self.elems[i] = v
+    end set
+
+    push(*self, v: T)
+        if self.count == self.elems.len
+            var bigger: []T = [v; if self.elems.len == 0usize then 8usize else self.elems.len * 2]
+
+            for i in 0..<self.count do bigger[i] = self.elems[i]
+
+            self.elems = bigger
+
+        self.elems[self.count] = v
+        self.count += 1usize
+    end push
+
+    pop(*self) -> Option[T]
+        if self.count == 0usize then return None
+
+        self.count -= 1usize
+        Some(self.elems[self.count])
+    end pop
+
+    truncate(*self, n: usize)
+        if n < self.count then self.count = n
+
+    clear(*self)
+        self.truncate(0usize)
+
+    remove(*self, i: usize) -> T
+        if i >= self.count
+            print("panic: index", i, "past the", self.count, "elements of a Buf")
+            exit(1)
+
+        var gone = self.elems[i]
+
+        for j in i..<self.count - 1usize
+            self.elems[j] = self.elems[j + 1usize]
+
+        self.truncate(self.count - 1usize)
+        gone
+    end remove
+
+    // The elements as a slice, which is what everything reading a `Buf` in bulk goes through. It is
+    // a view of the storage rather than a copy, so it is only valid while nothing pushes.
+    view(self) -> []T = self.elems[..<self.count]
+end Buf
+
+// Subscripting reaches the bounds-checked members rather than the storage, so `b[i]` on a `Buf`
+// means what `b.at(i)` means and cannot read a slot past the count that the backing slice still has.
+impl[T] Index[usize, T] for Buf[T]
+    index(self, i: usize) -> T = self.at(i)
+
+impl[T] IndexSet[usize, T] for Buf[T]
+    index_set(*self, i: usize, v: T) = self.set(i, v)
+
+buf[T]() -> Buf[T]
+    var b: Buf[T] = Buf([], 0usize)
+
+    b
+
+// The one writer the library supplies, and the reason it is supplied rather than left to each
+// program is `14 §2`'s rule that a specifier describes the field the *whole* value occupies: an
+// implementation rendering more than one part has to gather them before it can pad what they came
+// to, and gathering needs somewhere to put them.
+//
+// The writer standing for standard output stays the compiler's, because it holds no state and there
+// is no struct with no fields.
+struct ByteSink
+    bytes: &Buf[u8]
+
+    text(self) -> []u8 = self.bytes.view()
+end ByteSink
+
+byte_sink() -> ByteSink = ByteSink(buf())
+
+impl Writer for ByteSink
+    write(*self, bytes: []u8)
+        for b in bytes do self.bytes.push(b)

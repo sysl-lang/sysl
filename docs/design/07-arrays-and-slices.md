@@ -145,7 +145,7 @@ reason.
 
 ## Growing one
 
-`Buf[T]` is the growable array, and it is **ordinary sysl in the prelude** rather than a type the
+`Buf[T]` is the growable array, and it is **ordinary sysl in the library** rather than a type the
 compiler knows: a `[]T` field for the storage, a count of how much of it is live, and `push`, `pop`,
 `remove`, `truncate`, `at`, `set`, `view`, `len`, `cap`, `is_empty`, `clear`. That it can be written at all is
 the interesting part, and it is what the section above bought.
@@ -232,7 +232,7 @@ safe; reaching for a pointer is how it talks to hardware and to C, and the langu
 rather than withholding the second.
 
 **A type with no elements of its own is indexed through a trait**, and everything above is about the
-built-in subscript rather than about `[]` as a token. A user type — the prelude's `Buf[T]`, a
+built-in subscript rather than about `[]` as a token. A user type — the library's `Buf[T]`, a
 lookup table, anything a program writes — implements `Index` and is read with the same syntax
 (`14 §7`). Two differences follow from its being a call rather than a walk to an address: the index
 is whatever the implementation takes and not necessarily an integer, and the element is **not** a
