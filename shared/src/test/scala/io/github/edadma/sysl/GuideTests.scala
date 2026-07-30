@@ -254,4 +254,21 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- the edges of the arithmetic",
     )
   }
+
+  "matrix — an operator whose result is neither operand's type" in {
+    val out = guide("matrix")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 47
+    sections(out) shouldBe List(
+      "-- the four products of a vector space",
+      "-- the algebra holds where the results differ",
+      "-- indexing through a trait",
+      "-- solving a system",
+      "-- determinant and rank",
+      "-- inverse",
+      "-- a system big enough that the walk is the point",
+      "-- sharing, and the copy that ends it",
+    )
+  }
 }

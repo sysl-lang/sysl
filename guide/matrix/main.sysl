@@ -1,0 +1,232 @@
+// Matrices and vectors over the reals, and Gaussian elimination on top of them.
+//
+// The axis this program owns: **an operator whose result is neither operand's type.** A vector space
+// is the smallest honest example — `v * w` is a number, `A * v` is a vector, `A * B` is a matrix, and
+// `A * 2.0` is a matrix again — and until `14 §7` carried the result as a trait argument only the last
+// two of those four were spellable. The other two became methods, so an expression that is one line
+// of linear algebra read as a mixture of operators and calls.
+//
+// See `vec.sysl` and `mat.sysl` for the algebra and `gauss.sysl` for the elimination.
+//
+// WHAT THIS PROGRAM FOUND
+//
+// 1. The feature it was written for went in cleanly, and that is itself the report. Four
+//    implementations of `Mul` across two types — `Vector * Vector -> real`, `Matrix * Vector ->
+//    Vector`, `Matrix * Matrix -> Matrix`, and both scalings — are selected by the right operand and
+//    nothing else, and the line that composes all four reads as arithmetic. The rule that made it
+//    affordable is that **the result does not select**: a use writes the operands, so two
+//    implementations agreeing on them are refused where they are written rather than ranked at the
+//    use.
+//
+// 2. **An enum carries no equality.** `e == Singular` on this program's own three-variant `Fail` is
+//    refused, so `gauss.sysl` writes `is_singular` / `is_not_square` / `is_shape_mismatch` — three
+//    functions whose whole content is a two-armed match. `14 §7` records this with an `Option[T]` as
+//    its customer and calls it a catalog omission awaiting a decision about the whole family; a bare
+//    enum is the same gap with no generics in it, which makes the family smaller than the item
+//    assumes. The workaround costs three functions per enum a caller wants to branch on.
+//
+// 3. **A vector is a handle, and the type cannot say otherwise.** `Vector` and `Matrix` hold a
+//    `&Buf[real]`, so assigning one shares the numbers — see the last section, which pins the
+//    behaviour rather than complaining about it. The alternative is a fixed `[N]real`, which a type
+//    whose size is a runtime value cannot have (`07 § Not yet`, the bound-that-promises-a-value item).
+//    So a numerical type gets ARC sharing plus a named `copy`, which is exactly the bargain `04`
+//    strikes for a string, and the elimination has to copy defensively. Nothing here is wrong; it is
+//    worth recording that the value-semantics matrix a numerical library would want is not writable.
+
+section(name: string)
+    print("")
+    print("-- " + name)
+
+fail(what: string)
+    print("FAIL " + what)
+
+check(cond: bool, what: string)
+    if cond then print("ok " + what) else fail(what)
+
+const eps: real = 0.000000001
+
+close(a: real, b: real) -> bool = magnitude(a - b) < eps
+
+section("the four products of a vector space")
+
+var v = vector([1.0, 2.0, 3.0])
+var w = vector([4.0, 5.0, 6.0])
+
+// 1*4 + 2*5 + 3*6. The result is a `real`, and the expression says so by being usable as one.
+check(close(v * w, 32.0), "a dot product is an operator and yields a scalar")
+check(close(v * v, 14.0), "and a vector against itself is its squared length")
+check(close(v.norm(), 14.0), "which is what 'norm' is written as")
+
+var scaled = v * 2.0
+
+check(scaled.near(vector([2.0, 4.0, 6.0]), eps), "the same '*' scales, and yields a vector")
+
+var a = matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+var av = a * v
+
+check(av.near(vector([14.0, 32.0]), eps), "a matrix applied to a vector yields a vector")
+
+var b = matrix(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+var ab = a * b
+
+check(ab.near(matrix(2, 2, [22.0, 28.0, 49.0, 64.0]), eps), "a matrix times a matrix yields a matrix")
+
+var twice = a * 2.0
+
+check(twice.near(matrix(2, 3, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]), eps), "and a matrix scales")
+
+// Four implementations of one trait across two types, and every one of them was selected by the type
+// of the right operand alone. This is the line the program exists to be able to write.
+check(close((a * b * vector([1.0, 1.0])) * vector([1.0, 1.0]), 163.0), "the four compose in one expression")
+
+section("the algebra holds where the results differ")
+
+check((v + w).near(vector([5.0, 7.0, 9.0]), eps), "addition is componentwise")
+check((w - v).near(vector([3.0, 3.0, 3.0]), eps), "so is subtraction")
+check((-v).near(vector([-1.0, -2.0, -3.0]), eps), "negation has no right operand to select with")
+
+check(close(v * w, w * v), "the dot product is symmetric")
+check(close((v + w) * v, v * v + w * v), "and distributes over addition")
+check(close((v * 2.0) * w, (v * w) * 2.0), "scaling commutes with it")
+
+var i3 = identity(3)
+
+check((i3 * v).near(v, eps), "the identity fixes every vector")
+check((a * i3).near(a, eps), "and is a right unit for a matrix")
+check((identity(2) * a).near(a, eps), "and a left unit at the other shape")
+
+var t = a.transpose()
+
+check(t.rows == 3 && t.cols == 2, "a transpose swaps the shape")
+check(close((a * v) * vector([1.0, 1.0]), v * (t * vector([1.0, 1.0]))),
+    "and moves across a product, which is two of the four operators agreeing")
+
+section("indexing through a trait")
+
+check(close(v[0], 1.0) && close(v[2], 3.0), "a vector reads by one index")
+check(close(a[(1, 2)], 6.0), "a matrix reads by a pair")
+
+var mutable = v.copy()
+
+mutable[1] = 20.0
+
+check(close(mutable[1], 20.0), "and writes through the same spelling")
+check(close(v[1], 2.0), "the copy is what kept the original out of it")
+
+section("solving a system")
+
+// 2x + y - z = 8 ; -3x - y + 2z = -11 ; -2x + y + 2z = -3, whose solution is (2, 3, -1).
+var m = matrix(3, 3, [2.0, 1.0, -1.0, -3.0, -1.0, 2.0, -2.0, 1.0, 2.0])
+var rhs = vector([8.0, -11.0, -3.0])
+
+solve(m, rhs) match
+    Ok(x) ->
+        check(x.near(vector([2.0, 3.0, -1.0]), eps), "elimination finds the solution")
+        check((m * x).near(rhs, eps), "and the residual confirms it, through the operator")
+    Err(e) -> fail("elimination finds the solution: " + describe(e))
+
+// The pivot at (0,0) is zero, so a naive elimination divides by it. Partial pivoting is what makes
+// this an ordinary system rather than a failure.
+var needsPivot = matrix(3, 3, [0.0, 2.0, 1.0, 1.0, -1.0, 3.0, 2.0, 1.0, 1.0])
+
+solve(needsPivot, vector([5.0, 4.0, 5.0])) match
+    Ok(x) -> check((needsPivot * x).near(vector([5.0, 4.0, 5.0]), eps), "a zero pivot is swapped away")
+    Err(e) -> fail("a zero pivot is swapped away: " + describe(e))
+
+// One equation is twice another, so the matrix has no inverse and elimination must say so rather than
+// divide by a pivot that rounding left near zero.
+var singular = matrix(2, 2, [1.0, 2.0, 2.0, 4.0])
+
+solve(singular, vector([3.0, 6.0])) match
+    Ok(_) -> fail("a singular system is refused")
+    Err(e) -> check(is_singular(e), "a singular system is refused")
+
+solve(matrix(2, 3, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), vector([1.0, 1.0])) match
+    Ok(_) -> fail("a system that is not square is refused")
+    Err(e) -> check(is_not_square(e), "a system that is not square is refused")
+
+solve(m, vector([1.0, 2.0])) match
+    Ok(_) -> fail("a right-hand side of the wrong length is refused")
+    Err(e) -> check(is_shape_mismatch(e), "a right-hand side of the wrong length is refused")
+
+section("determinant and rank")
+
+check(close(det(identity(4)), 1.0), "the identity has determinant one")
+check(close(det(m), -1.0), "a determinant comes out of the same elimination")
+check(close(det(singular), 0.0), "a singular matrix has determinant zero")
+
+// Swapping two rows negates the determinant, which is the property the pivoting has to preserve — and
+// the one a sign the elimination forgot to track would get wrong.
+var swapped = matrix(3, 3, [-3.0, -1.0, 2.0, 2.0, 1.0, -1.0, -2.0, 1.0, 2.0])
+
+check(close(det(swapped), 1.0), "and a row swap negates it")
+check(close(det(m * swapped), det(m) * det(swapped)), "det is multiplicative, through the operator")
+
+check(rank(m) == 3, "a full-rank matrix has rank equal to its size")
+check(rank(singular) == 1, "and a dependent row costs exactly one")
+check(rank(zero_matrix(3, 3)) == 0, "the zero matrix has rank zero")
+check(rank(matrix(2, 3, [1.0, 2.0, 3.0, 2.0, 4.0, 6.0])) == 1, "rank does not need a square matrix")
+
+section("inverse")
+
+inverse(m) match
+    Ok(inv) ->
+        check((m * inv).near(identity(3), eps), "an inverse times its matrix is the identity")
+        check((inv * m).near(identity(3), eps), "on both sides")
+
+        // Solving by inverting must agree with solving by elimination, and they are different
+        // arithmetic — this is the check that would catch a sign or an index error in either.
+        check((inv * rhs).near(vector([2.0, 3.0, -1.0]), eps), "and solves the system it came from")
+    Err(e) -> fail("an inverse times its matrix is the identity: " + describe(e))
+
+inverse(singular) match
+    Ok(_) -> fail("a singular matrix has no inverse")
+    Err(e) -> check(is_singular(e), "a singular matrix has no inverse")
+
+section("a system big enough that the walk is the point")
+
+// A 12x12 system whose answer is known by construction: fill a matrix that is diagonally dominant (so
+// it is certainly invertible), pick an `x`, and solve for the `b` it produces.
+var n = 12
+var big = zero_matrix(n, n)
+
+for i in 0..<n
+    for j in 0..<n
+        big.set(i, j, if i == j then real(n) + 1.0 else 1.0 / real(i + j + 1))
+
+var want = zeros(n)
+
+for i in 0..<n do want.set(i, real(i) - 5.5)
+
+var produced = big * want
+
+solve(big, produced) match
+    Ok(got) -> check(got.near(want, 0.000001), "a 12x12 system recovers the vector it was built from")
+    Err(e) -> fail("a 12x12 system recovers the vector it was built from: " + describe(e))
+
+check(magnitude(det(big)) > 1.0, "and its determinant is nowhere near zero")
+
+section("sharing, and the copy that ends it")
+
+// A `Vector` is a handle, so this is the hazard `04` documents for a string, in the one place a
+// numerical program would meet it: elimination writes into rows, so it must be given a copy.
+var original = vector([1.0, 2.0, 3.0])
+var shared = original
+
+shared.set(0, 99.0)
+
+check(close(original.at(0), 99.0), "assigning a vector shares its numbers")
+
+var separate = original.copy()
+
+separate.set(0, 1.0)
+
+check(close(original.at(0), 99.0), "and 'copy' is what stops the sharing")
+
+// The elimination is the customer: it must not consume the matrix it was asked about, or the residual
+// check above would have been comparing the answer against its own workings.
+var before = m.at(0, 0)
+
+solve(m, rhs) match
+    Ok(_) -> check(close(m.at(0, 0), before), "solving leaves the matrix it was given alone")
+    Err(_) -> fail("solving leaves the matrix it was given alone")

@@ -1,0 +1,149 @@
+// Vectors over the reals — the half of a vector space whose operators return a *scalar*.
+//
+// This file exists for one line of `14 §1`: an operator trait's result is an argument, so `v * w`
+// may be a `real` while `v * 2.0` is a `Vector`. Both are `Mul` on `Vector`, told apart by the type
+// of the right operand and by nothing else, and each says what it gives back. Written with the
+// result fixed to `Self` the first of them is unspellable, and a dot product becomes a method while
+// scaling stays an operator — which is the split this program was chosen to test.
+//
+// A `Vector` is a struct of a length and a `&Buf[real]`, so it is a *handle*: assigning one shares
+// the numbers and costs a retain. Every operator below therefore builds a fresh vector rather than
+// writing into either operand, and the one place that does write in place says so in its name
+// (`set`). `copy` is how a caller stops sharing, which is the same bargain `04` strikes for a
+// string: the operation that copies is named, and the sharing is documented rather than encoded.
+
+private extern "sqrt" c_sqrt(x: f64) -> f64
+private extern "fabs" c_fabs(x: f64) -> f64
+
+// The reals have no `abs` of their own — `Neg` is a trait and absolute value is not — so this is the
+// libc one under a name the rest of the program reads better with.
+magnitude(x: real) -> real = c_fabs(x)
+
+struct Vector
+    n: int
+    cells: &Buf[real]
+
+    at(self, i: int) -> real = self.cells.at(usize(i))
+
+    set(*self, i: int, v: real) = self.cells.set(usize(i), v)
+
+    // The squared length, which is what a comparison wants: taking the root and squaring it again
+    // loses accuracy for nothing. `self * self` is the dot product declared below — the first place
+    // this program relies on a `*` whose result is not its operands' type.
+    norm(self) -> real = self * self
+
+    len(self) -> real = c_sqrt(self.norm())
+
+    copy(self) -> Vector
+        var out = zeros(self.n)
+
+        for i in 0..<self.n do out.set(i, self.at(i))
+
+        out
+    end copy
+
+    // Floating point makes equality the wrong question almost everywhere, so this is the one the
+    // checks actually ask.
+    near(self, rhs: Vector, eps: real) -> bool
+        if self.n != rhs.n then return false
+
+        for i in 0..<self.n
+            if magnitude(self.at(i) - rhs.at(i)) > eps then return false
+
+        true
+    end near
+
+    text(self) -> string
+        var out = "("
+
+        for i in 0..<self.n
+            if i > 0 then out += ", "
+            out += str(self.at(i))
+
+        out + ")"
+    end text
+end Vector
+
+zeros(n: int) -> Vector
+    var cells: Buf[real] = buf()
+
+    for i in 0..<n do cells.push(0.0)
+
+    Vector(n, cells)
+
+// A vector from the numbers a program wrote, which is what every check below is built out of.
+vector(xs: []real) -> Vector
+    var out = zeros(int(xs.len))
+
+    for i in 0..<int(xs.len) do out.set(i, xs[i])
+
+    out
+
+// The `i`th standard basis vector, which is what a matrix's columns are read out with.
+basis(n: int, i: int) -> Vector
+    var out = zeros(n)
+
+    out.set(i, 1.0)
+    out
+
+impl Add for Vector
+    add(self, rhs: Vector) -> Vector
+        require self.n == rhs.n, "vectors added must have the same length"
+
+        var out = zeros(self.n)
+
+        for i in 0..<self.n do out.set(i, self.at(i) + rhs.at(i))
+
+        out
+    end add
+
+impl Sub for Vector
+    sub(self, rhs: Vector) -> Vector
+        require self.n == rhs.n, "vectors subtracted must have the same length"
+
+        var out = zeros(self.n)
+
+        for i in 0..<self.n do out.set(i, self.at(i) - rhs.at(i))
+
+        out
+    end sub
+
+impl Neg for Vector
+    neg(self) -> Vector
+        var out = zeros(self.n)
+
+        for i in 0..<self.n do out.set(i, -self.at(i))
+
+        out
+    end neg
+
+// The dot product: two vectors in, one **real** out. `Mul[Vector, real]` — the operands select the
+// implementation and the implementation says the result, so this and the scaling below are one
+// operator on one type.
+impl Mul[Vector, real] for Vector
+    mul(self, rhs: Vector) -> real
+        require self.n == rhs.n, "vectors multiplied must have the same length"
+
+        var total = 0.0
+
+        for i in 0..<self.n do total += self.at(i) * rhs.at(i)
+
+        total
+    end mul
+
+// Scaling, whose result *is* a vector. Nothing but the right operand's type tells this from the dot
+// product above, and nothing needs to.
+impl Mul[real, Vector] for Vector
+    mul(self, k: real) -> Vector
+        var out = zeros(self.n)
+
+        for i in 0..<self.n do out.set(i, self.at(i) * k)
+
+        out
+    end mul
+
+impl Index[int, real] for Vector
+    index(self, i: int) -> real = self.at(i)
+
+impl IndexSet[int, real] for Vector
+    index_set(*self, i: int, v: real) = self.set(i, v)
