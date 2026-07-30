@@ -696,20 +696,23 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
     }
 
     "no part of the cursor is emitted" in {
-      val ir = Compiler.compileToLlvm("print(1)", "<input>").getOrElse(fail("the prelude broke"))
+      // Every name here is read off the seam, and a **negative** assertion is where that matters
+      // most: a spelled `@find_byte` would go on passing after the declaration moved and the symbol
+      // became `@sysl$find_byte` — vacuously, testing nothing, with nothing to say it had stopped.
+      val ir = Compiler.compileToLlvm("print(1)", "<input>").getOrElse(fail("the library broke"))
 
-      ir should not include "@getline"
-      ir should not include "@find_byte"
-      ir should not include "@lines"
+      ir should not include s"@${Library.key("Lines")}.getline"
+      ir should not include s"@${Library.key("find_byte")}("
+      ir should not include s"@${Library.key("lines")}("
     }
 
-    // The one thing that *is* paid: a non-generic type declared in the prelude gets its layout line
+    // The one thing that *is* paid: a non-generic type the library declares gets its layout line
     // whether or not anything reaches it. It names no storage and emits no instruction.
-    "only the layout of the types is, which is what the prelude says it costs" in {
-      val ir = Compiler.compileToLlvm("print(1)", "<input>").getOrElse(fail("the prelude broke"))
+    "only the layout of the types is, which is what the library says it costs" in {
+      val ir = Compiler.compileToLlvm("print(1)", "<input>").getOrElse(fail("the library broke"))
 
-      ir should include("%struct.FdReader = type")
-      ir should include("%struct.Lines = type")
+      ir should include(s"%struct.${Library.key("FdReader")} = type")
+      ir should include(s"%struct.${Library.key("Lines")} = type")
     }
 
     "and the platform's read arrives the moment something asks for it" in {

@@ -82,48 +82,10 @@ package io.github.edadma.sysl
  * that is not UTF-8 stops the program the way `unwrap` does, with the offset of the byte that made
  * it ill-formed — `04` puts that check at the boundary, and this is one.
  *
- * **`Reader` is the input half of the byte surface**, and it is here for the same reason `Writer` is:
- * a program that reads has to name what it reads from, and naming it once is what keeps two
- * mechanisms — and so two buffers, and bytes arriving in the wrong order — from growing. It is
- * `Writer` turned around, down to the `failed` latch and its `false` default, so a source that
- * cannot fail says nothing about failing.
- *
- * `read` hands back **the prefix of `into` that was filled** rather than a count, because a slice
- * already *is* a count and a pointer: the length is `got.len` and there is no way to be handed one
- * and forget to apply it to the other. Returning empty says end of input and nothing more — whether
- * input *ended badly* is what `failed` is for, and the two questions are separate because a caller
- * that does not care should not have to ask.
- *
- * **`Lines` borrows its reader rather than owning it**, which is not a preference: a `for` loop
- * iterates a *copy* of the iterator, so a `Lines` holding an `FdReader` by value would latch its
- * failure on a copy the caller cannot reach, and `failed` would be decorative. Holding a `*Reader`
- * leaves the reader in the caller's hands, which is exactly what makes `r.failed()` answerable after
- * the loop has ended. It costs a line at the call site — the reader has to be named — and buys the
- * only question worth asking once reading has stopped.
- *
- * A line is found with `memchr` rather than a byte loop because libc's reads a word at a time and
- * sysl's could not, and it is reached through `find_byte`, which is the whole of what pointer
- * difference is for: `memchr` answers *where* with an address, and an index is that address minus
- * the first. `Lines` scans **the buffer in place** and copies nothing for a line that fits in one
- * read; only a line that spans two reads is gathered, into a `Buf[u8]` that is then reused, so the
- * cost is proportional to the input rather than to the input times the number of refills.
- *
- * What it scans is **the slice `read` handed back**, not the one it offered. Those are the same
- * memory for a reader that fills what it was given, and the distinction costs nothing — but it is
- * what lets a reader hand back a view of a buffer of *its own*, never touching the offered one, and
- * still be read correctly. Taking a *length* from the answer and the *bytes* from the offer is how
- * the two could have disagreed, and there is now nowhere for them to.
- *
- * An empty read ends the cursor for good. That is right for the sources `read(2)` serves, where zero
- * means end of file and a failure arrives as `-1` instead — so nothing is being conflated, and a
- * caller wanting to read again past the end gets `None` every time rather than a second chance.
- *
- * `getline` yields a `string`, so the bytes are **validated where they arrive** — `04` puts the check
- * at the boundary and this is one — and ill-formed input stops the program the way an ill-formed
- * argument does. That is the right severity *because* the layer underneath is public: a caller who
- * would rather inspect than trap reads bytes through `Reader` and validates them itself, which is
- * what having the two layers is for. A trailing `\r` goes with the `\n`, so input written on one
- * system reads the same on the other, which is `bufio.Scanner`'s choice rather than C `getline`'s.
+ * **The reading surface is in the standard module** — `Reader`, `FdReader`, `Lines` and the
+ * functions around them — beside the rendering surface and for the same reasons. What is left here
+ * is what it stands on: `sysl_read` and `sysl_memchr` below, `from_utf8`, `Buf`, and the `Option`
+ * a line arrives in.
  *
  * **`char_from_u32` is the fallible half of `u32` → `char`** (`00 §1`), and it is a free function
  * for the reason `from_utf8` is one: a scalar has no member namespace to hang a `char.try` on. It
@@ -261,10 +223,6 @@ object Prelude {
       |    for b in s.bytes
       |        h = (h ^ u64(b)) * 0x100000001b3u64
       |    h
-      |
-      |trait Reader
-      |    read(*self, into: []u8) -> []u8
-      |    failed(*self) -> bool = false
       |
       |impl[A: Eq, B: Eq] Eq for (A, B)
       |    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1
@@ -640,97 +598,6 @@ object Prelude {
       |
       |    out.view()
       |
-      |find_byte(b: []u8, c: u8) -> Option[usize]
-      |    if b.len == 0usize then return None
-      |
-      |    var hit = sysl_memchr(&b[0], int(c), b.len)
-      |
-      |    if hit == null then None else Some(usize(hit - &b[0]))
-      |
-      |struct FdReader
-      |    fd: int
-      |    bad: bool
-      |end FdReader
-      |
-      |fd_reader(fd: int) -> FdReader = FdReader(fd, false)
-      |
-      |stdin() -> FdReader = fd_reader(0)
-      |
-      |impl Reader for FdReader
-      |    read(*self, into: []u8) -> []u8
-      |        if into.len == 0usize then return into
-      |
-      |        var k = sysl_read(self.fd, &into[0], into.len)
-      |
-      |        if k < 0isize then self.bad = true
-      |        if k <= 0isize then return into[0..<0usize]
-      |
-      |        into[0..<usize(k)]
-      |    end read
-      |
-      |    failed(*self) -> bool = self.bad
-      |
-      |line_text(b: []u8) -> string
-      |    var n = if b.len > 0usize && b[b.len - 1usize] == 13u8 then b.len - 1usize else b.len
-      |
-      |    from_utf8(b[0..<n]) match
-      |        Ok(s) -> s
-      |        Err(e) ->
-      |            print("panic: a line read from input is not UTF-8 at byte", e.offset, "of the line")
-      |            exit(1)
-      |
-      |struct Lines
-      |    src: *Reader
-      |    chunk: []u8
-      |    have: []u8
-      |    at: usize
-      |    held: &Buf[u8]
-      |    done: bool
-      |
-      |    getline(*self) -> Option[string]
-      |        loop
-      |            var rest = self.have[self.at..]
-      |
-      |            find_byte(rest, 10u8) match
-      |                Some(i) ->
-      |                    self.at += i + 1usize
-      |
-      |                    if self.held.is_empty() then return Some(line_text(rest[0..<i]))
-      |
-      |                    for b in rest[0..<i] do self.held.push(b)
-      |                    return Some(self.held_line())
-      |                None -> ()
-      |
-      |            for b in rest do self.held.push(b)
-      |            self.at = self.have.len
-      |
-      |            if self.done
-      |                if self.held.is_empty() then return None
-      |
-      |                return Some(self.held_line())
-      |
-      |            self.refill()
-      |    end getline
-      |
-      |    held_line(*self) -> string
-      |        var s = line_text(self.held.view())
-      |
-      |        self.held.clear()
-      |        s
-      |    end held_line
-      |
-      |    refill(*self)
-      |        self.have = self.src.read(self.chunk)
-      |        self.at = 0usize
-      |
-      |        if self.have.len == 0usize then self.done = true
-      |    end refill
-      |end Lines
-      |
-      |impl Iterate[string] for Lines
-      |    next(*self) -> Option[string] = self.getline()
-      |
-      |lines(r: *Reader) -> Lines = Lines(r, [0u8; 4096], [], 0usize, buf(), false)
       |""".stripMargin
 
   /** The source the prelude's own declarations point into, so a diagnostic against one quotes the

@@ -439,6 +439,58 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "a moved surface a program is expected to build on" - {
+
+    "a program may declare a 'Reader' of its own, and the library's cursor still means the library's" in {
+      // `Lines.src` is a `*Reader`, and it is the library's `Reader` by the word wherever `Lines`
+      // was written. A program that declares an input abstraction of its own — which is a name a
+      // program plausibly wants — does not thereby change what a line cursor reads through.
+      run(
+        """trait Reader
+          |    poll(self) -> int
+          |
+          |struct Tick
+          |    n: int
+          |
+          |impl Reader for Tick
+          |    poll(self) -> int = self.n
+          |
+          |struct Bytes
+          |    src: []u8
+          |    at: usize
+          |
+          |impl sysl.Reader for Bytes
+          |    read(*self, into: []u8) -> []u8
+          |        var n = self.src.len - self.at
+          |        if n > into.len then n = into.len
+          |        for i in 0usize..<n do into[i] = self.src[self.at + i]
+          |        self.at += n
+          |        into[0..<n]
+          |
+          |var b = Bytes("a\nbb\n".bytes, 0usize)
+          |var r: *sysl.Reader = &b
+          |for line in lines(r) do print(line, Tick(3).poll())
+          |""".stripMargin) shouldBe "a 3\nbb 3\n"
+    }
+
+    "and a sink of the program's own is refused where the library's reader is asked for" in {
+      refused(
+        """trait Reader
+          |    poll(self) -> int
+          |
+          |struct Tick
+          |    n: int
+          |
+          |impl Reader for Tick
+          |    poll(self) -> int = self.n
+          |
+          |var t: Tick
+          |var r: *Reader = &t
+          |for line in lines(r) do print(line)
+          |""".stripMargin) should include("sysl.Reader")
+    }
+  }
+
   "the standard module is the library's, and a program may not add to it" - {
 
     "a file declaring it is refused" in {
