@@ -205,7 +205,11 @@ trait CallAnalysis extends OperatorCalls {
     if args.length != 1 then
       err(s"'$shown' takes exactly one integer argument")
     val t = analyzeExpr(args.head, Some(en.underlying))
-    if !t.ty.isInstanceOf[Type.Integer] then
+    // Asked of `repr` rather than of the written type, because a **transparent** subtype *is* its
+    // base (`16 §1`) and its values flow where the base's do. `repr` strips exactly that and leaves
+    // a `new` derivation standing, which is the other half of the same rule: a derived type does not
+    // mix with its base, so `Color(m)` on a `Meters` is still the written `Color(int(m))`.
+    if !Type.repr(t.ty).isInstanceOf[Type.Integer] then
       err(s"'$shown' converts an integer, but the value has type ${show(t.ty)}")
     (en, t)
   }

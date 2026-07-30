@@ -18,6 +18,40 @@ class EnumConversionRunTests extends AnyFreeSpec with RunSupport {
       |    Yellow
       |""".stripMargin
 
+  /** `16 §1` makes a **transparent** subtype *the same type as* its base, with values flowing
+   * between them freely, and `§2` makes a `new` derivation a distinct type that does not. The
+   * conversion asked the written type whether it was an integer, so it refused the first along with
+   * the second — found by the audit that follows a merge, not by anything failing.
+   */
+  "the integer a checked cast takes may be a transparent subtype, which is its base" in {
+    val src = color +
+      """type Small = int within 0..2
+        |var s: Small = 1
+        |print(int(Color(s)))""".stripMargin
+
+    run(src) shouldBe "1\n"
+  }
+
+  "and the fallible constructor takes one too, sharing the same gate" in {
+    val src = color +
+      """type Small = int within 0..2
+        |var s: Small = 1
+        |Color.try(s) match
+        |    Some(c) -> print(int(c))
+        |    None -> print("none")""".stripMargin
+
+    run(src) shouldBe "1\n"
+  }
+
+  "while a 'new' derivation is a type of its own, and says so" in {
+    val src = color +
+      """type Tag = new int
+        |var t = Tag(1)
+        |print(int(Color(t)))""".stripMargin
+
+    a[Exception] should be thrownBy run(src)
+  }
+
   "enum to integer is total, each variant yielding its discriminant" in {
     val src = color +
       """print(int(Red), int(Green), int(Blue), int(Yellow))""".stripMargin

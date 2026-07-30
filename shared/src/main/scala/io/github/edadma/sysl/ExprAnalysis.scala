@@ -410,8 +410,11 @@ trait ExprAnalysis
       // What has to hold is that the result can be stored back. A constrained place is the one case
       // where the arithmetic's type and the place's legitimately differ — a transparent subtype
       // computes at its base — so the test is on the representation the two share, and what the
-      // difference costs is the check `constraintOf` asks for.
-      if d.isEmpty && Type.repr(arithType(binSym, place.ty, tv.ty)) != Type.repr(place.ty) then
+      // difference costs is the check `constraintOf` asks for. `disagree` is that comparison plus
+      // the suppression a poisoned type wants: a place whose type could not be worked out has been
+      // complained about once already, and saying its `+=` changes a type is a second complaint
+      // about the consequence.
+      if d.isEmpty && disagree(arithType(binSym, place.ty, tv.ty), place.ty) then
         err(s"'$op' would change the type of ${describe(target)}")
 
       withInvCheck(place, TUpdate(place, op, tv, place.ty, d, constraintOf(place.ty)))

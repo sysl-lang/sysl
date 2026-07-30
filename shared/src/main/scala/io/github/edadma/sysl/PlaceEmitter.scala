@@ -414,7 +414,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * value at the enum's underlying width, which is the enum's representation.
    */
   protected def genEnumFromInt(value: TExpr, en: Type.Enum): String = {
-    val vt = value.ty.asInstanceOf[Type.Integer]
+    // Through `repr`, because a transparent subtype *is* its base (`16 §1`) and the analyzer admits
+    // one here on exactly that ground — the value is laid out as the base and converts as it.
+    val vt = Type.repr(value.ty).asInstanceOf[Type.Integer]
     val v  = genExpr(value)
     trapUnless(enumMembership(en, vt, v), "enum")
     convert(vt, en.underlying, v)
@@ -426,7 +428,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    */
   protected def genEnumTry(value: TExpr, en: Type.Enum, optTy: Type.Enum,
                          some: Type.EnumVariant, none: Type.EnumVariant): String = {
-    val vt    = value.ty.asInstanceOf[Type.Integer]
+    val vt    = Type.repr(value.ty).asInstanceOf[Type.Integer]
     val v     = genExpr(value)
     val ok    = enumMembership(en, vt, v)
     val slot  = emitAlloca(freshTemp(), optTy.llvm)

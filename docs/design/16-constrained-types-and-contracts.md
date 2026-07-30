@@ -146,6 +146,17 @@ is not a `Small` and does not have to be, since what has to be in range is the p
 product is checked where it is stored. A **derived** subtype is its own representation, so it mixes
 with the base only through the cast §2 requires, and its results are its own and checked as §4 says.
 
+**The operations are the base's; their *overflow* is not.** Raw integer arithmetic wraps, and a
+wrapped result reaching a produce site is a wrong answer the range check can pass without noticing:
+on a `Slot = u8 within 0..<200`, `Slot(150) + Slot(150)` is 300, which wraps to 44, which is in
+range. So where an operand came through a `within` type and the operands' declared ranges permit a
+result the base width cannot hold, `+`, `-` and `*` are overflow-detecting and trap. A range narrow
+enough that its results always fit stays on the plain instruction, so a counter, an index, and an
+`x + 1` cost exactly what they did before. A left shift is checked on its own terms — it has no
+overflow intrinsic, so a bit pushed out of the top is caught by shifting back, and a shift amount at
+or past the width traps rather than being undefined. Raw integer arithmetic, on a type with no range,
+still wraps.
+
 What the base does not have, the subtype does not either, and the diagnostic names the subtype: unary
 `-` over an unsigned base, `~` over a float, `++` over a float or a `char`.
 
