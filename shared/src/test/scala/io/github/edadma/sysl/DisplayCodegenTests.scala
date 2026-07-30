@@ -56,8 +56,12 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "hands the value, the sink, and the specifier to the type's own display" in {
+      // The specifier's emitted type name **is** its key, as every emitted name is, so it is read
+      // off the seam rather than spelled here — and goes on saying the same thing after a move.
+      val spec = "%struct\\." + Library.key("FormatSpec").replace("$", "\\$")
+
       irMain(point + "print(Point(1, 2))") should include regex
-        """call void @Point\.display\(%struct\.Point %t\d+, \{ ptr, ptr \} %t\d+, %struct\.FormatSpec %t\d+\)"""
+        s"""call void @Point\\.display\\(%struct\\.Point %t\\d+, \\{ ptr, ptr \\} %t\\d+, $spec %t\\d+\\)"""
     }
 
     "reaches standard output through the prelude's own byte sink" in {

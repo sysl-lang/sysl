@@ -12,7 +12,7 @@ import org.scalatest.matchers.should.Matchers
  * pinned here: the names written down in `Library.known`, and the renderer and mixer names
  * `CoreTraits` chooses per type, which are not written down anywhere and so are gathered by asking it.
  */
-class LibraryTests extends AnyFreeSpec with Matchers {
+class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
   /** A program's own declarations, to be told from the library's. */
   private def parsed(src: String): List[Stmt] =
@@ -46,16 +46,51 @@ class LibraryTests extends AnyFreeSpec with Matchers {
 
   "a key and the spelling it stands for" - {
 
-    "a spelling makes the key the tables hold it under" in {
-      Library.key("Option") shouldBe Modules.qualify(Library.module, "Option")
+    "a spelling the prelude still holds makes the key it is filed under" in {
+      Library.key("Option") shouldBe "Option"
+      Modules.moduleOf(Library.key("Option")) shouldBe Modules.root
     }
 
-    "and the key gives the spelling back" in {
+    "a spelling the standard module holds makes that module's key" in {
+      // The whole of what moving a declaration does, seen from the one place that answers for it.
+      Library.key("FormatSpec") shouldBe Modules.qualify(Std.module, "FormatSpec")
+    }
+
+    "and the key gives the spelling back, from either part" in {
       Library.spelling(Library.key("Option")) shouldBe Some("Option")
+      Library.spelling(Library.key("FormatSpec")) shouldBe Some("FormatSpec")
     }
 
     "a key belonging to another module has no library spelling" in {
       Library.spelling(Modules.qualify("geom", "Option")) shouldBe None
+    }
+
+    "and neither has a program's own root-module declaration of a name that has moved" in {
+      // A program may write `struct FormatSpec` now, and it is keyed `FormatSpec` — which is where
+      // the library's used to be. Asking which module a key is in would call that one the library's;
+      // asking whether it is the key the library gives that spelling does not.
+      Library.spelling("FormatSpec") shouldBe None
+    }
+  }
+
+  "the standard module the library is being drained into" - {
+
+    "says in its header what `Std.module` says" in {
+      // `module` is a constant so that nothing has to parse to ask which module a name is in. This
+      // is what holds it to the source it stands for.
+      Std.parsed.module.map(_.show) shouldBe Some(Std.module)
+    }
+
+    "declares what it declares, and the prelude no longer does" in {
+      Std.decls should not be empty
+      Std.decls.forall(Library.owns) shouldBe true
+      Prelude.decls.exists(Std.declares) shouldBe false
+      Std.decls.exists(Prelude.declares) shouldBe false
+    }
+
+    "is a module every file may write the names of without importing it" in {
+      Library.modules should contain(Std.module)
+      AutoImport.modules should contain(Std.module)
     }
   }
 
@@ -140,13 +175,122 @@ class LibraryTests extends AnyFreeSpec with Matchers {
       ir.isRight shouldBe true
     }
 
-    "and a program may not declare one of its own over it" in {
-      // Today the library shares the program's namespace, so this is a clash rather than shadowing.
-      // Pinned because it is exactly what changes when the library becomes a module arriving by
-      // wildcard, and the change should be a failing test rather than a surprise.
+    "and a program may not declare one of its own over it, while it is still the prelude's" in {
+      // A name the prelude holds shares the program's namespace, so this is a clash rather than
+      // shadowing. Pinned because it is exactly what changes when the declaration moves, and the
+      // change should be a failing test rather than a surprise — see the group below for the
+      // other side of it.
       Compiler.compileToLlvm("enum Option\n    Yes\n    No\n") match
         case Left(e)  => e should include("already declared")
         case Right(_) => fail("a program redeclared 'Option' and was not told")
     }
   }
+
+  "a declaration that has moved into the standard module" - {
+
+    "arrives unqualified, with no import written" in {
+      // The auto-import, on a declaration the compiler also names for itself — an `impl Display`
+      // has to write `FormatSpec` in the signature it is matching against.
+      run(
+        """struct P
+          |    x: int
+          |
+          |impl Display for P
+          |    display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
+          |
+          |print(P(6))
+          |""".stripMargin) shouldBe "6\n"
+    }
+
+    "is the same type by its full path as by the name that arrives" in {
+      // The signature says `FormatSpec` and the call says `sysl.FormatSpec`; two types would not
+      // meet in the middle, so this passing is what says the wildcard reaches the module's own.
+      run("show(spec: FormatSpec) -> int = spec.width\nprint(show(sysl.FormatSpec(5, -1, false)))")
+        .shouldBe("5\n")
+    }
+
+    "is what a format hole builds, which the compiler names rather than resolves" in {
+      // `Library.key("FormatSpec")` and the `FormatSpec` the prelude's `display_str` wrote have to
+      // be one type, or this is a signature mismatch inside the library.
+      run("print(f\"[${str(42)}%5s]\")\nprint(f\"[${1.5}%8.3f]\")") shouldBe "[   42]\n[   1.500]\n"
+    }
+
+    "and a program may now declare one of its own beside it" in {
+      // The other side of the clash pinned above: a moved declaration is a *module's*, so `13 §3`
+      // gives the program's own the unqualified spelling and the library's is still reached by path
+      // — including by the compiler, which is what the format hole in the same program proves.
+      run(
+        """struct FormatSpec
+          |    n: int
+          |
+          |var mine = FormatSpec(3)
+          |print(mine.n)
+          |print(f"[${str(42)}%5s]")
+          |""".stripMargin) shouldBe "3\n[   42]\n"
+    }
+
+    "which does not reach into the library, whose own signatures still mean the library's" in {
+      // The prelude is in the root module and so is a headerless program, so "this module first"
+      // would hand `display_pad(text, out, fmt: FormatSpec)` the *program's* struct — and the whole
+      // printing surface would fail inside the library against a type its source never named. The
+      // rendering below is what walks every one of those signatures.
+      run(
+        """struct FormatSpec
+          |    n: int
+          |
+          |struct P
+          |    x: int
+          |
+          |impl Display for P
+          |    display(self, w: *Writer, spec: sysl.FormatSpec) = str(self.x).display(w, spec)
+          |
+          |print(FormatSpec(3).n)
+          |print(P(6))
+          |""".stripMargin) shouldBe "3\n6\n"
+    }
+
+    "and writing the shadowed one where the library's is wanted says which is which" in {
+      refused(
+        """struct FormatSpec
+          |    n: int
+          |
+          |struct P
+          |    x: int
+          |
+          |impl Display for P
+          |    display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
+          |""".stripMargin) should include(
+        "parameter 'spec' of method 'display' is FormatSpec, but trait 'Display' declares sysl.FormatSpec")
+    }
+  }
+
+  "the standard module is the library's, and a program may not add to it" - {
+
+    "a file declaring it is refused" in {
+      // A module's declarations are one set however many files they came from, so this would not be
+      // a module beside the standard one — it would be the standard one, with the program's names
+      // in it.
+      refusedOf(
+        Source("extra.sysl", "module sysl\n\nstruct Extra\n    n: int\n", List("sysl")),
+        Source("main.sysl", "print(1)"),
+      ) should include("is the module every program is compiled against")
+    }
+
+    "and so is one that redeclares a name it already carries" in {
+      refusedOf(
+        Source("extra.sysl", "module sysl\n\nstruct FormatSpec\n    n: int\n", List("sysl")),
+        Source("main.sysl", "print(1)"),
+      ) should include("is the module every program is compiled against")
+    }
+  }
+
+  private def refused(program: String): String =
+    Compiler.compileToLlvm(program) match
+      case Left(err) => err
+      case Right(_)  => fail("the program compiled, and should not have")
+
+  private def refusedOf(sources: Source*): String =
+    Compiler.compile(sources.toList) match
+      case Left(err) => err
+      case Right(_)  => fail("the program compiled, and should not have")
 }

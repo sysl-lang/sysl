@@ -31,7 +31,11 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
   def analyze(): TProgram = {
     checkLocations()
+    checkLibraryModules()
     moduleNames ++= units.map(moduleOf)
+    // The library's own modules are modules like any other, and are known for the same reason a
+    // file's header is: what they are called is settled before a single name is resolved.
+    moduleNames ++= Library.modules
 
     // Every declaration is read in the terms its file set up — the module it contributes to and
     // what it imported — so each one is carried alongside those rather than flattened into one
@@ -46,7 +50,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
       u -> base.copy(imports = inScope(base)(gatherImports(u.body, autoImported(here))))
     }
-    val body = Library.decls.map((Scope.root, _)) ::: files.flatMap((u, s) => u.body.map((s, _)))
+    val body = Library.scoped ::: files.flatMap((u, s) => u.body.map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -351,6 +355,21 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
         recover(())(at(u.module.flatMap(_.pos).orElse(u.body.headOption.flatMap(_.pos))) {
           err(s"${u.source.name} $theirs, but it $here — a module is a directory, so the two must agree")
         })
+
+  /** Refuses a file claiming a module the library already carries.
+   *
+   * A module's declarations are one set however many files they came from (`13 §1`), so a program
+   * with a `sysl` directory of its own would not be writing a module beside the standard one — it
+   * would be adding to it, sharing its key space, and shadowing whatever name it happened to reuse.
+   * There is nothing in the file that distinguishes that from a mistake, and the mistake is the far
+   * likelier reading, so it is a diagnostic rather than a silent merge.
+   */
+  private def checkLibraryModules(): Unit =
+    for u <- units; name = moduleOf(u) if Library.modules.contains(name) do
+      recover(())(at(u.module.flatMap(_.pos).orElse(u.body.headOption.flatMap(_.pos))) {
+        err(s"'$name' is the module every program is compiled against, so ${u.source.name} cannot " +
+          "declare it — its declarations would join the library's rather than sit beside them")
+      })
 
   /** The statements that become the program's entry point, and the module they are read in.
    *

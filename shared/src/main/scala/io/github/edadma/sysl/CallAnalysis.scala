@@ -459,7 +459,10 @@ trait CallAnalysis extends Literals with TraitObjects {
       sig         <- m.methods.find(_.name == "display")
       (fname, to) <- CoreTraits.display(rty)
     yield {
-      val params = sig.params.map(p => (p.name, rt(p.typ)))
+      // Read in the **trait's** terms, not the caller's: `Display.display` names the specifier
+      // struct, and a program that declares a type of that name means its own by the word
+      // everywhere except here.
+      val params = inDecl(m.name)(sig.params.map(p => (p.name, rt(p.typ))))
       val key    = Library.key(fname)
 
       if args.length != params.length then
@@ -528,7 +531,14 @@ trait CallAnalysis extends Literals with TraitObjects {
     yield {
       // A built-in's membership is homogeneous (`14 §5`), so the trait's own parameter is the
       // receiver's own type: `5.add(3)` is the `Add[int]` an `int` has, and it has no other.
-      val params = m.params.map(p => (p.name, resolveType(p.typ, selfBinding(rty) ++ decl.tparams.map(_ -> rty))))
+      //
+      // The signature is the **trait's**, so it is resolved in the trait's terms however far from it
+      // the call was written — the same rule an instantiated function's signature follows. Reading
+      // it here would let a program that declares a type the trait's signature names mean its own by
+      // the word, and `Display.display`'s specifier is exactly such a name.
+      val params = inDecl(decl.name) {
+        m.params.map(p => (p.name, resolveType(p.typ, selfBinding(rty) ++ decl.tparams.map(_ -> rty))))
+      }
 
       if args.length != params.length then
         err(s"method '$trName.$mname' takes ${quantity(params.length, "argument")}, " +

@@ -69,16 +69,20 @@ trait AnalyzerBase {
   /** The terms names are currently being read in. */
   protected def currentScope: Scope = Scope(currentModule, currentImports, currentFile)
 
-  /** The keys the library declares, which are in scope everywhere with no import (`13 §8`). They
-   * are keyed under the root module like any other rootless declaration, and this is what tells
-   * them from a *program's* root-module declarations — which are a module's like any other, and so
-   * are not visible from a named module that did not name them.
+  /** What the library declares, **as written** against the key it is filed under — the names that
+   * are in scope everywhere with no import (`13 §8`).
+   *
+   * It is a lookup rather than a set of keys because the two differ: a declaration the standard
+   * module carries is keyed `sysl$FormatSpec` and is still written `FormatSpec`, and what a use site
+   * has is the spelling. That also tells the library's root-module declarations from a *program's* —
+   * which are a module's like any other, and so are not visible from a named module that did not
+   * name them — since only the library's are entered here.
    *
    * Filled during hoisting from `Library.owns`, which is the one question about where a declaration
-   * came from; this is that answer indexed by key, for the lookups that have a name and no
-   * declaration to ask about.
+   * came from; this is that answer indexed by what a program writes, for the lookups that have a
+   * name and no declaration to ask about.
    */
-  protected val libraryNames = mutable.HashSet.empty[String]
+  protected val libraryNames = mutable.HashMap.empty[String, String]
 
   /** The key a name written in the current module resolves to, or `None` where nothing of that
    * name is declared anywhere it may be read from.
@@ -102,9 +106,17 @@ trait AnalyzerBase {
     val key =
       if written.indexOf(Modules.sep.toInt) >= 0 then Option.when(declared(written))(written).map(reachable)
       else if dot < 0 then
-        val own = Modules.qualify(currentModule, written)
+        val own     = Modules.qualify(currentModule, written)
+        val library = libraryNames.get(written).filter(declared)
 
-        if declared(own) && visible(own) then Some(own)
+        // A name written **in the library** means the library's, and is looked for there first.
+        // Part of the library is still in the root module, which is where a headerless program's
+        // declarations are too, so "this module first" would otherwise hand the prelude's own
+        // signatures whatever the program happened to declare under the same name — and nothing a
+        // program declares is the library's to reach, whichever module the two share.
+        if currentFile.exists(Library.source) then
+          library.orElse(Option.when(declared(own) && visible(own))(own))
+        else if declared(own) && visible(own) then Some(own)
         else
           // A declaration this file may not name is not a candidate, so the search goes on rather
           // than stopping at it: a file that imported a `width` said which one it meant, and a
@@ -112,7 +124,7 @@ trait AnalyzerBase {
           // at all is the restriction worth reporting — at which point it is the whole story, and a
           // better one than an undefined name.
           importedName(written)(declared)
-            .orElse(Option.when(libraryNames(written) && declared(written))(written))
+            .orElse(library)
             .orElse(Option.when(declared(own))(reachable(own)))
       else
         val module = modulePath(written.take(dot))

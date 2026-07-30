@@ -252,11 +252,6 @@ object Prelude {
       |    write(*self, bytes: []u8)
       |    failed(*self) -> bool = false
       |
-      |struct FormatSpec
-      |    width: int
-      |    prec: int
-      |    left: bool
-      |
       |trait Display
       |    display(self, out: *Writer, fmt: FormatSpec)
       |

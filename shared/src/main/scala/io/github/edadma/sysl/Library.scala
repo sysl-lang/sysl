@@ -13,13 +13,15 @@ package io.github.edadma.sysl
  * Both were answered in place, by asking `Prelude` directly and by spelling library keys as bare
  * names. That worked because the prelude is one `Source` keyed under the anonymous root module, so a
  * library key *is* its own spelling. It stops working the moment a declaration moves into a module
- * of its own, where `Option` is filed under `sysl$Option` and nothing spelled `Option` is found —
- * and it would stop working at every one of those sites at once, which is the failure this exists to
- * prevent. So they ask here instead, and moving a declaration is a change to this file.
+ * of its own, where `FormatSpec` is filed under `sysl$FormatSpec` and nothing spelled `FormatSpec`
+ * is found — and it would stop working at every one of those sites at once, which is the failure
+ * this exists to prevent. So they ask here instead, and moving a declaration is a change to this
+ * file.
  *
- * The two answers are still the prelude's, exactly as they were. That is deliberate: a seam is worth
- * having before it is worth using, and one introduced in the same change that alters what it answers
- * is a seam nothing was ever measured against.
+ * **The library is now in two places at once, and that is the point.** `Std` is the standard module
+ * the whole of it is headed for; `Prelude` is what has not moved yet. Every question below is
+ * answered over both, so which of the two a declaration is in is a fact no caller has to hold — and
+ * when the prelude is empty, what changes here is that one of the two parts goes away.
  *
  * **`CoreTraits` speaks spellings, and its consumers translate.** What that table holds is which
  * operator each trait's method *is*, which is a fact about the source language rather than about
@@ -29,37 +31,72 @@ package io.github.edadma.sysl
  */
 object Library {
 
-  /** The module the library's declarations belong to.
+  /** The **named** modules the library contributes, which every file may write the names of without
+   * importing them (`AutoImport`) and which a program may also reach by their full path.
    *
-   * The **anonymous root module** while the prelude is what supplies them: its declarations are
-   * keyed by their own names alone, which is what makes every library key its own spelling today.
+   * What the prelude contributes is not among them: its declarations are in the anonymous root
+   * module, which is the module a headerless program is in too, and there is no path that names it.
    */
-  def module: String = Modules.root
+  val modules: List[String] = List(Std.module)
 
-  /** The declarations every compilation carries, whatever the program said. */
-  def decls: List[Stmt] = Prelude.decls
+  /** The library's declarations, each with the terms its own part reads names in.
+   *
+   * The two parts read names in different modules and are hoisted accordingly, which is the whole
+   * of what a move does: the same declaration, registered under a different key. Neither part
+   * imports anything, and neither needs to — `resolveName` looks a name written in a library
+   * declaration up among the library's own first, by the spelling rather than by the key, so one
+   * part reaches the other with no import to write and in either direction.
+   *
+   * Each part carries **its own source**, which is what says a name is being read *in* the library.
+   * The module cannot say it: the prelude's part is in the root module, and so is a headerless
+   * program.
+   */
+  def scoped: List[(Scope, Stmt)] =
+    Std.decls.map((Scope(Std.module, Imports.empty, Some(Std.origin)), _)) :::
+      Prelude.decls.map((Scope(Modules.root, Imports.empty, Some(Prelude.origin)), _))
+
+  /** Whether a source is one of the library's own — what tells a name being read *in* the library
+   * from one being read in the program, which the module a declaration is in cannot while the
+   * prelude is still in the root one alongside a headerless program's declarations.
+   */
+  def source(s: Source): Boolean = (s eq Prelude.origin) || (s eq Std.origin)
+
+  /** Every declaration the library carries, whichever part it is in. */
+  def decls: List[Stmt] = Std.decls ::: Prelude.decls
 
   /** Whether a declaration is the library's rather than the program's.
    *
    * Asked of the **position** and not of the key, because the two disagree exactly where it matters:
-   * the library's declarations are keyed under the root module, and so are a headerless program's,
+   * the prelude's declarations are keyed under the root module, and so are a headerless program's,
    * so a program that declares an `Ok` of its own would be told its own type was the library's.
    */
-  def owns(decl: Positioned): Boolean = Prelude.declares(decl)
+  def owns(decl: Positioned): Boolean = Prelude.declares(decl) || Std.declares(decl)
 
   /** The key the library's declaration named `name` is filed under — what the compiler names one
    * by, wherever it names one rather than reading a name out of source.
+   *
+   * This is where a move is recorded, and it is recorded by *reading the standard module* rather
+   * than by listing what has moved: the declaration is the fact, and a list beside it would be a
+   * second one to keep in step. A name the standard module does not declare is the prelude's, whose
+   * key is its own spelling.
    */
-  def key(name: String): String = Modules.qualify(module, name)
+  def key(name: String): String = moved.getOrElse(name, Modules.qualify(Modules.root, name))
 
   /** The library's own spelling of a key, or `None` where the key is not the library's.
    *
    * `key`'s inverse, for the direction a resolved bound arrives in: an `impl`'s trait name and a
    * `Type.Bound`'s are keys by the time either is looked at, and the tables the compiler holds about
    * its own traits are spelled the way a program writes them.
+   *
+   * A key is the library's when it is the one `key` gives that spelling, which is stricter than
+   * asking which module it is in: a *program's* root-module `FormatSpec` is keyed `FormatSpec`, and
+   * that is not where the library's is once the standard module declares it.
    */
-  def spelling(key: String): Option[String] =
-    Option.when(Modules.moduleOf(key) == module)(Modules.bare(key))
+  def spelling(k: String): Option[String] = {
+    val name = Modules.bare(k)
+
+    Option.when(key(name) == k)(name)
+  }
 
   /** The enum `?` unwraps, paired with its success and failure variant names (`09 §4`).
    *
@@ -79,7 +116,15 @@ object Library {
    * not declare is a call that resolves to nothing, and the only thing standing between the two is
    * that both happen to be written in this repository.
    */
-  lazy val declared: Set[String] = decls.flatMap {
+  lazy val declared: Set[String] = names(decls)
+
+  /** Which of the library's names the **standard module** declares, and the key each is filed under.
+   * What is not in here has not moved yet.
+   */
+  private lazy val moved: Map[String, String] =
+    names(Std.decls).map(n => n -> Modules.qualify(Std.module, n)).toMap
+
+  private def names(stmts: List[Stmt]): Set[String] = stmts.flatMap {
     case d: ConstDecl  => List(d.name)
     case d: ValDecl    => List(d.name)
     case d: FuncDecl   => List(d.name)

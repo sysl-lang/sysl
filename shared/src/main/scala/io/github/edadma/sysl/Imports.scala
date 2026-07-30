@@ -62,15 +62,18 @@ object Imports {
  * same position: an edge from every file to it would say nothing, and would make the library's own
  * files depend on themselves.
  *
- * The aim is **`demo`, deliberately and temporarily** — the useless development library under
- * `devlib/`. Pointing it at a library nothing depends on is what lets the mechanism be proved
- * before the prelude is asked to rely on it: if this is wrong, the prelude still works and the
- * suite says exactly what broke. The switch to the real standard module is a change to this list.
+ * **`sysl` is the real one** — the standard module every program is compiled against, which is why
+ * every unqualified name in every program now goes through this. `demo` is beside it deliberately,
+ * as the useless development library under `devlib/`: it is what proved the mechanism on a library
+ * nothing depends on before the standard module was asked to rely on it, and it goes on holding that
+ * proof rather than being retired the moment it worked. It is also what puts **two** wildcards in
+ * front of every file `DevLibraryTests` compiles, which is the only thing that says a second
+ * auto-import leaves the first alone.
  */
 object AutoImport {
 
   /** The modules to bring in unqualified, if a compilation has them. */
-  val modules: List[String] = List("demo")
+  val modules: List[String] = "demo" :: Library.modules
 }
 
 /** The terms a name is read in: the module it is written in, what that file (or block) has
