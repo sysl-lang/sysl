@@ -18,6 +18,13 @@ package io.github.edadma.sysl
  */
 trait SpecialForms extends Closures {
 
+  /** The names recognized here, so that a mistake written *at* one of them can name the form rather
+   * than falling through to the general complaint about a callee. Nothing looks these up, so
+   * nothing else would know they are forms at all.
+   */
+  protected val specialFormNames: Set[String] =
+    Set("print", "str", "format", "from_utf8_unchecked", "va_start", "va_end", "va_arg", "va_copy")
+
   /** `print(a, b, …)` — each value rendered by the prelude function its type reaches, a space
    * between and a newline at the end.
    *
@@ -327,11 +334,15 @@ trait SpecialForms extends Closures {
     TVaCopy(vaListArg("va_copy", args.head), vaListArg("va_copy", args(1)))
   }
 
-  /** `va_arg[T](ap)` takes the next argument as a `T` and advances.
+  /** `va_arg(ap)` takes the next argument and advances.
    *
    * C writes the type as a second argument, which is not something a sysl expression can hold, so
    * it comes from the context the value is read into — the same place `None` and `Ok(5)` get
    * theirs. Nothing in the tail can confirm it, which is the unsafety C has here too.
+   *
+   * There is no `va_arg[T](ap)`: square brackets in an expression are indexing (`10 §2`), and
+   * call-site type arguments are refused language-wide (`10 § Open a`). Somebody reaching for that
+   * spelling is told what to write instead rather than that the callee is not a name.
    */
   protected def vaArg(args: List[Expr], expected: Option[Type]): TExpr = {
     val ap = vaList("va_arg", args)

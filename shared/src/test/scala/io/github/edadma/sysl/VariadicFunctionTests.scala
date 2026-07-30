@@ -93,6 +93,30 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
       run(src) shouldBe "42 2.5 A 9000000000\n"
     }
 
+    // An annotated declaration is not the only context that says which type is being read, and
+    // this is what bounds the cost of having no `va_arg[T]` spelling: a compound assignment's own
+    // place and a parameter the value is heading for both answer, so the extra statement is owed
+    // only where the surrounding expression says nothing at all.
+    "the type may come from a compound assignment's place, or from a parameter" in {
+      val src =
+        """take(x: int) -> int = x * 2
+          |
+          |sum(n: int, ...) -> int
+          |    var ap: va_list
+          |    va_start(ap)
+          |    var total = 0
+          |    for i in 0..<n
+          |        total += va_arg(ap)
+          |    var extra = take(va_arg(ap))
+          |    va_end(ap)
+          |    total + extra
+          |end sum
+          |
+          |print(sum(2, 10, 20, 7))""".stripMargin
+
+      run(src) shouldBe "44\n"
+    }
+
     // The promotions of `12 §1` are the caller's, so a narrow argument arrives widened and the
     // callee reads it at the promoted width — this is the pair of rules meeting.
     "a narrow argument is read at the width it was promoted to" in {
@@ -318,6 +342,43 @@ class VariadicFunctionTests extends AnyFreeSpec with CodegenSupport with RunSupp
     // A place, because the walk advances the list rather than reading a copy of it.
     "each form needs something with an address" in {
       err("f(n: int, ...)\n    va_start(1)\nf(1)") should include("'va_start'")
+    }
+
+    // An earlier draft of `12 §9` spelled this form `va_arg[T](ap)` and called the type argument
+    // "the same position every other generic puts one in". There is no such position — square
+    // brackets in an expression are indexing (`10 §2`) and call-site type arguments are refused
+    // language-wide (`10 § Open a`) — so the spelling a reader tries first has to name what to
+    // write instead. Without a case of its own it falls through to the general complaint about a
+    // callee that is not a name, which is the reading `10 § Open a` says this case must not get.
+    "va_arg takes no type arguments, and says what stands in for them" in {
+      val src =
+        """f(n: int, ...) -> int
+          |    var ap: va_list
+          |    va_start(ap)
+          |    var t = 0
+          |    for i in 0..<n
+          |        t += va_arg[int](ap)
+          |    va_end(ap)
+          |    t
+          |end f
+          |print(f(1, 2))""".stripMargin
+
+      err(src) should include("'va_arg' takes no type arguments")
+      err(src) should include("annotate the variable it is read into")
+      err(src) should not include "must be a name"
+    }
+
+    // The same case covers the rest of the forms, which have no type to be given either.
+    "and neither does any other form the compiler resolves by name" in {
+      err("print[int](5)") should include("'print' takes no type arguments")
+      err("f(n: int, ...)\n    var ap: va_list\n    va_start[int](ap)\nf(1)") should
+        include("'va_start' takes no type arguments")
+    }
+
+    // A local of that name is an ordinary indexed value, and telling its author about a form they
+    // never reached would be worse than the general complaint.
+    "while a local of the same name is indexed as any other value is" in {
+      run("var va_arg = [10, 20, 30]\nprint(va_arg[1])") shouldBe "20\n"
     }
 
     "va_arg needs to know what it is reading" in {

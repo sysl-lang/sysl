@@ -104,6 +104,17 @@ trait CollectionExprAnalysis extends ExprSupport {
               "'p[0..<n]' with the number of elements that are really there")
           e
 
+        // A type read by a subscript through `Index` cannot be *sliced* through it, and `14 §7`
+        // says why: the index would have to be a range, and a range is not yet a type a program can
+        // name, so there is nothing for the trait's argument to be. Somebody who has written an
+        // `Index` and is reaching for the neighbouring form is owed that rather than "cannot
+        // slice", which reads as though their type were the wrong shape for an operation that
+        // exists.
+        case other if indexes("Index", other) =>
+          err(s"${show(other)} is read by a subscript through 'Index', but slicing through the trait " +
+            "is not built: the index would have to be a range, and a range is not yet a type a " +
+            "program can name")
+
         case other => err(s"cannot slice ${show(other)}")
 
       // Part of a string is a string, not a `[]u8` — the bytes between two character boundaries

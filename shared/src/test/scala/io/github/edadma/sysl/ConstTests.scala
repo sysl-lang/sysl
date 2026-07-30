@@ -252,5 +252,14 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
     "declared over an enum variant's name" in {
       err("enum Colour\n    Red\nend Colour\nconst Red: int = 1") should include("already used by enum")
     }
+
+    // `13 §7` turns on a constant having no address: it is folded into each use, occupies no
+    // storage, needs no initialization order, and a `no alloc` module may hold one. `&capacity`
+    // being unwritable is that property seen from the program's side, and it is what divides a
+    // `const` from the `val` that exists to be indexed.
+    "pointed at, since it is folded into each use and sits nowhere" in {
+      err("const capacity: usize = 512\nvar p = &capacity\nprint(*p)") should
+        include("'&' needs a variable, a field, or a dereference")
+    }
   }
 }

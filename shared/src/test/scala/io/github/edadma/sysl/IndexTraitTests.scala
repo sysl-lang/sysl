@@ -294,6 +294,33 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(b[0usize])""".stripMargin) shouldBe "3\n"
     }
 
+    // `14 §7` defers slicing through the trait and gives the reason — the index would have to be a
+    // range, and a range is not a type a program can name. A type that has an `Index` is exactly
+    // who reaches for the neighbouring form, and the bare "cannot slice" reads as though its shape
+    // were wrong for an operation that exists rather than as a feature that is not built.
+    "slicing through Index is not built, and says so rather than that the type is the wrong shape" in {
+      val src =
+        """struct Row
+          |    a: int
+          |    b: int
+          |
+          |impl Index[usize, int] for Row
+          |    index(self, i: usize) -> int = if i == 0usize then self.a else self.b
+          |
+          |var r = Row(1, 2)
+          |print(r[0usize..<2usize])""".stripMargin
+
+      err(src) should include("slicing through the trait is not built")
+      err(src) should include("a range is not yet a type a program can name")
+      err(src) should not include "cannot slice Row"
+    }
+
+    // While a type with no indexing at all keeps the plain refusal, since for it the shape really
+    // is the whole story.
+    "while a type that indexes no way at all keeps the plain one" in {
+      err("struct P\n    v: int\nvar p = P(1)\nprint(p[0usize..<1usize])") should include("cannot slice P")
+    }
+
     // Reading takes `self` by value and writing takes `*self`, so a container reached through a
     // pointer indexes both ways, and one held by a counted reference does too.
     "a container is indexed through a pointer and through a counted reference" in {

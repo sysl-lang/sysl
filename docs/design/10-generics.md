@@ -344,7 +344,16 @@ never by a covariant container.
   result` — for a generic free function and a generic method alike, rather than by the general
   complaint about a callee that is not a name. The message is the whole of the mitigation: the
   syntax stays deferred, and the case that would otherwise look like a compiler limitation now
-  names the annotation that stands in for it.
+  names the annotation that stands in for it. The **special forms** are refused the same way and
+  for the same reason, `va_arg[int](ap)` above all.
+
+  **`va_arg` is the strongest case against the deferral, and worth recording as such.** Everywhere
+  else the annotation is a word — the type on the binding that was going to be written anyway. A
+  variadic body reads its tail into whatever the surrounding expression is, so `total += va_arg(ap)`
+  and `take(va_arg(ap))` are answered by the place and the parameter; but a bare `print(va_arg(ap))`
+  has nothing to read from and costs a whole statement to write. That is one position rather than a
+  class of them, which is why the deferral stands — but it is the first place the missing syntax
+  costs more than a word, and a second one would be the case this item is waiting for.
 - **b. Members on generic types** — settled and implemented, and no longer open. A method or
   property is instantiated from the receiver's own type arguments, so `Box[int].get` and
   `Box[real].get` are two monomorphized functions exactly as two instantiations of a free generic

@@ -620,7 +620,7 @@ sum(n: int, ...) -> int
     va_start(ap)
     var total = 0
     for i in 0..<n
-        total += va_arg[int](ap)
+        total += va_arg(ap)
     va_end(ap)
     total
 end sum
@@ -652,9 +652,19 @@ the refusal names the walk as the reason.
   written, because its layout is the target ABI's.
 - **`va_start(ap)`** readies it. C also names the last fixed parameter here; sysl does not, because
   the function already knows which parameter that is and repeating it is a chance to get it wrong.
-- **`va_arg[T](ap)`** takes the next argument as a `T` and advances. C writes the type as a second
-  argument, which is not a thing sysl expressions can hold, so it is a type argument — the same
-  position every other generic puts one in.
+- **`va_arg(ap)`** takes the next argument and advances. C writes the type it is reading as a second
+  argument, which is not a thing a sysl expression can hold; here it comes from the **context the
+  value is read into** — `var v: int = va_arg(ap)`, `total += va_arg(ap)`, `take(va_arg(ap))` — the
+  same place `None` and `Ok(5)` get theirs. Where the context says nothing the form is refused rather
+  than guessed at, and the diagnostic names the annotation to write.
+
+  *(An earlier draft of this section spelled it `va_arg[T](ap)` and called the type argument "the
+  same position every other generic puts one in". There is no such position: `10` §2 gives square
+  brackets in an expression to indexing, and call-site type arguments are refused language-wide,
+  `10 § Open a`. What that leaves is context and an annotation, which is what the implementation
+  does. `va_arg` is the strongest customer that open item has — the annotation costs a whole
+  statement in the one position, a bare `print(va_arg(ap))`, where the surrounding expression says
+  nothing.)*
 - **`va_end(ap)`** finishes with it.
 - **`va_copy(dst, src)`** starts `dst` where `src` has reached, so a tail can be walked twice.
 
@@ -680,7 +690,7 @@ passes it to somebody who does. The parameter type is **`*va_list`**, and the ca
 report(n: int, ap: *va_list) -> int
     var total = 0
     for i in 0..<n
-        total += va_arg[int](ap)
+        total += va_arg(ap)
     total
 end report
 

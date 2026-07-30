@@ -5,10 +5,10 @@ import org.scalatest.freespec.AnyFreeSpec
 /** A **member** that takes a `...` (`12-functions-and-closures.md` §9).
  *
  * A member is a function with a receiver in front, and that is the whole of the rule: the ellipsis
- * reaches a method, an associated function, a member of a generic type, and a trait's declaration,
- * under exactly the rules a free function's tail follows. What the receiver buys is that it counts
- * as the named parameter a `...` has to anchor on, so `only(self, ...)` is a complete declaration
- * while a receiverless `make(...)` is not.
+ * reaches a method, an associated function, a member of a generic type, a nested function, and a
+ * trait's declaration, under exactly the rules a free function's tail follows. What the receiver
+ * buys is that it counts as the named parameter a `...` has to anchor on, so `only(self, ...)` is a
+ * complete declaration while a receiverless `make(...)` is not.
  *
  * The one thing a variadic member cannot do is be reached through a **trait object**: a call to a
  * variadic names the callee's whole function type, and a slot in a method table is a word.
@@ -158,6 +158,39 @@ class VariadicMethodTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     "with nothing named before it is refused" in {
       err("struct S\n    v: int\n    make(...) -> S = S(1)\nprint(S.make(1).v)") should
         include("'S.make' needs at least one named parameter before '...'")
+    }
+  }
+
+  // `12 §9` names a nested function alongside a member: its environment holds the first parameter
+  // slot the way a receiver does, so the tail anchors after what the program wrote. That makes it
+  // the one variadic whose fixed parameters are not all written at the declaration.
+  "a nested function" - {
+    "walks its own tail, and reaches the frame it was declared in" in {
+      val src =
+        """outer(base: int)
+          |    total(n: int, ...) -> int
+          |        var ap: va_list
+          |        va_start(ap)
+          |        var t = base
+          |        for i in 0..<n
+          |            var v: int = va_arg(ap)
+          |            t += v
+          |        va_end(ap)
+          |        t
+          |    end total
+          |
+          |    print(total(3, 10, 20, 30))
+          |
+          |outer(1)""".stripMargin
+
+      run(src) shouldBe "61\n"
+    }
+
+    // The environment is not a *named* parameter, so it does not stand in for one: the rule an
+    // associated function's `make(...)` meets is the rule this meets.
+    "with nothing named before it is refused, as anywhere else" in {
+      err("outer()\n    make(...) -> int = 1\n    print(make(1))\nouter()") should
+        include("needs at least one named parameter before '...'")
     }
   }
 

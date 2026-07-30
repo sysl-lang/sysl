@@ -325,6 +325,20 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
            |""".stripMargin) should not include "call ptr @malloc"
     }
 
+    // Nor does a *generic* one, which is the fact that decides how much the erased case matters:
+    // monomorphization turns the call into a direct one, so the summary applies again and the
+    // buffer stays where it was declared. Reading through `[R: Reader]` rather than through
+    // `*Reader` is therefore both the faster shape and the one with no promotion in it.
+    "and one read into through a reader a type parameter stands for" in {
+      ir("""fill[R: Reader](r: R) -> usize
+           |    var room: [64]u8
+           |    var it = r
+           |    it.read(room[..]).len
+           |end fill
+           |print(fill(stdin()))
+           |""".stripMargin) should not include "call ptr @malloc"
+    }
+
     "and one whose view never leaves" in {
       ir("""sum(s: []int) -> int
            |    var t = 0
