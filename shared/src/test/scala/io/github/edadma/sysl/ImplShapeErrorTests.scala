@@ -153,7 +153,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     // a block that assumed nothing.
     "and the body is checked at its definition, against the bounds alone" in {
       err(s"${show}impl[T] Show for []T\n    show(self) -> string = str(self[0])") should
-        include("'str' needs 'T: sysl.Display'")
+        include(s"'str' needs 'T: ${lib("Display")}'")
     }
   }
 

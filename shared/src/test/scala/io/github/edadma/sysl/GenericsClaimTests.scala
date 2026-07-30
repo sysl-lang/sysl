@@ -47,12 +47,12 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
       // advice names it `sysl.Display`, and a spelling here would go stale on the next declaration
       // to move. What the bound has to be is the path that actually reaches the trait.
       err("shown[T](x: T) = print(x)") should
-        include(s"'print' needs 'T: ${Modules.show(Library.key("Display"))}'")
+        include(s"'print' needs 'T: ${lib("Display")}'")
     }
 
     """A SUBSCRIPT — which went unchecked, so the body compiled and the reader met the mistake at
       |whatever first instantiated it, against a type the definition never named""".stripMargin in {
-      err("idx[T](x: T) -> int = x[0]") should include("'index' needs 'T: Index'")
+      err("idx[T](x: T) -> int = x[0]") should include(s"'index' needs 'T: ${lib("Index")}'")
     }
 
     "and none of it depends on anything instantiating the body" in {

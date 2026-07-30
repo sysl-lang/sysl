@@ -389,7 +389,7 @@ implementation:
   the survivors down and then popping the tail off one at a time, which is two loops for what is one
   operation, and the second loop is easy to forget (leaving the last element in the buffer twice).
   Neither operation was a language question, which is why this item was mis-filed here: it asked
-  whether the prelude was complete, not what the language should be.
+  whether the library was complete, not what the language should be.
 - **An unchecked-index escape hatch** for hot loops, listed as likely-yes and deferred in `03`.
 - **Multi-dimensional shorthand.** `[3][3]f64` already works as an array of arrays; a distinct
   rectangular type is not planned.

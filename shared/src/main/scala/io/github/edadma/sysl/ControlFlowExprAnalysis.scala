@@ -125,7 +125,7 @@ trait ControlFlowExprAnalysis extends ExprSupport {
               iterating(label, name, seq, iterateElem(ty).get, body, elseOpt, expected, discarded)
             case other =>
               err(s"'for' iterates an integer range, an array, a slice, or a type that implements " +
-                s"'Iterate', and ${show(other)} is none of those")
+                s"'${qn(Library.key("Iterate"))}', and ${show(other)} is none of those")
 
     case TryExpr(e) =>
       analyzeTry(analyzeExpr(e))
@@ -210,7 +210,8 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     val opt = step.ty match
       case e: Type.Enum if e.base == Library.key("Option") && e.targs == List(elem) => e
       case other =>
-        err(s"'Iterate' asks its 'next' for an ${show(Type.Enum(Library.key("Option"), List(elem)))}, " +
+        err(s"'${qn(Library.key("Iterate"))}' asks its 'next' for an " +
+          s"${show(Type.Enum(Library.key("Option"), List(elem)))}, " +
           s"and this one gives back ${show(other)}")
 
     pushScope()
@@ -237,7 +238,7 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       case Nil            => None
       case List(elem) :: Nil => Some(elem)
       case several =>
-        err(s"${show(ty)} implements 'Iterate' " +
+        err(s"${show(ty)} implements '${qn(iterate)}' " +
           s"${conjoin(several.map(a => s"'${Type.Bound(iterate, a).show}'"))}, and a 'for' has " +
           "nothing to say which of them it means — call 'next' yourself, with the element type written")
   }

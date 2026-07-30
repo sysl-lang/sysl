@@ -66,16 +66,16 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
     // The whole payoff of `14 §4`: the complaint lands on the definition, naming the bound that
     // would license it, whether or not anything ever instantiates the function.
     "is told which bound would let it be printed" in {
-      err("f[T](x: T) = print(x)\nf(1)") should include("'print' needs 'T: sysl.Display'")
+      err("f[T](x: T) = print(x)\nf(1)") should include(s"'print' needs 'T: ${lib("Display")}'")
     }
 
     "is told the same about 'str'" in {
-      err("f[T](x: T) -> string = str(x)\nprint(f(1))") should include("'str' needs 'T: sysl.Display'")
+      err("f[T](x: T) -> string = str(x)\nprint(f(1))") should include(s"'str' needs 'T: ${lib("Display")}'")
     }
 
     // No call site at all, which is what tells a definition-time check apart from a template.
     "is told so even where nothing instantiates it" in {
-      err("f[T](x: T) = print(x)") should include("'print' needs 'T: sysl.Display'")
+      err("f[T](x: T) = print(x)") should include(s"'print' needs 'T: ${lib("Display")}'")
     }
 
     "is accepted once the bound is written" in {

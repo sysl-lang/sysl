@@ -755,6 +755,57 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "the moved traits the LANGUAGE'S OWN SYNTAX resolves through" - {
+
+    // `b[i]` and `for x in c` are syntax, not calls a program writes — the compiler picks `Index`
+    // and `Iterate` for itself. A program declaring either name gets its own, and the syntax keeps
+    // meaning the library's, which is the whole distinction these two make.
+    "a program may declare an 'Index' of its own, and a subscript still means the library's" in {
+      run(
+        """trait Index[I, E]
+          |    lookup(self, i: I) -> E
+          |
+          |var b: Buf[int] = buf()
+          |
+          |b.push(4)
+          |b.push(9)
+          |print(b[1usize], b.len())
+          |""".stripMargin) shouldBe "9 2\n"
+    }
+
+    "and an 'Iterate' of its own, while a 'for' still walks through the library's" in {
+      run(
+        """trait Iterate[E]
+          |    step(*self) -> E
+          |
+          |var total = 0
+          |
+          |for c in "abc".chars do total += 1
+          |print(total)
+          |""".stripMargin) shouldBe "3\n"
+    }
+
+    "a subscript refused through the library's Index names it by the path that reaches it" in {
+      // The advice spelled `'Index'` literally while resolving `IndexSet` by key — the standing
+      // defect, found again by the audit rather than by a failure.
+      refused(
+        """var b: Buf[int] = buf()
+          |
+          |b.push(1)
+          |b[0usize] += 2
+          |""".stripMargin) should include(s"'${Modules.show(Library.key("Index"))}'")
+    }
+
+    "and a 'for' over something that walks nowhere names 'Iterate' the same way" in {
+      refused(
+        """struct Still
+          |    n: int
+          |
+          |for x in Still(1) do print(x)
+          |""".stripMargin) should include(s"'${Modules.show(Library.key("Iterate"))}'")
+    }
+  }
+
   "a moved trait whose memberships the compiler supplies rather than a program declaring them" - {
 
     "a program may declare a 'Hash' of its own, and a built-in still satisfies the library's" in {

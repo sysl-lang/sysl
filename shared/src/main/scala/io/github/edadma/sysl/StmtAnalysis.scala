@@ -259,8 +259,9 @@ trait StmtAnalysis extends TypeResolution {
     for t <- m.targets do
       t match
         case Index(receiver, _) if indexes(Library.key("IndexSet"), receiver) =>
-          at(t.pos)(err("an element set through 'Index' is a call rather than a store, so it cannot be " +
-            "one place of a multiple assignment — write that one on its own"))
+          at(t.pos)(err(s"an element set through '${qn(Library.key("Index"))}' is a call rather " +
+            "than a store, so it cannot be one place of a multiple assignment — write that one " +
+            "on its own"))
         case _ =>
 
     val what   = if m.op == "=" then "assignment" else s"'${m.op}'"

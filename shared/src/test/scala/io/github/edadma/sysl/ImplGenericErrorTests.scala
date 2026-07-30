@@ -166,7 +166,7 @@ class ImplGenericErrorTests extends AnyFreeSpec with CodegenSupport {
 
     "rendering a parameter needs 'Display', and says so" in {
       err(s"$show${box}impl[T] Show for Box[T]\n    show(self) -> string = str(self.v)") should
-        include("'str' needs 'T: sysl.Display'")
+        include(s"'str' needs 'T: ${lib("Display")}'")
     }
 
     "an operator needs its own bound" in {

@@ -165,9 +165,9 @@ class TypeNameMemberTests extends AnyFreeSpec with CodegenSupport with RunSuppor
 
     // `12 §6` keeps the arity-carrying name out of diagnostics by rendering every `FnN[…]` *type*
     // as its arrow. This is the one position where the name is legitimately printed: a call trait
-    // is an ordinary prelude trait, and here the reader is the one who wrote it.
+    // is an ordinary trait of the library's, and here the reader is the one who wrote it.
     "a call trait is answered as the ordinary trait it is" in {
-      err("print(Fn1.call())") should include("is a member of the trait 'Fn1'")
+      err("print(Fn1.call())") should include(s"is a member of the trait '${lib("Fn1")}'")
     }
 
     // And what that message points at is real — a callable's member is reached on a value, which is

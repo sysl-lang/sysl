@@ -386,8 +386,8 @@ trait ExprAnalysis
     // the receiver and the index twice — and a container's subscript is a call, so twice is twice
     // the calls. Written out, the program says that itself.
     case Assign(op, Index(receiver, index), _) if indexes(Library.key("IndexSet"), receiver) =>
-      err(s"'$op' on an element read through 'Index' would evaluate the receiver and the index " +
-        s"twice — write it out as 'b[i] = b[i] ${op.dropRight(1)} …'")
+      err(s"'$op' on an element read through '${qn(Library.key("Index"))}' would evaluate the " +
+        s"receiver and the index twice — write it out as 'b[i] = b[i] ${op.dropRight(1)} …'")
 
     case Assign("=", target, value) =>
       val place = analyzePlace(target, "assignment")

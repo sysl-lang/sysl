@@ -108,30 +108,6 @@ object Prelude {
       |    putbytes(buf[0..<usize(k)])
       |end printr
       |
-      |trait Index[I, E]
-      |    index(self, i: I) -> E
-      |
-      |trait IndexSet[I, E]
-      |    index_set(*self, i: I, v: E)
-      |
-      |trait Iterate[E]
-      |    next(*self) -> Option[E]
-      |
-      |trait Fn0[R]
-      |    call(*self) -> R
-      |
-      |trait Fn1[A, R]
-      |    call(*self, a: A) -> R
-      |
-      |trait Fn2[A, B, R]
-      |    call(*self, a: A, b: B) -> R
-      |
-      |trait Fn3[A, B, C, R]
-      |    call(*self, a: A, b: B, c: C) -> R
-      |
-      |trait Fn4[A, B, C, D, R]
-      |    call(*self, a: A, b: B, c: C, d: D) -> R
-      |
       |printb(b: bool) = prints(if b then "true" else "false")
       |
       |printc(ch: char)

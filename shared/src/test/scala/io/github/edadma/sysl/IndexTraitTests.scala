@@ -284,7 +284,8 @@ class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err("""var b: Buf[int] = buf()
             |b.push(1)
             |b[0usize] += 2""".stripMargin) should include(
-        "'+=' on an element read through 'Index' would evaluate the receiver and the index twice")
+        s"'+=' on an element read through '${lib("Index")}' would evaluate the receiver and the " +
+          "index twice")
     }
 
     "and the form it points at works" in {
