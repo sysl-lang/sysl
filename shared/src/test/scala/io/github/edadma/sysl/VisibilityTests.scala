@@ -262,6 +262,28 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
     "a function" in {
       errIn(("", "main.sysl", "print(geom.scale(21))"), hidden) should include("'geom.scale' is private")
     }
+
+    // `13 §2` gives the exception a reason of its own, so the refusal has to carry the reason
+    // rather than the grammar's complaint that the modifier was not followed by a name. This is
+    // the same refusal the members *inside* an `impl` already get.
+    "and an 'impl' does not, having no name for one to restrict" in {
+      val src =
+        """trait Show
+          |    show(self) -> int
+          |
+          |struct P
+          |    v: int
+          |
+          |private impl Show for P
+          |    show(self) -> int = self.v
+          |
+          |print(P(1).show())""".stripMargin
+
+      err(src) should include("an 'impl' block carries no visibility of its own")
+      err(src) should not include "identifier expected"
+      err(src.replace("private impl", "private[geom] impl")) should
+        include("an 'impl' block carries no visibility of its own")
+    }
   }
 
   "what a restriction does not touch" - {

@@ -102,10 +102,24 @@ class SyslParser(val source: Source) extends DeclParser {
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
   protected lazy val declaration: PackratParser[Stmt] =
-    visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
-      case Visibility.Public ~ d => d
-      case v ~ d                 => restrict(v, d)
-    }
+    implVisibility |
+      visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
+        case Visibility.Public ~ d => d
+        case v ~ d                 => restrict(v, d)
+      }
+
+  /** A modifier written in front of an `impl` block, refused where it stands.
+   *
+   * This is the same refusal `noVisibility` gives the members *inside* one, and it is here for the
+   * same reason: `impl` is not among the forms above, so without a rule of its own the reading is
+   * "identifier expected" at the `impl` — the grammar's complaint that the modifier was not
+   * followed by a name, which says nothing about why there is no name to follow it with.
+   */
+  private lazy val implVisibility: Parser[Nothing] =
+    op("private") ~ opt(op("[") ~> ident <~ op("]")) ~ guard(op("impl")) ~> err(
+      "an 'impl' block carries no visibility of its own — it declares no name for one to restrict, " +
+        "and what it supplies is reached at the reach of the trait that asked for it",
+    )
 
   /** `private`, `private[M]`, or nothing at all — which is public (`13 §2`). There is no `pub`
    * keyword; its absence *is* public, so the unmarked case is the one that writes nothing.
