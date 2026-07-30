@@ -646,6 +646,15 @@ The two forms are told apart by what the initializer *is*, not by how it is writ
 — a number, an array of them, a repeat `[v; n]` (`07`) — is laid straight into the object file, runs
 nothing, and needs nothing ordered. Anything else is code, and code runs somewhere.
 
+**A value that has to be *checked* is code, whatever it looks like.** A `val` at a constrained type
+(`16`) is written as a plain number and would otherwise be laid down by the rule above — which would
+make it the one produce site in the language that skipped its check, since a global has nowhere to
+run one. So the constraint decides: `val a: Age = 200` is storage the program fills, the range check
+runs there, and an out-of-range one stops the program before any statement of its own. The same holds
+for a `where` predicate, for a struct `invariant`, and element by element for a table of a constrained
+type. This is not a second rule so much as the first one read correctly — a check is code, and code
+runs somewhere.
+
 **Where it runs is the program's own entry point**, ahead of the statements §7 pins to one file.
 That is the one moment that certainly comes first and is already written down; a platform's
 constructor section would run before the runtime was up, be spelled differently on every target, and

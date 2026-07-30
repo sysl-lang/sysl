@@ -105,6 +105,21 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
       err("""extern "no such thing" f()""") should include("is not a symbol a linker can resolve")
       err("""extern "" f()""") should include("is not a symbol a linker can resolve")
     }
+
+    /** The accepting half of the same rule (`12 §1`), which is the half that reaches the emitter: a
+      * symbol may hold `_`, `$` and `.` as well as letters and digits, and those are exactly the
+      * characters LLVM's own unquoted identifier admits — so the name goes through as written,
+      * with no quoting and no mangling. Real symbols look like this: a C++ mangling carries `$`, an
+      * Objective-C or versioned libc symbol carries `.`.
+      */
+    "may hold every character a linker symbol may hold, unquoted" in {
+      val out = ir("""extern "foo.bar$baz_9" f(n: int) -> int
+                     |print(f(1))""".stripMargin)
+
+      out should include("declare i32 @foo.bar$baz_9(i32)")
+      out should include("call i32 @foo.bar$baz_9(i32 1)")
+      out should not include "\"foo.bar"
+    }
   }
 
   /** A variadic callee is written two ways codegen has to get right: the `...` in its declaration,

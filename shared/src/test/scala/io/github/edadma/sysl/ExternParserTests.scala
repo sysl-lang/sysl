@@ -40,6 +40,21 @@ class ExternParserTests extends AnyFreeSpec with ParseSupport {
     progError("extern f() = 1") should not be empty
   }
 
+  /** `12 §1`: an extern is never generic, because monomorphization needs a body to specialize. The
+    * refusal is worth a message of its own rather than the `'(' expected` the bare grammar gives —
+    * the bracketed list is real syntax everywhere else a declaration names a type, so a reader who
+    * writes one here has made a mistake about `extern` and not about brackets. The contrast is the
+    * second assertion: the same header with no `extern` in front of it is an ordinary generic
+    * function.
+    */
+  "type parameters are not an extern's to declare" in {
+    progError("extern id[T](x: T) -> T") should include("declares no type parameters")
+    progError("extern id[T](x: T) -> T") should include("no body to monomorphize")
+    prog("id[T](x: T) -> T = x") shouldBe
+      List(FuncDecl("id", List("T"), List(Param("x", NamedType("T"))), Some(NamedType("T")),
+        List(ExprStmt(Ident("x")))))
+  }
+
   "an extern sits among other declarations" in {
     prog(
       """extern exit(code: int) -> never

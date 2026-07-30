@@ -46,9 +46,12 @@ written inline.
 
 **A missing `-> type` means the function returns `unit`.** `greet` above runs for its effect and
 yields nothing; there is no `-> unit` to write, though writing it is legal. This mirrors how a
-block whose trailing statement is not an expression has type `unit`. A result is also the *only*
-position `unit` may be written in — it names the absence of a value, so no parameter, field, or
-element can hold one (`00 §12`).
+block whose trailing statement is not an expression has type `unit`. A result is not the only
+position `unit` may stand in: it is the language's **zero-sized** type, so a parameter or a field of
+it is legal and simply occupies nothing, and what is refused — a pointer or reference to it, an array
+or a slice of it — is refused for wanting something to point at rather than for the absence of a
+value (`00 §12`). `f(x: unit)` is dropped from the emitted signature, which is what makes
+`Result[unit, E]` writable.
 
 ### A declaration with no body — `extern`
 

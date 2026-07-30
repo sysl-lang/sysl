@@ -743,9 +743,21 @@ class SyslParser(val source: Source) extends PackratParsers {
    * costs no keyword. Haskell's `foreign import ccall "snprintf" c_snprintf` is the same shape.
    */
   private lazy val externDecl: PackratParser[Stmt] =
-    op("extern") ~> opt(linkName) ~ ident ~ (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
-      case link ~ name ~ ((params, variadic)) ~ ret => ExternDecl(name, params, ret, variadic, link)
-    }
+    op("extern") ~> opt(linkName) ~ ident ~ noTypeParams ~ (op("(") ~> paramList <~ op(")")) ~
+      opt(op("->") ~> typeRef) ^^ {
+        case link ~ name ~ _ ~ ((params, variadic)) ~ ret => ExternDecl(name, params, ret, variadic, link)
+      }
+
+  /** An `extern` may not declare type parameters. Monomorphization needs a body to specialize, and a
+   * foreign symbol is one function at one signature however many sysl types would fit it — so the
+   * bracketed list has nothing to do here, and saying that is worth more than the "'(' expected" a
+   * grammar with no place for one would give. A program wanting one signature per type declares one
+   * `extern` per type, each under its own name with the same link name.
+   */
+  private lazy val noTypeParams: Parser[Unit] =
+    op("[") ~> err("an 'extern' declares no type parameters — there is no body to monomorphize, and " +
+      "a foreign symbol is one function at one signature") |
+      success(())
 
   private lazy val linkName: Parser[String] =
     accept("symbol name", { case t: lexical.StrLit => t.value })

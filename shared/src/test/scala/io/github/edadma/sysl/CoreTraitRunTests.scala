@@ -415,6 +415,36 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       out shouldBe "1\n2\nfalse\n"
     }
 
+    /** `§2` says the four derived comparisons are sound for a total order and unsound for a partial
+      * one, that the scalars are routed around the derivation so a float keeps IEEE's answers, and
+      * that the discrepancy is therefore **reachable only by a user type whose own `lt` is partial**
+      * — something to construct deliberately rather than to stumble into. This constructs it, and it
+      * is worth pinning precisely because it is the documented consequence of a decision: a change
+      * that quietly derived the scalars the same way would show up here first.
+      *
+      * `n < one` and `n > one` are both false, as IEEE says. `n <= one` is `!lt(one, n)` and `n >= one`
+      * is `!lt(n, one)`, so both come back **true**, where a float would say false.
+      */
+    "a user type whose 'lt' is partial reaches the discrepancy the derivation has" in {
+      val src =
+        """struct Maybe
+          |    v: f64
+          |impl Ord for Maybe
+          |    lt(self, rhs: Self) -> bool = self.v < rhs.v
+          |var n = Maybe(0.0 / 0.0)
+          |var one = Maybe(1.0)
+          |print(n < one, n > one, n <= one, n >= one)""".stripMargin
+
+      run(src) shouldBe "false false true true\n"
+    }
+
+    // The other half of the same claim, and the reason the scalars are routed around: the float's own
+    // comparisons answer false at every one of the four, which negating `lt` could not have produced.
+    "while the float the type wraps answers false to all four" in {
+      run("var n = 0.0 / 0.0\nprint(n < 1.0, n > 1.0, n <= 1.0, n >= 1.0)") shouldBe
+        "false false false false\n"
+    }
+
     // Two middle operands, each shared by the pair of comparisons around it, and the links are not
     // all the same operator — `<=` is derived and `<` is not, so a chain has to carry the two
     // derivations independently.

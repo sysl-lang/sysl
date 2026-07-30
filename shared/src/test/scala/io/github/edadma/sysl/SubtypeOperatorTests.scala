@@ -359,4 +359,32 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
         "    twice(self) -> int\n        int(self) * 2\nprint(Stamp(4).twice())") shouldBe "8\n"
     }
   }
+
+  /** The other side of inheriting the catalog (`14 §5`): a membership is what a **bound** is
+    * satisfied by, so a subtype reaches a generic written over the base's traits. The tests above
+    * pin that the *operators* reach a subtype; a bound is a different question, since it asks
+    * whether the type system agrees the subtype is a member rather than whether a token lowers.
+    */
+  "a subtype satisfies the bounds its base satisfies" - {
+    "a transparent one reaches an operator bound, computing at its base" in {
+      run(Age + "twice[T: Mul](x: T) -> T = x * x\nvar a: Age = 7\nprint(int(twice(a)))") shouldBe "49\n"
+    }
+
+    "and the several bounds a generic asks for at once" in {
+      val src = Age +
+        """show[T: Display + Eq](a: T, b: T) -> unit
+          |    print(a, a == b)
+          |var x: Age = 7
+          |var y: Age = 7
+          |show(x, y)""".stripMargin
+
+      run(src) shouldBe "7 true\n"
+    }
+
+    // A derived subtype is a type of its own, and the membership comes with the derivation — which
+    // is the same "everything the base can do it can do" bargain the file's header describes.
+    "a derived one reaches it too" in {
+      run(Stamp + "twice[T: Add](x: T) -> T = x + x\nprint(i64(twice(Stamp(7i64))))") shouldBe "14\n"
+    }
+  }
 }

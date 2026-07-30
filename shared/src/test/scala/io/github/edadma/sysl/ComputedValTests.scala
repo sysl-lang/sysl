@@ -535,4 +535,69 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run(src) shouldBe "18\n"
     }
   }
+
+  /** Where `13 §7`'s constant-tree rule meets `16 §4`'s produce-site checking, and which of the two
+    * wins. A `val` at a constrained type is written as a plain number, so the constant-tree rule
+    * alone would lay it straight into the object file — and would thereby be the one produce site in
+    * the language that skipped its check, because a check is code and a global has nowhere to run it.
+    *
+    * It does not: the value goes into storage the program fills, and the check runs there. The
+    * load-bearing assertions are the *out-of-range* ones. An in-range `val` reads correctly whichever
+    * way it was emitted, so a test that only looked at the good value would pass under exactly the
+    * bug this is about.
+    */
+  "a val at a checked type is filled, because a check is code" - {
+    "a constrained one is storage rather than a constant, though its initializer is a literal" in {
+      val out = ir("type Age = int within 0..150\nval a: Age = 30\nprint(a)")
+
+      out should include("@a = private global i32 zeroinitializer")
+      out should not include "@a = private constant"
+    }
+
+    "and the value it is out of range for stops the program" in {
+      exits("type Age = int within 0..150\nval a: Age = 200\nprint(a)")
+    }
+
+    "while the one in range reads back" in {
+      run("type Age = int within 0..150\nval a: Age = 30\nprint(a)") shouldBe "30\n"
+    }
+
+    "a 'where' predicate is checked there too" in {
+      run("type Even = int where value % 2 == 0\nval e: Even = 30\nprint(e)") shouldBe "30\n"
+      exits("type Even = int where value % 2 == 0\nval e: Even = 7\nprint(e)")
+    }
+
+    // An element of an array is a produce site of its own, so a table of a constrained type is
+    // checked element by element — and the array is filled rather than laid down for that reason.
+    "so is every element of a table of them" in {
+      val out = ir("type Age = int within 0..150\nval xs: [2]Age = [1, 2]\nprint(xs[1])")
+
+      out should include("@xs = private global [2 x i32] zeroinitializer")
+      run("type Age = int within 0..150\nval xs: [2]Age = [1, 2]\nprint(xs[1])") shouldBe "2\n"
+      exits("type Age = int within 0..150\nval xs: [2]Age = [1, 200]\nprint(xs[1])")
+    }
+
+    // A struct invariant is the same question about a different check.
+    "and a struct invariant" in {
+      val span =
+        """struct Span
+          |    lo: int
+          |    hi: int
+          |    invariant lo <= hi
+          |
+          |""".stripMargin
+
+      run(span + "val s: Span = Span(1, 2)\nprint(s.hi)") shouldBe "2\n"
+      exits(span + "val s: Span = Span(9, 2)\nprint(s.hi)")
+    }
+
+    // The derived case, which carries no check at all and is still filled: a conversion is not one
+    // of the three things `13 §7` calls a constant tree, so it is code by that rule alone.
+    "a derivation with nothing to check is code all the same" in {
+      val out = ir("type Meters = new int\nval m: Meters = Meters(30)\nprint(int(m))")
+
+      out should include("@m = private global i32 zeroinitializer")
+      run("type Meters = new int\nval m: Meters = Meters(30)\nprint(int(m))") shouldBe "30\n"
+    }
+  }
 }
