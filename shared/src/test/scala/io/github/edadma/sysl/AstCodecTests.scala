@@ -84,6 +84,10 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       // into the standard module a surface at a time and is heading for empty, so a threshold on it
       // is a threshold that fails on some future move for a reason that has nothing to do with the
       // codec — which is exactly what it did.
+      //
+      // The two comparisons this guards cover one half each, which is what keeps the pairing honest
+      // as the balance shifts: whichever half holds the declarations is the half whose comparison is
+      // doing the work. The prelude's will end up trivially true, and is deleted with the prelude.
       val stamped = positionsOf(Library.decls).count(_.isDefined)
 
       stamped should be > 1000
