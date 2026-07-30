@@ -859,10 +859,16 @@ work:
   the maximum permitted `N`; whether `i1`/`u1` are allowed and how they relate to `bool`;
   and whether packed structs lay out an `i5` field in exactly 5 bits (the bitfield / hardware
   register payoff).
-- **Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`). The
-  *lexing* mechanics are settled by adopting `IndentationLexical` (see `front-end.md`); this
-  remaining piece is a grammar decision. The trailing-continuation operator set that used to be
-  filed here is settled — see § *Continuing a line* below.
+- ~~**Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`).~~
+  **Settled, and settled the same way for all of them:** an introducer is **required for a one-line
+  body and optional before an indented block**, since the `Newline`+`Indent` the lexer emits already
+  marks the block unambiguously. The introducers are `then` (`if`, `elif`), `do` (`while`, `loop`,
+  `for`), `->` (a `match` arm), and `=` (a function's or member's body, where the short form is one
+  expression rather than a statement); `else` takes a body directly, with no introducer of its own to
+  need. So `if c then x = 1` and `if c` + an indented block are both written, and `while c do …`
+  likewise. The *lexing* mechanics were settled earlier by adopting `IndentationLexical` (see
+  `front-end.md`), and the trailing-continuation operator set that was also filed here is settled in
+  § *Continuing a line* below.
 - ~~Zero-sized types~~ — **done**, see §12. A `unit` field is skipped in the layout with the
   indices behind it shifted, and a `unit` parameter is dropped from the signature, which is what
   makes `Result[unit, E]` writable. It was additive as predicted: everything §12 used to refuse

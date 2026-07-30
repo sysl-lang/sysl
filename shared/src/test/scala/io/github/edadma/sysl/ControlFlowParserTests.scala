@@ -70,6 +70,21 @@ class ControlFlowParserTests extends AnyFreeSpec with ParseSupport {
       )
     }
 
+    "and `do` is optional before a for's block too" in {
+      prog("for x in xs\n    print(x)") shouldBe prog("for x in xs do\n    print(x)")
+    }
+
+    // The other half of the rule `00 § Open` used to leave undecided: an introducer is *required* for
+    // a one-line body, because with nothing between the condition and the body there is nothing to
+    // say where one ends and the other begins. The tests above show each keyword may be left out
+    // before a block; these show it may not be left out on one line.
+    "a one-line body without its introducer does not parse" in {
+      progError("while c print(1)") should not be empty
+      progError("if c print(1)") should not be empty
+      progError("for x in xs print(x)") should not be empty
+      progError("loop print(1)") should not be empty
+    }
+
     "an inline body still ends at a following statement" in {
       prog("while c do print(1)\nprint(2)") shouldBe List(
         whileStmt(Ident("c"), List(printStmt(i(1)))),
