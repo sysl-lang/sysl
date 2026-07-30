@@ -7,8 +7,8 @@ sysl to **bounded, definition-checked** generics, matching `02-traits.md`'s alre
 that by-value polymorphism is "a generic bounded by the trait, monomorphized."
 
 The mechanism is specified in `14 §4`, and it is **built**: a body's method calls, *property reads*,
-*operators*, and *renderings* of a type parameter are checked once, at the definition, against the
-parameter's bounds alone. `sum[T: Add](a, b) = a + b` type-checks because `T: Add` promises `+`, and
+*operators*, *subscripts*, and *renderings* of a type parameter are checked once, at the definition,
+against the parameter's bounds alone. `sum[T: Add](a, b) = a + b` type-checks because `T: Add` promises `+`, and
 dropping the bound fails on that line rather than at some caller; `print(x)` on a parameter asks for
 `T: Display` the same way (`14 §6`). A **field** read off a parameter is refused there too, and with
 no bound suggested, because none could license it — see §5.
@@ -73,7 +73,11 @@ and `Pair[int, int]` are one instantiation rather than two that happen to have t
 the trait, exactly as it does in a method's signature — so `impl Scale for P` is the
 `impl Scale[P] for P` it reads as, and `[T: Scale]` asks for `Scale[T]`. A struct and an enum have no
 implementing type, so `Self` in one of their defaults is refused. Neither has a **trait object**: an
-object has forgotten which type it holds, so `&Scale` is refused and `&Scale[int]` is what to write.
+object has forgotten which type it holds, so a default of `Self` has nothing to name and the argument
+is written out — `&Sink[int]` rather than `&Sink`, for a `trait Sink[T = Self]`. `Scale` is not the
+example to reach for here, and the reason is worth the line: its `scale` *returns* `Self`, so no
+object of it exists at any argument at all (`02`), and `&Scale[int]` is refused for that rather than
+for the default.
 
 Two rules follow from a default being the one part of a signature a use does not write. It is
 **exposed** like a field, so `13 §2` applies: a public declaration may not default to a type that
@@ -185,8 +189,20 @@ move-by-default and `T: Copy` / `T: Clone` litter generic signatures. In sysl, "
 along any `T`" is the free, unmarked baseline.
 
 What an unbounded `T` may **not** do is anything that assumes structure: no `+`, `<`, `==`, or
-other operator; no method call; no field access; no index; no cast. Each of those is a
-capability some types have and others do not, so each requires a bound that guarantees it.
+other operator; no method call; no field access; no index. Each of those is a capability some types
+have and others do not, so each requires a bound that guarantees it, and each is refused **at the
+definition**, naming the bound to write. A subscript is among them because a subscript *is* `Index`'s
+one method (`14 §3`), so it is asked of the bounds exactly as a dot call is.
+
+**A conversion is the exception, and it belongs here as an open question rather than as a rule.**
+`u8(x)` on a parameter is *not* refused at the definition: `§ Open f` calls it ordinary code, and
+`guide/sha2` is written on it — `top_byte[T: Word](x: T) -> u8` converts out of its parameter, once
+per instantiation. It is the one capability with nothing to promise it, because a conversion is
+between the concrete scalar kinds rather than something a trait declares, so there is no bound for
+the rule above to name. It is therefore checked where the type is known — which is exactly what
+every other capability's bound exists to avoid. Whether that stands is undecided: a scalar-shaped
+bound would settle it, and so would the trait-level `T.of(b)` that `§ Open f` wants for the
+other direction.
 
 **A field is the exception that proves the rule.** Every other unlicensed use names the bound that
 would allow it — the diagnostic's whole job is to say what to write. A field names none, because a

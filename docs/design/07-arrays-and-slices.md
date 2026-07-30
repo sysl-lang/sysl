@@ -147,7 +147,7 @@ reason.
 
 `Buf[T]` is the growable array, and it is **ordinary sysl in the prelude** rather than a type the
 compiler knows: a `[]T` field for the storage, a count of how much of it is live, and `push`, `pop`,
-`remove`, `truncate`, `at`, `set`, `view`, `len`, `cap`, `clear`. That it can be written at all is
+`remove`, `truncate`, `at`, `set`, `view`, `len`, `cap`, `is_empty`, `clear`. That it can be written at all is
 the interesting part, and it is what the section above bought.
 
 **Three of those shorten it, and they are one operation.** `truncate(n)` lowers the count to `n`,
@@ -326,11 +326,18 @@ implementation:
   to hold storage whose elements are not
   live yet, which is a question about the view types here — a length and a capacity as two separate
   facts about one allocation.
-- **A generic container still cannot declare storage it has no value for.** `[None; n]` works
-  whatever the parameters are, because `None` needs nothing of them; a `[16]K` cannot be written
-  for any `K`, because a repeat needs a value and no bound promises one. That is `14`'s decision
-  rather than this chapter's — see its `§7` entry on a bound that promises a value, which the
-  bullet above wants for the same reason.
+- **A generic container still cannot declare storage it has no value for — but this named the wrong
+  construct, and the one it named works.** `[None; n]` works whatever the parameters are, because
+  `None` needs nothing of them. A `[16]K` was said here to be unwritable for any `K`, and it is not:
+  it is the zero-value declaration of `§Writing one down`, so `var storage: [16]K` inside a generic
+  compiles, holds sixteen zeroed elements, and is refused per **instantiation** rather than at the
+  definition — at a `K` with no zero value, naming the instantiated `[16]Node` rather than the
+  parameter. What is genuinely out of reach is storage **sized while running**: the only form that
+  produces one is the repeat, a repeat needs a value in its value position, and no bound promises
+  one — so `var storage: []K` is the empty slice and nothing widens it. That is the shape of what
+  `Buf` does instead, which is why its `push` seeds the new storage with the value it arrived
+  holding. The remedy is `14`'s decision rather than this chapter's — see its `§7` entry on a bound
+  that promises a value, which the bullet above wants for the same reason.
 - ~~**Promotion of an escaping local array**~~ (`05`) — **built.** A view that would outlive its
   array now moves the array to a buffer instead of being refused, so a program that means to return
   one writes the ordinary `var buf: [64]u8` and says nothing. What is still refused is storage the

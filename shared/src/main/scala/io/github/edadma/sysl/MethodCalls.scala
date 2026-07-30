@@ -93,6 +93,15 @@ trait MethodCalls extends CallCore {
                     err(s"a method call reaches through one level of indirection and ${show(tr.ty)} " +
                       s"has more, so the rest is written: '(*x).$mname(…)' calls '$mname' on the " +
                       s"${show(rty)} it leaves")
+                  // A member the compiler provides, written with parentheses it does not take. A
+                  // property a program *declares* has said so since properties existed; a provided
+                  // one fell through to the line below and denied the member outright — the one
+                  // answer that is not true of it, since `len` is exactly what a slice has. Anything
+                  // reaching here failed to resolve as a call, so the provided members that really
+                  // are called — `copy`, and a weak reference's `get` — are already gone above.
+                  case _ if builtinMember(rty, mname) =>
+                    err(s"'$mname' is a property the compiler provides for '$base' — read it as " +
+                      s"'value.$mname', without '()'")
                   case _ => err(s"type '$base' has no method '$mname'")
               }
   }
