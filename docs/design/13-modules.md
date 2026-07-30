@@ -561,14 +561,18 @@ resolution rather than adding a second one. A **`val`** is the one module-level 
 have brought the trap back, since it is read while running and so has no value for a pattern to
 compare against; naming one in a pattern is therefore an error rather than a quiet binding.
 
-**A fourth place it may not stand, and should: the bounds of a `within` range.** `type Slot = u8
-within 0..<max_tasks` does not parse — the grammar takes a literal there — so a program that
-indexes a fixed table by a constrained integer writes the table's size twice, once as the array
-bound and once as the range, and nothing checks that the two agree. That is the one magic number a
-table-driven program has left, and it is in the one place a constant cannot reach.
-`guide/kernel` is the customer. The **diagnostic** names the rule and the name, at the name; what is
-still open is the restriction, not the way it reads. Recorded from the other side as
-`16 § Open b`, where the rest of the constrained-subtype design lives.
+**A fourth place it stands: the bounds of a `within` range.** `type Slot = u8 within 0..<max_tasks` is
+ordinary, so a program that indexes a fixed table by a constrained integer writes the table's size
+**once** — the array bound and the range are the same constant, and there is no pair of numbers left to
+disagree. That was the last magic number a table-driven program carried, and `guide/kernel` was the
+customer.
+
+The three positions a constant can size — an array bound, an enum discriminant, and a range bound — go
+through the **same fold**, which is the property worth keeping: they accept the same expressions because
+they ask the same question, rather than three grammars agreeing by coincidence. What a range bound still
+refuses is a name that is not a constant, and a **`val`** is the instructive case — it is read while
+running, so it cannot size a type any more than it can stand in a pattern. Recorded from the other side
+in `16`, where the rest of the constrained-subtype design lives.
 
 **A constant has no address.** It is folded into each use and occupies no storage, which is why it
 needs no initialization order, why a `no alloc` module may hold one, and why `&capacity` is not a

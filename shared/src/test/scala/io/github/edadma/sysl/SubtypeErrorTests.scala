@@ -31,12 +31,15 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
     ) should include("must be an integer, a float, or 'char'")
   }
 
+  // The messages say "integer bounds" rather than "integer-literal bounds", because a bound is a
+  // constant expression and need not be a literal at all (`16 § Open b`) — the kind is what is wrong
+  // here, not the spelling.
   "bounds of the wrong kind" - {
     "character bounds on an integer base are rejected" in {
-      err("type T = int within 'a'..'z'\nvar x: T = 1\nprint(int(x))") should include("integer-literal bounds")
+      err("type T = int within 'a'..'z'\nvar x: T = 1\nprint(int(x))") should include("needs integer bounds")
     }
     "integer bounds on a character base are rejected" in {
-      err("type L = char within 0..25\nvar x: L = 'a'\nprint(x)") should include("character-literal bounds")
+      err("type L = char within 0..25\nvar x: L = 'a'\nprint(x)") should include("needs character bounds")
     }
   }
 
@@ -81,6 +84,51 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
   "a subtype has no fallible cast" in {
     err("type Age = int within 0..150\nprint(Age.try(200).is_some())") should
       include("'Age' is a constrained type and has no 'try'")
+  }
+
+  /** A `within` bound is a constant expression, so what it refuses is a bound that is not constant —
+    * and the three cases differ in *why*, which is why each gets its own message. A name nothing
+    * declared, a name that is storage rather than a constant, and a constant of the wrong kind are
+    * three different mistakes, and telling a reader "needs integer bounds" about an undeclared name
+    * would send them to fix the wrong thing.
+    */
+  "a within bound has to be a constant" - {
+    "a name nothing declared is not one" in {
+      val e = err("type A = new int within 0..<nowhere")
+
+      e should include("has to be a constant")
+      e should include("'nowhere' is not one")
+    }
+
+    // A module-level `val` is read-only *storage* with an address (`13 §7`), which is exactly what a
+    // `const` is not — so it cannot size a type, and the message must not suggest it could.
+    "a module-level 'val' is storage, not a constant" in {
+      err("""val n: int = 4
+            |type B = new int within 0..<n""".stripMargin) should include("'n' is not one")
+    }
+
+    // Here the bound *is* constant and the complaint is about its kind, which is the other branch.
+    "a constant of the wrong kind is a different complaint" in {
+      val e = err("""const label: string = "hi"
+                    |type C = new int within 0..<label""".stripMargin)
+
+      e should include("needs integer bounds")
+      e should include("a string")
+    }
+
+    "a char subtype says so about a numeric bound" in {
+      err("""const n: int = 5
+            |type D = new char within 'a'..n""".stripMargin) should include("needs character bounds")
+    }
+
+    // The ordering check runs on the folded values, so two constants in the wrong order are caught
+    // exactly as two literals are.
+    "and two constants in the wrong order are still refused" in {
+      err("""const lo: int = 9
+            |const hi: int = 2
+            |type E = new int within lo..hi""".stripMargin) should
+        include("lower bound of 'E' is above its upper bound")
+    }
   }
 
   /** A derived scalar takes its base's whole catalog and may replace none of it.

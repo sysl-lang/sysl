@@ -52,6 +52,47 @@ class SubtypeParserTests extends AnyFreeSpec with ParseSupport {
           None,
         )
     }
+
+    /** A bound is a constant *expression*, not a literal (`16 § Open b`), so a name parses here and
+      * whether it denotes a constant is settled later. The level is the one tighter than a range,
+      * which is the whole reason this position could not simply take `expression`: at any looser
+      * level `0..<max_tasks` would parse as a **range expression** and swallow the `..<` that
+      * separates the two bounds.
+      */
+    "a name parses as a bound" in {
+      typeDecl("type Slot = int within 0..<max_tasks") shouldBe
+        TypeDecl(
+          "Slot",
+          named("int"),
+          derived = false,
+          Some(RangeBound(i(0), Ident("max_tasks"), exclusiveHi = true)),
+          None,
+        )
+    }
+
+    "and so does an expression over names" in {
+      typeDecl("type Mid = int within lo..hi - 1") shouldBe
+        TypeDecl(
+          "Mid",
+          named("int"),
+          derived = false,
+          Some(RangeBound(Ident("lo"), Binary("-", Ident("hi"), i(1)), exclusiveHi = false)),
+          None,
+        )
+    }
+
+    // The bound stops below the range operator, so the two bounds stay two — a bound parsed at a
+    // looser level would take `0..<n` as one range expression and leave the second bound missing.
+    "the bound does not swallow the range operator" in {
+      typeDecl("type S = int within a..<b") shouldBe
+        TypeDecl(
+          "S",
+          named("int"),
+          derived = false,
+          Some(RangeBound(Ident("a"), Ident("b"), exclusiveHi = true)),
+          None,
+        )
+    }
   }
 
   "where carries the predicate, with `value` a bare identifier" in {
@@ -88,21 +129,16 @@ class SubtypeParserTests extends AnyFreeSpec with ParseSupport {
            |    within""".stripMargin).collectFirst { case f: FuncDecl => f.name } shouldBe Some("where")
   }
 
-  // An array bound may name a `const`, which is what `const` exists for; a `within` bound may not,
-  // because the grammar takes a literal there. So a table's size and the range of the type that
-  // indexes it are written down separately and nothing checks that the two agree.
-  //
-  // Whether the restriction should stay is open (`16 § Open b`), but the message is not: the bare
-  // "newline expected" this used to give points past the end of the line and names neither the
-  // rule nor the name that broke it.
-  "a within bound is a literal, and says so where the name is written" in {
-    val e = progError("""const n: usize = 8
-                        |type Slot = new u8 within 0..<n
-                        |""".stripMargin)
-
-    e should include("a 'within' bound is a literal, and 'n' is a name")
-    e should not include "newline expected"
-
-    progError("type Slot = u8 within lo..9") should include("'lo' is a name")
+  // An array bound may name a `const` and a `within` bound now may too, so a table's size and the
+  // range of the type that indexes it are one fact written once. Both positions fold through the same
+  // `fold`, which is what keeps them from drifting apart.
+  "a within bound naming a const parses, as an array bound does" in {
+    prog("""const n: usize = 8
+           |type Slot = new u8 within 0..<n
+           |""".stripMargin) shouldBe
+      List(
+        ConstDecl("n", named("usize"), i(8)),
+        TypeDecl("Slot", named("u8"), derived = true, Some(RangeBound(i(0), Ident("n"), true)), None),
+      )
   }
 }

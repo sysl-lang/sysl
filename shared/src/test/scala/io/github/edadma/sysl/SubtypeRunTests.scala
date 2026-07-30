@@ -132,6 +132,60 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport {
           |print(Small(3))""".stripMargin) shouldBe "3\n"
   }
 
+  /** A `within` bound may name a `const` too (`16 § Open b`), which is what makes a table's size and
+    * the range of the type indexing it one fact instead of two. The bound folds through the same
+    * `fold` an array bound and an enum discriminant use, so the three positions accept the same
+    * expressions.
+    *
+    * The load-bearing assertions are the ones showing the bound really *is* the constant's value: a
+    * range that merely compiles proves nothing, since a bound silently read as zero would make every
+    * value out of range and a bound read as unbounded would check nothing at all.
+    */
+  "a within bound may name a const" - {
+    val table = "const max_tasks: int = 8\ntype Slot = new int within 0..<max_tasks\n"
+
+    "a value inside the constant's range is accepted" in {
+      run(table + "print(int(Slot(7)))") shouldBe "7\n"
+    }
+
+    // The exclusive upper bound really is 8, so 8 itself is out — this is the assertion that fails if
+    // the name folded to something else.
+    "and the bound is the constant's value, tested at the edge" in {
+      run(table + "print(Slot::Valid(7), Slot::Valid(max_tasks))") shouldBe "true false\n"
+    }
+
+    "a value the constant's range excludes still traps" in {
+      panics(table + "print(int(Slot(8)))", "")
+    }
+
+    // An expression over constants, which is the case that shows the bound is folded rather than
+    // pattern-matched against a bare name: `2..5` accepts 5 and rejects 6.
+    "an expression over constants is a bound" in {
+      run("""const lo: int = 2
+            |const hi: int = 8
+            |type Mid = new int within lo..hi - 3
+            |print(Mid::Valid(2), Mid::Valid(5), Mid::Valid(6), Mid::Valid(1))""".stripMargin) shouldBe
+        "true true false false\n"
+    }
+
+    // `::Valid` is for an integer subtype, so a `char` one is checked by constructing: one value the
+    // constant's range accepts, and one it does not, which traps.
+    "a char subtype takes a char constant" in {
+      val lower = "const first: char = 'a'\ntype Lower = new char within first..'f'\n"
+
+      run(lower + "print(char(Lower('c')))") shouldBe "c\n"
+      panics(lower + "print(char(Lower('z')))", "")
+    }
+
+    "and an array of the size the same constant gives is indexed by it" in {
+      run("""const max_tasks: int = 4
+            |type Slot = new int within 0..<max_tasks
+            |var table: [max_tasks]int = [0; 4]
+            |table[int(Slot(3))] = 9
+            |print(table.len, table[3])""".stripMargin) shouldBe "4 9\n"
+    }
+  }
+
   "a where predicate is checked at each produce site" - {
     val Even = "type Even = int within 0..100 where value % 2 == 0\n"
 

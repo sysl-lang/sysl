@@ -402,20 +402,34 @@ trait TypeResolution extends ImportResolution {
   }
 
   /** One `within` bound as a constant, checked against the base's kind: a `char` base takes a
-   * character literal, an integer base an integer literal that fits its width, a float base any
-   * numeric literal. A literal of the wrong kind, or an integer out of the base's range, is an error.
+   * character, an integer base an integer that fits its width, a float base any number. A bound of the
+   * wrong kind, or an integer out of the base's range, is an error.
+   *
+   * The bound is **folded first**, so a `const` — or an expression over constants — stands wherever a
+   * literal does, which is what makes `within 0..<max_tasks` and `[max_tasks]Task` one fact rather than
+   * two (`16 § Open b`). Folding is the same `fold` an array bound and an enum discriminant go through,
+   * so the three positions accept exactly the same expressions and cannot drift apart. What does not
+   * fold is reported as not being a constant, at the bound, rather than as a wrong *kind* — a name the
+   * program never declared is a different mistake from a name that is not a number.
    */
   private def boundValue(e: Expr, base: Type): BigDecimal =
+    fold(e) match
+      case Some(folded) => boundLiteral(folded, base)
+      case None =>
+        err(s"a 'within' bound has to be a constant, and ${boundKind(e)} is not one — a literal, a " +
+          "'const', or an expression over them")
+
+  private def boundLiteral(e: Expr, base: Type): BigDecimal =
     Type.underlying(base) match
       case Type.Char =>
         e match
           case CharLit(cp) => BigDecimal(cp)
-          case _           => err(s"a 'char' subtype needs character-literal bounds, not ${boundKind(e)}")
+          case _           => err(s"a 'char' subtype needs character bounds, not ${boundKind(e)}")
       case i: Type.Integer =>
         val v = e match
           case IntLit(n, _)             => n
           case Unary("-", IntLit(n, _)) => -n
-          case _                        => err(s"an integer subtype needs integer-literal bounds, not ${boundKind(e)}")
+          case _                        => err(s"an integer subtype needs integer bounds, not ${boundKind(e)}")
         if !Type.fits(v, i) then err(s"the bound $v does not fit ${show(base)}")
         BigDecimal(v)
       case _ =>
@@ -424,13 +438,18 @@ trait TypeResolution extends ImportResolution {
           case Unary("-", IntLit(n, _))   => BigDecimal(-n)
           case FloatLit(t, _)             => BigDecimal(t)
           case Unary("-", FloatLit(t, _)) => -BigDecimal(t)
-          case _                          => err(s"a floating-point subtype needs numeric-literal bounds, not ${boundKind(e)}")
+          case _                          => err(s"a floating-point subtype needs numeric bounds, not ${boundKind(e)}")
 
   private def boundKind(e: Expr): String = e match
-    case _: CharLit                      => "a character"
-    case _: FloatLit                     => "a floating-point literal"
-    case Unary("-", _: FloatLit)         => "a floating-point literal"
-    case _                               => "an integer"
+    case _: CharLit              => "a character"
+    case _: FloatLit             => "a floating-point literal"
+    case Unary("-", _: FloatLit) => "a floating-point literal"
+    case _: IntLit               => "an integer"
+    case Unary("-", _: IntLit)   => "an integer"
+    case _: StrLit               => "a string"
+    case _: BoolLit              => "a boolean"
+    case Ident(n)                => s"'$n'"
+    case _                       => "that"
 
   /** A trait named behind a memory-mode sigil, which is what makes the pointer a trait object
    * (`02`): `*Trait` raw and unmanaged, `&Trait` reference-counted. `None` for everything else,

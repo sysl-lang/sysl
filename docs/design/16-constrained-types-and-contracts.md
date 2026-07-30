@@ -333,11 +333,23 @@ method *name*, and `add` is taken. Whether the rule should be "no member may sha
 rather than "no member at all" is the open question, and it is the difference between the middle
 column of §3's table being empty and being usable. Decide with `14 §7`.
 
-**b. A `within` bound may not name a `const`.** An array bound may (`[max_tasks]Task`); a range bound
-takes a literal, so a table's size and the range of the type that indexes it are written twice with
-nothing checking they agree. `13 §7` records it from the other side. What is open is the
-restriction; the **diagnostic** names the rule and the name, at the name, which is the right shape
-of message whether the restriction stays or goes.
+**~~b. A `within` bound may not name a `const`.~~** **Closed — it may.** A bound is a **constant
+expression**, folded through the same `fold` an array bound and an enum discriminant go through, so the
+three positions accept the same expressions and cannot drift apart: `within 0..<max_tasks` beside
+`[max_tasks]Task` is one fact written once, and `within lo..hi - 3` is ordinary. Nothing about the rest
+of the chapter moved — the range is still checked at every produce site §4 names, and the ordering check
+runs on the folded values, so two constants in the wrong order are refused exactly as two literals are.
+
+What kept it at a literal was a **grammar** ambiguity rather than a decision, which is why this was
+implementation work: `rangeExpr` is built out of `bitOr`, so a bound parsed at any looser level would
+read `0..<max_tasks` as a *range expression* and swallow the operator separating the two bounds. Naming
+`bitOr` — the level immediately tighter than a range — is the whole of the fix.
+
+What a bound may still not be is **non-constant**, and the two refusals differ because the mistakes do:
+a name that denotes no constant is reported as not being one (a module-level `val` is read-only storage
+with an address, not a constant, and is refused here), while a constant of the wrong *kind* is reported
+against the base — `needs integer bounds`, not `needs integer-literal bounds`, since a bound need not be
+a literal at all.
 
 **c. Invariants on a generic struct.** Refused with a clear message. The question is what a clause
 over a field of type `T` could even mean when nothing about `T` is known — most useful invariants

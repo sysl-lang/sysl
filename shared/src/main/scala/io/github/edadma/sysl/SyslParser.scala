@@ -930,19 +930,20 @@ class SyslParser(val source: Source) extends PackratParsers {
 
   private lazy val whereClause: Parser[Expr] = whereKw ~> expression
 
-  /** A bound of a `within` range: a character literal, or a numeric literal with an optional sign.
+  /** A bound of a `within` range: any **constant expression**, which is the same thing an array bound
+   * accepts — `within 0..<max_tasks` beside `[max_tasks]Task`, so a table's size and the range of the
+   * type indexing it are one fact written once (`13 §7`, `16 § Open b`).
    *
-   * A name is the thing somebody writes here and cannot: an array bound may be a `const`
-   * (`[max_tasks]Task`) and a range bound may not, so a table's size and the range of the type
-   * indexing it are written twice with nothing checking they agree (`13 §7`, `16 § Open b`). The
-   * restriction is not settled, but the message a bare grammar failure gives — "newline expected",
-   * pointing past the end of the line — is the wrong shape whether it stays or goes.
+   * The level is `bitOr`, which is deliberately the one *tighter* than a range: `rangeExpr` is built
+   * out of `bitOr`, so parsing a bound at any looser level would let `0..<max_tasks` be read as a range
+   * expression and swallow the very operator that separates the two bounds. That ambiguity is what kept
+   * this position at a literal, and naming the level is the whole of the fix.
+   *
+   * Whether the expression really is constant is not a question the grammar can answer — `n + 1` is a
+   * fine parse and a fine constant when `n` is one — so it is answered where the bound is turned into a
+   * number, which is also where its kind is checked against the base.
    */
-  private lazy val boundLit: Parser[Expr] =
-    charLit | op("-") ~> (floatLit | intLit) ^^ (Unary("-", _)) | floatLit | intLit |
-      guard(ident) >> (n => err(s"a 'within' bound is a literal, and '$n' is a name — a constant cannot " +
-        "stand in a range yet, so the number has to be written out here as well as wherever the " +
-        "constant is used"))
+  private lazy val boundLit: Parser[Expr] = bitOr
 
   private lazy val newKw: Parser[Unit]    = softWord("new")
   private lazy val withinKw: Parser[Unit] = softWord("within")
