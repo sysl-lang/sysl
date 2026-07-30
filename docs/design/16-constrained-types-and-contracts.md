@@ -80,8 +80,13 @@ three ranges make that bug a compile error rather than a plausible-looking wrong
 strongest argument the language has for the feature, and it is an argument about **types**, not
 about checking.
 
-Reading a derived value *as* its base needs no cast where a base is what is wanted and no narrowing
-is involved; producing one always does.
+The two kinds behave oppositely here, and keeping them apart is the whole of this section. A
+**transparent** subtype *is* its base (§1), so reading one where a base is wanted needs no cast:
+`var n: int = a` on an `Age` is one integer flowing into another. A **derived** one needs the cast in
+*both* directions, and no position excuses it — an initializer, an argument and a returned value each
+refuse a `Meters` where an `f64` is written, and `f64(m)` is what to write. That is the bullet above
+rather than an exception to it: a derivation is a distinct type, and reading it as something else is
+a conversion whichever way it goes.
 
 ## 3. A derivation inherits its base's behaviour and may replace none of it
 
