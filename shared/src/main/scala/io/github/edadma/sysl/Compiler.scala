@@ -27,6 +27,15 @@ object Compiler {
   def compile(sources: List[Source], target: Target = Target.default): Either[String, String] =
     compiled(sources, target).map(_._1)
 
+  /** The same compilation, starting from trees that are **already parsed**.
+   *
+   * This is the seam a library artifact enters through (`AstCodec`): a decoded tree is the tree the
+   * parser would have produced, so everything from here on is unchanged and no pass has to know
+   * whether a declaration was read from source or from an artifact.
+   */
+  def compileTrees(units: List[Program], target: Target = Target.default): Either[String, String] =
+    analyzed(units, target).map(_._1)
+
   /** The same compilation, keeping the notes the driver may want to show — currently the heap
    * promotions, for `--explain-escapes` (`05`). Separate from `compile` so that the ordinary path
    * has nothing extra to ignore.
