@@ -155,21 +155,34 @@ class HashTraitTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   }
 
   "the trait itself is ordinary" - {
-    "declared in the prelude, so a program may name it in a bound" in {
-      ir("keyed[K: Hash](k: K) -> u64 = k.hash()\nprint(str(keyed(1)))") should include("@hash_u64")
+    // Which mixer `k.hash()` lowers to is chosen by the *compiler* from `CoreTraits`, not resolved
+    // from source, so every symbol here is a name the compiler spells — and one that goes stale
+    // silently unless it is read off the seam. The **negative** below is the one that would go
+    // quiet: it happens to survive a move, because `hash_u64` is a substring of `sysl$hash_u64`,
+    // and that is luck rather than design — the same assertion written `"@hash_u64"` would pass
+    // vacuously the moment the declaration crossed.
+    "declared in the library, so a program may name it in a bound" in {
+      ir("keyed[K: Hash](k: K) -> u64 = k.hash()\nprint(str(keyed(1)))") should
+        include(s"@${Library.key("hash_u64")}")
     }
 
-    // Nothing is emitted for a program that hashes nothing, which is the prelude's standing rule.
+    // Nothing is emitted for a program that hashes nothing, which is the library's standing rule.
     "and costs a program that hashes nothing exactly nothing" in {
-      ir("print(1)") should not include "hash_u64"
+      ir("print(1)") should not include Library.key("hash_u64")
     }
 
     "while a bool reaches its own lowering, one bit not being a number here" in {
-      ir("print(str(true.hash()))") should include("@hash_bool")
+      ir("print(str(true.hash()))") should include(s"@${Library.key("hash_bool")}")
     }
 
     "and a string reaches the byte-wise one" in {
-      ir("""print(str("a".hash()))""") should include("@hash_str")
+      ir("""print(str("a".hash()))""") should include(s"@${Library.key("hash_str")}")
+    }
+
+    "and a wide integer reaches the one that folds it in two" in {
+      // The fourth branch of the table, which nothing had asked about — and the one whose symbol a
+      // move would change with nothing to notice.
+      ir("print(str(u128(1).hash()))") should include(s"@${Library.key("hash_u128")}")
     }
   }
 

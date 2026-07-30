@@ -181,9 +181,6 @@ object Prelude {
       |trait Ord
       |    lt(self, rhs: Self) -> bool
       |
-      |trait Hash
-      |    hash(self) -> u64
-      |
       |trait Index[I, E]
       |    index(self, i: I) -> E
       |
@@ -207,22 +204,6 @@ object Prelude {
       |
       |trait Fn4[A, B, C, D, R]
       |    call(*self, a: A, b: B, c: C, d: D) -> R
-      |
-      |hash_u64(v: u64) -> u64
-      |    var h = v + 0x9e3779b97f4a7c15u64
-      |    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64
-      |    h = (h ^ (h >> 27u64)) * 0x94d049bb133111ebu64
-      |    h ^ (h >> 31u64)
-      |
-      |hash_u128(v: u128) -> u64 = hash_u64(u64(v)) * 0x100000001b3u64 ^ hash_u64(u64(v >> 64))
-      |
-      |hash_bool(b: bool) -> u64 = hash_u64(if b then 1u64 else 0u64)
-      |
-      |hash_str(s: string) -> u64
-      |    var h = 0xcbf29ce484222325u64
-      |    for b in s.bytes
-      |        h = (h ^ u64(b)) * 0x100000001b3u64
-      |    h
       |
       |impl[A: Eq, B: Eq] Eq for (A, B)
       |    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1

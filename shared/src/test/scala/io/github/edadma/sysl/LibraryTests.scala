@@ -491,6 +491,43 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "a moved trait whose memberships the compiler supplies rather than a program declaring them" - {
+
+    "a program may declare a 'Hash' of its own, and a built-in still satisfies the library's" in {
+      // `Hash`'s members are a *rule* rather than a table of `impl`s — the integer family is open,
+      // so there is no finite list to write one for. That makes the bound `[K: sysl.Hash]` the only
+      // way an `i5` was ever going to be accepted, and the shadowing program has to leave it alone.
+      run(
+        """trait Hash
+          |    digest(self) -> int
+          |
+          |struct Token
+          |    n: int
+          |
+          |impl Hash for Token
+          |    digest(self) -> int = self.n
+          |
+          |keyed[K: sysl.Hash](k: K) -> u64 = k.hash()
+          |
+          |print(Token(4).digest())
+          |print(keyed(1u8) == keyed(1i64))
+          |""".stripMargin) shouldBe "4\ntrue\n"
+    }
+
+    "and a bound on the program's own does not accept a built-in, which is the whole distinction" in {
+      // Two traits spelled `Hash`; only one of them a built-in belongs to, and the membership is
+      // what the compiler supplies rather than what the name says.
+      refused(
+        """trait Hash
+          |    digest(self) -> int
+          |
+          |keyed[K: Hash](k: K) -> int = k.digest()
+          |
+          |print(keyed(1))
+          |""".stripMargin) should include("Hash")
+    }
+  }
+
   "the standard module is the library's, and a program may not add to it" - {
 
     "a file declaring it is refused" in {

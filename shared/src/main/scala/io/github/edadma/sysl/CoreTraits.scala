@@ -2,10 +2,17 @@ package io.github.edadma.sysl
 
 /** The traits the compiler knows by name, and which built-in types satisfy them (`14 §2`, `§5`).
  *
- * The traits themselves are ordinary declarations in the prelude — a program can read them, and can
+ * The traits themselves are ordinary declarations of the library — a program can read them, and can
  * call their methods directly (`5.add(3)`) exactly as it calls any other. What lives here is the
  * part a source declaration cannot say: which operator each trait's one method *is*, and which
  * built-in types are members.
+ *
+ * **Everything in this file is a spelling**, which is what a program writes, and a consumer holding
+ * a resolved key goes through `Library.spelling` before asking. The two used to coincide and no
+ * longer do: `Display` and `Hash` are in the standard module and filed under `sysl$Display` and
+ * `sysl$Hash`, while `Add`, `Ord` and the rest are still the prelude's and keyed by their own names.
+ * Which of the two a trait is in is a fact this table deliberately does not hold — where a trait
+ * lives is not what its operator is.
  *
  * **The memberships have to be a rule rather than a table of `impl`s**, because the integer family
  * is open: `i5` and `u12` are types a program may name, so there is no finite list of scalars to
@@ -159,7 +166,7 @@ object CoreTraits {
     }
   }
 
-  /** The prelude function a built-in's `Hash` goes through, and the type its receiver widens to.
+  /** The library function a built-in's `Hash` goes through, and the type its receiver widens to.
    *
    * Everything whose value is one whole number arrives at the same mixer, widened to 64 bits, which
    * is what makes `1u8` and `1i64` hash alike — they compare alike, and the law is that they must.

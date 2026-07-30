@@ -1,0 +1,37 @@
+module sysl
+
+// What a value mixes down to when something needs to key on it (`14 §2`, `§5`).
+//
+// A `u64` rather than a `usize`, so a hash means the same thing on every target and a table moved
+// between two of them does not resize because the word did.
+trait Hash
+    hash(self) -> u64
+
+// The mixers a built-in's `Hash` membership renders through. A built-in has no `impl` block, so
+// there is no lowered `int.hash` to call; what it has is one of these, chosen by type, and naming
+// them is what lets a `Hash` written for a struct mix its own fields.
+//
+// This is splitmix64's finalizer: it is the one that turns a counter into something a table can
+// bucket on, since consecutive integers are the input a hash table actually meets and the identity
+// hash is what makes them collide in a row.
+hash_u64(v: u64) -> u64
+    var h = v + 0x9e3779b97f4a7c15u64
+    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64
+    h = (h ^ (h >> 27u64)) * 0x94d049bb133111ebu64
+    h ^ (h >> 31u64)
+
+// Past 64 bits the two halves are mixed separately and combined, because the finalizer above is
+// defined on a word and a wider integer has no single one.
+hash_u128(v: u128) -> u64 = hash_u64(u64(v)) * 0x100000001b3u64 ^ hash_u64(u64(v >> 64))
+
+// A `bool` is one bit, and one bit does not widen to a number in this language -- the same reason
+// `display_bool` exists rather than a widening into the integer renderer.
+hash_bool(b: bool) -> u64 = hash_u64(if b then 1u64 else 0u64)
+
+// FNV-1a over the bytes, which is what a string is: a validated `[]u8`, so there is nothing to
+// decode and every byte counts once.
+hash_str(s: string) -> u64
+    var h = 0xcbf29ce484222325u64
+    for b in s.bytes
+        h = (h ^ u64(b)) * 0x100000001b3u64
+    h
