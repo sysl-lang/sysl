@@ -187,7 +187,7 @@ trait SpecialForms extends Closures {
     checkWriterShape(); Type.underlying(t.ty)
   } match
     case a: Type.Abstract =>
-      if !satisfies(displayTrait, a) then boundErr(s"'$op' needs '${a.name}: Display'")
+      if !satisfies(displayTrait, a) then boundErr(s"'$op' needs '${a.name}: ${qn(displayTrait)}'")
       (displayMethod, t, None)
 
     case Type.Ptr(o: Type.Trait) => objectRenderer(t, o, op)
@@ -209,13 +209,20 @@ trait SpecialForms extends Closures {
             // advice names the block's own parameters rather than the arguments this value has. And
             // a type an implementation already covers is told what that implementation asked of it,
             // since writing a second one is exactly what it may not do.
+            //
+            // The trait is named by the **key**, never spelled: advice is the one place where being
+            // shown a name that means something else is worse than being shown a long one. A program
+            // with a `Display` of its own reaches the library's only by path, and telling it to write
+            // `impl Display` would have it implement its own trait and be refused again for the same
+            // reason.
+            val tr  = qn(displayTrait)
             val fix = unmetBound(displayTrait, ty).getOrElse(ty match
               case n: Type.Named if n.targs.nonEmpty =>
                 val tps = nominalTparams(n.base).mkString(", ")
-                s"write an 'impl[$tps] Display for ${qn(n.base)}[$tps]' to say how it renders"
-              case n: Type.Named                 => s"write an 'impl Display for ${show(n)}' to say how it renders"
-              case _: Type.Array | _: Type.Slice => s"write an 'impl Display for ${show(ty)}' to say how it renders"
-              case _                             => "it does not implement 'Display'")
+                s"write an 'impl[$tps] $tr for ${qn(n.base)}[$tps]' to say how it renders"
+              case n: Type.Named                 => s"write an 'impl $tr for ${show(n)}' to say how it renders"
+              case _: Type.Array | _: Type.Slice => s"write an 'impl $tr for ${show(ty)}' to say how it renders"
+              case _                             => s"it does not implement '$tr'")
             val asked = if op == "print" then "cannot print" else "cannot make a string of"
             err(s"$asked a ${show(ty)} value — $fix")
 
@@ -238,7 +245,7 @@ trait SpecialForms extends Closures {
         val asked = if op == "print" then "cannot print" else "cannot make a string of"
 
         err(s"$asked a ${show(t.ty)} value — an object offers what its trait declares and what that " +
-          s"trait requires, so write 'trait ${qn(o.name)}: Display' to keep the rendering the value " +
+          s"trait requires, so write 'trait ${qn(o.name)}: ${qn(displayTrait)}' to keep the rendering the value " +
           "had before it was erased")
 
   /** The library's `Display`, and the member of it every rendering goes through. Both are keys, so

@@ -119,7 +119,7 @@ class GenericMethodErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Box[T]
           |    v: T
           |    describe[U](self, x: U) -> string = str(x)""".stripMargin,
-      ) should include("'str' needs 'U: Display'")
+      ) should include("'str' needs 'U: sysl.Display'")
     }
 
     "an operator on one does too" in {
@@ -135,7 +135,7 @@ class GenericMethodErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Counter
           |    n: int
           |    describe[U](self, x: U) -> string = str(x)""".stripMargin,
-      ) should include("'str' needs 'U: Display'")
+      ) should include("'str' needs 'U: sysl.Display'")
     }
 
     "what the type asks of its own parameter says nothing about the member's" in {
@@ -143,7 +143,7 @@ class GenericMethodErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Box[T: Display]
           |    v: T
           |    describe[U](self, x: U) -> string = str(x)""".stripMargin,
-      ) should include("'str' needs 'U: Display'")
+      ) should include("'str' needs 'U: sysl.Display'")
     }
 
     "an unbounded parameter handed to a bounded type is refused at the definition" in {

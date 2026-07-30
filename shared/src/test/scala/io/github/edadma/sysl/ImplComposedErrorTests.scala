@@ -198,7 +198,7 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
     // statement that it renders no way at all.
     "printing a slice points at the impl to write" in {
       err("var a = [1, 2]\nprint(a[0..])") should
-        include("write an 'impl Display for []int' to say how it renders")
+        include("write an 'impl sysl.Display for []int' to say how it renders")
     }
 
     // A memory mode is one of the shapes an `impl` may not be for, so there is nothing to suggest.
@@ -208,7 +208,7 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
           |    v: int
           |var p = P(1)
           |print(&p)""".stripMargin,
-      ) should include("it does not implement 'Display'")
+      ) should include("it does not implement 'sysl.Display'")
     }
   }
 

@@ -525,7 +525,7 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |    display(self, out: *Writer, fmt: FormatSpec) = display_pad("r".bytes, out, fmt)
           |var o: &Shape = Rect(3, 4)
           |print(o)""".stripMargin,
-      ) should include("write 'trait Shape: Display'")
+      ) should include("write 'trait Shape: sysl.Display'")
     }
 
     // A table holds function pointers and a compiler-provided membership has no function — the
@@ -538,7 +538,7 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |impl Tagged for i32
           |    tag(self) -> int = 7
           |var o: &Tagged = 1i32""".stripMargin,
-      ) should include("implements 'Display' by the compiler's own rule rather than through an 'impl'")
+      ) should include("implements 'sysl.Display' by the compiler's own rule rather than through an 'impl'")
     }
 
     // The object-safety diagnostic has two names to get right and they are different names: the

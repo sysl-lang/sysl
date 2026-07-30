@@ -25,6 +25,16 @@ package io.github.edadma.sysl
  * three fields are explained. It is here first because it depends on nothing — a move is measured by
  * what breaks, and a leaf is what makes that measurement about the mechanism rather than about the
  * declaration.
+ *
+ * **`Display` is what a value's text is written through** (`14 §2`, `§6`): a rendering goes into a
+ * sink rather than into a fresh `string`, so it costs no allocation and a `no alloc` module can
+ * still log. It names two other things, and they are not in the same place — `FormatSpec` is here
+ * beside it, and `Writer` is still the prelude's. That is the point of moving it second: it is the
+ * first declaration whose signature reaches *out* of the standard module and back into what is left
+ * of the prelude, which is the direction that had never been exercised. A name written here is
+ * looked for among the library's own regardless of which of the two parts holds it, so neither
+ * direction needs an import; the module a declaration sits in is not what decides whose names it can
+ * see, and while the drain is in progress it could not be.
  */
 object Std {
 
@@ -40,6 +50,9 @@ object Std {
       |    width: int
       |    prec: int
       |    left: bool
+      |
+      |trait Display
+      |    display(self, out: *Writer, fmt: FormatSpec)
       |""".stripMargin
 
   /** The source these declarations point into, so a diagnostic against one quotes the standard

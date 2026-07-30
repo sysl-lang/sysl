@@ -16,26 +16,26 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
       err("""struct Q
             |    a: int
             |print(Q(1))""".stripMargin) should include(
-        "cannot print a Q value — write an 'impl Display for Q' to say how it renders")
+        "cannot print a Q value — write an 'impl sysl.Display for Q' to say how it renders")
     }
 
     "says the same about an enum" in {
       err("""enum Colour
             |    Red
-            |print(Red)""".stripMargin) should include("write an 'impl Display for Colour'")
+            |print(Red)""".stripMargin) should include("write an 'impl sysl.Display for Colour'")
     }
 
     "reports 'str' in the words 'str' was asked in" in {
       err("""struct Q
             |    a: int
             |print(str(Q(1)))""".stripMargin) should include(
-        "cannot make a string of a Q value — write an 'impl Display for Q'")
+        "cannot make a string of a Q value — write an 'impl sysl.Display for Q'")
     }
 
     // A pointer is deliberately not `Display` (`14 §5`): an address renders differently on every
     // run. There is no `impl` to suggest either, since a composed type cannot carry one yet.
     "offers no impl for a type that could not carry one" in {
-      err("var n = 1\nprint(&n)") should include("cannot print a *int value — it does not implement 'Display'")
+      err("var n = 1\nprint(&n)") should include("cannot print a *int value — it does not implement 'sysl.Display'")
     }
 
     "refuses a reference rather than reaching through it" in {
@@ -66,16 +66,16 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
     // The whole payoff of `14 §4`: the complaint lands on the definition, naming the bound that
     // would license it, whether or not anything ever instantiates the function.
     "is told which bound would let it be printed" in {
-      err("f[T](x: T) = print(x)\nf(1)") should include("'print' needs 'T: Display'")
+      err("f[T](x: T) = print(x)\nf(1)") should include("'print' needs 'T: sysl.Display'")
     }
 
     "is told the same about 'str'" in {
-      err("f[T](x: T) -> string = str(x)\nprint(f(1))") should include("'str' needs 'T: Display'")
+      err("f[T](x: T) -> string = str(x)\nprint(f(1))") should include("'str' needs 'T: sysl.Display'")
     }
 
     // No call site at all, which is what tells a definition-time check apart from a template.
     "is told so even where nothing instantiates it" in {
-      err("f[T](x: T) = print(x)") should include("'print' needs 'T: Display'")
+      err("f[T](x: T) = print(x)") should include("'print' needs 'T: sysl.Display'")
     }
 
     "is accepted once the bound is written" in {
@@ -92,7 +92,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
       err("""struct Q
             |    a: int
             |show[T: Display](x: T) = print(x)
-            |show(Q(1))""".stripMargin) should include("requires its type parameter 'T' to implement 'Display'")
+            |show(Q(1))""".stripMargin) should include("requires its type parameter 'T' to implement 'sysl.Display'")
     }
   }
 
@@ -102,7 +102,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
     "may not compete with a built-in's own rendering" in {
       err("""impl Display for int
             |    display(self, out: *Writer, fmt: FormatSpec) = display_str("no", out, fmt)
-            |print(1)""".stripMargin) should include("'int' already implements 'Display'")
+            |print(1)""".stripMargin) should include("'int' already implements 'sysl.Display'")
     }
 
     "must match the trait's signature" in {

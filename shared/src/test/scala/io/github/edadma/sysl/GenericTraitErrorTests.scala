@@ -281,7 +281,7 @@ class GenericTraitErrorTests extends AnyFreeSpec with RunSupport with CodegenSup
           |    into(self) -> T
           |show[X: Into[Y], Y](x: X)
           |    print(x.into())""".stripMargin,
-      ) should include("'print' needs 'Y: Display'")
+      ) should include("'print' needs 'Y: sysl.Display'")
     }
   }
 

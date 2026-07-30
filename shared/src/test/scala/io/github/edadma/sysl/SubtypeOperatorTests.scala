@@ -346,7 +346,7 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     }
     "and neither may Display" in {
       err(Stamp + "impl Display for Stamp\n    display(self, out: &Writer, fmt: string)\n        out.write(\"x\")") should
-        include("already implements 'Display'")
+        include("already implements 'sysl.Display'")
     }
     "nor for a transparent one, which is its base and has the base's rows" in {
       err(Age + "impl Add for Age\n    add(self, other: Age) -> Age\n        self") should

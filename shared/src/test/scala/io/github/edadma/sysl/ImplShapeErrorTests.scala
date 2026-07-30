@@ -153,7 +153,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     // a block that assumed nothing.
     "and the body is checked at its definition, against the bounds alone" in {
       err(s"${show}impl[T] Show for []T\n    show(self) -> string = str(self[0])") should
-        include("'str' needs 'T: Display'")
+        include("'str' needs 'T: sysl.Display'")
     }
   }
 
@@ -173,7 +173,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
            |struct P
            |    v: int
            |print(Row(P(1)))""".stripMargin,
-      ) should include("cannot print a Row[P] value — the 'impl' that covers it asks 'Display' of P, " +
+      ) should include("cannot print a Row[P] value — the 'impl' that covers it asks 'sysl.Display' of P, " +
         "which does not implement it")
     }
 

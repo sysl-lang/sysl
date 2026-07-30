@@ -44,7 +44,7 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
       err(
         """trait Loud
           |    say(self) = print(self)""".stripMargin
-      ) should include("'Self: Display'")
+      ) should include("'Self: sysl.Display'")
     }
 
     // The default's body is one body however many types inherit it, so its mistake is one

@@ -130,7 +130,7 @@ class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Wrap[T]
           |    inner: T
           |    line(self) -> string = str(self.inner)""".stripMargin,
-      ) should include("'T: Display'")
+      ) should include("'T: sysl.Display'")
     }
 
     // A field is layout rather than behaviour, so no bound could ever license one — the rule is the

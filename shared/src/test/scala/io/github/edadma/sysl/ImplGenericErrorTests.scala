@@ -151,7 +151,7 @@ class ImplGenericErrorTests extends AnyFreeSpec with CodegenSupport {
 
     "and a type with no rendering names the block to write" in {
       err(s"${box}print(Box(1))") should
-        include("write an 'impl[T] Display for Box[T]' to say how it renders")
+        include("write an 'impl[T] sysl.Display for Box[T]' to say how it renders")
     }
   }
 
@@ -166,7 +166,7 @@ class ImplGenericErrorTests extends AnyFreeSpec with CodegenSupport {
 
     "rendering a parameter needs 'Display', and says so" in {
       err(s"$show${box}impl[T] Show for Box[T]\n    show(self) -> string = str(self.v)") should
-        include("'str' needs 'T: Display'")
+        include("'str' needs 'T: sysl.Display'")
     }
 
     "an operator needs its own bound" in {

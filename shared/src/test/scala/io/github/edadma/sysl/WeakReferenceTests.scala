@@ -317,7 +317,7 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
 
     "and neither is printing one" in {
       err(node + "var a: &Node = Node(1)\nvar w: weak Node = a\nprint(w)") should include(
-        "cannot print a weak Node value — it does not implement 'Display'")
+        "cannot print a weak Node value — it does not implement 'sysl.Display'")
     }
 
     // `13 §2` — a declaration may not be more visible than the types it names, and the mode in

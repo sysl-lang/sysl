@@ -104,7 +104,7 @@ class AssociatedGenericErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Box[T]
           |    v: T
           |    describe(x: T) -> string = str(x)""".stripMargin,
-      ) should include("'str' needs 'T: Display'")
+      ) should include("'str' needs 'T: sysl.Display'")
     }
 
     "an operator on an unbounded parameter does too" in {

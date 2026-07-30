@@ -194,6 +194,6 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
         |print(f"${o}")""".stripMargin
 
     err(src) should include("cannot make a string of a &Shape value — an object offers what its " +
-      "trait declares and what that trait requires, so write 'trait Shape: Display'")
+      "trait declares and what that trait requires, so write 'trait Shape: sysl.Display'")
   }
 }

@@ -28,12 +28,11 @@ package io.github.edadma.sysl
  * — and that part lives in `CoreTraits`, because the open `iN` / `uN` families have no finite list
  * of scalars an `impl` could be written for.
  *
- * **`Writer` and `Display`** (`14 §2`, `§6`) are the rendering half of that catalog. A `Display`
- * writes its value's text into a sink rather than returning a fresh `string`, so rendering costs no
- * allocation and a `no alloc` module can still log; the sink is a `*Writer`, which is the trait
- * object of `02`. `Writer` takes bytes rather than a `string` because that is the direction that is
- * free — a `string` *is* a validated `[]u8` — and it reports failure by latching rather than by
- * returning, so an implementation stays straight-line and `print(x)` stays a statement.
+ * **`Writer`** (`14 §2`, `§6`) is the sink half of the rendering surface, the trait object of `02`
+ * that everything a `Display` renders is written into. It takes bytes rather than a `string` because
+ * that is the direction that is free — a `string` *is* a validated `[]u8` — and it reports failure by
+ * latching rather than by returning, so an implementation stays straight-line and `print(x)` stays a
+ * statement. `Display` itself is in the standard module and names this trait from there.
  *
  * `failed` carries a **default** of `false`, which is the prelude's own use of the mechanism `02`
  * calls for: most sinks cannot fail, and one that cannot should not have to write down that it
@@ -301,9 +300,6 @@ object Prelude {
       |trait Reader
       |    read(*self, into: []u8) -> []u8
       |    failed(*self) -> bool = false
-      |
-      |trait Display
-      |    display(self, out: *Writer, fmt: FormatSpec)
       |
       |display_fill(out: *Writer, b: u8, n: int)
       |    var buf: [16]u8

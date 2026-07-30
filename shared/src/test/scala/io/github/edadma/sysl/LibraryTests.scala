@@ -260,7 +260,87 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |impl Display for P
           |    display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
           |""".stripMargin) should include(
-        "parameter 'spec' of method 'display' is FormatSpec, but trait 'Display' declares sysl.FormatSpec")
+        "parameter 'spec' of method 'display' is FormatSpec, but trait 'sysl.Display' declares sysl.FormatSpec")
+    }
+  }
+
+  "a moved declaration whose own signature names one that has not moved" - {
+
+    // `Display.display` is declared `(self, out: *Writer, fmt: FormatSpec)`: `FormatSpec` is beside it
+    // in the standard module and `Writer` is still the prelude's, so matching an `impl` against it
+    // reads one name in each part. That direction — a standard-module declaration reaching back into
+    // the prelude — is what this group is for, and nothing before the move exercised it.
+
+    "an impl matches the trait's signature across both parts of the library" in {
+      run(
+        """struct P
+          |    x: int
+          |
+          |impl Display for P
+          |    display(self, out: *Writer, fmt: FormatSpec) = str(self.x).display(out, fmt)
+          |
+          |print(P(4))
+          |""".stripMargin) shouldBe "4\n"
+    }
+
+    "the sink it names is still the prelude's, which a program may not declare over" in {
+      // The clash is what protects `Writer` until it moves, and this is the pin that says so — the
+      // marker for the next move, and for the test that becomes writable then: with `Writer` in the
+      // standard module a program may have one of its own, and `Display.display` must go on meaning
+      // the library's. That is the failure `FormatSpec` had, pointing the other way, and it cannot
+      // happen while this test passes.
+      Library.key("Writer") shouldBe "Writer"
+      Modules.moduleOf(Library.key("Writer")) shouldBe Modules.root
+
+      refused("trait Writer\n    log(self) -> int\n") should include("already declared")
+    }
+
+    "a program may declare a 'Display' of its own, and the library's is still what print asks for" in {
+      // The name clash is gone the moment the trait moves, so `Display` unqualified is the program's
+      // here (`13 §3` — own module first) and has nothing to do with rendering.
+      run(
+        """trait Display
+          |    describe(self) -> int
+          |
+          |struct P
+          |    x: int
+          |
+          |impl Display for P
+          |    describe(self) -> int = self.x * 2
+          |
+          |impl sysl.Display for P
+          |    display(self, out: *Writer, fmt: FormatSpec) = str(self.x).display(out, fmt)
+          |
+          |print(P(5).describe())
+          |print(P(5))
+          |""".stripMargin) shouldBe "10\n5\n"
+    }
+
+    "the bound that advice names is one a program can actually write" in {
+      // `'print' needs 'T: sysl.Display'` is advice, and a bound reaches its trait through
+      // `resolveBound` rather than through the type path `sysl.FormatSpec` takes — a different
+      // lookup, and one nothing had asked a qualified name of. Advice that does not compile when
+      // followed is worse than no advice.
+      run("show[T: sysl.Display](x: T) = print(x)\nshow(7)\nshow(\"s\")") shouldBe "7\ns\n"
+    }
+
+    "and the advice names the trait by the path that reaches it, not by the shadowed spelling" in {
+      // Two traits spelled `Display`, and the one `print` needs is the one the program did not
+      // implement. Advice to `write an 'impl Display for P'` would have the program implement its
+      // own a second time and be refused again for the same reason — so the name in the message is
+      // the key, which is what the move made different from the spelling.
+      refused(
+        """trait Display
+          |    describe(self) -> int
+          |
+          |struct P
+          |    x: int
+          |
+          |impl Display for P
+          |    describe(self) -> int = self.x
+          |
+          |print(P(5))
+          |""".stripMargin) should include("write an 'impl sysl.Display for P' to say how it renders")
     }
   }
 
