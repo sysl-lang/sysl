@@ -291,12 +291,15 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
             |""".stripMargin) should include("has no home")
     }
 
-    // The names are the prelude's, so a program declaring one collides rather than shadowing —
-    // the same answer `from_utf8` and `buf` already give.
-    "and the names are declared, so a program's own collides rather than shadowing" in {
-      err("""cstring(s: string) -> int = 1
-            |print(cstring("a"))
-            |""".stripMargin) should include("already declared")
+    // These names are the standard module's, so a program declaring one of its own gets its own —
+    // the same answer `from_utf8` and `buf` now give, since they moved too. What the surface must
+    // not quietly become is *unreachable*: the library's is still there under the path that names
+    // it, and it is what the library's own callers keep meaning.
+    "and a program's own is its own, while the library's stays reachable by its path" in {
+      run("""cstring(s: string) -> int = 1
+            |
+            |print(cstring("a"), sysl.cstring("abc").len)
+            |""".stripMargin) shouldBe "1 3\n"
     }
 
     // A builder that took bytes would be `from_utf8_unchecked` with a longer name, so it is not a
@@ -308,17 +311,21 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
             |""".stripMargin) should not be empty
     }
 
-    // No *code* reaches a program that does not ask for it: a prelude declaration nothing calls is
+    // No *code* reaches a program that does not ask for it: a library declaration nothing calls is
     // neither analyzed nor emitted. Its **layout** is the documented exception — a non-generic type
     // is instantiated where it is declared — so what a quiet program carries is two more
     // `%struct.… = type` lines, which name no storage and emit no instructions.
+    //
+    // Every name here is read off `Library.key`. Spelled literally, all three negatives would go on
+    // passing once these declarations moved into the standard module and their symbols gained the
+    // `sysl$` prefix — asserting nothing, and saying so nowhere.
     "and a program that uses none of it carries no code for it" in {
       val out = ir("""print(1)""")
 
-      out should not include "@cstring"
-      out should not include "@str_builder"
-      out should not include "@StrBuilder."
-      out should include("%struct.StrBuilder = type")
+      out should not include s"@${Library.key("cstring")}("
+      out should not include s"@${Library.key("str_builder")}("
+      out should not include s"@${Library.key("StrBuilder")}."
+      out should include(s"%struct.${Library.key("StrBuilder")} = type")
     }
   }
 }

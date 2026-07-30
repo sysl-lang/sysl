@@ -1,0 +1,74 @@
+module sysl
+
+// Text gathered a piece at a time, handed back as one string.
+//
+// It is here rather than in the compiler because only its last line needs to be underneath the
+// language: everything above `finish` is ordinary sysl over the same `Buf[u8]` a `ByteSink` uses,
+// and what no sysl body can write is turning owned bytes into a `string`, which is
+// `from_utf8_unchecked` of bytes this builder has held all along.
+//
+// It exists so that joining does not rebuild what it already has. `a + b` allocates a fresh buffer
+// every time, so gathering n pieces that way costs the sum of every prefix; a builder pays for each
+// piece once and grows geometrically.
+struct StrBuilder
+    bytes: &Buf[u8]
+
+    len -> usize = self.bytes.len()
+
+    is_empty -> bool = self.bytes.is_empty()
+
+    push(*self, s: string)
+        for b in s.bytes do self.bytes.push(b)
+    end push
+
+    // The one encoder a builder needs, and it is written out rather than reaching `string(c)`
+    // because that would allocate a string per character only to copy its bytes back out.
+    push_char(*self, c: char)
+        var cp = u32(c)
+
+        if cp < 128
+            self.bytes.push(u8(cp))
+        elif cp < 2048
+            self.bytes.push(u8(192 | (cp >> 6)))
+            self.bytes.push(u8(128 | (cp & 63)))
+        elif cp < 65536
+            self.bytes.push(u8(224 | (cp >> 12)))
+            self.bytes.push(u8(128 | ((cp >> 6) & 63)))
+            self.bytes.push(u8(128 | (cp & 63)))
+        else
+            self.bytes.push(u8(240 | (cp >> 18)))
+            self.bytes.push(u8(128 | ((cp >> 12) & 63)))
+            self.bytes.push(u8(128 | ((cp >> 6) & 63)))
+            self.bytes.push(u8(128 | (cp & 63)))
+    end push_char
+
+    clear(*self)
+        self.bytes.clear()
+
+    // Every byte that went in came from a `string` or from `push_char`, so what is held is
+    // well-formed by construction and there is nothing left to validate.
+    finish(self) -> string = from_utf8_unchecked(self.bytes.view())
+end StrBuilder
+
+str_builder() -> StrBuilder = StrBuilder(buf())
+
+// A string copied into the NUL-terminated shape C reads, and the owner of that copy -- a language
+// with no manual free has to say who frees it, so the bytes belong to a value with a lifetime
+// rather than to whoever remembers.
+//
+// `len` is one less than the storage because the terminator is not part of the text, and `ptr` is
+// what an `extern` taking a `char *` is given.
+struct CString
+    bytes: []u8
+
+    ptr -> *u8 = &self.bytes[0]
+
+    len -> usize = self.bytes.len - 1
+end CString
+
+cstring(s: string) -> CString
+    var b: []u8 = [0u8; s.len + 1]   // one byte longer than the text, and the fill is the terminator
+
+    for i in 0..<s.len do b[i] = s.bytes[i]
+
+    CString(b)

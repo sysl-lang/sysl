@@ -666,6 +666,52 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "a moved surface whose whole point is the last line the compiler supplies" - {
+
+    "a builder gathers text and hands back one string, from the standard module" in {
+      run(
+        """var b = str_builder()
+          |
+          |b.push("ab")
+          |b.push_char('é')
+          |print(b.finish(), b.len)
+          |""".stripMargin) shouldBe "abé 4\n"
+    }
+
+    "and a program may declare a 'StrBuilder' of its own beside the library's" in {
+      // A name a program plausibly wants, and the library's is still what `str_builder()` returns.
+      run(
+        """struct StrBuilder
+          |    tag: int
+          |
+          |var mine = StrBuilder(7)
+          |var theirs = str_builder()
+          |
+          |theirs.push("hi")
+          |print(mine.tag, theirs.finish())
+          |""".stripMargin) shouldBe "7 hi\n"
+    }
+
+    "the C copy is owned by a value, and its length excludes the terminator" in {
+      // `CString` is the one place the library answers "who frees it" for a foreign shape, so the
+      // storage being one longer than the text is the invariant worth pinning.
+      run(
+        """var c = cstring("abc")
+          |
+          |print(c.len, c.bytes.len, c.bytes[3])
+          |""".stripMargin) shouldBe "3 4 0\n"
+    }
+
+    "and what it hands a foreign function is a pointer to those bytes" in {
+      run(
+        """extern "strlen" c_strlen(p: *u8) -> usize
+          |
+          |var c = cstring("hello")
+          |print(c_strlen(c.ptr))
+          |""".stripMargin) shouldBe "5\n"
+    }
+  }
+
   "a moved trait whose memberships the compiler supplies rather than a program declaring them" - {
 
     "a program may declare a 'Hash' of its own, and a built-in still satisfies the library's" in {

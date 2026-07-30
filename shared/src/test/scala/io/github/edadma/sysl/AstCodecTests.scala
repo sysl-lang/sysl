@@ -66,10 +66,25 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       positionsOf(back.head.body) shouldBe positionsOf(original.body)
     }
 
+    // The standard module is where most of the library now lives, so round-tripping only the
+    // prelude would test a shrinking half of what the codec has to carry.
+    "and so does the standard module, which is the other half of what a codec must carry" in {
+      val back = roundTrip(Std.parsed)
+
+      back should have length Std.parsed.length
+      back.map(_.body) shouldBe Std.parsed.map(_.body)
+      positionsOf(back.map(_.body)) shouldBe positionsOf(Std.parsed.map(_.body))
+    }
+
     "carries enough positions to be worth carrying" in {
-      // Guards the test above: if the prelude somehow had no positions, the comparison would hold
-      // vacuously and a codec that dropped them all would pass.
-      val stamped = positionsOf(Prelude.decls).count(_.isDefined)
+      // Guards the two tests above: if the trees somehow had no positions, their comparisons would
+      // hold vacuously and a codec that dropped every one of them would pass.
+      //
+      // Counted over the WHOLE library rather than the prelude alone. The prelude is being drained
+      // into the standard module a surface at a time and is heading for empty, so a threshold on it
+      // is a threshold that fails on some future move for a reason that has nothing to do with the
+      // codec — which is exactly what it did.
+      val stamped = positionsOf(Library.decls).count(_.isDefined)
 
       stamped should be > 1000
     }

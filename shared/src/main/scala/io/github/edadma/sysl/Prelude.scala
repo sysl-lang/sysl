@@ -41,15 +41,6 @@ package io.github.edadma.sysl
  * status, which is what `11-error-handling.md` says a trap does under the `os` capability — and it
  * is the reason those two need no compiler support of their own.
  *
- * **The four operations that make new bytes** (`04`) are the rest of what a `string` can do, and
- * three of them are here rather than in the compiler because only the last line of each needs to be
- * underneath the language. `StrBuilder` gathers text and hands back one string, over the same
- * `Buf[u8]` `ByteSink` uses; `cstring` copies a string into the NUL-terminated shape C reads, and
- * `CString` is what owns that copy, since a language with no manual free has to say who frees it.
- * The fourth, `string(c)`, is a conversion the compiler already had the encoder for. `s.copy()`
- * needs no declaration at all — it is bytes copied into a string that owns them, which is
- * `from_utf8_unchecked` of a string's own bytes.
- *
  * **`args_of` is how a program's arguments become a `[]string`**, and it is here because every line
  * of it is ordinary sysl. What the platform hands the entry point is C's
  * `argc` and `argv` — a count and a vector of NUL-terminated byte runs — and what a sysl program
@@ -65,13 +56,14 @@ package io.github.edadma.sysl
  * that is not UTF-8 stops the program the way `unwrap` does, with the offset of the byte that made
  * it ill-formed — `04` puts that check at the boundary, and this is one.
  *
- * **The reading, text and buffer surfaces are in the standard module** — `Reader`, `FdReader` and
- * `Lines`; `from_utf8`, `Utf8Error`, `Chars` and `char_from_u32`; `Buf`, `buf` and the `ByteSink`
- * every rendering gathers into — beside the rendering surface and for the same reasons. What is left
- * here is what they stand on: `sysl_read` and `sysl_memchr` below, and the `Option` and `Result`
- * their answers arrive in. `StrBuilder` and `args_of` above are written *against* the moved half,
- * naming `Buf` and `from_utf8` without an import, because a name written in either part of the
- * library is looked for among the library's own first.
+ * **Most of the library is now in the standard module** — the rendering, reading, text, buffer and
+ * builder surfaces all live under `lib/sysl/`. What is left here is what they stand on and what has
+ * not moved yet: the `print*` family and the `extern`s above, `args_of` below, and the `Option` and
+ * `Result` every fallible answer arrives in.
+ *
+ * `args_of` is written *against* the moved half — it names `Buf`, `buf` and `from_utf8` with no
+ * import, because a name written in either part of the library is looked for among the library's
+ * own first. That direction is the whole reason the drain can proceed one surface at a time.
  *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
@@ -311,59 +303,6 @@ object Prelude {
       |            print("panic:", msg)
       |            exit(1)
       |end Result
-      |
-      |struct StrBuilder
-      |    bytes: &Buf[u8]
-      |
-      |    len -> usize = self.bytes.len()
-      |
-      |    is_empty -> bool = self.bytes.is_empty()
-      |
-      |    push(*self, s: string)
-      |        for b in s.bytes do self.bytes.push(b)
-      |    end push
-      |
-      |    push_char(*self, c: char)
-      |        var cp = u32(c)
-      |
-      |        if cp < 128
-      |            self.bytes.push(u8(cp))
-      |        elif cp < 2048
-      |            self.bytes.push(u8(192 | (cp >> 6)))
-      |            self.bytes.push(u8(128 | (cp & 63)))
-      |        elif cp < 65536
-      |            self.bytes.push(u8(224 | (cp >> 12)))
-      |            self.bytes.push(u8(128 | ((cp >> 6) & 63)))
-      |            self.bytes.push(u8(128 | (cp & 63)))
-      |        else
-      |            self.bytes.push(u8(240 | (cp >> 18)))
-      |            self.bytes.push(u8(128 | ((cp >> 12) & 63)))
-      |            self.bytes.push(u8(128 | ((cp >> 6) & 63)))
-      |            self.bytes.push(u8(128 | (cp & 63)))
-      |    end push_char
-      |
-      |    clear(*self)
-      |        self.bytes.clear()
-      |
-      |    finish(self) -> string = from_utf8_unchecked(self.bytes.view())
-      |end StrBuilder
-      |
-      |str_builder() -> StrBuilder = StrBuilder(buf())
-      |
-      |struct CString
-      |    bytes: []u8
-      |
-      |    ptr -> *u8 = &self.bytes[0]
-      |
-      |    len -> usize = self.bytes.len - 1
-      |end CString
-      |
-      |cstring(s: string) -> CString
-      |    var b: []u8 = [0u8; s.len + 1]   // one byte longer than the text, and the fill is the terminator
-      |
-      |    for i in 0..<s.len do b[i] = s.bytes[i]
-      |
-      |    CString(b)
       |
       |args_of(argc: i32, argv: **u8) -> []string
       |    var out: Buf[string] = buf()
