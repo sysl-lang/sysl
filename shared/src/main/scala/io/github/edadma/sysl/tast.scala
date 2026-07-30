@@ -559,4 +559,19 @@ case class TProgram(
     funcs: List[TFunc],
     main: List[TStmt],
     entry: Option[TEntry] = None,
+    /** Functions a **library** already compiled, which this module calls but must not define
+     * (`LibraryArtifact`). They are declared rather than emitted, and the object file the library
+     * shipped supplies the body at link time.
+     *
+     * They are named here rather than turned into `TExtern`s because an `extern` is declared under
+     * the **C** convention, and these are sysl functions: the declaration has to be built from the
+     * same signature the definition would have had, or the caller passes its arguments the wrong
+     * way and the mistake is a corrupt run rather than a link error.
+     */
+    precompiled: Set[String] = Set.empty,
+    /** Whether this module carries the program's entry point. A library does not: it is lowered on
+     * its own to be linked into something else, and a `main` of its own would collide with the one
+     * belonging to whatever links it.
+     */
+    entryPoint: Boolean = true,
 )

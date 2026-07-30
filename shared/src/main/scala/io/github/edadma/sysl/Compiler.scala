@@ -48,11 +48,19 @@ object Compiler {
    * rule that reports two of them.
    */
   def compileWith(sources: List[Source], libraries: List[Program],
-                  target: Target = Target.default): Either[String, String] = {
+                  target: Target = Target.default): Either[String, String] =
+    compiledWith(sources, libraries, target).map(_._1)
+
+  /** The same compilation against a library, keeping the notes the driver may want to show. This is
+   * the one the CLI takes, so that a program linked against a library reports its heap promotions
+   * exactly as one compiled alone does.
+   */
+  def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
+                   precompiled: Set[String] = Set.empty): Either[String, (String, List[String])] = {
     val parsed = sources.map(SyslParser.parse)
 
     parsed.collect { case Left(e) => e } match
-      case Nil  => analyzed(libraries ::: parsed.collect { case Right(p) => p }, target).map(_._1)
+      case Nil  => analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled)
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -71,14 +79,53 @@ object Compiler {
       case errs => Left(errs.mkString("\n"))
   }
 
+  /** A **library** lowered on its own: the IR for everything in it that could be compiled ahead of
+   * time, and the names of those functions.
+   *
+   * The split needs no analysis of its own, which is the pleasant part. A generic declaration is
+   * kept untyped and monomorphized on demand, so analyzing a library alone yields typed functions
+   * for exactly the declarations that were already determined — a generic nothing called is simply
+   * not here. Those are what an object file can hold; the generics travel as trees and are compiled
+   * in whatever program fixes their type arguments.
+   *
+   * Nothing is pruned. A program is lowered from `main` outwards because anything it cannot reach is
+   * dead, but a library has no `main` and every public declaration is a potential entry — so all of
+   * them are emitted, and it is the *linker* that discards what a given program never calls.
+   */
+  def compileLibrary(units: List[Program], target: Target = Target.default)
+      : Either[String, (String, Set[String])] =
+    for
+      typed    <- Analyzer.analyze(units)
+      promoted <- Escape.check(typed)
+    yield
+      val ir = Codegen.generate(typed.copy(entryPoint = false), promoted, target)
+
+      // A function that reads a module-level `val` is left out of the precompiled half, and this is
+      // the honest boundary of what separate compilation reaches today: the storage for a `val` is
+      // initialized by the entry point, and a library has none. Such a function is compiled in the
+      // program instead, where the initialization it depends on actually happens. Everything else —
+      // which is most of a library — is compiled once, here.
+      val determined =
+        typed.funcs.filter(f => Reachability.reachedFrom(List(f), typed.funcs, typed.vtables).vals.isEmpty)
+
+      (ir, determined.map(_.name).toSet)
+
   /** Every pass that reads a whole typed program runs before anything is dropped from it: a
    * declaration nothing can reach is still one the program declared, and checking it is what makes a
    * mistake in it a mistake at all. Pruning is therefore the last thing that happens to the tree, and
    * the only thing between the checks and the lowering.
    */
-  private def analyzed(units: List[Program], target: Target): Either[String, (String, List[String])] =
+  private def analyzed(units: List[Program], target: Target, precompiled: Set[String] = Set.empty)
+      : Either[String, (String, List[String])] =
     for
       typed    <- Analyzer.analyze(units)
       promoted <- Escape.check(typed)
-    yield (Codegen.generate(Reachability.prune(typed), promoted, target), promoted.explanations)
+    yield
+      // Pruning still runs, and still from `main`: a library function this program never calls is
+      // dropped from the tree exactly as before. What `precompiled` changes is only what happens to
+      // the ones it *does* call — declared rather than defined, with the body coming from the
+      // library's object file at link time.
+      val pruned = Reachability.prune(typed)
+
+      (Codegen.generate(pruned.copy(precompiled = precompiled), promoted, target), promoted.explanations)
 }

@@ -26,15 +26,58 @@ object Toolchain {
    * *family* — `arm64-apple-macosx` — where the driver refines it to the installed SDK's version.
    * With `--target` passed, the only override that can still happen is that refinement.
    */
-  def build(ir: String, exe: String, target: Target = Target.default): Either[String, Unit] = {
+  def build(ir: String, exe: String, target: Target = Target.default,
+            archives: List[String] = Nil): Either[String, Unit] = {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    val result = exec(Seq("clang", s"--target=${target.triple}", "-Wno-override-module", ll, "-o", exe))
+    // A library archive goes on the command line after the module that calls into it, which is what
+    // the linker's left-to-right scan wants: a member is pulled in to resolve a symbol already
+    // undefined, so an archive listed first would be scanned before anything needed it.
+    val result = exec(
+      List("clang", s"--target=${target.triple}", "-Wno-override-module", ll) ::: archives ::: List("-o", exe))
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())
     else Left(s"clang failed (exit ${result.exitCode}):\n${result.stderr.trim}")
+  }
+
+  /** Assembles an IR module into a relocatable object file — the ahead-of-time half of a library.
+   *
+   * `-c` is the whole difference from `build`: nothing is linked, so a module with no `main` and
+   * with unresolved calls into the program that will use it is exactly what is wanted.
+   */
+  def compileObject(ir: String, obj: String, target: Target = Target.default): Either[String, Unit] = {
+    val ll = createTempFile("sysl-", ".ll")
+    writeFile(ll, ir)
+
+    val result =
+      exec(Seq("clang", s"--target=${target.triple}", "-Wno-override-module", "-c", ll, "-o", obj))
+    deleteFile(ll)
+
+    if result.exitCode == 0 then Right(())
+    else Left(s"clang failed (exit ${result.exitCode}):\n${result.stderr.trim}")
+  }
+
+  /** Bundles the members of a library into one `ar` archive — the container a `.syslib` is, and the
+   * same one a `.a` and an `.rlib` are. `r` replaces, `c` creates without complaining, `s` writes the
+   * symbol index the linker looks a needed symbol up in.
+   */
+  def archive(out: String, members: List[String]): Either[String, Unit] = {
+    deleteFile(out)
+
+    val result = exec(List("ar", "rc", out) ::: members)
+
+    if result.exitCode == 0 then Right(())
+    else Left(s"ar failed (exit ${result.exitCode}):\n${result.stderr.trim}")
+  }
+
+  /** One member's contents, read back out of an archive without unpacking it. */
+  def extract(archive: String, member: String): Either[String, String] = {
+    val result = exec(Seq("ar", "p", archive, member))
+
+    if result.exitCode == 0 then Right(result.stdout)
+    else Left(s"$archive has no '$member' member:\n${result.stderr.trim}")
   }
 
   /** Compiles, links, and runs a source program, returning its exit code and captured

@@ -28,8 +28,13 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
   // --- module --------------------------------------------------------------------------
 
   private def gen(): String = {
-    val funcTexts  = program.funcs.map(genFunction)
-    val mainText   = genMain(program.vals, program.main, program.entry)
+    // A function a library already compiled is declared, not defined: its body is in the object file
+    // the library shipped, and emitting it again would be a duplicate symbol at the link.
+    val (imported, own) = program.funcs.partition(f => program.precompiled(f.name))
+    val funcTexts       = own.map(genFunction)
+    // A library has no entry point. Emitting one would put a second `main` in every program that
+    // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
+    val mainText = if program.entryPoint then genMain(program.vals, program.main, program.entry) else ""
     // The tables come after the bodies because a table only exists for a type something erased, and
     // it may ask for an adapter, which the queue below is what emits.
     val vtableText = program.vtables.map(genVtable).mkString
@@ -103,6 +108,17 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     for (name, elem) <- bufs do
       out ++= s"$name = type { i64, ptr, i64, i64, [0 x ${elem.llvm}] }\n"
     if boxes.nonEmpty || bufs.nonEmpty then out ++= "\n"
+
+    // A library's own functions are declared here rather than up with the `extern`s, and it has to be
+    // **after** the type definitions: a named struct used before its `= type` line is opaque at that
+    // point, and an opaque type cannot be passed by value. Their signatures are built the way the
+    // *definition* would have built them rather than through `foreignSignature`, because these are
+    // sysl's convention and not C's — getting that wrong passes arguments the other way, which is a
+    // corrupt run rather than a link error.
+    for f <- imported do
+      val params = (Type.stored(f.params).map(_._2.llvm) ++ Option.when(f.variadic)("...")).mkString(", ")
+      out ++= s"declare ${f.retTy.llvm} @${symbolOf(f.name)}($params)\n"
+    if imported.nonEmpty then out ++= "\n"
 
     if boolStrs then
       out ++= "@.true = private constant [5 x i8] c\"true\\00\"\n"

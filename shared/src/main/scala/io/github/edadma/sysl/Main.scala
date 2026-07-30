@@ -15,10 +15,17 @@ import scopt.OParser
  * the name its location gives it — and naming a file compiles that file alone.
  *
  * Subcommands:
- *   - `sysl run <path>`        compile and execute
- *   - `sysl build <path> -o x` compile to a native executable
- *   - `sysl emit-llvm <path>`  print the generated LLVM IR
- *   - `sysl targets`           list the machines sysl can build for
+ *   - `sysl run <path>`            compile and execute
+ *   - `sysl build <path> -o x`     compile to a native executable
+ *   - `sysl build-lib <path> -o x` compile a library to a linkable artifact
+ *   - `sysl emit-llvm <path>`      print the generated LLVM IR
+ *   - `sysl targets`               list the machines sysl can build for
+ *
+ * **`--lib` takes either a source tree or an artifact**, and which one is read off the name: a
+ * `.syslib` is decoded, anything else is walked as source. That is deliberate — how a library was
+ * shipped is the shipper's business, and a program that depends on one should not have to write down
+ * which it got. `build-lib` is what turns the first into the second, and the only difference
+ * downstream is what the compilation *cost*: an artifact is a linear decode where source is a parse.
  *
  * **Everything after a bare `--` belongs to the program being run**, not to sysl: it is passed
  * straight through to the executable, which is what lets `sysl run prog.sysl -- -v file` reach a
@@ -61,6 +68,13 @@ case class Config(
           arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
           opt[String]('o', "output").action((o, c) => c.copy(output = Some(o))).text("output executable path"),
         ),
+      cmd("build-lib")
+        .action((_, c) => c.copy(command = "build-lib"))
+        .text("compile a sysl library to a linkable artifact, for '--lib'")
+        .children(
+          arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
+          opt[String]('o', "output").action((o, c) => c.copy(output = Some(o))).text("output artifact path"),
+        ),
       cmd("emit-llvm")
         .action((_, c) => c.copy(command = "emit-llvm"))
         .text("print the generated LLVM IR")
@@ -77,7 +91,8 @@ case class Config(
       opt[String]("lib")
         .unbounded()
         .action((l, c) => c.copy(libs = c.libs :+ l))
-        .text("a library project root to compile against; may be given more than once"),
+        .text("a library to compile against — a '.syslib' artifact or a source root; " +
+          "may be given more than once"),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
@@ -92,9 +107,20 @@ case class Config(
 private def execute(cfg: Config): Int = {
   if cfg.command == "targets" then return listTargets()
 
+  val sources =
+    try Project.collect(cfg.file)
+    catch case e: Exception => return fail(s"cannot read ${cfg.file}: ${e.getMessage}")
+
+  if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
+
   val target = chooseTarget(cfg.target) match
     case Left(err) => return fail(err)
     case Right(t)  => t
+
+  // Building a library stops here — there is no program to link it into. An artifact is **for a
+  // machine**, exactly as an rlib is, because half of it is compiled object code; the generic half
+  // travels as trees because there is nothing to compile until a caller fixes its type arguments.
+  if cfg.command == "build-lib" then return buildLibrary(cfg, sources, target)
 
   // Running the result is what makes `run` different from `build`, and only this machine can do
   // that — so a cross target is refused here rather than built and then failed to execute.
@@ -102,29 +128,53 @@ private def execute(cfg: Config): Int = {
     return fail(s"'run' executes what it builds, and '${target.name}' is not this machine — " +
       s"use 'sysl build --target ${target.name}'")
 
-  val sources =
-    try Project.collect(cfg.file)
-    catch case e: Exception => return fail(s"cannot read ${cfg.file}: ${e.getMessage}")
+  // A library reaches a compilation two ways, and neither is a second kind of input — both end as
+  // **more modules**. Given as source its files carry the directory segments they were found under,
+  // exactly as the program's do. Given as an artifact it arrives already parsed. Which one a path
+  // names is read off the name, so a program that depends on a library need not know how it shipped.
+  val (artifacts, roots) = cfg.libs.partition(LibraryArtifact.isArtifact)
 
-  if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
+  // An artifact's object half is unpacked to a temporary file, because what links it is `clang` and
+  // clang takes a path. The tree half is decoded and joins the compilation as more modules.
+  val unpacked =
+    try artifacts.map(p => LibraryArtifact.unpack(p, readBytes(p)))
+    catch case e: Exception => return fail(s"cannot read a library: ${e.getMessage}")
 
-  // A library given as source is simply **more modules**: its files carry the directory segments
-  // they were found under, exactly as the program's do, so the module rules do the rest and the
-  // compiler is handed one list. A library shipped as an artifact takes the other route
-  // (`Compiler.compileWith`), and nothing downstream tells the two apart.
+  unpacked.collectFirst { case Left(e) => e } match
+    case Some(e) => return fail(e)
+    case None    => ()
+
+  val objects = unpacked.collect { case Right((_, obj)) => obj }.map { obj =>
+    val path = createTempFile("sysl-lib-", ".o")
+    writeBytes(path, obj)
+    path
+  }
+
+  val decoded = artifacts.zip(unpacked).collect { case (p, Right((meta, _))) => LibraryArtifact.read(p, meta) }
+
+  decoded.collectFirst { case Left(e) => e } match
+    case Some(e) => objects.foreach(deleteFile); return fail(e)
+    case None    => ()
+
   val collected =
-    try cfg.libs.map(root => root -> Project.collect(root))
+    try roots.map(root => root -> Project.collect(root))
     catch case e: Exception => return fail(s"cannot read a library: ${e.getMessage}")
 
   collected.find(_._2.isEmpty) match
     case Some((root, _)) => return fail(s"$root holds no sysl source files")
     case None            => ()
 
-  val libraries = collected.flatMap(_._2)
+  val librarySources = collected.flatMap(_._2)
+  val read           = decoded.collect { case Right(r) => r }
+  val libraryTrees   = read.flatMap(_._1)
+
+  // What the library already compiled, so this module declares those rather than defining them a
+  // second time. Their bodies arrive from the archive at link time.
+  val precompiled = read.flatMap(_._2).toSet
 
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
-  val compiled = Compiler.compiled(libraries ::: sources, target) match
+  val compiled = Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled) match
     case Left(err) => return report(err)
     case Right((ir, notes)) =>
       if cfg.explainEscapes then
@@ -139,14 +189,14 @@ private def execute(cfg: Config): Int = {
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
 
-      Toolchain.build(compiled, exe, target) match
+      Toolchain.build(compiled, exe, target, objects) match
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
       val exe = createTempFile("sysl-", "")
 
-      Toolchain.build(compiled, exe, target) match
+      Toolchain.build(compiled, exe, target, objects) match
         case Left(err) => deleteFile(exe); fail(err)
         case Right(_) =>
           val result = exec(exe :: cfg.programArgs)
@@ -158,6 +208,31 @@ private def execute(cfg: Config): Int = {
     case other =>
       fail(s"unknown command '$other'")
 }
+
+/** `sysl build-lib <path> -o <artifact>` — a library's source written out as the tree a later
+ * compilation decodes (`LibraryArtifact`).
+ *
+ * No target is involved and nothing is lowered: an artifact carries the library's **AST**, not
+ * machine code, because a generic declaration has no compiled form until the program that calls it
+ * fixes its type arguments. That is also why one artifact serves every target.
+ */
+private def buildLibrary(cfg: Config, sources: List[Source], target: Target): Int =
+  LibraryArtifact.build(sources, target) match
+    case Left(err) => report(err)
+    case Right((ir, meta)) =>
+      val out = cfg.output.getOrElse(defaultOutputName(cfg.file) + LibraryArtifact.extension)
+
+      val obj = createTempFile("sysl-", ".o")
+
+      val outcome =
+        for _ <- Toolchain.compileObject(ir, obj, target)
+        yield writeBytes(out, LibraryArtifact.pack(meta, readBytes(obj)))
+
+      deleteFile(obj)
+
+      outcome match
+        case Left(err) => fail(err)
+        case Right(_)  => Console.err.println(s"wrote $out"); 0
 
 /** Which machine this invocation is for: the one it names, or this one. A machine sysl has no entry
  * for is reported rather than guessed at — the guess would be a module that looks right and is
