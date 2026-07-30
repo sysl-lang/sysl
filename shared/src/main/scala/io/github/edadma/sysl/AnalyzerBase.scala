@@ -940,7 +940,7 @@ trait AnalyzerBase {
   protected def analyzeBool(e: Expr): TExpr
   protected def analyzePlace(target: Expr, what: String, writes: Boolean = true): TExpr
   protected def requirePlace(t: TExpr, target: Expr, what: String, writes: Boolean = true): TExpr
-  protected def invCheckFor(place: TExpr): Option[(TExpr, Type.Struct, String)]
+  protected def invCheckFor(place: TExpr): List[(TExpr, Type.Struct, String)]
   protected def describe(target: Expr): String
   protected def indexes(traitName: String, receiver: Expr): Boolean
   protected def arithType(op: String, a: Type, b: Type): Type

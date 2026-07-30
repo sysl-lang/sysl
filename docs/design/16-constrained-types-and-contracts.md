@@ -292,11 +292,43 @@ cheap implementation checks the constructor and calls it done:
   (`w.hi++`), which is a write of one field and owed the same re-check
 - a field written through a pointer
 - a field written into an array element
+- a field written **inside** one of these — `o.a.n = 9`, or `g.items[0].n = 9`
+
+That last one is owed for a reason worth stating, because it is the one a narrow reading misses. A
+clause may read *through* a field: `invariant a.n <= b` is legal, and `a.n` is then not a field of
+the struct at all, so the write that breaks it is a write the struct never sees. The obligation is
+therefore on **every struct a place is written inside**, not only on the one whose field is named
+last, and the checks nest innermost-first, so the smallest struct the write broke is the one that
+stops it. An index locates a place rather than owning one, so it contributes no check and is walked
+through.
 
 The consequence, and it is the intended one: a sequence of writes that ends in a valid state but
 passes through an invalid one **traps at the step that broke it**. There is no "I am mid-update"
-mode. A struct that cannot be updated one field at a time has to be updated as a whole, which is
-what whole-struct assignment is for.
+mode.
+
+### What to do when a struct cannot be updated one field at a time
+
+Three answers, and the order matters, because the last one is the expensive one and it is the one
+reached for first:
+
+1. **Look for an order in which no intermediate state is illegal**, and often there is one. A
+   `count <= high` watermark is updated by raising the ceiling before the floor, and needs nothing
+   else; the same two writes in the other order are refused. That the same clause accepts one order
+   and refuses the other is the whole of the answer here.
+2. **Ask whether the clause is pointing at a redundant field.** An invariant relating two fields is
+   a claim about the *representation*, and the trap is often the compiler observing that the struct
+   carries one fact twice. A ring buffer that keeps `head`, `tail` and `count` cannot move any two of
+   them one at a time; one that keeps `head` and `count` and computes the end has no clause to break,
+   because nothing is left to disagree. Two of the three fields is the honest design either way —
+   which two is a choice about who writes what, not about the invariant.
+3. **Otherwise, assign the whole struct**, which is what whole-struct assignment is for — and know
+   the price. `*self = Ring(self.buf, ...)` restates the *whole* value to move two bytes, so an
+   invariant across two fields makes a container's own update cost the size of the container. For a
+   buffer that is its entire storage, per element.
+
+The multi-assignment form (`00 §2`) is the fourth way and belongs beside them: `s.lo, s.hi = 6, 8`
+lands both writes before either invariant is consulted, so a pair that ends legal is legal even
+where each half alone would not be.
 
 Invariants on a **generic** struct are not supported and say so.
 
@@ -401,3 +433,31 @@ made every arithmetic operator a produce site nobody had written down, so `Slot(
 `Slot` holding 200 — and storing it into another `Slot` did not re-check, because a value that
 already has the type is not produced again. `type Slot = new u8 within 0..<200` is §1's own example
 row. The two forms that compute and store in one step, `a += e` and `a++`, were the other omission.
+
+**f. A write through an alias into a field an invariant reads.** §6's obligation is discharged by
+walking outward through the *place* being written, and a pointer is where the places run out:
+
+```
+struct Inner
+    n: int
+struct Outer
+    a: Inner
+    b: int
+    invariant a.n <= b
+
+wreck(p: *Inner)
+    p.n = 9
+
+var o = Outer(Inner(1), 5)
+wreck(&o.a)        // `Outer`'s invariant is now false, and nothing said so
+```
+
+Inside `wreck` there is no `Outer` to re-read and no way to learn there ever was one, so no amount of
+checking at the write closes this. It is the only hole left in "checked at every write", and it is a
+rule about **what may be aliased** rather than about what is emitted — which is the shape of SPARK's
+answer, and the aliasing model this project has otherwise adopted. The candidates: refuse `&` on a
+field that an enclosing invariant reads (statically knowable, since a clause names the fields it
+reads); refuse it on any field of a struct carrying clauses at all (cruder, and it forbids handing
+out `&o.b`, which is harmless); or state the limit and leave it, which is what an invariant means in
+C++ too. The first looks right, and nothing turns on it until a program wants such a pointer. The
+case is pinned by an ignored test, so whichever way it goes the evidence is already written down.

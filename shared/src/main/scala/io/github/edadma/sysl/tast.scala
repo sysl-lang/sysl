@@ -292,17 +292,20 @@ case class TVaPass(ap: TExpr) extends TExpr { def ty: Type = Type.Ptr(Type.VaLis
 /** Positional construction of a value struct. */
 case class TStructNew(struct: Type.Struct, args: List[TExpr]) extends TExpr { def ty: Type = struct }
 
-/** A struct value checked against its `invariant` clauses (`05`): `value` builds the struct, `invFn`
+/** A struct value checked against its `invariant` clauses (`16 §6`): `value` builds the struct, `invFn`
  * is the synthesised `<Struct>$inv` that takes the fields and returns a `bool`. Codegen emits
  * `value`, calls `invFn` with its field values, traps on a false result, and yields the same value —
  * the struct is unchanged, so the only run-time effect is a trap when an invariant is violated.
  */
 case class TStructInvCheck(value: TExpr, struct: Type.Struct, invFn: String) extends TExpr { def ty: Type = struct }
 
-/** A field write into a struct that carries `invariant` clauses (`05`): `store` performs the write,
+/** A field write into a struct that carries `invariant` clauses (`16 §6`): `store` performs the write,
  * then `recv` — the struct being mutated — is re-read and passed to `invFn`, trapping on a false
  * result. Yields the stored value, so `s.f = v` remains an expression of the field's type. Covers a
  * direct `s.f = v`, a compound `s.f op= v`, and a through-pointer `(*p).f = v`.
+ *
+ * These **nest** where a place is written inside more than one struct that carries clauses: `o.a.n`
+ * wraps the store in `Inner`'s check and that in `Outer`'s, so the inner one runs first.
  */
 case class TCheckedStore(store: TExpr, recv: TExpr, struct: Type.Struct, invFn: String) extends TExpr {
   def ty: Type = store.ty
@@ -422,7 +425,7 @@ case class TExprStmt(expr: TExpr)                         extends TStmt
  * here and so is checked here (`16 §4`).
  */
 case class TWrite(place: TExpr, op: String, value: TExpr, dispatch: Option[TDispatch],
-                  check: Option[(TExpr, Type.Struct, String)],
+                  check: List[(TExpr, Type.Struct, String)],
                   constraint: Option[Type.Constrained] = None)
 
 /** `a, b = b, a` — several places written from several values (`00 §2`).

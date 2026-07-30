@@ -23,6 +23,14 @@ one and asserts that nothing failed, that the number of checks is the one expect
 sections ran in order — the count being what makes the first assertion mean anything, since a check
 that quietly stopped running would otherwise look like a check that passed.
 
+**What a program cannot check about itself is what it refuses.** A violated `require`, a broken
+`invariant` and a failed range check all *trap*, so a program that tried to demonstrate one would
+die rather than report it, and the run would look truncated instead of failing. A program therefore
+asserts a refusal only through a total operation that answers instead of trapping — and the traps
+themselves are asserted from outside, in a suite, which is the only place a trap is an observation
+rather than the end of the run. `guide/ring` is the first to need this and `RingClaimTests` is where
+its half of the evidence lives.
+
 | directory | axis it owns |
 |---|---|
 | `json` | recursive ownership — a value that contains itself through `&T` |

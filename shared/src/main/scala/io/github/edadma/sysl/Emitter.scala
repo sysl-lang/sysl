@@ -141,7 +141,7 @@ trait Emitter {
   protected def combine(op: String, ty: Type, valueTy: Type, dispatch: Option[TDispatch],
                         cur: String, v: String): String
 
-  /** Traps unless a struct's `invariant` clauses hold of the value in `v` (`05`). */
+  /** Traps unless a struct's `invariant` clauses hold of the value in `v` (`16 §6`). */
   protected def emitInvCheck(v: String, struct: Type.Struct, invFn: String): Unit
 
   /** Traps unless `v` satisfies everything the constrained subtype `c` asks of its values — its
