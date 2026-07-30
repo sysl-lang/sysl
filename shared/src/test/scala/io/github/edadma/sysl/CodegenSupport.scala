@@ -8,6 +8,17 @@ import org.scalatest.matchers.should.Matchers
  */
 trait CodegenSupport extends Matchers { this: Assertions =>
 
+  /** How a diagnostic spells a library declaration — the key it resolves to, rendered.
+   *
+   * A diagnostic names a moved declaration by the path that reaches it, so a bound on the core
+   * catalog reads `T: sysl.Add`. Reading the spelling off `Library` rather than writing it out is
+   * what keeps these assertions honest across a move: the library is being drained into the
+   * standard module a surface at a time, and an expectation with the name baked in either fails for
+   * a reason that has nothing to do with what it is testing, or — if it is a negative — quietly
+   * stops testing anything at all.
+   */
+  protected def lib(name: String): String = Modules.show(Library.key(name))
+
   /** The IR for a program that must compile. */
   protected def ir(src: String): String =
     Compiler.compileToLlvm(src) match {

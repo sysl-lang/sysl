@@ -859,8 +859,8 @@ knowing which of the three the right side is, which is the point of spelling the
 ### Who owns a tuple's traits
 
 A tuple type has no declaration and so no module, which looks like `02`'s orphan rule having nothing
-to bite on. It is the same question `int` already answers: **a built-in type is the prelude's**, and
-the prelude is where its catalog rows live. So:
+to bite on. It is the same question `int` already answers: **a built-in type is the library's**, and
+the library is where its catalog rows live. So:
 
 - **The library provides `Eq`, `Ord`, `Hash` and `Display` structurally**, for each arity it
   declares, whenever every component has the row. Ordering is lexicographic — first component first
@@ -876,9 +876,9 @@ is three.** Beyond it a program writes a struct, which it should have been doing
 compiler says so in those words rather than reporting a missing membership, since the fix is a type
 with a name and not a fourth `impl`.
 
-None of these rows is compiler-generated. They are eight ordinary `impl` blocks in the prelude,
+None of these rows is compiler-generated. They are eight ordinary `impl` blocks in the library,
 written in sysl over `(A, B)` and `(A, B, C)` and reached by `02`'s existing shape rule — which is
-the strongest form the claim above could take: the prelude owns a tuple's catalog because it can
+the strongest form the claim above could take: the library owns a tuple's catalog because it can
 simply *write* it.
 
 ## Open at the basics level (not yet decided)
@@ -914,7 +914,7 @@ work:
   result list, and §13's first subsection for the rule about which to reach for. **An earlier draft
   of this item argued against tuples on coherence grounds, and that argument was wrong** — it said an
   anonymous type has no home for `impl Eq for (int, int)` to live in, but `int` has no home either
-  and the prelude owns its rows. The orphan rule needed a sentence, not an exception. What tuples
+  and the library owns its rows. The orphan rule needed a sentence, not an exception. What tuples
   actually cost is a second product type in the language and one structural `impl` per arity, and
   both were judged worth paying for the thing result lists genuinely cannot do: carry a pair into an
   `Option`, a container, or a generic argument.

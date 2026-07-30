@@ -712,6 +712,49 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "the moved OPERATOR CATALOG, whose identity the compiler holds separately from its declaration" - {
+
+    "a program may declare a catalog trait of its own, and the operator still means the library's" in {
+      // Before the move this was refused outright — the catalog sat in the root module and the name
+      // was taken. That clash was the only thing protecting the operator, and moving the catalog
+      // out of the root module removes it, so what keeps `<` meaning the library's `Ord` is that
+      // `CoreTraits` resolves the token through `Library.key` rather than by the bare word.
+      run(
+        """trait Ord
+          |    rank(self) -> int
+          |
+          |struct Tier
+          |    n: int
+          |
+          |impl Ord for Tier
+          |    rank(self) -> int = self.n
+          |
+          |print(Tier(3).rank(), 1 < 2, "b" < "a")
+          |""".stripMargin) shouldBe "3 true false\n"
+    }
+
+    "and a bound on the program's own does not accept a built-in, which is the whole distinction" in {
+      refused(
+        """trait Ord
+          |    rank(self) -> int
+          |
+          |top[T: Ord](x: T) -> int = x.rank()
+          |
+          |print(top(3))
+          |""".stripMargin) should include("Ord")
+    }
+
+    "the structural rows still make a tuple comparable exactly when its parts are" in {
+      run(
+        """print((1, "a") == (1, "a"), (1, 2) < (1, 3), (1, 2, 3) == (1, 2, 4))
+          |""".stripMargin) shouldBe "true true false\n"
+    }
+
+    "and a tuple renders as one field, so a width pads the whole of it" in {
+      run("""print(f"[${(1, 2)}%8s]")""") shouldBe "[  (1, 2)]\n"
+    }
+  }
+
   "a moved trait whose memberships the compiler supplies rather than a program declaring them" - {
 
     "a program may declare a 'Hash' of its own, and a built-in still satisfies the library's" in {

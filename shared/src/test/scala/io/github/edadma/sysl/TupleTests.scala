@@ -326,7 +326,7 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
     // fourth implementation.
     "and beyond the widest arity the library declares, the advice is a struct" in {
       err("print((1, 2, 3, 4) == (1, 2, 3, 4))") should include(
-        "the library provides 'Eq' for tuples of up to 3 parts and this one has 4",
+        s"the library provides '${lib("Eq")}' for tuples of up to 3 parts and this one has 4",
       )
     }
   }
@@ -381,7 +381,7 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
       err("""impl Eq for (int, int)
             |    eq(self, rhs: Self) -> bool = true
             |print(1)
-            |""".stripMargin) should include("every tuple of 2 parts already implements 'Eq'")
+            |""".stripMargin) should include(s"every tuple of 2 parts already implements '${lib("Eq")}'")
     }
   }
 

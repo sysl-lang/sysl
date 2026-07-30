@@ -342,7 +342,7 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
   "the catalog is inherited and cannot be replaced" - {
     "an operator trait the compiler provides may not be implemented for a derived subtype" in {
       err(Stamp + "impl Add for Stamp\n    add(self, other: Stamp) -> Stamp\n        self") should
-        include("'Stamp' already implements 'Add' — the compiler provides it")
+        include(s"'Stamp' already implements '${lib("Add")}' — the compiler provides it")
     }
     "and neither may Display" in {
       err(Stamp + "impl Display for Stamp\n    display(self, out: &Writer, fmt: string)\n        out.write(\"x\")") should
@@ -350,7 +350,7 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     }
     "nor for a transparent one, which is its base and has the base's rows" in {
       err(Age + "impl Add for Age\n    add(self, other: Age) -> Age\n        self") should
-        include("already implements 'Add'")
+        include(s"already implements '${lib("Add")}'")
     }
     // A trait of the program's own is not part of the catalog, so it is ordinary — which is what
     // keeps the ruling about the *base's* operations rather than about derived types generally.

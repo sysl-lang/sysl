@@ -530,7 +530,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Box[T]
           |    value: T
           |    inc(self) -> T = self.value + 1""".stripMargin
-      ) should include("'+' needs 'T: Add'")
+      ) should include(s"'+' needs 'T: ${lib("Add")}'")
     }
   }
 
@@ -745,14 +745,11 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("already declared")
     }
 
-    // The catalog traits are prelude declarations, so their names are taken exactly as `Option`'s
-    // is — a program that wants its own addition trait picks another name.
-    "a program cannot redeclare a catalog trait" in {
-      err(
-        """trait Ord
-          |    lt(self, rhs: Self) -> bool""".stripMargin
-      ) should include("already declared")
-    }
+    // A program declaring `Ord` now declares its own — the clash that used to refuse it belonged to
+    // the root module, and moving the catalog out of it removed the clash. What that leaves is
+    // pinned in `LibraryTests`, beside every other moved surface: the program's trait is its own and
+    // the operator still means the library's. What may still not be redeclared is a name the *root*
+    // module holds, which is what `Option` above shows.
 
     "a built-in's membership cannot be overridden by an impl" in {
       err(
@@ -793,39 +790,39 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       err(
         """sum[T: Add](a: T, b: T) -> T = a.add(b)
           |print(sum(true, false))""".stripMargin
-      ) should include("requires its type parameter 'T' to implement 'Add', but bool does not")
+      ) should include(s"requires its type parameter 'T' to implement '${lib("Add")}', but bool does not")
     }
 
     // The payoff of the definition-time pass over the catalog: the body is wrong on its own line,
     // and the diagnostic names the bound that would license it.
     "an unbounded parameter cannot call a catalog method" in {
-      err("sum[T](a: T, b: T) -> T = a.add(b)") should include("'add' needs 'T: Add'")
+      err("sum[T](a: T, b: T) -> T = a.add(b)") should include(s"'add' needs 'T: ${lib("Add")}'")
     }
 
     "a bound licenses only its own trait's method" in {
-      err("mix[T: Add](a: T, b: T) -> bool = a.lt(b)") should include("'lt' needs 'T: Ord'")
+      err("mix[T: Add](a: T, b: T) -> bool = a.lt(b)") should include(s"'lt' needs 'T: ${lib("Ord")}'")
     }
 
     // The whole point of definition-checked bounds, in its operator spelling: the body is wrong on
     // its own line, and the diagnostic names the bound that would make it right.
     "an operator on an unbounded parameter names the bound it needs" in {
-      err("sum[T](a: T, b: T) -> T = a + b") should include("'+' needs 'T: Add'")
+      err("sum[T](a: T, b: T) -> T = a + b") should include(s"'+' needs 'T: ${lib("Add")}'")
     }
 
     "an ordering operator on an unbounded parameter names 'Ord'" in {
-      err("less[T](a: T, b: T) -> bool = a < b") should include("'<' needs 'T: Ord'")
+      err("less[T](a: T, b: T) -> bool = a < b") should include(s"'<' needs 'T: ${lib("Ord")}'")
     }
 
     "a bound licenses only its own operator" in {
-      err("less[T: Eq](a: T, b: T) -> bool = a < b") should include("'<' needs 'T: Ord'")
+      err("less[T: Eq](a: T, b: T) -> bool = a < b") should include(s"'<' needs 'T: ${lib("Ord")}'")
     }
 
     "a prefix operator on an unbounded parameter names 'Neg'" in {
-      err("flip[T](a: T) -> T = -a") should include("'-' needs 'T: Neg'")
+      err("flip[T](a: T) -> T = -a") should include(s"'-' needs 'T: ${lib("Neg")}'")
     }
 
     "an equality operator on an unbounded parameter names 'Eq'" in {
-      err("same[T](a: T, b: T) -> bool = a == b") should include("'==' needs 'T: Eq'")
+      err("same[T](a: T, b: T) -> bool = a == b") should include(s"'==' needs 'T: ${lib("Eq")}'")
     }
 
     // Every other unlicensed use names a bound that would allow it. This one names none — nothing
@@ -869,7 +866,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
           |    add(self, rhs: Self) -> Self = M(self.v + rhs.v)
           |var a = M(1)
           |a += 2""".stripMargin
-      ) should include("'+' between M and int needs 'Add[int]'")
+      ) should include(s"'+' between M and int needs '${lib("Add")}[int]'")
     }
 
     "an operator on a user type with no impl is not defined" in {
@@ -891,7 +888,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
         // The implementation it *does* have is spelled as the program wrote it: `impl Add for M` is
         // the homogeneous one, so naming it `Add[M]` — or `Add[M, M]`, which is what it resolves to
         // now that the result is an argument too — would spell out what a default supplied.
-      ) should include("'+' between M and int needs 'Add[int]' — it implements 'Add'")
+      ) should include(s"'+' between M and int needs '${lib("Add")}[int]' — it implements '${lib("Add")}'")
     }
 
     // Member lookup finds an inherent member before it asks about a membership, so an `impl` of

@@ -758,7 +758,7 @@ exactly (`§5`), one row further down the catalog.
 ## 8. Open (not yet decided)
 
 - **a. ~~Whether the core traits are stdlib source or pure compiler intrinsics.~~ Settled:
-  prelude-declared, with compiler-known identity.** `Add`, `Ord`, `Eq` and the rest are ordinary
+  library-declared, with compiler-known identity.** `Add`, `Ord`, `Eq` and the rest are ordinary
   trait declarations a program can read, and their methods are callable by name — `5.add(3)` is
   legal and is the machine's `add`. What the compiler holds is the identity: which operator each
   trait's one method *is*, and which built-in types are members. The memberships could not have been

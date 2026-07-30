@@ -26,9 +26,9 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
   "everything an unbounded parameter may not do is refused at its own definition" - {
 
     "an operator names the bound that supplies it" in {
-      err("plus[T](a: T, b: T) -> T = a + b") should include("'+' needs 'T: Add'")
-      err("less[T](a: T, b: T) -> bool = a < b") should include("'<' needs 'T: Ord'")
-      err("same[T](a: T, b: T) -> bool = a == b") should include("'==' needs 'T: Eq'")
+      err("plus[T](a: T, b: T) -> T = a + b") should include(s"'+' needs 'T: ${lib("Add")}'")
+      err("less[T](a: T, b: T) -> bool = a < b") should include(s"'<' needs 'T: ${lib("Ord")}'")
+      err("same[T](a: T, b: T) -> bool = a == b") should include(s"'==' needs 'T: ${lib("Eq")}'")
     }
 
     "a method call names it, or says no trait declares one" in {

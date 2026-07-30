@@ -46,7 +46,7 @@ class OperatorDomainTests extends AnyFreeSpec with CodegenSupport with RunSuppor
 
     "and does not satisfy a 'Rem' bound either" in {
       err("m[T: Rem](a: T, b: T) -> T = a % b\nprint(m(5.0, 2.0))") should
-        include("'T' to implement 'Rem', but real does not")
+        include(s"'T' to implement '${lib("Rem")}', but real does not")
     }
 
     "while an integer does both" in {

@@ -184,7 +184,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
             |    v: int
             |impl Eq[int] for P
             |    eq(self, k: int) -> bool = self.v == k
-            |print(1)""".stripMargin) should include("trait 'Eq' does not take type arguments")
+            |print(1)""".stripMargin) should include(s"trait '${lib("Eq")}' does not take type arguments")
     }
 
     "so comparing two types is still a mismatch" in {
@@ -199,7 +199,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
   "what a mistake says" - {
     "the wrong right-hand type names the trait that is missing" in {
       err(complex + "print(show(C(1.0, 2.0) * 2))") should include(
-        "'*' between C and int needs 'Mul[int]' — it implements 'Mul[real]'",
+        s"'*' between C and int needs '${lib("Mul")}[int]' — it implements '${lib("Mul")}[real]'",
       )
     }
 
@@ -211,13 +211,13 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
     }
 
     "a bounded parameter is told which bound to write" in {
-      err(complex + "twice[T](k: f64, x: T) -> T = x * k") should include("'*' needs 'T: Mul[real]'")
+      err(complex + "twice[T](k: f64, x: T) -> T = x * k") should include(s"'*' needs 'T: ${lib("Mul")}[real]'")
     }
 
     // The bare spelling is what a program writes, so it is what the advice has to say — telling
     // someone to write `T: Mul[T]` would be telling them to write out what they may leave out.
     "and a homogeneous one is told the bare trait" in {
-      err("sq[T](x: T) -> T = x * x") should include("'*' needs 'T: Mul'")
+      err("sq[T](x: T) -> T = x * x") should include(s"'*' needs 'T: ${lib("Mul")}'")
     }
 
     "a scalar keeps its instruction rather than taking a user implementation" in {
@@ -233,7 +233,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
     "two implementations at one argument list is still one too many" in {
       err(complex + """impl Mul[f64] for C
                       |    mul(self, k: f64) -> C = C(self.re, self.im)
-                      |print(1)""".stripMargin) should include("'C' already implements 'Mul[real]'")
+                      |print(1)""".stripMargin) should include(s"'C' already implements '${lib("Mul")}[real]'")
     }
   }
 
@@ -298,7 +298,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
     // With no bound for the operator at all there is nothing to read the literal against, and the
     // homogeneous reading is the one whose advice — write `T: Sub` — is the advice that helps.
     "and is left homogeneous where no bound names the operator" in {
-      err("dec[T](x: T) -> T = x - 1") should include("'-' needs 'T: Sub'")
+      err("dec[T](x: T) -> T = x - 1") should include(s"'-' needs 'T: ${lib("Sub")}'")
     }
 
     "a negative literal is read the same way" in {
@@ -476,7 +476,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
             |    x: real
             |impl Mul[V, real] for V
             |    mul(self, o: V) -> V = V(self.x * o.x)""".stripMargin) should
-        include("returns V, but trait 'Mul' declares real")
+        include(s"returns V, but trait '${lib("Mul")}' declares real")
     }
 
     "an unwritten result still defaults to the implementing type" in {
@@ -484,7 +484,7 @@ class HeterogeneousOperandTests extends AnyFreeSpec with RunSupport with Codegen
             |    x: real
             |impl Mul[V] for V
             |    mul(self, o: V) -> real = self.x * o.x""".stripMargin) should
-        include("returns real, but trait 'Mul' declares V")
+        include(s"returns real, but trait '${lib("Mul")}' declares V")
     }
 
     // A bound names the operands it needs and the result comes with the implementation, so a bounded

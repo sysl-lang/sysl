@@ -509,7 +509,7 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         """trait Word: Add
           |    width(self) -> int
           |var w: &Word = 1i32""".stripMargin,
-      ) should include("'add' of 'Add' mentions 'Self' away from its receiver")
+      ) should include(s"'add' of '${lib("Add")}' mentions 'Self' away from its receiver")
     }
 
     "an object over a trait that requires nothing printable is still refused" in {

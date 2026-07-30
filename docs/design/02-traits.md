@@ -113,13 +113,13 @@ block the rule then refused. Rust reaches the same answer by its covered-type ru
 The reach of that is smaller than it looks, because a **generic named type has one implementation
 covering every instantiation** (below): there is no `impl Eq for Option[Point]` to be licensed, only
 `impl[T] Eq for Option[T]`, which names nothing local. So the sentence buys the composed types —
-slices, arrays, tuples — and leaves the prelude's generic enums to the prelude, which is the right
+slices, arrays, tuples — and leaves the library's generic enums to the library, which is the right
 split: a slice of your struct is your business, and `Option` is not.
 
 **A type parameter is not a local type**, so `impl[T: Display] Display for []T` is refused however
 its bound is written. That is the case with two unrelated modules each supplying a different row for
 one type, which is what the rule exists to stop; making every printable slice printable is the
-prelude's to do, and the prelude's own rows for tuples are written exactly that way.
+library's to do, and the library's own rows for tuples are written exactly that way.
 
 **Open: whether a trait *argument* licenses a block.** Rust counts one — `impl ForeignTrait<Local>
 for i32` is allowed there — and sysl does not, so `impl Mul[Complex] for int` has no home. Nothing

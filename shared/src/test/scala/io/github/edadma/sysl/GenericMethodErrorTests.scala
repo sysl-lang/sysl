@@ -127,7 +127,7 @@ class GenericMethodErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Box[T]
           |    v: T
           |    twice[U](self, x: U) -> U = x + x""".stripMargin,
-      ) should include("'+' needs 'U: Add'")
+      ) should include(s"'+' needs 'U: ${lib("Add")}'")
     }
 
     "a type with no parameters of its own has its member checked all the same" in {

@@ -1,0 +1,113 @@
+module sysl
+
+// The core trait catalog (`14 §2`).
+//
+// These are ordinary trait declarations. A program can read them, and can call their methods by
+// name -- `5.add(3)` is exactly `5 + 3` -- because what makes them an *operator* catalog is not
+// anything written here. The compiler adds the identity: which operator token means which trait,
+// and which built-in types are members. That part cannot be written in sysl at all, because the
+// open `iN` / `uN` families have no finite list of scalars an `impl` could be written for.
+//
+// **Each trait requires exactly one method**, and that is the point. Implementing a comparison
+// means writing `lt` and nothing else, so there is no way for four functions to disagree with each
+// other: `a > b` is `lt(b, a)`, `a <= b` is `!lt(b, a)`, and the compiler derives the rest.
+//
+// The ten binary traits take `[Rhs = Self, Out = Self]` so that an implementation may accept an
+// operand of another type and yield a third, while the overwhelmingly common case -- a type closed
+// under its own operator -- writes neither argument. A use writes neither either: `a * b` fixes the
+// operands and asks to be told the result, so the operands select the implementation and the result
+// is whatever that one supplies.
+
+trait Add[Rhs = Self, Out = Self]
+    add(self, rhs: Rhs) -> Out
+
+trait Sub[Rhs = Self, Out = Self]
+    sub(self, rhs: Rhs) -> Out
+
+trait Mul[Rhs = Self, Out = Self]
+    mul(self, rhs: Rhs) -> Out
+
+trait Div[Rhs = Self, Out = Self]
+    div(self, rhs: Rhs) -> Out
+
+trait Rem[Rhs = Self, Out = Self]
+    rem(self, rhs: Rhs) -> Out
+
+trait BitAnd[Rhs = Self, Out = Self]
+    bitand(self, rhs: Rhs) -> Out
+
+trait BitOr[Rhs = Self, Out = Self]
+    bitor(self, rhs: Rhs) -> Out
+
+trait BitXor[Rhs = Self, Out = Self]
+    bitxor(self, rhs: Rhs) -> Out
+
+trait Shl[Rhs = Self, Out = Self]
+    shl(self, rhs: Rhs) -> Out
+
+trait Shr[Rhs = Self, Out = Self]
+    shr(self, rhs: Rhs) -> Out
+
+trait Neg
+    neg(self) -> Self
+
+trait Not
+    not(self) -> Self
+
+trait Eq
+    eq(self, rhs: Self) -> bool
+
+trait Ord
+    lt(self, rhs: Self) -> bool
+
+// A tuple is comparable, hashable and printable exactly when its parts are, which is what these
+// rows say: the membership is *structural*, so nothing has to be written per tuple type.
+//
+// They are written out per arity rather than derived because a tuple's arity is part of its type
+// and there is no variadic `impl` to write. Two and three cover what a program reaches for; a wider
+// tuple is a struct with names, which is the better thing to have written anyway.
+
+impl[A: Eq, B: Eq] Eq for (A, B)
+    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1
+
+impl[A: Eq, B: Eq, C: Eq] Eq for (A, B, C)
+    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1 && self.2 == rhs.2
+
+// Lexicographic, and written as a ladder rather than as `<` on each part in turn because deciding a
+// position takes *two* comparisons: this one is less, or it is greater, or the two agree and the
+// next position decides.
+impl[A: Ord, B: Ord] Ord for (A, B)
+    lt(self, rhs: Self) -> bool
+        if self.0 < rhs.0 then return true
+        if rhs.0 < self.0 then return false
+        self.1 < rhs.1
+    end lt
+
+impl[A: Ord, B: Ord, C: Ord] Ord for (A, B, C)
+    lt(self, rhs: Self) -> bool
+        if self.0 < rhs.0 then return true
+        if rhs.0 < self.0 then return false
+        if self.1 < rhs.1 then return true
+        if rhs.1 < self.1 then return false
+        self.2 < rhs.2
+    end lt
+
+// Mixed with the same FNV prime the string hash uses, so that the parts' order matters -- `(1, 2)`
+// and `(2, 1)` are different keys, and a plain XOR would make them the same one.
+impl[A: Hash, B: Hash] Hash for (A, B)
+    hash(self) -> u64 = hash_u64(self.0.hash() * 0x100000001b3u64 ^ self.1.hash())
+
+impl[A: Hash, B: Hash, C: Hash] Hash for (A, B, C)
+    hash(self) -> u64 =
+        hash_u64((self.0.hash() * 0x100000001b3u64 ^ self.1.hash()) * 0x100000001b3u64 ^ self.2.hash())
+
+// Rendered as one field, which is why the parts are gathered before anything is padded: `14 §2`'s
+// rule is that a specifier describes the field the *whole* value occupies, so `%8s` on a pair pads
+// the pair and not its first element.
+impl[A: Display, B: Display] Display for (A, B)
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_pad(("(" + str(self.0) + ", " + str(self.1) + ")").bytes, out, fmt)
+
+impl[A: Display, B: Display, C: Display] Display for (A, B, C)
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_pad(("(" + str(self.0) + ", " + str(self.1) + ", " + str(self.2) + ")").bytes, out, fmt)

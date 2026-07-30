@@ -110,7 +110,7 @@ class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Box[T]
           |    value: T
           |    twice(self) -> T = self.value + self.value""".stripMargin,
-      ) should include("'+' needs 'T: Add'")
+      ) should include(s"'+' needs 'T: ${lib("Add")}'")
     }
 
     "a bound licenses only its own trait's members" in {
@@ -158,7 +158,7 @@ class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport {
           |print(a.twice(), b.twice())""".stripMargin,
       )
 
-      out.linesIterator.count(_.contains("needs 'T: Add'")) shouldBe 1
+      out.linesIterator.count(_.contains(s"needs 'T: ${lib("Add")}'")) shouldBe 1
     }
   }
 

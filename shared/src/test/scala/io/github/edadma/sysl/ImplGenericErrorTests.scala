@@ -177,7 +177,7 @@ class ImplGenericErrorTests extends AnyFreeSpec with CodegenSupport {
            |    twice(self) -> string
            |        var doubled = self.v + self.v
            |        "done\"""".stripMargin,
-      ) should include("'+' needs 'T: Add'")
+      ) should include(s"'+' needs 'T: ${lib("Add")}'")
     }
 
     // One mistake, one diagnostic: the definition-time complaint names the bound that would license

@@ -144,8 +144,8 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
             |    v: T
             |impl[T] Mul[Box[int]] for Box[T]
             |    mul(self, o: Box[int]) -> Box[T] = self""".stripMargin) should include(
-        "'Box[int]' is a Box, and a 'Mul' whose arguments default names the type it is written " +
-          "for — so at one Box this block and a defaulted one would promise the same thing",
+        s"'Box[int]' is a Box, and a '${lib("Mul")}' whose arguments default names the type it is " +
+          "written for — so at one Box this block and a defaulted one would promise the same thing",
       )
     }
 
@@ -371,7 +371,7 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
       err(timeline +
         """impl Sub[Instant] for Instant
           |    sub(self, o: Instant) -> Duration = Duration(self.us - o.us)
-          |print(1)""".stripMargin) should include("method 'sub' returns Duration, but trait 'Sub' declares Instant")
+          |print(1)""".stripMargin) should include(s"method 'sub' returns Duration, but trait '${lib("Sub")}' declares Instant")
     }
 
     // Nor does dispatching on the pair rescue it: the two implementations differ in what they take,
@@ -382,7 +382,7 @@ class MultipleImplementationTests extends AnyFreeSpec with RunSupport with Codeg
           |    sub(self, d: Duration) -> Instant = Instant(self.us - d.us)
           |impl Sub[Instant] for Instant
           |    sub(self, o: Instant) -> Duration = Duration(self.us - o.us)
-          |print(1)""".stripMargin) should include("but trait 'Sub' declares Instant")
+          |print(1)""".stripMargin) should include(s"but trait '${lib("Sub")}' declares Instant")
     }
   }
 }

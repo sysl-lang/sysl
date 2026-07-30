@@ -209,9 +209,9 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
             |    eq(self, rhs: Option[T]) -> bool = self.is_some() == rhs.is_some()
             |print(1)
             |""".stripMargin) should include(
-        "an 'impl' may be written only in the module that declares the trait or in one that " +
-          "declares a type named in the subject, and 'Eq' is the library's while nothing in " +
-          "'Option' is declared outside the library — so this one has no home")
+        s"an 'impl' may be written only in the module that declares the trait or in one that " +
+          s"declares a type named in the subject, and '${lib("Eq")}' is the library's while " +
+          "nothing in 'Option' is declared outside the library — so this one has no home")
     }
 
     // A catalog trait the compiler already provides for a built-in is refused one step earlier

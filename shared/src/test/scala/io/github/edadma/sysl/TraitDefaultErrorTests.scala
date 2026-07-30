@@ -37,7 +37,7 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
         """trait Doubler
           |    value(self) -> Self
           |    twice(self) -> Self = self.value() + self.value()""".stripMargin
-      ) should include("'Self: Add'")
+      ) should include(s"'Self: ${lib("Add")}'")
     }
 
     "a default printing its receiver asks for Display" in {

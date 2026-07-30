@@ -112,7 +112,7 @@ class AssociatedGenericErrorTests extends AnyFreeSpec with CodegenSupport {
         """struct Box[T]
           |    v: T
           |    twice(x: T) -> T = x + x""".stripMargin,
-      ) should include("'+' needs 'T: Add'")
+      ) should include(s"'+' needs 'T: ${lib("Add")}'")
     }
 
     "a bound licenses only what its own trait declares" in {

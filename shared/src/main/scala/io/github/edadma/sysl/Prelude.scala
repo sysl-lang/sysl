@@ -22,17 +22,15 @@ package io.github.edadma.sysl
  * them in sysl is a small job for the integers and a large one for the floats (correct shortest
  * round-trip), so they wait until there is a reason — a target without a C library.
  *
- * **The core trait catalog is here too** (`14 §2`): `Add`, `Ord`, `Eq` and the rest are ordinary
- * trait declarations a program can read and whose methods it can call by name. What the compiler
- * adds is identity — which operator token means which of them, and which built-in types are members
- * — and that part lives in `CoreTraits`, because the open `iN` / `uN` families have no finite list
- * of scalars an `impl` could be written for.
+ * **The core trait catalog is in the standard module** (`14 §2`): `Add`, `Ord`, `Eq` and the rest,
+ * beside the structural rows that make a tuple comparable when its parts are. What the compiler adds
+ * is identity — which operator token means which trait, and which built-in types are members — and
+ * that part lives in `CoreTraits`, which holds them as *spellings* and deliberately does not record
+ * which half of the library a trait is in.
  *
- * **The rendering surface is in the standard module** — `Writer`, `Display`, and the whole
- * `display_*` family that renders the built-in types into a sink. What is left here is what is
- * written *against* it: the `print*` family above, and the `impl Writer` blocks further down. Both
- * name the standard module's declarations without an import, because a name written in either part
- * of the library is looked for among the library's own first.
+ * What is left here is written *against* the moved half — the `print*` family above names the
+ * standard module's declarations with no import, because a name written in either part of the
+ * library is looked for among the library's own first.
  *
  * The `extern`s are the only things here that are not sysl. All but one are plumbing rather than
  * surface, so they take a link name and leave `putchar`, `snprintf`, `read` and `memchr` free for a
@@ -110,48 +108,6 @@ object Prelude {
       |    putbytes(buf[0..<usize(k)])
       |end printr
       |
-      |trait Add[Rhs = Self, Out = Self]
-      |    add(self, rhs: Rhs) -> Out
-      |
-      |trait Sub[Rhs = Self, Out = Self]
-      |    sub(self, rhs: Rhs) -> Out
-      |
-      |trait Mul[Rhs = Self, Out = Self]
-      |    mul(self, rhs: Rhs) -> Out
-      |
-      |trait Div[Rhs = Self, Out = Self]
-      |    div(self, rhs: Rhs) -> Out
-      |
-      |trait Rem[Rhs = Self, Out = Self]
-      |    rem(self, rhs: Rhs) -> Out
-      |
-      |trait BitAnd[Rhs = Self, Out = Self]
-      |    bitand(self, rhs: Rhs) -> Out
-      |
-      |trait BitOr[Rhs = Self, Out = Self]
-      |    bitor(self, rhs: Rhs) -> Out
-      |
-      |trait BitXor[Rhs = Self, Out = Self]
-      |    bitxor(self, rhs: Rhs) -> Out
-      |
-      |trait Shl[Rhs = Self, Out = Self]
-      |    shl(self, rhs: Rhs) -> Out
-      |
-      |trait Shr[Rhs = Self, Out = Self]
-      |    shr(self, rhs: Rhs) -> Out
-      |
-      |trait Neg
-      |    neg(self) -> Self
-      |
-      |trait Not
-      |    not(self) -> Self
-      |
-      |trait Eq
-      |    eq(self, rhs: Self) -> bool
-      |
-      |trait Ord
-      |    lt(self, rhs: Self) -> bool
-      |
       |trait Index[I, E]
       |    index(self, i: I) -> E
       |
@@ -175,43 +131,6 @@ object Prelude {
       |
       |trait Fn4[A, B, C, D, R]
       |    call(*self, a: A, b: B, c: C, d: D) -> R
-      |
-      |impl[A: Eq, B: Eq] Eq for (A, B)
-      |    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1
-      |
-      |impl[A: Eq, B: Eq, C: Eq] Eq for (A, B, C)
-      |    eq(self, rhs: Self) -> bool = self.0 == rhs.0 && self.1 == rhs.1 && self.2 == rhs.2
-      |
-      |impl[A: Ord, B: Ord] Ord for (A, B)
-      |    lt(self, rhs: Self) -> bool
-      |        if self.0 < rhs.0 then return true
-      |        if rhs.0 < self.0 then return false
-      |        self.1 < rhs.1
-      |    end lt
-      |
-      |impl[A: Ord, B: Ord, C: Ord] Ord for (A, B, C)
-      |    lt(self, rhs: Self) -> bool
-      |        if self.0 < rhs.0 then return true
-      |        if rhs.0 < self.0 then return false
-      |        if self.1 < rhs.1 then return true
-      |        if rhs.1 < self.1 then return false
-      |        self.2 < rhs.2
-      |    end lt
-      |
-      |impl[A: Hash, B: Hash] Hash for (A, B)
-      |    hash(self) -> u64 = hash_u64(self.0.hash() * 0x100000001b3u64 ^ self.1.hash())
-      |
-      |impl[A: Hash, B: Hash, C: Hash] Hash for (A, B, C)
-      |    hash(self) -> u64 =
-      |        hash_u64((self.0.hash() * 0x100000001b3u64 ^ self.1.hash()) * 0x100000001b3u64 ^ self.2.hash())
-      |
-      |impl[A: Display, B: Display] Display for (A, B)
-      |    display(self, out: *Writer, fmt: FormatSpec) =
-      |        display_pad(("(" + str(self.0) + ", " + str(self.1) + ")").bytes, out, fmt)
-      |
-      |impl[A: Display, B: Display, C: Display] Display for (A, B, C)
-      |    display(self, out: *Writer, fmt: FormatSpec) =
-      |        display_pad(("(" + str(self.0) + ", " + str(self.1) + ", " + str(self.2) + ")").bytes, out, fmt)
       |
       |printb(b: bool) = prints(if b then "true" else "false")
       |
