@@ -218,6 +218,14 @@ trait MemberLowering extends TypeResolution {
           err(s"'${m.name}' is a member the compiler provides for ${show(ty)} — a member of this " +
             "name would hide it")
 
+      // A shape block never reaches the loop above, because `Self` is not a type until an
+      // instantiation says what its element is. Asking the shape instead is what closes the one
+      // spelling that got through: every written-out sequence was refused a `len` and every slice
+      // at once was not.
+      for h <- home.head if home.shaped && builtinShapeMember(h, m.name) do
+        err(s"'${m.name}' is a member the compiler provides for ${everyShape(h)} — a member of " +
+          "this name would hide it")
+
       memberDecls((home.key, filed)) = m
 
       // A name a program spells that now reaches more than one member is recorded as reaching all of

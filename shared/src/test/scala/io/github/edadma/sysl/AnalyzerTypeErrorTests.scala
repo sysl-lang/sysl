@@ -72,8 +72,8 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
     }
 
     "'&' needs something with an address" in {
-      err("print(*(&(1 + 2)))") should include("needs a variable, a field, or a dereference")
-      err("f() -> int = 1\nvar p = &f()") should include("needs a variable, a field, or a dereference")
+      err("print(*(&(1 + 2)))") should include("needs a variable, a field, an element, or a dereference")
+      err("f() -> int = 1\nvar p = &f()") should include("needs a variable, a field, an element, or a dereference")
     }
 
     "'*' needs a pointer or a reference" in {

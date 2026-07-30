@@ -262,6 +262,14 @@ what puts these names out of reach for an `impl` (`02`): a member declared as `l
 is the same rule that stops an `impl` method from colliding with a struct's field, applied to a type
 whose "fields" are the language's.
 
+The rule has to be asked of a **shape** as well as of a type, and asking it only of the type left a
+hole exactly where the sentence above points. `impl Sized for []int` is refused because `Self` is a
+type by the time its members are hoisted and the type has a `len`; `impl[T] Sized for []T` has no
+`Self` yet — the element is still a parameter — so the same question found nothing to ask, and the
+block was accepted and then never reached, which is the outcome the refusal exists to prevent. The
+shape is asked directly now, and the shapes that have a provided member are the two written with
+brackets, `len` being the whole of what a sequence gets. A tuple's shape is its arity and has none.
+
 ### A type with no name still has members
 
 The forms above are written in a type's own body, which only a `struct` or an `enum` has. Everything

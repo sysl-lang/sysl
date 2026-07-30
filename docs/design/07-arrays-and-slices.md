@@ -358,6 +358,22 @@ implementation:
   alternative — a `[80]T` parameter — copies the table at every call. A table small enough to copy
   escapes it, which is why the same program hands its eight initial values over as a `[8]T` and
   thinks nothing of it.
+- **A string's `.bytes` is the third customer, and it is the one that makes this a soundness item
+  rather than an ergonomic one.** The other two are *refusals* — the language declines to make the
+  view, so nothing is unsound, only unwritable. `.bytes` reinterprets a string's three words as a
+  `[]u8` without copying (`04`), so the view **already exists**, and it views storage the language
+  calls immutable. Writing one byte of a literal's bytes wrote into read-only memory and killed the
+  process, out of a program containing no `*T` — which is exactly what `03`'s headline guarantee
+  says cannot happen; writing one byte of a heap string's silently mutated an immutable value and
+  can leave a `string` that is not valid UTF-8. The direct spelling `s.bytes[i] = v` is now refused
+  where it is written, which closes the door somebody opens by accident. `&s.bytes[i]` is
+  deliberately *not* refused: it is a `*T` the moment it is written, which is the tier the guarantee
+  excludes, and it is how a string reaches a C function taking a pointer and a length —
+  `printf("%.*s")` is exactly that call. What the refusal cannot reach is the view **bound to a name
+  or passed to a function** — once it
+  is a plain `[]u8`, nothing about it says whose elements it holds, and any `f(b: []u8)` may write
+  through it. So the missing type is not a convenience here; it is the difference between the
+  guarantee holding and not.
 - ~~**A `Buf` grows and shrinks at its end and nowhere else.**~~ **Built** — see `§ Growing one`.
   `remove(i)` and `truncate(n)`, the second being the one the first is written in terms of, and
   `clear` now written in terms of it too. What made the item worth doing was the shape of the code
