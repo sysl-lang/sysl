@@ -9,11 +9,22 @@ package io.github.edadma.sysl
  * `PatternAnalysis`, a block to `StmtAnalysis`, and the handful the compiler resolves by name to
  * `SpecialForms`.
  *
- * Places are here rather than beside assignment because what makes an expression a place is a
- * property of the expression: a local, a dereference, a field of either, and an element of a slice
- * have an address, and anything computed does not.
+ * **Three groups of forms live in traits of their own**, and the dispatch below sends each group
+ * whole: reading a member to `MemberExprAnalysis`, building or indexing a sequence to
+ * `CollectionExprAnalysis`, and control flow used as an expression to `ControlFlowExprAnalysis`.
+ * Each group's own arms keep the order they had, which is what makes the split safe to read: an arm
+ * can only ever be shadowed by an arm matching the same node type, and every group is a set of node
+ * types nothing else here matches. What more than one group needs is in `ExprSupport`.
+ *
+ * What stays is the dispatch itself and the forms with nowhere else to be: literals, names,
+ * operators, assignment, and places. Places are here rather than beside assignment because what
+ * makes an expression a place is a property of the expression: a local, a dereference, a field of
+ * either, and an element of a slice have an address, and anything computed does not.
  */
-trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
+trait ExprAnalysis
+    extends MemberExprAnalysis
+    with CollectionExprAnalysis
+    with ControlFlowExprAnalysis {
 
   // --- expressions ---------------------------------------------------------------------
 
@@ -174,137 +185,11 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     checkInto(v, c)
   }
 
-  /** A constrained subtype's name with a member selected from it. The name is a **type**, and this
-   * case exists so that it is never reported as an undefined *name* — which is what analyzing the
-   * receiver would fall out to, and the one thing about a declared type that is certainly false.
-   *
-   * Three things could have been meant. A method or a property is reached on a value, exactly as a
-   * struct's is. `try` is the one everybody writes first, because a simple enum has one, and the
-   * answer is that a constrained type deliberately does not: the cast checks and traps, and the
-   * question is asked with `Valid`. Anything else is a member the type does not have, and what it
-   * does have is spelled with `::`.
-   */
-  private def constrainedMember(key: String, written: String, f: String): Nothing = {
-    val c      = resolveConstrained(key)
-    val ranged = Type.underlying(c.base).isInstanceOf[Type.Integer] && c.lo.isDefined
-
-    memberDecls.get((key, f)) match
-      case Some(m) if m.isProperty =>
-        err(s"'$f' is a property of '${qn(key)}' — read it on a value, as 'value.$f'")
-      case Some(m) if m.receiver.isDefined =>
-        err(s"'$f' is a method of '${qn(key)}' — call it on a value, as 'value.$f(…)'")
-      case _ if f == "try" =>
-        err(s"'${qn(key)}' is a constrained type and has no 'try': a value outside its range is a " +
-          s"mistake in the code that produced it rather than a condition to handle, so '$written(x)' " +
-          "checks it and traps" +
-          (if ranged then s", and '$written::Valid(x)' asks the question without trapping" else ""))
-      case _ =>
-        err(s"'${qn(key)}' is a type, not a value, and has no member '$f'" +
-          (if ranged then
-             s" — what a constrained type offers under its own name is written with '::': " +
-               s"'$written::First', '$written::Last', '$written::Valid(x)', '$written::Succ(x)', " +
-               s"'$written::Pred(x)'"
-           else ""))
-  }
-
-  /** A trait's name with a member selected from it, which is the same shape of mistake one type
-   * over. A trait is not a value and is not a type on its own: what its members are reached
-   * through is a value of an implementing type, or a trait object.
-   */
-  private def traitMember(key: String, f: String): Nothing =
-    traitDecls(key).methods.find(_.name == f) match
-      case Some(m) if m.isProperty =>
-        err(s"'$f' is a property of the trait '${qn(key)}' — read it on a value of a type that " +
-          s"implements '${qn(key)}', or on a '&${qn(key)}'")
-      case Some(_) =>
-        err(s"'$f' is a member of the trait '${qn(key)}' — call it on a value of a type that " +
-          s"implements '${qn(key)}', or on a '&${qn(key)}'")
-      case None =>
-        err(s"'${qn(key)}' is a trait, not a value, and declares no member '$f'")
-
-  /** A type attribute `T::Attr`, with the arguments a call form supplied (empty for the bare form).
-   * Dispatched on the kind of type `T` is: a constrained subtype (`16 §5`) or a simple enum
-   * (`09 §2`), which are the two that have questions to answer about their own value sets.
-   */
-  private def typeAttr(key: String, attr: String, args: List[Expr]): TExpr =
-    if constrainedDecls.contains(key) then constrainedAttr(resolveConstrained(key), key, attr, args)
-    else if enumDecls.contains(key) then
-      if enumDecls(key).tparams.nonEmpty then
-        err(s"'${qn(key)}' is generic, so '${qn(key)}::$attr' has no single enum to read")
-      enumAttr(instantiateEnum(key, Nil), key, attr, args)
-    else err(s"'${qn(key)}' has no type attributes")
-
-  /** The attributes a constrained integer subtype exposes: its bounds (`First`/`Last`), the total
-   * membership test (`Valid`), and the trapping steps (`Succ`/`Pred`).
-   */
-  private def constrainedAttr(c: Type.Constrained, key: String, attr: String, args: List[Expr]): TExpr = {
-    val base = c.base match
-      case i: Type.Integer => i
-      case other           => err(s"'${qn(key)}::$attr' needs an integer subtype, not ${show(other)}")
-
-    def ranged: (BigDecimal, BigDecimal) = (c.lo, c.hi) match
-      case (Some(lo), Some(hi)) => (lo, hi)
-      case _                    => err(s"'${qn(key)}::$attr' needs a 'within' range")
-
-    def noArgs(): Unit = if args.nonEmpty then err(s"'${qn(key)}::$attr' takes no arguments")
-
-    def oneArg(): TExpr =
-      if args.length != 1 then err(s"'${qn(key)}::$attr' takes exactly one argument")
-      val x = analyzeExpr(args.head, Some(base))
-      if disagree(x.ty, base) then err(s"'${qn(key)}::$attr' takes a ${show(base)}, not ${show(x.ty)}")
-      x
-
-    attr match
-      case "First" => noArgs(); TIntLit(ranged._1.toBigInt, base)
-      case "Last"  => noArgs(); val (_, hi) = ranged; TIntLit((if c.exclusiveHi then hi - 1 else hi).toBigInt, base)
-      case "Valid" => val x = oneArg(); ranged; TConstrainedValid(x, c)
-      case "Succ"  => val x = oneArg(); ranged; TConstrainedStep(x, c, up = true, base)
-      case "Pred"  => val x = oneArg(); ranged; TConstrainedStep(x, c, up = false, base)
-      case "Range" => err(s"'${qn(key)}::Range' is only meaningful as the iterable of a 'for' loop")
-      case _       => err(s"'${qn(key)}' has no attribute '$attr'")
-  }
-
-  /** The attributes a simple enum exposes: its endpoints (`First`/`Last`), the ordinal maps
-   * (`Pos` a value to its 0-based position, `Val` a position back to its value), the neighbouring
-   * values (`Succ`/`Pred`), and the name maps (`Image` a value to its name, `Value` a name to its
-   * value). All but `First`/`Last` carry an operand, and the ones that could be handed something
-   * out of range (`Val`, `Succ` at the end, `Pred` at the start, `Value` with no such name) trap.
-   */
-  private def enumAttr(en: Type.Enum, key: String, attr: String, args: List[Expr]): TExpr = {
-    if !en.simple then err(s"'${qn(key)}::$attr' needs a simple enum, and '${qn(key)}' carries data")
-
-    def noArgs(): Unit = if args.nonEmpty then err(s"'${qn(key)}::$attr' takes no arguments")
-
-    def oneArg(want: Type): TExpr =
-      if args.length != 1 then err(s"'${qn(key)}::$attr' takes exactly one argument")
-      val x = analyzeExpr(args.head, Some(want))
-      if disagree(x.ty, want) then err(s"'${qn(key)}::$attr' takes a ${show(want)}, not ${show(x.ty)}")
-      x
-
-    attr match
-      case "First" => noArgs(); TIntLit(BigInt(en.variants.head.tag), en)
-      case "Last"  => noArgs(); TIntLit(BigInt(en.variants.last.tag), en)
-      case "Pos"   => TEnumAttr("Pos", en, oneArg(en), Type.Int)
-      case "Val"   => TEnumAttr("Val", en, oneArg(Type.Int), en)
-      case "Succ"  => TEnumAttr("Succ", en, oneArg(en), en)
-      case "Pred"  => TEnumAttr("Pred", en, oneArg(en), en)
-      case "Image" => TEnumAttr("Image", en, oneArg(en), Type.Str)
-      case "Value" => TEnumAttr("Value", en, oneArg(Type.Str), en)
-      case _       => err(s"'${qn(key)}' has no attribute '$attr'")
-  }
 
   /** Whether a context of this type converts what it is given rather than simply requiring it. */
   private def converts(want: Type): Boolean =
     Type.erased(want) || want.isInstanceOf[Type.Ref] || want.isInstanceOf[Type.Weak]
 
-  /** What an array form's elements should be analyzed as, given what the form itself is expected to
-   * produce. A `string` is not on the list: its elements are bytes, but writing one is a validity
-   * question rather than an arrangement of elements.
-   */
-  private def elementWanted(want: Type): Option[Type] = want match
-    case Type.Array(_, e) => Some(e)
-    case Type.Slice(e)    => Some(e)
-    case _                => None
 
   /** Whether an expression yields its value through branches rather than producing one itself. */
   private def branching(expr: Expr): Boolean = expr match
@@ -345,7 +230,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
   private def analyzeValue(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr =
     at(expr.pos)(analyzeValueAt(expr, expected, discarded)).setPos(expr.pos)
 
-  private def analyzeValueAt(expr: Expr, expected: Option[Type], discarded: Boolean = false): TExpr = expr match
+  protected def analyzeValueAt(expr: Expr, expected: Option[Type], discarded: Boolean): TExpr = expr match
     case IntLit(v, suffix)   => intLiteral(v, suffix, expected)
     case FloatLit(t, suffix) => floatLiteral(t, suffix, expected)
     case CharLit(cp)         => TIntLit(cp, Type.Char)
@@ -572,7 +457,7 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
 
     // A simple enum's name in call position is a checked cast from an integer — `Color(n)` traps
     // on a value that is not a declared discriminant. Told from a data enum, which has no integer
-    // to reinterpret, and from a struct constructor, which line 479 already claimed.
+    // to reinterpret, and from a struct constructor, which the arm above already claimed.
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).exists(enumDecls.contains) =>
       enumFromInt(typeKey(name).get, args)
 
@@ -676,457 +561,20 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     case Call(_, _) =>
       err("the thing being called must be a name, or something whose type says it is callable")
 
-    case f: Field if throughModule(f).isDefined =>
-      analyzeValueAt(throughModule(f).get, expected)
+    // A member read is one form with three readings — a field, a property, or an attribute of a
+    // type's own name — and each reading's mistakes want their own words. `MemberExprAnalysis`.
+    case e: Field    => fieldExpr(e, expected)
+    case e: TypeAttr => typeAttrExpr(e)
+    // Building a sequence and reaching into one, which share the question of how many elements
+    // there are and whether this index is one of them. `CollectionExprAnalysis`.
+    case e @ (_: ArrayLit | _: ArrayFill | _: Index) => sequenceExpr(e, expected)
+    // Control flow that yields a value (`00 §10`), and the forms that carry several at once.
+    // `ControlFlowExprAnalysis`.
+    case e @ (_: IfExpr | _: MatchExpr | _: While | _: Loop | _: CFor | _: For | _: TryExpr |
+        _: RangeExpr | _: ResultList | _: Lambda | _: Tuple) =>
+      controlExpr(e, expected, discarded)
 
-    case Field(Ident(written), f) if lookupOpt(written).isEmpty && typeKey(written).exists(enumDecls.contains) =>
-      val n = typeKey(written).get
 
-      if enumDecls(n).variants.exists(_.name == f) then
-        constructVariant(Modules.qualify(Modules.moduleOf(n), f), Nil, expected)
-      else
-        memberDecls.get((n, f)) match
-          case Some(m) if m.isProperty =>
-            err(s"'$f' is a property of '${qn(n)}' — read it on a value, as 'value.$f'")
-          case Some(m) if m.receiver.isDefined =>
-            err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
-          case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
-          case None    => err(s"enum '${qn(n)}' has no variant '$f'")
-
-    // A struct name is not a value, so a member selected from it is one of the three that could
-    // have been meant rather than a field read — which is what the name would otherwise be reported
-    // as, in an undefined-name message naming the type instead of the member.
-    case Field(Ident(written), f) if lookupOpt(written).isEmpty && typeKey(written).exists(structDecls.contains) =>
-      val n = typeKey(written).get
-
-      memberDecls.get((n, f)) match
-        case Some(m) if m.isProperty =>
-          err(s"'$f' is a property of '${qn(n)}' — read it on a value, as 'value.$f'")
-        case Some(m) if m.receiver.isDefined =>
-          err(s"'$f' is a method of '${qn(n)}' — call it on a value, as 'value.$f(…)'")
-        case Some(_) => err(s"'$f' is an associated function of '${qn(n)}' — call it with '$written.$f(…)'")
-        case None    => err(s"type '${qn(n)}' has no member '$f' — and '${qn(n)}' is a type, not a value")
-
-    case Field(Ident(written), f)
-        if lookupOpt(written).isEmpty && typeKey(written).exists(constrainedDecls.contains) =>
-      constrainedMember(typeKey(written).get, written, f)
-
-    case Field(Ident(written), f)
-        if lookupOpt(written).isEmpty && typeKey(written).isEmpty && traitKey(written).isDefined =>
-      traitMember(traitKey(written).get, f)
-
-    // `T::Attr` — a type attribute read with no argument (`First`, `Last`). `T::Attr(x)` is a
-    // `Call` over this node, handled beside the other call forms.
-    case TypeAttr(Ident(name), attr) if lookupOpt(name).isEmpty && typeKey(name).isDefined =>
-      typeAttr(typeKey(name).get, attr, Nil)
-
-    case TypeAttr(_, attr) =>
-      err(s"'::$attr' is a type attribute, so its left side must be a type name")
-
-    case Field(receiver, f) =>
-      val tr = autoDeref(analyzeExpr(receiver))
-      tr.ty match
-        // A trait object has no fields: the layout is exactly what it forgot. What it still has is
-        // whatever the trait declares, and a property is declared to be read exactly like this.
-        case _ if Type.erased(tr.ty) =>
-          readTraitObjectProperty(tr, Type.erasedTrait(tr.ty).get, f)
-
-        // A tuple's parts are named for their positions, so `t.0` arrives here as an ordinary field
-        // selection. An index past the end is worth its own complaint: nothing about "no property
-        // '3'" tells a reader that what they wrote was one part too far.
-        case t: Type.Tuple =>
-          val idx = t.fieldIndex(f)
-          if idx >= 0 then TField(tr, idx, t.fields(idx)._2)
-          else if f.forall(_.isDigit) then
-            err(s"${show(t)} has ${quantity(t.fields.length, "part")}, so there is no '.$f' — " +
-              s"the parts are numbered from 0")
-          else readProperty(tr, t, f)
-
-        case s: Type.Struct =>
-          val idx = s.fieldIndex(f)
-          if idx >= 0 then
-            checkFieldVisible(s.base, f)
-            TField(tr, idx, s.fields(idx)._2)
-          else readProperty(tr, s, f)
-
-        // An enum has no fields to shadow a member, so every name read off one is a property.
-        case e: Type.Enum => readProperty(tr, e, f)
-
-        // A bound promises behaviour, and a property is behaviour spelled like a field — so this is
-        // a bound's to license after all, and it is checked at the definition like every other use
-        // of a parameter. What no bound reaches is a real *field*: that is layout, which is `10 §5`'s
-        // rule and the complaint left when nothing declares a property of the name.
-        case a: Type.Abstract => readBoundProperty(a, tr, f)
-        // `len`, `bytes` and `chars` are the compiler-provided members: `len` a property on every
-        // array, slice, and string, `bytes` the reinterpretation of a string's three words
-        // as a `[]u8`, dropping only the validity guarantee, and `chars` a cursor over the scalar
-        // values those bytes encode. `chars` is the one that cannot be a view — the decoding is
-        // what makes the characters — so it is the prelude's `Chars`, positioned at the start.
-        case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
-        case Type.Str if f == "bytes"                   => TBytes(tr)
-        case Type.Str if f == "chars"                   => callPrelude("chars_of", TBytes(tr))
-
-        // `copy` is the one compiler-provided member of a string that is a *method*, so reading it
-        // without the parentheses is told what a user type's method is told. The parentheses are
-        // what say it allocates and walks the bytes (`08 § Property or method`), which is exactly
-        // the information this line was missing.
-        case Type.Str if f == "copy" =>
-          err("'copy' is a method of 'string' — call it with 'copy()', since it allocates and " +
-            "copies the bytes rather than naming what is already there")
-
-        // Everything about the object is behind `get()`, including whether there still is one, so a
-        // weak reference has no fields of its own to offer and none of the referent's either.
-        case w: Type.Weak =>
-          err(s"a ${show(w)} may be gone, so nothing is read off one directly — 'get()' hands back " +
-            s"'Option[&${Type.show(w.inner)}]', and '$f' is read off what is inside it")
-
-        // Any other type reaches its own members too, since an `impl` may be written for one and a
-        // trait may ask for a property. A name none of them supplies is the older complaint, which
-        // is the better one there: nothing about `x.foo` on an `int` says a property was meant.
-        case other if hasMember(other, f) => readProperty(tr, other, f)
-        case other                        => err(s"cannot read field '$f' of ${show(other)}")
-
-    case ArrayLit(elems) =>
-      val elemExp = expected.flatMap(elementWanted)
-      val ts      = elems.map(analyzeExpr(_, elemExp))
-
-      for t <- ts do
-        if Type.noValue(t.ty) then err(s"an array cannot hold ${show(t.ty)} values")
-        if t.ty != ts.head.ty then
-          err(s"an array literal needs one element type, got ${show(ts.head.ty)} and ${show(t.ty)}")
-
-      val elemTy = ts.headOption.map(_.ty).orElse(elemExp).getOrElse(
-        err("an empty array literal takes its element type from its context, and there is none here"),
-      )
-
-      expected match
-        case Some(Type.Slice(_)) => TBufLit(ts, Type.Slice(elemTy))
-        case _                   => TArrayLit(ts, Type.Array(ts.length, elemTy))
-
-    // `[v; n]` — the form for an array whose element type has no zero, or has one that is not the
-    // wanted starting value. The value is evaluated **once** and copied into every element, which
-    // is what makes `[f(); 8]` mean one call rather than eight.
-    //
-    // What is being asked for decides which of the two things this is (`07 §Storage sized while
-    // running`). Under a `[N]T` the count is part of the type and so a compile-time constant; under
-    // a `[]T` the length is not in the type at all, so the count is an ordinary expression and the
-    // elements are storage of their own that the view owns.
-    case ArrayFill(value, count) =>
-      val elemExp = expected.flatMap(elementWanted)
-      val tv      = analyzeExpr(value, elemExp)
-
-      if Type.noValue(tv.ty) then err(s"an array cannot hold ${show(tv.ty)} values")
-
-      expected match
-        case Some(Type.Slice(_)) =>
-          val tc = analyzeExpr(count)
-
-          // A count is an index's twin, so it takes a transparent subtype for the same reason one
-          // does — and refuses a derived one for the same reason too, and is held to the same width
-          // for the same reason: a truncated count would size the storage by a number nobody wrote.
-          val checked = Type.repr(tc.ty) match
-            case i: Type.Integer => checkedIndexWidth(tc, i)
-            case _ => err(s"a repeat count is a number of elements, and ${show(tc.ty)} is not an integer")
-
-          TBufFill(tv, checked, Type.Slice(tv.ty))
-
-        case _ =>
-          val n = constInt(count) match
-            case Some(v) if v >= 0 && v.isValidInt => v.toInt
-            case Some(v)                           => err(s"an array cannot have $v elements")
-            case None =>
-              err("an array's repeat count must be a constant, since it is the array's bound — a " +
-                "literal, or a 'const' naming one. A count computed while running makes storage " +
-                "instead, which is written where a '[]T' is expected")
-
-          TArrayFill(tv, Type.Array(n, tv.ty))
-
-    // A range subscript takes a view. The receiver is left *undereferenced* on purpose: for a
-    // heap array the reference is both where the elements are and what keeps them alive, and
-    // evaluating it once is what makes those the same object.
-    case Index(receiver, RangeExpr(lo, hi, inclusive)) =>
-      if !inclusive && hi.isEmpty then err("an open-ended slice is written 'a[lo..]'")
-
-      val tr = analyzeExpr(receiver)
-
-      // A `[]T` permits writes and records nothing about where its elements came from, so a view of
-      // a `val` would be a way of writing one. Refused outright rather than allowed and policed,
-      // since the view outlives the expression that made it: what this wants is a read-only slice
-      // type, and that is a decision about `07`'s view types rather than about `val`.
-      if readOnly(tr) then
-        err("a 'val' cannot be sliced: a slice permits writes and does not record whose elements it " +
-          "views, so the view would be a way of writing one")
-
-      val elem = tr.ty match
-        case Type.Ref(Type.Array(_, e), false) => e
-        case Type.Ref(Type.Array(_, _), true) =>
-          err("a slice does not record whether its owner's count is atomic, so a '&sync' array cannot be sliced")
-        case w: Type.View               => w.elem
-        case Type.Array(_, e)           => e
-        case Type.Ptr(Type.Array(_, e)) => e
-
-        // A view of a `*T` region — the shape every C function that fills a buffer hands back. The
-        // pointer carries no length, so the end must be written and is taken on trust; that is the
-        // same trust `*p` already asks for, and the resulting view owns nothing (`05`).
-        case Type.Ptr(e) =>
-          if hi.isEmpty then
-            err(s"a ${show(tr.ty)} carries no length, so a view of one needs its end written — " +
-              "'p[0..<n]' with the number of elements that are really there")
-          e
-
-        case other => err(s"cannot slice ${show(other)}")
-
-      // Part of a string is a string, not a `[]u8` — the bytes between two character boundaries
-      // are still well-formed UTF-8, which is what the check at those boundaries is for.
-      val viewTy = if tr.ty == Type.Str then Type.Str else Type.Slice(elem)
-
-      TSlice(tr, lo.map(bound), hi.map(bound), inclusive, viewTy)
-
-    case Index(receiver, index) =>
-      val raw = analyzeExpr(receiver)
-
-      // `p[i]` on a raw pointer is C's, unchecked: the pointer is a bare address, so the subscript
-      // is the address arithmetic C spells the same way. It is read off the *undereferenced*
-      // receiver — a pointer to an array keeps the checked form below, because that one has a
-      // length in its type to check against.
-      val tr = raw.ty match
-        case Type.Ptr(_: Type.Array) => autoDeref(raw)
-        case _: Type.Ptr             => raw
-        case _                       => autoDeref(raw)
-
-      Type.element(tr.ty) match
-        case Some(elem) =>
-          val ti = analyzeExpr(index, Some(Type.Usize))
-
-          // A transparent constrained subtype stands where its base does, so an `Index within 0..<n`
-          // indexes without a cast. A derived one does not: `new` is nominal, and reaching the base
-          // is exactly what a written conversion is for.
-          Type.repr(ti.ty) match
-            case i: Type.Integer => TIndex(tr, checkedIndexWidth(ti, i), elem)
-            case other           => err(s"an index must be an integer, not ${show(other)}")
-
-        // A type with no elements of its own is indexed through `Index`, whose one method the
-        // subscript *is* (`14 §3`). The index is not held to being an integer here: what a
-        // container is read by is the trait's own argument, and a type that indexes by something
-        // else is implementing a different `Index` rather than misusing this one.
-        case None if indexes("Index", tr.ty) => callMethodOn(raw, "index", List(index), expected)
-
-        case None => err(s"cannot index ${show(tr.ty)}")
-
-    // An `if` whose own value is unused hands that down: each branch is a block in statement
-    // position, so neither is asked what it yields and the two have nothing to disagree about.
-    case IfExpr(cond, thenBody, elseOpt) =>
-      val tc    = analyzeBool(cond)
-      val tThen = analyzeValueBlock(thenBody, expected, discarded)
-      val tElse = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-      // The branches meet at one type, and a branch that does not finish takes the other's. A
-      // branch used only for its effect is a different thing: one `unit` branch makes the whole
-      // `if` a statement, whose value is nobody's, exactly as a missing `else` does.
-      val ty = tElse match
-        case Some(eb) =>
-          join(tThen.ty, eb.ty).getOrElse {
-            if eb.ty == Type.Unit || tThen.ty == Type.Unit then Type.Unit
-            else err(s"if branches have different types: ${show(tThen.ty)} and ${show(eb.ty)}")
-          }
-        case None => Type.Unit
-      TIf(tc, tThen, tElse, ty)
-
-    case MatchExpr(scrut, arms) =>
-      val ts    = analyzeExpr(scrut)
-      val tarms = arms.map(analyzeArm(ts.ty, _, expected, discarded))
-      TMatch(ts, tarms, matchResultType(ts.ty, tarms))
-
-    // A loop's `else` is a block like any other, so a loop in statement position discards it too.
-    // Without that, Python's own idiom — walk, `break` on a hit, set a flag in the `else` when
-    // nothing hit — would be refused for a disagreement between the flag and a bare `break`.
-    case While(label, cond, body, elseOpt) =>
-      val tc            = analyzeBool(cond)
-      val (tbody, ctx)  = analyzeLoopBody(expected, label)(analyzeStmts(body))
-      val telse         = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-      TWhile(tc, tbody, telse, loopResultType(ctx, telse))
-
-    case Loop(label, body) =>
-      val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))
-      TLoop(tbody, endlessResultType(ctx))
-
-    // The init's binding belongs to the loop and to nothing outside it, so the scope opens before
-    // the condition — which reads that binding — and closes after the `else`, which may too.
-    case CFor(label, init, cond, step, body, elseOpt) =>
-      pushScope()
-      val tinit        = init.toList.flatMap(recoverStmt)
-      val tcond        = cond.map(analyzeBool)
-      val (tbody, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
-      val tstep        = step.toList.flatMap(recoverStmt)
-      val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-      popScope()
-      // With no condition the loop cannot finish on its own, so its type is what its `break`s
-      // carry, exactly as `loop`'s is — and an `else` that can never run is a mistake worth saying.
-      if tcond.isEmpty && telse.isDefined then
-        err("this 'for' has no condition, so it never finishes on its own and its 'else' cannot run")
-      TCFor(tinit, tcond, tstep, tbody, telse,
-            if tcond.isEmpty then endlessResultType(ctx) else loopResultType(ctx, telse))
-
-    case For(label, name, iter, body, elseOpt) =>
-      iter match
-        // `for i in T::Range` iterates a constrained integer subtype's range, `First` through `Last`
-        // inclusive — the one place `::Range` is meaningful.
-        case TypeAttr(Ident(tn), "Range") if lookupOpt(tn).isEmpty && typeKey(tn).exists(constrainedDecls.contains) =>
-          val c = resolveConstrained(typeKey(tn).get)
-          val i = c.base match
-            case i: Type.Integer => i
-            case other           => err(s"'${qn(typeKey(tn).get)}::Range' iterates an integer subtype, not ${show(other)}")
-          val (lo, hi) = (c.lo, c.hi) match
-            case (Some(l), Some(h)) => (l, h)
-            case _                  => err(s"'${qn(typeKey(tn).get)}::Range' needs a 'within' range")
-          val last      = if c.exclusiveHi then hi - 1 else hi
-          pushScope()
-          val u         = declare(name, i)
-          val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
-          popScope()
-          val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-          TFor(u, i, TIntLit(lo.toBigInt, i), TIntLit(last.toBigInt, i), inclusive = true, tb, telse,
-               loopResultType(ctx, telse))
-
-        case RangeExpr(Some(lo), Some(hi), inclusive) =>
-          val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
-          if tlo.ty != thi.ty then
-            err(s"a 'for' range needs matching bounds, got ${show(tlo.ty)} and ${show(thi.ty)}")
-          val vty = tlo.ty match
-            case i: Type.Integer => i
-            case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
-          pushScope()
-          val u            = declare(name, vty)
-          val (tb, ctx)    = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
-          popScope()
-          val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-          TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
-
-        case _ =>
-          val seq = autoDeref(analyzeExpr(iter))
-          seq.ty match
-            case Type.Array(_, elem) => forEach(label, name, seq, elem, body, elseOpt, expected, discarded)
-            case Type.Slice(elem)    => forEach(label, name, seq, elem, body, elseOpt, expected, discarded)
-            // A string has two granularities and no reason to prefer one silently, so which one
-            // is wanted is written: `s.bytes` for the bytes, `s.chars` for the characters they
-            // encode. Neither is the default, because a program that means one rarely means both.
-            case Type.Str =>
-              err("a string is iterated as 's.bytes' or 's.chars', " +
-                "since a string has bytes and characters both")
-            case ty if iterateElem(ty).isDefined =>
-              iterating(label, name, seq, iterateElem(ty).get, body, elseOpt, expected, discarded)
-            case other =>
-              err(s"'for' iterates an integer range, an array, a slice, or a type that implements " +
-                s"'Iterate', and ${show(other)} is none of those")
-
-    case TryExpr(e) =>
-      analyzeTry(analyzeExpr(e))
-
-    case _: RangeExpr =>
-      err("a range is only allowed in a 'for' loop or a 'match' pattern")
-
-    // `a, b` where a function's result list is what is being produced. It builds the aggregate the
-    // caller takes apart — the same one a tuple builds, since a result list is a tuple's layout
-    // without a tuple's type.
-    case ResultList(values) =>
-      if !retIsList then
-        err("several values separated by commas are a function's result list, and this function " +
-          "declares one result — write the values it wants, or declare a result list")
-
-      val want = retTy.asInstanceOf[Type.Tuple]
-
-      if values.length != want.targs.length then
-        err(s"this function yields ${quantity(want.targs.length, "result")}, but " +
-          s"${supplied(values.length, "value")}")
-
-      val ts = values.zip(want.targs).map((v, w) => analyzeExpr(v, Some(w)))
-
-      for ((t, w) <- ts.zip(want.targs)) do
-        if disagree(t.ty, w) then
-          at(t.pos)(err(s"this result is declared ${show(w)}, but the value is ${show(t.ty)}"))
-
-      TStructNew(want, ts)
-
-    case l: Lambda => analyzeLambda(l, expected)
-
-    // `(a, b)` — a tuple, built exactly as a struct is: the parts are the fields, in the order they
-    // were written. What each part is *wanted* at comes from the tuple being asked for, which is
-    // what lets `var p: (i8, i8) = (1, 2)` narrow its literals the way a struct's fields do.
-    case Tuple(elems) =>
-      // A function declaring a result list yields several things and not one tuple (`12 §5b`), so
-      // the parentheses are refused where they would build the carrier the form says never exists.
-      if wantsResults(expected) then
-        err(s"this function yields ${quantity(elems.length, "result")} rather than a tuple — " +
-          s"write the values without the parentheses")
-
-      val wanted = expected.map(Type.underlying) match
-        case Some(t: Type.Tuple) if t.targs.length == elems.length => t.targs.map(Some(_))
-        case _                                                     => elems.map(_ => None)
-
-      val ts = elems.zip(wanted).map((e, w) => analyzeExpr(e, w))
-
-      // A `unit` part is let through for the reason a `unit` field is (`00 §12`): the layout skips
-      // it. `never` is refused for the reason it is refused everywhere but a result — a part that
-      // is never produced is a part nothing can give the tuple.
-      for t <- ts do
-        if t.ty == Type.Never then
-          at(t.pos)(err("a tuple part has to be a value, and this expression never produces one"))
-
-      TStructNew(tupleType(ts.map(_.ty)), ts)
-
-  /** `value.name` where `name` is not a field: a computed property, which reads with no
-   * parentheses and so is spelled exactly as a field is, with an implicit by-value receiver.
-   *
-   * The receiver may be of **any** type, because every type has an owner key its members are filed
-   * under and a trait may declare a property for an `impl` to supply — so `21.twice` reads one
-   * exactly as `p.twice` does, through the member the implementation was lowered to.
-   *
-   * The absent-member wording is the one difference between the kinds: a struct's `x` could have
-   * been either a field or a property, while an enum and a built-in have no fields to have meant.
-   */
-  private def readProperty(tr: TExpr, ty: Type, f: String): TExpr = {
-    val (base, _) = memberKey(ty, f)
-    // A property takes no arguments, so where two implementations of one trait both supply one there
-    // is nothing to say which is meant — which `pickOverload` reports as the call it is.
-    val chosen = pickOverload(ty, base, f, Nil)
-
-    memberDecls.get((base, chosen)) match
-      case Some(m) if m.isProperty =>
-        checkMemberVisible(base, chosen, m)
-        val fname      = memberFuncName(ty, chosen)
-        val (_, rtype) = funcInsts(fname)
-        funcsUsed += fname
-        TCall(fname, List(tr), rtype)
-      case Some(_) => err(s"'$f' is a method of '${show(ty)}' — call it with '$f(…)'")
-      case None =>
-        ty match
-          case _: Type.Struct => err(s"'${show(ty)}' has no field or property '$f'")
-          case _              => err(s"'${show(ty)}' has no property '$f'")
-  }
-
-  /** One end of a slice range: an index like any other, so any integer will do. */
-  private def bound(e: Expr): TExpr = {
-    val t = analyzeExpr(e, Some(Type.Usize))
-
-    t.ty match
-      case i: Type.Integer => checkedIndexWidth(t, i)
-      case other           => err(s"a slice bound must be an integer, not ${show(other)}")
-  }
-
-  /** An index or a slice bound, held to a width the bounds test can actually be made at.
-   *
-   * Reaching an element is `usize` arithmetic (`00 §7`), and a narrower index is *widened* into it —
-   * value-preserving, so nothing has to be written. A **wider** one cannot be: it would have to be
-   * truncated, and a truncated index is not the index that was written. At 128 bits `2^64 + 5` would
-   * arrive as 5 and pass the test on a six-element array — checked, and wrong, which is worse than
-   * unchecked. No array can hold more than `usize` elements, so a wider index is either a mistake or
-   * a narrowing the programmer means; either way it is written, exactly as `01`'s rule says a
-   * conversion that can lose information is.
-   */
-  private def checkedIndexWidth(t: TExpr, i: Type.Integer): TExpr =
-    if i.bits <= 64 then t
-    else
-      err(s"an index is reached at ${Type.pointerBits} bits and ${show(t.ty)} is wider, so it cannot " +
-        "be one without losing what it holds — write 'usize(i)' to say which value is meant")
 
   /** `++`/`--` — a step of one, which the base decides the existence of and a constrained place
    * then has to accept: the new value is checked between the addition and the store, so a counter
@@ -1143,122 +591,11 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
       case _               => err(s"'$op' is not defined for ${show(place.ty)}")
   }
 
-  /** `for name in seq` over storage that is already there: each element is copied out by index, and
-   * the sequence is evaluated once.
-   */
-  private def forEach(label: Option[String], name: String, seq: TExpr, elem: Type, body: List[Stmt],
-                      elseOpt: Option[List[Stmt]], expected: Option[Type], discarded: Boolean): TExpr = {
-    pushScope()
-    val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
-    popScope()
-    val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-    TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
-  }
 
-  /** `for name in cursor` over a sequence that has to be produced a value at a time (`14 §7`).
-   *
-   * The cursor is the loop's own: the expression is evaluated once into a slot nothing outside the
-   * loop can name, and `next` takes that slot's address, so a `Chars` or any other iterator advances
-   * in place while whatever was written stays a value like every other. That the slot is a *copy* is
-   * the ordinary value semantics — draining `for c in it` leaves an `it` the program declared
-   * untouched, exactly as passing it to a function would.
-   */
-  private def iterating(label: Option[String], name: String, seq: TExpr, elem: Type, body: List[Stmt],
-                        elseOpt: Option[List[Stmt]], expected: Option[Type], discarded: Boolean): TExpr = {
-    val cursor = freshName("iter")
-    val step   = callMethodOn(TLoad(cursor, seq.ty), "next", Nil, None)
-    val opt = step.ty match
-      case e: Type.Enum if e.base == "Option" && e.targs == List(elem) => e
-      case other =>
-        err(s"'Iterate' asks its 'next' for an ${show(Type.Enum("Option", List(elem)))}, " +
-          s"and this one gives back ${show(other)}")
-
-    pushScope()
-    val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
-    popScope()
-    val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-    val bind      = TVariantPattern(opt, opt.variant("Some").get, List(TBindPattern(u, elem)))
-    TIterate(cursor, seq.ty, seq, step, bind, tb, telse, loopResultType(ctx, telse))
-  }
-
-  /** What a type's `Iterate` implementation yields, or `None` where it has none.
-   *
-   * A type may implement one parameterized trait at more than one argument list (`02`), and for
-   * every other trait the call's arguments are what say which — but `next` takes none, so a second
-   * `Iterate` leaves the loop nothing to decide with. That is reported here rather than left to the
-   * call, because the sentence a program needs names the loop.
-   */
-  private def iterateElem(ty: Type): Option[Type] = {
-    val (key, targs) = memberOwner(ty)
-    implsOf("Iterate", key).map(suppliedBound(_, "Iterate", ty, targs).args) match
-      case Nil            => None
-      case List(elem) :: Nil => Some(elem)
-      case several =>
-        err(s"${show(ty)} implements 'Iterate' " +
-          s"${conjoin(several.map(a => s"'${Type.Bound("Iterate", a).show}'"))}, and a 'for' has " +
-          "nothing to say which of them it means — call 'next' yourself, with the element type written")
-  }
-
-  /** Whether a subscript on this type reaches one of the two indexing traits, asked of a type that
-   * has no elements of its own. A built-in's subscript is never this: an array, a slice and a
-   * string are indexed by the compiler, and nothing a program writes competes with that.
-   */
-  private def indexes(traitName: String, ty: Type): Boolean =
-    implsOf(traitName, memberOwner(ty)._1).nonEmpty
-
-  /** The same, asked of an assignment target before the statement has committed to being a store.
-   * Whatever goes wrong while typing the receiver is left for the ordinary path to report, in the
-   * place the programmer wrote it.
-   */
-  protected def indexes(traitName: String, receiver: Expr): Boolean =
-    probe(autoDeref(analyzeExpr(receiver)).ty)
-      .exists(t => Type.element(t).isEmpty && indexes(traitName, t))
 
   // --- names reached through a module ---------------------------------------------------
 
-  /** A reference written as a chain of plain names: `std.fs.read` is `["std", "fs", "read"]`.
-   * `None` for anything else, since a chain interrupted by a call or a subscript is a value being
-   * read from rather than a path being named.
-   */
-  private def chain(e: Expr): Option[List[String]] = e match
-    case Ident(n)    => Some(List(n))
-    case Field(r, f) => chain(r).map(_ :+ f)
-    case _           => None
 
-  /** A reference reaching into a module, rewritten with the module folded into the name it
-   * qualifies — `std.fs.read` becomes the one name `std.fs`'s `read` is keyed under — or `None`
-   * where the chain names no module.
-   *
-   * That rewrite is the whole of what qualified access needs: what is left is `read(…)`,
-   * `Point(…)`, `Shape.Circle(…)` — the ordinary forms, resolved by the cases that already handle
-   * them, against tables that were keyed this way to begin with.
-   *
-   * Two rules decide it, and both are `13 §3`'s. **A local binding shadows a module name**, so a
-   * chain whose head is bound to a value is a field read and nothing else — which is why this
-   * cannot be a pre-pass over the tree and has to be asked where the scopes are. And the
-   * **longest** module prefix wins, so a module `a.b` is reached as one rather than as `a`'s `b`.
-   *
-   * A head that names no module is read as an import of one, which is what makes the `fs` of
-   * `import std.fs` a prefix everywhere a written path is.
-   */
-  protected def throughModule(e: Expr): Option[Expr] =
-    for
-      written <- chain(e) if written.length > 1 && lookupOpt(written.head).isEmpty
-      path = if namesModule(written.head) then written
-             else importedModule(written.head).fold(written)(_.split('.').toList ::: written.tail)
-      k <- (path.length - 1).to(1, -1).find(n => moduleNames(path.take(n).mkString(".")))
-    yield
-      val module = path.take(k).mkString(".")
-      val rest   = path.drop(k)
-
-      // The key this builds is spelled the way the compiler spells its own references, so resolving
-      // it says nothing about which module wrote it — but *this* is a path a file wrote, in the
-      // terms of the body being read, so the dependency it makes is recorded here (`13 §6`).
-      dependsOn(module)
-      rest.tail.foldLeft[Expr](Ident(Modules.qualify(module, rest.head)))((acc, n) => Field(acc, n))
-        .setPos(e.pos)
 
   /** `old(e)` — the value `e` had at function entry. It is analyzed in the entry scope the `ensure`
    * runs in (parameters, but no body locals, which are not in scope yet), then recorded in the
@@ -1359,24 +696,6 @@ trait ExprAnalysis extends SpecialForms with PatternAnalysis with StmtAnalysis {
     t
   }
 
-  /** Whether a place bottoms out in something bound by a `val` — either a module-level one or a
-   * local. Reaching *into* one keeps the property: an element of a read-only array is read-only,
-   * and so is a field of a read-only struct.
-   */
-  protected def readOnly(t: TExpr): Boolean = t match
-    case _: TGlobal         => true
-    case TLoad(name, _)     => readOnlyLocals(name)
-    case TField(recv, _, _) => readOnly(recv)
-    // Only where the elements are the receiver's own storage. A slice's are somebody else's, and
-    // whose they are is exactly what a slice does not record.
-    case TIndex(recv, _, _) =>
-      recv.ty match
-        case _: Type.View => false
-        // A `val *T` fixes the address, not what is at it — exactly as `*p = v` through one is
-        // already allowed. C's `T *const p` reads the same way.
-        case _: Type.Ptr  => false
-        case _            => readOnly(recv)
-    case _ => false
 
   /** One level of automatic dereference, so a field is selected through a `*T` or a `&T`
    * exactly as it is on the value itself. One level only: reaching through a `**T` is written.
