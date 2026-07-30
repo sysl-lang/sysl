@@ -57,8 +57,16 @@ Two decisions the run-it tiers force, settled now:
 - **Codegen emits textual LLVM IR** (`.ll`), not via an in-memory LLVM-C binding. Simplest and
   most portable (no native bindings), and it makes the Tier-1 IR-shape checks trivial — you
   assert on the emitted string.
-- **Tests execute via `lli` / ORC-JIT for speed**; `clang → native` is the "real" build. This
-  recovers iteration speed from the *same* IR (one semantics, still fast) — the JIT path the
-  restart pointed to when it dropped the interpreter. The only environment dependency is an
-  LLVM toolchain, far lighter than the old multi-backend setup. On the aarch64 dev machine,
-  `lli`/`clang` target aarch64 natively.
+- **Tests execute through `clang → native`**, and that is worth stating plainly because this
+  document used to record the opposite as settled. The plan was `lli` / ORC-JIT for speed, with
+  `clang → native` as the "real" build; what exists is `Toolchain.build`, which writes a `.ll`,
+  invokes `clang`, and runs the executable, and every Tier-2 helper goes through it. `lli` appears
+  nowhere in the compiler or the suite.
+
+  The motivation for the JIT path stands and is unspent: a run-it test currently pays a full
+  `clang` invocation, which is most of what a suite of a few thousand costs. It runs the *same*
+  IR, so it is one semantics either way, and a program has been checked to run under `lli`
+  correctly — including a 128-bit divide, and a trap, which kills `lli` noisily while still
+  yielding status 133. Adopting it is an available speed-up rather than a design question; the
+  only environment dependency is the LLVM toolchain that is already required. On the aarch64 dev
+  machine, `lli` and `clang` both target aarch64 natively.
