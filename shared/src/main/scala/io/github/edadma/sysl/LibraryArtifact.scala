@@ -64,7 +64,7 @@ object LibraryArtifact {
    * against it is handed a diagnostic pointing into somebody else's source. `main` is optional
    * (`13 §7`), so a library having none is not a complaint.
    */
-  def build(sources: List[Source], target: Target = Target.default)
+  def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty)
       : Either[String, (String, String)] = {
     val parsed = sources.map(SyslParser.parse)
 
@@ -73,8 +73,38 @@ object LibraryArtifact {
       case _ =>
         val units = parsed.collect { case Right(p) => p }
 
-        Compiler.compileLibrary(units, target).map((ir, compiled) => (ir, metadata(units, compiled)))
+        rootless(units) match
+          case Some(err) => Left(err)
+          case None =>
+            Compiler.compileLibrary(units, target, building)
+              .map((ir, compiled) => (ir, metadata(units, compiled)))
   }
+
+  /** Why a library may not sit in the anonymous root module.
+   *
+   * Two reasons, and either alone would be enough. A library is reached by **naming** its module
+   * (`13 §3`), and the root module has no name — so a declaration there is one no program that
+   * depends on the library could write. And the root module is where a headerless *program's*
+   * declarations go, so the two would share a key space: the library's `double` and the program's
+   * would be one name, and which of them a call meant would depend on what else was linked.
+   *
+   * It is also what makes the split above exact. Everything the compiler supplied is keyed outside
+   * the library's own modules, and that stops being true the moment the library is in the module the
+   * prelude is in.
+   */
+  private def rootless(units: List[Program]): Option[String] =
+    units.find(u => Compiler.moduleOf(u) == Modules.root).map(u =>
+      s"a library is reached by naming its module, and ${u.source.name} is in none — " +
+        "put the library's files in a directory under the root it is built from")
+
+  /** The one library whose source the compiler also carries: its own standard module.
+   *
+   * Building it is the only compilation that is allowed to declare a module the library supplies,
+   * and it is what `sysl build-lib --core` passes. Everything else about the build is the same —
+   * which is the claim worth making, since a standard library that needed its own toolchain would
+   * not be evidence that the toolchain works.
+   */
+  def core: Set[String] = Library.modules.toSet
 
   /** The metadata blob: how many symbols the object half defines, those symbols, then the tree. */
   private def metadata(units: List[Program], compiled: Set[String]): String = {

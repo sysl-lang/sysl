@@ -91,14 +91,34 @@ object Compiler {
    * Nothing is pruned. A program is lowered from `main` outwards because anything it cannot reach is
    * dead, but a library has no `main` and every public declaration is a potential entry — so all of
    * them are emitted, and it is the *linker* that discards what a given program never calls.
+   *
+   * **A library defines its own declarations and nobody else's.** The compilation is handed the
+   * shipped library too — a library that prints reaches `printi` and `putbytes` exactly as a program
+   * does — and emitting *those* would put a copy of the printing surface in every artifact, so two
+   * libraries that both print could not be linked into one program. They are declared here and
+   * defined in the consuming program, which compiles the shipped library anyway and reaches them
+   * through the very body that called for them.
+   *
+   * Which is which is read off the **module**, and that is exact rather than approximate: a library's
+   * declarations are keyed under the module its directory names, and everything the compiler supplied
+   * — including a generic of the shipped library's monomorphized for this one's sake — is keyed
+   * somewhere else. It is exact only because a library may not sit in the anonymous root module,
+   * which `LibraryArtifact.build` is what refuses.
+   *
+   * `building` names the shipped library's own modules where *this* is the compilation producing
+   * them, so that the compiler does not supply the files it is being asked to compile.
    */
-  def compileLibrary(units: List[Program], target: Target = Target.default)
+  def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty)
       : Either[String, (String, Set[String])] =
     for
-      typed    <- Analyzer.analyze(units)
+      typed    <- Analyzer.analyze(units, building)
       promoted <- Escape.check(typed)
     yield
-      val ir = Codegen.generate(typed.copy(entryPoint = false), promoted, target)
+      val mine            = units.map(moduleOf).toSet
+      val (own, supplied) = typed.funcs.partition(f => mine(Modules.moduleOf(f.name)))
+      val ir =
+        Codegen.generate(
+          typed.copy(entryPoint = false, precompiled = supplied.map(_.name).toSet), promoted, target)
 
       // A function that reads a module-level `val` is left out of the precompiled half, and this is
       // the honest boundary of what separate compilation reaches today: the storage for a `val` is
@@ -106,9 +126,14 @@ object Compiler {
       // program instead, where the initialization it depends on actually happens. Everything else —
       // which is most of a library — is compiled once, here.
       val determined =
-        typed.funcs.filter(f => Reachability.reachedFrom(List(f), typed.funcs, typed.vtables).vals.isEmpty)
+        own.filter(f => Reachability.reachedFrom(List(f), typed.funcs, typed.vtables).vals.isEmpty)
 
       (ir, determined.map(_.name).toSet)
+
+  /** The module a file contributes to, as its header says. The directory has to agree, and the
+   * analyzer is what holds it to that; before anything is analyzed the header is what there is.
+   */
+  private[sysl] def moduleOf(u: Program): String = u.module.map(_.show).getOrElse(Modules.root)
 
   /** Every pass that reads a whole typed program runs before anything is dropped from it: a
    * declaration nothing can reach is still one the program declared, and checking it is what makes a

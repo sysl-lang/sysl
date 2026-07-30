@@ -728,7 +728,7 @@ The metadata carries **every** declaration, not only the generic ones: a call in
 half still has to be type-checked, and the tree is where the signature is. What the symbol list adds
 is which of those the consumer must declare rather than emit a second time.
 
-Three consequences worth stating, because each is a thing a reader would otherwise have to discover:
+Five consequences worth stating, because each is a thing a reader would otherwise have to discover:
 
 - **An artifact is for one machine**, exactly as an `.rlib` is, because half of it is object code.
   The tree half would travel anywhere; the object half is what pins it.
@@ -737,6 +737,25 @@ Three consequences worth stating, because each is a thing a reader would otherwi
 - **Nothing is pruned when a library is built.** A program is lowered from `main` outwards because
   what it cannot reach is dead; a library has no `main` and every public declaration is a potential
   entry, so all of them are emitted and the *linker* discards what a given program never calls.
+- **A library defines its own declarations and nobody else's.** The compilation is handed the
+  standard library too, and a library that prints reaches `printi` and `putbytes` exactly as a
+  program does — but emitting *those* would put a copy of the printing surface in every artifact, so
+  two libraries that both printed could not be linked into one program. They are declared in the
+  artifact and defined in the consuming program, which compiles the standard library anyway and
+  reaches them through the very body that called for them.
+- **A library may not sit in the anonymous root module.** A library is reached by naming its module
+  (§3) and the root module has no name, so nothing depending on it could write a path to what it
+  declares — and its keys would be a headerless program's own. Its files go in directories under the
+  root it is built from. This is also what makes the rule above exact: everything the compiler
+  supplied is keyed outside the library's own modules.
+
+**The standard module is built the same way.** `sysl`'s own source is ordinary sysl files under
+`lib/sysl`, and `sysl build-lib lib --core` compiles them — `--core` being the one thing that lets a
+compilation declare a module the compiler otherwise supplies. It is written down rather than inferred
+from the module names in the tree, because a build that guessed would turn a clear refusal — *you
+cannot add to the module every program is compiled against* — into an artifact that builds and then
+collides with the built-in copy at whatever link tried to use it. What a shipped compiler carries is
+generated from those files, so the files are the fact and the carrier cannot disagree with them.
 
 A library is **analyzed before anything is written**. A library that does not check is broken once,
 by whoever built it; without that check the artifact ships anyway and every program that links
@@ -823,9 +842,15 @@ happens. Lifting that needs a library initializer the program calls before `main
   This is no longer waiting on a decision, only on the work.
 
 - **h. What is in the standard library — the *where* is settled, the *what* is not.** A library now
-  has somewhere to live and a way to be reached: §8 is the mechanism, and `sysl` is the module name
-  every program is compiled against. What that module should *contain* is the open half, and it is
-  the question the whole exercise was for.
+  has somewhere to live and a way to be reached: §8 is the mechanism, `sysl` is the module name every
+  program is compiled against, and its source is real sysl files under `lib/sysl` that the compiler's
+  own `build-lib --core` compiles. What that module should *contain* is the open half, and it is the
+  question the whole exercise was for.
+
+  The prelude is still where most of it is, and moving a declaration across is one declaration at a
+  time rather than a switch: every unqualified name in every program resolves through the library, so
+  a change that moved all of it at once would put the whole surface onto a path nothing had exercised
+  and a single hole in it would fail everything with nothing to bisect.
 
   The pressure is real and predates the mechanism: the first program to want mathematics found none
   — `guide/fft` declares `sin`, `cos` and `sqrt` as C externs of its own and writes its own absolute

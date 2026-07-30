@@ -75,10 +75,21 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
   "the standard module the library is being drained into" - {
 
-    "says in its header what `Std.module` says" in {
+    "says in every one of its headers what `Std.module` says" in {
       // `module` is a constant so that nothing has to parse to ask which module a name is in. This
-      // is what holds it to the source it stands for.
-      Std.parsed.module.map(_.show) shouldBe Some(Std.module)
+      // is what holds it to the source it stands for — and it is asked of every file, because a
+      // second module hiding among them would be a module nothing auto-imports and no header
+      // announces.
+      Std.parsed should not be empty
+      Std.parsed.map(_.module.map(_.show)).distinct shouldBe List(Some(Std.module))
+    }
+
+    "is made of more than one file, each of which the driver would build the same way" in {
+      // `Display.display` names `Writer` from the other file. That direction is what says a module's
+      // members are one set however many files they came from, and it is why neither file imports
+      // the other.
+      Std.sources.length should be > 1
+      Std.sources.map(_.dir).distinct shouldBe List(Some(List(Std.module)))
     }
 
     "declares what it declares, and the prelude no longer does" in {

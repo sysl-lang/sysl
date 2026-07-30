@@ -47,6 +47,7 @@ case class Config(
     explainEscapes: Boolean = false,
     target: Option[String] = None,
     libs: List[String] = Nil,
+    core: Boolean = false,
     programArgs: List[String] = Nil,
 )
 
@@ -74,6 +75,9 @@ case class Config(
         .children(
           arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
           opt[String]('o', "output").action((o, c) => c.copy(output = Some(o))).text("output artifact path"),
+          opt[Unit]("core")
+            .action((_, c) => c.copy(core = true))
+            .text("this library is sysl's own standard module, which the compiler otherwise supplies"),
         ),
       cmd("emit-llvm")
         .action((_, c) => c.copy(command = "emit-llvm"))
@@ -206,18 +210,29 @@ private[sysl] def execute(cfg: Config): Int = {
         val exe = createTempFile("sysl-", "")
 
         Toolchain.build(compiled, exe, target, objects) match
-          case Left(err) => deleteFile(exe); fail(err)
+          case Left(err) => discard(exe); fail(err)
           case Right(_) =>
             val result = exec(exe :: cfg.programArgs)
-            deleteFile(exe)
+            discard(exe)
             stdout(result.stdout)
             if result.stderr.nonEmpty then Console.err.print(result.stderr)
             result.exitCode
 
       case other =>
         fail(s"unknown command '$other'")
-  finally objects.foreach(deleteFile)
+  finally objects.foreach(discard)
 }
+
+/** Removes a temporary file, whether or not it is there.
+ *
+ * Cleanup runs on the paths that failed, and those are exactly the paths where the file may never
+ * have been created: `createTempFile` reserves a name, and it is the toolchain that writes to it. A
+ * `deleteFile` on a link that failed therefore threw, and the stack trace replaced the linker's own
+ * message — the one thing the user needed to see.
+ */
+private def discard(path: String): Unit =
+  try deleteFile(path)
+  catch case _: Exception => ()
 
 /** `sysl build-lib <path> -o <artifact>` — a library compiled once, into the two halves a program
  * links against (`LibraryArtifact`).
@@ -225,9 +240,15 @@ private[sysl] def execute(cfg: Config): Int = {
  * The artifact is **for one machine**, exactly as an `.rlib` is, because half of it is object code.
  * The other half is the tree, which would travel anywhere: a generic has no compiled form until the
  * program that calls it fixes its type arguments, so it is monomorphized in that program instead.
+ *
+ * `--core` says the library being built is sysl's own standard module, which is the one thing an
+ * ordinary compilation may not declare. It is written down rather than inferred from the module
+ * names in the tree: guessing it would turn a clear refusal — *you cannot add to the module every
+ * program is compiled against* — into an artifact that builds and then collides with the built-in
+ * copy at whatever link tried to use it.
  */
 private def buildLibrary(cfg: Config, sources: List[Source], target: Target): Int =
-  LibraryArtifact.build(sources, target) match
+  LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
       val out = cfg.output.getOrElse(defaultOutputName(cfg.file) + LibraryArtifact.extension)

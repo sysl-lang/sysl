@@ -411,7 +411,7 @@ trait HoistImpl extends ImplConformance {
    * any named module is.
    */
   protected def checkCoherence(impl: ImplDecl, label: String): Unit = {
-    val home     = if Library.owns(impl) then None else Some(currentModule)
+    val home     = if libraryOwns(impl, currentModule) then None else Some(currentModule)
     val declarer = declaringModule(impl.traitName)
     val subject  = subjectHomes(impl.forType)
 
@@ -439,10 +439,10 @@ trait HoistImpl extends ImplConformance {
       .orElse(constrainedDecls.get(key))
 
     decl match
-      case Some(d) if Library.owns(d) => None
-      case Some(_)                    => Some(Modules.moduleOf(key))
+      case Some(d) if libraryOwns(d, Modules.moduleOf(key)) => None
+      case Some(_)                                          => Some(Modules.moduleOf(key))
       // A name nothing declares is a built-in, which has no module of its own and is the library's.
-      case None                       => None
+      case None                                             => None
   }
 
   /** Every module the **subject** of an `impl` belongs to: its own where it is a declared type, and

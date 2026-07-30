@@ -37,6 +37,48 @@ ThisBuild / description := "A modern, ref-counted, OS-level systems language —
 
 ThisBuild / publishTo := sonatypePublishToBundle.value
 
+// The core library's own source, embedded into the compiler that ships it.
+//
+// `lib/sysl/*.sysl` is where the standard module is *written* -- ordinary sysl files, read by the
+// same driver a user's library goes through. But a compiler has to carry it: the standard module is
+// what every program is compiled against, so it cannot be something a compilation goes looking for
+// on disk and may not find. Generating the carrier from the files rather than hand-keeping a copy
+// beside them is what makes the files the fact.
+def syslLiteral(s: String): String =
+  s.flatMap {
+    case '"'  => "\\\""
+    case '\\' => "\\\\"
+    case '\n' => "\\n"
+    case '\r' => "\\r"
+    case '\t' => "\\t"
+    case c    => c.toString
+  }.mkString("\"", "", "\"")
+
+lazy val embedCoreLibrary = Def.task {
+  val utf8 = java.nio.charset.StandardCharsets.UTF_8
+  val out  = (Compile / sourceManaged).value / "io" / "github" / "edadma" / "sysl" / "CoreSource.scala"
+  val dir  = (ThisBuild / baseDirectory).value / "lib" / "sysl"
+  val files = Option(dir.listFiles).getOrElse(Array.empty).filter(_.getName.endsWith(".sysl")).sortBy(_.getName)
+
+  if (files.isEmpty) sys.error(s"the core library has no source files at $dir")
+
+  val entries =
+    files.map(f => s"""    ("lib/sysl/${f.getName}", ${syslLiteral(IO.read(f, utf8))}),""").mkString("\n")
+  val text =
+    s"""package io.github.edadma.sysl
+       |
+       |/** Generated from the sysl files under `lib/sysl` by `build.sbt` -- do not edit. See `Std`. */
+       |private[sysl] object CoreSource {
+       |  val files: List[(String, String)] = List(
+       |$entries
+       |  )
+       |}
+       |""".stripMargin
+
+  if (!out.exists || IO.read(out, utf8) != text) IO.write(out, text, utf8)
+  Seq(out)
+}
+
 lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .in(file("."))
   .settings(
@@ -57,6 +99,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
         "-language:existentials",
         "-language:dynamics",
       ),
+    Compile / sourceGenerators += embedCoreLibrary.taskValue,
     libraryDependencies += "org.scalatest" %%% "scalatest" % "3.2.20" % "test",
     libraryDependencies ++= Seq(
       "com.github.scopt"         %%% "scopt"                    % "4.1.0",

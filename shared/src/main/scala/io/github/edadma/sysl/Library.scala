@@ -50,16 +50,27 @@ object Library {
    * Each part carries **its own source**, which is what says a name is being read *in* the library.
    * The module cannot say it: the prelude's part is in the root module, and so is a headerless
    * program.
+   *
+   * `building` is the modules this compilation is **producing** rather than being supplied with,
+   * which is how the library's own source gets compiled at all: pointed at `lib`, the compiler would
+   * otherwise hand a copy of `sysl` to the files that declare it, and every name in them would be
+   * declared twice. What is left out is exactly what the units bring, so the prelude is still here —
+   * and it goes on resolving `Writer` to the same key, now answered by the file being compiled
+   * rather than by the copy.
    */
-  def scoped: List[(Scope, Stmt)] =
-    Std.decls.map((Scope(Std.module, Imports.empty, Some(Std.origin)), _)) :::
-      Prelude.decls.map((Scope(Modules.root, Imports.empty, Some(Prelude.origin)), _))
+  def scoped(building: Set[String] = Set.empty): List[(Scope, Stmt)] = {
+    val std =
+      if building(Std.module) then Nil
+      else Std.parsed.flatMap(p => p.body.map((Scope(Std.module, Imports.empty, Some(p.source)), _)))
+
+    std ::: Prelude.decls.map((Scope(Modules.root, Imports.empty, Some(Prelude.origin)), _))
+  }
 
   /** Whether a source is one of the library's own — what tells a name being read *in* the library
    * from one being read in the program, which the module a declaration is in cannot while the
    * prelude is still in the root one alongside a headerless program's declarations.
    */
-  def source(s: Source): Boolean = (s eq Prelude.origin) || (s eq Std.origin)
+  def source(s: Source): Boolean = (s eq Prelude.origin) || Std.sources.exists(_ eq s)
 
   /** Every declaration the library carries, whichever part it is in. */
   def decls: List[Stmt] = Std.decls ::: Prelude.decls

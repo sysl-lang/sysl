@@ -35,6 +35,29 @@ case class Poisoned() extends RuntimeException
  */
 trait AnalyzerBase {
 
+  /** The library modules this compilation is **producing** rather than being supplied with.
+   *
+   * Empty for every ordinary compilation, which is what makes the library something a program never
+   * has to think about. It is non-empty only where the library's own source is what is being
+   * compiled — `sysl build-lib lib --core` — and there it does two things: it stops the compiler
+   * from handing those files a second copy of themselves, and it makes what they declare count as
+   * the library's, which is `libraryOwns` below.
+   */
+  protected def building: Set[String]
+
+  /** Whether a declaration written in `module` is one the **library** supplies.
+   *
+   * Normally that is a question about which file it came from and nothing else (`Library.owns`) —
+   * the library's declarations are keyed under the root module exactly as a headerless program's
+   * are, so the key cannot answer it. The compilation that *builds* a library module is the one
+   * case where the source is the library's without being the copy the compiler carries, and it has
+   * to be, or the rest of the library could not name what it declares: the prelude's
+   * `display_pad(text, out: *Writer, …)` resolves `Writer` among the library's own, and while
+   * `lib/sysl/write.sysl` is being compiled that is the file in front of it.
+   */
+  protected def libraryOwns(d: Positioned, module: String): Boolean =
+    Library.owns(d) || building(module)
+
   /** Every module the program is made of, by name, including the anonymous root one when a file
    * declared no header. It is what tells a dotted reference that names a module from one that
    * reads a field off a value (`13 §3`), and it is known before any name is resolved because a

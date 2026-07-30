@@ -166,5 +166,47 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       cli(Config(command = "emit-llvm", file = program("print(1)"),
         libs = List(createTempDirectory("sysl-cli-empty-lib-")))) should not be 0
     }
+
+    "reports a link that fails rather than falling over cleaning up after it" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // An object half the linker cannot read is the reachable way to fail a link, and what it
+      // caught was the cleanup: `createTempFile` reserves a name and the toolchain is what writes
+      // to it, so deleting the executable of a build that never produced one threw — and the stack
+      // trace stood where the linker's own message should have been.
+      val junk = corrupt(LibraryArtifact.pack("0\n", "not an object file".getBytes))
+
+      cli(Config(command = "run", file = program("print(1)"), libs = List(junk))) should not be 0
+    }
+  }
+
+  "build-lib --core" - {
+
+    "builds the standard module, which nothing else may declare" in {
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+
+      val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
+
+      cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
+
+      LibraryArtifact.unpack(out, readBytes(out)) match
+        case Right((meta, _)) => meta should include(Std.module)
+        case Left(err)        => fail(err)
+
+      deleteFile(out)
+    }
+
+    "and without it the same root is refused, because the module is the library's" in {
+      // The refusal is the ordinary one every program gets, and keeping it is the point: inferring
+      // the mode from the module names in the tree would turn a clear diagnostic into an artifact
+      // that builds and then collides with the built-in copy at whatever link tried to use it.
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+
+      val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
+
+      deleteFile(out)
+      cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out))) should not be 0
+      isFile(out) shouldBe false
+    }
   }
 }

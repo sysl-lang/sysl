@@ -50,7 +50,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
       u -> base.copy(imports = inScope(base)(gatherImports(u.body, autoImported(here))))
     }
-    val body = Library.scoped ::: files.flatMap((u, s) => u.body.map((s, _)))
+    val body = Library.scoped(building) ::: files.flatMap((u, s) => u.body.map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -363,9 +363,13 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
    * would be adding to it, sharing its key space, and shadowing whatever name it happened to reuse.
    * There is nothing in the file that distinguishes that from a mistake, and the mistake is the far
    * likelier reading, so it is a diagnostic rather than a silent merge.
+   *
+   * Unless the compilation is what **produces** that module, which is the one reading under which
+   * the files are not adding to the library but are the library. Nothing infers it: a build says so,
+   * because a build that guessed would turn this crisp refusal into a link-time collision.
    */
   private def checkLibraryModules(): Unit =
-    for u <- units; name = moduleOf(u) if Library.modules.contains(name) do
+    for u <- units; name = moduleOf(u) if Library.modules.contains(name) && !building.contains(name) do
       recover(())(at(u.module.flatMap(_.pos).orElse(u.body.headOption.flatMap(_.pos))) {
         err(s"'$name' is the module every program is compiled against, so ${u.source.name} cannot " +
           "declare it — its declarations would join the library's rather than sit beside them")

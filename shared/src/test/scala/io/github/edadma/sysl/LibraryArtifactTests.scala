@@ -108,6 +108,78 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** A library whose one function prints — which is what reaches the shipped library's own
+   * `printi`, `printc` and `putbytes` from inside a library build.
+   */
+  private def printing(module: String, fn: String): (String, String) =
+    LibraryArtifact.build(List(Source(s"$module/lib.sysl",
+      s"module $module\n\n$fn(n: int)\n    print(n)\nend $fn\n", List(module)))) match
+      case Right(r)  => r
+      case Left(err) => fail(s"the library did not build: $err")
+
+  "what a library does NOT compile, however much it uses it" - {
+
+    "the shipped library's own functions are declared, not defined a second time here" in {
+      // A library that prints reaches `printi` and `putbytes` exactly as a program does, and
+      // emitting them would put a copy of the printing surface in every artifact.
+      val (ir, meta) = printing("say", "hello")
+
+      LibraryArtifact.read("say.syslib", meta) match
+        case Right((_, syms)) => syms shouldBe Set("say$hello")
+        case Left(err)        => fail(err)
+
+      ir should include("define void @say$hello(")
+      ir should include("declare void @printi(")
+      ir should not include "define void @printi("
+    }
+
+    "so two libraries that both print can be linked into one program" in {
+      // Before the split above they could not: each artifact defined `printi`, `printc` and
+      // `putbytes`, and the linker refused the pair with three duplicate symbols. The consuming
+      // program defines them once, reached through the very bodies that called for them.
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val built = List(printing("say", "hello"), printing("shout", "loud"))
+      val objects = built.map { (ir, _) =>
+        val obj = createTempFile("sysl-test-", ".o")
+
+        Toolchain.compileObject(ir, obj) match
+          case Left(err) => fail(s"a library did not assemble: $err")
+          case Right(_)  => obj
+      }
+      val trees = built.flatMap { (_, meta) =>
+        LibraryArtifact.read("x.syslib", meta) match
+          case Right((t, _)) => t
+          case Left(err)     => fail(err)
+      }
+      val syms = Set("say$hello", "shout$loud")
+      val emitted =
+        Compiler.compiledWith(List(Source("<input>", "say.hello(1)\nshout.loud(3)\nprint(2)")),
+          trees, Target.default, syms) match
+          case Right((out, _)) => out
+          case Left(err)       => fail(err)
+
+      val exe = createTempFile("sysl-test-", "")
+      val ran = Toolchain.build(emitted, exe, Target.default, objects).map { _ =>
+        val r = exec(List(exe))
+
+        (r.exitCode, r.stdout)
+      }
+
+      objects.foreach(deleteFile)
+      deleteFile(exe)
+      ran shouldBe Right((0, "1\n3\n2\n"))
+    }
+  }
+
+  "a library may not sit in the module a program's own headerless files are in" in {
+    // The root module has no name, so nothing that depended on this library could write a path to
+    // what it declares — and its keys would be the consuming program's own.
+    LibraryArtifact.build(List(Source("lib.sysl", "double(n: int) -> int = n * 2\n", Nil))) match
+      case Left(err) => err should include("is reached by naming its module")
+      case Right(_)  => fail("a library with no module of its own produced an artifact")
+  }
+
   "a library that does not check is refused before anything is written" in {
     // Otherwise the artifact ships anyway and every program that links against it is handed a
     // diagnostic pointing into somebody else's source.

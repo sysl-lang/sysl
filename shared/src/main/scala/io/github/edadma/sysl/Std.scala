@@ -14,75 +14,52 @@ package io.github.edadma.sysl
  * here is reached exactly as one in `Prelude` is — `Library` is the one thing that knows which of
  * the two a name is in, and by the end it will know only this one.
  *
- * **The source is embedded rather than read off disk**, as the prelude's is, because packaging is a
- * separate question from meaning: how the standard module is shipped — as text, as a checked-in
- * `AstCodec` artifact, as files a driver finds — changes what a compilation *costs* and nothing
- * about what it means. Mixing the two would make a failure ambiguous about which caused it.
+ * **The source is real files, under `lib/sysl`.** That is the difference between a standard
+ * module and a second prelude: the prelude is a string literal inside the compiler and could never
+ * be anything else, while these are ordinary sysl files a driver reads exactly as it reads a user's
+ * library — which is what `sysl build-lib` is pointed at, and what makes the library's own source
+ * something a reader can open. What the compiler carries is **generated from them** (`CoreSource`,
+ * written by `build.sbt`), so the files are the fact and the carrier cannot disagree with them.
  *
- * **`FormatSpec` is what a format string's flags are carried in** (`14 §2`, `§8`): the field the
- * whole value occupies, the precision each renderer reads in its own terms, and which side the
- * padding goes on. What honours it is the `display_*` family, whose prose in `Prelude` is where the
- * three fields are explained. It is here first because it depends on nothing — a move is measured by
- * what breaks, and a leaf is what makes that measurement about the mechanism rather than about the
- * declaration.
+ * It has to carry *something*, and that is not a packaging accident. The standard module is what
+ * every program is compiled against, so it cannot be a thing a compilation goes looking for on disk
+ * and may not find. How it is carried — as text, as a checked-in `AstCodec` artifact — changes what
+ * a compilation *costs* and nothing about what it means, so the two questions are kept apart.
  *
- * **`Writer` and `Display` are the rendering surface** (`14 §2`, `§6`). A `Display` writes its
- * value's text into a sink rather than returning a fresh `string`, so rendering costs no allocation
- * and a `no alloc` module can still log; the sink is a `*Writer`, which is the trait object of `02`.
- * `Writer` takes bytes rather than a `string` because that is the direction that is free — a `string`
- * *is* a validated `[]u8` — and it reports failure by latching rather than by returning, so an
- * implementation stays straight-line and `print(x)` stays a statement.
- *
- * `failed` carries a **default** of `false`, which is the library's own use of the mechanism `02`
- * calls for: most sinks cannot fail, and one that cannot should not have to write down that it
- * cannot. A sink that can — a bounded buffer, a device that goes away — overrides it, and nothing
- * about the latch changes.
- *
- * The two crossed separately, and `Display` crossed first on purpose: while `Writer` was still the
- * prelude's, `Display.display` was the one signature naming a declaration in each part, which is how
- * the *sysl → prelude* direction got exercised before anything depended on it. A name written in
- * either part is looked for among the library's own first, so neither direction needs an import —
- * the module a declaration sits in is not what decides whose names it can see, and while the drain is
- * in progress it could not be. What is left in the prelude now names both of these from there: the
- * whole `display_*` family, and the `impl Writer` blocks.
+ * **It is more than one file, and that is load-bearing rather than tidiness.** `Display.display`
+ * names `Writer`, which is declared in the other one: a module's members are one set however many
+ * files they came from (`13 §6`), so neither file imports the other and the order they are read in
+ * decides nothing. A library that could only ever be one file would not be a library.
  */
 object Std {
 
-  /** The module these declarations belong to. The header below says the same thing, and a test holds
-   * the two to agreeing — this is a constant so that nothing has to parse to ask the question.
+  /** The module these declarations belong to. Every file's header says the same thing, and a test
+   * holds them to agreeing — this is a constant so that nothing has to parse to ask the question.
    */
   val module: String = "sysl"
 
-  val source: String =
-    """module sysl
-      |
-      |struct FormatSpec
-      |    width: int
-      |    prec: int
-      |    left: bool
-      |
-      |trait Writer
-      |    write(*self, bytes: []u8)
-      |    failed(*self) -> bool = false
-      |
-      |trait Display
-      |    display(self, out: *Writer, fmt: FormatSpec)
-      |""".stripMargin
-
-  /** The source these declarations point into, so a diagnostic against one quotes the standard
-   * module rather than the user's file at some unrelated line — and so a declaration can be told to
-   * have come from here, which is half of what `Library.owns` answers.
+  /** The standard module's files, in the order the generator found them — that is, sorted by
+   * name, so that what a compilation sees does not depend on a directory listing.
+   *
+   * Each carries the directory it sits in below `lib/`, which is the module its header has to agree
+   * with (`13 §1`), so these are the same `Source` values the driver would build from disk.
    */
-  val origin: Source = Source("<sysl>", source)
+  val sources: List[Source] =
+    CoreSource.files.map((name, text) => Source(name, text, List(module)))
 
   /** The parsed standard module, parsed once. */
-  lazy val parsed: Program =
-    SyslParser.parse(origin) match
-      case Right(p) => p
-      case Left(e)  => sys.error(s"the standard module does not parse: $e")
+  lazy val parsed: List[Program] =
+    sources.map(s =>
+      SyslParser.parse(s) match
+        case Right(p) => p
+        case Left(e)  => sys.error(s"the standard module does not parse: $e"),
+    )
 
-  def decls: List[Stmt] = parsed.body
+  def decls: List[Stmt] = parsed.flatMap(_.body)
 
-  /** Whether a declaration came from here rather than from the program being compiled. */
-  def declares(s: Positioned): Boolean = s.pos.exists(_.source eq origin)
+  /** Whether a declaration came from here rather than from the program being compiled. Sources
+   * compare by identity, so a user file that happened to be called `lib/sysl/display.sysl` is not
+   * this one.
+   */
+  def declares(s: Positioned): Boolean = s.pos.exists(p => sources.exists(_ eq p.source))
 }
