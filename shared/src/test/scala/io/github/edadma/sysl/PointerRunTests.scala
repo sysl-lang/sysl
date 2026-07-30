@@ -409,4 +409,107 @@ class PointerRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
            |""".stripMargin) should include("insertvalue { ptr, ptr, i64 } zeroinitializer, ptr null, 0")
     }
   }
+
+  /** `p - q`, C's `ptrdiff_t` (`03`). It is the inverse of `&p[n]`: indexing takes an address and a
+    * count to an address, and the difference takes two addresses back to a count. The whole reason it
+    * is here is that without it the interior-pointer half of libc — `memchr`, `strchr`, `strstr`,
+    * `memmem` — is callable and useless, since each hands back a pointer *into* the caller's buffer
+    * and nothing could turn one into an index.
+    *
+    * It counts **elements**, not bytes, which is C's rule and is what keeps the two operations
+    * inverse. A test on a `*u8` cannot tell the two apart — a one-byte stride makes them the same
+    * number — so every stride below is exercised at a width where it can.
+    */
+  "two pointers subtract, counting the elements between them" - {
+    "a byte pointer gives the count, and the other way round gives its negative" in {
+      run("var a: [8]u8\nvar p = &a[0]\nvar q = &a[3]\nprint(q - p, p - q)") shouldBe "3 -3\n"
+    }
+
+    "the same pointer is no distance at all" in {
+      run("var a: [8]u8\nvar p = &a[2]\nprint(p - p)") shouldBe "0\n"
+    }
+
+    // The discriminating cases: a stride of 4 and a stride of 8, where counting bytes would give 12
+    // and 32 instead of 3 and 4.
+    "a wider pointee strides by its own size" in {
+      run("var a: [8]u32\nprint(&a[3] - &a[0])") shouldBe "3\n"
+    }
+
+    "and so does a struct, by the size of the struct" in {
+      run("""struct C
+            |    n: int
+            |    m: int
+            |var cs: [8]C
+            |print(&cs[5] - &cs[1])""".stripMargin) shouldBe "4\n"
+    }
+
+    "a pointer to a pointer counts pointers" in {
+      run("var t: [4]*u8\nprint(&t[3] - &t[1])") shouldBe "2\n"
+    }
+
+    // The inverse property, stated as one program: taking a pointer `n` elements along and
+    // subtracting the original gives `n` back, at a width where a byte count would not.
+    "it is the inverse of indexing" in {
+      run("""var a: [8]u32
+            |var p = &a[0]
+            |var n = 5usize
+            |print(&p[n] - p == isize(n))""".stripMargin) shouldBe "true\n"
+    }
+
+    /** The customer, end to end: `memchr` hands back an interior pointer, the difference turns it
+      * into an index, and the index cuts the run of bytes. This is the shape a line reader is built
+      * out of, and it is what the operator was added for.
+      */
+    "which is what makes memchr usable at all" in {
+      run("""extern memchr(p: *u8, c: int, n: usize) -> *u8
+            |var buf: [8]u8 = [65u8, 66u8, 10u8, 67u8, 0u8, 0u8, 0u8, 0u8]
+            |var hit = memchr(&buf[0], 10, 8usize)
+            |if hit == null
+            |    print("absent")
+            |else
+            |    var at = usize(hit - &buf[0])
+            |    print(at, from_utf8_unchecked(buf[0..<at]))""".stripMargin) shouldBe "2 AB\n"
+    }
+
+    "and reports the absence of what it looked for, without a difference to take" in {
+      run("""extern memchr(p: *u8, c: int, n: usize) -> *u8
+            |var buf: [4]u8 = [65u8, 66u8, 67u8, 68u8]
+            |print(memchr(&buf[0], 10, 4usize) == null)""".stripMargin) shouldBe "true\n"
+    }
+
+    "a one-byte pointee needs no divide, and a wider one does" in {
+      val narrow = mainOf(ir("var a: [8]u8\nprint(&a[3] - &a[0])"))
+      val wide   = mainOf(ir("var a: [8]u32\nprint(&a[3] - &a[0])"))
+
+      narrow should include("ptrtoint")
+      narrow should not include "sdiv"
+      wide should include("sdiv i64")
+    }
+
+    "what it is not" - {
+      // Two pointees of different types have no shared element to count, and the message is the
+      // ordinary matching-types one rather than a rule of its own.
+      "two pointers to different types" in {
+        err("var a: [4]u8\nvar b: [4]u32\nprint(&a[0] - &b[0])") should
+          include("'-' needs matching types, got *byte and *uint")
+      }
+
+      // Difference is the only pointer arithmetic here: offsetting is `&p[n]`, which already exists
+      // and already strides, so a second spelling for it would be a second thing to keep in step.
+      "a pointer and an integer, offsetting being '&p[n]'" in {
+        err("var a: [8]u8\nprint(&a[0] - 1)") should include("'-' needs matching types")
+      }
+
+      "two pointers added, there being no address to name" in {
+        err("var a: [8]u8\nprint(&a[0] + &a[1])") should include("'+' is not defined for *byte")
+      }
+
+      // A counted reference is not an address the program is free to do arithmetic on — the whole
+      // difference between the two modes (`03`) — so it keeps the equality it had and nothing more.
+      "a counted reference, which is not a raw pointer" in {
+        err("struct P\n    x: int\nvar a: &P = P(1)\nvar b: &P = P(2)\nprint(a - b)") should
+          include("'-' is not defined for &P")
+      }
+    }
+  }
 }

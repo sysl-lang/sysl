@@ -342,6 +342,39 @@ that cannot write `p[i]` cannot be written.
 An array whose length the program computes needs an allocator, and so would a growable one; a fixed
 array and a view of one do not.
 
+### Two pointers subtract — C's `ptrdiff_t`
+
+`p - q` between two `*T`s of the **same** pointee is an `isize`, and it counts **elements** rather
+than bytes:
+
+```
+var at = usize(hit - &buf[0])          // an interior pointer, as an index
+```
+
+It is the **inverse of `&p[n]`**: indexing takes an address and a count to an address, and the
+difference takes two addresses back to a count, both striding by the pointee. Writing it as bytes
+would break that, and would make the answer depend on the pointee in the one direction where C's does
+not.
+
+**Why it is here at all**, since a program that only walks a buffer can index it: the
+interior-pointer half of libc hands back a pointer *into* a buffer the caller owns — `memchr`,
+`strchr`, `strrchr`, `strstr`, `memmem` — and without a difference every one of them is *callable and
+useless*, because nothing could turn the answer into an index. That is a whole family of C the
+language could not reach, which is exactly the floor `*T` exists to hold.
+
+**Offsetting stays `&p[n]`.** `p + n` is not spelled, and deliberately: indexing already exists, it
+already strides by the pointee, and a second spelling for the same address would be a second thing to
+keep in step. So the two directions are `&p[n]` and `p - q`, and there is one way to write each.
+
+What it is not: two pointers of **different** pointee types have no shared element to count and are
+refused by the ordinary matching-types rule; `p + q` names no address and is refused; and a **counted
+`&T` has no arithmetic at all**, keeping the equality it always had and nothing more. Arithmetic is a
+property of the unsafe mode, not of holding an address.
+
+Whether two pointers into unrelated objects may be subtracted is the programmer's business, as `p[i]`
+past the end already is — this is the unsafe tier, and the difference is as unchecked as the subscript
+it inverts.
+
 How the two are written, indexed, and sliced — the literal, the zero-valued declaration, the
 range subscript, `.len` — is **`07-arrays-and-slices.md`**.
 

@@ -861,6 +861,30 @@ class Codegen private (program: TProgram, promotions: Escape.Promotions, protect
     case TBinary(_, l, r, Type.Str) =>
       ownTemp(strConcat(genExpr(l), genExpr(r)), Type.Str)
 
+    /** `p - q`, C's `ptrdiff_t`. The bytes between the two addresses, divided by the pointee's size
+      * so the answer counts elements — the inverse of `&p[n]`, which strides by the same size.
+      *
+      * The divide is skipped for a one-byte pointee, which is not an optimization so much as the
+      * common case: a `*u8` walk over bytes is what `memchr` and every other interior-pointer libc
+      * function hands back, and `sdiv` by 1 would be noise in the emitted text a reader has to
+      * discount.
+      */
+    case TBinary("-", l, r, _) if Type.underlying(l.ty).isInstanceOf[Type.Ptr] =>
+      val stride = Type.underlying(l.ty) match
+        case Type.Ptr(e) => Layout.size(e)
+        case _           => 1
+      val (lv, rv) = (genExpr(l), genExpr(r))
+      val (la, ra) = (freshTemp(), freshTemp())
+      emit(s"$la = ptrtoint ptr $lv to ${Type.Isize.llvm}")
+      emit(s"$ra = ptrtoint ptr $rv to ${Type.Isize.llvm}")
+      val bytes = freshTemp()
+      emit(s"$bytes = sub ${Type.Isize.llvm} $la, $ra")
+      if stride <= 1 then bytes
+      else
+        val n = freshTemp()
+        emit(s"$n = sdiv ${Type.Isize.llvm} $bytes, $stride")
+        n
+
     case TBinary(op, l, r, _) =>
       // Arithmetic runs at the base representation — a derived type keeps its own identity in the
       // analyzer but is added, multiplied, and divided as the base it is laid out as.

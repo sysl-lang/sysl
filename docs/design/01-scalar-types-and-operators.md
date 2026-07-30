@@ -226,6 +226,11 @@ Key points:
 - **Equality reaches further than ordering.** `==` and `!=` are defined wherever `<` is, and
   additionally on `bool` and on the two pointer-shaped modes `*T` and `&T`, which compare by
   address. Ordering on an address is not defined — a bare address has no meaningful one.
+- **The one arithmetic two pointers have is `-`.** `p - q` between two `*T`s of the same pointee is
+  an `isize` counting the **elements** between them, C's `ptrdiff_t` and the inverse of `&p[n]`
+  (`03`). It is the only operator in the table whose result is neither operand's type. Nothing else
+  is defined: `p + q` names no address, `p - n` is `&p[n]`'s job, and a counted `&T` has no
+  arithmetic at all.
 - **A float comparison is IEEE 754's, `NaN` and all.** A `NaN` is equal to nothing, itself included,
   so `==`, `<`, `>`, `<=` and `>=` are all false at one — and `!=` is **true**, because IEEE makes it
   the negation of `==` rather than a sixth ordered comparison. Exactly one of the six answers true,

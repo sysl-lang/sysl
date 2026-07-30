@@ -186,6 +186,11 @@ trait Literals extends TypeResolution {
       case (_: Type.Integer, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^") => result
       case (_: Type.Floating, "+" | "-" | "*" | "/")                                      => result
       case (Type.Str, "+")                                                                => result
+      // C's `ptrdiff_t`: the one arithmetic two pointers have, and the only operator whose result is
+      // neither operand's type nor their shared representation. It counts *elements*, so it is the
+      // inverse of `&p[n]` (`03`) — which is why the pointee decides the stride and why two pointers
+      // into different objects are the programmer's business, exactly as `p[i]` already is.
+      case (Type.Ptr(_), "-")                                                             => Type.Isize
       case _ => err(s"operator '$op' is not defined for ${show(a)}")
   }
 
