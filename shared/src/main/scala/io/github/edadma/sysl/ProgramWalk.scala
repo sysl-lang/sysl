@@ -19,6 +19,16 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
   // --- program -------------------------------------------------------------------------
 
+  /** The imports a file starts with, before it has written any of its own (`AutoImport`).
+   *
+   * A module is brought in only where this compilation actually has it, so a program built without
+   * the library carries nothing. A file of the auto-imported module itself is left alone: its own
+   * declarations already resolve first, and a file wildcard-importing the module it is in would
+   * read as though it needed to.
+   */
+  private def autoImported(module: String): Imports =
+    Imports(wildcards = AutoImport.modules.filter(m => m != module && moduleNames(m)))
+
   def analyze(): TProgram = {
     checkLocations()
     moduleNames ++= units.map(moduleOf)
@@ -31,9 +41,10 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // The imports are gathered in the file's own terms, since what an import may reach is a
     // question about where it was written (`13 §2`) as much as about what it names.
     val files = units.map { u =>
-      val base = Scope(moduleOf(u), Imports.empty, Some(u.source))
+      val here = moduleOf(u)
+      val base = Scope(here, Imports.empty, Some(u.source))
 
-      u -> base.copy(imports = inScope(base)(gatherImports(u.body, Imports.empty)))
+      u -> base.copy(imports = inScope(base)(gatherImports(u.body, autoImported(here))))
     }
     val body = Prelude.decls.map((Scope.root, _)) ::: files.flatMap((u, s) => u.body.map((s, _)))
 

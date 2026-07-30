@@ -36,6 +36,26 @@ object Compiler {
   def compileTrees(units: List[Program], target: Target = Target.default): Either[String, String] =
     analyzed(units, target).map(_._1)
 
+  /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
+   * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
+   *
+   * The library arrives as trees rather than as source because that is what it will be: an
+   * `AstCodec` artifact, decoded. Nothing downstream distinguishes the two, which is the property
+   * worth having — a library is not a second kind of input, it is more modules.
+   *
+   * A library declares no statements of its own; the one file that carries a program's statements
+   * (`13 §7`) is still the program's, and a library that carried any would be reported by the same
+   * rule that reports two of them.
+   */
+  def compileWith(sources: List[Source], libraries: List[Program],
+                  target: Target = Target.default): Either[String, String] = {
+    val parsed = sources.map(SyslParser.parse)
+
+    parsed.collect { case Left(e) => e } match
+      case Nil  => analyzed(libraries ::: parsed.collect { case Right(p) => p }, target).map(_._1)
+      case errs => Left(errs.mkString("\n"))
+  }
+
   /** The same compilation, keeping the notes the driver may want to show — currently the heap
    * promotions, for `--explain-escapes` (`05`). Separate from `compile` so that the ordinary path
    * has nothing extra to ignore.

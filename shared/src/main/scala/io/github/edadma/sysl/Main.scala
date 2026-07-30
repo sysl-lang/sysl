@@ -39,6 +39,7 @@ case class Config(
     output: Option[String] = None,
     explainEscapes: Boolean = false,
     target: Option[String] = None,
+    libs: List[String] = Nil,
     programArgs: List[String] = Nil,
 )
 
@@ -73,6 +74,10 @@ case class Config(
       opt[String]("target")
         .action((t, c) => c.copy(target = Some(t)))
         .text("the machine to build for; defaults to this one. 'sysl targets' lists them"),
+      opt[String]("lib")
+        .unbounded()
+        .action((l, c) => c.copy(libs = c.libs :+ l))
+        .text("a library project root to compile against; may be given more than once"),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
@@ -103,9 +108,23 @@ private def execute(cfg: Config): Int = {
 
   if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
 
+  // A library given as source is simply **more modules**: its files carry the directory segments
+  // they were found under, exactly as the program's do, so the module rules do the rest and the
+  // compiler is handed one list. A library shipped as an artifact takes the other route
+  // (`Compiler.compileWith`), and nothing downstream tells the two apart.
+  val collected =
+    try cfg.libs.map(root => root -> Project.collect(root))
+    catch case e: Exception => return fail(s"cannot read a library: ${e.getMessage}")
+
+  collected.find(_._2.isEmpty) match
+    case Some((root, _)) => return fail(s"$root holds no sysl source files")
+    case None            => ()
+
+  val libraries = collected.flatMap(_._2)
+
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
-  val compiled = Compiler.compiled(sources, target) match
+  val compiled = Compiler.compiled(libraries ::: sources, target) match
     case Left(err) => return report(err)
     case Right((ir, notes)) =>
       if cfg.explainEscapes then

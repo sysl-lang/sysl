@@ -41,6 +41,38 @@ object Imports {
   val empty: Imports = Imports()
 }
 
+/** The modules whose public names every file may write **unqualified without importing them**.
+ *
+ * An auto-imported module is exactly a **wildcard import every file starts with**, and that is the
+ * whole mechanism — `13 §3`'s rules then say everything else, with nothing written twice:
+ *
+ *   - **a file's own declaration wins**, because `resolveName` asks the current module before it
+ *     asks the imports at all, so a program declaring its own `Pair` shadows the library's;
+ *   - **an explicit import wins**, because `wildcards` is consulted only where `names` and
+ *     `modules` have no entry;
+ *   - **two auto-imports offering one name is ambiguous**, reported by the same message a pair of
+ *     written wildcards gets;
+ *   - and the **fully-qualified path always works**, since an import never granted the access.
+ *
+ * A module is auto-imported only where it is actually present, so a program compiled without the
+ * library is unaffected rather than carrying a wildcard over a module that does not exist.
+ *
+ * **The dependency graph is not told.** `13 §6` puts the prelude outside the graph on the grounds
+ * that it is the language rather than a module, and a library every file gets for free is in the
+ * same position: an edge from every file to it would say nothing, and would make the library's own
+ * files depend on themselves.
+ *
+ * The aim is **`demo`, deliberately and temporarily** — the useless development library under
+ * `devlib/`. Pointing it at a library nothing depends on is what lets the mechanism be proved
+ * before the prelude is asked to rely on it: if this is wrong, the prelude still works and the
+ * suite says exactly what broke. The switch to the real standard module is a change to this list.
+ */
+object AutoImport {
+
+  /** The modules to bring in unqualified, if a compilation has them. */
+  val modules: List[String] = List("demo")
+}
+
 /** The terms a name is read in: the module it is written in, what that file (or block) has
  * imported, and which file it is. All three travel together everywhere a declaration's signature,
  * fields, or body is resolved, because each is a property of *where it was written* rather than of

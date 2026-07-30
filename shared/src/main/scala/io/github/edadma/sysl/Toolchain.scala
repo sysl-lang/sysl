@@ -51,6 +51,12 @@ object Toolchain {
   def compileAndRun(sources: List[Source]): Either[String, (Int, String)] =
     runIr(Compiler.compile(sources), Nil)
 
+  /** The same, for a program compiled **against a library** whose modules arrive as trees rather
+   * than as source — an `AstCodec` artifact, decoded (`Compiler.compileWith`).
+   */
+  def compileAndRun(sources: List[Source], libraries: List[Program]): Either[String, (Int, String)] =
+    runIr(Compiler.compileWith(sources, libraries), Nil)
+
   /** `args` are the words the program is started with, which reach it exactly as they would from a
    * shell: the executable's own path arrives ahead of them as the zeroth, since that is what the
    * platform passes and not something this could withhold.
