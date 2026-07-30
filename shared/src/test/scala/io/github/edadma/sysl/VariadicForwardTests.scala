@@ -130,6 +130,33 @@ class VariadicForwardTests extends AnyFreeSpec with CodegenSupport with RunSuppo
       run(src) shouldBe "6\n"
     }
 
+    // `12 §9` says a `*va_list` is an ordinary raw pointer and is refused nowhere — the struct
+    // above is one half of that and a *result* is the other, which is the half a `va_list` itself
+    // is refused at. A walk handed straight out of a call is still the lender's own.
+    "and may be returned, since it is a pointer like any other" in {
+      val src =
+        """lend(ap: *va_list) -> *va_list = ap
+          |
+          |take(n: int, ap: *va_list) -> int
+          |    var t = 0
+          |    for i in 0..<n
+          |        var v: int = va_arg(ap)
+          |        t += v
+          |    t
+          |
+          |go(n: int, ...) -> int
+          |    var ap: va_list
+          |    va_start(ap)
+          |    var t = take(n, lend(&ap))
+          |    va_end(ap)
+          |    t
+          |end go
+          |
+          |print(go(3, 4, 5, 6))""".stripMargin
+
+      run(src) shouldBe "15\n"
+    }
+
     // The promotions are the *caller's* (`12 §1`), and lending the walk moves nothing about them —
     // so the mistake a body makes reading the tail too narrow is the same mistake and the same
     // message wherever the walk came from.

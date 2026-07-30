@@ -552,6 +552,17 @@ trait ExprAnalysis
     case Call(Index(Field(_, mname), _), _) if memberDecls.exists((k, d) => k._2 == mname && d.tparams.nonEmpty) =>
       err(s"'$mname' cannot be given type arguments at a call; write the type on what receives the result")
 
+    // A special form written with type arguments. `va_arg[int](ap)` is the one this is really for:
+    // it is what somebody reaches for first, and an earlier draft of `12 §9` told them to. None of
+    // the forms takes any, for the reason nothing else does — square brackets in an expression are
+    // indexing (`10 §2`) — and without this case the reading is the general complaint about a
+    // callee that is not a name, which is the one `10 § Open a` says this case must not get.
+    case Call(Index(Ident(name), _), _) if lookupOpt(name).isEmpty && specialFormNames(name) =>
+      if name == "va_arg" then
+        err("'va_arg' takes no type arguments; the type it reads comes from the context the value " +
+          "is read into, so annotate the variable it is read into")
+      else err(s"'$name' takes no type arguments")
+
     // Anything that *is* a callable may be called, wherever it was read from — an element of an
     // array of them, a part of a tuple, a container's item (`12 §6`). The head of a call is looked
     // at rather than required to be a name, and only what turns out not to be callable is refused.

@@ -299,6 +299,16 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "21\n"
     }
 
+    // `12 §6` lists the result of another call among these, which is the one that never passes
+    // through a name at all: the head of the outer call is the inner call itself.
+    "the result of another call, called straight away" in {
+      run("""pick(which: bool) -> &Fn(int) -> int
+            |    if which then x -> x + 1 else x -> x * 2
+            |
+            |print(pick(true)(10), pick(false)(10))
+            |""".stripMargin) shouldBe "11 20\n"
+    }
+
     "the result of a callable, so one may yield another" in {
       run("""mk() -> &Fn(int) -> &Fn(int) -> int
             |    a -> b -> a + b
