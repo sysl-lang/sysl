@@ -167,6 +167,31 @@ class DevLibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "the names the compiler spells for itself still reach the library" - {
+
+    "a program's own `Display`, a format hole, and a library name in one program" in {
+      // Everything here goes through `Library.key` rather than through name resolution: `Writer` and
+      // `FormatSpec` in the signature the `impl` must match, the specifier `f"…"` builds, the
+      // renderer `str` reaches for a scalar, and `putbytes` in the table standard output dispatches
+      // through. A library linked beside the program must not disturb any of them.
+      ran(
+        """struct P
+          |    x: int
+          |
+          |impl Display for P
+          |    display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
+          |
+          |var p = P(double(3))
+          |print(p)
+          |print(f"[${str(answer)}%5s]")
+          |""".stripMargin) shouldBe "6\n[   42]\n"
+    }
+
+    "and a `for` over a library value, which reaches `Iterate` and `Option` by key" in {
+      ran("for c in \"hi\".chars\n    print(c)\nprint(demo.answer)") shouldBe "h\ni\n42\n"
+    }
+  }
+
   "the auto-import loses to anything more specific" - {
 
     "a declaration the program makes itself" in {

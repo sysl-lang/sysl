@@ -738,12 +738,10 @@ object Prelude {
       case Right(p) => p.body
       case Left(e)  => sys.error(s"the prelude does not parse: $e")
 
-  /** Whether a declaration came from here rather than from the program being compiled. */
+  /** Whether a declaration came from here rather than from the program being compiled.
+   *
+   * Asked through `Library.owns` rather than directly, so that what counts as the library's is one
+   * question with one answer while declarations are moving out of here and into a module.
+   */
   def declares(s: Positioned): Boolean = s.pos.exists(_.source eq origin)
-
-  /** The enum `?` unwraps, paired with its success and failure variant names. */
-  def tryVariants(base: String): Option[(String, String)] = base match
-    case "Result" => Some(("Ok", "Err"))
-    case "Option" => Some(("Some", "None"))
-    case _        => None
 }

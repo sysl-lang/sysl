@@ -379,13 +379,13 @@ trait ExprAnalysis
     // `b[i] = v` on a type with no elements of its own is `IndexSet`, and it is a call rather than a
     // store because a trait's method gives back a value and never an address — so there is no place
     // for the ordinary path to write through, and the trait says as much by taking the value.
-    case Assign("=", Index(receiver, index), value) if indexes("IndexSet", receiver) =>
+    case Assign("=", Index(receiver, index), value) if indexes(Library.key("IndexSet"), receiver) =>
       callMethod(receiver, "index_set", List(index, value), None)
 
     // The compound forms would have to read the element and write it back, which means evaluating
     // the receiver and the index twice — and a container's subscript is a call, so twice is twice
     // the calls. Written out, the program says that itself.
-    case Assign(op, Index(receiver, index), _) if indexes("IndexSet", receiver) =>
+    case Assign(op, Index(receiver, index), _) if indexes(Library.key("IndexSet"), receiver) =>
       err(s"'$op' on an element read through 'Index' would evaluate the receiver and the index " +
         s"twice — write it out as 'b[i] = b[i] ${op.dropRight(1)} …'")
 

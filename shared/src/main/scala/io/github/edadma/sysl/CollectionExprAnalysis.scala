@@ -139,7 +139,7 @@ trait CollectionExprAnalysis extends ExprSupport {
         // subscript *is* (`14 §3`). The index is not held to being an integer here: what a
         // container is read by is the trait's own argument, and a type that indexes by something
         // else is implementing a different `Index` rather than misusing this one.
-        case None if indexes("Index", tr.ty) => callMethodOn(raw, "index", List(index), expected)
+        case None if indexes(Library.key("Index"), tr.ty) => callMethodOn(raw, "index", List(index), expected)
 
         case None => err(s"cannot index ${show(tr.ty)}")
 

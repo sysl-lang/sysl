@@ -215,12 +215,12 @@ case class TFormat(arg: TExpr, spec: String) extends TExpr { def ty: Type = Type
 /** Standard output as a `*Writer` — the sink a value renders itself into when `print` is given one
  * that is not a built-in (`14 §6`).
  *
- * It carries no state at all, and that is why it is a node rather than a value the prelude could
+ * It carries no state at all, and that is why it is a node rather than a value the library could
  * have declared: a writer over standard output has nothing to keep, and there is no struct with no
  * fields for it to be one of. Its data word is therefore null, and the `write` in its table is the
- * prelude's own `putbytes` — so the one function a freestanding target replaces is still that one.
+ * library's own `putbytes` — so the one function a freestanding target replaces is still that one.
  */
-case class TStdout() extends TExpr { def ty: Type = Type.Ptr(Type.Trait("Writer")) }
+case class TStdout() extends TExpr { def ty: Type = Type.Ptr(Type.Trait(Library.key("Writer"))) }
 
 /** `str(x)` and an `f"…"` hole on a value that renders itself: `method` is the `display` its type
  * reaches, and it writes into a growable buffer whose bytes this yields as a fresh `string`.

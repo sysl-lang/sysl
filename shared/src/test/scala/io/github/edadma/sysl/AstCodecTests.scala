@@ -74,14 +74,14 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       stamped should be > 1000
     }
 
-    "rebinds to the caller's own Source, so a decoded declaration is still the prelude's" in {
+    "rebinds to the caller's own Source, so a decoded declaration is still the library's" in {
       val original = Program(Prelude.decls, None, Prelude.origin)
       val back     = roundTrip(List(original), Map(Prelude.origin.name -> Prelude.origin))
 
-      // `Prelude.declares` is identity on the Source, and it is what decides whether an unreached
+      // `Library.owns` is identity on the Source, and it is what decides whether an unreached
       // declaration may be dropped — so a decoded tree has to land on the same object.
       back.head.source should be theSameInstanceAs Prelude.origin
-      back.head.body.forall(Prelude.declares) shouldBe true
+      back.head.body.forall(Library.owns) shouldBe true
     }
 
     "reconstructs a usable Source when the caller supplies none" in {

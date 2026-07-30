@@ -208,9 +208,9 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     val cursor = freshName("iter")
     val step   = callMethodOn(TLoad(cursor, seq.ty), "next", Nil, None)
     val opt = step.ty match
-      case e: Type.Enum if e.base == "Option" && e.targs == List(elem) => e
+      case e: Type.Enum if e.base == Library.key("Option") && e.targs == List(elem) => e
       case other =>
-        err(s"'Iterate' asks its 'next' for an ${show(Type.Enum("Option", List(elem)))}, " +
+        err(s"'Iterate' asks its 'next' for an ${show(Type.Enum(Library.key("Option"), List(elem)))}, " +
           s"and this one gives back ${show(other)}")
 
     pushScope()
@@ -231,12 +231,14 @@ trait ControlFlowExprAnalysis extends ExprSupport {
    */
   protected def iterateElem(ty: Type): Option[Type] = {
     val (key, targs) = memberOwner(ty)
-    implsOf("Iterate", key).map(suppliedBound(_, "Iterate", ty, targs).args) match
+    val iterate      = Library.key("Iterate")
+
+    implsOf(iterate, key).map(suppliedBound(_, iterate, ty, targs).args) match
       case Nil            => None
       case List(elem) :: Nil => Some(elem)
       case several =>
         err(s"${show(ty)} implements 'Iterate' " +
-          s"${conjoin(several.map(a => s"'${Type.Bound("Iterate", a).show}'"))}, and a 'for' has " +
+          s"${conjoin(several.map(a => s"'${Type.Bound(iterate, a).show}'"))}, and a 'for' has " +
           "nothing to say which of them it means — call 'next' yourself, with the element type written")
   }
 }

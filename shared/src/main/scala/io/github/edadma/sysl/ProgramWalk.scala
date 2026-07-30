@@ -46,7 +46,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
       u -> base.copy(imports = inScope(base)(gatherImports(u.body, autoImported(here))))
     }
-    val body = Prelude.decls.map((Scope.root, _)) ::: files.flatMap((u, s) => u.body.map((s, _)))
+    val body = Library.decls.map((Scope.root, _)) ::: files.flatMap((u, s) => u.body.map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -158,27 +158,27 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // A function whose body did not analyze is left out of the program rather than stood in for:
     // there is nothing to emit, and nothing will be emitted at all while an error stands.
     //
-    // The prelude's own functions are held back: they are analyzed below, and only if something
+    // The library's own functions are held back: they are analyzed below, and only if something
     // reaches them. That keeps a program that never prints from carrying the printing surface.
     //
     // The hoisted declarations are what is walked, rather than the source statements, because
     // hoisting is where each one was renamed to the key its module gives it — an `extern` is left
     // out by the table that says which names have no body rather than by its declaration form.
-    val (fromPrelude, ours) = funcDecls.values.toList
+    val (fromLibrary, ours) = funcDecls.values.toList
       .filter(f => f.tparams.isEmpty && !externDecls.contains(f.name))
-      .partition(Prelude.declares)
+      .partition(Library.owns)
 
     for f <- ours do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
     // A member is held back on the same terms a free function is, and for the same reason: a
-    // prelude *type* with members would otherwise put every one of them into every program, which
+    // library *type* with members would otherwise put every one of them into every program, which
     // is the cost the rule above exists to avoid, one declaration form further in. Only the ones
     // with nothing left to instantiate qualify — a generic member is already reached through the
     // queue rather than from here.
-    val (preludeMembers, ourMembers) = members.toList
+    val (libraryMembers, ourMembers) = members.toList
       .filter(f => !defaultOrigin.get(f.name).exists(brokenDefaults))
-      .partition(f => f.tparams.isEmpty && Prelude.declares(f))
+      .partition(f => f.tparams.isEmpty && Library.owns(f))
 
     for f <- ourMembers do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
@@ -194,7 +194,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     val tmain = inBlock(mainStmts)(mainStmts.flatMap(recoverStmt))
 
     // The `main` the program runs after those statements, if it declared one. Read here rather than
-    // during hoisting because the conversion it may want is a prelude function, and marking one as
+    // during hoisting because the conversion it may want is a library function, and marking one as
     // reached has to happen before the loop below decides which of them are worth analyzing.
     val tentry = recover(Option.empty[TEntry])(declaredEntry())
 
@@ -211,10 +211,10 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
     drain()
 
-    // A prelude function is analyzed only once something has called it, and analyzing one may call
+    // A library function is analyzed only once something has called it, and analyzing one may call
     // another — `printi` reaches `putbytes`, `printb` reaches `prints` — so this runs to a fixpoint
     // too. Nothing reaches them in a program that never prints, and none of them is emitted.
-    val available = (fromPrelude ::: preludeMembers).map(f => f.name -> f).toMap
+    val available = (fromLibrary ::: libraryMembers).map(f => f.name -> f).toMap
     val analyzed  = mutable.HashSet.empty[String]
     var reached   = true
 
@@ -304,7 +304,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
           params.map(_._2) match
             case Nil                      => Some(TEntry(key, None))
             case Type.Slice(Type.Str) :: Nil =>
-              val argsFn = Modules.qualify(Modules.root, "args_of")
+              val argsFn = Library.key("args_of")
 
               funcsUsed += argsFn
               Some(TEntry(key, Some(argsFn)))

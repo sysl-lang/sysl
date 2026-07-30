@@ -116,7 +116,7 @@ private class Escape(program: TProgram) {
     // however many ways the program erased it.
     val offenders =
       for
-        vt   <- program.vtables if vt.traitName == "Writer"
+        vt   <- program.vtables if vt.traitName == Library.key("Writer")
         slot <- vt.slots.headOption.toList if keeps((slot.target, 1))
       yield slot.target
 
@@ -132,7 +132,8 @@ private class Escape(program: TProgram) {
   /** Whether a trait object's methods borrow what they are passed rather than possibly keeping it.
    * `Writer` is the one trait that says so, and the check above is what makes it true.
    */
-  private def borrows(ty: Type): Boolean = Type.erasedTrait(ty).exists(_.name == "Writer")
+  private def borrows(ty: Type): Boolean =
+    Type.erasedTrait(ty).exists(_.name == Library.key("Writer"))
 
   /** Whether a value of this type could carry a view of somebody's elements. */
   private def carriesView(t: Type): Boolean = t match

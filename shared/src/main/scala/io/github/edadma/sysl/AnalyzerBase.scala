@@ -69,12 +69,16 @@ trait AnalyzerBase {
   /** The terms names are currently being read in. */
   protected def currentScope: Scope = Scope(currentModule, currentImports, currentFile)
 
-  /** The names the prelude declares, which are in scope everywhere with no import (`13 §8`). They
+  /** The keys the library declares, which are in scope everywhere with no import (`13 §8`). They
    * are keyed under the root module like any other rootless declaration, and this is what tells
    * them from a *program's* root-module declarations — which are a module's like any other, and so
    * are not visible from a named module that did not name them.
+   *
+   * Filled during hoisting from `Library.owns`, which is the one question about where a declaration
+   * came from; this is that answer indexed by key, for the lookups that have a name and no
+   * declaration to ask about.
    */
-  protected val preludeNames = mutable.HashSet.empty[String]
+  protected val libraryNames = mutable.HashSet.empty[String]
 
   /** The key a name written in the current module resolves to, or `None` where nothing of that
    * name is declared anywhere it may be read from.
@@ -84,7 +88,7 @@ trait AnalyzerBase {
    * a question that can only be answered against the table the use site is looking in.
    *
    * The order is `13 §3`'s: **this module**, then what the file (or the block) has **imported**,
-   * then the **prelude**, and a **fully-qualified path** reaches anything at all. A sibling
+   * then the **library**, and a **fully-qualified path** reaches anything at all. A sibling
    * module's names are deliberately not in it — a module earns visibility by being named or
    * imported (`13 §8`), and the root module has no name, so its declarations are its own files' to
    * use.
@@ -108,7 +112,7 @@ trait AnalyzerBase {
           // at all is the restriction worth reporting — at which point it is the whole story, and a
           // better one than an undefined name.
           importedName(written)(declared)
-            .orElse(Option.when(preludeNames(written) && declared(written))(written))
+            .orElse(Option.when(libraryNames(written) && declared(written))(written))
             .orElse(Option.when(declared(own))(reachable(own)))
       else
         val module = modulePath(written.take(dot))

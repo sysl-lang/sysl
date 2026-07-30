@@ -55,30 +55,35 @@ trait SpecialForms extends Closures {
     // A width past 64 bits has no printf conversion to be widened to, so it renders itself first
     // and goes out as the string that came back. That is the one scalar whose printing allocates,
     // and it allocates because C cannot be asked to do this one.
-    case i: Type.Integer if i.bits > 64  => callPrelude("prints", TStr(t))
-    case i: Type.Integer if i.signed => callPrelude("printi", widen(t, Type.Integer(64, signed = true)))
-    case _: Type.Integer             => callPrelude("printu", widen(t, Type.Integer(64, signed = false)))
-    case _: Type.Floating            => callPrelude("printr", widen(t, Type.Real))
-    case Type.Bool                   => callPrelude("printb", t)
-    case Type.Char                   => callPrelude("printc", t)
-    case Type.Str                    => callPrelude("prints", t)
+    case i: Type.Integer if i.bits > 64  => callLibrary("prints", TStr(t))
+    case i: Type.Integer if i.signed => callLibrary("printi", widen(t, Type.Integer(64, signed = true)))
+    case _: Type.Integer             => callLibrary("printu", widen(t, Type.Integer(64, signed = false)))
+    case _: Type.Floating            => callLibrary("printr", widen(t, Type.Real))
+    case Type.Bool                   => callLibrary("printb", t)
+    case Type.Char                   => callLibrary("printc", t)
+    case Type.Str                    => callLibrary("prints", t)
     case _ =>
       renderer(t, "print") match
         case (_, value, Some(slot)) => TVCall(value, slot, List(stdout(), plainSpec), Type.Unit)
         case (method, value, None)  => TCall(method, List(value, stdout(), plainSpec), Type.Unit)
 
   /** The separator and the terminator `print` puts around its values. */
-  private def printChar(c: Char): TExpr = callPrelude("printc", TIntLit(c.toInt, Type.Char))
+  private def printChar(c: Char): TExpr = callLibrary("printc", TIntLit(c.toInt, Type.Char))
 
-  /** A call to a prelude function, built from an already-analyzed argument. Recording the name is
-   * what brings the function itself into the program: a prelude declaration nothing reaches is
+  /** A call to a library function, built from an already-analyzed argument. Recording the name is
+   * what brings the function itself into the program: a library declaration nothing reaches is
    * neither analyzed nor emitted.
+   *
+   * `name` is the spelling the library declares it under, and the key it is filed as is
+   * `Library`'s to say — this is the one place the compiler calls a function it named itself rather
+   * than one a program wrote, so it is the one place that translation belongs.
    */
-  protected def callPrelude(name: String, arg: TExpr): TExpr = {
-    val (_, rtype) = funcInsts(name)
+  protected def callLibrary(name: String, arg: TExpr): TExpr = {
+    val key        = Library.key(name)
+    val (_, rtype) = funcInsts(key)
 
-    funcsUsed += name
-    TCall(name, List(arg), rtype)
+    funcsUsed += key
+    TCall(key, List(arg), rtype)
   }
 
   /** `str(x)` renders a value of a primitive type, and a `string` as itself. Anything else writes
@@ -182,8 +187,8 @@ trait SpecialForms extends Closures {
     checkWriterShape(); Type.underlying(t.ty)
   } match
     case a: Type.Abstract =>
-      if !satisfies("Display", a) then boundErr(s"'$op' needs '${a.name}: Display'")
-      ("Display.display", t, None)
+      if !satisfies(displayTrait, a) then boundErr(s"'$op' needs '${a.name}: Display'")
+      (displayMethod, t, None)
 
     case Type.Ptr(o: Type.Trait) => objectRenderer(t, o, op)
     case Type.Ref(o: Type.Trait, _) => objectRenderer(t, o, op)
@@ -191,18 +196,20 @@ trait SpecialForms extends Closures {
     case ty =>
       CoreTraits.display(ty) match
         case Some((name, want)) =>
-          funcsUsed += name
-          (name, rendered(t, want), None)
+          val key = Library.key(name)
+
+          funcsUsed += key
+          (key, rendered(t, want), None)
 
         case None =>
-          if !conforms("Display", ty) then
+          if !conforms(displayTrait, ty) then
             // Naming the `impl` to write is only advice where one could be written at all: a memory
             // mode is the shape `02` refuses, so it is told what is true of it rather than pointed
             // at a block that would not compile. A generic type is written for as a whole, so the
             // advice names the block's own parameters rather than the arguments this value has. And
             // a type an implementation already covers is told what that implementation asked of it,
             // since writing a second one is exactly what it may not do.
-            val fix = unmetBound("Display", ty).getOrElse(ty match
+            val fix = unmetBound(displayTrait, ty).getOrElse(ty match
               case n: Type.Named if n.targs.nonEmpty =>
                 val tps = nominalTparams(n.base).mkString(", ")
                 s"write an 'impl[$tps] Display for ${qn(n.base)}[$tps]' to say how it renders"
@@ -226,7 +233,7 @@ trait SpecialForms extends Closures {
    */
   private def objectRenderer(t: TExpr, o: Type.Trait, op: String): (String, TExpr, Option[Int]) =
     displaySlot(o) match
-      case Some(slot) => ("Display.display", t, Some(slot))
+      case Some(slot) => (displayMethod, t, Some(slot))
       case None =>
         val asked = if op == "print" then "cannot print" else "cannot make a string of"
 
@@ -234,39 +241,47 @@ trait SpecialForms extends Closures {
           s"trait requires, so write 'trait ${qn(o.name)}: Display' to keep the rendering the value " +
           "had before it was erased")
 
+  /** The library's `Display`, and the member of it every rendering goes through. Both are keys, so
+   * they are asked of `Library` rather than spelled — everything below reaches the trait the library
+   * declares and never one a program happens to have named the same.
+   */
+  private def displayTrait: String = Library.key("Display")
+
+  private def displayMethod: String = s"$displayTrait.display"
+
   /** Which slot of a trait object's table holds `Display`'s renderer, if the trait requires it. */
   private def displaySlot(o: Type.Trait): Option[Int] =
     traitMembers(o.bound).zipWithIndex.collectFirst {
-      case ((from, m), slot) if from.name == "Display" && m.name == "display" => slot
+      case ((from, m), slot) if from.name == displayTrait && m.name == "display" => slot
     }
 
   /** Whether a type renders through an `impl` rather than through a printf conversion — which is
    * the case `format` hands its specifier on for instead of applying it.
    */
   private def rendersItself(ty: Type): Boolean = ty match
-    case a: Type.Abstract           => satisfies("Display", a)
+    case a: Type.Abstract           => satisfies(displayTrait, a)
     case Type.Ptr(o: Type.Trait)    => displaySlot(o).isDefined
     case Type.Ref(o: Type.Trait, _) => displaySlot(o).isDefined
-    case _                          => conforms("Display", ty)
+    case _                          => conforms(displayTrait, ty)
 
   /** The compiler's own writers are laid out by hand and reached by slot index, so `Writer`'s shape
    * is something the emitter depends on rather than merely reads. Checking it here turns a later
-   * edit to the prelude into a failed build instead of a call through the wrong slot.
+   * edit to the library into a failed build instead of a call through the wrong slot.
    */
   private def checkWriterShape(): Unit = {
-    val declared = traitDecls.get("Writer").map(_.methods.map(_.name)).getOrElse(Nil)
+    val declared = traitDecls.get(Library.key("Writer")).map(_.methods.map(_.name)).getOrElse(Nil)
 
     if declared != List("write", "failed") then
       sys.error(s"the compiler's own writers assume 'Writer' declares 'write' then 'failed', " +
-        s"but the prelude declares ${declared.mkString("'", "', '", "'")}")
+        s"but the library declares ${declared.mkString("'", "', '", "'")}")
   }
 
   /** Standard output as a sink. Recording `putbytes` is what brings it into the program: the table
-   * this node's writer dispatches through ends at that function, and a prelude declaration nothing
+   * this node's writer dispatches through ends at that function, and a library declaration nothing
    * reaches is neither analyzed nor emitted.
    */
   private def stdout(): TExpr = {
-    funcsUsed += "putbytes"
+    funcsUsed += Library.key("putbytes")
     TStdout()
   }
 
@@ -276,7 +291,7 @@ trait SpecialForms extends Closures {
   private def plainSpec: TExpr = specValue(0, -1, left = false)
 
   private def specValue(width: Int, prec: Int, left: Boolean): TExpr = {
-    val s = instantiateStruct("FormatSpec", Nil)
+    val s = instantiateStruct(Library.key("FormatSpec"), Nil)
 
     TStructNew(s, List(TIntLit(width, s.fields.head._2), TIntLit(prec, s.fields(1)._2), TBoolLit(left)))
   }

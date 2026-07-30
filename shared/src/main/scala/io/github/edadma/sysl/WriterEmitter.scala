@@ -28,14 +28,17 @@ trait WriterEmitter extends Emitter {
 
 object WriterEmitter {
 
-  /** Writing to standard output. It goes through the prelude's own `putbytes` rather than straight
+  /** Writing to standard output. It goes through the library's own `putbytes` rather than straight
    * to the byte loop, so the one function a freestanding target replaces is still that one — the
    * sink moved, not the seam.
+   *
+   * The symbol is the **key** `putbytes` is filed under and not the spelling, because a key is what
+   * an emitted name is (`Modules`) — so this table names whichever module the library declares it in.
    */
   val stdout: String =
-    """define private void @sysl.w.out.write(ptr %self, { ptr, ptr, i64 } %b) {
+    s"""define private void @sysl.w.out.write(ptr %self, { ptr, ptr, i64 } %b) {
       |entry:
-      |  call void @putbytes({ ptr, ptr, i64 } %b)
+      |  call void @${Library.key("putbytes")}({ ptr, ptr, i64 } %b)
       |  ret void
       |}
       |

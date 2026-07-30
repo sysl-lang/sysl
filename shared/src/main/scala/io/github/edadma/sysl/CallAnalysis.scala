@@ -455,11 +455,12 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   private def builtinDisplay(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
     for
-      m           <- Option.when(mname == "display")(traitDecls.get("Display")).flatten
+      m           <- Option.when(mname == "display")(traitDecls.get(Library.key("Display"))).flatten
       sig         <- m.methods.find(_.name == "display")
       (fname, to) <- CoreTraits.display(rty)
     yield {
       val params = sig.params.map(p => (p.name, rt(p.typ)))
+      val key    = Library.key(fname)
 
       if args.length != params.length then
         err(s"method 'Display.display' takes ${quantity(params.length, "argument")}, " +
@@ -467,8 +468,8 @@ trait CallAnalysis extends Literals with TraitObjects {
 
       val self = rendered(buildReceiver(RecvMode.ByValue, recv), to)
 
-      funcsUsed += fname
-      TCall(fname, self :: checkArgs("Display.display", params, args, None), Type.Unit)
+      funcsUsed += key
+      TCall(key, self :: checkArgs("Display.display", params, args, None), Type.Unit)
     }
 
   /** `k.hash()` — the mixing a built-in's `Hash` membership provides (`14 §5`).
@@ -481,16 +482,18 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   private def builtinHash(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
     for
-      _           <- Option.when(mname == "hash")(traitDecls.get("Hash")).flatten
+      _           <- Option.when(mname == "hash")(traitDecls.get(Library.key("Hash"))).flatten
       (fname, to) <- CoreTraits.hash(rty)
     yield {
+      val key = Library.key(fname)
+
       if args.nonEmpty then
         err(s"method 'Hash.hash' takes no arguments, but ${supplied(args.length, "argument")}")
 
       val self = widen(buildReceiver(RecvMode.ByValue, recv), to)
 
-      funcsUsed += fname
-      TCall(fname, List(self), Type.Integer(64, signed = false))
+      funcsUsed += key
+      TCall(key, List(self), Type.Integer(64, signed = false))
     }
 
   /** `w.get()` — the one thing a `weak T` can be asked (`03`).
@@ -505,7 +508,7 @@ trait CallAnalysis extends Literals with TraitObjects {
         s"only thing to ask one, and what it hands back is what has methods")
     if args.nonEmpty then err(s"'get' takes no arguments")
 
-    val optTy = instantiateEnum("Option", List(w.strong))
+    val optTy = instantiateEnum(Library.key("Option"), List(w.strong))
     TUpgrade(recv, optTy, optTy.variant("Some").get, optTy.variant("None").get)
   }
 
@@ -520,7 +523,7 @@ trait CallAnalysis extends Literals with TraitObjects {
     for
       trName <- CoreTraits.declaring(mname)
       if CoreTraits.builtin(trName, rty)
-      decl   <- traitDecls.get(trName)
+      decl   <- traitDecls.get(Library.key(trName))
       m      <- decl.methods.find(_.name == mname)
     yield {
       // A built-in's membership is homogeneous (`14 §5`), so the trait's own parameter is the
@@ -721,12 +724,16 @@ trait CallAnalysis extends Literals with TraitObjects {
   protected def prefixCall(op: String, t: TExpr): Option[TExpr] =
     CoreTraits.prefix.get(op).flatMap(trName => traitOperator(trName, op, None, t))
 
-  private def traitOperator(trName: String, op: String, rhs: Option[TExpr], recv: TExpr): Option[TExpr] = {
-    val tr = opBound(trName, recv.ty, rhs.map(_.ty))
+  /** `spelling` is the trait as `CoreTraits` names it, which is how a program writes it; the key the
+   * tables hold it under is the library's for that spelling.
+   */
+  private def traitOperator(spelling: String, op: String, rhs: Option[TExpr], recv: TExpr): Option[TExpr] = {
+    val trName = Library.key(spelling)
+    val tr     = opBound(trName, recv.ty, rhs.map(_.ty))
 
-    dispatchFor(trName, op, recv.ty, tr).map { d =>
+    dispatchFor(spelling, op, recv.ty, tr).map { d =>
       val self = opSubst(trName, recv.ty, tr)
-      val m    = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
+      val m    = traitDecls(trName).methods.find(_.name == CoreTraits.required(spelling)._1).get
 
       for b <- rhs do checkOperand(op, recv.ty, b, resolveType(m.params.head.typ, self))
 
@@ -811,14 +818,15 @@ trait CallAnalysis extends Literals with TraitObjects {
    * with the member its `impl` produced. A type with no membership either way answers `None`, so the
    * diagnostic stays the one the scalar path already gives.
    */
-  private def dispatchFor(trName: String, op: String, ty: Type, tr: Type.Bound): Option[TDispatch] = {
+  private def dispatchFor(spelling: String, op: String, ty: Type, tr: Type.Bound): Option[TDispatch] = {
+    val trName         = Library.key(spelling)
     val (swap, negate) = CoreTraits.derivation.getOrElse(op, (false, false))
-    val method         = CoreTraits.required(trName)._1
+    val method         = CoreTraits.required(spelling)._1
     // The right operand as the diagnostics below name it — the selector argument, which is every
     // argument but the result the implementation supplies.
     val rhs            = tr.args.take(math.max(0, tr.args.length - 1)).headOption
 
-    if CoreTraits.builtin(trName, ty) then None
+    if CoreTraits.builtin(spelling, ty) then None
     else
       ty match
         case a: Type.Abstract =>
@@ -857,13 +865,14 @@ trait CallAnalysis extends Literals with TraitObjects {
    * the operand's own tree would evaluate it again.
    */
   protected def compareLink(op: String, l: TExpr, r: TExpr): TCmp = {
-    val trName = CoreTraits.infix(op)
-    val tr     = opBound(trName, l.ty, Some(r.ty))
+    val spelling = CoreTraits.infix(op)
+    val trName   = Library.key(spelling)
+    val tr       = opBound(trName, l.ty, Some(r.ty))
 
     TCmp(
       op,
-      dispatchFor(trName, op, l.ty, tr).map { d =>
-        val m = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
+      dispatchFor(spelling, op, l.ty, tr).map { d =>
+        val m = traitDecls(trName).methods.find(_.name == CoreTraits.required(spelling)._1).get
         checkOperand(op, l.ty, r, resolveType(m.params.head.typ, opSubst(trName, l.ty, tr)))
         d
       },
@@ -890,7 +899,7 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   private def boundRhs(op: String, a: Type.Abstract): Option[Type] =
     for
-      trName <- CoreTraits.infix.get(op)
+      trName <- CoreTraits.infix.get(op).map(Library.key)
       b      <- a.bounds.iterator.flatMap(traitClosure(_, selfBinding(a))).find(_.name == trName)
       arg    <- b.args.headOption
     yield arg
@@ -924,21 +933,22 @@ trait CallAnalysis extends Literals with TraitObjects {
   protected def updateExpected(op: String, placeTy: Type): Option[Type] =
     CoreTraits.infix.get(op) match
       // A parameter is the one place-type that may be either, and its bounds are what say which.
-      case Some(trName) =>
+      case Some(spelling) =>
         placeTy match
-          case a: Type.Abstract                         => Some(boundRhs(op, a).getOrElse(a))
-          case _ if CoreTraits.builtin(trName, placeTy) => Some(Type.repr(placeTy))
-          case _                                        => None
+          case a: Type.Abstract                           => Some(boundRhs(op, a).getOrElse(a))
+          case _ if CoreTraits.builtin(spelling, placeTy) => Some(Type.repr(placeTy))
+          case _                                          => None
       case _ => Some(placeTy)
 
   protected def updateDispatch(op: String, place: TExpr, value: TExpr): Option[TDispatch] =
     for
-      trName <- CoreTraits.infix.get(op)
-      tr = opBound(trName, place.ty, Some(value.ty))
-      d <- dispatchFor(trName, op, place.ty, tr)
+      spelling <- CoreTraits.infix.get(op)
+      trName = Library.key(spelling)
+      tr     = opBound(trName, place.ty, Some(value.ty))
+      d <- dispatchFor(spelling, op, place.ty, tr)
     yield {
       val subst = opSubst(trName, place.ty, tr)
-      val m     = traitDecls(trName).methods.find(_.name == CoreTraits.required(trName)._1).get
+      val m     = traitDecls(trName).methods.find(_.name == CoreTraits.required(spelling)._1).get
 
       checkOperand(op, place.ty, value, resolveType(m.params.head.typ, subst))
 
@@ -1163,7 +1173,7 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   protected def enumTry(name: String, args: List[Expr]): TExpr = {
     val (en, t) = simpleEnumArg(name, args)
-    val optTy   = instantiateEnum("Option", List(en))
+    val optTy   = instantiateEnum(Library.key("Option"), List(en))
     TEnumTry(t, en, optTy, optTy.variant("Some").get, optTy.variant("None").get)
   }
 
@@ -1173,17 +1183,17 @@ trait CallAnalysis extends Literals with TraitObjects {
    */
   protected def analyzeTry(t: TExpr): TExpr = {
     val en = t.ty match
-      case e: Type.Enum if Prelude.tryVariants(e.base).isDefined => e
+      case e: Type.Enum if Library.tryVariants(e.base).isDefined => e
       case other => err(s"'?' needs an Option or Result value, not ${show(other)}")
 
-    val (okName, failName) = Prelude.tryVariants(en.base).get
+    val (okName, failName) = Library.tryVariants(en.base).get
 
     retTy match
       case ret: Type.Enum if ret.base == en.base =>
-        if en.base == "Result" && ret.targs(1) != en.targs(1) then
+        if en.base == Library.key("Result") && ret.targs(1) != en.targs(1) then
           err(s"'?' propagates a ${show(en.targs(1))} error, but this function returns ${show(ret.targs(1))}")
         TTry(t, en.variant(okName).get, en.variant(failName).get, ret, ret.variant(failName).get, en.targs.head)
       case other =>
-        err(s"'?' may only be used in a function returning ${en.base}, not ${show(other)}")
+        err(s"'?' may only be used in a function returning ${Modules.show(en.base)}, not ${show(other)}")
   }
 }

@@ -96,7 +96,7 @@ trait MemberExprAnalysis extends ExprSupport {
         // what makes the characters — so it is the prelude's `Chars`, positioned at the start.
         case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
         case Type.Str if f == "bytes"                   => TBytes(tr)
-        case Type.Str if f == "chars"                   => callPrelude("chars_of", TBytes(tr))
+        case Type.Str if f == "chars"                   => callLibrary("chars_of", TBytes(tr))
 
         // `copy` is the one compiler-provided member of a string that is a *method*, so reading it
         // without the parentheses is told what a user type's method is told. The parentheses are

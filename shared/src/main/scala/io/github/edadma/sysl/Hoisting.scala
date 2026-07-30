@@ -55,7 +55,7 @@ trait Hoisting extends HoistMembers {
       // types they name, which is a pass that runs before any member is lowered.
       for f <- s.fields do at(f.pos)(recordMemberAccess(key, f.name, f.vis, s"${s.name}.${f.name}"))
       for m <- s.members do at(m.pos)(recordMemberAccess(key, m.name, m.vis, s"${s.name}.${m.name}"))
-      if Prelude.declares(s) then preludeNames += key
+      if Library.owns(s) then libraryNames += key
     case e: EnumDecl =>
       val key = Modules.qualify(currentModule, e.name)
 
@@ -70,7 +70,7 @@ trait Hoisting extends HoistMembers {
       declScope(key) = currentScope
       recordAccess(key, e.vis)
       for m <- e.members do at(m.pos)(recordMemberAccess(key, m.name, m.vis, s"${e.name}.${m.name}"))
-      if Prelude.declares(e) then preludeNames += key
+      if Library.owns(e) then libraryNames += key
       // Variant names are unique **within a module** rather than across the program: a bare
       // `Circle(5)` resolves against the module it is written in, so two modules may each name a
       // variant `Circle` without either use site becoming ambiguous.
@@ -83,7 +83,7 @@ trait Hoisting extends HoistMembers {
         // carries its enum's visibility, since an enum nobody outside may name is not one whose
         // variants they may construct.
         recordAccess(vkey, e.vis)
-        if Prelude.declares(e) then preludeNames += vkey
+        if Library.owns(e) then libraryNames += vkey
     case t: TraitDecl =>
       val key = Modules.qualify(currentModule, t.name)
 
@@ -95,7 +95,7 @@ trait Hoisting extends HoistMembers {
       // which is what makes "how far does this member go" one question with one answer, whether it
       // was asked about a trait's member, a type's, or a type's field.
       for m <- t.methods do recordMemberAccess(key, m.name, Visibility.Public, s"${t.name}.${m.name}")
-      if Prelude.declares(t) then preludeNames += key
+      if Library.owns(t) then libraryNames += key
       checkBoundNames(t.name, t.bounds)
       for m <- t.methods do
         // A property carries its receiver without writing one, so the reading below — no receiver
@@ -207,7 +207,7 @@ trait Hoisting extends HoistMembers {
       funcDecls(key) = f.copy(name = key).setPos(f.pos)
       declScope(key) = currentScope
       recordAccess(key, f.vis)
-      if Prelude.declares(f) then preludeNames += key
+      if Library.owns(f) then libraryNames += key
       if f.tparams.isEmpty then
         funcInsts(key) =
           (f.params.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))),
@@ -227,7 +227,7 @@ trait Hoisting extends HoistMembers {
       externDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
       declScope(key) = currentScope
       recordAccess(key, e.vis)
-      if Prelude.declares(e) then preludeNames += key
+      if Library.owns(e) then libraryNames += key
       funcInsts(key) =
         (e.params.map(p => (p.name, foreignParam(recover(Type.Unknown)(resolveType(p.typ, Map.empty))))),
          e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))

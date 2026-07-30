@@ -321,7 +321,7 @@ trait HoistMembers extends TypeResolution {
     // decides: a catalog trait's arguments default to the implementing type, so an `impl Mul for
     // int` that wrote none of them is the one the compiler already provides, while one that wrote
     // an argument is asking for something else entirely.
-    if written.isEmpty && CoreTraits.builtin(impl.traitName, ty) then
+    if written.isEmpty && Library.spelling(impl.traitName).exists(CoreTraits.builtin(_, ty)) then
       err(s"'${outer.label}' already implements '${qn(impl.traitName)}' — the compiler provides it")
 
     // What this block's own promise is read against: the type where it has one, and the type applied
@@ -356,7 +356,9 @@ trait HoistMembers extends TypeResolution {
     // agree on the operands and differ only in the result leave a use with nothing to choose by.
     // Refused here rather than at the use, because the use is where it would be too late to say which
     // of the two the program meant.
-    if CoreTraits.selectsByOperand(impl.traitName) && bound.args.length > 1 then
+    val catalog = Library.spelling(impl.traitName).filter(CoreTraits.required.contains)
+
+    if catalog.exists(CoreTraits.selectsByOperand) && bound.args.length > 1 then
       val operands = bound.args.dropRight(1)
 
       for
@@ -368,7 +370,7 @@ trait HoistMembers extends TypeResolution {
         theirs = suppliedBound(other, impl.traitName, subject, mine)
       do
         err(s"'${outer.label}' already implements '${showBound(theirs, subject)}', and this one differs " +
-          s"only in what it gives back — '${CoreTraits.required(impl.traitName)._2}' between " +
+          s"only in what it gives back — '${CoreTraits.required(catalog.get)._2}' between " +
           s"${show(subject)} and ${conjoin(operands.map(show))} would have two results to choose from " +
           "and nothing at the use to choose with")
 
@@ -678,13 +680,13 @@ trait HoistMembers extends TypeResolution {
    * depends on. What it forbids is the case with no home, a foreign trait for a foreign type, where
    * two unrelated modules could each supply a different implementation and no rule picks one.
    *
-   * The prelude is a module of its own for this purpose even though its declarations are keyed under
+   * The library is a module of its own for this purpose even though its declarations are keyed under
    * the root like a rootless program's, so which file a declaration came from is what decides rather
-   * than the key. A program at the project root is therefore as foreign to `Eq` as any named module
-   * is.
+   * than the key — `Library.owns`. A program at the project root is therefore as foreign to `Eq` as
+   * any named module is.
    */
   private def checkCoherence(impl: ImplDecl, label: String): Unit = {
-    val home     = if Prelude.declares(impl) then None else Some(currentModule)
+    val home     = if Library.owns(impl) then None else Some(currentModule)
     val declarer = declaringModule(impl.traitName)
     val subject  = subjectHomes(impl.forType)
 
@@ -699,11 +701,11 @@ trait HoistMembers extends TypeResolution {
     if homes == Set(None) then s"nothing in '$label' is declared outside the prelude"
     else s"'$label' names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
 
-  /** Which module licenses what a key names, or `None` for the prelude's.
+  /** Which module licenses what a key names, or `None` for the library's.
    *
-   * Asked of the **declaration** rather than of `preludeNames`, which holds a prelude enum's variant
+   * Asked of the **declaration** rather than of `libraryNames`, which holds a library enum's variant
    * names beside its type names — so a program declaring a `struct Ok` of its own would have been
-   * told its own type was the prelude's.
+   * told its own type was the library's.
    */
   private def declaringModule(key: String): Option[String] = {
     val decl: Option[Positioned] = structDecls.get(key)
@@ -712,10 +714,10 @@ trait HoistMembers extends TypeResolution {
       .orElse(constrainedDecls.get(key))
 
     decl match
-      case Some(d) if Prelude.declares(d) => None
-      case Some(_)                        => Some(Modules.moduleOf(key))
-      // A name nothing declares is a built-in, which has no module of its own and is the prelude's.
-      case None                           => None
+      case Some(d) if Library.owns(d) => None
+      case Some(_)                    => Some(Modules.moduleOf(key))
+      // A name nothing declares is a built-in, which has no module of its own and is the library's.
+      case None                       => None
   }
 
   /** Every module the **subject** of an `impl` belongs to: its own where it is a declared type, and

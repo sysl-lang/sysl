@@ -258,7 +258,7 @@ trait StmtAnalysis extends TypeResolution {
     // address" the ordinary path would reach.
     for t <- m.targets do
       t match
-        case Index(receiver, _) if indexes("IndexSet", receiver) =>
+        case Index(receiver, _) if indexes(Library.key("IndexSet"), receiver) =>
           at(t.pos)(err("an element set through 'Index' is a call rather than a store, so it cannot be " +
             "one place of a multiple assignment — write that one on its own"))
         case _ =>

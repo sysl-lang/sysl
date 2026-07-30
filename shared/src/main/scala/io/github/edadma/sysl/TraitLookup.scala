@@ -369,7 +369,9 @@ trait TraitLookup extends MemberVisibility {
     // rather than a limitation of this one: no operator promotes, so an `int` is `Mul[int]` and is
     // not `Mul` at anything else. The arguments are compared the way an assignment compares two
     // types, so a transparent subtype is its base's member exactly as it is its base's operand.
-    case _ => conforms(tr, t) || (tr.args.forall(!disagree(_, t)) && CoreTraits.builtin(tr.name, t))
+    case _ =>
+      conforms(tr, t) ||
+        (tr.args.forall(!disagree(_, t)) && Library.spelling(tr.name).exists(CoreTraits.builtin(_, t)))
 
   /** The same question about a trait that takes no arguments, which is every trait the compiler
    * knows by name and most of the ones a program declares.
