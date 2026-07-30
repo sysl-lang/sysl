@@ -130,7 +130,7 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     "bytes are sent to the form that validates them" in {
       err("""var b: []u8 = [104u8, 105u8]
             |var x = string(b)
-            |""".stripMargin) should include("'from_utf8(b)'")
+            |""".stripMargin) should include(s"'${Modules.show(Library.key("from_utf8"))}(b)'")
     }
 
     "and a string is told it is already one" in {

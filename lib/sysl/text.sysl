@@ -1,0 +1,107 @@
+module sysl
+
+// The fallible half of `u32` -> `char` (`00 §1`). It is a free function because a scalar has no
+// member namespace to hang a `char.try` on, and it needs no unchecked primitive underneath it: the
+// guard it writes and the check `char(u)` already makes are the same two comparisons on the same
+// value, so the cast on the far side of the guard can never trip and the optimizer folds it.
+// Trading a primitive for a redundant compare in a cold branch is the better side of that bargain.
+char_from_u32(u: u32) -> Option[char]
+    if u > 0x10FFFFu32 || (u >= 0xD800u32 && u <= 0xDFFFu32) then
+        None
+    else
+        Some(char(u))
+end char_from_u32
+
+// What a refused decode reports: the offset `04` asks for, plus the one distinction a caller can
+// act on -- whether the input merely *ended* in the middle of a sequence, which more bytes would
+// fix, or holds one that no continuation could rescue.
+struct Utf8Error
+    offset: usize
+    truncated: bool
+
+// The one direction a `string` could not otherwise be reached from, and it is written here rather
+// than in the compiler because only its last line needs to be: validation is ordinary sysl over a
+// `[]u8`, and the compiler supplies just `from_utf8_unchecked`, the primitive that says "these bytes
+// are a string now".
+//
+// The validator is Unicode's own well-formedness table rather than a decode-and-range-check, which
+// is what makes the four ways of being ill-formed -- overlong, a surrogate, a value past `10FFFF`,
+// and a byte that can never appear -- fall out of the lead byte's row instead of each needing a test
+// of its own.
+from_utf8(b: []u8) -> Result[string, Utf8Error]
+    var i = 0usize
+    while i < b.len
+        var c = b[i]
+        var need = 0usize
+        var lo = 128u8
+        var hi = 191u8
+
+        if c < 128u8 then
+            need = 1usize
+        elif c < 194u8 then
+            return Err(Utf8Error(i, false))
+        elif c < 224u8 then
+            need = 2usize
+        elif c < 240u8 then
+            need = 3usize
+            if c == 224u8 then lo = 160u8
+            if c == 237u8 then hi = 159u8
+        elif c < 245u8 then
+            need = 4usize
+            if c == 240u8 then lo = 144u8
+            if c == 244u8 then hi = 143u8
+        else
+            return Err(Utf8Error(i, false))
+
+        var have = b.len - i
+        var k = 1usize
+        while k < need && k < have
+            var t = b[i + k]
+            var min = if k == 1usize then lo else 128u8
+            var max = if k == 1usize then hi else 191u8
+            if t < min || t > max then return Err(Utf8Error(i, false))
+            k += 1usize
+
+        if have < need then return Err(Utf8Error(i, true))
+        i += need
+
+    Ok(from_utf8_unchecked(b))
+end from_utf8
+
+// A cursor over the characters of a run of bytes, which is what `s.chars` reaches -- the compiler
+// names `chars_of` for itself, so this is a declaration the language depends on by name rather than
+// one a program has to find.
+struct Chars
+    rest: []u8
+    at: usize
+end Chars
+
+chars_of(b: []u8) -> Chars = Chars(b, 0usize)
+
+// The decode is a plain shift-and-accumulate with no validation, which is sound only because there
+// is no way to reach it with bytes that were not validated first: a `string` is UTF-8 by
+// construction, so the lead byte's width is the width that is there.
+impl Iterate[char] for Chars
+    next(*self) -> Option[char]
+        if self.at >= self.rest.len then return None
+
+        var lead = self.rest[self.at]
+        var need = 1usize
+        var v = u32(lead)
+
+        if lead >= 240u8
+            need = 4usize
+            v = u32(lead & 7u8)
+        elif lead >= 224u8
+            need = 3usize
+            v = u32(lead & 15u8)
+        elif lead >= 192u8
+            need = 2usize
+            v = u32(lead & 31u8)
+
+        for k in 1usize..<need
+            v = (v << 6u32) | u32(self.rest[self.at + k] & 63u8)
+
+        self.at += need
+        Some(char(v))
+    end next

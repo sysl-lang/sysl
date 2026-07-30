@@ -491,6 +491,100 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
+  "a moved surface the LANGUAGE reaches by name, not the program" - {
+
+    // `s.chars` is a member the compiler provides, and what it provides is a call to `chars_of` —
+    // a name no program wrote and none can see it choose. Nothing pinned that symbol before this
+    // move, so nothing would have noticed it changing.
+    "a string's characters reach the library's cursor, under the key the standard module files it as" in {
+      val out = Compiler.compileToLlvm("""for c in "ab".chars do print(c)""")
+
+      out.map(_.contains(s"@${Library.key("chars_of")}(")) shouldBe Right(true)
+      out.map(_.contains("@chars_of(")) shouldBe Right(false)
+    }
+
+    "and a program declaring 'chars_of' of its own does not become what '.chars' walks" in {
+      // The compiler asks the library for this one by name. A program is free to mean something
+      // else by the word, and `.chars` is not it.
+      run(
+        """chars_of(b: []u8) -> int = int(b.len)
+          |
+          |print(chars_of("abc".bytes))
+          |for c in "ab".chars do print(c)
+          |""".stripMargin) shouldBe "3\na\nb\n"
+    }
+
+    "the validator arrives unqualified, and its error type with it" in {
+      run(
+        """from_utf8([0xC3u8, 0xA9u8]) match
+          |    Ok(s) -> print(s)
+          |    Err(e) -> print("bad at", e.offset)
+          |""".stripMargin) shouldBe "é\n"
+    }
+
+    "and a program may declare a 'Utf8Error' of its own beside the library's" in {
+      // A plausible name for a program to want, and the library's is still what `from_utf8`
+      // answers with — told apart by the path, as every moved declaration is.
+      run(
+        """struct Utf8Error
+          |    why: string
+          |
+          |bad() -> Utf8Error = Utf8Error("mine")
+          |
+          |print(bad().why)
+          |
+          |from_utf8([0xFFu8]) match
+          |    Ok(s) -> print(s)
+          |    Err(e) -> print("bad at", e.offset, e.truncated)
+          |""".stripMargin) shouldBe "mine\nbad at 0 false\n"
+    }
+
+    "the conversion advice names the validator by the path that reaches it" in {
+      refused("""var b = [0x61u8]
+                |var s = string(b[..])
+                |""".stripMargin) should include(s"'${Modules.show(Library.key("from_utf8"))}(b)'")
+    }
+
+    "and a program's own 'from_utf8' leaves both of the library's callers alone" in {
+      // A shape none of the earlier moves had: this one is called from *both* sides of the drain —
+      // by `line_text` in the standard module and by `args_of`, still in the prelude. A program
+      // that means something else by the word has to leave both of those meaning the library's.
+      runWith(
+        """from_utf8(b: []u8) -> string = "mine"
+          |
+          |struct Bytes
+          |    src: []u8
+          |    at: usize
+          |
+          |impl sysl.Reader for Bytes
+          |    read(*self, into: []u8) -> []u8
+          |        var n = self.src.len - self.at
+          |        if n > into.len then n = into.len
+          |        for i in 0usize..<n do into[i] = self.src[self.at + i]
+          |        self.at += n
+          |        into[0..<n]
+          |
+          |main(args: []string)
+          |    print(from_utf8("x".bytes))
+          |    for a in args[1..] do print(a)
+          |    var b = Bytes("hi\nthere\n".bytes, 0usize)
+          |    var r: *sysl.Reader = &b
+          |    for line in lines(r) do print(line)
+          |""".stripMargin, "one", "two") shouldBe "mine\none\ntwo\nhi\nthere\n"
+    }
+
+    "and the fallible half of a scalar conversion came across too" in {
+      run(
+        """char_from_u32(9731u32) match
+          |    Some(c) -> print(c)
+          |    None -> print("no")
+          |char_from_u32(0xD800u32) match
+          |    Some(c) -> print(c)
+          |    None -> print("no")
+          |""".stripMargin) shouldBe "☃\nno\n"
+    }
+  }
+
   "a moved trait whose memberships the compiler supplies rather than a program declaring them" - {
 
     "a program may declare a 'Hash' of its own, and a built-in still satisfies the library's" in {

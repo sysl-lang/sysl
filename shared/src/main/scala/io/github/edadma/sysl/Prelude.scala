@@ -48,27 +48,17 @@ package io.github.edadma.sysl
  * be written at all until a `[]T` could be sized while running. The writer standing for standard
  * output stays the compiler's, because it holds no state and there is no struct with no fields.
  *
- * **`from_utf8` is the one direction a `string` could not otherwise be reached from**, and it is
- * here rather than in the compiler because only its last line needs to be: validation is ordinary
- * sysl over a `[]u8`, and the compiler supplies just `from_utf8_unchecked`, the primitive that says
- * "these bytes are a string now". The validator is Unicode's own well-formedness table rather than a
- * decode-and-range-check, which is what makes the four ways of being ill-formed — overlong, a
- * surrogate, a value past `10FFFF`, and a byte that can never appear — fall out of the lead byte's
- * row instead of each needing its own test. `Utf8Error` carries the offset `04` asks for plus the
- * one distinction a caller can act on: whether the input merely **ended** in the middle of a
- * sequence, which more bytes would fix, or holds one that no continuation could rescue.
- *
  * **The four operations that make new bytes** (`04`) are the rest of what a `string` can do, and
- * three of them are here rather than in the compiler for the reason `from_utf8` is: only the last
- * line of each needs to be underneath the language. `StrBuilder` gathers text and hands back one
- * string, over the same `Buf[u8]` `ByteSink` uses; `cstring` copies a string into the
- * NUL-terminated shape C reads, and `CString` is what owns that copy, since a language with no
- * manual free has to say who frees it. The fourth, `string(c)`, is a conversion the compiler
- * already had the encoder for. `s.copy()` needs no declaration at all — it is bytes copied into a
- * string that owns them, which is `from_utf8_unchecked` of a string's own bytes.
+ * three of them are here rather than in the compiler because only the last line of each needs to be
+ * underneath the language. `StrBuilder` gathers text and hands back one string, over the same
+ * `Buf[u8]` `ByteSink` uses; `cstring` copies a string into the NUL-terminated shape C reads, and
+ * `CString` is what owns that copy, since a language with no manual free has to say who frees it.
+ * The fourth, `string(c)`, is a conversion the compiler already had the encoder for. `s.copy()`
+ * needs no declaration at all — it is bytes copied into a string that owns them, which is
+ * `from_utf8_unchecked` of a string's own bytes.
  *
- * **`args_of` is how a program's arguments become a `[]string`**, and it is here for the reason
- * `from_utf8` is: every line of it is ordinary sysl. What the platform hands the entry point is C's
+ * **`args_of` is how a program's arguments become a `[]string`**, and it is here because every line
+ * of it is ordinary sysl. What the platform hands the entry point is C's
  * `argc` and `argv` — a count and a vector of NUL-terminated byte runs — and what a sysl program
  * asks for is a slice of strings, so something has to walk the one and build the other. Doing it in
  * the prelude is what keeps the pair out of every sysl signature: a `main(args: []string)` is called
@@ -82,17 +72,10 @@ package io.github.edadma.sysl
  * that is not UTF-8 stops the program the way `unwrap` does, with the offset of the byte that made
  * it ill-formed — `04` puts that check at the boundary, and this is one.
  *
- * **The reading surface is in the standard module** — `Reader`, `FdReader`, `Lines` and the
- * functions around them — beside the rendering surface and for the same reasons. What is left here
- * is what it stands on: `sysl_read` and `sysl_memchr` below, `from_utf8`, `Buf`, and the `Option`
- * a line arrives in.
- *
- * **`char_from_u32` is the fallible half of `u32` → `char`** (`00 §1`), and it is a free function
- * for the reason `from_utf8` is one: a scalar has no member namespace to hang a `char.try` on. It
- * needs no unchecked primitive to sit on top of — the guard it writes and the check `char(u)`
- * already makes are the same two comparisons on the same value, so the cast on the far side of the
- * guard can never trip and the optimizer folds it. Trading a primitive for a redundant compare in
- * a cold branch is the better side of that bargain.
+ * **The reading and text surfaces are in the standard module** — `Reader`, `FdReader` and `Lines`
+ * on one side, `from_utf8`, `Utf8Error`, `Chars` and `char_from_u32` on the other — beside the
+ * rendering surface and for the same reasons. What is left here is what they stand on: `sysl_read`
+ * and `sysl_memchr` below, `Buf`, and the `Option` and `Result` their answers arrive in.
  *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
@@ -332,89 +315,6 @@ object Prelude {
       |            print("panic:", msg)
       |            exit(1)
       |end Result
-      |
-      |char_from_u32(u: u32) -> Option[char]
-      |    if u > 0x10FFFFu32 || (u >= 0xD800u32 && u <= 0xDFFFu32) then
-      |        None
-      |    else
-      |        Some(char(u))
-      |end char_from_u32
-      |
-      |struct Utf8Error
-      |    offset: usize
-      |    truncated: bool
-      |
-      |from_utf8(b: []u8) -> Result[string, Utf8Error]
-      |    var i = 0usize
-      |    while i < b.len
-      |        var c = b[i]
-      |        var need = 0usize
-      |        var lo = 128u8
-      |        var hi = 191u8
-      |
-      |        if c < 128u8 then
-      |            need = 1usize
-      |        elif c < 194u8 then
-      |            return Err(Utf8Error(i, false))
-      |        elif c < 224u8 then
-      |            need = 2usize
-      |        elif c < 240u8 then
-      |            need = 3usize
-      |            if c == 224u8 then lo = 160u8
-      |            if c == 237u8 then hi = 159u8
-      |        elif c < 245u8 then
-      |            need = 4usize
-      |            if c == 240u8 then lo = 144u8
-      |            if c == 244u8 then hi = 143u8
-      |        else
-      |            return Err(Utf8Error(i, false))
-      |
-      |        var have = b.len - i
-      |        var k = 1usize
-      |        while k < need && k < have
-      |            var t = b[i + k]
-      |            var min = if k == 1usize then lo else 128u8
-      |            var max = if k == 1usize then hi else 191u8
-      |            if t < min || t > max then return Err(Utf8Error(i, false))
-      |            k += 1usize
-      |
-      |        if have < need then return Err(Utf8Error(i, true))
-      |        i += need
-      |
-      |    Ok(from_utf8_unchecked(b))
-      |end from_utf8
-      |
-      |struct Chars
-      |    rest: []u8
-      |    at: usize
-      |end Chars
-      |
-      |chars_of(b: []u8) -> Chars = Chars(b, 0usize)
-      |
-      |impl Iterate[char] for Chars
-      |    next(*self) -> Option[char]
-      |        if self.at >= self.rest.len then return None
-      |
-      |        var lead = self.rest[self.at]
-      |        var need = 1usize
-      |        var v = u32(lead)
-      |
-      |        if lead >= 240u8
-      |            need = 4usize
-      |            v = u32(lead & 7u8)
-      |        elif lead >= 224u8
-      |            need = 3usize
-      |            v = u32(lead & 15u8)
-      |        elif lead >= 192u8
-      |            need = 2usize
-      |            v = u32(lead & 31u8)
-      |
-      |        for k in 1usize..<need
-      |            v = (v << 6u32) | u32(self.rest[self.at + k] & 63u8)
-      |
-      |        self.at += need
-      |        Some(char(v))
-      |    end next
       |
       |struct Buf[T]
       |    elems: []T

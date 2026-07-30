@@ -144,7 +144,7 @@ trait Literals extends TypeResolution {
     case Type.Str  => err("a 'string' conversion encodes a char, and this value is already a string")
     case Type.Slice(Type.Byte) =>
       err("a 'string' conversion encodes a char — bytes are already text or are not, so " +
-        "'from_utf8(b)' is what says which")
+        s"'${Modules.show(Library.key("from_utf8"))}(b)' is what says which")
     case other =>
       err(s"a 'string' conversion encodes a char, and ${show(other)} is not one — 'str(x)' renders " +
         "a value as text")

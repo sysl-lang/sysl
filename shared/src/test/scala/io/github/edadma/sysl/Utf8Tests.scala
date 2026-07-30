@@ -334,10 +334,15 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "what it costs a program that never decodes" - {
     // The reachability rule the prelude relies on: neither the validator nor anything it reaches is
     // emitted for a program that does not call it.
+    // The name is read off `Library.key` rather than written out, because the validator is in the
+    // standard module and `@from_utf8` is no longer the symbol: spelled literally, this negative
+    // would go on passing while asserting nothing. `@sysl.str.from_bytes` below is a *codegen*
+    // helper — dots, not the module separator — so it is unaffected by where the library declares
+    // things and stays spelled as it is emitted.
     "the validator is not emitted" in {
       val out = Compiler.compileToLlvm("print(1)")
 
-      out.map(_.contains("@from_utf8")) shouldBe Right(false)
+      out.map(_.contains(s"@${Library.key("from_utf8")}(")) shouldBe Right(false)
       out.map(_.contains("@sysl.str.from_bytes")) shouldBe Right(false)
     }
 
@@ -346,7 +351,7 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "its error type costs exactly one line of layout" in {
       val out = Compiler.compileToLlvm("print(1)")
 
-      out.map(_.linesIterator.count(_.startsWith("%struct.Utf8Error"))) shouldBe Right(1)
+      out.map(_.linesIterator.count(_.startsWith(s"%struct.${Library.key("Utf8Error")}"))) shouldBe Right(1)
     }
   }
 }

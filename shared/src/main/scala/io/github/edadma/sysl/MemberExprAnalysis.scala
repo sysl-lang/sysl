@@ -94,7 +94,7 @@ trait MemberExprAnalysis extends ExprSupport {
         // array, slice, and string, `bytes` the reinterpretation of a string's three words
         // as a `[]u8`, dropping only the validity guarantee, and `chars` a cursor over the scalar
         // values those bytes encode. `chars` is the one that cannot be a view — the decoding is
-        // what makes the characters — so it is the prelude's `Chars`, positioned at the start.
+        // what makes the characters — so it is the library's `Chars`, positioned at the start.
         case _: Type.Array | _: Type.View if f == "len" => TLen(tr)
         case Type.Str if f == "bytes"                   => TBytes(tr)
         case Type.Str if f == "chars"                   => callLibrary("chars_of", TBytes(tr))

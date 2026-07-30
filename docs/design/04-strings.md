@@ -15,7 +15,7 @@ to text, and **`s.chars`**, the cursor over the scalar values those bytes encode
 The four that make new bytes are built too: **`s.copy()`**, which stops a substring holding its
 parent alive, **`string(c)`**, which encodes one scalar value, **`StrBuilder`**, which gathers text
 without rebuilding what it already has, and **`cstring(s)`**, which copies a string into the shape C
-reads. Three of them are the prelude's rather than the compiler's, for the reason `from_utf8` is:
+reads. Three of them are the library's rather than the compiler's, for the reason `from_utf8` is:
 only the last line of each needs to be underneath the language.
 
 A string is therefore no longer always traceable to a literal; a program can build one by joining,
