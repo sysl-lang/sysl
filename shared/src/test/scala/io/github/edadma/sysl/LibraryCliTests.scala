@@ -279,6 +279,65 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       fallsBack("when it was built from a different lib/sysl", corrupt(LibraryArtifact.pack(stale, Array.empty)))
     }
 
+    "is not needed at all, the artifact being looked for where build-lib --core puts it" - {
+
+      // Every case here routes the default path through `coreSearch` to a temporary file rather than
+      // using the real one. Suites run in parallel, and an artifact left at the true default would be
+      // found by every other test in the run — which is the environment-dependence this feature
+      // introduces, arriving first in our own suite. The real default is pinned separately, below.
+
+      "so building it with no -o and compiling with no --core-lib is the whole workflow" in {
+        assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+        assume(Toolchain.clangAvailable, "clang not available")
+
+        val where = s"${createTempDirectory("sysl-cli-found-")}/core${LibraryArtifact.extension}"
+
+        cli(Config(command = "build-lib", file = CoreLib.root.get, core = true, coreSearch = where)) shouldBe 0
+        isFile(where) shouldBe true
+
+        val (status, notes) =
+          diagnostics(Config(command = "run", file = program("print(21 * 2)"), coreSearch = where))
+
+        status shouldBe 0
+        notes should not include "warning"
+      }
+
+      "while nothing there is the ordinary state of a fresh tree, and passes without comment" in {
+        val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
+          coreSearch = s"${createTempDirectory("sysl-cli-none-")}/core${LibraryArtifact.extension}"))
+
+        status shouldBe 0
+        notes should not include "warning"
+      }
+
+      "but something unreadable there still warns, since that is the shape a drifted one takes" in {
+        // The asymmetry that matters: absent is silence, present-and-wrong is not. Staying quiet
+        // here is what would let a stale artifact go on being ignored rather than fixed.
+        val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
+          coreSearch = corrupt("not a library\n".getBytes)))
+
+        status shouldBe 0
+        notes should include("warning")
+      }
+
+      "and --core-lib wins over it, being the one someone actually asked for" in {
+        val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
+          coreLib = Some(corrupt("not a library\n".getBytes)),
+          coreSearch = corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)))
+
+        status shouldBe 0
+        notes should include("warning")
+        notes should not include "different sysl"
+      }
+
+      "and the place both ends agree on is the documented one" in {
+        // The tests above route around the real default so they cannot collide; this is what says
+        // the real default is what they were standing in for.
+        Config().coreSearch shouldBe LibraryArtifact.coreDefault
+        LibraryArtifact.coreDefault should endWith(LibraryArtifact.extension)
+      }
+    }
+
     "and having fallen back, emits the standard module rather than declaring it" in {
       assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")
