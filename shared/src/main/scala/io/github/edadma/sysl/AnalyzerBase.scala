@@ -332,6 +332,15 @@ trait AnalyzerBase {
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
+  /** Types whose *declaration* was reported as a mistake, so that using one does not report it
+   * again. A declaration is instantiated eagerly and therefore judged once, but a name can be
+   * mentioned any number of times afterwards, and each mention would otherwise rebuild the same
+   * type and raise the same complaint at its own position — telling the reader the same thing about
+   * `enum Colour` at every line that says `Colour`. A use of one of these raises `Poisoned` instead,
+   * which abandons that statement in silence, exactly as touching a `Type.Unknown` does.
+   */
+  protected val brokenDecls = mutable.Set.empty[String]
+
   /** Declared constrained subtypes by key (`16`). Each `type Name = Base …` is registered here; the
    * resolved `Type.Constrained` it stands for is built and cached the first time the name is used.
    */

@@ -90,6 +90,8 @@ trait GenericInstantiation extends ConstFolding {
     inDecl(name)(instantiateStructIn(name, targs))
 
   private def instantiateStructIn(name: String, written: List[Type]): Type.Struct = {
+    if brokenDecls(name) then poisoned()
+
     val decl = structDecls(name)
     checkArity(name, decl.tparams, decl.tdefaults, written)
 
@@ -187,6 +189,8 @@ trait GenericInstantiation extends ConstFolding {
     inDecl(name)(instantiateEnumIn(name, targs))
 
   private def instantiateEnumIn(name: String, written: List[Type]): Type.Enum = {
+    if brokenDecls(name) then poisoned()
+
     val decl = enumDecls(name)
     checkArity(name, decl.tparams, decl.tdefaults, written)
 
@@ -220,29 +224,61 @@ trait GenericInstantiation extends ConstFolding {
 
         val subst    = decl.tparams.zip(targs).toMap
         var nextTag = 0
-        try en.variants = decl.variants.map { v =>
+        try
+          en.variants = decl.variants.map { v =>
+            if en.simple then
+              def fitting(n: BigInt): Int =
+                if !Type.fits(n, en.underlying) then
+                  err(s"discriminant $n of variant '${v.name}' does not fit ${show(en.underlying)}")
+                n.toInt
+              val tag = v.value match
+                // A discriminant is any compile-time integer, so a negative one under a signed
+                // underlying type folds from the unary negation the parser gives, and a `const` may
+                // stand where a literal does (`13 §7`).
+                case Some(e) =>
+                  fitting(constInt(e).getOrElse(
+                    err(s"the value of variant '${v.name}' must be a constant integer")))
+                case None => fitting(nextTag)
+              nextTag = tag + 1
+              Type.EnumVariant(v.name, tag, Nil, false)
+            else
+              if v.value.isDefined then
+                err(s"variant '${v.name}' carries data, so it cannot also have an explicit value")
+              val tag    = nextTag; nextTag += 1
+              val fields = v.fields.map(f => (f.name, recover(Type.Unknown)(resolveType(f.typ, subst))))
+              Type.EnumVariant(v.name, tag, fields, fields.nonEmpty)
+          }
+
+          // A simple enum's value *is* its identity — there is nothing else to tell two variants
+          // apart — so two names for one value leave the language unable to keep its own promises:
+          // `Pos` and `Val` stop being inverses, the second variant's `match` arm can never run,
+          // and `Image` lowers to a switch with a repeated case that the assembler rejects outright.
+          // A data enum cannot reach this, since its tags are assigned in order and it refuses an
+          // explicit value. Naming a value twice on purpose is what a `const` is for.
           if en.simple then
-            def fitting(n: BigInt): Int =
-              if !Type.fits(n, en.underlying) then
-                err(s"discriminant $n of variant '${v.name}' does not fit ${show(en.underlying)}")
-              n.toInt
-            val tag = v.value match
-              // A discriminant is any compile-time integer, so a negative one under a signed
-              // underlying type folds from the unary negation the parser gives, and a `const` may
-              // stand where a literal does (`13 §7`).
-              case Some(e) =>
-                fitting(constInt(e).getOrElse(
-                  err(s"the value of variant '${v.name}' must be a constant integer")))
-              case None => fitting(nextTag)
-            nextTag = tag + 1
-            Type.EnumVariant(v.name, tag, Nil, false)
-          else
-            if v.value.isDefined then
-              err(s"variant '${v.name}' carries data, so it cannot also have an explicit value")
-            val tag    = nextTag; nextTag += 1
-            val fields = v.fields.map(f => (f.name, recover(Type.Unknown)(resolveType(f.typ, subst))))
-            Type.EnumVariant(v.name, tag, fields, fields.nonEmpty)
-        }
+            val seen = mutable.Map.empty[Int, String]
+            for v <- en.variants do
+              seen.get(v.tag) match
+                case Some(first) =>
+                  err(
+                    s"variants '$first' and '${v.name}' both stand for ${v.tag}, and a simple enum's "
+                      + "values are the whole of what tells its variants apart — a second name for one "
+                      + "value is a 'const'",
+                  )
+                case None => seen(v.tag) = v.name
+        catch
+          // Nothing a *simple* enum's variants read depends on the type arguments: a discriminant is
+          // a constant and the underlying type is fixed at the declaration. So a mistake found here
+          // belongs to the declaration rather than to this instantiation of it, and marking it as
+          // such is what keeps a generic one — which has no eager instantiation to be judged at —
+          // from repeating the same complaint at every use.
+          //
+          // Only a pass that *reports* may mark: the definition-time walk of a generic body raises
+          // errors and drops them (`14 §4`), so marking from there would retire the declaration
+          // before anything had told the reader about it.
+          case e: AnalyzerError if en.simple && !abstractPass =>
+            brokenDecls += name
+            throw e
         finally
           resolving -= key
           inProgress -= key

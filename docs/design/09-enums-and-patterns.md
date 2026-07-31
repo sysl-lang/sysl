@@ -82,6 +82,18 @@ compile error), and **signedness** (a `uN` underlying type rejects a negative di
 The annotation is only meaningful on a non-generic simple enum; a generic or data enum's tag
 width is a separate, later concern (§ Open a).
 
+**Two variants may not stand for one value**, however the collision arises — two explicit
+discriminants, or an auto-incremented one landing on a number written out further down. The reason is
+that a simple enum's value *is* its identity: there is nothing else carried, so two names for one
+number are one value with two spellings, and every promise this chapter makes about telling variants
+apart stops holding. `Pos` and `Val` stop being inverses; the second variant's `match` arm can never
+run, silently; and `Image` has two answers to one question. C permits the collision because a C enum
+offers none of those; sysl refuses it, and the diagnostic names both variants and the value they
+share. **Deliberately naming one value twice is what a `const` is for** — the aliasing use C reaches
+for (`COLOUR_MAX = BLUE`) is a constant, not a variant, and stays writable. A data enum cannot reach
+the case at all: its tags are handed out in order and an explicit value on a data-carrying variant is
+refused on its own grounds.
+
 **Conversion is checked in the unsafe direction, mirroring `char` (`00 §1`).** Going *to* the
 underlying integer — `u8(c)`, `int(c)` — is **total**, every enum value is a valid integer.
 Coming *from* an integer has two spellings by how trustworthy the value is: `Color(n)` is a
@@ -412,9 +424,14 @@ Recorded so they are not lost; each needs a decision before the relevant feature
   is not selectable. Now that the payload is a union (§3) the two halves of the layout no longer
   interact, so `enum E: u8` beside a payload region is a decision that can be taken on its own —
   and it is worth taking, since a tag narrower than its payload's alignment is free: an
-  `Option[&T]` would be eight bytes rather than sixteen. Also open within simple enums: whether
-  explicit discriminants must be distinct, and whether a simple enum is iterable / carries a
-  `::Range`.
+  `Option[&T]` would be eight bytes rather than sixteen. ~~Also open within simple enums: whether
+  explicit discriminants must be distinct~~ — **that half is closed: they must**, and §2 says why.
+  It was never a question about what the language should be. The code had already answered it, and
+  answered it wrongly: a duplicate was accepted, the losing variant's `match` arm quietly became
+  unreachable, and `Image` lowered to a `switch` with a repeated case that the assembler refused —
+  so a program was accepted by the compiler and then failed to build, with the reader shown clang's
+  complaint about a temporary file. What remains open here is only whether a simple enum is
+  **iterable** — a `::Range` over its variants, as a constrained subtype has (`16 §5`).
 - **f. `sizeof`.** The compiler models storage internally (`Layout`, §3) because a union's width
   has to be written down. Whether the *language* can ask — `sizeof(T)` as a compile-time constant,
   which is what a `static_assert` on a wire format needs — is a separate decision: it would fix
