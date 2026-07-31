@@ -307,7 +307,17 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
     case Left(err)   => return fail(err)
     case Right(path) => path
 
-  LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty, core) match
+  // The library's C files, which become members of the archive beside the object its own modules
+  // compiled to (`15 §7`). Checked for a name collision here rather than after the build, for the
+  // same reason the archiver is: the compile is the slow part, and a name that cannot be archived is
+  // known before any of it has run.
+  val native = Project.cSources(cfg.file)
+
+  LibraryArtifact.collisions(native) match
+    case Some(err) => return fail(err)
+    case None      => ()
+
+  LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty, core, native) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
       // The standard module's default output is the place a compilation looks for it, so that
@@ -325,15 +335,20 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
       val staging  = createTempDirectory("sysl-lib-")
       val code     = s"$staging/${LibraryArtifact.codeMember}"
       val metadata = s"$staging/${LibraryArtifact.metadataMember}"
+      val objects  = native.map(s => s -> s"$staging/${LibraryArtifact.nativeMember(s)}")
 
       val outcome =
         for
           _ <- Toolchain.compileObject(ir, code, target)
           _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(meta, target), metadata, target)
-          _ <- Toolchain.archive(List(code, metadata), out, ar)
+          // Each C file becomes its own member, so the linker pulls in a shim the same way it pulls
+          // in anything else: because something left its symbol undefined.
+          _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
+                 so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target)))
+          _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), out, ar)
         yield ()
 
-      List(code, metadata, staging).foreach(discard)
+      (code :: metadata :: objects.map(_._2) ::: List(staging)).foreach(discard)
 
       outcome match
         case Left(err) => fail(err)

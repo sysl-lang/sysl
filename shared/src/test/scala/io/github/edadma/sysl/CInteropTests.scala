@@ -191,6 +191,55 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |var msg: [3]u8 = [104u8, 105u8, 10u8]
             |print(write(1, &msg[0], 3usize) == 3isize)""".stripMargin) shouldBe "hi\ntrue\n"
     }
+
+    /* The caller-allocated opaque type, which is the shape `regcomp` and half of POSIX are written
+     * in: the callee fills storage the caller supplies, and the storage's size lives in a header.
+     *
+     * Both of these run, and that is the point worth recording — the shape is *reachable*, so what a
+     * binding is missing is never "sysl cannot call this". What both spellings really hold is the
+     * numbers 32 and 8 and the value of `REG_EXTENDED`, transcribed by hand, correct on this machine
+     * and different under glibc, with nothing checking either. That is the argument for a shim
+     * (`15 §7`), and these two are what it is an argument against. */
+
+    "a caller-allocated C struct, transcribed field by field" in {
+      // macOS <regex.h>: int re_magic; size_t re_nsub; const char *re_endp; struct re_guts *re_g.
+      run("""struct regex_t
+            |    magic: i32
+            |    nsub: usize
+            |    endp: *u8
+            |    g: *u8
+            |struct regmatch_t
+            |    so: i64
+            |    eo: i64
+            |extern regcomp(preg: *regex_t, pattern: *u8, cflags: int) -> int
+            |extern regexec(preg: *regex_t, s: *u8, nmatch: usize, pmatch: *regmatch_t, eflags: int) -> int
+            |extern regfree(preg: *regex_t)
+            |var re: regex_t
+            |print(regcomp(&re, c"a+b", 1) == 0)
+            |var m: regmatch_t
+            |print(regexec(&re, c"xxaaab", 1usize, &m, 0) == 0)
+            |print(m.so, m.eo)
+            |regfree(&re)""".stripMargin) shouldBe "true\ntrue\n2 6\n"
+    }
+
+    "and the same one as nothing but sized, aligned storage" in {
+      // The fields are never read here, so the whole declaration is the two numbers: four words, at
+      // the alignment `u64` carries. It is the smaller lie of the two and exactly as unchecked.
+      run("""struct regex_t
+            |    words: [4]u64
+            |struct regmatch_t
+            |    so: i64
+            |    eo: i64
+            |extern regcomp(preg: *regex_t, pattern: *u8, cflags: int) -> int
+            |extern regexec(preg: *regex_t, s: *u8, nmatch: usize, pmatch: *regmatch_t, eflags: int) -> int
+            |extern regfree(preg: *regex_t)
+            |var re: regex_t
+            |print(regcomp(&re, c"a+b", 1) == 0)
+            |var m: regmatch_t
+            |print(regexec(&re, c"xxaaab", 1usize, &m, 0) == 0)
+            |print(m.so, m.eo)
+            |regfree(&re)""".stripMargin) shouldBe "true\ntrue\n2 6\n"
+    }
   }
 
   /** The gaps, as assertions about today. Each names what a C library needs and sysl cannot yet do,
