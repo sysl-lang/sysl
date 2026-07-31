@@ -44,8 +44,11 @@ trait ProgramWalk
     readCapabilities()
     moduleNames ++= units.map(moduleOf)
     // The library's own modules are modules like any other, and are known for the same reason a
-    // file's header is: what they are called is settled before a single name is resolved.
-    moduleNames ++= Library.modules
+    // file's header is: what they are called is settled before a single name is resolved. They are
+    // read off the core this compilation was handed rather than off the source in the tree, because
+    // naming one is reaching declarations, and the declarations that are there are the ones that
+    // arrived.
+    moduleNames ++= core.modules
 
     // Every declaration is read in the terms its file set up — the module it contributes to and
     // what it imported — so each one is carried alongside those rather than flattened into one
@@ -54,13 +57,19 @@ trait ProgramWalk
     // the headers alone.
     // The imports are gathered in the file's own terms, since what an import may reach is a
     // question about where it was written (`13 §2`) as much as about what it names.
-    val files = units.map { u =>
+    def scopeOf(u: Program): Scope = {
       val here = moduleOf(u)
       val base = Scope(here, Imports.empty, Some(u.source))
 
-      u -> base.copy(imports = inScope(base)(gatherImports(u.body, autoImported(here))))
+      base.copy(imports = inScope(base)(gatherImports(u.body, autoImported(here))))
     }
-    val body = core.scoped(building) ::: files.flatMap((u, s) => u.body.map((s, _)))
+
+    val files = units.map(u => u -> scopeOf(u))
+    // The library's files go through the same construction, because they are files of modules like
+    // any other — one of them may import a sibling module of the library, and until there was more
+    // than one library module there was nothing for such an import to name.
+    val library = core.contributed(building).map(u => u -> scopeOf(u))
+    val body    = (library ::: files).flatMap((u, s) => u.body.map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -406,7 +415,7 @@ trait ProgramWalk
    * because a build that guessed would turn this crisp refusal into a link-time collision.
    */
   private def checkLibraryModules(): Unit =
-    for u <- units; name = moduleOf(u) if Library.modules.contains(name) && !building.contains(name) do
+    for u <- units; name = moduleOf(u) if core.carries(name) && !building.contains(name) do
       recover(())(at(u.module.flatMap(_.pos).orElse(u.body.headOption.flatMap(_.pos))) {
         err(s"'$name' is the module every program is compiled against, so ${u.source.name} cannot " +
           "declare it — its declarations would join the library's rather than sit beside them")

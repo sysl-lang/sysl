@@ -33,28 +33,33 @@ final class Core(val units: List[Program]) {
    */
   private val own: Set[Source] = units.map(_.source).toSet
 
-  /** The library's declarations, each with the terms it reads names in.
+  /** The modules these trees declare — the library's own, as *this* compilation was handed it.
    *
-   * The library imports nothing and needs to import nothing — `resolveName` looks a name written in
-   * a library declaration up among the library's own first, by the spelling rather than by the key,
-   * so one file reaches another with no import to write.
+   * A program may name any of them and may declare none of them, and both are questions about what
+   * is actually there: a compilation given a stand-in library has whatever that one declares, and
+   * one given none has nothing to collide with at all.
+   */
+  lazy val modules: List[String] = units.map(Compiler.moduleOf).distinct.sorted
+
+  /** Whether `module` is one of the library's own here. */
+  def carries(module: String): Boolean = modules.contains(module)
+
+  /** The library's files, as units for the walk to read on the same terms as the program's.
    *
-   * Each program carries **its own source**, which is what says a name is being read *in* the
-   * library.
+   * They *are* files of modules, so what a name in one of them resolves against is what its own
+   * header and its own imports say — not one scope standing in for the whole library. That was
+   * exact while the library was a single module importing nothing, and stops being so the moment it
+   * has more than one: a file of `sysl.sys` naming `Buf` is naming another module's declaration, and
+   * has to say so the way any other file would.
    *
    * `building` is the modules this compilation is **producing** rather than being supplied with,
    * which is how the library's own source gets compiled at all: pointed at `lib`, the compiler would
    * otherwise hand a copy of `sysl` to the files that declare it, and every name in them would be
-   * declared twice.
+   * declared twice. It is per file rather than all-or-nothing so that the answer stays right for a
+   * build producing some of the library's modules and not others.
    */
-  def scoped(building: Set[String]): List[(Scope, Stmt)] =
-    if building(Std.module) then Nil
-    else units.flatMap(p => p.body.map((Scope(Std.module, Imports.empty, Some(p.source)), _)))
-
-  /** Whether a source is one of the library's own — what tells a name being read *in* the library
-   * from one being read in the program.
-   */
-  def source(s: Source): Boolean = own(s)
+  def contributed(building: Set[String]): List[Program] =
+    units.filterNot(u => building(Compiler.moduleOf(u)))
 
   /** Whether a declaration is the library's rather than the program's.
    *

@@ -46,7 +46,18 @@ object Std {
    * with (`13 §1`), so these are the same `Source` values the driver would build from disk.
    */
   val sources: List[Source] =
-    CoreSource.files.map((name, text) => Source(name, text, List(module)))
+    CoreSource.files.map((name, text) => Source(name, text, directoryOf(name)))
+
+  /** Where a carried file sits, as the directory segments between the library root and it — the
+   * `dir` a driver would have put on the `Source` had it read the file off disk.
+   *
+   * The generator writes each name as the path below `lib`, so the segments are simply what is left
+   * after dropping that root and the file itself: `lib/sysl/print.sysl` is in `sysl`, and
+   * `lib/sysl/sys/args.sysl` is in `sysl.sys`. Deriving it is what lets the library be a tree —
+   * naming the module here instead, as this once did, is a claim every file is in the same one, and
+   * a submodule's files would have been checked against the wrong header.
+   */
+  private[sysl] def directoryOf(name: String): List[String] = name.split('/').toList.drop(1).init
 
   /** What the library's source amounts to, for telling a prebuilt artifact built from *this* library
    * from one built from a different version of it.

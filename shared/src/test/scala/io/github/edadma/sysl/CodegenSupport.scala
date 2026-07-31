@@ -101,9 +101,20 @@ trait CodegenSupport extends Matchers { this: Assertions =>
    * A program compiled this way has **only** what the stand-in declares, `print` included, so these
    * fixtures state everything they use.
    */
-  protected def standIn(fs: (String, String)*): (List[Program], Core) = {
-    val units = fs.toList.map { case (name, text) =>
-      SyslParser.parse(Source(name, text, List(Std.module))) match {
+  protected def standIn(fs: (String, String)*): (List[Program], Core) =
+    standInTree(fs.map { case (name, text) => (Std.module, name, text) }*)
+
+  /** The same, for a library that is a **tree**: each file paired with the module it sits in,
+   * written as the dotted path a driver walking `lib` would have derived (`Project.walk`).
+   *
+   * A library with more than one module is not something the real one can stand for while it has
+   * only the standard module, and it is the case every question about a submodule is about — that
+   * its names do not arrive unasked-for, that a program may reach it by naming it, that what it
+   * keeps to itself it keeps from the rest of the library too.
+   */
+  protected def standInTree(fs: (String, String, String)*): (List[Program], Core) = {
+    val units = fs.toList.map { case (module, name, text) =>
+      SyslParser.parse(Source(name, text, module.split('.').toList)) match {
         case Right(p) => p
         case Left(e)  => fail(s"the stand-in standard module does not parse: $e")
       }
@@ -114,23 +125,34 @@ trait CodegenSupport extends Matchers { this: Assertions =>
 
   /** The IR for a program compiled against a stand-in standard module, which must compile. */
   protected def irAgainst(lib: (String, String)*)(fs: (String, String)*): String =
-    against(lib, fs) match {
+    resultOf(standIn(lib*)._2, fs) match {
       case Right(out) => out
       case Left(e)    => fail(e)
     }
 
   /** The error for a program compiled against a stand-in standard module, which must be rejected. */
   protected def errAgainst(lib: (String, String)*)(fs: (String, String)*): String =
-    against(lib, fs) match {
+    resultOf(standIn(lib*)._2, fs) match {
       case Right(out) => fail(s"expected an error, got:\n$out")
       case Left(e)    => e
     }
 
-  private def against(lib: Seq[(String, String)], fs: Seq[(String, String)]): Either[String, String] = {
-    val (_, core) = standIn(lib*)
+  /** The IR for a program compiled against a stand-in library of several modules. */
+  protected def irAgainstTree(lib: (String, String, String)*)(fs: (String, String)*): String =
+    resultOf(standInTree(lib*)._2, fs) match {
+      case Right(out) => out
+      case Left(e)    => fail(e)
+    }
 
+  /** The error for a program compiled against a stand-in library of several modules. */
+  protected def errAgainstTree(lib: (String, String, String)*)(fs: (String, String)*): String =
+    resultOf(standInTree(lib*)._2, fs) match {
+      case Right(out) => fail(s"expected an error, got:\n$out")
+      case Left(e)    => e
+    }
+
+  private def resultOf(core: Core, fs: Seq[(String, String)]): Either[String, String] =
     Compiler.compiledWith(files(fs*), Nil, Target.default, Set.empty, core).map(_._1)
-  }
 
   private def compiled(sources: List[Source]): String =
     Compiler.compile(sources) match {
