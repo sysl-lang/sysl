@@ -213,9 +213,21 @@ trait SpecialForms extends Closures {
               case n: Type.Named if n.targs.nonEmpty =>
                 val tps = nominalTparams(n.base).mkString(", ")
                 s"write an 'impl[$tps] Display for ${qn(n.base)}[$tps]' to say how it renders"
-              case n: Type.Named                 => s"write an 'impl Display for ${show(n)}' to say how it renders"
-              case _: Type.Array | _: Type.Slice => s"write an 'impl Display for ${show(ty)}' to say how it renders"
-              case _                             => "it does not implement 'Display'")
+              case n: Type.Named => s"write an 'impl Display for ${show(n)}' to say how it renders"
+
+              // A composed type is the module's when anything named in it is (`02 § Coherence`), so
+              // the advice holds for a `[]Point` and is impossible for a `[]int`: `Display` is the
+              // prelude's and nothing in `[]int` is this module's, so the block named here is one
+              // `checkCoherence` refuses. Both diagnostics used to arrive in the same run — the
+              // rule saying the `impl` has no home, and this line telling the reader to write it.
+              case _: Type.Array | _: Type.Slice if implementableHere(ty) =>
+                s"write an 'impl Display for ${show(ty)}' to say how it renders"
+
+              case _: Type.Array | _: Type.Slice =>
+                s"nothing renders a ${show(ty)}, and an 'impl Display' for it has no home outside " +
+                  "the prelude — print the elements, or give them a type of your own to be held in"
+
+              case _ => "it does not implement 'Display'")
             val asked = if op == "print" then "cannot print" else "cannot make a string of"
             err(s"$asked a ${show(ty)} value — $fix")
 
@@ -223,6 +235,21 @@ trait SpecialForms extends Closures {
 
           funcsUsed += fname
           (fname, t, None)
+
+  /** Whether an `impl` for this type could be written **here** — the coherence question
+   * (`02 § Coherence`), asked of a resolved type rather than of a written subject.
+   *
+   * `Display` belongs to the prelude, so the only thing that can give the block a home is a type of
+   * this module's named somewhere in the subject. The walk goes through the composed shapes for that
+   * reason: it is the *elements* that carry the licence, which is what makes `[]Point` writable and
+   * `[]int` not.
+   */
+  private def implementableHere(ty: Type): Boolean = ty match
+    case Type.Array(_, elem) => implementableHere(elem)
+    case Type.Slice(elem)    => implementableHere(elem)
+    case n: Type.Named =>
+      declaringModule(n.base).contains(currentModule) || n.targs.exists(implementableHere)
+    case _ => false
 
   /** The `display` slot in a trait object's table, or why the object has none.
    *

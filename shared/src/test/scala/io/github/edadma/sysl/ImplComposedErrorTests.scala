@@ -194,11 +194,56 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
       ) should include("type '[]int' has no method 'show'")
     }
 
-    // Now that a slice may carry one, the advice is the `impl` to write rather than a bare
-    // statement that it renders no way at all.
-    "printing a slice points at the impl to write" in {
-      err("var a = [1, 2]\nprint(a[0..])") should
-        include("write an 'impl Display for []int' to say how it renders")
+    // A slice may carry an `impl`, so the advice names the one to write — but only where the
+    // coherence rule would let it be written (`02 § Coherence`). `Display` is the prelude's, so it
+    // is the *element* that gives the block a home: a `[]P` may have one and a `[]int` may not.
+    "printing a slice points at the impl to write, where one could be written" in {
+      err("""struct P
+            |    v: int
+            |var a = [P(1), P(2)]
+            |print(a[0..])""".stripMargin) should
+        include("write an 'impl Display for []P' to say how it renders")
+    }
+
+    "and an array of them the same way, through however many shapes it takes" in {
+      val e = err("""struct P
+                    |    v: int
+                    |var a = [[P(1)], [P(2)]]
+                    |print(a)""".stripMargin)
+
+      e should include("write an 'impl Display for [2][1]P' to say how it renders")
+    }
+
+    "but where nothing in the subject is this module's, it says there is no home for one" in {
+      for src <- List("var a = [1, 2]\nprint(a[0..])", "var a = [1, 2]\nprint(a)") do
+        val e = err(src)
+
+        e should include("no home outside the prelude")
+        e should not include "write an 'impl Display for"
+    }
+
+    /** The defect the pair above exists for. Both diagnostics used to arrive in the same run — the
+      * coherence rule refusing the block as having no home, and the print telling the reader to
+      * write that very block. Advice naming something the compiler refuses is worse than none.
+      */
+    "so a program that tries the advice is not told to try it again" in {
+      val e = err("""impl Display for []int
+                    |    display(self, out: *Writer, fmt: FormatSpec)
+                    |        display_str("ints", out, fmt)
+                    |
+                    |var a = [1, 2]
+                    |print(a[0..])""".stripMargin)
+
+      e should include("has no home")
+      e should not include "write an 'impl Display for"
+    }
+
+    // The same advice reaches the other renderer, since both ask one function for it.
+    "and an interpolation is told the same thing print is" in {
+      val e = err("var a = [1, 2]\nprint(f\"${a}\")")
+
+      e should include("cannot make a string of")
+      e should include("no home outside the prelude")
     }
 
     // A memory mode is one of the shapes an `impl` may not be for, so there is nothing to suggest.

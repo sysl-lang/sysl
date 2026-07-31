@@ -385,6 +385,30 @@ trait AnalyzerBase {
    */
   protected val traitDecls = mutable.LinkedHashMap.empty[String, TraitDecl]
 
+  /** Which module licenses what a key names, or `None` for the prelude's.
+   *
+   * Asked of the **declaration** rather than of `preludeNames`, which holds a prelude enum's variant
+   * names beside its type names — so a program declaring a `struct Ok` of its own would have been
+   * told its own type was the prelude's.
+   *
+   * It lives here rather than beside the coherence check that first needed it because it is a table
+   * lookup with no phase of its own, and a *diagnostic* has to be able to ask the same question: any
+   * message advising a program to write an `impl` is only advice where the coherence rule would let
+   * one be written.
+   */
+  protected def declaringModule(key: String): Option[String] = {
+    val decl: Option[Positioned] = structDecls.get(key)
+      .orElse(enumDecls.get(key))
+      .orElse(traitDecls.get(key))
+      .orElse(constrainedDecls.get(key))
+
+    decl match
+      case Some(d) if Prelude.declares(d) => None
+      case Some(_)                        => Some(Modules.moduleOf(key))
+      // A name nothing declares is a built-in, which has no module of its own and is the prelude's.
+      case None                           => None
+  }
+
   /** Every `impl Trait for Type` as written, in source order. Kept unresolved because the type it
    * names may be declared further down the file; `hoistImpl` resolves each one after every type is
    * registered, and that is where `traitImpls` gets filled.

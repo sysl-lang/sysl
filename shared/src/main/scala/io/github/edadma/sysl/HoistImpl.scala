@@ -424,25 +424,6 @@ trait HoistImpl extends ImplConformance {
     if homes == Set(None) then s"nothing in '$label' is declared outside the prelude"
     else s"'$label' names only what ${homes.toList.map(whose).sorted.mkString(" and ")}"
 
-  /** Which module licenses what a key names, or `None` for the prelude's.
-   *
-   * Asked of the **declaration** rather than of `preludeNames`, which holds a prelude enum's variant
-   * names beside its type names — so a program declaring a `struct Ok` of its own would have been
-   * told its own type was the prelude's.
-   */
-  protected def declaringModule(key: String): Option[String] = {
-    val decl: Option[Positioned] = structDecls.get(key)
-      .orElse(enumDecls.get(key))
-      .orElse(traitDecls.get(key))
-      .orElse(constrainedDecls.get(key))
-
-    decl match
-      case Some(d) if Prelude.declares(d) => None
-      case Some(_)                        => Some(Modules.moduleOf(key))
-      // A name nothing declares is a built-in, which has no module of its own and is the prelude's.
-      case None                           => None
-  }
-
   /** Every module the **subject** of an `impl` belongs to: its own where it is a declared type, and
    * every one its parts belong to where it is composed (`02 § Coherence`).
    *
