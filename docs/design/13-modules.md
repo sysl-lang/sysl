@@ -305,10 +305,10 @@ a name it declares resolves even where a file's imports say nothing.
 **The library's own files take the same three steps.** They are files of modules, and the module each
 is in is one of the library's, so "this module first" can only ever hand a library file the library's
 own declaration — there is nothing for a special order to protect it from. A file of the library may
-therefore also *import*, which is what a library of more than one module needs: `sysl.sys` naming
-something of `sysl.text` is naming another module's declaration and says so exactly as any other file
-would. Only the standard module is auto-imported (§8); a submodule of it is an offer like any other
-library's.
+therefore also *import*, which is what a library of more than one module needs: `sysl.io` opens with
+`import sysl.sys.{sysl_memchr, sysl_read}` and says what it needs from the platform exactly as any
+other file would. Only the standard module is auto-imported (§8); a submodule of it is an offer like
+any other library's.
 
 **Every step is filtered by §2, the library's included.** A member the library keeps to itself is not
 an answer to a program's bare name, exactly as a sibling file's private helper is not: the search
@@ -462,6 +462,14 @@ built on, so `sysl.sys` may name nothing of `sysl`'s — which is why it holds t
 else, and why the argument conversion, which calls `buf`, `from_utf8`, `print` and `exit`, is
 `sysl.args` and not part of `sys`. A module that depends on nothing is what a platform module should
 be anyway; the rule is what says so out loud.
+
+**The rule reads forward as well as backward, and that is what moved the reading surface.** A
+submodule may use the free names as freely as it likes so long as `sysl` does not name it back, so
+the question to ask of a candidate is not what it needs but who needs *it*. `sysl.io` calls `print`,
+`exit`, `buf` and `from_utf8` and is none the worse for it, because nothing the language desugars
+onto reads — whereas the reading surface could not leave `sysl` while `line_text` was still in it,
+since the validator it calls was too. Which surface moves first is therefore decided by the graph and
+not by which one is tidiest to move.
 
 Three things follow from acyclicity:
 

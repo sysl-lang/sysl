@@ -331,9 +331,15 @@ runs after everything that checks one (`15 §3`).
 
 ### The `Reader` surface
 
+**All of it is `sysl.io` rather than `sysl`**, so a program that reads writes `import sysl.io.*` and
+one that does not never has these names. That asymmetry with `Writer` is not an inconsistency: `print`
+is a keyword and what it desugars onto cannot be behind an import nobody wrote, while nothing in the
+language desugars onto reading. `13 §6` is what allows it — the module reaches `print`, `exit`, `buf`
+and `from_utf8` freely, because the dependency only has to not run back.
+
 | Trait | Methods |
 |---|---|
-| `Reader` | `read(*self, into: []u8) -> []u8`, `failed(*self) -> bool = false` |
+| `sysl.io.Reader` | `read(*self, into: []u8) -> []u8`, `failed(*self) -> bool = false` |
 
 `Writer` turned around, and deliberately the same shape: one method on bytes, a latch rather than a
 `Result`, `*self` on both so a reader can be stateful and still object-safe. What differs is the

@@ -314,7 +314,7 @@ expression makes has no other holder to disagree with it.
 
 **What it does not refuse: `&`.** `&xs[0]` is a `*T` the moment it is written, which is the tier
 `03` says the guarantees stop at, and it is how a view reaches a C function taking a pointer and a
-length. The prelude's `find_byte` is `memchr` over exactly this, and `printf("%.*s")` is the same
+length. The library's own `find_byte` is `memchr` over exactly this, and `printf("%.*s")` is the same
 shape. A read-only view that could not yield an address could not do the job it was added for. Note
 this is *not* the rule for a `val` itself, where `&k[0]` is refused (`13`): a `val` is storage whose
 promise is kept where it was made, and a view is a value whose promise is about writing through it.

@@ -347,7 +347,8 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // call to the allocator in a module that declared it would make none.
     "a call into a function that allocates is refused too" in {
       val e = errOf(
-        "thing/a.sysl" -> "module thing\nno alloc\n\ntext(b: []const u8) -> string = line_text(b)\n",
+        "thing/a.sysl" ->
+          "module thing\nno alloc\n\nimport sysl.io.line_text\n\ntext(b: []const u8) -> string = line_text(b)\n",
         "main.sysl" -> "var bytes: [2]u8 = [104u8, 105u8]\nprint(thing.text(bytes[0..<2]))\n",
       )
 

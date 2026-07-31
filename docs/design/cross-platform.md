@@ -70,7 +70,7 @@ and `build` and `run` work from every platform's CLI.
 child's stdin and captures both output streams, which is exactly right for asking `clang` a question
 and wrong for `run`: a compiled program that reads standard input sees end of input immediately,
 whatever the CLI itself was given. Reading standard input is not a language gap — the library supplies
-`stdin()`, `Reader` and the `Lines` cursor over `read(2)` (`14 §2`), and needed nothing new from the
+`sysl.io`'s `stdin()`, `Reader` and `Lines` cursor over `read(2)` (`14 §2`), and needed nothing new from the
 language to do it — it is a gap in what the runner hands the program it started, and the only part of
 the reading surface no test can drive end to end. What the tests do instead is pass a path through
 `argv` and let the program open it, which exercises everything above the descriptor

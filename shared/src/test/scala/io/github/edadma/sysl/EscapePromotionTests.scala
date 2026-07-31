@@ -270,7 +270,8 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     // an erased reader promotes it. `05` records why the two directions differ and leaves the
     // question open; this is what the answer is today.
     "is read into through an erased reader, where a written one would not have been" in {
-      promotes("""use(r: *Reader) -> usize
+      promotes("""import sysl.io.*
+                 |use(r: *Reader) -> usize
                  |    var room: [64]u8
                  |    r.read(room[..]).len
                  |end use
@@ -316,7 +317,8 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     // `Reader` is not `Writer`: a concrete reader is a direct call, so the summary applies and
     // `FdReader.read` keeps nothing — the buffer stays where it was declared.
     "and one read into through a reader whose body is known" in {
-      ir("""fill() -> usize
+      ir("""import sysl.io.*
+           |fill() -> usize
            |    var r = stdin()
            |    var room: [64]u8
            |    r.read(room[..]).len
@@ -330,7 +332,8 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     // buffer stays where it was declared. Reading through `[R: Reader]` rather than through
     // `*Reader` is therefore both the faster shape and the one with no promotion in it.
     "and one read into through a reader a type parameter stands for" in {
-      ir("""fill[R: Reader](r: R) -> usize
+      ir("""import sysl.io.*
+           |fill[R: Reader](r: R) -> usize
            |    var room: [64]u8
            |    var it = r
            |    it.read(room[..]).len

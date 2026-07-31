@@ -353,7 +353,7 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // The one thing it does NOT refuse, and the reason a read-only view is usable at all: `&` is a
-    // `*T`, the tier `03` excludes, and it is how the view reaches C. The prelude's own `find_byte`
+    // `*T`, the tier `03` excludes, and it is how the view reaches C. The library's own `find_byte`
     // is `memchr` over exactly this shape.
     "while taking an address is allowed, because that is the raw tier and is how a view reaches C" in {
       run("""extern printf(fmt: *u8, ...) -> int

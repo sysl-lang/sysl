@@ -238,7 +238,7 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
     // The address stays available under a name, and deliberately: `&` is a `*T`, which is the tier
     // this guarantee excludes, and a read-only view that could not yield one could not reach the C
-    // functions it exists to reach. The prelude's own `find_byte` is `memchr` over exactly this.
+    // functions it exists to reach. The library's own `find_byte` is `memchr` over exactly this.
     "while its address may still be taken under a name, since that is the raw tier either way" in {
       val src =
         """extern printf(fmt: *u8, ...) -> int

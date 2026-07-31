@@ -269,9 +269,9 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     }
   }
 
-  // The real library, which is what all of the above was for. Five names left the set every program
-  // gets for free: the four C functions the printing and reading are built on, and the argument
-  // conversion nearly nobody calls.
+  // The real library, which is what all of the above was for. What has left the set every program
+  // gets for free: the four C functions the printing and reading are built on, the argument
+  // conversion nearly nobody calls, and the whole of the reading surface.
   "the standard library's own submodules" - {
     "keep the platform's C functions out of every program's namespace" in {
       errOf(
@@ -313,6 +313,39 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
 
     "and `exit` stays a word every program has, which is why it is not in `sys`" in {
       irOf("main.sysl" -> "exit(3)") should include("call void @exit(")
+    }
+
+    // Nothing the language desugars onto reads, so the whole input half is an offer: a program that
+    // takes input says so, and one that does not never sees the names.
+    "put the reading surface behind an import, so a program that reads says so" in {
+      errOf("main.sysl" -> "var r = stdin()") should include("undefined function 'stdin'")
+    }
+
+    "which the path reaches without one" in {
+      irOf(
+        "main.sysl" -> "var r = sysl.io.stdin()\nprint(r.fd)",
+      ) should include(s"call %struct.${Library.key("FdReader")} @${Library.key("stdin")}()")
+    }
+
+    "and an import reaches by the bare word again" in {
+      irOf(
+        "main.sysl" -> "import sysl.io.stdin\n\nvar r = stdin()\nprint(r.fd)",
+      ) should include(s"call %struct.${Library.key("FdReader")} @${Library.key("stdin")}()")
+    }
+
+    // The trait too, which is what a program implements to be read through — and the one that says
+    // the whole surface moved rather than just its entry points.
+    "including the trait a program implements to be read from" in {
+      errOf("main.sysl" -> "var r: *Reader = null") should include("unknown type 'Reader'")
+    }
+
+    // The direction §6 permits, demonstrated by the library compiling at all: `line_text` calls
+    // `print`, `exit` and `from_utf8`, every one of them the standard module's, and reaches them
+    // with no import because a submodule gets the free names like any other file.
+    "while the surface itself reaches the standard module's names freely" in {
+      irOf(
+        "main.sysl" -> "print(sysl.io.line_text(\"hi\".bytes))",
+      ) should include(s"call { ptr, ptr, i64 } @${Library.key("line_text")}(")
     }
   }
 }

@@ -514,7 +514,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |    src: []const u8
           |    at: usize
           |
-          |impl sysl.Reader for Bytes
+          |impl sysl.io.Reader for Bytes
           |    read(*self, into: []u8) -> []const u8
           |        var n = self.src.len - self.at
           |        if n > into.len then n = into.len
@@ -523,8 +523,8 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |        into[0..<n]
           |
           |var b = Bytes("a\nbb\n".bytes, 0usize)
-          |var r: *sysl.Reader = &b
-          |for line in lines(r) do print(line, Tick(3).poll())
+          |var r: *sysl.io.Reader = &b
+          |for line in sysl.io.lines(r) do print(line, Tick(3).poll())
           |""".stripMargin) shouldBe "a 3\nbb 3\n"
     }
 
@@ -541,8 +541,8 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |
           |var t: Tick
           |var r: *Reader = &t
-          |for line in lines(r) do print(line)
-          |""".stripMargin) should include("sysl.Reader")
+          |for line in sysl.io.lines(r) do print(line)
+          |""".stripMargin) should include("sysl.io.Reader")
     }
   }
 
@@ -612,7 +612,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |    src: []const u8
           |    at: usize
           |
-          |impl sysl.Reader for Bytes
+          |impl sysl.io.Reader for Bytes
           |    read(*self, into: []u8) -> []const u8
           |        var n = self.src.len - self.at
           |        if n > into.len then n = into.len
@@ -624,8 +624,8 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |    print(from_utf8("x".bytes))
           |    for a in args[1..] do print(a)
           |    var b = Bytes("hi\nthere\n".bytes, 0usize)
-          |    var r: *sysl.Reader = &b
-          |    for line in lines(r) do print(line)
+          |    var r: *sysl.io.Reader = &b
+          |    for line in sysl.io.lines(r) do print(line)
           |""".stripMargin, "one", "two") shouldBe "mine\none\ntwo\nhi\nthere\n"
     }
 

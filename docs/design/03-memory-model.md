@@ -34,7 +34,7 @@ rule: `var b = s.bytes; b[0] = v` is refused at the write, `poke(s.bytes)` where
 carried under a name. Taking an address is entering the raw tier on purpose: `&b[0]` is a `*T` the
 moment it is written, and this guarantee is about programs that have none. It is also how a view
 reaches a C function that wants a pointer and a length — `printf("%.*s")` is that call, and so is
-`memchr`, which is what the prelude's own `find_byte` is written as. A read-only view that could
+`memchr`, which is what the library's own `find_byte` is written as. A read-only view that could
 not yield an address could not do the job it was added for, and would buy nothing for it: `*T` is
 greppable, and a program with none still cannot reach these bytes.
 

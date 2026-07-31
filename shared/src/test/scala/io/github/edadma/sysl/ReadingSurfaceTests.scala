@@ -13,6 +13,21 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
 
+  /** The reading surface is a module rather than part of the standard one, so a program that reads
+   * says so. It is written once here and prepended to every program below, since what each of them
+   * is about is the bytes and not the import — but it is a real line in a real file, and a program
+   * that leaves it out is refused, which `LibraryTreeTests` is where that is asserted.
+   */
+  private val importing = "import sysl.io.*\n\n"
+
+  override protected def run(src: String): String = super.run(importing + src)
+
+  override protected def runWith(src: String, args: String*): String =
+    super.runWith(importing + src, args*)
+
+  override protected def panics(src: String, message: String): Unit =
+    super.panics(importing + src, message)
+
   /** The library offers no way to turn a path into a file descriptor, and deliberately: `Reader` is
    * about bytes arriving, not about where a program got its descriptors. So every program here opens
    * its own, which is also the demonstration that `FdReader` is not tied to standard input.
@@ -717,10 +732,11 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
 
     "and the platform's read arrives the moment something asks for it" in {
       val src =
-        """var r = stdin()
-          |var room: [8]u8
-          |
-          |print(r.read(room[..]).len)""".stripMargin
+        importing +
+          """var r = stdin()
+            |var room: [8]u8
+            |
+            |print(r.read(room[..]).len)""".stripMargin
       val ir = Compiler.compileToLlvm(src, "<input>").getOrElse(fail("the reading surface broke"))
 
       ir should include("declare i64 @read(i32, ptr, i64)")

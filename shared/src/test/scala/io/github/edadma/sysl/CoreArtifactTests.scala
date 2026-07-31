@@ -297,7 +297,9 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       // The heaviest thing in the library that a program can reach by name: `Lines` holds a reader,
       // a fixed array, a slice, and a `Buf` all at once.
       sameBothWays(
-        """var r = stdin()
+        """import sysl.io.*
+          |
+          |var r = stdin()
           |for line in lines(&r)
           |    print(line)
           |end for
