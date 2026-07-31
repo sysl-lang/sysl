@@ -112,4 +112,19 @@ class EnumAttrRunTests extends AnyFreeSpec with RunSupport {
   "a variant named after an attribute does not shadow it" in {
     run("enum Edge\n    First\n    Last\nprint(Edge::Pos(Edge::First), Edge::Pos(Edge.Last))") shouldBe "0 1\n"
   }
+
+  // Two variants may not stand for one value (`AnalyzerDeclErrorTests`), and this is the other side
+  // of that rule: distinctness is the whole of what is asked, so values written out of order, below
+  // zero, and with gaps between them are ordinary. `Pos` is what makes it a real check — it reports
+  // the declared position, which none of these values is.
+  "discriminants out of order, negative, and gapped are ordinary" in {
+    val Level =
+      """|enum Level: int
+         |    Low = 5
+         |    Deep = -3
+         |    Mid = 0
+         |""".stripMargin
+
+    run(Level + "print(Level::Image(Level.Deep), Level::Pos(Level.Mid), Level::Pos(Level::Last))") shouldBe "Deep 2 2\n"
+  }
 }

@@ -1,0 +1,303 @@
+// A bounded ring buffer: fixed storage, indices that cannot leave it, and the whole of what "this
+// ring is consistent" means written into the types and the contracts rather than into the checks.
+//
+// The axis this owns is **the constrained-subtype surface** — `within` ranges, the `::` attributes
+// they expose, `require`/`ensure`/`old`, and struct invariants. `guide/kernel` gives its three
+// tables bounded identities and then never asks one a question; until this program nothing in the
+// set had read an attribute or written a contract at all. A ring buffer is the smallest subject
+// that needs all of them at once, because every bug a ring buffer has is an index that went
+// somewhere it should not have, and those are the bugs a range type exists to make unwritable.
+//
+// It is written to be **compared**, like `guide/kernel` next to `guide/scheduler`: `Ring` and
+// `Tracked` are the same buffer under the same scenarios, one keeping the fact of where the ring
+// ends once and the other keeping it twice. Every check below runs both and asserts they agree, so
+// the difference between the two implementations is the measurement.
+//
+// What that difference turned out to be, in the order it bit:
+//
+//   * **A derived subtype's attributes handed back its base**, which made the whole `::` surface
+//     unusable by the only kind of subtype that needs it. `Slot::Last` was a `byte`, `Slot::Succ`
+//     took one, and the loop variable of `Slot::Range` was one — so every use of an attribute had
+//     to be cast back into `Slot`, undoing the `new` that made it a type at all. The sibling
+//     surface next door had it right all along: a simple enum's `First`, `Last`, `Succ` and `Pred`
+//     are the enum, and only the ones that cross into another domain (`Pos`, `Image`) are not. It
+//     was invisible until now because a transparent subtype *is* its base, and every test the
+//     attributes had used a transparent one. Fixed in the compiler — the attributes are the subtype,
+//     and `Valid` alone takes the base, because asking whether a value is a `Slot` is only a
+//     question about something that is not one yet.
+//   * **The successor of the last slot is a trap, not a wrap.** `Slot::Succ` steps within the range
+//     and refuses at `Last`, which is exactly right for a counter and exactly wrong for a ring —
+//     the one operation a ring buffer is *made* of is the step that goes round. So the modular
+//     successor is `wrap`, written by hand out of `%`, and the attribute set is not what supplies
+//     the ring's own arithmetic. That is not a defect. It is what the attributes mean: `Succ` is
+//     the step that stays inside a range, and a ring's step does not.
+//   * **An invariant relating two fields is a claim about the representation, not about the code.**
+//     `Tracked` keeps `head`, `tail` and `count`, so `tail == (head + count) % capacity` — and a
+//     `push` that writes `tail` and then `count` traps at the first of the two, on a state that was
+//     on its way to a perfectly good one. The reflex is to call that a wart and reach for a way to
+//     suspend the check. It is not a wart: the invariant is the compiler pointing out that the
+//     struct carries one fact twice, and `Ring` — `head` and `count`, with `tail` computed — has no
+//     invariant to break because there is nothing left to disagree. The mid-update trap found a
+//     redundant field. That is what it is for.
+//
+//     There are **two** honest two-field designs and the invariant rules out neither: this one, and
+//     the embedded classic that keeps `head` and `tail` and derives the count, paying one unused
+//     slot to tell a full ring from an empty one. That second one is what an interrupt-driven ring
+//     wants, because a producer and a consumer then write disjoint fields and neither has to touch
+//     a shared count. What the clause refuses is only the third design that keeps all of them.
+//   * **Where the fields genuinely cannot be ordered, the way out costs the whole struct.** Keeping
+//     `Tracked` anyway, the only form that moves two fields without being seen between them is
+//     whole-struct assignment — `*self = Tracked(self.buf, ...)`, which restates the buffer to move
+//     two bytes. For this ring that is thirty-two bytes copied per push against three written; for
+//     a ring sized like a real one it is the entire storage, per element. **An invariant across two
+//     fields makes the container's own update cost the size of the container**, and the check that
+//     `Ring` and `Tracked` agree is bought at exactly that price.
+//   * **Ordering the writes is enough more often than it looks.** `Watermark` relates two fields
+//     too — `count <= high` — and needs none of the above, because raising the ceiling before the
+//     floor keeps every intermediate state legal. The whole-struct form is the last resort, not the
+//     first; the question to ask of a failing invariant is whether an order exists, and only then
+//     whether the representation is redundant.
+//   * **A program cannot check its own contracts.** A violated `require` traps, so no check below
+//     can be the one that breaks one — the program would die rather than report. Every refusal this
+//     program asserts therefore comes from a *total* operation that answers instead of trapping
+//     (`try_push`, `try_pop`), and the contracts are asserted only by the states they permit. The
+//     traps themselves are asserted from outside, in the suite, which is the only place a trap is
+//     an observation rather than the end of the run.
+//
+// Deliberately not modelled: growth, more than one producer, and any element type but `int`. The
+// first two are other programs' axes and the third is `guide/hashmap`'s.
+
+// The ring's one size. Both the storage and what may index it are named from it, so the two cannot
+// drift apart — a bound is a constant expression, so `within 0..<capacity` is as ordinary as the
+// array beside it.
+const capacity: usize = 8
+
+// A slot of the buffer, and how much of the buffer is occupied. They are `new`, so they are two
+// types and not two names for `u8`: handing a count to something that wanted a slot does not
+// compile, and that is the confusion a ring buffer actually makes. `Count` reaches `capacity`
+// because a full ring has one; `Slot` does not, because there is no such slot.
+type Slot = new u8 within 0..<capacity
+type Count = new u8 within 0..capacity
+
+// The step that goes round. `Slot::Succ` is the step that stays inside the range and traps at
+// `Last`, which is the whole difference between a counter and a ring.
+wrap(s: Slot) -> Slot = Slot(u8((usize(s) + 1) % capacity))
+
+// Where the `n`th slot after `s` is.
+advance(s: Slot, n: Count) -> Slot = Slot(u8((usize(s) + usize(n)) % capacity))
+
+// The ring the invariant argued for: where the elements begin, and how many there are. Where they
+// end is not a field, so there is no second copy of it to contradict the first, and no invariant
+// relating fields — which is why every method below writes one field at a time and none of them
+// has to move two things at once.
+struct Ring
+    buf: [capacity]int
+    head: Slot
+    count: Count
+
+    // The end is computed. This is the field `Tracked` keeps, and the whole of what keeping it
+    // costs is visible in the two implementations side by side.
+    tail(self) -> Slot = advance(self.head, self.count)
+
+    len(self) -> int = int(self.count)
+
+    is_empty(self) -> bool = usize(self.count) == 0
+
+    is_full(self) -> bool = usize(self.count) == capacity
+
+    // The `i`th oldest element. The contract is on the caller because there is no answer to give
+    // for an element that is not there — the total form is `try_pop`, and this is the checked one.
+    at(self, i: int) -> int
+        require i >= 0 && i < self.len()
+        self.buf[usize(advance(self.head, Count(u8(i))))]
+    end at
+
+    // The postcondition is what `old` is for: the claim a push makes is not about the value it
+    // stored but about the length before and after, which is a sentence that needs both.
+    push(*self, v: int)
+        require !self.is_full()
+        ensure self.len() == old(self.len()) + 1
+        self.buf[usize(self.tail())] = v
+        self.count = Count(u8(usize(self.count) + 1))
+    end push
+
+    pop(*self) -> int
+        require !self.is_empty()
+        ensure self.len() == old(self.len()) - 1
+        var v = self.buf[usize(self.head)]
+        self.head = wrap(self.head)
+        self.count = Count(u8(usize(self.count) - 1))
+        v
+    end pop
+
+    // The total forms. A full ring is an ordinary answer rather than a broken caller, and these are
+    // what the checks below use to assert a refusal — a violated `require` would end the program
+    // instead of reporting.
+    try_push(*self, v: int) -> bool
+        if self.is_full() then return false
+        self.push(v)
+        true
+    end try_push
+
+    try_pop(*self) -> Option[int]
+        if self.is_empty() then return None
+        Some(self.pop())
+    end try_pop
+
+    peek(self) -> Option[int]
+        if self.is_empty() then return None
+        Some(self.buf[usize(self.head)])
+    end peek
+
+    clear(*self)
+        ensure self.is_empty()
+        self.count = Count(0u8)
+    end clear
+
+    // The elements oldest first, one digit each, which is what lets a check say what the ring
+    // *contains* rather than only how much of it is occupied.
+    contents(self) -> string
+        var s = ""
+
+        for i in 0..<self.len() do s += str(self.at(i))
+
+        s
+    end contents
+end Ring
+
+// The same ring keeping the end as a field as well. It behaves identically — every check runs both
+// and compares — and the difference is entirely in how it is written.
+struct Tracked
+    buf: [capacity]int
+    head: Slot
+    tail: Slot
+    count: Count
+    invariant usize(tail) == (usize(head) + usize(count)) % capacity
+
+    len(self) -> int = int(self.count)
+
+    is_empty(self) -> bool = usize(self.count) == 0
+
+    is_full(self) -> bool = usize(self.count) == capacity
+
+    at(self, i: int) -> int
+        require i >= 0 && i < self.len()
+        self.buf[usize(advance(self.head, Count(u8(i))))]
+    end at
+
+    // Two fields have to move together and no order of the two is legal on its own, so the write
+    // is of the whole struct — which restates the buffer to move two bytes. Writing
+    // `self.tail = wrap(self.tail)` and then `self.count = ...` traps at the first of them.
+    push(*self, v: int)
+        require !self.is_full()
+        ensure self.len() == old(self.len()) + 1
+        self.buf[usize(self.tail)] = v
+        *self = Tracked(self.buf, self.head, wrap(self.tail), Count(u8(usize(self.count) + 1)))
+    end push
+
+    pop(*self) -> int
+        require !self.is_empty()
+        ensure self.len() == old(self.len()) - 1
+        var v = self.buf[usize(self.head)]
+        *self = Tracked(self.buf, wrap(self.head), self.tail, Count(u8(usize(self.count) - 1)))
+        v
+    end pop
+
+    try_push(*self, v: int) -> bool
+        if self.is_full() then return false
+        self.push(v)
+        true
+    end try_push
+
+    try_pop(*self) -> Option[int]
+        if self.is_empty() then return None
+        Some(self.pop())
+    end try_pop
+
+    // Emptying moves the end as well, because the end is where the elements are — which is the
+    // clearest single line of what the extra field costs: `Ring` writes `count` and is done.
+    clear(*self)
+        ensure self.is_empty()
+        *self = Tracked(self.buf, self.head, self.head, Count(0u8))
+    end clear
+
+    contents(self) -> string
+        var s = ""
+
+        for i in 0..<self.len() do s += str(self.at(i))
+
+        s
+    end contents
+end Tracked
+
+// Two fields that must agree, where ordering the writes is the whole answer: raising the ceiling
+// before the floor means no intermediate state is ever illegal. This is the case the mid-update
+// trap does *not* apply to, and it is the common one.
+struct Watermark
+    count: Count
+    high: Count
+    invariant usize(count) <= usize(high)
+
+    take(*self)
+        require usize(self.count) < capacity
+        ensure int(self.count) == int(old(self.count)) + 1
+        var n = Count(u8(usize(self.count) + 1))
+
+        if usize(n) > usize(self.high) then self.high = n
+
+        self.count = n
+    end take
+
+    give(*self)
+        require usize(self.count) > 0
+        ensure int(self.count) == int(old(self.count)) - 1
+        self.count = Count(u8(usize(self.count) - 1))
+    end give
+end Watermark
+
+fresh_ring() -> Ring = Ring([0; capacity], Slot(0), Count(0))
+
+fresh_tracked() -> Tracked = Tracked([0; capacity], Slot(0), Slot(0), Count(0))
+
+// One thing a run does at a tick.
+enum Step
+    Put(v: int)
+    Take
+    Idle
+end Step
+
+// A producer and a consumer sharing one ring, stepping through a fixed script. Each tick writes a
+// letter: the digit that moved, `x` for a push a full ring refused, `-` for a pop from an empty
+// one, and `.` for a tick nobody used. The result is a schedule that can be worked out on paper,
+// which is what makes it an assertion rather than a recording.
+run_ring(script: []Step) -> string
+    var r = fresh_ring()
+    var out = ""
+
+    for i in 0..<script.len
+        out += script[i] match
+            Put(v) -> if r.try_push(v) then str(v) else "x"
+            Take -> r.try_pop() match
+                Some(v) -> str(v)
+                None -> "-"
+            Idle -> "."
+
+    out
+end run_ring
+
+// The same run over the ring that keeps its end twice. Every scenario below is asserted against
+// both, and the two strings are required to be equal.
+run_tracked(script: []Step) -> string
+    var t = fresh_tracked()
+    var out = ""
+
+    for i in 0..<script.len
+        out += script[i] match
+            Put(v) -> if t.try_push(v) then str(v) else "x"
+            Take -> t.try_pop() match
+                Some(v) -> str(v)
+                None -> "-"
+            Idle -> "."
+
+    out
+end run_tracked

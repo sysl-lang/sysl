@@ -255,6 +255,29 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
     )
   }
 
+  // The one program whose subject is the checking rather than the computing: two implementations of
+  // the same buffer, one keeping where the elements end and one computing it, driven through every
+  // scenario side by side and required to agree. What it cannot do is break a contract — a violated
+  // `require` traps, so the program would end rather than report — and those claims are asserted in
+  // `RingClaimTests` instead.
+  "ring — bounded indices, and an invariant that found a redundant field" in {
+    val out = guide("ring")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 100
+    sections(out) shouldBe List(
+      "-- the slot type, and the step it will not take",
+      "-- an empty ring",
+      "-- what goes in comes out in order",
+      "-- filling it, and what a full ring refuses",
+      "-- going round the end",
+      "-- emptying",
+      "-- a producer and a consumer over one ring",
+      "-- two fields where ordering the writes is enough",
+      "-- every state a ring of this size has",
+    )
+  }
+
   "matrix — an operator whose result is neither operand's type" in {
     val out = guide("matrix")
 

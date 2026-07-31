@@ -151,27 +151,32 @@ trait ExprAnalysis
   private def checkInto(v: TExpr, c: Type.Constrained): TExpr = TConstrainedCheck(v, c).setPos(v.pos)
 
 
-  /** If `place` is a field of a struct that carries `invariant` clauses, wrap the write so the
-   * struct's invariant is re-checked the moment the field changes; otherwise the write stands as it
-   * is. The receiver of the field is the struct to re-read — the same node covers `s.f = v`, a
-   * compound `s.f op= v`, and a through-pointer `(*p).f = v`, since each analyses to a field place.
+  /** Wraps the write so that every struct the place is written *inside* re-checks its invariant the
+   * moment the field changes. The wraps nest innermost-first, so the smallest struct broken is the
+   * one whose diagnostic fires.
    */
   private def withInvCheck(place: TExpr, store: TExpr): TExpr =
-    invCheckFor(place) match
-      case Some((recv, s, fn)) => TCheckedStore(store, recv, s, fn).setPos(store.pos)
-      case None                => store
+    invCheckFor(place).foldLeft(store)((acc, c) => TCheckedStore(acc, c._1, c._2, c._3).setPos(store.pos))
 
-  /** The struct a write through `place` obliges a re-check of, if any: what to re-read, its type,
-   * and the predicate to call. Split out from the wrapper above because a multi-assignment's writes
-   * are statements rather than expressions, so there is nothing there for a node to wrap.
+  /** Every struct a write through `place` obliges a re-check of: what to re-read, its type, and the
+   * predicate to call, innermost first. Split out from the wrapper above because a multi-assignment's
+   * writes are statements rather than expressions, so there is nothing there for a node to wrap.
+   *
+   * The walk goes **outward through the whole place**, not just to the field's own receiver, because
+   * an invariant may read through a field — `invariant a.n <= b` is a claim `o.a.n = 9` can break
+   * just as `o.b = 0` can, and only the enclosing struct knows it. Nothing is owed by the parts of a
+   * place that merely locate it, so an index contributes no check of its own and is walked through.
    */
-  protected def invCheckFor(place: TExpr): Option[(TExpr, Type.Struct, String)] = place match
-    case TField(recv, _, _) =>
-      recv.ty match
-        case s: Type.Struct if structDecls.get(s.base).exists(d => d.invariants.nonEmpty && d.tparams.isEmpty) =>
-          Some((recv, s, invKey(s.base)))
-        case _ => None
-    case _ => None
+  protected def invCheckFor(place: TExpr): List[(TExpr, Type.Struct, String)] =
+    def owed(recv: TExpr): List[(TExpr, Type.Struct, String)] = recv.ty match
+      case s: Type.Struct if structDecls.get(s.base).exists(d => d.invariants.nonEmpty && d.tparams.isEmpty) =>
+        List((recv, s, invKey(s.base)))
+      case _ => Nil
+
+    place match
+      case TField(recv, _, _) => owed(recv) ++ invCheckFor(recv)
+      case TIndex(recv, _, _) => invCheckFor(recv)
+      case _                  => Nil
 
   /** `Name(value)` — an explicit cast into a constrained subtype. The operand is taken at the
    * subtype's base and checked; a value whose base does not agree is a mistake the message names.
@@ -410,8 +415,11 @@ trait ExprAnalysis
       // What has to hold is that the result can be stored back. A constrained place is the one case
       // where the arithmetic's type and the place's legitimately differ — a transparent subtype
       // computes at its base — so the test is on the representation the two share, and what the
-      // difference costs is the check `constraintOf` asks for.
-      if d.isEmpty && Type.repr(arithType(binSym, place.ty, tv.ty)) != Type.repr(place.ty) then
+      // difference costs is the check `constraintOf` asks for. `disagree` is that comparison plus
+      // the suppression a poisoned type wants: a place whose type could not be worked out has been
+      // complained about once already, and saying its `+=` changes a type is a second complaint
+      // about the consequence.
+      if d.isEmpty && disagree(arithType(binSym, place.ty, tv.ty), place.ty) then
         err(s"'$op' would change the type of ${describe(target)}")
 
       withInvCheck(place, TUpdate(place, op, tv, place.ty, d, constraintOf(place.ty)))

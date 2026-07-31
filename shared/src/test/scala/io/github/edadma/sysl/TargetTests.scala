@@ -179,6 +179,85 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  /** Everything whose width `Layout` has to state in the emitted text rather than leave to LLVM: a
+   * padded aggregate, a nested one, an array, a data enum's union region — and a `va_list`, whose
+   * storage `targets.md § What a target does not decide` says is one width for every target.
+   */
+  private val shapes =
+    """struct Padded
+      |    a: u8
+      |    big: i64
+      |    b: u16
+      |
+      |struct Nested
+      |    p: Padded
+      |    q: [3]u16
+      |
+      |enum Payload
+      |    Small(c: u8)
+      |    Large(x: i64, y: i64)
+      |    Middling(f: f32)
+      |
+      |extern vprintf(fmt: *u8, ap: va_list) -> i32
+      |
+      |log(fmt: *u8, ...) -> i32
+      |    var ap: va_list
+      |    va_start(ap)
+      |    var k = vprintf(fmt, &ap)
+      |    va_end(ap)
+      |    k
+      |end log
+      |
+      |what(p: Payload) -> int
+      |    p match
+      |        Small(c) -> int(c)
+      |        Large(x, y) -> int(x + y)
+      |        Middling(f) -> 0
+      |end what
+      |
+      |var n = Nested(Padded(1u8, 2i64, 3u16), [4u16; 3])
+      |var s: *u8 = null
+      |print(n.p.a, what(Small(1u8)), log(s, 1))""".stripMargin
+
+  private def typeLines(t: Target): List[String] =
+    irFor(t, shapes).linesIterator.filter(_.contains("= type")).toList
+
+  /** `targets.md § What a target does not decide` rests the whole of `Layout` on one claim: every
+   * target in the registry answers a layout question the same way, so the object that answers them
+   * takes no `Target`. `LayoutTests` measures those answers against *this machine*, which is a
+   * statement about a machine rather than about targets — the agreement itself can only be made by
+   * emitting one program for more than one of them.
+   */
+  "what a target does not decide" - {
+    "every target lays an aggregate out the same way, which is why Layout takes none" in {
+      val supported = Target.all.filter(_.supported)
+      val host      = typeLines(supported.head)
+
+      host should not be empty
+
+      for t <- supported.tail do withClue(t.name)(typeLines(t) shouldBe host)
+    }
+
+    // And the agreement is worth something only because the modules themselves disagree: these same
+    // targets lower a variadic walk four different ways, so "the type lines match" is a fact about
+    // layout and not about the target being ignored.
+    "while the code around those types is not the same for all of them" in {
+      val supported = Target.all.filter(_.supported)
+
+      supported.map(t => irFor(t, shapes)).distinct.length should be > 1
+    }
+
+    // The width is `Layout`'s, not the target's: a module built for a machine whose own `va_list` is
+    // eight bytes still reserves the widest any of them needs.
+    "and a va_list is spelled one way in every module, the widest any target needs" in {
+      Target.all.filter(_.supported).map(_.vaListBytes).distinct.length should be > 1
+      Layout.size(Type.VaList) shouldBe 32
+
+      for t <- Target.all if t.supported do
+        withClue(t.name)(irFor(t, shapes) should include(s"alloca ${Type.VaList.llvm}"))
+    }
+  }
+
   "the machine as it described itself" - {
     "is shown in its own words, whether or not it was recognized" in {
       val (processor, system) = hostMachine

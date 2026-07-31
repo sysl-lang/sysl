@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 /** Everything that traps when a value turns out not to be what it was promised to be: a function's
  * `require` and `ensure` clauses (`16 §5`), a constrained subtype's `within` range and `where`
- * predicate (`16 §4`), and a struct's `invariant` (`05`).
+ * predicate (`16 §4`), and a struct's `invariant` (`16 §6`).
  *
  * They live together because they are one mechanism wearing four names. Each one evaluates a
  * condition and traps on false, and each one has to leave nothing behind on the checked path — a

@@ -89,7 +89,9 @@ trait ControlFlowExprAnalysis extends ExprSupport {
             case _                  => err(s"'${qn(typeKey(tn).get)}::Range' needs a 'within' range")
           val last      = if c.exclusiveHi then hi - 1 else hi
           pushScope()
-          val u         = declare(name, i)
+          // The loop variable is a `T`, since what the range walks are the values of the subtype —
+          // the bounds and the comparison stay at the base, which is what `T` is laid out as.
+          val u         = declare(name, c)
           val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
           popScope()
           val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))

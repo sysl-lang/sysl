@@ -23,6 +23,14 @@ one and asserts that nothing failed, that the number of checks is the one expect
 sections ran in order — the count being what makes the first assertion mean anything, since a check
 that quietly stopped running would otherwise look like a check that passed.
 
+**What a program cannot check about itself is what it refuses.** A violated `require`, a broken
+`invariant` and a failed range check all *trap*, so a program that tried to demonstrate one would
+die rather than report it, and the run would look truncated instead of failing. A program therefore
+asserts a refusal only through a total operation that answers instead of trapping — and the traps
+themselves are asserted from outside, in a suite, which is the only place a trap is an observation
+rather than the end of the run. `guide/ring` is the first to need this and `RingClaimTests` is where
+its half of the evidence lives.
+
 | directory | axis it owns |
 |---|---|
 | `json` | recursive ownership — a value that contains itself through `&T` |
@@ -36,6 +44,7 @@ that quietly stopped running would otherwise look like a check that passed.
 | `kernel` | the same scheduler with no heap — a fixed table, indices for identity, intrusive lists |
 | `datetime` | a conversion that can succeed twice — wall clocks, timelines, and daylight saving |
 | `matrix` | an operator whose result is neither operand's type — a vector space, then Gaussian elimination |
+| `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts and struct invariants |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

@@ -53,8 +53,9 @@ class SyslParser(val source: Source) extends DeclParser {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      importDecl | implDecl | declaration | varDecl | returnStmt |
-        breakStmt | continueStmt | requireStmt | ensureStmt | multiAssign | resultListStmt | exprStmt,
+      capabilityClause | importDecl | implDecl | declaration | varDecl | returnStmt |
+        breakStmt | continueStmt | requireStmt | ensureStmt | multiAssign |
+        resultListStmt | exprStmt,
     )
 
   /** A statement written on the same line as the keyword that introduces it.
@@ -159,6 +160,23 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val moduleHeader: Parser[ModuleName] =
     at(op("module") ~> dottedName ^^ ModuleName.apply)
+
+  /** The capability clause `13 §4` and `capabilities.md` specify and nothing implements — `no alloc`
+   * to narrow a module below its target, `requires alloc` to declare what it cannot do without.
+   *
+   * It is matched only to be refused, for the reason `noVisibility` is matched: both documents
+   * describe this clause in detail, so a reader writes exactly what the design tells them to and is
+   * answered with "newline expected" at the head of a line the design told them to write. Saying
+   * what is true of the clause instead costs one rule.
+   *
+   * `no` and `alloc` are **reserved**, not contextual, so they are matched with `op` — a `softWord`
+   * matches an identifier and these never lex as one, which is why the words were already spoken for
+   * and the clause still had nowhere to go.
+   */
+  protected lazy val capabilityClause: Parser[Nothing] =
+    (op("no") ~ op("alloc") | op("requires") ~ (op("alloc") | ident)) ~> err(
+      "a module's capability clause is designed but not built: 'capabilities.md' and '13 §4' " +
+        "specify 'no alloc' and 'requires alloc', and nothing enforces either yet")
 
   /** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — the Scala forms (`13 §3`).
    *

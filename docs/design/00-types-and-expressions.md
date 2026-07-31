@@ -189,7 +189,7 @@ statements are the version that surprises: `a += b` followed by `b += a` folds t
 and nothing on the page says so. One line that means what it looks like is worth more than a rule
 against writing it.
 
-**A struct's `invariant` is re-checked once, after every write has landed** (`05`), and not after
+**A struct's `invariant` is re-checked once, after every write has landed** (`16 §6`), and not after
 each one in turn. This is the same rule as everything else here, applied to the checks: the form
 promises that the places change together, and an invariant relating two fields is exactly what it
 is for. Checking field by field would refuse `s.lo, s.hi = 6, 8` on a `Span` that held `1..5`,

@@ -108,8 +108,16 @@ without any pass having to carry the source text alongside the message.
 
 ## Reporting every error, not just the first
 
-A compilation reports **every mistake it can find**, rendered in source order and separated by a
-blank line. The analyzer still signals an error by throwing — 150-odd call sites say `err(…)` and
+A compilation reports **every mistake it can find, up to a limit of five**, rendered in source order
+and separated by a blank line. Past five it stops and says how many there were — `showing the first 5
+of 8 errors` — and the five it keeps are the **earliest**, because an error early in a file is
+usually the one that caused the rest and is the one worth reading. At exactly five it says nothing
+extra, there being nothing withheld. Escape errors are capped the same way and on their own count,
+since they come from a different pass.
+
+The cap is worth stating rather than leaving to be discovered: the whole point of the machinery below
+is that a reader gets more than the first mistake, and a reader who gets exactly five and no note of
+it would conclude they had them all. The analyzer still signals an error by throwing — 150-odd call sites say `err(…)` and
 mean it — but the throw is caught at a **recovery region** boundary, the error is recorded, and
 the walk resumes at the next region. The regions are the boundaries a well-formed program can
 resynchronize on:

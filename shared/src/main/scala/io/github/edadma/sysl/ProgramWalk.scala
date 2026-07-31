@@ -81,8 +81,19 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
     // A non-generic type is instantiated eagerly, so it is emitted whether or not it is used;
     // a generic one only exists once something asks for a concrete instantiation.
-    for (n, d) <- enumDecls if d.tparams.isEmpty do recover(())(instantiateEnum(n, Nil))
-    for (n, d) <- structDecls if d.tparams.isEmpty do recover(())(instantiateStruct(n, Nil))
+    //
+    // A bad one is reported where the constants above are: at the declaration, since that is the
+    // line that is wrong. Without the position these loops set, the complaint landed at whatever the
+    // walk had last looked at — for a program whose only mistake was its own first line, that was a
+    // trait in the prelude. Failing here also marks the name broken, so that the mentions of the type
+    // further down abandon their own statements without repeating what the declaration was already
+    // told.
+    def eagerly(key: String, decl: Positioned)(build: => Type): Unit =
+      currentPos = decl.pos
+      if !recover(false) { build; true } then brokenDecls += key
+
+    for (n, d) <- enumDecls if d.tparams.isEmpty do eagerly(n, d)(instantiateEnum(n, Nil))
+    for (n, d) <- structDecls if d.tparams.isEmpty do eagerly(n, d)(instantiateStruct(n, Nil))
 
     // Every constrained subtype is resolved now, whether or not anything uses it — so an out-of-range
     // or inverted bound is a mistake reported at the declaration, exactly as a constant's is.

@@ -67,9 +67,19 @@ class SubtypeOperatorTests extends AnyFreeSpec with RunSupport with CodegenSuppo
       run(Age + "var a: Age = 12\nvar b: Age = 5\nprint(a + b, a - b, a * b, a / b, a % b)") shouldBe
         "17 7 60 2 2\n"
     }
-    "including the bitwise ones and the shifts" in {
-      run(Mask + "var m: Mask = 12\nvar n: Mask = 5\nprint(m & n, m | n, m ^ n, m << n, m >> n)") shouldBe
-        "4 13 9 128 0\n"
+    "including the bitwise ones, none of which can leave the base width" in {
+      run(Mask + "var m: Mask = 12\nvar n: Mask = 5\nprint(m & n, m | n, m ^ n, m >> n)") shouldBe
+        "4 13 9 0\n"
+    }
+
+    /** A left shift is the one bitwise operator that can lose a bit, so on a **ranged** type it is
+     * checked rather than allowed to wrap. `12 << 5` is 384 and a `u8` cannot hold it; the wrapped
+     * 128 is a wrong answer that a produce-site range check could pass without noticing, which is
+     * the hole the checked form closes. A shift that fits is untouched.
+     */
+    "while a shift that pushes a bit out of the base width traps" in {
+      exits(Mask + "var m: Mask = 12\nvar n: Mask = 5\nprint(m << n)")
+      run(Mask + "var m: Mask = 3\nvar n: Mask = 2\nprint(m << n)") shouldBe "12\n"
     }
   }
 

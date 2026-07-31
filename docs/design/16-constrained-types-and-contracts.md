@@ -146,6 +146,17 @@ is not a `Small` and does not have to be, since what has to be in range is the p
 product is checked where it is stored. A **derived** subtype is its own representation, so it mixes
 with the base only through the cast §2 requires, and its results are its own and checked as §4 says.
 
+**The operations are the base's; their *overflow* is not.** Raw integer arithmetic wraps, and a
+wrapped result reaching a produce site is a wrong answer the range check can pass without noticing:
+on a `Slot = u8 within 0..<200`, `Slot(150) + Slot(150)` is 300, which wraps to 44, which is in
+range. So where an operand came through a `within` type and the operands' declared ranges permit a
+result the base width cannot hold, `+`, `-` and `*` are overflow-detecting and trap. A range narrow
+enough that its results always fit stays on the plain instruction, so a counter, an index, and an
+`x + 1` cost exactly what they did before. A left shift is checked on its own terms — it has no
+overflow intrinsic, so a bit pushed out of the top is caught by shifting back, and a shift amount at
+or past the width traps rather than being undefined. Raw integer arithmetic, on a type with no range,
+still wraps.
+
 What the base does not have, the subtype does not either, and the diagnostic names the subtype: unary
 `-` over an unsigned base, `~` over a float, `++` over a float or a `char`.
 
@@ -215,12 +226,25 @@ what a `within`-ranged integer subtype offers:
 
 | written | is | notes |
 |---|---|---|
-| `T::First` | the lower bound | a constant, no argument |
-| `T::Last` | the upper bound | one *below* the written bound where the range is exclusive |
-| `T::Valid(x)` | whether `x` is in range | a `bool`, and **total** — it never traps, which is what makes it the question form |
-| `T::Succ(x)` | the next value | traps at `T::Last` |
-| `T::Pred(x)` | the previous value | traps at `T::First` |
-| `T::Range` | the range itself | only as a `for` loop's iterable, `First..Last` inclusive |
+| `T::First` | the lower bound | a `T`, a constant, no argument |
+| `T::Last` | the upper bound | a `T`; one *below* the written bound where the range is exclusive |
+| `T::Valid(x)` | whether `x` is in range | takes the **base**; a `bool`, and **total** — it never traps, which is what makes it the question form |
+| `T::Succ(x)` | the next value | a `T` from a `T`; traps at `T::Last` |
+| `T::Pred(x)` | the previous value | a `T` from a `T`; traps at `T::First` |
+| `T::Range` | the range itself | only as a `for` loop's iterable, `First..Last` inclusive, the variable a `T` |
+
+**Every attribute but `Valid` speaks the subtype.** A bound of `T` is a value of `T`, the step from
+one `T` is another, and the values `Range` walks are `T`'s. This is invisible on a transparent
+subtype, where `T` and its base agree anyway (§1) — it is what makes the set usable on a **derived**
+one, which is otherwise the only kind of type whose own attributes would have to be cast back into
+it. A `new` subtype exists to stay out of its base's traffic, and an attribute surface that handed
+back the base would make its own declaration the thing you had to undo to use it.
+
+`Valid` is the exception and the asymmetry is its job: it takes the **base**, because asking whether
+a value is a `T` is only a question about something that is not one yet. Handed a `T` it is refused,
+since the answer could only be yes. The numbers it can be asked about are therefore the ones the
+base can hold, and a subtype over a `u8` cannot be asked about `-1` — that is not a narrowing of the
+question, it is the base's range being what a base is.
 
 **`Valid` is the answer to "how do I ask instead of trapping".** §4 rules that a produce site traps
 because a value outside the range is a mistake and not a condition; `Valid` is how a program that
@@ -268,11 +292,43 @@ cheap implementation checks the constructor and calls it done:
   (`w.hi++`), which is a write of one field and owed the same re-check
 - a field written through a pointer
 - a field written into an array element
+- a field written **inside** one of these — `o.a.n = 9`, or `g.items[0].n = 9`
+
+That last one is owed for a reason worth stating, because it is the one a narrow reading misses. A
+clause may read *through* a field: `invariant a.n <= b` is legal, and `a.n` is then not a field of
+the struct at all, so the write that breaks it is a write the struct never sees. The obligation is
+therefore on **every struct a place is written inside**, not only on the one whose field is named
+last, and the checks nest innermost-first, so the smallest struct the write broke is the one that
+stops it. An index locates a place rather than owning one, so it contributes no check and is walked
+through.
 
 The consequence, and it is the intended one: a sequence of writes that ends in a valid state but
 passes through an invalid one **traps at the step that broke it**. There is no "I am mid-update"
-mode. A struct that cannot be updated one field at a time has to be updated as a whole, which is
-what whole-struct assignment is for.
+mode.
+
+### What to do when a struct cannot be updated one field at a time
+
+Three answers, and the order matters, because the last one is the expensive one and it is the one
+reached for first:
+
+1. **Look for an order in which no intermediate state is illegal**, and often there is one. A
+   `count <= high` watermark is updated by raising the ceiling before the floor, and needs nothing
+   else; the same two writes in the other order are refused. That the same clause accepts one order
+   and refuses the other is the whole of the answer here.
+2. **Ask whether the clause is pointing at a redundant field.** An invariant relating two fields is
+   a claim about the *representation*, and the trap is often the compiler observing that the struct
+   carries one fact twice. A ring buffer that keeps `head`, `tail` and `count` cannot move any two of
+   them one at a time; one that keeps `head` and `count` and computes the end has no clause to break,
+   because nothing is left to disagree. Two of the three fields is the honest design either way —
+   which two is a choice about who writes what, not about the invariant.
+3. **Otherwise, assign the whole struct**, which is what whole-struct assignment is for — and know
+   the price. `*self = Ring(self.buf, ...)` restates the *whole* value to move two bytes, so an
+   invariant across two fields makes a container's own update cost the size of the container. For a
+   buffer that is its entire storage, per element.
+
+The multi-assignment form (`00 §2`) is the fourth way and belongs beside them: `s.lo, s.hi = 6, 8`
+lands both writes before either invariant is consulted, so a pair that ends legal is legal even
+where each half alone would not be.
 
 Invariants on a **generic** struct are not supported and say so.
 
@@ -377,3 +433,31 @@ made every arithmetic operator a produce site nobody had written down, so `Slot(
 `Slot` holding 200 — and storing it into another `Slot` did not re-check, because a value that
 already has the type is not produced again. `type Slot = new u8 within 0..<200` is §1's own example
 row. The two forms that compute and store in one step, `a += e` and `a++`, were the other omission.
+
+**f. A write through an alias into a field an invariant reads.** §6's obligation is discharged by
+walking outward through the *place* being written, and a pointer is where the places run out:
+
+```
+struct Inner
+    n: int
+struct Outer
+    a: Inner
+    b: int
+    invariant a.n <= b
+
+wreck(p: *Inner)
+    p.n = 9
+
+var o = Outer(Inner(1), 5)
+wreck(&o.a)        // `Outer`'s invariant is now false, and nothing said so
+```
+
+Inside `wreck` there is no `Outer` to re-read and no way to learn there ever was one, so no amount of
+checking at the write closes this. It is the only hole left in "checked at every write", and it is a
+rule about **what may be aliased** rather than about what is emitted — which is the shape of SPARK's
+answer, and the aliasing model this project has otherwise adopted. The candidates: refuse `&` on a
+field that an enclosing invariant reads (statically knowable, since a clause names the fields it
+reads); refuse it on any field of a struct carrying clauses at all (cruder, and it forbids handing
+out `&o.b`, which is harmless); or state the limit and leave it, which is what an invariant means in
+C++ too. The first looks right, and nothing turns on it until a program wants such a pointer. The
+case is pinned by an ignored test, so whichever way it goes the evidence is already written down.

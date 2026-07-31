@@ -40,7 +40,70 @@ trait ScalarEmitter extends StringEmitter {
           case _   => sys.error(s"unreachable arith '$op'")
       case other => sys.error(s"unreachable arith on ${other.llvm}")
 
-    val r = freshTemp(); emit(s"$r = $instr ${ty.llvm} $lv, $rv"); r
+    // Integer division and remainder have two inputs LLVM leaves undefined and would miscompile: a
+    // zero divisor always, and — for signed operands — INT_MIN by -1, whose true quotient overflows
+    // the width. A zero divisor traps; signed `/` traps on that overflow; signed `%` returns its
+    // defined zero by dividing by 1 in the one case -1 would make the remainder undefined, since
+    // `a % -1` is 0 for every `a`. None of this touches raw multiplication or addition, which wrap.
+    var divisor = rv
+    ty match
+      case i: Type.Integer if op == "/" || op == "%" =>
+        val nz = freshTemp(); emit(s"$nz = icmp ne ${ty.llvm} $rv, 0")
+        trapUnless(nz, "div")
+        if i.signed then
+          val neg1 = freshTemp(); emit(s"$neg1 = icmp eq ${ty.llvm} $rv, -1")
+          if op == "/" then
+            val min   = (-(BigInt(2).pow(i.bits - 1))).toString
+            val isMin = freshTemp(); emit(s"$isMin = icmp eq ${ty.llvm} $lv, $min")
+            val ovf   = freshTemp(); emit(s"$ovf = and i1 $isMin, $neg1")
+            val ok    = freshTemp(); emit(s"$ok = xor i1 $ovf, true")
+            trapUnless(ok, "overflow")
+          else
+            val safe = freshTemp(); emit(s"$safe = select i1 $neg1, ${ty.llvm} 1, ${ty.llvm} $rv")
+            divisor = safe
+      case _ =>
+
+    val r = freshTemp(); emit(s"$r = $instr ${ty.llvm} $lv, $divisor"); r
+  }
+
+  /** Integer `+`, `-`, `*` where the operands' declared ranges allow a result the base width cannot
+   * hold, so a plain instruction would wrap before the range check at the produce site could see it.
+   * The overflow-detecting intrinsic traps on a representation overflow, so what the range check then
+   * examines is the true result. Raw integer arithmetic is defined to wrap and never reaches here;
+   * a range narrow enough that its results always fit the width stays on the plain path above.
+   */
+  protected def checkedArith(op: String, ty: Type.Integer, lv: String, rv: String): String = {
+    val name = op match
+      case "+" => "add"
+      case "-" => "sub"
+      case "*" => "mul"
+      case _   => sys.error(s"unreachable checkedArith '$op'")
+    val fn = s"llvm.${if ty.signed then "s" else "u"}$name.with.overflow.${ty.llvm}"
+    satDecls += s"declare {${ty.llvm}, i1} @$fn(${ty.llvm}, ${ty.llvm})"
+
+    val pair = freshTemp(); emit(s"$pair = call {${ty.llvm}, i1} @$fn(${ty.llvm} $lv, ${ty.llvm} $rv)")
+    val v    = freshTemp(); emit(s"$v = extractvalue {${ty.llvm}, i1} $pair, 0")
+    val ovf  = freshTemp(); emit(s"$ovf = extractvalue {${ty.llvm}, i1} $pair, 1")
+    val ok   = freshTemp(); emit(s"$ok = xor i1 $ovf, true")
+    trapUnless(ok, "overflow")
+    v
+  }
+
+  /** A left shift of a value produced through a ranged type. There is no overflow intrinsic for a
+   * shift, so the check is direct: the amount must be below the width — the machine shift is
+   * undefined at or above it — and shifting the result back must recover the value, since a bit
+   * pushed out of the top is exactly the overflow. Raw shifts, the hot bit-manipulation path, are
+   * left to wrap and never reach here.
+   */
+  protected def checkedShl(ty: Type.Integer, lv: String, sh: String): String = {
+    val amtOk = freshTemp(); emit(s"$amtOk = icmp ult ${ty.llvm} $sh, ${ty.bits}")
+    trapUnless(amtOk, "overflow")
+
+    val r    = freshTemp(); emit(s"$r = shl ${ty.llvm} $lv, $sh")
+    val back = freshTemp(); emit(s"$back = ${if ty.signed then "ashr" else "lshr"} ${ty.llvm} $r, $sh")
+    val ok   = freshTemp(); emit(s"$ok = icmp eq ${ty.llvm} $back, $lv")
+    trapUnless(ok, "overflow")
+    r
   }
 
   /** The `icmp` / `fcmp` predicate for an operator at a type. `char` compares by scalar

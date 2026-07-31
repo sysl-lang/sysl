@@ -204,5 +204,131 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
           |    B""".stripMargin
       ) should include("does not fit")
     }
+
+    /** A simple enum's value is the whole of its identity, so two names for one value leave the
+      * language unable to keep its own promises: `Pos` and `Val` stop being inverses, the second
+      * variant's `match` arm can never run, and `Image` lowered to a `switch` with a repeated case,
+      * which clang rejected — the program was accepted and then failed to assemble.
+      */
+    "two variants standing for one value" - {
+      "are refused, and the message names both of them and the value" in {
+        val e = err(
+          """enum Colour: int
+            |    Red = 1
+            |    Green = 1
+            |    Blue = 2""".stripMargin
+        )
+
+        e should include("'Red' and 'Green'")
+        e should include("both stand for 1")
+        e should include("a 'const'")
+      }
+
+      // The collision an explicit value cannot be read off the line it is written on: `Green` takes
+      // the value after `Red`, and `Blue` says that same number out loud two lines later.
+      "including where an auto-incremented value lands on an explicit one" in {
+        err(
+          """enum Colour: int
+            |    Red = 1
+            |    Green
+            |    Blue = 2""".stripMargin
+        ) should include("'Green' and 'Blue' both stand for 2")
+      }
+
+      // Distinctness is the whole of the rule: nothing about order or sign is being asked for. The
+      // negative control — that such an enum still runs and still answers correctly — is in
+      // `EnumAttrRunTests`, where a run can show the values rather than only their acceptance.
+
+      // A data enum's tags are handed out in order and it refuses an explicit value outright, so it
+      // has no way to reach the collision — pinned here so that giving it one would have to say so.
+      "and a data enum cannot reach the case at all" in {
+        err(
+          """enum Shape
+            |    Circle(r: int)
+            |    Empty = 0""".stripMargin
+        ) should include("cannot also have an explicit value")
+      }
+
+      // A declaration is judged whether or not anything reads it, exactly as a constant is — so the
+      // enum nobody mentions is the one that shows the judging happens at the declaration and not on
+      // the way to a use.
+      "even where nothing in the program ever names the enum" in {
+        err(
+          """enum Unused: int
+            |    Red = 1
+            |    Green = 1
+            |print("nothing mentions it")""".stripMargin
+        ) should include("both stand for 1")
+      }
+
+      // A discriminant is any constant expression (`13 §7`), so the collision need not be visible in
+      // the two lines that collide — it is the folded values that must differ, not their spellings.
+      "and where one value reaches its number through a const" in {
+        err(
+          """const TOP: int = 1
+            |enum Colour: int
+            |    Red = TOP
+            |    Green = 1""".stripMargin
+        ) should include("'Red' and 'Green' both stand for 1")
+      }
+    }
+
+    /** A generic enum has no eager instantiation to be judged at, so the first use is where it is
+      * caught — but nothing a *simple* enum's variants read depends on the type arguments, so it is
+      * still the declaration that is wrong and still reported once however many instantiations
+      * follow.
+      */
+    "a generic simple enum with two variants standing for one value" in {
+      def occurrences(haystack: String, needle: String): Int =
+        haystack.sliding(needle.length).count(_ == needle)
+
+      val e = err(
+        """enum Pair[T]
+          |    Left = 1
+          |    Right = 1
+          |var p: Pair[int] = Pair[int].Left
+          |var q: Pair[bool] = Pair[bool].Left""".stripMargin
+      )
+
+      e should include("'Left' and 'Right' both stand for 1")
+      occurrences(e, "both stand for") shouldBe 1
+    }
+
+    /** A declaration is judged once, but its name can be mentioned any number of times, and each
+      * mention used to rebuild the type and raise the same complaint again at its own position. The
+      * report also landed wherever the walk had last looked rather than at the declaration — for a
+      * program whose only mistake was its first line, that was a trait in the prelude.
+      */
+    "a mistake in an enum declaration is reported once, at the declaration" - {
+      def occurrences(haystack: String, needle: String): Int =
+        haystack.sliding(needle.length).count(_ == needle)
+
+      "however many times the type is named afterwards" in {
+        val e = err(
+          """enum Colour: int
+            |    Red = 1
+            |    Green = 1
+            |print(Colour::Pos(Colour.Red))
+            |print(Colour::Image(Colour.Green))
+            |print(Colour::Pos(Colour.Red))""".stripMargin
+        )
+
+        occurrences(e, "both stand for") shouldBe 1
+        e should include("1 | enum Colour: int")
+      }
+
+      "and the same holds for a discriminant that does not fit" in {
+        val e = err(
+          """enum Colour: u8
+            |    Red = 1
+            |    Green = 300
+            |print(Colour::Pos(Colour.Red))
+            |print(Colour::Pos(Colour.Red))""".stripMargin
+        )
+
+        occurrences(e, "does not fit") shouldBe 1
+        e should include("1 | enum Colour: u8")
+      }
+    }
   }
 }

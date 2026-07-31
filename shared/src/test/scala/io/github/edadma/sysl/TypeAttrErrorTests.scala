@@ -8,7 +8,8 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class TypeAttrErrorTests extends AnyFreeSpec with CodegenSupport {
 
-  private val Age = "type Age = int within 0..150\n"
+  private val Age  = "type Age = int within 0..150\n"
+  private val Slot = "type Slot = new u8 within 0..<8\n"
 
   "an unknown attribute is rejected" in {
     err(Age + "print(Age::Middle)") should include("has no attribute 'Middle'")
@@ -33,6 +34,25 @@ class TypeAttrErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "Range outside a for loop is rejected" in {
     err(Age + "print(Age::Range)") should include("only meaningful as the iterable of a 'for' loop")
+  }
+
+  /** A **derived** subtype is nominally distinct from its base (`16 §1`), and `16 §5` types its
+   * attributes as the subtype — so the base is what a step now refuses, which is the reverse of
+   * what it refused before. `Valid` keeps the base, and so keeps refusing the subtype: a value that
+   * is already a `Slot` is not something to ask about.
+   */
+  "on a derived subtype the base is what a step refuses" - {
+    "Succ wants the subtype" in {
+      err(Slot + "print(Slot::Succ(3u8))") should include("'Slot::Succ' takes a Slot, not byte")
+    }
+
+    "Pred wants the subtype" in {
+      err(Slot + "print(Slot::Pred(3u8))") should include("'Slot::Pred' takes a Slot, not byte")
+    }
+
+    "and Valid, alone, wants the base" in {
+      err(Slot + "print(Slot::Valid(Slot(3u8)))") should include("'Slot::Valid' takes a byte, not Slot")
+    }
   }
 
   // Every one of these is a question about integer bounds, so a subtype over another scalar has
