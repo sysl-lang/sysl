@@ -205,6 +205,93 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       runOf("thing/a.sysl" -> "module thing\nno alloc\n\nname() -> string = \"kernel\"\n",
         "main.sysl" -> "print(thing.name())") shouldBe "kernel\n"
     }
+
+    // `capabilities.md` lists this among the no-alloc subset by name: the allocator's own building
+    // blocks. Nothing follows a call out of the language, so what a C function does with the storage
+    // it hands back is not this compiler's question — which is what makes an allocator writable in a
+    // module that has none.
+    "the malloc a module provides itself, which is an extern like any other" in {
+      irOf(
+        "thing/a.sysl" ->
+          """module thing
+            |no alloc
+            |
+            |extern malloc(n: usize) -> *u8
+            |extern free(p: *u8)
+            |
+            |take(n: usize) -> *u8 = malloc(n)
+            |
+            |give(p: *u8) = free(p)
+            |""".stripMargin,
+        "main.sysl" -> "var p = thing.take(8usize)\nthing.give(p)\n",
+      ) should include("declare ptr @malloc")
+    }
+
+    // Also listed by name: a closure that does not outlive its scope is inlined and boxes nothing.
+    "a closure that does not escape, which is inlined rather than boxed" in {
+      runOf(
+        "thing/a.sysl" ->
+          """module thing
+            |no alloc
+            |
+            |twice(f: int -> int, n: int) -> int = f(f(n))
+            |
+            |four(n: int) -> int = twice(x -> x + 2, n)
+            |""".stripMargin,
+        "main.sysl" -> "print(thing.four(1))",
+      ) shouldBe "5\n"
+    }
+
+    // The other half of "holding is not making": a slice whose storage is on the heap was made by
+    // somebody with an allocator, and reading it needs none.
+    "a heap-backed slice made elsewhere and read here" in {
+      runOf(
+        "thing/a.sysl" -> "module thing\nno alloc\n\nfirst(xs: []int) -> int = xs[0]\n",
+        "main.sysl" -> "var xs: []int = [7, 8, 9]\nprint(thing.first(xs))",
+      ) shouldBe "7\n"
+    }
+  }
+
+  "the rule reaches every place a module's code can be written" - {
+
+    // A `val` holds plain data, so it cannot *be* a string — but its initializer is code like any
+    // other, and joining two strings to measure the result allocates just the same.
+    "a module-level val's initializer" in {
+      errOf("thing/a.sysl" -> "module thing\nno alloc\n\nval width: usize = (\"a\" + \"b\").bytes.len\n",
+        "main.sysl" -> "print(thing.width)") should include("needs an allocator")
+    }
+
+    "a method of a trait implementation" in {
+      errOf(
+        "thing/a.sysl" ->
+          """module thing
+            |no alloc
+            |
+            |trait Named
+            |    name(self) -> string
+            |
+            |struct Box
+            |    n: int
+            |
+            |impl Named for Box
+            |    name(self) -> string = str(self.n)
+            |""".stripMargin,
+        "main.sysl" -> "print(thing.Box(1).name())",
+      ) should include("needs an allocator")
+    }
+
+    // A generic body is checked once with its parameters standing in for themselves and again at
+    // each instantiation, and the diagnostic is wanted exactly once — from the instantiation, since
+    // that is the tree that would have been emitted.
+    "and a generic, at the instantiation that would have allocated" in {
+      val e = errOf(
+        "thing/a.sysl" -> "module thing\nno alloc\n\nhold[T](v: T) -> &T = v\n",
+        "main.sysl" -> "print(*thing.hold(5))",
+      )
+
+      e should include("a reference needs an allocator")
+      e.linesIterator.count(_.contains("needs an allocator")) shouldBe 1
+    }
   }
 
   "the promotion a module cannot make is reported rather than made silently" - {
