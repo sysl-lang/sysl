@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 4
+  val Version: Int = 5
 
   private val Magic = "sysl-ast"
 
@@ -148,6 +148,11 @@ object AstCodec {
       case Visibility.Public    => tok("0")
       case Visibility.File      => tok("1")
       case Visibility.Scoped(m) => tok("2"); sref(m)
+
+    // A shipped library carries no tests — `Library.withoutTests` is what drops them, on the way in
+    // rather than here. What this is for is the codec's own promise: a tree reads back as the tree
+    // that was written, and a field left out silently is how that stops being true.
+    private def testAttr(a: TestAttr): Unit = { pos(a); opt(a.display)(sref); bool(a.shouldTrap); opt(a.expected)(sref) }
 
     private def recv(r: RecvMode): Unit = r match
       case RecvMode.ByValue   => tok("0")
@@ -271,9 +276,9 @@ object AstCodec {
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
-          bounds(bs); bool(va); vis(vs); tdefaults(tds)
+          bounds(bs); bool(va); vis(vs); tdefaults(tds); opt(t)(testAttr)
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -502,6 +507,8 @@ object AstCodec {
       case "2"   => Visibility.Scoped(sref())
       case other => fail(s"'$other' is not a visibility")
 
+    private def testAttr(): TestAttr = at(TestAttr(opt(sref()), bool(), opt(sref())))
+
     private def recv(): RecvMode = tok() match
       case "0"   => RecvMode.ByValue
       case "1"   => RecvMode.ByPtr
@@ -607,7 +614,7 @@ object AstCodec {
         case "ens"  => Ensure(expr(), opt(sref()))
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
-            bounds(), bool(), vis(), tdefaults())
+            bounds(), bool(), vis(), tdefaults(), opt(testAttr()))
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "sd" =>

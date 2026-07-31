@@ -513,7 +513,26 @@ case class FuncDecl(
     variadic: Boolean = false,
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
+    test: Option[TestAttr] = None,
 ) extends Stmt
+
+/** What `#test` says about the function it is written above (`testing.md`).
+ *
+ * A test is a function the program does not call: `sysl test` calls it, and whether it *returned* is
+ * the whole of the result. So the attribute carries only what the runner cannot work out for itself
+ * — what to call the test in its report, and whether returning is the outcome it was after.
+ *
+ * `display` is the name a report shows, defaulting to the function's own. It exists because a
+ * function name is a name and a test's subject is a sentence: `#test("an empty slice has no first
+ * element")` says something `first_of_empty` only gestures at.
+ *
+ * `shouldTrap` inverts the verdict: the test passes exactly when the process does *not* come back.
+ * That is how a runtime check is tested at all — a bounds violation, a broken `require`, a `within`
+ * that does not hold each end in `llvm.trap`, which no program survives to report anything about.
+ * `expected` narrows it to a run whose output holds a given substring, which is what tells a trap
+ * from the *right* trap where the failure prints something first.
+ */
+case class TestAttr(display: Option[String], shouldTrap: Boolean, expected: Option[String]) extends Positioned
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
  * by the linker under the name it is declared with.

@@ -34,9 +34,89 @@ asserted.
 
 sysl's **own test framework**: `#test`-annotated functions written *in sysl*, discovered and
 run by a `sysl test` CLI command. **These test *sysl code*** — the standard library and
-language behavior — and are the executable-spec / conformance corpus. Tier 3 is itself a
-*feature to build* (the `#test` attribute + the runner), so it lands **after** codegen works
-and Tier 2 is green.
+language behavior — and are the executable-spec / conformance corpus.
+
+**Built.** What follows is what it is, rather than what it should be.
+
+### The attribute
+
+```
+#test
+adds_two() =
+    assert(add(1, 1) == 2, "one and one")
+
+#test("an empty slice has no first element")
+first_of_empty() = …
+
+#test(should_trap)
+a_broken_promise() = …
+
+#test(should_trap: "past the end")
+an_index_past_the_end() = …
+```
+
+`#` is the language's first attribute and for now its only one; a word after it that is not
+`test` is answered by name rather than as grammar. It is deliberately *not* a general
+mechanism yet — the two that will make it one are `packed` (`15 §1`) and the alignment
+attribute `00 § Open` wants, and neither is designed. The attribute goes on its own line above
+an ordinary function declaration, which may still be `private`.
+
+**A test is an ordinary function with a caller nothing else has.** No parameters, no result,
+not generic — all three are the same requirement from different sides, since the runner calls
+it with nothing and reads the answer off whether it returned. They are checked at the
+attribute, because the function is a perfectly good function and it is `#test` that made a
+promise about it.
+
+**A test passes by returning.** That is the whole protocol, and it is what lets a test assert
+in the language it is testing rather than in a framework: a broken `require`, a bounds
+violation, `unwrap` of a `None` — each ends the process, and none of them had to know it was
+running under a test. `should_trap` inverts the reading, for a test whose subject *is* the
+check; with a string it additionally requires that the run printed it, which is what tells a
+trap from the *right* trap. A silent trap satisfies `should_trap` and can satisfy no string —
+`llvm.trap` raises a signal and says nothing.
+
+**A test has one caller and the program is not it.** Calling one is refused where the call is
+written. Every build but `sysl test` drops the definition, so the call would compile and fail
+at the link; work two tests share belongs in an ordinary function they both call.
+
+### What is dropped, and when
+
+`sysl run`, `sysl build`, `sysl emit-llvm` and `sysl build-lib` all drop the tests, and drop
+them **after** analysis — so a `#test` that does not compile is an error in a build that would
+never have run it, and a module's capability clause (`13 §4`) reaches its tests like any other
+member. That ordering is what lets a test sit beside what it tests: a library's tests do not
+travel in the library, a program's do not run when it runs, and neither stops being checked.
+
+A helper only a test calls leaves with it, because it becomes unreachable and pruning notices;
+a helper the program also calls stays, because the program still calls it.
+
+### The runner
+
+```
+sysl test <path>
+sysl test <path> --filter <text>
+sysl test <path> --fail-fast
+```
+
+**One build, one process per test.** The tree is compiled once, into a binary whose entry point
+takes a test's name and runs that test alone — the program's own statements and its `main` are
+not run, though its module-level `val`s are still filled, since a test reads a module's storage
+like any other function. The runner then starts that binary once per test.
+
+The process per test is not a cost being tolerated; it is the mechanism. A test that fails does
+so by ending its process, so a run that shared one would report the first failure and nothing
+after it. The compile is the slow half and there is only ever one of it.
+
+Exit status is 0 iff every test that ran passed. A tree with no tests, and a filter that matched
+none of the tests there are, both exit 0 and say which happened.
+
+### `assert` and `panic`
+
+Both are in the standard module (`lib/sysl/check.sysl`), and the tests needed them: `require`
+is a promise about a *call*, checked on entry, and a test's fifth statement has no contract to
+hang a claim on. They stop the program the way `unwrap` does — a line naming what happened,
+then the hosted exit — rather than with `llvm.trap`, because a check a *program* makes is one
+the compiler cannot see, and the message is the whole point of it.
 
 **Summary:** Tier 1 = static (fast, most tests, including IR-shape); Tier 2 = the compiler's
 own run-it tests (Scala-authored); Tier 3 = the language's test framework (sysl-authored).

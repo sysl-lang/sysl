@@ -180,6 +180,16 @@ trait CallCore extends Literals with TraitObjects {
 
     val shown = qn(f.name)
 
+    // A `#test` function has one caller and it is not in the program (`testing.md`). Every build but
+    // `sysl test` drops it, so a call would compile and then fail at the *link*, naming a symbol
+    // nothing in the source explains — which is the shape of failure a diagnostic exists to prevent.
+    // Refused wherever the call is written, a test's own body included: two tests sharing work share
+    // an ordinary function, which is what one is for.
+    if f.test.isDefined then
+      err(s"'$shown' is a '#test' function, which 'sysl test' calls and nothing else does — " +
+        "every other build leaves it out, so this call would have no definition to reach. " +
+        "Work two tests share belongs in an ordinary function they both call")
+
     checkArity(s"function '$shown'", f.params.length, variadic, args.length)
 
     // An extern is declared in the output only if something reaches it, which is what keeps an

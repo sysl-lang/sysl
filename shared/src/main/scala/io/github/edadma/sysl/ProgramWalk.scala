@@ -304,6 +304,10 @@ trait ProgramWalk
       tentry,
       noAllocModules = moduleNarrows.collect { case (m, caps) if caps.contains(Capability.Alloc) => m }.toSet,
       mainModule = mainScope.module,
+      // Only the tests whose bodies survived analysis. A test whose body was reported is not a test
+      // the runner could run, and listing it would put a name in the report that no dispatcher arm
+      // matches — which reads as a test that vanished rather than as the error already printed.
+      tests = tests.filter(t => allFuncs.exists(_.name == t.func)).toList,
     )
   }
 

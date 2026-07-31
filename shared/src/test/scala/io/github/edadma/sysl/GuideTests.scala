@@ -278,6 +278,19 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
     )
   }
 
+  // The other half of the ring's evidence, and the half its own run cannot produce: a refusal
+  // traps, and a trap ends the run rather than reporting into it. Each of these passes by not
+  // coming back (`testing.md`).
+  //
+  // The count is asserted for the reason the check counts above are: a `should_trap` test that
+  // stopped being compiled would look exactly like one that passed, since there would be no failing
+  // line to see. What keeps the traps themselves honest is the two ordinary tests beside them —
+  // they build the same fixtures and *return*, so a trap that fired while a ring was being set up
+  // would fail those rather than quietly satisfying the ones that expect it.
+  "ring — the refusals, which the program's own run cannot assert" in {
+    guideTests("ring") should have length 9
+  }
+
   // The one program that *makes* storage rather than being handed it. `guide/kernel` is
   // allocator-free and indexes three fixed tables it was given; this is what a program would have to
   // write before it could have them, so it is written with no allocator itself — which is what puts

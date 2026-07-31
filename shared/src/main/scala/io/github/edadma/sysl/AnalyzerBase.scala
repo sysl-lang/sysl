@@ -453,6 +453,12 @@ trait AnalyzerBase {
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
+  /** The `#test` functions the sources declared, in the order hoisting met them (`testing.md`). A
+   * report lists tests in the order they were written, and this is where that order comes from —
+   * the typed functions are grouped by what reaches them and say nothing about where they sat.
+   */
+  protected val tests = mutable.ListBuffer.empty[TTest]
+
   /** Types whose *declaration* was reported as a mistake, so that using one does not report it
    * again. A declaration is instantiated eagerly and therefore judged once, but a name can be
    * mentioned any number of times afterwards, and each mention would otherwise rebuild the same

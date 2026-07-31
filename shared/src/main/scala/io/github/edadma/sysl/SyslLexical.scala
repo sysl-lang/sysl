@@ -146,6 +146,10 @@ class SyslLexical
     // really the end of a statement.
     ".*",
     ",", "::", ":", "->",
+    // Opens an attribute, which is a declaration's only prefix that is not a word (`testing.md`).
+    // It is deliberately not an operator: nothing in the expression grammar spells `#`, so a line
+    // beginning with one can only be an attribute and the reading needs no lookahead.
+    "#",
     // Only ever a separator inside a three-clause `for` header (`00` §10). It is deliberately not a
     // statement terminator: a line ends a statement, and a token that could also end one would give
     // the language two answers to the same question.
