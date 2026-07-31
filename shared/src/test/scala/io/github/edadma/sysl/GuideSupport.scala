@@ -35,4 +35,40 @@ trait GuideSupport extends Matchers { this: Assertions =>
       case Left(err)          => fail(s"$dir did not compile:\n$err")
     }
   }
+
+  /** Runs the `#test` functions of `guide/<name>` and fails naming any that did not pass
+   * (`testing.md`).
+   *
+   * This is the half of a guide program its own run cannot assert: a refusal traps, and a trap ends
+   * the run rather than reporting a failure into it. Driven through the same functions the CLI
+   * drives, so what is asserted here is what `sysl test guide/<name>` does.
+   */
+  protected def guideTests(name: String): List[TestRunner.Outcome] = {
+    val dir = s"guide/$name"
+
+    assume(Toolchain.clangAvailable, "clang not available")
+    assume(isDirectory(dir), s"$dir is not reachable from the working directory")
+
+    val (ir, tests) = Compiler.compileTests(Project.collect(dir), Nil) match {
+      case Right(result) => result
+      case Left(err)     => fail(s"$dir did not compile:\n$err")
+    }
+
+    val exe = createTempFile("sysl-guide-test-", "")
+
+    val ran =
+      try
+        Toolchain.build(ir, exe) match {
+          case Left(err) => fail(s"$dir did not link:\n$err")
+          case Right(_)  => TestRunner.execute(exe, tests, TestRunner.Options())
+        }
+      finally
+        try deleteFile(exe)
+        catch case _: Exception => ()
+
+    ran.filterNot(_.passed) match {
+      case Nil => ran
+      case bad => fail(bad.map(o => s"${o.test.display}: ${o.detail.getOrElse("")}").mkString("\n"))
+    }
+  }
 }

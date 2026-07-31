@@ -23,13 +23,18 @@ one and asserts that nothing failed, that the number of checks is the one expect
 sections ran in order — the count being what makes the first assertion mean anything, since a check
 that quietly stopped running would otherwise look like a check that passed.
 
-**What a program cannot check about itself is what it refuses.** A violated `require`, a broken
+**What a program's own run cannot check is what it refuses.** A violated `require`, a broken
 `invariant` and a failed range check all *trap*, so a program that tried to demonstrate one would
-die rather than report it, and the run would look truncated instead of failing. A program therefore
-asserts a refusal only through a total operation that answers instead of trapping — and the traps
-themselves are asserted from outside, in a suite, which is the only place a trap is an observation
-rather than the end of the run. `guide/ring` is the first to need this and `RingClaimTests` is where
-its half of the evidence lives.
+die rather than report it, and the run would look truncated instead of failing. The run therefore
+asserts a refusal only through a total operation that answers instead of trapping.
+
+**The traps are asserted in `#test(should_trap)` functions** (`testing.md`), which live in the
+program's own directory and are run by `sysl test <directory>`. Each runs in a process of its own
+and passes by not coming back, so a trap is an observation there rather than the end of the run —
+which is what lets a refusal be stated in sysl, beside the code it is about. `guide/ring` was the
+first to need this; its `tests.sysl` is where that half of the evidence lives, and
+`RingClaimTests` is the same claims asserted from outside, kept because the two routes to them are
+independent.
 
 | directory | axis it owns |
 |---|---|
