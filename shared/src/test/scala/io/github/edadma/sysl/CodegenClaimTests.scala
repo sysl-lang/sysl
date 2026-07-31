@@ -51,9 +51,13 @@ class CodegenClaimTests extends AnyFreeSpec with CodegenSupport {
       mainOf(printOnly) should not include "@malloc"
     }
 
+    // Both names are read off `Library` rather than written out. `FormatSpec` and `display_pad` are
+    // in the standard module, so the emitted symbols carry its prefix — and the negative is the
+    // fragile one: `display_pad` spelled bare is still a substring of `sysl$display_pad`, so it
+    // would keep passing while no longer testing what it names.
     "FormatSpec's layout is emitted although nothing renders through one" in {
-      printOnly should include("%struct.FormatSpec = type { i32, i32, i1 }")
-      printOnly should not include "display_pad"
+      printOnly should include(s"%struct.${Library.key("FormatSpec")} = type { i32, i32, i1 }")
+      printOnly should not include s"@${Library.key("display_pad")}("
     }
 
     // The counterweight, so this pair cannot pass by the module simply containing everything: the
