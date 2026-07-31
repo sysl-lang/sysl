@@ -440,4 +440,46 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
         include("'*' needs matching types")
     }
   }
+
+  /** `02`, *Object safety*: a built-in that belongs to a trait **by the compiler's rule** cannot be
+    * erased, because a table holds function pointers and what the compiler provides is an
+    * instruction or a rendering. The membership itself is real, which is why the refusal is pinned
+    * here beside the questions the same type still answers — a plain "wrong type" would deny the
+    * conformance instead of naming the rule, and send the reader after one they already have.
+    *
+    * `Display` is what makes this reachable at all: it is the one compiler-provided trait that is
+    * also object-safe, so every other one is stopped a step earlier by object safety.
+    */
+  "a built-in belongs to a trait by rule, and a rule is not a table" - {
+    "so erasing one is refused, and the refusal names the rule" in {
+      for src <- List(
+          """var d: &Display = 5""",
+          """var d: &Display = "hi"""",
+          """var xs: [3]&Display = [1, 2, 3]""",
+        )
+      do
+        val e = err(src)
+
+        e should include("by the compiler's rule rather than through an 'impl'")
+        e should include("table")
+        e should not include "but the value is"
+    }
+
+    "though a bound over that same trait is met, and print finds the same rendering" in {
+      run("""show[T: Display](x: T)
+            |    print(x)
+            |
+            |show(5)
+            |show("hi")
+            |""".stripMargin) shouldBe "5\nhi\n"
+    }
+
+    // The contrast that shows the rule is about *how* a type joined the trait and not about what it
+    // is: a tuple is a built-in shape too, and it erases, because the prelude writes it an `impl`.
+    "while a tuple, whose membership the prelude writes out, erases and dispatches" in {
+      run("""var d: &Display = (1, 2)
+            |print(d)
+            |""".stripMargin) shouldBe "(1, 2)\n"
+    }
+  }
 }

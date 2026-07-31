@@ -48,6 +48,18 @@ trait TraitObjects extends TypeResolution {
       case (_, inner) if implsOf(tr.name, ownerKey(inner)).nonEmpty =>
         erase(t, tr, inner, want, boxed = false)
 
+      // A built-in that belongs to the trait by the compiler's rule rather than through an `impl`
+      // (`02`, *Object safety*). The membership is real — a bound over the trait is met, and `print`
+      // finds the rendering — so falling through to the caller's plain mismatch would deny the one
+      // thing about this value that is true, and send the reader looking for the conformance they
+      // already have. What a built-in cannot do is fill a table slot, since what the compiler
+      // provides is an instruction or a rendering rather than a member anything can point at.
+      case (_, inner) if CoreTraits.builtin(tr.name, inner) =>
+        at(t.pos)(err(s"${show(inner)} is a '${tr.bound.show}' by the compiler's rule rather than " +
+          s"through an 'impl', and a ${show(want)} holds a table of functions — what the compiler " +
+          "provides for a built-in is an instruction or a rendering, and neither is a function the " +
+          "table could point at"))
+
       case _ => t
   }
 
@@ -55,9 +67,12 @@ trait TraitObjects extends TypeResolution {
    * compiler provides.
    *
    * The difference matters because a table holds function pointers, and a compiler-provided
-   * membership has no functions — a scalar's `add` is an instruction. Nothing is lost by the
-   * distinction: object safety already refuses every trait in the catalog, so the only traits that
-   * reach here are ones a program declared and implemented itself.
+   * membership has no functions — a scalar's `add` is an instruction.
+   *
+   * It is a rule of its own, and not, as an earlier reading had it, a consequence of object safety
+   * refusing the operator catalog. `Display` is the counter-example and the reason the distinction
+   * has to be drawn here: it is compiler-provided and object-safe both, so nothing upstream stops an
+   * `int` reaching this point. What stops it is this predicate, and the caller says so by name.
    */
   private def implements(tr: Type.Bound, t: Type): Boolean = conforms(tr, t)
 
