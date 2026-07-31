@@ -54,7 +54,10 @@ trait TraitObjects extends TypeResolution {
       // thing about this value that is true, and send the reader looking for the conformance they
       // already have. What a built-in cannot do is fill a table slot, since what the compiler
       // provides is an instruction or a rendering rather than a member anything can point at.
-      case (_, inner) if CoreTraits.builtin(tr.name, inner) =>
+      // `tr.name` is a key and `CoreTraits` speaks spellings, so the question goes through
+      // `Library.spelling` — asking the catalog `sysl$Display` finds nothing, and the value would
+      // fall through to the plain mismatch this case exists to replace.
+      case (_, inner) if Library.spelling(tr.name).exists(CoreTraits.builtin(_, inner)) =>
         at(t.pos)(err(s"${show(inner)} is a '${tr.bound.show}' by the compiler's rule rather than " +
           s"through an 'impl', and a ${show(want)} holds a table of functions — what the compiler " +
           "provides for a built-in is an instruction or a rendering, and neither is a function the " +
