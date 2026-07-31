@@ -161,7 +161,9 @@ class BufTests extends AnyFreeSpec with RunSupport {
     // remainder — the order it comes out in is the whole assertion.
     "one at a time until there is nothing left" in {
       run(
-        """var b: &Buf[int] = buf()
+        """import sysl.text.str_builder
+          |
+          |var b: &Buf[int] = buf()
           |for i in 0..<6 do b.push(i)
           |var out = str_builder()
           |while !b.is_empty() do out.push(str(b.remove(0)))

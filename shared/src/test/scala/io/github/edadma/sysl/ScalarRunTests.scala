@@ -176,7 +176,9 @@ class ScalarRunTests extends AnyFreeSpec with RunSupport {
     "a valid scalar value comes back, and is the character it names" in {
       ask("9731") shouldBe "9731\n"
 
-      run("""char_from_u32(9731u32) match
+      run("""import sysl.text.char_from_u32
+            |
+            |char_from_u32(9731u32) match
             |    Some(c) -> print(c)
             |    None -> print("no")""".stripMargin) shouldBe "☃\n"
     }
@@ -213,7 +215,9 @@ class ScalarRunTests extends AnyFreeSpec with RunSupport {
    * codepoint so an unprintable answer is still something a test can compare.
    */
   private def ask(u: String): String =
-    run(s"""char_from_u32(${u}u32) match
+    run(s"""import sysl.text.char_from_u32
+           |
+           |char_from_u32(${u}u32) match
            |    Some(c) -> print(u32(c))
            |    None -> print("no")""".stripMargin)
 }

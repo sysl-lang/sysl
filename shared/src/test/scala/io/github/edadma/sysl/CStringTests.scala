@@ -11,6 +11,11 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class CStringTests extends AnyFreeSpec with ParseSupport with CodegenSupport with RunSupport {
 
+  /** `c"…"` is a literal and costs nothing named, but the conversion back is a library function in
+   * `sysl.text`, so the programs below that use one ask for it.
+   */
+  private def converting(src: String): String = run("import sysl.text.from_cstring\n\n" + src)
+
   "parsing" - {
     "a C string is its own literal, distinct from an ordinary one" in {
       prog("""var a = c"hi"
@@ -144,62 +149,62 @@ class CStringTests extends AnyFreeSpec with ParseSupport with CodegenSupport wit
   "from_cstring" - {
 
     "round-trips a C string literal" in {
-      run("""print(from_cstring(c"hello").unwrap())""") shouldBe "hello\n"
+      converting("""print(from_cstring(c"hello").unwrap())""") shouldBe "hello\n"
     }
 
     "gives the empty string for a pointer at an immediate NUL" in {
-      run("""print(f"[${from_cstring(c"").unwrap()}]")""") shouldBe "[]\n"
+      converting("""print(f"[${from_cstring(c"").unwrap()}]")""") shouldBe "[]\n"
     }
 
     "stops at the first NUL and reads nothing after it" in {
       // The discriminating case a literal cannot reach: bytes *do* follow the terminator, so a
       // length taken from the allocation rather than from the scan would show up here as "hi\0xy".
-      run("""var b: [6]u8 = [104u8, 105u8, 0u8, 120u8, 121u8, 0u8]
-            |print(f"[${from_cstring(&b[0]).unwrap()}]")""".stripMargin) shouldBe "[hi]\n"
+      converting("""var b: [6]u8 = [104u8, 105u8, 0u8, 120u8, 121u8, 0u8]
+                   |print(f"[${from_cstring(&b[0]).unwrap()}]")""".stripMargin) shouldBe "[hi]\n"
     }
 
     "copies, so the string outlives what C did next with the buffer" in {
       // The claim the doc comment makes, and the one worth pinning: C's storage is a static buffer
       // it reuses or memory the caller is about to free. A view would print "xi" here.
-      run("""var b: [4]u8 = [104u8, 105u8, 0u8, 0u8]
-            |var s = from_cstring(&b[0]).unwrap()
-            |b[0] = 120u8
-            |print(s)""".stripMargin) shouldBe "hi\n"
+      converting("""var b: [4]u8 = [104u8, 105u8, 0u8, 0u8]
+                   |var s = from_cstring(&b[0]).unwrap()
+                   |b[0] = 120u8
+                   |print(s)""".stripMargin) shouldBe "hi\n"
     }
 
     "carries multi-byte UTF-8 through as characters, not bytes" in {
       // `é` is two bytes, so a conversion that counted bytes as characters would disagree here.
-      run("""var s = from_cstring(c"héllo").unwrap()
-            |var n = 0
-            |for c in s.chars do n += 1
-            |print(n)""".stripMargin) shouldBe "5\n"
+      converting("""var s = from_cstring(c"héllo").unwrap()
+                   |var n = 0
+                   |for c in s.chars do n += 1
+                   |print(n)""".stripMargin) shouldBe "5\n"
     }
 
     "reads what a real C function wrote" in {
       // Not a literal: `snprintf` writes the bytes and the terminator at run time, which is the
       // shape every binding actually meets.
-      run("""extern "snprintf" c_snprintf(b: *u8, n: usize, f: *u8, ...) -> int
-            |var buf: [16]u8
-            |c_snprintf(&buf[0], 16usize, c"%d-%s", 42, c"ok")
-            |print(from_cstring(&buf[0]).unwrap())""".stripMargin) shouldBe "42-ok\n"
+      converting("""extern "snprintf" c_snprintf(b: *u8, n: usize, f: *u8, ...) -> int
+                   |var buf: [16]u8
+                   |c_snprintf(&buf[0], 16usize, c"%d-%s", 42, c"ok")
+                   |print(from_cstring(&buf[0]).unwrap())""".stripMargin) shouldBe "42-ok\n"
     }
 
     "refuses bytes that are not UTF-8, rather than making a string of them" in {
       // The error path, and the reason the result is a `Result`: nothing about a `char *` promises
       // UTF-8, and a C library reporting in another locale is ordinary rather than corrupt.
-      run("""var b: [3]u8 = [255u8, 0u8, 0u8]
-            |from_cstring(&b[0]) match
-            |    Ok(s) -> print(f"wrongly accepted ${s}")
-            |    Err(e) -> print(e.offset, e.truncated)""".stripMargin) shouldBe "0 false\n"
+      converting("""var b: [3]u8 = [255u8, 0u8, 0u8]
+                   |from_cstring(&b[0]) match
+                   |    Ok(s) -> print(f"wrongly accepted ${s}")
+                   |    Err(e) -> print(e.offset, e.truncated)""".stripMargin) shouldBe "0 false\n"
     }
 
     "and says a sequence merely ran out, where that is what happened" in {
       // `0xC3` opens a two-byte sequence and the NUL ends the input before its continuation. That is
       // `truncated`, which is the one distinction a caller can act on — more bytes would fix it.
-      run("""var b: [2]u8 = [195u8, 0u8]
-            |from_cstring(&b[0]) match
-            |    Ok(s) -> print(f"wrongly accepted ${s}")
-            |    Err(e) -> print(e.offset, e.truncated)""".stripMargin) shouldBe "0 true\n"
+      converting("""var b: [2]u8 = [195u8, 0u8]
+                   |from_cstring(&b[0]) match
+                   |    Ok(s) -> print(f"wrongly accepted ${s}")
+                   |    Err(e) -> print(e.offset, e.truncated)""".stripMargin) shouldBe "0 true\n"
     }
   }
 }

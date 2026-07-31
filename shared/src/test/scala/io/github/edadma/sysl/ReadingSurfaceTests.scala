@@ -14,11 +14,11 @@ import org.scalatest.freespec.AnyFreeSpec
 class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
 
   /** The reading surface is a module rather than part of the standard one, so a program that reads
-   * says so. It is written once here and prepended to every program below, since what each of them
-   * is about is the bytes and not the import — but it is a real line in a real file, and a program
-   * that leaves it out is refused, which `LibraryTreeTests` is where that is asserted.
+   * says so — and one that opens a file and validates what it read names `sysl.text` too. Written
+   * once here and prepended to every program below, since what each of them is about is the bytes
+   * and not the import; that a program leaving it out is refused is `LibraryTreeTests`' assertion.
    */
-  private val importing = "import sysl.io.*\n\n"
+  private val importing = "import sysl.io.*\nimport sysl.text.{cstring, from_utf8}\n\n"
 
   override protected def run(src: String): String = super.run(importing + src)
 

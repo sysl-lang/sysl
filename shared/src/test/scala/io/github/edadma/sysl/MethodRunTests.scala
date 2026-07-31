@@ -111,7 +111,9 @@ class MethodRunTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   // way, so the block reaches both halves: the trait's answer and the implementation's.
   "a trait's default property and an impl's may each open one" in {
     val src =
-      """trait Named
+      """import sysl.text.str_builder
+        |
+        |trait Named
         |    label -> string
         |        var b = str_builder()
         |        b.push("<")
@@ -155,7 +157,9 @@ class MethodRunTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   // from the receiver's own arguments as a method is, and an enum's may take its own value apart.
   "a block reaches a generic type's property and an enum's" in {
     val src =
-      """struct Box[T: Display]
+      """import sysl.text.str_builder
+        |
+        |struct Box[T: Display]
         |    v: T
         |
         |    shown -> string

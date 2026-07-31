@@ -459,17 +459,18 @@ library* it is the whole of what keeps the split honest: a submodule of `sysl` t
 names depends on `sysl`, so `sysl` may not turn round and depend on it. That is a real constraint and
 it decides the library's own layout. `sysl` reaches `sysl.sys` for the C functions its printing is
 built on, so `sysl.sys` may name nothing of `sysl`'s — which is why it holds the externs and nothing
-else, and why the argument conversion, which calls `buf`, `from_utf8`, `print` and `exit`, is
-`sysl.args` and not part of `sys`. A module that depends on nothing is what a platform module should
-be anyway; the rule is what says so out loud.
+else, and why the argument conversion, which calls `buf`, `print` and `exit`, is `sysl.args` and not
+part of `sys`. A module that depends on nothing is what a platform module should be anyway; the rule
+is what says so out loud.
 
-**The rule reads forward as well as backward, and that is what moved the reading surface.** A
+**The rule reads forward as well as backward, and that is what ordered the rest of the library.** A
 submodule may use the free names as freely as it likes so long as `sysl` does not name it back, so
 the question to ask of a candidate is not what it needs but who needs *it*. `sysl.io` calls `print`,
-`exit`, `buf` and `from_utf8` and is none the worse for it, because nothing the language desugars
-onto reads — whereas the reading surface could not leave `sysl` while `line_text` was still in it,
-since the validator it calls was too. Which surface moves first is therefore decided by the graph and
-not by which one is tidiest to move.
+`exit` and `buf` and is none the worse for it, because nothing the language desugars onto reads. But
+it also calls `from_utf8`, and while `line_text` was still a declaration of `sysl`'s the validator
+could not leave either — `sysl.text` had a caller in `sysl`, and moving it would have closed a cycle.
+Moving the reading surface first is what freed it. Which surface moves first is therefore decided by
+the graph and not by which one is tidiest to move.
 
 Three things follow from acyclicity:
 

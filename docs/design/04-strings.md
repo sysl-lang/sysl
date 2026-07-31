@@ -22,6 +22,14 @@ A string is therefore no longer always traceable to a literal; a program can bui
 by rendering, by gathering, or by validating bytes, and can walk what it built at either
 granularity.
 
+**Where these live: everything the compiler writes for itself is `sysl` and everything a program
+writes by name is `sysl.text`.** A literal, `+`, `str(x)`, an interpolation and `s.chars` are all
+desugarings, so they cost no import — even `s.chars`, whose cursor is `sysl.text`'s, because the
+compiler names `chars_of` by key rather than by resolving the word (`13 §8`). Named at the call
+site, and so imported: `from_utf8`, `from_cstring`, `char_from_u32`, `str_builder`, `cstring`, and
+the types `Utf8Error`, `Chars`, `StrBuilder` and `CString`. The split is the one `13 § Open h`
+describes — what a program cannot avoid needing is free, and what it has to ask for it asks for.
+
 ## The decision in one paragraph
 
 A `string` is a **three-word owning view of validated UTF-8 bytes** — the same shape every
@@ -244,6 +252,8 @@ copies everything it has so far on every step. `StrBuilder` is the form for that
 growable buffer, appends into it, and hands back a string when the gathering is done.
 
 ```
+import sysl.text.str_builder
+
 var b = str_builder()
 
 b.push("hello, ")

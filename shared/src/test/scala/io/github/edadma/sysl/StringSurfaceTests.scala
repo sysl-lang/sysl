@@ -13,6 +13,18 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
+  /** `StrBuilder`, `cstring` and `CString` are `sysl.text`'s, so a program that makes new bytes asks
+   * for the module. It is written once here rather than at each program, since what these tests are
+   * about is the bytes; `runBare` is the way past it for the one test whose subject *is* the naming.
+   */
+  private val importing = "import sysl.text.*\n\n"
+
+  private def runBare(src: String): String = super.run(src)
+
+  override protected def run(src: String): String = super.run(importing + src)
+
+  override protected def err(src: String): String = super.err(importing + src)
+
   /** `s.copy()` exists for one reason (`04 § Ownership and lifetime`): a substring shares its
    * parent's buffer, so a short-lived slice of a long-lived string would otherwise pin the whole
    * thing. Copying is the named operation that breaks that hold.
@@ -291,15 +303,15 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
             |""".stripMargin) should include("has no home")
     }
 
-    // These names are the standard module's, so a program declaring one of its own gets its own —
-    // the same answer `from_utf8` and `buf` now give, since they moved too. What the surface must
-    // not quietly become is *unreachable*: the library's is still there under the path that names
-    // it, and it is what the library's own callers keep meaning.
+    // These names are `sysl.text`'s, so a program declaring one of its own gets its own. What the
+    // surface must not quietly become is *unreachable*: the library's is still there under the path
+    // that names it, and it is what the library's own callers keep meaning. Written without the
+    // file's import, since the point is what a bare word means when a program has claimed it.
     "and a program's own is its own, while the library's stays reachable by its path" in {
-      run("""cstring(s: string) -> int = 1
-            |
-            |print(cstring("a"), sysl.cstring("abc").len)
-            |""".stripMargin) shouldBe "1 3\n"
+      runBare("""cstring(s: string) -> int = 1
+                |
+                |print(cstring("a"), sysl.text.cstring("abc").len)
+                |""".stripMargin) shouldBe "1 3\n"
     }
 
     // A builder that took bytes would be `from_utf8_unchecked` with a longer name, so it is not a
@@ -317,8 +329,8 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     // `%struct.… = type` lines, which name no storage and emit no instructions.
     //
     // Every name here is read off `Library.key`. Spelled literally, all three negatives would go on
-    // passing once these declarations moved into the standard module and their symbols gained the
-    // `sysl$` prefix — asserting nothing, and saying so nowhere.
+    // passing once these declarations moved into a module of the library's and their symbols gained
+    // its prefix — asserting nothing, and saying so nowhere.
     "and a program that uses none of it carries no code for it" in {
       val out = ir("""print(1)""")
 

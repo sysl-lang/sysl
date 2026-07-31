@@ -334,8 +334,9 @@ runs after everything that checks one (`15 §3`).
 **All of it is `sysl.io` rather than `sysl`**, so a program that reads writes `import sysl.io.*` and
 one that does not never has these names. That asymmetry with `Writer` is not an inconsistency: `print`
 is a keyword and what it desugars onto cannot be behind an import nobody wrote, while nothing in the
-language desugars onto reading. `13 §6` is what allows it — the module reaches `print`, `exit`, `buf`
-and `from_utf8` freely, because the dependency only has to not run back.
+language desugars onto reading. `13 §6` is what allows it — the module reaches `print`, `exit` and
+`buf` freely and imports `sysl.text` for the validation, because the dependency only has to not run
+back.
 
 | Trait | Methods |
 |---|---|

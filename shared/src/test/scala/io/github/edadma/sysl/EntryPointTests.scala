@@ -152,7 +152,9 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     "an argument outlives the vector it came from" in {
-      runWith("""keep(args: []string) -> string
+      runWith("""import sysl.text.str_builder
+                |
+                |keep(args: []string) -> string
                 |    var b = str_builder()
                 |    for a in args[1..]
                 |        b.push(a)
@@ -369,7 +371,9 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     "and the arguments survive being churned through" in {
-      runWith("""main(args: []string)
+      runWith("""import sysl.text.str_builder
+                |
+                |main(args: []string)
                 |    var total = 0usize
                 |
                 |    for i in 0..<100000

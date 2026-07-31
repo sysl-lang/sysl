@@ -265,7 +265,9 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       // `StrBuilder` holds a `&Buf[u8]`, so this monomorphizes a library generic *behind* a library
       // struct — a layout the program never names and cannot get from the precompiled half.
       sameBothWays(
-        """var b = str_builder()
+        """import sysl.text.str_builder
+          |
+          |var b = str_builder()
           |b.push("count: ")
           |b.push_char('#')
           |print(b.finish(), b.len, b.is_empty)
@@ -308,7 +310,9 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
 
     "for one that hands bytes to C, which reaches the owned NUL-terminated copy" in {
       sameBothWays(
-        """var c = cstring("hi")
+        """import sysl.text.cstring
+          |
+          |var c = cstring("hi")
           |print(c.len)
           |""".stripMargin)
     }
@@ -318,7 +322,9 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       // the same declarations through a different door than `print` does, and the view's constness
       // is carried in the artifact's own encoding of the type rather than re-derived from source.
       sameBothWays(
-        """count(b: []const u8) -> usize
+        """import sysl.text.chars_of
+          |
+          |count(b: []const u8) -> usize
           |    var n = 0usize
           |    for c in chars_of(b) do n += 1
           |    n

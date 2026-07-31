@@ -469,6 +469,8 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       val binding =
         """module rx
           |
+          |import sysl.text.{cstring, from_cstring}
+          |
           |extern "probe_rx_new" c_new() -> *u8
           |extern "probe_rx_free" c_free(re: *u8)
           |extern "probe_rx_compile" c_compile(re: *u8, pattern: *u8) -> int

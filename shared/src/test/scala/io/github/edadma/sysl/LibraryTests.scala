@@ -569,9 +569,13 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |""".stripMargin) shouldBe "3\na\nb\n"
     }
 
-    "the validator arrives unqualified, and its error type with it" in {
+    "the validator is asked for by name, and its error type comes with it" in {
+      // Importing the function alone is enough to read the failure: `e` is the library's `Utf8Error`
+      // by inference, so a program that only wants to know what went wrong never names the type.
       run(
-        """from_utf8([0xC3u8, 0xA9u8]) match
+        """import sysl.text.from_utf8
+          |
+          |from_utf8([0xC3u8, 0xA9u8]) match
           |    Ok(s) -> print(s)
           |    Err(e) -> print("bad at", e.offset)
           |""".stripMargin) shouldBe "é\n"
@@ -579,9 +583,13 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
     "and a program may declare a 'Utf8Error' of its own beside the library's" in {
       // A plausible name for a program to want, and the library's is still what `from_utf8`
-      // answers with — told apart by the path, as every moved declaration is.
+      // answers with — told apart by the path, as every moved declaration is. Here the import
+      // names only the function, so the program's own type is the only `Utf8Error` in scope and
+      // the two do not even have to be told apart.
       run(
-        """struct Utf8Error
+        """import sysl.text.from_utf8
+          |
+          |struct Utf8Error
           |    why: string
           |
           |bad() -> Utf8Error = Utf8Error("mine")
@@ -631,7 +639,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
     "and the fallible half of a scalar conversion came across too" in {
       run(
-        """char_from_u32(9731u32) match
+        """import sysl.text.char_from_u32
+          |
+          |char_from_u32(9731u32) match
           |    Some(c) -> print(c)
           |    None -> print("no")
           |char_from_u32(0xD800u32) match
@@ -703,11 +713,13 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
     "a program may declare a 'Buf' of its own, and what the library builds on still means the library's" in {
       // `StrBuilder` holds a `&Buf[u8]`, so the library reaches its own `Buf` through a second
-      // declaration rather than at the call — and with a *generic*, where the program's own is not
-      // even the same arity of thing. The library's is what `str_builder()` gathers into, whatever
-      // the word means here.
+      // declaration rather than at the call — and now across two of its own modules, since the
+      // builder is `sysl.text`'s and the buffer is `sysl`'s. With a *generic*, too, where the
+      // program's own is not even the same arity of thing.
       run(
-        """struct Buf[T]
+        """import sysl.text.str_builder
+          |
+          |struct Buf[T]
           |    only: T
           |
           |mine[T](v: T) -> Buf[T] = Buf(v)
@@ -737,7 +749,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       // `ByteSink` is why `Buf` had to move with it: it is the writer a multi-part `Display`
       // gathers into before its specifier can pad what the parts came to.
       run(
-        """struct Pair
+        """import sysl.text.from_utf8
+          |
+          |struct Pair
           |    a: int
           |    b: int
           |
@@ -757,9 +771,11 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
   "a moved surface whose whole point is the last line the compiler supplies" - {
 
-    "a builder gathers text and hands back one string, from the standard module" in {
+    "a builder gathers text and hands back one string, from the module that holds it" in {
       run(
-        """var b = str_builder()
+        """import sysl.text.str_builder
+          |
+          |var b = str_builder()
           |
           |b.push("ab")
           |b.push_char('é')
@@ -768,9 +784,12 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
 
     "and a program may declare a 'StrBuilder' of its own beside the library's" in {
-      // A name a program plausibly wants, and the library's is still what `str_builder()` returns.
+      // A name a program plausibly wants, and the library's is still what `str_builder()` returns —
+      // which the import does not even have to be told apart from, since it names the function only.
       run(
-        """struct StrBuilder
+        """import sysl.text.str_builder
+          |
+          |struct StrBuilder
           |    tag: int
           |
           |var mine = StrBuilder(7)
@@ -785,7 +804,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       // `CString` is the one place the library answers "who frees it" for a foreign shape, so the
       // storage being one longer than the text is the invariant worth pinning.
       run(
-        """var c = cstring("abc")
+        """import sysl.text.cstring
+          |
+          |var c = cstring("abc")
           |
           |print(c.len, c.bytes.len, c.bytes[3])
           |""".stripMargin) shouldBe "3 4 0\n"
@@ -793,7 +814,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
     "and what it hands a foreign function is a pointer to those bytes" in {
       run(
-        """extern "strlen" c_strlen(p: *u8) -> usize
+        """import sysl.text.cstring
+          |
+          |extern "strlen" c_strlen(p: *u8) -> usize
           |
           |var c = cstring("hello")
           |print(c_strlen(c.ptr))

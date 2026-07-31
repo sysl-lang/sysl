@@ -26,6 +26,18 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
+  /** The validator is `sysl.text`'s, so every program here asks for it. The unchecked primitive
+   * below is the compiler's own and needs nothing named, which is the distinction the two halves of
+   * this suite are about — the import is written once so that neither half is about the import.
+   */
+  private val importing = "import sysl.text.from_utf8\n\n"
+
+  override protected def run(src: String): String = super.run(importing + src)
+
+  override protected def exits(src: String): Unit = super.exits(importing + src)
+
+  override protected def err(src: String): String = super.err(importing + src)
+
   private def literal(hex: String): String =
     if hex.isEmpty then "[]" else hex.split(" ").map(b => s"0x${b}u8").mkString("[", ", ", "]")
 
@@ -334,8 +346,8 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "what it costs a program that never decodes" - {
     // The reachability rule the library relies on: neither the validator nor anything it reaches is
     // emitted for a program that does not call it.
-    // The name is read off `Library.key` rather than written out, because the validator is in the
-    // standard module and `@from_utf8` is no longer the symbol: spelled literally, this negative
+    // The name is read off `Library.key` rather than written out, because the validator is in a
+    // module of the library's and `@from_utf8` is no longer the symbol: spelled literally, this negative
     // would go on passing while asserting nothing. `@sysl.str.from_bytes` below is a *codegen*
     // helper — dots, not the module separator — so it is unaffected by where the library declares
     // things and stays spelled as it is emitted.

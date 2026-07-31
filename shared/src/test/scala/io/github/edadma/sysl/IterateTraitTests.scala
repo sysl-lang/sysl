@@ -377,7 +377,9 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
     // decoder ask for a continuation byte that is not there, and the slice's own bounds check is
     // what stops it: the read traps rather than running off the end.
     "a hand-built cursor over truncated bytes traps rather than reading past the end" in {
-      exits("""var b = [0xF0u8]
+      exits("""import sysl.text.chars_of
+              |
+              |var b = [0xF0u8]
               |for c in chars_of(b[..]) do print(c)""".stripMargin)
     }
 

@@ -20,7 +20,9 @@ class VariadicForeignTests extends AnyFreeSpec with CodegenSupport with RunSuppo
    * `vprintf`. The extern is written the way the C header is.
    */
   private val logger =
-    """extern vprintf(fmt: *u8, ap: va_list) -> i32
+    """import sysl.text.cstring
+      |
+      |extern vprintf(fmt: *u8, ap: va_list) -> i32
       |
       |log(fmt: *u8, ...) -> i32
       |    var ap: va_list
@@ -80,7 +82,9 @@ class VariadicForeignTests extends AnyFreeSpec with CodegenSupport with RunSuppo
 
     // A walk this function was lent is already an address, so lending it on to C asks nothing new.
     "a walk lent by a sysl caller can be handed straight on to C" in {
-      run(s"""extern vprintf(fmt: *u8, ap: va_list) -> i32
+      run(s"""import sysl.text.cstring
+             |
+             |extern vprintf(fmt: *u8, ap: va_list) -> i32
              |
              |render(fmt: *u8, ap: *va_list) -> i32 = vprintf(fmt, ap)
              |

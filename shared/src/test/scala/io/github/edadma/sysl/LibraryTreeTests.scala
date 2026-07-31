@@ -340,12 +340,44 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     }
 
     // The direction §6 permits, demonstrated by the library compiling at all: `line_text` calls
-    // `print`, `exit` and `from_utf8`, every one of them the standard module's, and reaches them
-    // with no import because a submodule gets the free names like any other file.
+    // `print` and `exit`, both of them the standard module's, and reaches them with no import
+    // because a submodule gets the free names like any other file.
     "while the surface itself reaches the standard module's names freely" in {
       irOf(
         "main.sysl" -> "print(sysl.io.line_text(\"hi\".bytes))",
       ) should include(s"call { ptr, ptr, i64 } @${Library.key("line_text")}(")
+    }
+
+    // The conversions either side of a `string`, which a program that stays in `string` never needs.
+    "put the text conversions behind an import too" in {
+      errOf("main.sysl" -> "var s = from_utf8([0x61u8])") should include("undefined function 'from_utf8'")
+    }
+
+    "and the builder and the C copy with them" in {
+      val e = errOf("main.sysl" -> "var b = str_builder()\nvar c = cstring(\"x\")")
+
+      e should include("undefined function 'str_builder'")
+      e should include("undefined function 'cstring'")
+    }
+
+    // One import reaches a whole file of them, `sysl.text` being two files and one module (`13 §1`).
+    "which one import over the module reaches, however many files declared them" in {
+      irOf(
+        "main.sysl" -> "import sysl.text.*\n\nvar b = str_builder()\nb.push(\"x\")\nprint(b.finish(), cstring(\"y\").len)",
+      ) should include(s"call %struct.${Library.key("StrBuilder")} @${Library.key("str_builder")}()")
+    }
+
+    // The exception, and the reason it is one: `.chars` is a member the compiler provides, so it
+    // names `chars_of` by key rather than by resolving the word. A cursor over characters costs a
+    // program nothing even though the cursor moved out of reach of its bare name.
+    "while a character walk still costs a program no import at all" in {
+      irOf(
+        "main.sysl" -> """for c in "ab".chars do print(c)""",
+      ) should include(s"call %struct.${Library.key("Chars")} @${Library.key("chars_of")}(")
+    }
+
+    "though naming the cursor itself does need one" in {
+      errOf("main.sysl" -> "var c: Chars = \"ab\".chars") should include("unknown type 'Chars'")
     }
   }
 }
