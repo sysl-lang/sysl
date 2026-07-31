@@ -282,6 +282,13 @@ expected — `xs.map(square)` — is simply a closure with an empty environment,
 wrapper. There is no separate "function pointer" concept to learn; the capture-free case is the
 degenerate one, the way a simple enum is the degenerate data enum (`09` §1).
 
+This holds at **both** of §6's representations, and the two are worth naming separately because a
+name reaching one is no evidence it reaches the other: a function goes to a bare-arrow parameter,
+where it monomorphizes like any other closure, and it is **erased into a `&Fn`** wherever a concrete
+type is required — a field, a return type, an element of a collection, an annotated `var`. A
+generic function and an `extern` both go, the object's arguments being what says which instantiation
+is meant. A **nested** function is the one exception, and §5a gives the reason it has to be.
+
 ## 5a. Nested functions — a closure with a name
 
 A function declaration may stand inside a function body, spelled exactly as a top-level one:
@@ -460,8 +467,9 @@ lightweight answer, not the general one.
 - **How a result list appears in a callable type.** §6 makes the bare arrow parameter-only sugar and
   requires `&Fn` elsewhere; `(int) -> int, int` is ambiguous about where the parameter list ends, so
   a callable yielding several results needs a spelling — probably `(int) -> (int, int)`, which
-  reintroduces the parentheses this section otherwise avoids. It waits on the closure implementation
-  like the rest of §6's corners.
+  reintroduces the parentheses this section otherwise avoids. Closures are built, so nothing blocks
+  it but the choice: today `&Fn(int, int) -> (int, int)` is read as yielding one **tuple**, which is
+  a callable a program can already write and pass, and what has no spelling is the *list*.
 - **Whether a binding may annotate its parts.** `var a: int, b: int = f(x)` is noisy and
   `var a, b: int = f(x)` reads as though it types only `b`. Inference covers the ordinary case; the
   spelling for the case it does not is unsettled.
@@ -825,8 +833,8 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
   joins this chapter with `08` and is not settled here.
 - **f. A symbol for a sysl *definition*.** §1 lets an `extern` name the symbol it resolves to; the
   other direction — a sysl function exported under a chosen symbol, C's side of the same seam — has
-  no spelling. It is the same question as how a sysl function's symbol is decided at all, which the
-  module system (`13`) settles, so it waits for that rather than growing a second mechanism here.
+  no spelling. It is the same question as how a sysl function's symbol is decided at all, and `13`
+  has since settled that, so what is left here is the **spelling** rather than anything to wait for.
 - ~~**g. `va_copy`, and a `va_list` that crosses a call.**~~ **Built** (§9, *Handing a walk on*).
   `va_copy` is a fifth language form, and a walk is handed on as a `*va_list` — which turned out to
   need no rule of its own, because §2 already says a function is given something to advance by
@@ -842,7 +850,9 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
   it cannot then be is a trait object, for the reason object safety gives.
 - **i. A *safe* variadic beside the C-faithful one.** A homogeneous `...T` collected into a slice
   (Go's, Swift's) or a heterogeneous `...&Show` over trait objects would be checked, which §9's
-  cannot be. It is additive and wanted; the trait-object half waits on dynamic dispatch (`02`).
+  cannot be. It is additive and wanted, and nothing blocks it any longer — the trait objects its
+  heterogeneous half wanted are built (`02`), so what remains is a spelling and a decision to take
+  it.
 - **h. Capability gating for externs.** An `extern` reaching into libc is exactly the kind of thing
   `capabilities.md` exists to gate, and a freestanding `no alloc` target's externs are a different
   set from a hosted one's. Which capability an extern requires — and whether that is a property of

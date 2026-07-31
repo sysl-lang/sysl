@@ -112,12 +112,15 @@ trait ExprAnalysis
     case Some(o) if Type.erased(o) =>
       expr match
         case NullLit() => analyzeValue(expr, Some(o))
-        // A closure is the other exception, and for the opposite reason to `null`'s: it has no type
+        // A callable is the other exception, and for the opposite reason to `null`'s: it has no type
         // of its own to be analyzed at and then erased, since what it takes is exactly what the
         // object's arguments say (`12 §5`). So the object is pushed down, and the erasure that
-        // follows boxes the struct the literal became.
-        case _: Lambda => coerce(analyzeValue(expr, Some(o)), o)
-        case _         => coerce(analyzeValue(expr, None), o)
+        // follows boxes the struct it became. This covers a **named function** as well as a literal:
+        // §5 makes the two one thing — a declared function used where a callable is wanted is the
+        // capture-free closure — and asking a name that stands for a declaration to produce a value
+        // with no context is asking for the one thing it cannot do.
+        case _ if callableArg(expr) => coerce(analyzeValue(expr, Some(o)), o)
+        case _                      => coerce(analyzeValue(expr, None), o)
 
     case Some(r: Type.Ref) =>
       expr match
@@ -292,6 +295,16 @@ trait ExprAnalysis
       err(s"'$name' is a nested function, so it is called where it is written rather than passed — " +
         "its environment is the frame it was declared in, and a callable value is a way of carrying " +
         s"it out. Something that has to be passed is a closure of its own: 'var $name = x -> …'")
+
+    // A declared function named where nothing wants a callable. The name is not undefined — the
+    // declaration is right above — and saying so sends the reader hunting for a typo instead of at
+    // what is really missing: a context that says which call trait to build the function into
+    // (`§5`, `§6`). A function has no address of its own to fall back on, which is the other thing
+    // a reader arriving here may have been reaching for, so the message rules it out by name.
+    case Ident(name) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+      err(s"'$name' is a function, and a function becomes a value only where a callable is wanted — " +
+        "a bare-arrow parameter, or a '&Fn' where a concrete type is required. Nothing here asks " +
+        "for one, and a function has no address of its own to take instead")
 
     case Ident(name) =>
       lookupOpt(name) match
