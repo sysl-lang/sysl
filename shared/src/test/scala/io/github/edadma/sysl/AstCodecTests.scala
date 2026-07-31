@@ -165,6 +165,23 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
         |import a.b
         |""".stripMargin)
     check("a module header", "module geom.shape\n\nf() -> int = 1")
+    // A library ships no tests, so nothing that travels in a real artifact carries one of these —
+    // which is exactly why the round trip is asserted here rather than left to the library above.
+    // The codec's promise is that a tree reads back as the tree that was written, and a field only
+    // ever seen holding `None` is one that could be dropped with nothing noticing.
+    check("a test in each form its attribute takes",
+      """#test
+        |plain() = 0
+        |
+        |#test("a sentence about what holds")
+        |named() = 0
+        |
+        |#test(should_trap)
+        |trapping() = 0
+        |
+        |#test("both at once", should_trap: "past the end")
+        |both() = 0
+        |""".stripMargin)
   }
 
   "an expression round-trips" - {

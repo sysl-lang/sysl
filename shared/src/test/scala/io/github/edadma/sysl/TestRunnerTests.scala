@@ -258,6 +258,74 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     }
   }
 
+  "a test is a member of its module like any other" - {
+    // The claim this settles is about *order*: tests are dropped after the whole-program checks have
+    // run, so a module's capability clause reaches them (`13 §4`). A test invisible to that check
+    // would let a `no alloc` module hold an allocation that its own tests exercised every day.
+    "a module's 'no alloc' clause reaches its tests" in {
+      errIn(("m", "m.sysl", """module m
+                              |no alloc
+                              |
+                              |add(a: int, b: int) -> int = a + b
+                              |
+                              |#test
+                              |adding() =
+                              |    val s = str(add(2, 2))
+                              |    assert(s == "4", "adding")
+                              |""".stripMargin)) should include("declared 'no alloc'")
+    }
+
+    "a test that allocates nothing is fine in the same module" in {
+      irIn(("m", "m.sysl", """module m
+                             |no alloc
+                             |
+                             |add(a: int, b: int) -> int = a + b
+                             |
+                             |#test
+                             |adding() =
+                             |    assert(add(2, 2) == 4, "adding")
+                             |""".stripMargin)) should not be empty
+    }
+  }
+
+  "a test has one caller, and it is not the program" - {
+    // Found by probing rather than by reasoning: a call compiled fine and failed at the *link*,
+    // naming a symbol nothing in the source explained — because the ordinary build had dropped the
+    // definition and kept the call.
+    "calling a test is refused where the call is written" in {
+      err("""#test
+            |t() =
+            |    assert(true, "up")
+            |
+            |t()
+            |""".stripMargin) should include("'sysl test' calls and nothing else does")
+    }
+
+    "a test calling another test is the same refusal" in {
+      err("""#test
+            |helper() =
+            |    assert(true, "up")
+            |
+            |#test
+            |t() =
+            |    helper()
+            |""".stripMargin) should include("'sysl test' calls and nothing else does")
+    }
+
+    "work two tests share goes in an ordinary function, which both may call" in {
+      allPass("""shared() -> int = 21
+                |
+                |#test
+                |first() =
+                |    assert(shared() == 21, "shared")
+                |
+                |#test
+                |second() =
+                |    assert(shared() * 2 == 42, "shared again")
+                |""".stripMargin)
+    }
+  }
+
   "a test build is not the program" - {
     "the program's own statements do not run" in {
       // The statement would print if the entry point were the ordinary one. What runs instead is the
@@ -339,6 +407,31 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
                      |""".stripMargin)
 
       out should include("shared")
+    }
+
+    // A library is lowered without pruning — it has no `main` to prune from, and every public
+    // declaration is a potential entry — so the rule that keeps a program's tests out of its output
+    // does not reach it. Dropping them is a separate act, and this is what says it happens.
+    "a library's tests are not in the library" in {
+      val lib = SyslParser.parse(Source("lib.sysl", """module demo
+                                                      |
+                                                      |double(n: int) -> int = n * 2
+                                                      |
+                                                      |#test
+                                                      |doubling() =
+                                                      |    assert(double(2) == 4, "doubling")
+                                                      |""".stripMargin, List("demo"))) match {
+        case Right(p) => p
+        case Left(e)  => fail(e)
+      }
+
+      Compiler.compileLibrary(List(lib)) match {
+        case Right((out, symbols)) =>
+          out should include("double")
+          out should not include "doubling"
+          symbols.filter(_.contains("doubling")) shouldBe empty
+        case Left(e) => fail(e)
+      }
     }
 
     "the program still runs, and runs what it always did" in {

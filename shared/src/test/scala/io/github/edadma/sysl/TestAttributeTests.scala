@@ -216,6 +216,42 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     }
   }
 
+  "the shapes the grammar has to say no to" - {
+    // A member is not a declaration statement — it parses under the rule that reads a struct's,
+    // an enum's, a trait's and an `impl`'s alike — so `#test` has no place there. The refusal comes
+    // from the member grammar rather than from the attribute rule, which is why it is pinned: the
+    // message a reader gets is the one that rule gives, and this says which rule that is.
+    "a method cannot be a test" in {
+      err("""struct Point
+            |    x: int
+            |
+            |    #test
+            |    t(self) = 0
+            |""".stripMargin) should not be empty
+    }
+
+    "an attribute with empty parentheses says nothing, and is not a form" in {
+      err("""#test()
+            |t() = 0
+            |""".stripMargin) should not be empty
+    }
+
+    "one attribute to a declaration" in {
+      err("""#test
+            |#test
+            |t() = 0
+            |""".stripMargin) should not be empty
+    }
+
+    // Refused, but by the grammar rather than by the attribute rule, so the message is the
+    // grammar's. The attribute rule's own sentence needs a token after the newline to be reported
+    // against and at the end of a file there is none — every case where something *is* written
+    // below gets the better message, which is the one a reader will meet.
+    "an attribute at the end of a file has nothing to attach to" in {
+      err("#test\n") should not be empty
+    }
+  }
+
   "a test is analyzed whether or not the build would run it" - {
     // The property that lets a test sit beside what it tests: dropping them is an *emission*
     // decision, taken after every check has run. A test that stopped being checked the moment it

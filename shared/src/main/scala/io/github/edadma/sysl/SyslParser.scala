@@ -122,14 +122,24 @@ class SyslParser(val source: Source) extends DeclParser {
    * answered with the sentence rather than with the list of forms the grammar could still have read.
    */
   protected lazy val testDecl: PackratParser[Stmt] =
-    testAttr ~ (newlines ~> visibility ~ funcDecl) ^^ {
-      case a ~ (Visibility.Public ~ (f: FuncDecl)) => f.copy(test = Some(a))
-      case a ~ (v ~ (f: FuncDecl))                 => restrict(v, f.copy(test = Some(a)))
-      case _ ~ (_ ~ other)                         => other
-    } | testAttr ~> newlines ~> err(
-      "'#test' marks a function as a unit test, and only a function — there is nothing for " +
-        "'sysl test' to call in any other declaration",
-    )
+    testAttr >> { a =>
+      // Once the attribute has been read the statement is committed to being a test, which is what
+      // `>>` buys: everything after it is read against that, so a declaration that cannot carry one
+      // is answered with the sentence below rather than with the grammar's complaint about whichever
+      // alternative it went on to try.
+      // The newlines are consumed *before* the choice so that both arms start at the same token. A
+      // combinator choice keeps whichever alternative reached furthest, so an `err` written behind
+      // the newline would sit earlier than the declaration rule's own failure and lose to it —
+      // leaving the reader with "identifier expected" at a line whose problem is the one above it.
+      opt(newlines) ~> ((visibility ~ funcDecl) ^^ {
+        case Visibility.Public ~ (f: FuncDecl) => f.copy(test = Some(a))
+        case v ~ (f: FuncDecl)                 => restrict(v, f.copy(test = Some(a)))
+        case _ ~ other                         => other
+      } | err(
+        "'#test' marks a function as a unit test, and only a function — there is nothing for " +
+          "'sysl test' to call in any other declaration",
+      ))
+    }
 
   /** `#test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
