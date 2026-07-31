@@ -487,9 +487,12 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe "294\n"
     }
 
-    "a byte view can be handed to anything that takes a slice" in {
+    // The parameter is `[]const u8` because that is what `.bytes` yields: the bytes may be a
+    // literal's, and those live where the platform will not let anybody write. A reader who only
+    // adds them up loses nothing by saying so.
+    "a byte view can be handed to anything that takes a view it does not write" in {
       val src =
-        """total(bytes: []u8) -> int
+        """total(bytes: []const u8) -> int
           |    var t = 0
           |    for b in bytes do t += int(b)
           |    t
@@ -498,6 +501,19 @@ class StringRunTests extends AnyFreeSpec with RunSupport {
           |""".stripMargin
 
       run(src) shouldBe "294 197\n"
+    }
+
+    // A parameter that reserves the right to write refuses these bytes instead, which is the
+    // soundness item `03` opens with — the refusals are pinned in `MemoryModelClaimTests`, where
+    // the chapter's claim is.
+    "and the view a program keeps reading is still the string's own storage, not a copy" in {
+      val src =
+        """var s = "abc"
+          |var b = s.bytes
+          |print(b.len, b[0], b[2])
+          |""".stripMargin
+
+      run(src) shouldBe "3 97 99\n"
     }
   }
 

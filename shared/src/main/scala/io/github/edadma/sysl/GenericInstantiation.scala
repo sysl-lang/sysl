@@ -177,7 +177,7 @@ trait GenericInstantiation extends ConstFolding {
         case Type.Ref(inner, syn) => Type.Ref(substParams(inner, subst), syn)
         case Type.Weak(inner)     => Type.Weak(substParams(inner, subst))
         case Type.Array(n, elem)  => Type.Array(n, substParams(elem, subst))
-        case Type.Slice(elem)     => Type.Slice(substParams(elem, subst))
+        case Type.Slice(elem, ro) => Type.Slice(substParams(elem, subst), ro)
         case other                => other
 
   /** Instantiates an enum for one set of type arguments. All-dataless variants make a *simple*
@@ -316,11 +316,15 @@ trait GenericInstantiation extends ConstFolding {
         case Type.Weak(t)  => unify(inner, t, tparams, sub)
         case Type.Ref(t, _) => unify(inner, t, tparams, sub)
         case _             => ()
-    case ArrayType(None, elem) =>
+    // Whether the view refuses writes is not matched here, for the reason `&T` and `weak T` above
+    // do not match their own modes: this is where a type *parameter* is read off an argument, and
+    // whether the argument may stand in the parameter's place is the coercion's question. Refusing
+    // here would report a missing instantiation for what is really a write into read-only elements.
+    case ArrayType(None, elem, _) =>
       actual match
-        case Type.Slice(e) => unify(elem, e, tparams, sub)
-        case _             => ()
-    case ArrayType(Some(_), elem) =>
+        case Type.Slice(e, _) => unify(elem, e, tparams, sub)
+        case _                => ()
+    case ArrayType(Some(_), elem, _) =>
       actual match
         case Type.Array(_, e) => unify(elem, e, tparams, sub)
         case _                => ()

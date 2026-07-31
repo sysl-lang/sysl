@@ -128,9 +128,9 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
      * here rather than trusted not to. */
     "may not keep the bytes it is written" in {
       err("""struct Bad
-            |    held: []u8
+            |    held: []const u8
             |impl Writer for Bad
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.held = bytes
             |    failed(*self) -> bool = false
             |var b: Bad
@@ -143,7 +143,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
       ir("""struct Ok
             |    n: usize
             |impl Writer for Ok
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |    failed(*self) -> bool = false
             |var o: Ok
@@ -155,13 +155,31 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
       err("""struct S
             |    n: usize
             |impl Writer for S
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |    failed(*self) -> bool = false
             |var w: &Writer = S(0usize)
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
         s"'out' of '${Modules.show(Library.key("display_int"))}' is *sysl.Writer, " +
           "but &sysl.Writer was given")
+    }
+
+    /* A member whose signature does not match the trait's is reported at the `impl` and never
+     * registered. Errors are collected rather than thrown, so the erasure that follows still runs
+     * and finds no function for the slot — and reading it straight out of the table turned a
+     * diagnostic the compiler already had into a stack trace with no diagnostic at all. */
+    "and a member at the wrong signature is reported rather than crashing the table builder" in {
+      val e = err("""struct Counter
+                    |    n: usize
+                    |impl Writer for Counter
+                    |    write(*self, bytes: []u8)
+                    |        self.n += bytes.len
+                    |var c: Counter
+                    |var w: *Writer = &c
+                    |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin)
+
+      e should include("parameter 'bytes' of method 'write' is []byte, but trait 'Writer' declares []const byte")
+      e should include("has no 'write' that 'Writer' can point a slot at")
     }
   }
 

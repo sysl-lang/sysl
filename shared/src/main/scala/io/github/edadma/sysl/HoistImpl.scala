@@ -220,7 +220,7 @@ trait HoistImpl extends ImplConformance {
     case Type.Ptr(inner)     => mentionsKey(inner, key)
     case Type.Ref(inner, _)  => mentionsKey(inner, key)
     case Type.Array(_, elem) => mentionsKey(elem, key)
-    case Type.Slice(elem)    => mentionsKey(elem, key)
+    case Type.Slice(elem, _) => mentionsKey(elem, key)
     case _                   => false
 
   /** `a Box`, `an Adder` — the article a diagnostic needs when it names a type in running prose. */
@@ -444,7 +444,7 @@ trait HoistImpl extends ImplConformance {
     case PtrType(inner)      => subjectHomes(inner)
     case RefType(inner, _)   => subjectHomes(inner)
     case WeakType(inner)     => subjectHomes(inner)
-    case ArrayType(_, elem)  => subjectHomes(elem)
+    case ArrayType(_, elem, _) => subjectHomes(elem)
     case TupleType(parts, _) => Set(None) ++ parts.flatMap(subjectHomes)
     case f: FnType           => subjectHomes(f.asTrait)
 

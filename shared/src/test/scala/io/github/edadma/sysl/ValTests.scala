@@ -239,10 +239,13 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       ) should include("written once")
     }
 
-    // The decision recorded rather than a limit stumbled into: a `[]T` permits writes and records
-    // nothing about whose elements it views, so a view of a `val` would be a way of writing one.
-    "slicing one, until a slice can say its elements are read-only" in {
-      err("val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]") should include("cannot be sliced")
+    // Slicing is no longer among them: a view of a `val` is a `[]const T`, which carries the
+    // read-only-ness rather than losing it, so what is refused is the write through the view.
+    "writing through a view of one, which is where the refusal moved when slicing became legal" in {
+      run("val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]\nprint(s[0], s[1])") shouldBe "2 3\n"
+
+      err("val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]\ns[0] = 9") should
+        include("views elements it may not write")
     }
 
     "a module-level 'val' with no type, which every module member states" in {

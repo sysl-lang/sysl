@@ -116,7 +116,7 @@ trait ControlFlowExprAnalysis extends ExprSupport {
           val seq = autoDeref(analyzeExpr(iter))
           seq.ty match
             case Type.Array(_, elem) => forEach(label, name, seq, elem, body, elseOpt, expected, discarded)
-            case Type.Slice(elem)    => forEach(label, name, seq, elem, body, elseOpt, expected, discarded)
+            case Type.Slice(elem, _) => forEach(label, name, seq, elem, body, elseOpt, expected, discarded)
             // A string has two granularities and no reason to prefer one silently, so which one
             // is wanted is written: `s.bytes` for the bytes, `s.chars` for the characters they
             // encode. Neither is the default, because a program that means one rarely means both.

@@ -159,7 +159,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
       run("""struct Counter
             |    n: usize
             |impl Writer for Counter
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |    failed(*self) -> bool = false
             |var c: Counter
@@ -175,7 +175,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
       run("""struct Counter
             |    n: usize
             |impl Writer for Counter
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |var c: Counter
             |var w: *Writer = &c
@@ -190,7 +190,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
             |    n: usize
             |    over: bool
             |impl Writer for Cap
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |        if self.n > 4usize then self.over = true
             |    failed(*self) -> bool = self.over
@@ -207,7 +207,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
         """struct Counter
           |    n: usize
           |impl Writer for Counter
-          |    write(*self, bytes: []u8)
+          |    write(*self, bytes: []const u8)
           |        self.n += bytes.len
           |    failed(*self) -> bool = false
           |var c: Counter

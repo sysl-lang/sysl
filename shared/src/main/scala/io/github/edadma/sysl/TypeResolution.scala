@@ -108,7 +108,7 @@ trait TypeResolution extends GenericInstantiation {
     case PtrType(inner)                     => PtrType(spellSelf(inner, selfRef))
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
     case WeakType(inner)                    => WeakType(spellSelf(inner, selfRef))
-    case ArrayType(len, elem)               => ArrayType(len, spellSelf(elem, selfRef))
+    case ArrayType(len, elem, ro)           => ArrayType(len, spellSelf(elem, selfRef), ro)
     case TupleType(parts, r)                => TupleType(parts.map(spellSelf(_, selfRef)), r)
     case f: FnType =>
       f.copy(params = f.params.map(spellSelf(_, selfRef)), ret = spellSelf(f.ret, selfRef))
@@ -122,7 +122,7 @@ trait TypeResolution extends GenericInstantiation {
     case PtrType(inner)     => mentions(inner, tps)
     case RefType(inner, _)  => mentions(inner, tps)
     case WeakType(inner)    => mentions(inner, tps)
-    case ArrayType(_, elem) => mentions(elem, tps)
+    case ArrayType(_, elem, _) => mentions(elem, tps)
     case TupleType(parts, _) => parts.exists(mentions(_, tps))
     case f: FnType          => mentions(f.asTrait, tps)
 
@@ -293,9 +293,10 @@ trait TypeResolution extends GenericInstantiation {
 
     // An array holds its elements, so it is no indirection at all and a type cannot contain an
     // array of itself. A slice only points at them, so it breaks a cycle exactly as `*T` does.
-    case ArrayType(None, elem) => Type.Slice(addressable(underIndirection(resolveType(elem, subst)), "a slice"))
+    case ArrayType(None, elem, ro) =>
+      Type.Slice(addressable(underIndirection(resolveType(elem, subst)), "a slice"), readOnly = ro)
     // A bound is a compile-time constant, which a `const` is and a call is not (`13 §7`).
-    case ArrayType(Some(len), elem) =>
+    case ArrayType(Some(len), elem, _) =>
       val n = constInt(len) match
         case Some(v) if v >= 0 && v.isValidInt => v.toInt
         case Some(v)                           => err(s"an array cannot have $v elements")
@@ -562,7 +563,7 @@ trait TypeResolution extends GenericInstantiation {
     case PtrType(i)          => mentionsAny(i, names)
     case RefType(i, _)       => mentionsAny(i, names)
     case WeakType(i)         => mentionsAny(i, names)
-    case ArrayType(_, e)     => mentionsAny(e, names)
+    case ArrayType(_, e, _)  => mentionsAny(e, names)
     case TupleType(parts, _) => parts.exists(mentionsAny(_, names))
     case f: FnType           => mentionsAny(f.asTrait, names)
 

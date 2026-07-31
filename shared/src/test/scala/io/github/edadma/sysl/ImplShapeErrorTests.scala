@@ -291,4 +291,33 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
             |""".stripMargin) shouldBe "true\n"
     }
   }
+
+  /** Both views share the one `[]` shape key, so a block written for either is *found* for either —
+    * what settles it is whether the receiver may stand at the block's `self`. That makes
+    * `[]const T` the form to write a block for, since a `[]T` widens into it and nothing widens the
+    * other way. It is the advice C++ gives about `span<const T>`, reached here by the same route.
+    */
+  "a shape block and the two views" - {
+    "a block for '[]T' does not reach a view that may not be written" in {
+      err("""trait Total
+            |    total(self) -> usize
+            |impl[T] Total for []T
+            |    total(self) -> usize = self.len
+            |var s = "hello"
+            |print(s.bytes.total())
+            |""".stripMargin) should include("does not become the other")
+    }
+
+    // The same block written the other way, to show the refusal is about which form was chosen and
+    // not about `s.bytes` being unable to find a member at all.
+    "while the same block written for '[]const T' reaches it" in {
+      run("""trait Total
+            |    total(self) -> usize
+            |impl[T] Total for []const T
+            |    total(self) -> usize = self.len
+            |var s = "hello"
+            |print(s.bytes.total())
+            |""".stripMargin) shouldBe "5\n"
+    }
+  }
 }

@@ -152,6 +152,12 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     check("a constrained subtype with a range and a predicate",
       "type Age = u8 within 0..<200 where value != 13u8")
     check("a const and a module-level val", "const cap: usize = 512\nval order: [3]int = [2, 0, 1]")
+    check("a read-only view, beside the mutable one it is not",
+      // Whether a view is read-only is one `Boolean` on `ArrayType`, and dropping it on the way
+      // through would still compile and still round-trip every other field — the library would just
+      // quietly arrive with `putbytes` taking a slice it is allowed to write. The two forms sit
+      // together here so a codec that encoded neither, or conflated them, has nowhere to hide.
+      "f(a: []const u8, b: []u8) -> []const u8 = a")
     check("every import form",
       """import a.b.c
         |import a.b.{c, d as e}
@@ -192,8 +198,11 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     }
 
     "an artifact from a different version, naming both" in {
+      // The version travels from the constant. Written out as a literal, this test goes on passing
+      // after a format bump while silently checking that a header naming a version nobody uses is
+      // refused — which is not the claim.
       val original = AstCodec.encode(List(parsed("f() -> int = 1")))
-      val older    = original.replaceFirst("sysl-ast 1", "sysl-ast 0")
+      val older    = original.replaceFirst(s"sysl-ast ${AstCodec.Version}", "sysl-ast 0")
 
       AstCodec.decode(older) match
         case Left(e) =>

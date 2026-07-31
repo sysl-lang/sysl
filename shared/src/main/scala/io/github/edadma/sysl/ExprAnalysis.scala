@@ -148,6 +148,13 @@ trait ExprAnalysis
       else if v.ty == c then v
       else checkInto(v, c)
 
+    // A slice expectation is pushed down as it is — storage the expression *makes* takes whichever
+    // form was asked for, so a buffer literal needs no conversion — and `coerce` settles what comes
+    // back at the other one. Both directions come here, because the direction that is refused is
+    // owed a message about what it would have allowed rather than the bare mismatch a reader gets
+    // from two types that merely differ.
+    case Some(v: Type.Slice) => coerce(analyzeValue(expr, Some(v)), v)
+
     case _ => analyzeValue(expr, expected)
 
   /** Wraps a base-typed value in the run-time check for a constrained subtype. */
@@ -196,7 +203,8 @@ trait ExprAnalysis
 
   /** Whether a context of this type converts what it is given rather than simply requiring it. */
   private def converts(want: Type): Boolean =
-    Type.erased(want) || want.isInstanceOf[Type.Ref] || want.isInstanceOf[Type.Weak]
+    Type.erased(want) || want.isInstanceOf[Type.Ref] || want.isInstanceOf[Type.Weak] ||
+      Type.readOnlyView(want)
 
 
   /** Whether an expression yields its value through branches rather than producing one itself. */
@@ -204,11 +212,12 @@ trait ExprAnalysis
     case _: IfExpr | _: MatchExpr | _: While | _: For => true
     case _                                            => false
 
-  /** The three conversions a context may apply to a value that does not already have its type: a
-   * `T` the context wanted by reference is boxed, a `&T` the context wanted weakly is weakened, and
-   * something concrete where a trait object was wanted is erased into one. Nothing else coerces —
-   * any other mismatch is left for the caller to diagnose, where the message can name the parameter
-   * or the variable it is about.
+  /** The four conversions a context may apply to a value that does not already have its type: a
+   * `T` the context wanted by reference is boxed, a `&T` the context wanted weakly is weakened,
+   * something concrete where a trait object was wanted is erased into one, and a `[]T` where a
+   * `[]const T` was wanted gives up the ability to write. Nothing else coerces — any other mismatch
+   * is left for the caller to diagnose, where the message can name the parameter or the variable it
+   * is about.
    *
    * A `T` where a `weak T` was wanted goes through both: the value is boxed and the reference that
    * comes back is weakened. What that makes is an edge to an object nothing else holds, which dies
@@ -232,6 +241,20 @@ trait ExprAnalysis
         "the other: a count is atomic or it is not from the moment the object is allocated, and a " +
         s"conversion would put an ordinary retain beside an atomic one. Allocate ${show(want)} as a " +
         s"'&${if sync then "sync " else ""}${show(want)}' where it is constructed")
+
+    // A view that may be written stands where one that may not was asked for, and never the other
+    // way round. The safe direction is a promise the caller keeps and the callee does not need: the
+    // elements are still whatever they were, and the callee has merely lost a way of changing them.
+    // The unsafe direction is the whole of what the type exists to stop, and it is diagnosed below
+    // rather than here so that the message can say what it would have allowed.
+    case Type.Slice(want, true) if t.ty == Type.Slice(want, readOnly = false) =>
+      TConstView(t).setPos(t.pos)
+
+    case Type.Slice(want, false) if t.ty == Type.Slice(want, readOnly = true) =>
+      err(s"a '[]const ${show(want)}' views elements it may not write, and a '[]${show(want)}' is a " +
+        "licence to write them — so the one does not become the other. Copy what you need into a " +
+        s"'[]${show(want)}' of your own, or take the parameter as '[]const ${show(want)}' if it is " +
+        "only read")
 
     case _ => t
 
@@ -732,15 +755,28 @@ trait ExprAnalysis
       // string's own storage and assigning to one is the line above by another route — with a
       // literal's bytes in read-only memory, a segfault out of a program containing no `*T` at all.
       //
-      // Only the *assignment* is refused. `&s.bytes[0]` is how a string reaches a C function that
-      // takes a pointer and a length, which is the whole of `printf("%.*s")`, and it is a `*T` the
-      // moment it is written — the tier where `03` says the guarantees stop. What neither reaches is
-      // the view once it has been bound to a name or passed on, because a `[]T` records nothing
-      // about whose elements it views; that is the read-only view type `07 § Not yet` waits on.
+      // `s.bytes` reinterprets the same three words as a `[]u8` (`04`), so its elements are the
+      // string's own storage and assigning to one is the line above by another route — with a
+      // literal's bytes in read-only memory, a segfault out of a program containing no `*T` at all.
       case TIndex(_: TBytes, _, _) if writes =>
         err("a string is immutable, and 'bytes' views the string's own storage rather than a copy " +
           "of it — so writing through one is writing the string. Bytes you may write are bytes of " +
           "your own: copy them into a '[]u8' first")
+
+      // Any other element of a read-only view: the view bound to a name, passed to a function, or
+      // sliced again, which is what the arm above cannot reach.
+      //
+      // Only the *write* is refused. `&` is left alone here, unlike on the `val` itself (`13`), and
+      // the difference is which tier the reader is in: `&v[0]` is a `*T` the moment it is written,
+      // and `03` says in as many words that the guarantees stop there and that this is how a view
+      // reaches a C function taking a pointer and a length. `printf("%.*s")` is exactly that call
+      // and so is `memchr`, which is what the prelude's own `find_byte` is. Refusing it would leave
+      // a type that cannot do the job it was added for, while buying nothing: `*T` is greppable, and
+      // a program that has none still cannot reach these bytes.
+      case TIndex(recv, _, _) if writes && Type.readOnlyView(recv.ty) && recv.ty != Type.Str =>
+        err(s"this element belongs to a '${show(recv.ty)}', which views elements it may not write, " +
+          "so there is nothing to assign through. Elements you may write are elements of your own: " +
+          s"copy them into a '[]${show(Type.element(recv.ty).getOrElse(Type.Unknown))}' first")
 
       case _ =>
         // The enumeration names all four kinds rather than the three it used to: an element is a
