@@ -85,6 +85,53 @@ trait CodegenSupport extends Matchers { this: Assertions =>
   /** The error message for a project laid out across directories that must be rejected. */
   protected def errIn(fs: (String, String, String)*): String = rejected(project(fs*))
 
+  /** A **stand-in standard module**, written by the test rather than read from `lib/sysl`.
+   *
+   * Some questions are about the library's *position* rather than about what it happens to declare —
+   * that a program reaches its members without importing them, that it is searched after a file's
+   * imports, that what it keeps to itself is out of reach. Asking those of the real library means
+   * the answer changes whenever the library does, and a question it has no case for cannot be asked
+   * at all: nothing in `lib/sysl` is private, so nothing there can show what a private member of the
+   * library does.
+   *
+   * The trees go in as the `Core` and **not** as units of the compilation, which is the same way the
+   * embedded library arrives: a `Core` contributes its own declarations to the walk, and a file that
+   * were also a unit would be a program declaring `module sysl` — which is refused, and rightly.
+   *
+   * A program compiled this way has **only** what the stand-in declares, `print` included, so these
+   * fixtures state everything they use.
+   */
+  protected def standIn(fs: (String, String)*): (List[Program], Core) = {
+    val units = fs.toList.map { case (name, text) =>
+      SyslParser.parse(Source(name, text, List(Std.module))) match {
+        case Right(p) => p
+        case Left(e)  => fail(s"the stand-in standard module does not parse: $e")
+      }
+    }
+
+    (units, new Core(units))
+  }
+
+  /** The IR for a program compiled against a stand-in standard module, which must compile. */
+  protected def irAgainst(lib: (String, String)*)(fs: (String, String)*): String =
+    against(lib, fs) match {
+      case Right(out) => out
+      case Left(e)    => fail(e)
+    }
+
+  /** The error for a program compiled against a stand-in standard module, which must be rejected. */
+  protected def errAgainst(lib: (String, String)*)(fs: (String, String)*): String =
+    against(lib, fs) match {
+      case Right(out) => fail(s"expected an error, got:\n$out")
+      case Left(e)    => e
+    }
+
+  private def against(lib: Seq[(String, String)], fs: Seq[(String, String)]): Either[String, String] = {
+    val (_, core) = standIn(lib*)
+
+    Compiler.compiledWith(files(fs*), Nil, Target.default, Set.empty, core).map(_._1)
+  }
+
   private def compiled(sources: List[Source]): String =
     Compiler.compile(sources) match {
       case Right(out) => out

@@ -147,6 +147,10 @@ trait AnalyzerBase {
    * module's names are deliberately not in it — a module earns visibility by being named or
    * imported (`13 §8`), and the root module has no name, so its declarations are its own files' to
    * use.
+   *
+   * **Every step is filtered by what may be named from here**, the library's included, so that the
+   * two spellings of one declaration cannot disagree: a member the library keeps to itself is out
+   * of reach whether a program writes it bare or by path.
    */
   protected def resolveName(written: String)(declared: String => Boolean): Option[String] = {
     val dot = written.lastIndexOf('.')
@@ -160,6 +164,18 @@ trait AnalyzerBase {
         val own     = Modules.qualify(currentModule, written)
         val library = libraryNames.get(written).filter(declared)
 
+        // The library's step is held to the same restriction as every other, so a helper the
+        // library keeps to itself is not an answer to a program's bare name. Nothing enforced it
+        // while the library declared nothing private, which is what let the unqualified spelling
+        // and the qualified one disagree about the same declaration.
+        val offered = library.filter(visible)
+
+        // Where nothing answered at all, a candidate passed over for being out of reach is the
+        // whole story, and saying which restriction it was beats an undefined name. A program's own
+        // declaration is reported ahead of the library's for the same reason it is searched for
+        // first: it is the likelier thing to have been meant.
+        def restricted = Option.when(declared(own))(own).orElse(library).map(reachable)
+
         // A name written **in the library** means the library's, and is looked for there first —
         // the one place the first two steps are inverted. It mattered most while part of the library
         // sat in the root module a headerless program is also in, where "this module first" would
@@ -167,7 +183,7 @@ trait AnalyzerBase {
         // name; it stays because nothing a program declares is the library's to reach, and a rule
         // that holds only while the two are in different modules is one waiting to be broken.
         if currentFile.exists(core.source) then
-          library.orElse(Option.when(declared(own) && visible(own))(own))
+          offered.orElse(Option.when(declared(own) && visible(own))(own)).orElse(restricted)
         else if declared(own) && visible(own) then Some(own)
         else
           // A declaration this file may not name is not a candidate, so the search goes on rather
@@ -176,8 +192,8 @@ trait AnalyzerBase {
           // at all is the restriction worth reporting — at which point it is the whole story, and a
           // better one than an undefined name.
           importedName(written)(declared)
-            .orElse(library)
-            .orElse(Option.when(declared(own))(reachable(own)))
+            .orElse(offered)
+            .orElse(restricted)
       else
         val module = modulePath(written.take(dot))
         val name   = Modules.qualify(module, written.drop(dot + 1))

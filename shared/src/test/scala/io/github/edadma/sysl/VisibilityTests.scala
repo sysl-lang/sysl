@@ -19,6 +19,16 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
        |twice(n: int) -> int = scale(n)
        |""".stripMargin)
 
+  // A stand-in standard module keeping one member to itself, for the cases below that are about the
+  // library's own step in resolution. The real library declares nothing private, so it cannot pose
+  // the question at all.
+  private val lib =
+    ("core.sysl",
+     """module sysl
+       |private[sysl] carry(n: int) -> int = n * 2
+       |twice(n: int) -> int = carry(n)
+       |""".stripMargin)
+
   "the modifiers parse" - {
     "a bare 'private' is the file" in {
       prog("private f() -> int = 1") shouldBe
@@ -366,6 +376,97 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
         ("geom", "g.sysl", "module geom\nprivate width(n: int) -> int = n * 2\ngo() -> int = width(21)"),
         ("text", "t.sysl", "module text\nwidth(n: int) -> int = n + 1"),
       ) shouldBe "42\n"
+    }
+  }
+
+  // The library is reached without an import and searched after everything else, which is what makes
+  // it the one step where a restriction could go unasked: a program writes its members bare, and a
+  // bare name that resolved is a name nothing questioned. These are asked of a stand-in standard
+  // module because the real one declares nothing private, so the real one cannot pose the question.
+  "a member the library keeps to itself" - {
+    "is not what a program's bare name resolves to" in {
+      errAgainst(lib)(
+        "main.sysl" -> "carry(21)",
+      ) should include("'sysl.carry' is private to module 'sysl'")
+    }
+
+    "and the qualified spelling says the same thing, which is the point" in {
+      errAgainst(lib)(
+        "main.sysl" -> "sysl.carry(21)",
+      ) should include("'sysl.carry' is private to module 'sysl'")
+    }
+
+    "while what the library does offer is reached with no import at all" in {
+      irAgainst(lib)(
+        "main.sysl" -> "twice(21)",
+      ) should include(s"call i32 @${Library.key("twice")}")
+    }
+
+    "and the library's own files go on reaching it" in {
+      irAgainst(lib)(
+        "main.sysl" -> "twice(21)",
+      ) should include(s"call i32 @${Library.key("carry")}")
+    }
+
+    "a program may declare the name the library kept, and mean its own" in {
+      irAgainst(lib)(
+        "main.sysl" -> "carry(n: int) -> int = n + 1\ncarry(21)",
+      ) should include("call i32 @carry")
+    }
+
+    "a file-private one is out of reach the same way" in {
+      errAgainst(
+        ("core.sysl", "module sysl\nprivate carry(n: int) -> int = n * 2\ntwice(n: int) -> int = carry(n)"),
+      )(
+        "main.sysl" -> "carry(21)",
+      ) should include("private to 'core.sysl', the file that declares it")
+    }
+
+    "and a second library file may not reach that one either" in {
+      errAgainst(
+        ("a.sysl", "module sysl\nprivate carry(n: int) -> int = n * 2"),
+        ("b.sysl", "module sysl\ntwice(n: int) -> int = carry(n)"),
+      )(
+        "main.sysl" -> "twice(21)",
+      ) should include("private to 'a.sysl', the file that declares it")
+    }
+
+    // The tables are asked separately — a spelling may be a type in one module and a function in
+    // another — so a restriction that held for one of them says nothing about the rest.
+    "a type it keeps is out of reach the same way" in {
+      errAgainst(
+        ("core.sysl", "module sysl\nprivate[sysl] struct Cell\n    n: int"),
+      )(
+        "main.sysl" -> "f(c: Cell) -> int = c.n",
+      ) should include("'sysl.Cell' is private to module 'sysl'")
+    }
+
+    "and so is a trait it keeps" in {
+      errAgainst(
+        ("core.sysl", "module sysl\nprivate[sysl] trait Carry\n    carry(self) -> int"),
+      )(
+        "main.sysl" -> "f[T: Carry](x: T) -> int = x.carry()",
+      ) should include("'sysl.Carry' is private to module 'sysl'")
+    }
+
+    "and a variant of an enum it keeps, which is named without naming the enum" in {
+      errAgainst(
+        ("core.sysl", "module sysl\nprivate[sysl] enum Step\n    Go(n: int)\n    Stop"),
+      )(
+        "main.sysl" -> "f() -> int = 1\nvar s = Go(3)",
+      ) should include("private to module 'sysl'")
+    }
+
+    "naming it in an import is refused where the import is written" in {
+      errAgainst(lib)(
+        "main.sysl" -> "import sysl.carry\ncarry(21)",
+      ) should include("'sysl.carry' is private to module 'sysl'")
+    }
+
+    "and a wildcard over the library does not offer it" in {
+      errAgainst(lib)(
+        "main.sysl" -> "import sysl.*\ncarry(21)",
+      ) should include("'sysl.carry' is private to module 'sysl'")
     }
   }
 

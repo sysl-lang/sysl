@@ -302,7 +302,17 @@ is reachable two ways and they agree: it is auto-imported into every file, so it
 import step and takes part in the wildcard rules above, and it is also the last step on its own, so
 a name it declares resolves even where a file's imports say nothing. **A file of the library itself
 inverts the first two** — a name written there means the library's before it means the module's,
-since nothing a program declares is the library's to reach. A **dotted**
+since nothing a program declares is the library's to reach.
+
+**Every step is filtered by §2, the library's included.** A member the library keeps to itself is not
+an answer to a program's bare name, exactly as a sibling file's private helper is not: the search
+passes over it and goes on, and only where nothing else answers at all is the restriction reported —
+at which point it is the whole story, and better than an undefined name. This is what keeps the two
+spellings of one declaration from disagreeing. The library is the step where it would be easiest to
+lose, because it is the one a program reaches without writing anything, so a name that resolved there
+is a name nothing was asked about.
+
+A **dotted**
 reference names a module by the **longest prefix of it that is one**: a program holding both `a`
 and `a.b` reads `a.b.f` as `a.b`'s `f` rather than as `a`'s `b`, and §1's refusal of a module named
 for a type of its parent is what keeps that from silently hiding a member. Everything left of the
