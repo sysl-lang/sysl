@@ -454,7 +454,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |    n: usize
           |
           |impl Writer for S
-          |    write(*self, bytes: []u8)
+          |    write(*self, bytes: []const u8)
           |        self.n += bytes.len
           |    failed(*self) -> bool = false
           |
@@ -481,11 +481,11 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |    poll(self) -> int = self.n
           |
           |struct Bytes
-          |    src: []u8
+          |    src: []const u8
           |    at: usize
           |
           |impl sysl.Reader for Bytes
-          |    read(*self, into: []u8) -> []u8
+          |    read(*self, into: []u8) -> []const u8
           |        var n = self.src.len - self.at
           |        if n > into.len then n = into.len
           |        for i in 0usize..<n do into[i] = self.src[self.at + i]
@@ -532,7 +532,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       // The compiler asks the library for this one by name. A program is free to mean something
       // else by the word, and `.chars` is not it.
       run(
-        """chars_of(b: []u8) -> int = int(b.len)
+        """chars_of(b: []const u8) -> int = int(b.len)
           |
           |print(chars_of("abc".bytes))
           |for c in "ab".chars do print(c)
@@ -576,14 +576,14 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       // the other from the entry point, which names the conversion by key rather than by the word.
       // A program that means something else by that word has to leave both meaning the library's.
       runWith(
-        """from_utf8(b: []u8) -> string = "mine"
+        """from_utf8(b: []const u8) -> string = "mine"
           |
           |struct Bytes
-          |    src: []u8
+          |    src: []const u8
           |    at: usize
           |
           |impl sysl.Reader for Bytes
-          |    read(*self, into: []u8) -> []u8
+          |    read(*self, into: []u8) -> []const u8
           |        var n = self.src.len - self.at
           |        if n > into.len then n = into.len
           |        for i in 0usize..<n do into[i] = self.src[self.at + i]
@@ -630,7 +630,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     "and its own 'putbytes', which the writer table still resolves past" in {
       // The `print` on the last line is itself the check: every renderer writes through the
       // library's sink, so if the program's had been picked there would be no output at all.
-      run("""putbytes(b: []u8) -> int = 7
+      run("""putbytes(b: []const u8) -> int = 7
             |
             |var g = byte_sink()
             |var w: *Writer = &g

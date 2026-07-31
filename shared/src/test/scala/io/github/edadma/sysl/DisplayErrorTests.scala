@@ -178,8 +178,12 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
                     |var w: *Writer = &c
                     |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin)
 
-      e should include("parameter 'bytes' of method 'write' is []byte, but trait 'Writer' declares []const byte")
-      e should include("has no 'write' that 'Writer' can point a slot at")
+      // The trait is named as the library's, since that is where it is declared — spelled from the
+      // key rather than written out, so a diagnostic that stopped qualifying it fails here.
+      val writer = Modules.show(Library.key("Writer"))
+
+      e should include(s"parameter 'bytes' of method 'write' is []byte, but trait '$writer' declares []const byte")
+      e should include(s"has no 'write' that '$writer' can point a slot at")
     }
   }
 
