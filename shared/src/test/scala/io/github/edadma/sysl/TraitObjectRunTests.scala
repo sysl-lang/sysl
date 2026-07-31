@@ -441,6 +441,38 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     }
   }
 
+  /** `02`, *Forming and using one*, lists the six positions the coercion applies at: an argument, a
+    * declared variable, an assignment, a returned value, an array element, a struct field. Taken
+    * together in one program so that the list is pinned as a list — a position dropped from the
+    * coercion would otherwise be found by whichever unrelated test happened to use it.
+    */
+  "erasure applies at every position the chapter names" in {
+    run("""trait Shape
+          |    area(self) -> int
+          |
+          |struct Rect
+          |    w: int
+          |    h: int
+          |
+          |impl Shape for Rect
+          |    area(self) -> int = self.w * self.h
+          |
+          |struct Holder
+          |    s: &Shape
+          |
+          |take(s: &Shape) -> int = s.area()
+          |give() -> &Shape = Rect(2, 3)
+          |
+          |var decl: &Shape = Rect(1, 2)
+          |var assigned: &Shape = Rect(1, 1)
+          |assigned = Rect(4, 5)
+          |var arr: [2]&Shape = [Rect(1, 3), Rect(2, 2)]
+          |var h = Holder(Rect(6, 6))
+          |
+          |print(take(Rect(7, 1)), give().area(), decl.area(), assigned.area(), arr[0].area(), h.s.area())
+          |""".stripMargin) shouldBe "7 6 2 20 3 36\n"
+  }
+
   /** `02`, *Object safety*: a built-in that belongs to a trait **by the compiler's rule** cannot be
     * erased, because a table holds function pointers and what the compiler provides is an
     * instruction or a rendering. The membership itself is real, which is why the refusal is pinned
