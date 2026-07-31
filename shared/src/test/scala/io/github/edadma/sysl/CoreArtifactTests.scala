@@ -162,6 +162,19 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
         .shouldBe(Std.fingerprint)
       LibraryArtifact.fingerprint(Std.sources.tail) should not be Std.fingerprint
     }
+
+    "and it is exactly the hash it says it is" in {
+      // A known-answer test, over a fixed input rather than the library, so that editing `lib/sysl`
+      // does not come here. It is the only kind that pins a hash: every behavioural property worth
+      // asserting — that a change moves it, that order and path do not — holds just as well of the
+      // FNV-1a underneath without the `fmix64` finalizer on top, so nothing short of the value
+      // itself can tell whether the algorithm is still the one that was written down.
+      LibraryArtifact.fingerprint(List(Source("a/one.sysl", "module m\n"))) shouldBe "438db5d52d94904b"
+
+      LibraryArtifact.fingerprint(
+        List(Source("a/one.sysl", "module m\n"), Source("b/two.sysl", "f() -> int = 1\n")))
+        .shouldBe("34149c796c985378")
+    }
   }
 
   "a program compiled against the decoded core emits exactly what one compiled against the source does" - {
