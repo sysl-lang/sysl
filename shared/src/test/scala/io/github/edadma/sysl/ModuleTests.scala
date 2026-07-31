@@ -32,13 +32,10 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       progError("module a\nprint(1)\nmodule b") should include("module")
     }
 
-    // `13 §4`'s capability clause is unbuilt, so the two guide programs written to hold the
-    // property — the bytecode machine's dispatch loop and `guide/kernel` entire — cannot declare
-    // it, and nothing checks that they do. What it gets instead of a parse error is the reason
-    // (`CapabilityClauseTests`), which holds on the header's own line as well as under it.
-    "carries no capability clause yet" in {
-      progError("module m no alloc\nprint(1)") should
-        include("a module's capability clause is designed but not built")
+    // A capability clause is a line of the header rather than part of this one (`13 §4`), and the
+    // refusal says so rather than reporting a token it did not expect (`CapabilityClauseTests`).
+    "does not carry the capability clause on its own line" in {
+      progError("module m no alloc\nprint(1)") should include("belongs in the file's header")
     }
 
     "may be preceded by blank lines" in {

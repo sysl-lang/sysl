@@ -152,6 +152,32 @@ object Toolchain {
     else Left(s"clang failed (exit ${result.exitCode}):\n${result.stderr.trim}")
   }
 
+  /** Compiles one of a library's C files into a relocatable object, to be archived beside the
+   * object the library's own sysl compiled to (`15 §7`).
+   *
+   * **This is what makes a binding to a C library writable at all.** A caller-allocated type like
+   * `regex_t` has a size and an alignment that only the target's own headers know, and a macro like
+   * `REG_EXTENDED` has no symbol to link against; both are reachable from C and from nothing else.
+   * A few lines of C beside the binding turn each of them into an ordinary function the sysl side
+   * declares with `extern` — so the numbers come from the headers rather than from a transcription
+   * that is right until the platform changes.
+   *
+   * The same section flags as `compileObject`, for the same reason: a shim a program never calls is
+   * dropped by the linker only if it was given a section of its own. A library that binds forty
+   * functions should not cost a program that calls one of them the other thirty-nine.
+   *
+   * `-Wno-override-module` is *not* passed. It exists for a `.ll` that states a target family the
+   * driver then refines, and a `.c` has no module statement to override — passing it here would be
+   * suppressing a warning that cannot arise.
+   */
+  def compileC(source: String, obj: String, target: Target = Target.default): Either[String, Unit] = {
+    val result = exec(Seq("clang", s"--target=${target.triple}",
+      "-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj))
+
+    if result.exitCode == 0 then Right(())
+    else Left(s"$source did not compile (exit ${result.exitCode}):\n${result.stderr.trim}")
+  }
+
   /** Compiles, links, and runs a source program, returning its exit code and captured
    * stdout — the end-to-end path the run-it test tier exercises.
    *

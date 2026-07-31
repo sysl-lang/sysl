@@ -69,8 +69,9 @@ trait MethodCalls extends CallCore {
             val recvArg  = buildReceiver(m.receiver.get, tr)
             val restArgs = declared.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             funcsUsed += fname
-            TCall(fname, checkArgs(if callable then shown else fname, params, declared,
-                                   Some(recvArg :: restArgs), callable) ::: tail.map(variadicArg(_)), rtype)
+            recheckAfter(recvArg,
+              TCall(fname, checkArgs(if callable then shown else fname, params, declared,
+                                     Some(recvArg :: restArgs), callable) ::: tail.map(variadicArg(_)), rtype))
           // Neither of the two remaining kinds takes a receiver, and they are not the same mistake:
           // a property is this call with the parentheses dropped, an associated function is not
           // reached through a value at all.
@@ -226,7 +227,8 @@ trait MethodCalls extends CallCore {
     val (params, rtype) = funcInsts(name)
     val recvArg         = buildReceiver(m.receiver.get, recv)
 
-    TCall(name, checkArgs(shown, params, passed, Some(recvArg :: provisional)) ::: tail.map(variadicArg(_)), rtype)
+    recheckAfter(recvArg,
+      TCall(name, checkArgs(shown, params, passed, Some(recvArg :: provisional)) ::: tail.map(variadicArg(_)), rtype))
   }
 
   /** `5.display(out, fmt)` — the rendering a built-in's `Display` membership provides (`14 §5`).

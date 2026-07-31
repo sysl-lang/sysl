@@ -374,10 +374,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       emitInvCheck(v, struct, invFn)
       v
 
-    case TCheckedStore(store, recv, struct, invFn) =>
-      // The store runs first (yielding the value the assignment expression is), then the mutated
-      // struct is re-read so the invariant sees the new field.
-      val v = genExpr(store)
+    case TRecheck(after, recv, struct, invFn) =>
+      // The write or the call runs first (yielding the value the expression is), then the struct it
+      // could have changed is re-read so the invariant sees the new fields.
+      val v = genExpr(after)
       emitInvCheck(genExpr(recv), struct, invFn)
       v
 

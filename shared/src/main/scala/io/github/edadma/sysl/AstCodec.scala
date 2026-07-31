@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 3
+  val Version: Int = 4
 
   private val Magic = "sysl-ast"
 
@@ -129,6 +129,7 @@ object AstCodec {
     private def program(p: Program): Unit = {
       int(src(p.source))
       opt(p.module)(m => { pos(m); list(m.parts)(sref) })
+      list(p.capabilities)(c => { pos(c); tok(if c.direction == CapabilityDirection.Narrows then "no" else "req"); sref(c.name) })
       list(p.body)(stmt)
       body.append('\n')
     }
@@ -480,8 +481,12 @@ object AstCodec {
       if s < 0 || s >= sources.length then fail(s"source $s is not in the artifact's table")
 
       val module = opt(at(ModuleName(list(sref()))))
+      val caps = list(at(tok() match
+        case "no"  => CapabilityClause(CapabilityDirection.Narrows, sref())
+        case "req" => CapabilityClause(CapabilityDirection.Requires, sref())
+        case t     => fail(s"'$t' is not a capability clause's direction")))
 
-      Program(list(stmt()), module, sources(s))
+      Program(list(stmt()), module, caps, sources(s))
     }
 
     // -------------------------------------------------------------- pieces

@@ -2,6 +2,8 @@ package io.github.edadma.sysl
 
 import scala.collection.mutable
 
+import TreeWalk.{blocks, children, forEachStmt, ownBreakValues}
+
 /** Escape analysis for slices, as specified in `05-escape-analysis.md`.
  *
  * A slice keeps its buffer alive through its owner word — except when there is no owner,
@@ -90,7 +92,7 @@ private class Escape(program: TProgram) {
         (who, walk)
       }
 
-    val refused = borrowed ::: walks.flatMap(_._2.escape)
+    val refused = borrowed ::: walks.flatMap(noAllocPromotion) ::: walks.flatMap(_._2.escape)
 
     if refused.nonEmpty then Left(Diagnostic.report(refused))
     else
@@ -192,6 +194,13 @@ private class Escape(program: TProgram) {
     /** Why each of them moved, in the order the escapes were found. */
     val why = mutable.ListBuffer.empty[String]
 
+    /** The same promotions with their parts still separate — the array, where the view that carried
+     * it out was written, and how — for the one reader that has to say something else about them: a
+     * module that declared `no alloc` has nowhere to promote into, so what is silent everywhere else
+     * is a diagnostic there.
+     */
+    val sites = mutable.ListBuffer.empty[(String, Option[Pos], String)]
+
     /** Whether any confined view left the frame at all, promotable or not. This is what a parameter
      * summary asks — "does the callee let this outlive the call" is a yes/no, and the roots that
      * answer promotion are not its question.
@@ -225,7 +234,7 @@ private class Escape(program: TProgram) {
       case TVCall(_, _, args, _, _) => View.any(args.map(views))
       case TStructNew(_, args)  => View.any(args.map(views))
       case TStructInvCheck(v, _, _) => views(v)
-      case TCheckedStore(store, _, _, _) => views(store)
+      case TRecheck(after, _, _, _) => views(after)
       case TEnumNew(_, _, args) => View.any(args.map(views))
       case TArrayLit(elems, _)  => View.any(elems.map(views))
       case TArrayFill(v, _)     => views(v)
@@ -392,6 +401,7 @@ private class Escape(program: TProgram) {
 
       for name <- v.named if !promoted(name) do
         why += Diagnostic.explain(s"'$name' is promoted to the heap, because this view of it $how", at.pos)
+        sites += ((name, at.pos, how))
 
       promoted ++= v.named
       gotOut = true
@@ -409,6 +419,34 @@ private class Escape(program: TProgram) {
     }
   }
 
+  /** A promotion in a module that declared `no alloc`, said as the refusal it is there.
+   *
+   * Promotion is deliberately silent everywhere else (`05 § Promotion is silent, not hidden`) — the
+   * program means what it said and the storage quietly moves. A module that gave the allocator up
+   * has nowhere for it to move to, so the same fact has to be reported, and it is reported against
+   * the view that leaves the frame rather than against the array: the array is fine, and what the
+   * reader has to change is where its contents go.
+   *
+   * The body's module is read off the function's key, or is the entry point's for the statements a
+   * program runs, which belong to the file that carries them however little they look declared.
+   */
+  private def noAllocPromotion(walk: (Option[String], Walk)): List[String] = {
+    val (who, w) = walk
+    val module   = who.map(Modules.moduleOf).getOrElse(program.mainModule)
+
+    if !program.noAllocModules(module) then Nil
+    else
+      w.sites.toList.map((name, pos, how) =>
+        Diagnostic.render(
+          s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
+            "and this module declared 'no alloc', so there is nothing to move it into. Keep the view " +
+            "inside the frame, or take the storage from a caller as a '[]T' parameter, which is " +
+            "already wherever its owner put it",
+          pos,
+        ),
+      )
+  }
+
   /** The arrays a body declares for itself, which are the ones it may move to the heap. A `[N]T`
    * parameter is storage the caller laid out, so it is deliberately not here.
    */
@@ -419,124 +457,4 @@ private class Escape(program: TProgram) {
     found.toSet
   }
 
-  // --- tree walking ----------------------------------------------------------------------
-
-  /** Applies `f` to every statement, including the ones nested in loop and branch bodies. Loops
-   * are expressions now, so they are reached through the `blocks` an expression carries rather
-   * than as statements of their own.
-   */
-  private def forEachStmt(stmts: List[TStmt])(f: PartialFunction[TStmt, Unit]): Unit =
-    for s <- stmts do
-      f.applyOrElse(s, (_: TStmt) => ())
-      s match
-        case TExprStmt(e)     => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
-        case TVarDecl(_, _, e) => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
-        case TReturn(Some(e))  => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
-        case TBreak(Some(e), _)   => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
-        case TMultiAssign(writes) =>
-          for w <- writes; e <- List(w.place, w.value); b <- blocks(e) do forEachStmt(b.stmts)(f)
-        case _                 =>
-
-  /** The `break` values that belong to a loop with these body statements — those in its body but
-   * not inside a nested loop, whose `break`s are that loop's. Walks through the branch bodies of
-   * `if`/`match`, which do not introduce a new loop.
-   */
-  private def ownBreakValues(stmts: List[TStmt]): List[TExpr] = stmts.flatMap {
-    case TBreak(Some(v), _)   => List(v)
-    case TExprStmt(e)      => ownBreaksInExpr(e)
-    case TVarDecl(_, _, e) => ownBreaksInExpr(e)
-    case TReturn(Some(e))  => ownBreaksInExpr(e)
-    case TMultiAssign(writes) => writes.flatMap(w => ownBreaksInExpr(w.place) ::: ownBreaksInExpr(w.value))
-    case _                 => Nil
-  }
-
-  private def ownBreaksInExpr(e: TExpr): List[TExpr] = e match
-    case _: TWhile | _: TLoop | _: TFor | _: TForEach | _: TCFor | _: TIterate => Nil
-    case TIf(_, t, el, _)   => ownBreakValues(t.stmts) ::: el.toList.flatMap(b => ownBreakValues(b.stmts))
-    case TMatch(_, arms, _) => arms.flatMap(a => ownBreakValues(a.body.stmts))
-    case _                  => Nil
-
-  /** Every block an expression contains, so a statement nested inside an `if`, a `match`, or a
-   * loop used as a value is walked too. A loop's body is wrapped as a block; its `else` is one.
-   */
-  private def blocks(e: TExpr): List[TBlock] = e match
-    case TIf(_, t, el, _)   => t :: el.toList ::: children(e).flatMap(blocks)
-    case TMatch(_, arms, _) => arms.map(_.body) ::: children(e).flatMap(blocks)
-    case TWhile(_, body, el, _)           => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
-    case TLoop(body, _)                   => TBlock(body, None, Type.Unit) :: children(e).flatMap(blocks)
-    // The init and the step are statements of the loop's own scope, so they are walked as part of
-    // the block its body makes rather than as expressions beside it.
-    case TCFor(init, _, step, body, el, _) =>
-      TBlock(init ::: body ::: step, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
-    case TFor(_, _, _, _, _, body, el, _) => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
-    case TForEach(_, _, _, body, el, _)   => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
-    case TIterate(_, _, _, _, _, body, el, _) =>
-      TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
-    case _                  => children(e).flatMap(blocks)
-
-  private def children(e: TExpr): List[TExpr] = e match
-    case TBox(v, _)                 => List(v)
-    case TCast(v, _)                => List(v)
-    case TDeref(v, _)               => List(v)
-    case TAddrOf(v, _)              => List(v)
-    case TStore(p, v, _)            => List(p, v)
-    case TUpdate(p, _, v, _, _, _)  => List(p, v)
-    case TIncDec(p, _, _, _, _)     => List(p)
-    case TBinary(_, l, r, _)        => List(l, r)
-    case TUnary(_, v, _)            => List(v)
-    case TLogical(_, l, r)          => List(l, r)
-    case TCompare(ops, _)           => ops
-    case TSeq(exprs)                => exprs
-    case TCall(_, args, _, _)          => args
-    // Which function a trait object's call reaches is a run-time word, so there is no parameter
-    // list to ask whether an argument is kept — a callee that might keep anything is exactly what
-    // `kept` already assumes of a name it does not recognise.
-    case TVCall(r, _, args, _, _)   => r :: args
-    case TErase(v, _, _)            => List(v)
-    case TStructNew(_, args)        => args
-    case TStructInvCheck(v, _, _)   => List(v)
-    case TCheckedStore(store, recv, _, _) => List(store, recv)
-    case TEnumNew(_, _, args)       => args
-    case TEnumFromInt(v, _)         => List(v)
-    case TEnumTry(v, _, _, _, _)    => List(v)
-    case TDowngrade(v, _)           => List(v)
-    case TUpgrade(v, _, _, _)       => List(v)
-    case TArrayLit(elems, _)        => elems
-    case TArrayFill(v, _)           => List(v)
-    case TBufLit(elems, _)          => elems
-    case TBufFill(v, n, _)          => List(v, n)
-    case TIndex(r, i, _)            => List(r, i)
-    case TLen(r)                    => List(r)
-    case TBytes(r)                  => List(r)
-    case TStr(a)                    => List(a)
-    // The string it yields owns a copy, so nothing of the argument's storage survives in it — the
-    // walk is here for the argument's own sake.
-    case TFromBytes(a)              => List(a)
-    case TConstView(a)              => List(a)
-    case TFormat(a, _)              => List(a)
-    // A render's result is a fresh string that owns its own bytes, so it views nothing here; what
-    // is worth walking is the value and the specifier it hands the implementation.
-    case TRender(v, _, s, _)        => List(v, s)
-    case TSlice(b, lo, hi, _, _)    => b :: lo.toList ::: hi.toList
-    // A `va_list` carries no view of this frame, and a value read out of the tail came from the
-    // caller's — so walking these finds nothing, and they are here to keep the walk complete
-    // rather than because anything can escape through them.
-    case TVaStart(ap)               => List(ap)
-    case TVaEnd(ap)                 => List(ap)
-    case TVaArg(ap, _)              => List(ap)
-    case TVaCopy(d, s)              => List(d, s)
-    case TVaPass(ap)                => List(ap)
-    case TTry(v, _, _, _, _, _)     => List(v)
-    case TField(r, _, _)            => List(r)
-    case TIf(c, t, el, _)           => c :: t.result.toList ::: el.flatMap(_.result).toList
-    case TMatch(s, arms, _)         => s :: arms.flatMap(a => a.guard.toList ::: a.body.result.toList)
-    // A loop's own sub-expressions plus its `else` value; the `break` values reach `escaping`
-    // through the body statements, so they are not repeated here.
-    case TWhile(c, _, el, _)             => c :: el.flatMap(_.result).toList
-    case TFor(_, _, lo, hi, _, _, el, _) => lo :: hi :: el.flatMap(_.result).toList
-    case TForEach(_, _, seq, _, el, _)   => seq :: el.flatMap(_.result).toList
-    // The cursor's initializer and the `next` call that reads it are both the loop's own, and the
-    // element the loop binds comes out of the second — so both are walked.
-    case TIterate(_, _, init, next, _, _, el, _) => init :: next :: el.flatMap(_.result).toList
-    case _                          => Nil
 }

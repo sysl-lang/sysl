@@ -180,30 +180,11 @@ trait ExprAnalysis
 
   /** Wraps the write so that every struct the place is written *inside* re-checks its invariant the
    * moment the field changes. The wraps nest innermost-first, so the smallest struct broken is the
-   * one whose diagnostic fires.
+   * one whose diagnostic fires. `invCheckFor` — the walk that finds them — is in `Aliasing`, beside
+   * the rule about which aliases could put a struct out of that walk's reach.
    */
   private def withInvCheck(place: TExpr, store: TExpr): TExpr =
-    invCheckFor(place).foldLeft(store)((acc, c) => TCheckedStore(acc, c._1, c._2, c._3).setPos(store.pos))
-
-  /** Every struct a write through `place` obliges a re-check of: what to re-read, its type, and the
-   * predicate to call, innermost first. Split out from the wrapper above because a multi-assignment's
-   * writes are statements rather than expressions, so there is nothing there for a node to wrap.
-   *
-   * The walk goes **outward through the whole place**, not just to the field's own receiver, because
-   * an invariant may read through a field — `invariant a.n <= b` is a claim `o.a.n = 9` can break
-   * just as `o.b = 0` can, and only the enclosing struct knows it. Nothing is owed by the parts of a
-   * place that merely locate it, so an index contributes no check of its own and is walked through.
-   */
-  protected def invCheckFor(place: TExpr): List[(TExpr, Type.Struct, String)] =
-    def owed(recv: TExpr): List[(TExpr, Type.Struct, String)] = recv.ty match
-      case s: Type.Struct if structDecls.get(s.base).exists(d => d.invariants.nonEmpty && d.tparams.isEmpty) =>
-        List((recv, s, invKey(s.base)))
-      case _ => Nil
-
-    place match
-      case TField(recv, _, _) => owed(recv) ++ invCheckFor(recv)
-      case TIndex(recv, _, _) => invCheckFor(recv)
-      case _                  => Nil
+    invCheckFor(place).foldLeft(store)((acc, c) => TRecheck(acc, c._1, c._2, c._3).setPos(store.pos))
 
   /** `Name(value)` — an explicit cast into a constrained subtype. The operand is taken at the
    * subtype's base and checked; a value whose base does not agree is a mistake the message names.
@@ -404,8 +385,12 @@ trait ExprAnalysis
 
     // Address-of yields a *raw* pointer: a place lives in a frame or inside another object, so
     // there is no refcount to take a share of. Reaching a `&T` means being handed one.
+    //
+    // The one place it is refused is a place inside a struct whose invariant reads it: the pointer
+    // would be typed below the promise, and `16 §6` is discharged by naming the struct.
     case Unary("&", e) =>
       val place = analyzePlace(e, "'&'", writes = false)
+      checkAddressable(place)
       TAddrOf(place, Type.Ptr(place.ty))
 
     case Unary("*", e) =>

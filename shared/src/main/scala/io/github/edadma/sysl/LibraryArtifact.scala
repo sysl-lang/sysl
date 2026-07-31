@@ -164,7 +164,7 @@ object LibraryArtifact {
    * (`13 §7`), so a library having none is not a complaint.
    */
   def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty,
-            core: Core = Core.embedded): Either[String, (String, String)] = {
+            core: Core = Core.embedded, native: List[Source] = Nil): Either[String, (String, String)] = {
     val parsed = sources.map(SyslParser.parse)
 
     parsed.collect { case Left(e) => e } match
@@ -175,8 +175,44 @@ object LibraryArtifact {
         rootless(units) match
           case Some(err) => Left(err)
           case None =>
+            // The C files are fingerprinted with the sysl ones and not apart from them. A library's
+            // shims are as much its source as its modules are, and an artifact that did not change
+            // when one of them was edited is a stale artifact nothing would notice was stale.
             Compiler.compileLibrary(units, target, building, core)
-              .map((ir, compiled) => (ir, metadata(units, compiled, fingerprint(sources))))
+              .map((ir, compiled) => (ir, metadata(units, compiled, fingerprint(sources ::: native))))
+  }
+
+  /** What one of a library's C files is called inside the archive.
+   *
+   * Named after the path it was found at, with the directories kept, because a member name has to be
+   * unique across the whole library and a basename is not: two modules may each hold a `util.c`, and
+   * `ar r` **replaces by name**, so the second would silently evict the first and the library would
+   * ship missing whatever only the first defined.
+   */
+  def nativeMember(source: Source): String =
+    (source.dir.getOrElse(Nil) :+ Project.basename(source.name)).mkString(".").stripSuffix(".c") + ".o"
+
+  /** Why a library's members cannot all live in one archive, if they cannot.
+   *
+   * Two ways it can happen, and both would otherwise produce an artifact that builds and is wrong
+   * rather than a build that fails. Two C files can map to one member name only by sitting at the
+   * same path, which cannot happen — but a directory named `sysl` holding a `code.c` maps to the
+   * name the library's own compiled half uses, and that one evicts the code the whole library is.
+   */
+  def collisions(native: List[Source]): Option[String] = {
+    val reserved = Set(codeMember, metadataMember)
+    val named    = native.map(s => nativeMember(s) -> s.name)
+    val clashing = named.filter((member, _) => reserved(member))
+    val repeated = named.groupBy(_._1).collect { case (m, ss) if ss.length > 1 => (m, ss.map(_._2)) }
+
+    if clashing.nonEmpty then
+      Some(clashing.map((m, file) =>
+        s"$file would be archived as '$m', which is the name the library's own compiled half uses — " +
+          "rename it, or move it out of a directory called 'sysl'").mkString("\n"))
+    else if repeated.nonEmpty then
+      Some(repeated.map((m, files) =>
+        s"${files.mkString(" and ")} would both be archived as '$m'").mkString("\n"))
+    else None
   }
 
   /** Why a library may not sit in the anonymous root module.

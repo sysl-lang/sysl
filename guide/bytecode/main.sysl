@@ -41,10 +41,12 @@
 //     table of single-character symbols was written that way and is now the one expression it
 //     always wanted to be. An operator that cannot finish an expression now carries the line
 //     (`00 §2`).
-//   * **The machine cannot say the one thing it was written to be.** `run` allocates nothing, on
-//     purpose, and `no alloc` under a `module` header is a parse error: the capability clause is
-//     specified and unbuilt. The property holds by construction and by reading, and nothing checks
-//     it — which is exactly the gap a capability is for.
+//   * **The machine could not say the one thing it was written to be** — answered. `run` allocates
+//     nothing on purpose, and the capability clause that states it was specified and unbuilt, so the
+//     property held by reading and nothing checked it. `vm` now carries `no alloc` and the compiler
+//     holds it to it. What that cost is worth writing down: `describe` had to leave the module,
+//     because rendering a trap as a sentence builds a string, and the machine's half of that job is
+//     to say which trap and where. The clause did not create the seam, it found it.
 //   * **Coverage was not computed through a nested pattern** — `Some(Halt)` and `Some(Push)` and
 //     `None` cover an `Option[Op]` between them, and the analyzer asked for an `else` anyway. The
 //     rule it was checking was a per-arm approximation of the one `09 §8` states, which is about
@@ -58,6 +60,24 @@
 
 // The checks. Every line of output begins `ok`, so the whole of stdout is the assertion.
 
+// What a trap says, in English. It lives here rather than beside `Trap`, and the capability clause
+// is the reason: every one of these lines builds a string, and `vm` declares that it makes no heap
+// storage at all. The machine's job is to say *which* trap and where; turning that into a sentence
+// is the caller's, and a caller is something that has an allocator.
+trap_text(t: vm.Trap) -> string
+    t match
+        vm.BadOpcode(at) -> s"no such opcode at $at"
+        vm.Truncated(at) -> s"an instruction runs past the end at $at"
+        vm.BadJump(at) -> s"a jump out of the program at $at"
+        vm.BadSlot(at) -> s"no such variable at $at"
+        vm.Overflow(at) -> s"the stack is full at $at"
+        vm.Underflow(at) -> s"the stack is empty at $at"
+        vm.DivideByZero(at) -> s"a division by zero at $at"
+        vm.Overrun(at) -> s"the program ran off the end at $at"
+        vm.NoRoom(at) -> s"no room left for output at $at"
+        vm.Runaway -> "the program did not finish"
+end trap_text
+
 // A program that runs to a halt, and the values it printed in order.
 runs(label: string, src: string, want: string)
     var out: [32]int
@@ -66,7 +86,7 @@ runs(label: string, src: string, want: string)
         Err(f) -> print(s"FAIL  $label -> ${compiler.describe(f)}")
         Ok(c) ->
             vm.run(c, out[..]) match
-                Err(t) -> print(s"FAIL  $label -> ${vm.describe(t)}")
+                Err(t) -> print(s"FAIL  $label -> ${trap_text(t)}")
                 Ok(n) ->
                     var got = joined(out[..], n)
 
@@ -95,7 +115,7 @@ stops(label: string, src: string, want: string)
             vm.run(c, out[..]) match
                 Ok(n) -> print(s"FAIL  $label ran to a halt")
                 Err(t) ->
-                    var got = vm.describe(t)
+                    var got = trap_text(t)
 
                     if got == want then print(s"ok    $label -> $got")
                     else print(s"FAIL  $label -> $got")
@@ -109,7 +129,7 @@ rejects(label: string, c: &isa.Chunk, want: string)
     vm.run(c, out[..]) match
         Ok(n) -> print(s"FAIL  $label ran to a halt")
         Err(t) ->
-            var got = vm.describe(t)
+            var got = trap_text(t)
 
             if got == want then print(s"ok    $label -> $got")
             else print(s"FAIL  $label -> $got")
