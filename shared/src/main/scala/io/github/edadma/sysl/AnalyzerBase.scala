@@ -444,10 +444,13 @@ trait AnalyzerBase {
       .orElse(constrainedDecls.get(key))
 
     decl match
-      case Some(d) if Prelude.declares(d) => None
-      case Some(_)                        => Some(Modules.moduleOf(key))
+      // `libraryOwns` rather than the key's module, because the two disagree while the library's own
+      // source is what is being compiled: there its declarations *are* the module being built, and a
+      // `sysl$Display` would otherwise be reported as belonging to whoever is compiling it.
+      case Some(d) if libraryOwns(d, Modules.moduleOf(key)) => None
+      case Some(_)                                          => Some(Modules.moduleOf(key))
       // A name nothing declares is a built-in, which has no module of its own and is the library's.
-      case None                           => None
+      case None                                             => None
   }
 
   /** Every `impl Trait for Type` as written, in source order. Kept unresolved because the type it
