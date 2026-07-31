@@ -834,15 +834,25 @@ carries. Sorting by basename rather than by path is what lets the artifact built
 disk match the copy the compiler generated from the same files, which are named by where each was
 read.
 
-**It falls back where `--lib` refuses**, and the asymmetry is the point. A `--lib` that cannot be read
-leaves the program's calls into that library with nothing to resolve them, so there is nothing to do
-but stop. The core is the one library the compiler always has its own copy of, so an artifact that is
-missing, corrupt, or built from other sources costs a warning and the built-in copy — a compilation
-that would have succeeded does not start failing because an optimization was unavailable. Nothing at
-the default path is the ordinary state of a fresh tree and says nothing at all; something
-*unreadable* there warns like any other, because that is the shape a drifted artifact takes and
-silence is what would let it go on being ignored. `--no-core-lib` asks for the built-in copy on
-purpose, which is what makes "compile it both ways and compare" a thing one command can do.
+**A compilation that finds no standard module stops**, exactly as one handed a `--lib` it cannot read
+does. The reasoning is the same in both cases: the calls into that library have nothing to resolve
+them, and a compiler does not answer *I could not find the library you meant* by silently compiling
+against a different one. No C compiler that cannot find libc carries a spare, and none of them
+guesses. A missing artifact is therefore an error naming the command that builds it, and so is one
+that is corrupt, truncated, built by another sysl, or built from other sources than these — a
+standard module that cannot be read is not a standard module.
+
+**`--no-core-lib` is the one route to the copy the compiler carries.** That copy exists because sysl
+has no released compiler to build its first artifact with, and because the compiler's own tests have
+to run in a tree where nothing has been built yet; it is reached by asking for it, never by a lookup
+coming up empty. The distinction is what keeps it honest. A fallback taken silently would be a
+fallback taken *always* — nobody would have any reason to build an artifact — and the path meant for
+the rarest of circumstances would quietly become the only one anyone ever ran. It has a second use
+once it exists: compiling one program both ways is how the two paths are held to meaning the same
+thing.
+
+**`build-lib --core` is exempt**, and must be: it is the command that produces the artifact, so
+requiring one would be a deadlock with nothing to break it.
 
 **The copy the compiler carries is a choice, not a necessity.** No other toolchain embeds its
 standard library: clang ships no libc, and rustc ships precompiled `libstd.rlib` beside the binary in

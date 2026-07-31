@@ -16,8 +16,21 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
   /** The driver, under a name of its own: `Suite` has an `execute` too, and it is the one that wins
    * unqualified.
+   *
+   * **A compilation that finds no standard module is an error**, and these tests run in a tree where
+   * none has been built — so one that says nothing about the core gets `--no-core-lib`, which is what
+   * it means: *this test is about `--lib`, or about the driver, and not about which standard module a
+   * compilation gets.* Spelled once here rather than at twenty call sites.
+   *
+   * A test that mentions the core **in any way** — names one, refuses one, redirects the search path,
+   * or builds one — opts out of this entirely and is run exactly as it was written. Otherwise this
+   * default would quietly rewrite the premise of the very tests that exist to pin it.
    */
-  private def cli(cfg: Config): Int = io.github.edadma.sysl.execute(cfg)
+  private def cli(cfg: Config): Int =
+    io.github.edadma.sysl.execute(if mentionsCore(cfg) then cfg else cfg.copy(noCoreLib = true))
+
+  private def mentionsCore(cfg: Config): Boolean =
+    cfg.core || cfg.noCoreLib || cfg.coreLib.isDefined || cfg.coreSearch != LibraryArtifact.coreDefault
 
   private val library =
     """module demo
@@ -268,39 +281,40 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       notes should not include "warning"
     }
 
-    "falls back to the built-in copy rather than failing, and says so" - {
+    "refuses the compilation rather than substituting another library" - {
 
-      // The asymmetry with `--lib` is deliberate. A library that cannot be read leaves the calls
-      // into it with nothing to resolve them, so there is nothing to do but stop. The core is the
-      // one library the compiler always has its own copy of, so every one of these compiles.
-      def fallsBack(what: String, path: String): Unit =
+      // The same rule `--lib` follows, and for the same reason: a library that cannot be read leaves
+      // the calls into it with nothing to resolve them. That the compiler happens to carry a copy of
+      // this one does not make quietly compiling against a *different* standard module than the one
+      // asked for an acceptable answer — it makes it a harder mistake to notice.
+      def refuses(what: String, path: String): Unit =
         what in {
           val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
             coreLib = Some(path)))
 
-          status shouldBe 0
-          notes should include("warning")
+          status should not be 0
+          notes should include("error")
         }
 
-      fallsBack("when it is not there at all",
+      refuses("when it is not there at all",
         s"${createTempDirectory("sysl-cli-nocore-")}/absent${LibraryArtifact.extension}")
 
-      fallsBack("when it is not one of ours", corrupt("not a library\n".getBytes))
+      refuses("when it is not one of ours", corrupt("not a library\n".getBytes))
 
-      fallsBack("when another sysl built it", corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes))
+      refuses("when another sysl built it", corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes))
 
-      fallsBack("when it is truncated", corrupt(truncated))
+      refuses("when it is truncated", corrupt(truncated))
 
-      fallsBack("when its metadata will not decode",
+      refuses("when its metadata will not decode",
         corrupt(LibraryArtifact.pack("0000000000000000\n0\nrubbish", Array.empty)))
 
       // The one a developer actually meets: build the artifact, then edit `lib/sysl`. It decodes and
       // would link perfectly — it is simply no longer the standard module in the tree — so nothing
       // but the fingerprint would catch it, and a silently wrong library is the worst of the five.
-      fallsBack("when it was built from a different lib/sysl", corrupt(LibraryArtifact.pack(stale, Array.empty)))
+      refuses("when it was built from a different lib/sysl", corrupt(LibraryArtifact.pack(stale, Array.empty)))
     }
 
-    "is not needed at all, the artifact being looked for where build-lib --core puts it" - {
+    "is not needed by name, the artifact being looked for where build-lib --core puts it" - {
 
       // Every case here routes the default path through `coreSearch` to a temporary file rather than
       // using the real one. Suites run in parallel, and an artifact left at the true default would be
@@ -323,32 +337,36 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
         notes should not include "warning"
       }
 
-      "while nothing there is the ordinary state of a fresh tree, and passes without comment" in {
+      "while nothing there stops the compilation, and names the command that fixes it" in {
+        // A fresh clone has to build the library once. Saying so is the whole difference between a
+        // one-line fix and a user wondering why their program is slower than the one in the docs —
+        // and, more to the point, the compiler does not get to pick a different standard module.
         val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
           coreSearch = s"${createTempDirectory("sysl-cli-none-")}/core${LibraryArtifact.extension}"))
 
-        status shouldBe 0
-        notes should not include "warning"
+        status should not be 0
+        notes should include("build-lib lib --core")
+        notes should include("--no-core-lib")
       }
 
-      "but something unreadable there still warns, since that is the shape a drifted one takes" in {
-        // The asymmetry that matters: absent is silence, present-and-wrong is not. Staying quiet
-        // here is what would let a stale artifact go on being ignored rather than fixed.
+      "and something unreadable there stops it too, that being the shape a drifted one takes" in {
         val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
           coreSearch = corrupt("not a library\n".getBytes)))
 
-        status shouldBe 0
-        notes should include("warning")
+        status should not be 0
+        notes should include("error")
       }
 
-      "and --core-lib wins over it, being the one someone actually asked for" in {
+      "and --core-lib is the one consulted, being the one someone actually asked for" in {
+        // Both are unreadable, so both refuse — what says which was read is *how* each is broken:
+        // the named one is not ours at all, the one at the default path claims a later format.
         val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
           coreLib = Some(corrupt("not a library\n".getBytes)),
           coreSearch = corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)))
 
-        status shouldBe 0
-        notes should include("warning")
-        notes should not include "different sysl"
+        status should not be 0
+        notes should include("is not a sysl library")
+        notes should not include "built by a different sysl"
       }
 
       "and the place both ends agree on is the documented one" in {
@@ -357,19 +375,6 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
         Config().coreSearch shouldBe LibraryArtifact.coreDefault
         LibraryArtifact.coreDefault should endWith(LibraryArtifact.extension)
       }
-    }
-
-    "and having fallen back, emits the standard module rather than declaring it" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
-      assume(Toolchain.clangAvailable, "clang not available")
-
-      // The claim the fallback rests on: what it falls back *to* is a complete compilation. A
-      // warning followed by a link against symbols nobody defines would be worse than refusing.
-      val (status, notes) = diagnostics(Config(command = "run", file = program("print(21 * 2)"),
-        coreLib = Some(corrupt("not a library\n".getBytes))))
-
-      status shouldBe 0
-      notes should include("warning")
     }
   }
 
@@ -380,14 +385,25 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
      * about the command line. These say the flag reaches it on purpose. */
 
     "does not read the artifact at the default path, even a broken one" in {
-      // The discriminating pair: this exact artifact at this exact path warns without the flag (the
-      // discovery section above), so silence here is the artifact going unread rather than a
-      // corruption that happens not to be worth mentioning.
+      // The discriminating pair: this exact artifact at this exact path *refuses* the compilation
+      // without the flag (the discovery section above), so succeeding here is the artifact going
+      // unread rather than a corruption that happens not to matter.
       val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
         noCoreLib = true, coreSearch = corrupt("not a library\n".getBytes)))
 
       status shouldBe 0
-      notes should not include "warning"
+      notes should not include "error"
+    }
+
+    "and is what a tree with no artifact at all needs, there being no silent fallback" in {
+      // The flag's reason for existing. Without it this exact configuration — a fresh clone, nothing
+      // built — is an error, which is the whole point: the carried copy is reached deliberately or
+      // not at all.
+      val nowhere = s"${createTempDirectory("sysl-cli-bare-")}/core${LibraryArtifact.extension}"
+
+      cli(Config(command = "emit-llvm", file = program("print(1)"), coreSearch = nowhere)) should not be 0
+      cli(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
+        coreSearch = nowhere)) shouldBe 0
     }
 
     "and takes the built-in copy with a good artifact sitting right there" in {

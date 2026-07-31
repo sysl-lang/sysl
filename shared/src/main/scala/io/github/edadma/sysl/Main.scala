@@ -34,21 +34,18 @@ import scopt.OParser
  *
  * **It need not be given.** `build-lib --core` with no `-o` writes to `LibraryArtifact.coreDefault`,
  * and a compilation with no `--core-lib` looks there — one path at both ends, so building the
- * artifact once after a clone is the whole of what anyone has to do. Nothing there is the ordinary
- * state of a fresh tree and passes without comment.
+ * artifact once after a clone is the whole of what anyone has to do.
  *
- * **It falls back where `--lib` refuses**, and the asymmetry is the point. A `--lib` that cannot be
- * read leaves the program's calls into that library with nothing to resolve them, so there is nothing
- * to do but stop. The core is the one library the compiler always has its own copy of, so an artifact
- * that is missing, corrupt, or built by another sysl costs a warning and the built-in copy — a
- * compilation that would have succeeded does not start failing because an optimization was
- * unavailable.
+ * **And it has to be there.** A compilation that finds no standard module stops, the same as one
+ * handed a `--lib` it cannot read: a compiler does not silently substitute a different library for
+ * the one it was meant to use, and a C compiler that cannot find libc does not carry a spare. The
+ * diagnostic names the command that builds it.
  *
- * **`--no-core-lib` asks for that built-in copy on purpose**, ignoring whatever is on disk. It exists
- * because the fallback is silent when the artifact is merely absent, which makes "which standard
- * module did this compilation actually use" a question about the filesystem rather than about the
- * command line; this is the answer that does not depend on the filesystem. The two should agree, and
- * running a compilation both ways is how that is checked.
+ * **`--no-core-lib` is the one route to the copy the compiler carries**, ignoring whatever is on
+ * disk. That copy is what makes bootstrap possible — there is no released sysl to build the first
+ * artifact with — so it is reached deliberately rather than by a lookup coming up empty. Taken
+ * silently it would be taken always, because then nobody would have any reason to build an artifact
+ * at all.
  *
  * **Everything after a bare `--` belongs to the program being run**, not to sysl: it is passed
  * straight through to the executable, which is what lets `sysl run prog.sysl -- -v file` reach a
@@ -171,10 +168,11 @@ private[sysl] def execute(cfg: Config): Int = {
   if cfg.noCoreLib && cfg.coreLib.isDefined then
     return fail("--no-core-lib and --core-lib ask for different standard modules")
 
-  // Which standard module this compilation is compiled against. A prebuilt one arrives here;
-  // anything else — including a named one that could not be read — leaves the copy the compiler
-  // carries, which is why this warns where a bad `--lib` refuses.
-  val (core, coreSymbols, coreObject) = chooseCore(cfg)
+  // Which standard module this compilation is compiled against — an error if there is none, the same
+  // as any other missing library.
+  val (core, coreSymbols, coreObject) = chooseCore(cfg) match
+    case Left(err) => return fail(err)
+    case Right(c)  => c
 
   // Building a library stops here — there is no program to link it into. An artifact is **for a
   // machine**, exactly as an rlib is, because half of it is compiled object code; the generic half
@@ -325,44 +323,40 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $out"); 0
 
-/** The standard module this compilation gets, and where it was looked for.
+/** The standard module this compilation gets, or why it has none.
  *
- * Three places, in order: the one `--core-lib` names, the one sitting at the default path, and the
- * copy the compiler carries. `--no-core-lib` skips straight to the third — the compiler keeps its own
- * copy so that it can be bootstrapped and so that its tests need nothing built first, and this is how
- * that copy is reached on purpose rather than by an artifact happening to be absent. What it is for is
- * telling the two apart: a compilation that behaves one way against a prebuilt standard module and
- * another way against the built-in one has a bug in the artifact path, and this flag is what turns
- * that into two runs of one command.
+ * Two places, in order: the one `--core-lib` names and the one sitting at the default path. **Neither
+ * one being there is an error**, exactly as it is for every other library — a compiler that cannot
+ * find its standard library does not quietly compile against something else, and clang without a
+ * libc does not carry a spare. The message names the command that fixes it, because "build the
+ * library once" is the whole of what a fresh clone has to do.
  *
- * **Only the first two can warn, and they warn about different things.**
- * A named artifact that cannot be read is worth saying out loud — somebody asked for it by name and
- * did not get it. A default path with nothing at it is the ordinary state of a fresh clone and says
- * nothing at all; but a default path with something *unreadable* at it warns like any other, because
- * that is the shape a drifted artifact takes and silence is exactly what makes it dangerous.
+ * `--no-core-lib` is the one way to the copy the compiler carries. That copy exists for bootstrap —
+ * there is no released sysl to build the first artifact with — and reaching it is therefore a
+ * deliberate act rather than what happens when a lookup comes up empty. Which is what keeps it
+ * honest: a fallback taken silently is a fallback taken *always*, since nobody would ever build the
+ * artifact, and the path meant for the rarest of circumstances would become the only path anyone ran.
  *
- * Looking without being asked is what makes the artifact worth having: built once after a clone, it
- * is found by every compilation afterwards with nothing to remember. The cost is that what a
- * compilation emits now depends on what is on disk beside it — the same program, declaring the
- * library where an artifact was found and defining it where none was. They mean the same thing
- * (`CoreArtifactTests`), and the fingerprint is what stops them from meaning different things.
+ * **`build-lib --core` is exempt, and has to be.** It is the command that produces the artifact, so
+ * requiring one would be a deadlock with nothing to break it — the bootstrap case in its purest form,
+ * and the reason the carried copy is kept at all.
  */
-private def chooseCore(cfg: Config): (Core, Set[String], Option[Array[Byte]]) =
-  if cfg.noCoreLib then (Core.embedded, Set.empty, None)
-  else cfg.coreLib.orElse(Option.when(isFile(cfg.coreSearch))(cfg.coreSearch)).map(loadCore) match
-    case None                => (Core.embedded, Set.empty, None)
-    case Some(Right(loaded)) => loaded
-    case Some(Left(err)) =>
-      Console.err.println(s"sysl: warning: $err — compiling against the built-in standard module")
-      (Core.embedded, Set.empty, None)
+private def chooseCore(cfg: Config): Either[String, (Core, Set[String], Option[Array[Byte]])] =
+  if cfg.noCoreLib || cfg.core then Right((Core.embedded, Set.empty, None))
+  else
+    cfg.coreLib.orElse(Option.when(isFile(cfg.coreSearch))(cfg.coreSearch)) match
+      case Some(path) => loadCore(path)
+      case None =>
+        Left(s"cannot find the standard module — build it with 'sysl build-lib lib --core', " +
+          s"or pass --no-core-lib to compile against the copy built into the compiler")
 
 /** A prebuilt standard module read back: the trees to compile against, the symbols its object half
  * already defines, and that object half itself.
  *
- * The failure is returned rather than reported, because the caller does not treat it as one. Every
- * way this can go wrong — a path that is not there, a file that is not ours, one built by another
- * sysl, a tree that will not decode — leaves a compilation that can still be run against the copy
- * the compiler carries, and the only thing lost is the work the artifact would have saved.
+ * Every way this can go wrong — a file that is not ours, one built by another sysl, one built from
+ * other sources than the compiler carries, a tree that will not decode — is a failure of the same
+ * kind as not finding it at all, and is reported rather than worked around. A standard module that
+ * cannot be read is not a standard module.
  */
 private def loadCore(path: String): Either[String, (Core, Set[String], Option[Array[Byte]])] = {
   val bytes =
