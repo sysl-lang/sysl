@@ -120,7 +120,9 @@ trait SpecialForms extends Closures {
     val t = analyzeExpr(args.head)
 
     Type.underlying(t.ty) match
-      case Type.Slice(Type.Byte) => TFromBytes(t)
+      // Either view will do: making a string out of bytes reads them, and a `[]const u8` is the
+      // shape `s.bytes` hands over, which is the commonest thing anyone validates.
+      case Type.Slice(Type.Byte, _) => TFromBytes(t)
       case Type.Array(_, Type.Byte) =>
         err("'from_utf8_unchecked' takes a []u8, and an array is not one — slice it, as 'from_utf8_unchecked(a[..])'")
       case Type.Str =>
@@ -246,7 +248,7 @@ trait SpecialForms extends Closures {
    */
   private def implementableHere(ty: Type): Boolean = ty match
     case Type.Array(_, elem) => implementableHere(elem)
-    case Type.Slice(elem)    => implementableHere(elem)
+    case Type.Slice(elem, _) => implementableHere(elem)
     case n: Type.Named =>
       declaringModule(n.base).contains(currentModule) || n.targs.exists(implementableHere)
     case _ => false

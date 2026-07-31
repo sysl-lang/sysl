@@ -182,12 +182,14 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
    * no `*T` in it; writing one byte of a **heap** string silently mutated a value the language calls
    * immutable, and can leave a `string` that is not valid UTF-8.
    *
-   * The assignment is closed below. `&s.bytes[i]` is deliberately left open — it is a `*T` the
-   * moment it is written, which is the tier the guarantee excludes, and it is how a string reaches
-   * `printf("%.*s")`. The two `ignore`d tests carry the assertions the language owes and cannot yet
-   * make: once the view is bound to a name or handed to a function, a `[]T` records nothing about
-   * whose elements it views, which is exactly the read-only view type `07 § Not yet` is waiting on.
-   * They are written as they should read when it exists.
+   * The hole is closed: `s.bytes` is a `[]const u8`, so the property travels with the view instead
+   * of expiring with the expression that made it — the last two tests below are the ones that could
+   * not be made until a view could record it.
+   *
+   * `&s.bytes[i]` is deliberately still open — it is a `*T` the moment it is written, which is the
+   * tier the guarantee excludes, and it is how a string reaches `printf("%.*s")`. The licence is
+   * for that form as *written*: the same view under a name is an ordinary `[]const u8` and may not
+   * have its address taken, because there the raw tier is no longer visible to a reader.
    */
   "a string's bytes are the string's own storage, so writing one is writing the string" - {
     "the subscript is refused, and the message says the view is not a copy" in {
@@ -216,13 +218,14 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
       run("var s = \"hi\"\nvar c = s.copy()\nprint(c.bytes[1])") shouldBe "105\n"
     }
 
-    // TODO: un-ignore once a view can record that its elements are read-only.
-    "the view refuses a write once it has been bound to a name" ignore {
-      err("var s = \"hello\"\nvar b = s.bytes\nb[0] = 74u8") should include("a string is immutable")
+    "the view refuses a write once it has been bound to a name" in {
+      err("var s = \"hello\"\nvar b = s.bytes\nb[0] = 74u8") should
+        include("views elements it may not write")
     }
 
-    // TODO: un-ignore once a view can record that its elements are read-only.
-    "and once it has been handed to something that takes a '[]u8'" ignore {
+    // Refused at the call rather than at the write, and that is the better place: the callee is
+    // written against a `[]u8` and is not wrong, so what is wrong is handing it these bytes.
+    "and once it has been handed to something that takes a '[]u8'" in {
       errOf(
         "main.sysl" ->
           """poke(b: []u8)
@@ -230,7 +233,14 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
             |var s = "hello"
             |poke(s.bytes)
             |""".stripMargin,
-      ) should include("a string is immutable")
+      ) should include("does not become the other")
+    }
+
+    // The address is refused under a name for the same reason it is allowed when written out: what
+    // the licence is for is a `*T` a reader can *see* being taken out of a string.
+    "and its address may not be taken once it has been bound to a name either" in {
+      err("var s = \"hello\"\nvar b = s.bytes\nvar p = &b[0]") should
+        include("an address would be a licence to write them")
     }
   }
 

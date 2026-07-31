@@ -452,6 +452,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case TFormat(arg, spec) =>
       ownTemp(genFormat(arg, spec), Type.Str)
 
+    // Nothing to emit: dropping the ability to write is a fact about the type and not about the
+    // three words, which are the same three words either way.
+    case TConstView(arg) => genExpr(arg)
+
     // The bytes are copied into a string that owns them rather than viewed in place: a `[]u8` can
     // be written through afterwards, and a `string` whose bytes could change is not one that was
     // ever validated. The same copy is what `str(x)` finishes through, so both spend one allocation.

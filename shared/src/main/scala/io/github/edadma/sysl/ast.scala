@@ -157,9 +157,9 @@ sealed trait TypeRef extends Positioned {
     case PtrType(inner)                   => s"*${inner.show}"
     case RefType(inner, sync)             => s"&${if sync then "sync " else ""}${inner.show}"
     case WeakType(inner)                  => s"weak ${inner.show}"
-    case ArrayType(None, elem)            => s"[]${elem.show}"
-    case ArrayType(Some(IntLit(n, _)), e) => s"[$n]${e.show}"
-    case ArrayType(Some(_), elem)         => s"[…]${elem.show}"
+    case ArrayType(None, elem, ro)           => s"[]${if ro then "const " else ""}${elem.show}"
+    case ArrayType(Some(IntLit(n, _)), e, _) => s"[$n]${e.show}"
+    case ArrayType(Some(_), elem, _)         => s"[…]${elem.show}"
     case TupleType(parts, false)          => s"(${parts.map(_.show).mkString(", ")})"
     case TupleType(parts, true)           => parts.map(_.show).mkString(", ")
     case FnType(List(one), ret, true)     => s"${one.show} -> ${ret.show}"
@@ -182,8 +182,14 @@ case class RefType(inner: TypeRef, sync: Boolean) extends TypeRef
 /** `weak T` — a reference that does not keep its referent alive (`03`). */
 case class WeakType(inner: TypeRef) extends TypeRef
 
-/** `[N]T` — a fixed array — or `[]T`, a slice, when no length is written. */
-case class ArrayType(length: Option[Expr], elem: TypeRef) extends TypeRef
+/** `[N]T` — a fixed array — or `[]T`, a slice, when no length is written, and `[]const T` when the
+ * slice may not be written through.
+ *
+ * `const` sits after the brackets rather than before them for the reason `sync` sits after the `&`:
+ * it is a property of the *view*, not of the element type, and putting it where the element type
+ * goes would say a program had a type called "const T".
+ */
+case class ArrayType(length: Option[Expr], elem: TypeRef, readOnly: Boolean = false) extends TypeRef
 
 /** `a, b` where a function's own result list is what is being produced (`12 §5b`) — the callee's
  * side of the form. It is never a value: the analyzer accepts it only where the enclosing

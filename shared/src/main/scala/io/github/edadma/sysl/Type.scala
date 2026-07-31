@@ -240,14 +240,43 @@ object Type {
     def llvm: String = "{ ptr, ptr, i64 }"
   }
 
-  /** `[]T` — a view of any elements at all. */
-  case class Slice(elem: Type) extends View
+  /** `[]T` — a view of any elements at all, and `[]const T` when the elements may not be written
+   * through it.
+   *
+   * The two are one type with a bit rather than two types, because they are one *view*: the same
+   * three words, the same instructions to reach through, and the same thing to keep alive. What the
+   * bit changes is only what may be *done* with the view, which is why a `[]T` is accepted wherever
+   * a `[]const T` is wanted and never the other way round — dropping the ability to write is safe,
+   * and inventing it is the hole (`07 § Not yet`).
+   *
+   * `string` is the same idea arrived at from the other side and kept separate: it is a read-only
+   * view of `u8` *plus* the promise that the bytes are well-formed UTF-8, and it is the promise, not
+   * the read-only-ness, that makes it its own type.
+   */
+  case class Slice(elem: Type, readOnly: Boolean = false) extends View
 
   /** A view of bytes that are well-formed UTF-8 and stay that way: the same three words a slice
    * is, minus the ability to write through it. The validity invariant is what separates the two
    * types, so converting a `[]u8` to a `string` is checked and the other direction is free.
    */
   case object Str extends View { def elem: Type = Byte }
+
+  /** Whether a view refuses to be written through. Both read-only views answer yes, and they are
+   * read-only for different reasons: a `[]const T` views elements somebody else promised not to
+   * have written, and a `string` views bytes whose UTF-8 a write is what would break.
+   */
+  def readOnlyView(t: Type): Boolean = t match
+    case Slice(_, ro) => ro
+    case Str          => true
+    case _            => false
+
+  /** The same view, minus the ability to write through it — the one direction that is safe, and
+   * what makes a `[]T` argument acceptable where a `[]const T` is asked for. A view that is already
+   * read-only is returned unchanged, so this is idempotent and may be applied without asking.
+   */
+  def constView(t: Type): Type = t match
+    case Slice(e, false) => Slice(e, readOnly = true)
+    case other           => other
 
   /** The element type of whatever a subscript may be applied to. */
   def element(t: Type): Option[Type] = t match
@@ -319,7 +348,7 @@ object Type {
     case Ref(inner, sync)         => s"&${if sync then "sync " else ""}${show(inner)}"
     case Weak(inner)              => s"weak ${show(inner)}"
     case Array(n, elem)           => s"[$n]${show(elem)}"
-    case Slice(elem)              => s"[]${show(elem)}"
+    case Slice(elem, ro)          => s"[]${if ro then "const " else ""}${show(elem)}"
     case Abstract(n, _)           => n
     // A call trait is spelled the way it is written rather than the way it is filed, so nothing a
     // reader is told names the arity-carrying declaration behind it (`12 §6`).
@@ -360,7 +389,7 @@ object Type {
     case Ref(inner, _)    => mentionsAbstract(inner)
     case Weak(inner)      => mentionsAbstract(inner)
     case Array(_, elem)   => mentionsAbstract(elem)
-    case Slice(elem)      => mentionsAbstract(elem)
+    case Slice(elem, _)   => mentionsAbstract(elem)
     case _                => false
 
   def isNumeric(t: Type): Boolean = underlying(t) match
@@ -639,7 +668,12 @@ object Type {
     case Ref(inner, true)  => s"sync.${mangleOne(inner)}"
     case Weak(inner)       => s"weak.${mangleOne(inner)}"
     case Array(n, elem)    => s"arr$n.${mangleOne(elem)}"
-    case Slice(elem)       => s"slice.${mangleOne(elem)}"
+    // The bit is mangled even though both forms have one layout and one set of instructions, so
+    // that a generic instantiated at `[]const T` never shares a body with one instantiated at
+    // `[]T` — the bodies would be identical machine code, but only one of them had its writes
+    // checked, and reusing that analysis is the way the bit stops meaning anything.
+    case Slice(elem, false) => s"slice.${mangleOne(elem)}"
+    case Slice(elem, true)  => s"constslice.${mangleOne(elem)}"
     case Trait(n, args)    => mangled(n, args)
     // A transparent subtype shares its base's representation, so it mangles as the base; a derived
     // one is its own type and mangles under its name, keeping `Vec[Meters]` and `Vec[f64]` apart.

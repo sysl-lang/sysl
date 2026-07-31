@@ -182,7 +182,7 @@ object Prelude {
       |extern "read" sysl_read(fd: int, p: *u8, n: usize) -> isize
       |extern "memchr" sysl_memchr(p: *u8, c: int, n: usize) -> *u8
       |
-      |putbytes(b: []u8)
+      |putbytes(b: []const u8)
       |    var i = 0usize
       |    while i < b.len
       |        sysl_putchar(int(b[i]))

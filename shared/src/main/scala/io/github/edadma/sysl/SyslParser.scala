@@ -246,7 +246,16 @@ class SyslParser(val source: Source) extends DeclParser {
         op("weak") ~> softSync ~> err("an atomic reference has no weak form yet — 'weak sync T' " +
           "wants the concurrency model of '06', which is not built") |
         op("weak") ~> coreType ^^ WeakType.apply |
-        (op("[") ~> opt(expression) <~ op("]")) ~ coreType ^^ { case n ~ t => ArrayType(n, t) } |
+        ((op("[") ~> opt(expression) <~ op("]")) ~ opt(op("const")) ~ coreType >> {
+          // `const` after the brackets says the *view* refuses writes, so a length in them is a
+          // contradiction: an array is storage rather than a view of it, and storage that is written
+          // once is what `val` declares. Somebody reaching for one is owed that word rather than a
+          // parse error, since the two spellings are a bracketed number apart.
+          case Some(_) ~ Some(_) ~ t =>
+            err(s"'const' says a view refuses writes, and an array is storage rather than a view of " +
+              s"one — read-only storage is declared with 'val', as 'val name: [N]${t.show}'")
+          case n ~ ro ~ t => success(ArrayType(n, t, readOnly = ro.isDefined))
+        }) |
         tupleType |
         qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
     )

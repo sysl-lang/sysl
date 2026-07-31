@@ -298,14 +298,40 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  "the two refusals '§ Not yet' promises, each naming what the missing view type would record" - {
+  /** `§ Not yet` promised two refusals against the day a view could record something about the
+    * storage it views. One of them has been paid off and the other has not, and they are kept
+    * together because what separates them is the point: read-only-ness is a property of the **view**,
+    * so a type can carry it, while whether a count is atomic is a property of the **owner**, which
+    * the view can only report on.
+    */
+  "what '§ Not yet' promised, and which half of it a view type reaches" - {
 
-    "a 'val' cannot be sliced, because a slice permits writes" in {
-      err("val table: [4]int = [1, 2, 3, 4]\nvar sliced = table[0..<2]") should
-        include("a 'val' cannot be sliced")
+    "a 'val' CAN be sliced now, and what comes back may not be written" in {
+      run("""val table: [4]int = [1, 2, 3, 4]
+            |var sliced = table[0..<2]
+            |print(sliced.len, sliced[1])
+            |""".stripMargin) shouldBe "2 2\n"
+
+      err("val table: [4]int = [1, 2, 3, 4]\nvar sliced = table[0..<2]\nsliced[0] = 9") should
+        include("views elements it may not write")
     }
 
-    "and a '&sync' array cannot, because a slice does not record whose count is atomic" in {
+    // The bit follows the storage rather than the expression, which is the whole of what makes it
+    // sound: re-slicing, binding and passing all keep it, and the refusal lands wherever the write is.
+    "and it stays read-only through a re-slice and through a call" in {
+      err("""val table: [4]int = [1, 2, 3, 4]
+            |var sliced = table[0..]
+            |var again = sliced[1..]
+            |again[0] = 9
+            |""".stripMargin) should include("views elements it may not write")
+
+      err("""val table: [4]int = [1, 2, 3, 4]
+            |take(xs: []int) = print(xs.len)
+            |take(table[0..])
+            |""".stripMargin) should include("does not become the other")
+    }
+
+    "but a '&sync' array still cannot be sliced, since that is the owner's property and not the view's" in {
       err("var p: &sync [4]int = [1, 2, 3, 4]\nvar v = p[..]") should
         include("a slice does not record whether its owner's count is atomic")
     }

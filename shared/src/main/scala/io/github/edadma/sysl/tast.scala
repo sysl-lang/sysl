@@ -74,10 +74,17 @@ case class TIndex(receiver: TExpr, index: TExpr, ty: Type) extends TExpr
  */
 case class TLen(receiver: TExpr) extends TExpr { def ty: Type = Type.Usize }
 
-/** `s.bytes` — a string's bytes, as a `[]u8`. The same three words the string already is, so
+/** `s.bytes` — a string's bytes, as a `[]const u8`. The same three words the string already is, so
  * this reinterprets rather than converts; only the validity guarantee is given up.
+ *
+ * The view is read-only because the string is, and because the elements may be a literal's, which
+ * live in memory the platform will not let anybody write. A writable view of them was the one way
+ * a program with no `*T` in it could still be killed by the machine (`03`), so the guarantee that
+ * chapter opens with is what this bit is holding up.
  */
-case class TBytes(receiver: TExpr) extends TExpr { def ty: Type = Type.Slice(Type.Byte) }
+case class TBytes(receiver: TExpr) extends TExpr {
+  def ty: Type = Type.Slice(Type.Byte, readOnly = true)
+}
 
 /** `a[lo..hi]` — a view of some of `base`'s elements. `base` is either the reference that owns
  * a heap array or another view, so that one expression yields both where the elements are and
@@ -205,6 +212,16 @@ case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
  * that had already been checked.
  */
 case class TFromBytes(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
+
+/** A `[]T` standing where a `[]const T` was asked for — the one direction between the two views
+ * that is safe, since giving up the ability to write cannot be observed by anything holding the
+ * view it came from.
+ *
+ * It carries no instruction. Both views are the same three words and the same layout, so this
+ * exists only so that what is written on the expression matches what the context asked for; codegen
+ * emits the operand and nothing else.
+ */
+case class TConstView(arg: TExpr) extends TExpr { def ty: Type = Type.constView(arg.ty) }
 
 /** `format(value, spec)` — one value rendered through a printf specifier, the lowering of an
  * `f"…"` hole. Always allocates a fresh string; `spec` is the sysl specifier (`%08.2f`), which

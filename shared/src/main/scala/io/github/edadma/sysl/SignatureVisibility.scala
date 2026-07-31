@@ -231,7 +231,7 @@ trait SignatureVisibility extends TypeResolution {
     case PtrType(inner)     => namesIn(inner, skip)
     case RefType(inner, _)  => namesIn(inner, skip)
     case WeakType(inner)    => namesIn(inner, skip)
-    case ArrayType(_, elem) => namesIn(elem, skip)
+    case ArrayType(_, elem, _) => namesIn(elem, skip)
     case TupleType(parts, _) => parts.flatMap(namesIn(_, skip))
     // A callable mentions the prelude's call trait, which is public and is nobody's to hide; what a
     // signature can expose through one is its parameters and its result, so those are what is walked.

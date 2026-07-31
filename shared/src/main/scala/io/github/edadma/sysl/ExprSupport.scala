@@ -25,7 +25,7 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    */
   protected def elementWanted(want: Type): Option[Type] = want match
     case Type.Array(_, e) => Some(e)
-    case Type.Slice(e)    => Some(e)
+    case Type.Slice(e, _) => Some(e)
     case _                => None
 
   /** A reference written as a chain of plain names: `std.fs.read` is `["std", "fs", "read"]`.

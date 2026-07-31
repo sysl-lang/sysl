@@ -236,7 +236,11 @@ trait TraitLookup extends MemberVisibility {
    * has said nothing about it.
    */
   protected def shapeOwner(t: Type): Option[(String, List[Type])] = t match
-    case Type.Slice(elem)    => Some(("[]", List(elem)))
+    // Both views share the one shape, and for the reason the shape exists: a block written for
+    // every slice is written against what a slice *is* — a pointer and a count of `T` — and whether
+    // this one may be written through is not part of that. A block that does write is caught where
+    // it writes, which is a better place to say so than a missing implementation.
+    case Type.Slice(elem, _) => Some(("[]", List(elem)))
     case Type.Array(n, elem) => Some((s"[$n]", List(elem)))
     // A tuple's shape is its **arity**, since that is the whole of what an implementation can be
     // written for at once: there is no way to be generic over how many parts a tuple has, so a

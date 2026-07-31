@@ -303,7 +303,10 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
           params.map(_._2) match
             case Nil                      => Some(TEntry(key, None))
-            case Type.Slice(Type.Str) :: Nil =>
+            // Written either way: the arguments are the platform's and a program that only reads
+            // them may say so, which costs the entry point nothing since the two views are one
+            // layout and `args_of` yields the one that may stand in for either.
+            case Type.Slice(Type.Str, _) :: Nil =>
               val argsFn = Modules.qualify(Modules.root, "args_of")
 
               funcsUsed += argsFn

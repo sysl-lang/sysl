@@ -30,8 +30,11 @@ trait CollectionExprAnalysis extends ExprSupport {
       )
 
       expected match
-        case Some(Type.Slice(_)) => TBufLit(ts, Type.Slice(elemTy))
-        case _                   => TArrayLit(ts, Type.Array(ts.length, elemTy))
+        // The buffer is storage this expression makes, so nobody else can be holding a writable
+        // view of it and it takes whichever form was asked for. Under a `[]const T` that is a
+        // buffer written by its own literal and never again.
+        case Some(Type.Slice(_, ro)) => TBufLit(ts, Type.Slice(elemTy, ro))
+        case _                       => TArrayLit(ts, Type.Array(ts.length, elemTy))
 
     // `[v; n]` — the form for an array whose element type has no zero, or has one that is not the
     // wanted starting value. The value is evaluated **once** and copied into every element, which
@@ -48,7 +51,7 @@ trait CollectionExprAnalysis extends ExprSupport {
       if Type.noValue(tv.ty) then err(s"an array cannot hold ${show(tv.ty)} values")
 
       expected match
-        case Some(Type.Slice(_)) =>
+        case Some(Type.Slice(_, ro)) =>
           val tc = analyzeExpr(count)
 
           // A count is an index's twin, so it takes a transparent subtype for the same reason one
@@ -58,7 +61,7 @@ trait CollectionExprAnalysis extends ExprSupport {
             case i: Type.Integer => checkedIndexWidth(tc, i)
             case _ => err(s"a repeat count is a number of elements, and ${show(tc.ty)} is not an integer")
 
-          TBufFill(tv, checked, Type.Slice(tv.ty))
+          TBufFill(tv, checked, Type.Slice(tv.ty, ro))
 
         case _ =>
           val n = constInt(count) match
@@ -79,13 +82,11 @@ trait CollectionExprAnalysis extends ExprSupport {
 
       val tr = analyzeExpr(receiver)
 
-      // A `[]T` permits writes and records nothing about where its elements came from, so a view of
-      // a `val` would be a way of writing one. Refused outright rather than allowed and policed,
-      // since the view outlives the expression that made it: what this wants is a read-only slice
-      // type, and that is a decision about `07`'s view types rather than about `val`.
-      if readOnly(tr) then
-        err("a 'val' cannot be sliced: a slice permits writes and does not record whose elements it " +
-          "views, so the view would be a way of writing one")
+      // A view of read-only storage is read-only, which is the whole of what it takes to make this
+      // safe: the view records the property, so it carries it wherever it is bound or passed rather
+      // than losing it at the end of the expression that made it. Slicing a `val` was refused for
+      // exactly as long as there was no type to say that in.
+      val viewIsConst = readOnly(tr)
 
       val elem = tr.ty match
         case Type.Ref(Type.Array(_, e), false) => e
@@ -119,7 +120,13 @@ trait CollectionExprAnalysis extends ExprSupport {
 
       // Part of a string is a string, not a `[]u8` — the bytes between two character boundaries
       // are still well-formed UTF-8, which is what the check at those boundaries is for.
-      val viewTy = if tr.ty == Type.Str then Type.Str else Type.Slice(elem)
+      //
+      // Anything else is a slice, read-only when what it views is: `val` storage, or another view
+      // that had already given the ability up. Re-slicing is where a bit like this is easiest to
+      // drop, and dropping it would make `xs[1..]` the way around `xs`.
+      val viewTy =
+        if tr.ty == Type.Str then Type.Str
+        else Type.Slice(elem, readOnly = viewIsConst || Type.readOnlyView(tr.ty))
 
       TSlice(tr, lo.map(bound), hi.map(bound), inclusive, viewTy)
 
