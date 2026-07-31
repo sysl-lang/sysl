@@ -41,6 +41,18 @@ reads — the same convention `sysl run <path> -- <args>` follows.
 
 That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with clang.
 
+A program's own unit tests are `#test` functions written beside what they test, and `sysl test` is
+what runs them (`docs/design/testing.md`):
+
+```bash
+sbt "syslJVM/run test guide/ring"                  # every #test under a directory
+sbt "syslJVM/run test guide/ring --filter empty"   # the ones whose name holds this
+```
+
+A test passes by returning; `#test(should_trap)` is for the ones whose subject is a check that
+should fire, and passes only if the run does not come back. Every other build drops the tests, so
+they cost a program nothing.
+
 Every program is compiled against the standard module, which is built once after a clone:
 
 ```bash
