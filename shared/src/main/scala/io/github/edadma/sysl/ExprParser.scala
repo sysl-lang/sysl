@@ -175,10 +175,25 @@ trait ExprParser extends SyslParserBase {
 
   lazy val primary: PackratParser[Expr] =
     at(
-      floatLit | intLit | charLit | interpLit | cStrLit | strLit | boolLit | nullLit | selfExpr | identExpr |
+      floatLit | intLit | charLit | interpLit | cStrLit | strLit | boolLit | nullLit | layoutOf | selfExpr |
+        identExpr |
         arrayLit |
         op("(") ~> parenTail,
     )
+
+  /** `sizeof(T)` and `alignof(T)` — the two forms whose operand is a type (`03 § Reinterpreting
+   * storage`).
+   *
+   * They are read here rather than left to look like calls because a call's argument list holds
+   * expressions, and `sizeof(*Node)` would parse as a dereference of a name. Both words are reserved,
+   * so nothing else can be meant by one and the parentheses can be insisted on.
+   */
+  protected lazy val layoutOf: PackratParser[Expr] =
+    (op("sizeof") ^^^ "sizeof" | op("alignof") ^^^ "alignof") >> { what =>
+      (op("(") ~> typeRef <~ op(")")) ^^ (t => LayoutOf(what, t)) |
+        err(s"'$what' takes a type in parentheses, as '$what(int)' — there is no form that takes a " +
+          "value, since a value's type is what would be measured anyway")
+    }
 
   /** A comma-separated list that may end in a comma.
    *

@@ -122,6 +122,7 @@ class SyslLexical
     "alloc",
     "requires",
     "sizeof",
+    "alignof",
     "require",
     "ensure",
     "type",

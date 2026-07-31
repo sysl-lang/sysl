@@ -121,6 +121,18 @@ trait Literals extends TypeResolution {
       case (e: Type.Enum, _: Type.Integer) =>
         if !e.simple then err(s"only a simple enum converts to an integer — ${show(e)} carries data")
         true
+      // A pointer → integer is total: an address *is* a number of `usize`'s width, so reading one as
+      // that number loses nothing and yields a value nothing can dereference. It goes only this way;
+      // making a pointer out of an integer is `ptr_cast` in the raw tier (`03 § Reinterpreting
+      // storage`). A pointer to a trait is two words rather than an address, so it has no number.
+      case (Type.Ptr(_: Type.Trait), _: Type.Integer) =>
+        err("a pointer to a trait is two words — the address and the table of the type it was " +
+          "erased from — so it is not a number")
+      case (_: Type.Ptr, i: Type.Integer) =>
+        if !i.pointerWidth then
+          err(s"an address is read as 'usize' or 'isize' rather than as ${show(i)} — a fixed width " +
+            "is not an address's width on every target")
+        true
       case _                                    => false
 
     if !allowed then err(s"cannot convert ${show(t.ty)} to ${show(to)}")

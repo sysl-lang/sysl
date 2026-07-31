@@ -160,8 +160,9 @@ has no operation that reinterprets part of itself as another type, which is exac
 union is. A construction writes the payload into a stack slot at its own variant's type and reads
 the whole enum back out; a match does the reverse. The compiler therefore has to know how wide the
 widest variant is *before* LLVM sees the module, since an array length in the emitted text is a
-literal — that is what `Layout` is, and it is the only place the compiler models storage. It is
-deliberately not the language's `sizeof`, which is still open (§ Open).
+literal — that is what `Layout` is, and it is the only place the compiler models storage. The
+language's `sizeof` (`03 § Reinterpreting storage`) is the same measurement asked from the outside,
+so the two agree by construction rather than by being kept in step.
 
 **Recursion goes through an indirection, as always (`03`).** A variant that holds the enum by
 value would make the type infinitely sized and is rejected; a recursive data type reaches
@@ -432,11 +433,6 @@ Recorded so they are not lost; each needs a decision before the relevant feature
   so a program was accepted by the compiler and then failed to build, with the reader shown clang's
   complaint about a temporary file. What remains open here is only whether a simple enum is
   **iterable** — a `::Range` over its variants, as a constrained subtype has (`16 §5`).
-- **f. `sizeof`.** The compiler models storage internally (`Layout`, §3) because a union's width
-  has to be written down. Whether the *language* can ask — `sizeof(T)` as a compile-time constant,
-  which is what a `static_assert` on a wire format needs — is a separate decision: it would fix
-  the layout of every type as part of the language rather than as an implementation detail, and
-  it wants an answer for a type whose size the host ABI decides.
 - **b. Binding mode through a reference.** When matching `*e` on a `&Enum`, does a payload
   binding copy the field or project a `&`/`*` into the live enum? This is the "match ergonomics"
   question Rust answers with default binding modes; sysl needs an explicit rule.
@@ -448,6 +444,13 @@ Recorded so they are not lost; each needs a decision before the relevant feature
 - **e. Unreachable-arm and redundant-pattern lints.** An arm made unreachable by an earlier
   catch-all, or a literal already covered by an earlier arm, is currently accepted silently; a
   lint would catch dead arms.
+
+**`sizeof` is settled and has moved.** It was open here because `Layout` is this chapter's, and the
+question was whether the *language* could ask what the compiler already measures. It can, over any
+type, and the reasoning is in `03 § Reinterpreting storage` — where it belongs, beside the pointer
+reinterpretation it exists to serve. The objection recorded here was that answering would fix every
+type's layout as part of the language; `15 §1` had already done that, so there was nothing left to
+spend.
 
 **Settled while writing this chapter** (were open; now decided above): the selectable
 underlying type and checked int→enum conversion for simple enums (§2); `bool` literal patterns

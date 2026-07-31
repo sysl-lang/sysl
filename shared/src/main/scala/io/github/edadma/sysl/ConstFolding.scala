@@ -159,7 +159,25 @@ trait ConstFolding extends ImportResolution {
     case Binary(op, l, r)   => for (a <- fold(l); b <- fold(r); v <- binary(op, a, b)) yield v
     case Compare(List(l, r), List(op)) => for (a <- fold(l); b <- fold(r); v <- binary(op, a, b)) yield v
 
+    // `sizeof(T)` and `alignof(T)` are compile-time constants (`03 § Reinterpreting storage`), so
+    // they fold exactly as a literal does. That is what makes them usable in the two positions this
+    // folder serves — an array bound and an enum discriminant — as well as in a `const`, which is
+    // where a program names the block size a slab is laid out in.
+    case LayoutOf(what, tr) => layoutBytes(what, resolveType(tr, Map.empty)).map(n => IntLit(n, None))
+
     case _ => None
+
+  /** The bytes `sizeof(T)` / `alignof(T)` answer with, or `None` where the type has no answer here.
+   *
+   * There are two ways to have no answer, and neither is a mistake to report. A **type parameter**
+   * is concrete at every instantiation and stands in for itself only during the walk that reports
+   * what a generic body's bounds do not license, so the measurement is not wrong there — it is not
+   * being made yet. A **poisoned** type has already been complained about once, and saying its width
+   * is unknown would be a second complaint about the same thing.
+   */
+  protected def layoutBytes(what: String, ty: Type): Option[Int] = Type.underlying(ty) match
+    case _: Type.Abstract | Type.Unknown => None
+    case t                               => Some(if what == "sizeof" then Layout.size(t) else Layout.align(t))
 
   private def convert(value: Expr, target: Type): Option[Expr] = (value, target) match
     case (IntLit(v, _), i: Type.Integer) => Some(IntLit(Type.wrap(v, i), None))

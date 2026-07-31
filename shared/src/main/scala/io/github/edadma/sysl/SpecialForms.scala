@@ -2,11 +2,15 @@ package io.github.edadma.sysl
 
 /** The call forms the compiler resolves by name.
  *
- * A call is normally a name looked up among the program's declarations. These eight are not: the
+ * A call is normally a name looked up among the program's declarations. These nine are not: the
  * analyzer recognizes `print`, `str`, `format`, `from_utf8_unchecked`, `va_start`, `va_end`,
- * `va_arg`, and `va_copy` before it gets that far. Collecting them in one file is deliberate — it is
- * the whole of what the language knows that a program could not have told it, and the list is meant
- * to shrink.
+ * `va_arg`, `va_copy`, and `ptr_cast` before it gets that far. Collecting them in one file is
+ * deliberate — it is the whole of what the language knows that a program could not have told it, and
+ * the list is meant to shrink.
+ *
+ * `ptr_cast` is the exception that is written elsewhere: it belongs to the raw tier alongside
+ * `sizeof`, so its meaning is in `RawStorage` and only its *name* is registered here, which is what
+ * the dispatch and the mistake-at-a-form diagnostic below both need.
  *
  * The four `va_*` forms belong here permanently. Each is an **ABI primitive** that no sysl body
  * could implement, in the same category as `sizeof`, so there is nothing to put in the library
@@ -23,7 +27,7 @@ trait SpecialForms extends Closures {
    * nothing else would know they are forms at all.
    */
   protected val specialFormNames: Set[String] =
-    Set("print", "str", "format", "from_utf8_unchecked", "va_start", "va_end", "va_arg", "va_copy")
+    Set("print", "str", "format", "from_utf8_unchecked", "va_start", "va_end", "va_arg", "va_copy", "ptr_cast")
 
   /** `print(a, b, …)` — each value rendered by the library function its type reaches, a space
    * between and a newline at the end.

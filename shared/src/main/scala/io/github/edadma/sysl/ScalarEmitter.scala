@@ -174,6 +174,13 @@ trait ScalarEmitter extends StringEmitter {
     // integer is just that integer conversion; every enum value is already in range.
     case (e: Type.Enum, b: Type.Integer) => convert(e.underlying, b, v)
 
+    // The raw tier (`03 § Reinterpreting storage`). Two pointee types are the same `ptr` under
+    // opaque pointers, so reading one as the other is nothing at all at this level — which is
+    // exactly the claim the language is making about it.
+    case (_: Type.Ptr, _: Type.Ptr)      => v
+    case (a: Type.Ptr, b: Type.Integer)  => castOp("ptrtoint", a, b, v)
+    case (a: Type.Integer, b: Type.Ptr)  => castOp("inttoptr", a, b, v)
+
     case _ => sys.error(s"unreachable conversion from ${from.llvm} to ${to.llvm}")
 
   private def castOp(instr: String, from: Type, to: Type, v: String): String = {

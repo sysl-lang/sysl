@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 2
+  val Version: Int = 3
 
   private val Magic = "sysl-ast"
 
@@ -234,6 +234,7 @@ object AstCodec {
         case Index(recv, i)          => tok("idx"); expr(recv); expr(i)
         case Field(recv, n)          => tok("fld"); expr(recv); sref(n)
         case TypeAttr(recv, a)       => tok("tat"); expr(recv); sref(a)
+        case LayoutOf(what, t)       => tok("lay"); sref(what); typ(t)
         case TryExpr(x)              => tok("try"); expr(x)
         case Tuple(es)               => tok("tup"); list(es)(expr)
         case Lambda(ps, b)           => tok("lam"); list(ps)(lambdaParam); list(b)(stmt)
@@ -567,6 +568,7 @@ object AstCodec {
         case "idx"  => Index(expr(), expr())
         case "fld"  => Field(expr(), sref())
         case "tat"  => TypeAttr(expr(), sref())
+        case "lay"  => LayoutOf(sref(), typ())
         case "try"  => TryExpr(expr())
         case "tup"  => Tuple(list(expr()))
         case "lam"  => Lambda(list(lambdaParam()), list(stmt()))

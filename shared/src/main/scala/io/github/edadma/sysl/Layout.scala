@@ -15,7 +15,13 @@ package io.github.edadma.sysl
  * — every target in the registry answers these questions the same way, and the registry refuses a
  * 32-bit one precisely because this is where it would stop being true. The emitted module states
  * its triple and LLVM derives the data layout from that, so nothing here has to be written down
- * twice. Nothing here is exposed to the language; `sizeof` is a separate question (`09 § Open`).
+ * twice.
+ *
+ * The language's `sizeof` and `alignof` (`03 § Reinterpreting storage`) are these two functions asked
+ * from outside, so the answer a program gets and the width the compiler writes into a union agree by
+ * construction rather than by being kept in step. Everything reaches them through
+ * `ConstFolding.layoutBytes`, which is where the two operands with no answer — a type parameter
+ * standing in for itself, and a type already complained about — are turned away before they arrive.
  */
 object Layout {
 
@@ -28,6 +34,12 @@ object Layout {
     case i: Type.Integer                 => intAlloc(i)
     case f: Type.Floating                => f.bits / 8
     case Type.Unit | Type.Never          => 0
+    // A part the compiler could not work out contributes nothing rather than stopping the walk. The
+    // program that produced one has an error and will not be lowered, so the number this yields is
+    // never used — but a struct with one bad field is still asked its width, by a `sizeof` and by the
+    // union a data enum lays out, and answering is what lets the *real* diagnostic be the one the
+    // reader sees instead of a stack trace about a type they were already told about.
+    case Type.Unknown                    => 0
     case Type.VaList                     => 32
     case t2 @ (_: Type.Ptr | _: Type.Ref) => if Type.erased(t2) then 16 else 8
     // A weak reference is an address like the other two, and a weak trait object is the same pair
@@ -46,6 +58,7 @@ object Layout {
     case i: Type.Integer                 => intAlign(i)
     case f: Type.Floating                => f.bits / 8
     case Type.Unit | Type.Never          => 1
+    case Type.Unknown                    => 1
     case Type.VaList                     => 8
     case _: Type.Ptr | _: Type.Ref       => 8
     case _: Type.Weak                    => 8

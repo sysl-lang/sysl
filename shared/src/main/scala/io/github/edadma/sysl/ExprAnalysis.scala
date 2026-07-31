@@ -24,7 +24,8 @@ package io.github.edadma.sysl
 trait ExprAnalysis
     extends MemberExprAnalysis
     with CollectionExprAnalysis
-    with ControlFlowExprAnalysis {
+    with ControlFlowExprAnalysis
+    with RawStorage {
 
   // --- expressions ---------------------------------------------------------------------
 
@@ -97,6 +98,15 @@ trait ExprAnalysis
     case other     => sys.error(s"a result list arrived on a ${other.getClass.getSimpleName}")
 
   private def analyzeExpected(expr: Expr, expected: Option[Type]): TExpr = expected match
+    // `ptr_cast` is answered against the type that was **written**, rather than against whatever a
+    // converting context would have asked an ordinary expression for. Every arm below hands the
+    // expression something other than the annotation — a `&T` asks for the payload it would box, a
+    // trait object asks for nothing at all — and an address read out of bytes is precisely the value
+    // that may not be turned into either, so the refusal has to be able to name what the programmer
+    // spelled. `null` is special-cased below for the same reason: a raw address is written at the
+    // type it is expected to have rather than converted into it.
+    case Some(want) if rawCast(expr) => analyzeValue(expr, Some(want))
+
     // An `if`/`match`/loop yields its value through its branches — a loop's, through its `break`s
     // and its `else` — so a context that *converts* belongs to each of those rather than to the
     // aggregate: every branch boxes or erases on its own. That is what lets a `&T` branch and a
@@ -156,6 +166,13 @@ trait ExprAnalysis
     case Some(v: Type.Slice) => coerce(analyzeValue(expr, Some(v)), v)
 
     case _ => analyzeValue(expr, expected)
+
+  /** Whether an expression is the raw-tier reinterpretation, which takes its expectation as written
+   * (`03 § Reinterpreting storage`).
+   */
+  private def rawCast(e: Expr): Boolean = e match
+    case Call(Ident("ptr_cast"), _) => true
+    case _                          => false
 
   /** Wraps a base-typed value in the run-time check for a constrained subtype. */
   private def checkInto(v: TExpr, c: Type.Constrained): TExpr = TConstrainedCheck(v, c).setPos(v.pos)
@@ -473,6 +490,11 @@ trait ExprAnalysis
     case Call(Ident("va_end"), args)                        => vaEnd(args)
     case Call(Ident("va_arg"), args)                        => vaArg(args, expected)
     case Call(Ident("va_copy"), args)                       => vaCopy(args)
+    case Call(Ident("ptr_cast"), args)                      => ptrCast(args, expected)
+
+    // `sizeof(T)` / `alignof(T)` — the parser has already read the operand as a type, which is what
+    // separates these from every form above: they are syntax rather than a name the analyzer knows.
+    case LayoutOf(what, tr)                                 => layoutOf(what, tr)
 
     // `old(e)` is a contextual keyword read only while an `ensure` is being analyzed; the guard is
     // what lets `old` stay an ordinary name outside a postcondition.

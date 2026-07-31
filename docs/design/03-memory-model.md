@@ -425,6 +425,101 @@ it inverts.
 How the two are written, indexed, and sliced — the literal, the zero-valued declaration, the
 range subscript, `.len` — is **`07-arrays-and-slices.md`**.
 
+## Reinterpreting storage
+
+An allocator carves bytes and hands back a typed pointer. That is the whole of what an allocator
+does, and until this section it was not expressible: `&arena[0]` is a `*u8`, the caller wants a
+`*Node`, and no spelling took one to the other. The same absence stopped a driver taking an MMIO
+address the datasheet gives as a number and reaching the register block at it.
+
+Both are cases the section above already committed to: **anything C can do through a pointer, sysl
+can**. A language that can index a raw pointer and subtract two of them, and then cannot say which
+type the bytes are, has drawn the line in a place no C program respects — and it is exactly the line
+an allocator sits on. So storage may be reinterpreted, in the raw tier, written.
+
+**Three directions, two spellings**, because they are not equally dangerous:
+
+```
+var n = usize(p)                       // a pointer as a number — an ordinary conversion
+var p: *u8    = ptr_cast(addr)         // a number as a pointer
+var node: *Node = ptr_cast(raw)        // one pointee type as another
+```
+
+**A pointer becomes an integer through the ordinary conversion syntax** (`01`), because it is an
+ordinary conversion: `usize` is wide enough to hold any address by definition, so the conversion is
+total and loses nothing, and the result is a number that cannot be dereferenced. Nothing unsafe has
+happened yet. `isize` takes one too, which is what a program comparing addresses against a signed
+offset wants.
+
+**The other two directions produce a pointer, and they are the unsafe ones**, so they share one form
+that says what it is doing. `ptr_cast(x)` takes a `*A` or an address-sized integer and produces the
+`*B` its context asks for. The target type is **not written in the call** — it comes from whatever
+receives the result, the same way `va_arg` (`12 §9`), a bare `None`, and a bare `null` all take
+theirs. That is not a shortcut: square brackets in an expression are indexing, and call-site type
+arguments are refused language-wide (`10 § Open a`), so a written target would need a syntax nothing
+else in the language has. Where nothing says which pointer is wanted, the program is told to annotate
+what receives it.
+
+**`ptr_cast` never produces a `&T`.** A reference is a safe-tier value: non-null, refcounted, and
+relied on by everything the safe subset promises. An address invented from bytes has no count for ARC
+to own and no object to be non-null about, so a `&T` conjured this way would put a value the safe
+subset trusts into a state only the unsafe tier can produce — which is the one thing the two-tier
+split exists to prevent. `weak T` and the fat types (a slice, a `string`) are refused for the same
+reason and one more: they are wider than an address, so there is nothing to reinterpret. What comes
+out is a `*T`, and reaching anything else from it is the ordinary route through `*p`.
+
+**Where this meets the aliasing rule.** `16 §6` refuses an alias typed *below* a promise — `&o.a`,
+where a clause on `o` reads `a` — and a reinterpretation is another way to arrive at such a pointer.
+The two do not conflict, and the reason is worth stating rather than leaving to be discovered. `16
+§6` restricts alias creation **from a place**, because a place has a type whose promises the compiler
+can see and a read set it can compare against. `ptr_cast` starts from an address, which names no
+place and carries no promise, so there is nothing to compare and nothing to refuse. That is the
+unsafe tier's bargain, unchanged: `p[i]` past the end is already the programmer's assertion, and a
+`*T` aimed at storage some invariant covers is the same assertion about a different thing. The
+boundary the compiler *can* police is the one above — that no `&T` comes out — and it polices it.
+
+### `sizeof` and `alignof`
+
+```
+var bytes = sizeof(Node)               // usize, a compile-time constant
+var a     = alignof(Node)
+```
+
+Both take a **type** and yield a `usize` (`00 §7`). Both are written over the whole type grammar —
+`sizeof(*Node)`, `sizeof([16]u8)`, `sizeof(int)` — which is why they are forms the parser reads
+rather than functions a name lookup finds; a library function's argument list holds values, and these
+hold neither a value nor a name.
+
+There is **no value form**. C accepts `sizeof x` as well as `sizeof(T)`, and the two disagree in the
+one case that matters — `sizeof arr` against `sizeof ptr` after an array has decayed. sysl has no
+decay, so the value form would buy only the confusion.
+
+**Any type may be asked**, and this costs less than an earlier draft assumed. The objection was that
+answering would fix every type's layout as part of the language rather than as an implementation
+detail — but `15 §1` already did that, deliberately and for its own reasons: fields are laid out in
+declaration order and never reordered, every type is C-compatible by construction, and **layout is
+part of a module's public interface**, since a caller needs size, alignment and offsets to
+stack-allocate a `T` or pass one by value. A change to any type's layout is already a change to its
+interface, already hashed as one. `sizeof` promises nothing that was not promised; it makes the
+promise *askable*.
+
+Two consequences follow rather than needing rules of their own:
+
+- **The answer is per target.** `sizeof(usize)` is 8 on a 64-bit target and 4 on a 32-bit one,
+  exactly as C's is, and a program that needs a width to be the same everywhere says so with a
+  `require` on a constant rather than assuming.
+- **A type parameter may be asked**, since a generic body is compiled once per instantiation and the
+  argument is concrete by then. That is what lets a slab allocator be written over any `T` instead of
+  over one hardcoded size, and it closes the absence `07` names in passing.
+
+The one layout still genuinely in motion is the **data-enum tag**, which `09 § Open a` wants to
+narrow. Exposing `sizeof` does not decide that: the tag's width is a layout change like any other,
+and `15 §1` already made every layout change an interface change. What it does is make the change
+visible to a program that asked, which is an argument for taking `09 § Open a` sooner and not for
+withholding the operator. The future carve-out already has its home: an `opaque` struct (`15 § Open
+a`) withholds its layout entirely, and *no `sizeof`* is on the list of what that costs — the type
+opts out, rather than `sizeof` opting in.
+
 ## Slices keep their backing alive
 
 A slice is **three words**, not two:

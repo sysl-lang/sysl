@@ -162,6 +162,13 @@ rests on applies to representation changes too.
 | `char` → integer | `u32(c)` | total — every `char` is an integer |
 | integer → `char` | `char(u)` | **partial** — traps on a value that is not a Unicode scalar value (`00` §1) |
 | `char` → `string` | `string(c)` | total — the one character UTF-8-encoded into a fresh string (`04`) |
+| `*T` → integer | `usize(p)`, `isize(p)` | total — an address is a number, and `usize` is wide enough to hold one |
+
+The pointer row goes only this way. An address **is** a number of `usize`'s width, so reading one as
+that number loses nothing and produces a value that cannot be dereferenced — nothing unsafe has
+happened. The inverse is a different matter and is not a conversion: making a pointer out of an
+integer, or out of a pointer to something else, is `ptr_cast` in the raw tier (`03 § Reinterpreting
+storage`), spelled apart from this table because it is where the language's guarantees stop.
 
 Everything else is rejected: there is no conversion to or from `bool` (`int(true)` is an error, and so
 is `bool(0)`), and **no number converts to or from a `string`** — `str(x)` renders one and

@@ -69,6 +69,16 @@ case class Field(receiver: Expr, name: String)  extends Expr
  */
 case class TypeAttr(receiver: Expr, attr: String) extends Expr
 
+/** `sizeof(T)` / `alignof(T)` — how much storage a type occupies and what it must be aligned to
+ * (`03 § Reinterpreting storage`).
+ *
+ * The operand is a **type**, which is why this is a node of its own rather than a `Call` the analyzer
+ * recognizes by name: an argument list holds values, and the whole type grammar is written here —
+ * `sizeof(*Node)`, `sizeof([16]u8)`, `sizeof((int, real))`. `op` is the word that was written, so one
+ * node carries both and the two never drift apart.
+ */
+case class LayoutOf(op: String, typ: TypeRef) extends Expr
+
 /** The postfix `?` error-propagation operator. */
 case class TryExpr(expr: Expr) extends Expr
 
