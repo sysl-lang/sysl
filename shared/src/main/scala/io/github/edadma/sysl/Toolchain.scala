@@ -35,24 +35,50 @@ object Toolchain {
     // the linker's left-to-right scan wants: a member is pulled in to resolve a symbol already
     // undefined, so an archive listed first would be scanned before anything needed it.
     val result = exec(
-      List("clang", s"--target=${target.triple}", "-Wno-override-module", ll) ::: archives ::: List("-o", exe))
+      List("clang", s"--target=${target.triple}", "-Wno-override-module") ::: deadStrip(target) :::
+        List(ll) ::: archives ::: List("-o", exe))
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())
     else Left(s"clang failed (exit ${result.exitCode}):\n${result.stderr.trim}")
   }
 
+  /** Ask the linker to drop what nothing reaches.
+   *
+   * **A library's object half is one `.o` named on the command line, and a named object is linked
+   * entire** — unlike an archive member, which is pulled only to resolve something already
+   * undefined. So without this, every symbol a library compiled lands in every binary that links it:
+   * a program whose whole text is `print(1)` carried all 61 of the standard module's symbols,
+   * including the reader, the string builder and the hashes, none of which it can reach.
+   *
+   * The two spellings are not interchangeable. Mach-O resolves at **atom** granularity, so
+   * `-dead_strip` needs nothing from the compile step. ELF resolves at **section** granularity and
+   * `--gc-sections` can therefore only drop a function that was given a section of its own, which is
+   * what `-ffunction-sections` in `compileObject` is for — the two halves are one mechanism and
+   * changing either alone silently stops working.
+   */
+  private def deadStrip(target: Target): List[String] =
+    target.os match
+      case Os.MacOS => List("-Wl,-dead_strip")
+      case _        => List("-Wl,--gc-sections")
+
   /** Assembles an IR module into a relocatable object file — the ahead-of-time half of a library.
    *
    * `-c` is the whole difference from `build`: nothing is linked, so a module with no `main` and
    * with unresolved calls into the program that will use it is exactly what is wanted.
+   *
+   * `-ffunction-sections`/`-fdata-sections` give every definition a section of its own, which is
+   * what lets the linker drop the ones a program never reaches (`deadStrip`). It is the *library*
+   * side of that pair and useless without the linker side, and on Mach-O it is redundant rather than
+   * wrong — atoms are already per-definition there. Passed unconditionally so that an artifact built
+   * on one host still strips when linked for another.
    */
   def compileObject(ir: String, obj: String, target: Target = Target.default): Either[String, Unit] = {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    val result =
-      exec(Seq("clang", s"--target=${target.triple}", "-Wno-override-module", "-c", ll, "-o", obj))
+    val result = exec(Seq("clang", s"--target=${target.triple}", "-Wno-override-module",
+      "-ffunction-sections", "-fdata-sections", "-c", ll, "-o", obj))
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())

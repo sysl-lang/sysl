@@ -452,5 +452,55 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       deleteFile(exe)
       ran shouldBe Right((0, "1\ntwo\n3.5\ntrue\n"))
     }
+
+    /* A library's object half is one `.o` named on the link line, and a named object is linked
+     * *entire* — so what a program does not call is carried anyway unless the linker is asked to
+     * drop it. Before `Toolchain.deadStrip`, a program whose whole text was `print(1)` carried all
+     * 61 of the standard module's symbols: the reader, the line buffering, the string builder, the
+     * hashes. The binary was 53,496 bytes where 33,728 would do. */
+
+    "and carries only the library it reaches, the rest being dropped at the link" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val obj = createTempFile("sysl-core-", ".o")
+      val exe = createTempFile("sysl-core-", "")
+
+      Toolchain.compileObject(artifact._1, obj, Target.default) match
+        case Left(err) => fail(s"the core library did not assemble: $err")
+        case Right(_)  => ()
+
+      Toolchain.build(linked("print(1)\n"), exe, Target.default, List(obj)) match
+        case Left(err) => fail(s"the program did not link: $err")
+        case Right(_)  => ()
+
+      // `nm` rather than a byte count: the size is a consequence and would drift with every change
+      // to the library, while *which* symbols survive is the claim itself. Reading it needs no
+      // parsing beyond a substring, since every core symbol carries the module in its name.
+      val listed = exec(List("nm", exe))
+      val kept   = listed.stdout.linesIterator.filter(_.contains(Library.key(""))).toList
+
+      deleteFile(obj)
+      deleteFile(exe)
+
+      // Skipped rather than failed where there is no `nm`: this asserts something about the
+      // platform's linker, and a machine that cannot list symbols cannot be asked about it.
+      assume(listed.exitCode == 0, "nm not available")
+
+      // Reached: printing an int goes through the renderer and out to the sink.
+      kept.count(_.contains(Library.key("printi"))) shouldBe 1
+      kept.count(_.contains(Library.key("putbytes"))) shouldBe 1
+
+      // Not reached by `print(1)` — and every one of these was in the binary before dead-stripping,
+      // which is what makes this a test of the flag rather than of the library's shape.
+      for gone <- List("lines", "find_byte", "str_builder", "cstring", "hash_u128", "fd_reader") do
+        withClue(s"$gone should have been dropped: ") {
+          kept.exists(_.contains(Library.key(gone))) shouldBe false
+        }
+
+      // The whole library is far larger than what one `print` reaches, so a link that dropped
+      // nothing would leave dozens here. Bounded rather than exact, since which helpers the
+      // renderer itself pulls in is the library's business and changes with it.
+      kept.length should be < 12
+    }
   }
 }
