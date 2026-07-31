@@ -15,18 +15,34 @@ C-like risk. In a Minix-style OS that is the kernel's low-level core and the dri
 nowhere else — the servers, utilities, and applications never write `*T` and are segfault-proof
 by construction.
 
-**One hole in that guarantee is known and open, and it is recorded here rather than left to be
-discovered.** `s.bytes` reinterprets a string's three words as a `[]u8` without copying (`04`), so
-the view's elements are the string's own storage — and a `[]u8` permits writes. Writing one byte of
-a **literal's** bytes writes into read-only memory and kills the process, from a program containing
-no `*T` at all. Assigning to one where the view is named — `s.bytes[i] = v` — is refused, which
-closes the spelling somebody reaches by accident; `&s.bytes[i]` is left alone, because taking an
-address is entering the raw tier on purpose and it is how a string reaches a C function that wants a
-pointer and a length. What stays open is the view once it has been **bound to a name or passed on**,
-because a `[]T` records nothing about whose elements it views. That missing **read-only view type**
-is `07 § Not yet`'s, and
-this is its third and sharpest customer — the other two are refusals, where nothing unsound is
-built, and this one is a view the language already makes.
+**One hole in that guarantee was open long enough to be worth recording, and what closed it is worth
+recording with it.** `s.bytes` reinterprets a string's three words as a `[]u8` without copying
+(`04`), so the view's elements are the string's own storage — and a `[]u8` permits writes. Writing
+one byte of a **literal's** bytes writes into read-only memory and kills the process, from a program
+containing no `*T` at all. Assigning to one where the view is named — `s.bytes[i] = v` — was refused
+early, which closes the spelling somebody reaches by accident, but that refusal is written at the
+subscript and so cannot see the view once it has been **bound to a name or passed on**. A property
+enforced where a value is *made* expires with the expression that made it; a property recorded in
+the *type* travels with the value, and that is the whole of the difference.
+
+So `s.bytes` yields a **`[]const u8`** — `07`'s read-only view type, whose elements may not be
+written through it. The three spellings that walked around the old refusal now all land on the same
+rule: `var b = s.bytes; b[0] = v` is refused at the write, `poke(s.bytes)` where `poke` takes a
+`[]u8` is refused at the call, and re-slicing keeps the property rather than dropping it.
+
+**`&` on a read-only view is deliberately still allowed**, whether the view is written out or
+carried under a name. Taking an address is entering the raw tier on purpose: `&b[0]` is a `*T` the
+moment it is written, and this guarantee is about programs that have none. It is also how a view
+reaches a C function that wants a pointer and a length — `printf("%.*s")` is that call, and so is
+`memchr`, which is what the prelude's own `find_byte` is written as. A read-only view that could
+not yield an address could not do the job it was added for, and would buy nothing for it: `*T` is
+greppable, and a program with none still cannot reach these bytes.
+
+This is not the rule `13` applies to a `val` itself, where `&k[0]` **is** refused, and the
+difference is which thing is being addressed. A `val` is storage the program declared read-only, and
+the refusal keeps the promise where it was made; a view is a value that has already been handed out,
+and what it promises is about writing *through* it. Slicing is how you cross from the one to the
+other, and it is written down.
 
 ## Why runtime safety, not Rust's compile-time safety
 

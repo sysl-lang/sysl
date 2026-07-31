@@ -236,11 +236,18 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
       ) should include("does not become the other")
     }
 
-    // The address is refused under a name for the same reason it is allowed when written out: what
-    // the licence is for is a `*T` a reader can *see* being taken out of a string.
-    "and its address may not be taken once it has been bound to a name either" in {
-      err("var s = \"hello\"\nvar b = s.bytes\nvar p = &b[0]") should
-        include("an address would be a licence to write them")
+    // The address stays available under a name, and deliberately: `&` is a `*T`, which is the tier
+    // this guarantee excludes, and a read-only view that could not yield one could not reach the C
+    // functions it exists to reach. The prelude's own `find_byte` is `memchr` over exactly this.
+    "while its address may still be taken under a name, since that is the raw tier either way" in {
+      val src =
+        """extern printf(fmt: *u8, ...) -> int
+          |var s = "hello"
+          |var b = s.bytes
+          |printf(c"[%.*s]\n", int(b.len), &b[0])
+          |""".stripMargin
+
+      run(src) shouldBe "[hello]\n"
     }
   }
 

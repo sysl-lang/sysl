@@ -614,10 +614,20 @@ is short: *if it has to be indexed or pointed at, it is a `val`.*
 
 **Read-only means read-only at every depth.** `k = …`, `k[0] = …`, `k[0] += 1`, and `k[0]++` are
 all refused, and so is `&k[0]` — a `*T` is a licence to write, and handing one out would move the
-mistake one step away from where it could still be reported. Slicing is refused for the same
-reason and is the one thing this costs today: a `[]T` permits writes and does not record whose
-elements it views, so it cannot carry the property. That wants a read-only view type, which is
-`07`'s decision to make, and it is additive.
+mistake one step away from where it could still be reported.
+
+**Slicing is allowed, and yields a `[]const T`** (`07 § A view that may not be written`). It was
+refused for exactly as long as there was no type that could carry the property: a plain `[]T`
+permits writes and records nothing about whose elements it views, so the view would have been a
+route around the paragraph above, and one the view outlives the expression to take. A `[]const T`
+records it, so the property travels with the view — through a name, through a call, and through a
+second subscript — and every *write* listed above is refused through it too. This is what lets a
+table be **read and passed** rather than only read, which is the one thing a `val` used to cost.
+
+`&` is the one refusal above that does **not** carry over to the view. `&k[0]` on the `val` stays
+refused, because that is where the promise was made and where it can still be kept; `&v[0]` on a
+view of it is a `*T`, the tier `03` excludes on purpose, and is how the view reaches C. Slicing is
+the step between the two, and it is written down.
 
 **A module-level `val` holds plain data** — the numbers, characters, booleans, enums, and the
 structs and arrays built out of those. A reference, a pointer, a slice, or a `string` in one is

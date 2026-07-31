@@ -249,9 +249,13 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
 
     // `string` is a view of bytes that are valid UTF-8, and that invariant is the whole difference
     // between it and a `[]u8` — so a block written for every slice has said nothing about it.
+    //
+    // The block is written for `[]const T` because that is the form that covers both: a `[]T`
+    // widens into it, and `s.bytes` already is one. A block for `[]T` covers only the writable
+    // half, which the two tests below pin from either side.
     "leave 'string' alone, since a string is not a slice" in {
       run(
-        s"""${total}impl[T] Total for []T
+        s"""${total}impl[T] Total for []const T
            |    total(self) -> usize = self.len
            |impl Total for string
            |    total(self) -> usize = 0usize
@@ -260,6 +264,21 @@ class ImplShapeRunTests extends AnyFreeSpec with RunSupport {
            |print(s.bytes.total())""".stripMargin,
       ) shouldBe "0\n5\n"
     }
+
+    // One block, both views — the reason to write the read-only form even when the writable one
+    // would do, and the same advice C++ gives about `span<const T>`.
+    "so a block for '[]const T' covers a writable view and a read-only one alike" in {
+      run(
+        s"""${total}impl[T] Total for []const T
+           |    total(self) -> usize = self.len
+           |val k: [4]int = [1, 2, 3, 4]
+           |var a = [1, 2, 3]
+           |print(k[0..].total(), a[0..].total())""".stripMargin,
+      ) shouldBe "4 3\n"
+    }
+
+    // The other direction does not hold — a block for `[]T` reserves the right to write — and that
+    // refusal is pinned in `ImplShapeErrorTests`, where the error helper lives.
 
     // A slice and an array of two are two shapes, so one trait may be implemented for both — the
     // key is the shape, and neither of these covers what the other does.

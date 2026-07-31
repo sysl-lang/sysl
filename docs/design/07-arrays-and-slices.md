@@ -272,6 +272,55 @@ requires that its named high element exist. An empty slice is legal, including a
 `*[N]T` — field selection's one-level auto-deref (`03`) applies to a subscript too, so
 `buf[0..<n]` reads the same whether `buf` is the array or a reference to it.
 
+## A view that may not be written
+
+`[]const T` is a view whose elements may not be written **through it**:
+
+```
+total(xs: []const int) -> int      // reads the elements, and says so
+    var s = 0
+    for x in xs do s += x
+    s
+```
+
+The `const` sits after the brackets, where `sync` sits after the `&`, and for the same reason: it
+is a property of the *view*, not of the element type. `[N]const T` is not a type — an array is
+storage rather than a view of it, and storage written once is what `val` declares.
+
+**It is one type with a bit, not two types.** Both forms are the same three words, reach through
+the same instructions, and keep the same thing alive; what the bit changes is only what may be
+*done* with the view. So a `[]T` is accepted wherever a `[]const T` is wanted:
+
+```
+var buf: [3]int = [1, 2, 3]
+val table: [4]int = [10, 20, 30, 40]
+
+print(total(buf[0..]))             // a writable view, widened
+print(total(table[0..]))           // a `val`'s view, already read-only
+```
+
+and never the other way round. Giving up the ability to write is a promise the caller keeps and
+the callee does not need; inventing one is the whole of what the type exists to stop.
+
+**What produces one.** Slicing a `val` — read-only storage gives a read-only view, which is what
+makes `val` sliceable at all. `s.bytes`, whose elements are a string's own storage and may be a
+literal's (`03`, `04`). Re-slicing one, because a bit that a second subscript dropped would make
+`xs[0..]` the way around `xs`. And a buffer literal written where one is wanted, since storage an
+expression makes has no other holder to disagree with it.
+
+**What it refuses.** Writing through an element: `xs[i] = v`, `xs[i] += 1`, `xs[i]++`.
+
+**What it does not refuse: `&`.** `&xs[0]` is a `*T` the moment it is written, which is the tier
+`03` says the guarantees stop at, and it is how a view reaches a C function taking a pointer and a
+length. The prelude's `find_byte` is `memchr` over exactly this, and `printf("%.*s")` is the same
+shape. A read-only view that could not yield an address could not do the job it was added for. Note
+this is *not* the rule for a `val` itself, where `&k[0]` is refused (`13`): a `val` is storage whose
+promise is kept where it was made, and a view is a value whose promise is about writing through it.
+
+**What it does not record.** Whose elements these are, whether they outlive the program, and
+whether their owner's count is atomic. Those are properties of the *owner*, and a view can only
+report on them; see `§ Not yet`.
+
 ## Length
 
 `a.len` is the number of elements, as a `usize`. On a `[N]T` it is the constant `N` and costs
@@ -348,39 +397,40 @@ implementation:
   storage is on the heap the moment the struct is, and the view names the box the walk to the field
   went through as its owner. A field of a struct on the *frame* is still refused, which is the
   unspecified aggregate-promotion question and not this one.
-- **Slicing a `&sync` buffer.** A `[]T` does not record whether its owner's count is atomic, so
-  it cannot carry an owner that needs the atomic path. Rejected with a diagnostic until slices
-  distinguish the two. `06 § &sync T` now has a second customer for the same missing type, arrived
-  at from the opposite side: a shared object may hold no `string` and no `[]T` either, because a
-  view records nothing about whether the bytes it points at are a literal's — and an immortal one
-  would have been safe to share.
-- **Slicing a `val`.** The same gap seen from the other side: a `[]T` permits writes and records
-  nothing about whose elements it views, so a view of read-only storage would be a way of writing
-  it — and the view outlives the expression that made it, so there is nowhere to catch that later.
-  Rejected with a diagnostic. What this wants is a **read-only view type**, which is a decision
-  about the view types here rather than about `val`, and it is additive: every program that can be
-  written today keeps its meaning when one arrives. The cost has a name now: **a static table can
-  be read and not passed.** `guide/sha2` has eighty round constants per width, and the generic
-  compression reaches them only through a trait method whose whole body is one index, because the
-  alternative — a `[80]T` parameter — copies the table at every call. A table small enough to copy
-  escapes it, which is why the same program hands its eight initial values over as a `[8]T` and
-  thinks nothing of it.
-- **A string's `.bytes` is the third customer, and it is the one that makes this a soundness item
-  rather than an ergonomic one.** The other two are *refusals* — the language declines to make the
-  view, so nothing is unsound, only unwritable. `.bytes` reinterprets a string's three words as a
-  `[]u8` without copying (`04`), so the view **already exists**, and it views storage the language
-  calls immutable. Writing one byte of a literal's bytes wrote into read-only memory and killed the
-  process, out of a program containing no `*T` — which is exactly what `03`'s headline guarantee
-  says cannot happen; writing one byte of a heap string's silently mutated an immutable value and
-  can leave a `string` that is not valid UTF-8. The direct spelling `s.bytes[i] = v` is now refused
-  where it is written, which closes the door somebody opens by accident. `&s.bytes[i]` is
-  deliberately *not* refused: it is a `*T` the moment it is written, which is the tier the guarantee
-  excludes, and it is how a string reaches a C function taking a pointer and a length —
-  `printf("%.*s")` is exactly that call. What the refusal cannot reach is the view **bound to a name
-  or passed to a function** — once it
-  is a plain `[]u8`, nothing about it says whose elements it holds, and any `f(b: []u8)` may write
-  through it. So the missing type is not a convenience here; it is the difference between the
-  guarantee holding and not.
+- ~~**Slicing a `val`, and a string's `.bytes`**~~ — **built**, as `[]const T`. See
+  `§ A view that may not be written`. What these two wanted was one thing and they got it: a view
+  whose *type* records that its elements may not be written through it, so the property travels
+  wherever the view is bound or passed instead of expiring with the expression that made it.
+  Slicing a `val` yields one, `.bytes` yields one, and `03`'s soundness hole closes with them —
+  which is the difference between the two customers, since the `val` case was a *refusal* (nothing
+  unsound was built, only nothing written) and `.bytes` was a view the language already made.
+
+  The cost it lifts had a name: **a static table can be read and not passed.** `guide/sha2` has
+  eighty round constants per width and reached them only through a trait method whose whole body is
+  one index, because the alternative — a `[80]T` parameter — copies the table at every call. A table
+  small enough to copy escaped it, which is why the same program hands its eight initial values over
+  as a `[8]T` and thinks nothing of it.
+
+  It was additive, as promised: a `[]T` is accepted wherever a `[]const T` is wanted, so no program
+  that could be written before means anything different now.
+- **Slicing a `&sync` buffer.** A `[]T` does not record whether its owner's count is atomic, so it
+  cannot carry an owner that needs the atomic path. Still rejected with a diagnostic — and it is
+  worth saying why the item above did not fix it, because the two were filed here as one missing
+  type and they are not one.
+
+  **Read-only-ness is a property of the view; which count discipline an owner uses is a property of
+  the owner.** A `[]const T` can be *made* out of a writable view by giving something up, which is
+  why widening is safe and why the bit costs nothing at run time. An atomic count cannot be made out
+  of a non-atomic one at all: it is fixed when the object is allocated (`06 § &sync T`), and a view
+  claiming it would be reporting on somebody else's storage rather than describing itself. `06` half
+  concedes this about its own neighbouring case — an *immortal* view would be safe to share, but
+  which kind a string holds is "decided at run time by whether the owner word is null (`03`)… so the
+  rule as drafted could not be applied to a *type*."
+
+  Rust reaches the same three answers with three mechanisms, and the split is the same one: `&[T]`
+  carries writability in the **reference**, `Rc<[T]>` versus `Arc<[T]>` carries count discipline in
+  the **owner's type**, and `&'static [u8]` carries lifetime. So what is left here is not one more
+  bit on the view; it is a question about what an owner is, and it belongs with `06`.
 - ~~**A `Buf` grows and shrinks at its end and nowhere else.**~~ **Built** — see `§ Growing one`.
   `remove(i)` and `truncate(n)`, the second being the one the first is written in terms of, and
   `clear` now written in terms of it too. What made the item worth doing was the shape of the code

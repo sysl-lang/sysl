@@ -337,6 +337,67 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** The claims `07 § A view that may not be written` makes, asked one at a time. Each of these is
+    * a sentence of that section rather than a case the code suggested, which is the point of asking
+    * them separately: a claim written for a category is satisfied by whichever form a test picks.
+    */
+  "what a view that may not be written promises" - {
+
+    // Every spelling of a write, not just the one an implementation happens to route first.
+    "every way of writing an element is refused, not only the plain assignment" in {
+      val view = "val k: [4]int = [1, 2, 3, 4]\nvar v = k[0..]\n"
+
+      err(view + "v[0] = 9") should include("may not write")
+      err(view + "v[0] += 1") should include("may not write")
+      err(view + "v[0]++") should include("may not write")
+    }
+
+    // The one thing it does NOT refuse, and the reason a read-only view is usable at all: `&` is a
+    // `*T`, the tier `03` excludes, and it is how the view reaches C. The prelude's own `find_byte`
+    // is `memchr` over exactly this shape.
+    "while taking an address is allowed, because that is the raw tier and is how a view reaches C" in {
+      run("""extern printf(fmt: *u8, ...) -> int
+            |val k: [4]u8 = [104u8, 105u8, 0u8, 0u8]
+            |var v = k[0..<2]
+            |printf(c"[%.*s]\n", int(v.len), &v[0])
+            |""".stripMargin) shouldBe "[hi]\n"
+    }
+
+    "a length in the brackets contradicts the word, and the message names 'val'" in {
+      err("var bad: [4]const int = [1, 2, 3, 4]") should
+        include("read-only storage is declared with 'val'")
+    }
+
+    // Storage the expression makes has no other holder to disagree with it, so a literal takes
+    // whichever form was asked for rather than needing a conversion.
+    "storage the expression makes takes the read-only form directly" in {
+      run("""var lit: []const int = [7, 8, 9]
+            |var filled: []const int = [5; 3]
+            |var empty: []const int = []
+            |print(lit[2], filled[1], empty.len)
+            |""".stripMargin) shouldBe "9 5 0\n"
+    }
+
+    // The places a type has to work to be a type at all: a field, a type argument, an element of
+    // something else, and a result. None of these is mentioned by the section, which is why they
+    // are worth asking — a bit added to one type tends to be dropped by whatever composes it.
+    "and it composes — as a field, a type argument, an element, and a result" in {
+      run("""struct Holder
+            |    items: []const int
+            |sum(h: Holder) -> int
+            |    var s = 0
+            |    for x in h.items do s += x
+            |    s
+            |count[T](xs: []const T) -> usize = xs.len
+            |give() -> []const int = [4, 5]
+            |var a = [1, 2, 3]
+            |var nested: [2][]const int = [a[0..], a[1..]]
+            |print(sum(Holder(a[0..])), count(a[0..]), count("ab".bytes))
+            |print(nested[0].len, nested[1].len, give().len)
+            |""".stripMargin) shouldBe "6 3 2\n3 2 2\n"
+    }
+  }
+
   /** The three sequence types answer the same questions, so the questions are asked of all three at
     * once. Each of these reaches the array, the slice and the string by a different path in the
     * compiler, and a claim about "a sequence" is satisfied by whichever one a test happens to pick —

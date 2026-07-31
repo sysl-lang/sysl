@@ -130,7 +130,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
       err("""struct Bad
             |    held: []u8
             |impl Writer for Bad
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.held = bytes
             |    failed(*self) -> bool = false
             |var b: Bad
@@ -143,7 +143,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
       ir("""struct Ok
             |    n: usize
             |impl Writer for Ok
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |    failed(*self) -> bool = false
             |var o: Ok
@@ -155,7 +155,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
       err("""struct S
             |    n: usize
             |impl Writer for S
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |    failed(*self) -> bool = false
             |var w: &Writer = S(0usize)

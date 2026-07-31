@@ -106,10 +106,19 @@ which it holds is a property of the value, decided at run time by whether the ow
 (`03`). So the rule as drafted could not be applied to a *type*, and the strict half is what is
 enforced: a shared object holds no view at all. The same is true of `[]T`.
 
-What would lift it is not a rule about strings but the **read-only view type** `07 § Not yet`
-already wants — a `[]T` whose type records something about the storage it views. An immortal view
-is one such fact, and a view of a `&sync` buffer is another; both are the same missing thing, and
-neither should be invented here.
+What would lift it is not a rule about strings but a view whose type records something about the
+storage it views. `07`'s **read-only view type** is now built — `[]const T` — and it does **not**
+lift this, which is worth stating plainly because an earlier draft of this paragraph assumed one
+type would answer both.
+
+**The two facts sit on different sides of the view.** Whether a view may be written through is a
+property of the *view*: it can be given up, so a `[]T` widens into a `[]const T` and the bit costs
+nothing. Whether the elements are immortal, and whether their owner's count is atomic, are
+properties of the *owner* — and the paragraph above has already said what that means here, that
+which kind a `string` holds is decided at run time by whether the owner word is null. A view cannot
+describe that about itself; it could only report it, and a report is what a type is not. So a shared
+object still holds no view at all, and what this waits on is a question about owners rather than one
+more bit on a view.
 
 **The walk stops at two places, and both are the same argument ARC already makes.** A `&sync U`
 inside a shared object is a leaf, because whatever *that* type reaches was settled where it was

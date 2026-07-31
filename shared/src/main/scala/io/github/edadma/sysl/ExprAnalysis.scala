@@ -755,28 +755,28 @@ trait ExprAnalysis
       // string's own storage and assigning to one is the line above by another route — with a
       // literal's bytes in read-only memory, a segfault out of a program containing no `*T` at all.
       //
-      // Only the *assignment* is refused, and this arm comes first so that the general one below
-      // cannot reach the address. `&s.bytes[0]` is how a string reaches a C function that takes a
-      // pointer and a length, which is the whole of `printf("%.*s")`, and it is a `*T` the moment it
-      // is written — the tier where `03` says the guarantees stop. The licence is for the form as
-      // *written*, which is where a reader can see the raw tier being entered on purpose; the view
-      // bound to a name is an ordinary `[]const u8` and is held to the rule below.
-      case TIndex(_: TBytes, _, _) =>
-        if writes then
-          err("a string is immutable, and 'bytes' views the string's own storage rather than a copy " +
-            "of it — so writing through one is writing the string. Bytes you may write are bytes of " +
-            "your own: copy them into a '[]u8' first")
+      // `s.bytes` reinterprets the same three words as a `[]u8` (`04`), so its elements are the
+      // string's own storage and assigning to one is the line above by another route — with a
+      // literal's bytes in read-only memory, a segfault out of a program containing no `*T` at all.
+      case TIndex(_: TBytes, _, _) if writes =>
+        err("a string is immutable, and 'bytes' views the string's own storage rather than a copy " +
+          "of it — so writing through one is writing the string. Bytes you may write are bytes of " +
+          "your own: copy them into a '[]u8' first")
 
-      // Any element of a read-only view — the view bound to a name, passed to a function, or sliced
-      // again, which is what the arm above deliberately does not cover. `&` is refused along with
-      // assignment, because a `*T` is a licence to write and handing one out would move the mistake
-      // one step from where it could still be reported — the argument `13` makes about `&k[0]` on
-      // the `val` most of these views are of.
-      case TIndex(recv, _, _) if Type.readOnlyView(recv.ty) && recv.ty != Type.Str =>
-        err(s"this element belongs to a '${show(recv.ty)}', which views elements it may not write — " +
-          s"${if writes then "so there is nothing to assign through"
-            else "and an address would be a licence to write them"}. Copy what you need into a " +
-          s"'[]${show(Type.element(recv.ty).getOrElse(Type.Unknown))}' of your own")
+      // Any other element of a read-only view: the view bound to a name, passed to a function, or
+      // sliced again, which is what the arm above cannot reach.
+      //
+      // Only the *write* is refused. `&` is left alone here, unlike on the `val` itself (`13`), and
+      // the difference is which tier the reader is in: `&v[0]` is a `*T` the moment it is written,
+      // and `03` says in as many words that the guarantees stop there and that this is how a view
+      // reaches a C function taking a pointer and a length. `printf("%.*s")` is exactly that call
+      // and so is `memchr`, which is what the prelude's own `find_byte` is. Refusing it would leave
+      // a type that cannot do the job it was added for, while buying nothing: `*T` is greppable, and
+      // a program that has none still cannot reach these bytes.
+      case TIndex(recv, _, _) if writes && Type.readOnlyView(recv.ty) && recv.ty != Type.Str =>
+        err(s"this element belongs to a '${show(recv.ty)}', which views elements it may not write, " +
+          "so there is nothing to assign through. Elements you may write are elements of your own: " +
+          s"copy them into a '[]${show(Type.element(recv.ty).getOrElse(Type.Unknown))}' first")
 
       case _ =>
         // The enumeration names all four kinds rather than the three it used to: an element is a

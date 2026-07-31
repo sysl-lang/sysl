@@ -373,9 +373,9 @@ case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = 
  *
  * What separates it from a `const` is an **address**. A constant is folded into every use and has
  * no storage at all, which is what lets an array bound name one; a `val` is a thing that sits
- * somewhere, so it may be indexed, iterated, and — once the type system can say "read-only view" —
- * sliced. The rule for a reader is short: if it has to be indexed, pointed at, or is bigger than a
- * scalar, it is a `val`.
+ * somewhere, so it may be indexed, iterated, and sliced — the slice being a `[]const T`, which is
+ * how the read-only-ness survives being handed on. The rule for a reader is short: if it has to be
+ * indexed, pointed at, or is bigger than a scalar, it is a `val`.
  *
  * The type is optional in the syntax and required by the analyzer at module level, where `13 §2`'s
  * "anything visible outside its file states its types" applies. A local states nothing to anyone,

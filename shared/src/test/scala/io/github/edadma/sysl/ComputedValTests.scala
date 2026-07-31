@@ -424,11 +424,11 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err(src) should include("plain data")
     }
 
-    // A computed `val` may not be sliced either, for the reason a constant one may not: the view
-    // would not carry the read-only property.
-    "slicing a computed one is refused as slicing a written-down one is" in {
-      err("build() -> [4]int = [1, 2, 3, 4]\nval k: [4]int = build()\nvar s = k[1..<3]") should
-        include("cannot be sliced")
+    // A computed `val` slices exactly as a written-down one does, and the view it gives carries the
+    // read-only property for the same reason: the property is the storage's, not the initializer's.
+    "slicing a computed one gives a view that may not be written, as a written-down one's does" in {
+      err("build() -> [4]int = [1, 2, 3, 4]\nval k: [4]int = build()\nvar s = k[1..<3]\ns[0] = 9") should
+        include("views elements it may not write")
     }
 
     // A comparison is the one operator that does *not* become a call — the method rides on the

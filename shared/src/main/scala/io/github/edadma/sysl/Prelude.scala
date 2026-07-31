@@ -295,7 +295,7 @@ object Prelude {
       |    h
       |
       |trait Writer
-      |    write(*self, bytes: []u8)
+      |    write(*self, bytes: []const u8)
       |    failed(*self) -> bool = false
       |
       |trait Reader
@@ -320,7 +320,7 @@ object Prelude {
       |        left -= k
       |end display_fill
       |
-      |display_pad(text: []u8, out: *Writer, fmt: FormatSpec)
+      |display_pad(text: []const u8, out: *Writer, fmt: FormatSpec)
       |    var pad = fmt.width - int(text.len)
       |    if pad < 0 then pad = 0
       |    if !fmt.left then display_fill(out, 32u8, pad)
@@ -328,7 +328,7 @@ object Prelude {
       |    if fmt.left then display_fill(out, 32u8, pad)
       |end display_pad
       |
-      |display_digits(text: []u8, out: *Writer, fmt: FormatSpec)
+      |display_digits(text: []const u8, out: *Writer, fmt: FormatSpec)
       |    var sign = if text.len > 0usize && text[0] == 45u8 then 1usize else 0usize
       |    var zeros = 0
       |    if fmt.prec > int(text.len - sign) then zeros = fmt.prec - int(text.len - sign)
@@ -540,7 +540,7 @@ object Prelude {
       |    offset: usize
       |    truncated: bool
       |
-      |from_utf8(b: []u8) -> Result[string, Utf8Error]
+      |from_utf8(b: []const u8) -> Result[string, Utf8Error]
       |    var i = 0usize
       |    while i < b.len
       |        var c = b[i]
@@ -581,11 +581,11 @@ object Prelude {
       |end from_utf8
       |
       |struct Chars
-      |    rest: []u8
+      |    rest: []const u8
       |    at: usize
       |end Chars
       |
-      |chars_of(b: []u8) -> Chars = Chars(b, 0usize)
+      |chars_of(b: []const u8) -> Chars = Chars(b, 0usize)
       |
       |impl Iterate[char] for Chars
       |    next(*self) -> Option[char]
@@ -698,7 +698,7 @@ object Prelude {
       |byte_sink() -> ByteSink = ByteSink(buf())
       |
       |impl Writer for ByteSink
-      |    write(*self, bytes: []u8)
+      |    write(*self, bytes: []const u8)
       |        for b in bytes do self.bytes.push(b)
       |
       |struct StrBuilder
@@ -775,7 +775,7 @@ object Prelude {
       |
       |    out.view()
       |
-      |find_byte(b: []u8, c: u8) -> Option[usize]
+      |find_byte(b: []const u8, c: u8) -> Option[usize]
       |    if b.len == 0usize then return None
       |
       |    var hit = sysl_memchr(&b[0], int(c), b.len)
@@ -805,7 +805,7 @@ object Prelude {
       |
       |    failed(*self) -> bool = self.bad
       |
-      |line_text(b: []u8) -> string
+      |line_text(b: []const u8) -> string
       |    var n = if b.len > 0usize && b[b.len - 1usize] == 13u8 then b.len - 1usize else b.len
       |
       |    from_utf8(b[0..<n]) match

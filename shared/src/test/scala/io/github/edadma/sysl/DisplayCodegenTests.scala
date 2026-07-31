@@ -117,7 +117,7 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
       ir("""struct C
             |    n: usize
             |impl Writer for C
-            |    write(*self, bytes: []u8)
+            |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |    failed(*self) -> bool = false
             |var c: C
