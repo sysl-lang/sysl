@@ -254,7 +254,8 @@ object AstCodec {
     private def stmt(s: Stmt): Unit = {
       pos(s)
       s match
-        case ImportDecl(path, sels, wild) => tok("imp"); list(path)(sref); list(sels)(selector); bool(wild)
+        case ImportDecl(path, sels, wild, alias) =>
+          tok("imp"); list(path)(sref); list(sels)(selector); bool(wild); opt(alias)(sref)
         case VarDecl(n, t, i)             => tok("var"); sref(n); opt(t)(typ); opt(i)(expr)
         case ConstDecl(n, t, v, vs)       => tok("cst"); sref(n); typ(t); expr(v); vis(vs)
         case ValDecl(n, t, v, vs)         => tok("val"); sref(n); opt(t)(typ); expr(v); vis(vs)
@@ -584,7 +585,7 @@ object AstCodec {
 
     private def stmt(): Stmt = at {
       tok() match
-        case "imp"  => ImportDecl(list(sref()), list(selector()), bool())
+        case "imp"  => ImportDecl(list(sref()), list(selector()), bool(), opt(sref()))
         case "var"  => VarDecl(sref(), opt(typ()), opt(expr()))
         case "cst"  => ConstDecl(sref(), typ(), expr(), vis())
         case "val"  => ValDecl(sref(), opt(typ()), expr(), vis())

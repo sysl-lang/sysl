@@ -319,8 +319,8 @@ case class ImportSelector(name: String, alias: Option[String]) extends Positione
   def bound: String = alias.getOrElse(name)
 }
 
-/** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — a shorter spelling for names that
- * are already reachable by their full path (`13 §3`).
+/** `import a.b.c`, `import a.b.c as d`, `import a.b.{c, d as e}`, `import a.b.*` — a shorter
+ * spelling for names that are already reachable by their full path (`13 §3`).
  *
  * The path is kept **as written**, undivided, because which part of `a.b.c` is the module and
  * which the member is a question only the analyzer can answer: `a.b.c` names a member `c` of
@@ -329,12 +329,26 @@ case class ImportSelector(name: String, alias: Option[String]) extends Positione
  *
  * `selectors` is empty for the bare-path form, and `wildcard` marks the `.*` form; the two are
  * mutually exclusive by the grammar.
+ *
+ * `alias` is the **unbraced rename**, and it belongs to the bare-path form alone — `a.b.{c as d}`
+ * carries its rename on the selector, where a list needs one per name. It renames whatever the path
+ * turned out to name, module or member, because the two are one piece of syntax here and a reader
+ * asking for a shorter word does not first have to know which they wrote.
  */
-case class ImportDecl(path: List[String], selectors: List[ImportSelector] = Nil, wildcard: Boolean = false)
-    extends Stmt {
+case class ImportDecl(
+    path: List[String],
+    selectors: List[ImportSelector] = Nil,
+    wildcard: Boolean = false,
+    alias: Option[String] = None,
+) extends Stmt {
 
   /** The path as a programmer wrote it, for a diagnostic. */
   def show: String = path.mkString(".")
+
+  /** The name the bare-path form binds here — the alias where one was written, the last segment
+   * otherwise, which is the same rule `ImportSelector.bound` follows.
+   */
+  def bound: String = alias.getOrElse(path.last)
 }
 
 /** `var name [: type] [= init]`. A declaration with a type and no initializer starts at that

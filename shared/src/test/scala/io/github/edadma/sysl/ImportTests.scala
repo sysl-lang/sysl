@@ -48,6 +48,29 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
       prog("import std.fs.*") shouldBe List(ImportDecl(List("std", "fs"), Nil, wildcard = true))
     }
 
+    // The unbraced rename, which Scala 3 allows and `§3` had listed only in its braced form. It
+    // belongs to the bare-path form alone: there is exactly one thing being named, so there is no
+    // ambiguity about what the new word refers to.
+    "an unbraced rename" in {
+      prog("import std.fs.read as rd") shouldBe
+        List(ImportDecl(List("std", "fs", "read"), Nil, wildcard = false, alias = Some("rd")))
+    }
+
+    "and one on a single segment, which renames the module" in {
+      prog("import geom as g") shouldBe
+        List(ImportDecl(List("geom"), Nil, wildcard = false, alias = Some("g")))
+    }
+
+    // Refused rather than ignored. Silently dropping the alias would leave a program whose text
+    // says one thing and whose bindings say another.
+    "a rename after a wildcard has nothing to name" in {
+      progError("import std.fs.* as x") should include("a wildcard brings in every member")
+    }
+
+    "and a selector list carries its own, so a trailing one is refused too" in {
+      progError("import std.fs.{read} as x") should include("carries its own 'as' per name")
+    }
+
     "a single segment, which is a module or nothing" in {
       prog("import geom") shouldBe List(ImportDecl(List("geom")))
     }
@@ -73,6 +96,26 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
 
     "a member under another name" in {
       runIn(("", "main.sysl", "import geom.{twice as double}\nprint(double(21))"), geom) shouldBe "42\n"
+    }
+
+    // The same binding by the unbraced spelling, so the two forms are one feature rather than two
+    // that happen to agree — and the old name is gone, which is what makes it a rename.
+    "the same, written without the braces" in {
+      runIn(("", "main.sysl", "import geom.twice as double\nprint(double(21))"), geom) shouldBe "42\n"
+    }
+
+    "and the name it replaced is not also bound" in {
+      errIn(("", "main.sysl", "import geom.twice as double\nprint(twice(21))"), geom) should
+        include("twice")
+    }
+
+    // A module renamed by the unbraced form, which the braced one cannot express at the top level:
+    // `import text.util as u` has no selector list to hang the rename on.
+    "a module under a shorter name, which only this form can say" in {
+      runIn(
+        ("", "main.sysl", "import text.util as u\nprint(u.width(4))"),
+        ("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n + 1"),
+      ) shouldBe "5\n"
     }
 
     "a module, so its members are reached by its last segment" in {

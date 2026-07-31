@@ -79,14 +79,14 @@ trait ImportResolution extends TraitLookup {
       // (`13 §3`): `import a.b` is the module `a.b` where there is one, and `a`'s member `b`
       // otherwise. That is what makes the module form and the member form one piece of syntax.
       if moduleNames(path) then
-        bindModule(decl.path.last, path, acc)
+        bindModule(decl.bound, path, acc)
       else
         val module = decl.path.init.mkString(".")
 
         if decl.path.length == 1 || !moduleNames(module) then
           err(s"no module is called '$path', and nothing declares it")
 
-        bindName(decl.path.last, module, decl.path.last, acc)
+        bindName(decl.bound, module, decl.path.last, acc)
   }
 
   /** One `{…}` selector, which may name a member of the module or a module beneath it. A

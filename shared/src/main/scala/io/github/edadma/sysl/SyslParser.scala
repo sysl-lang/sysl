@@ -171,11 +171,16 @@ class SyslParser(val source: Source) extends DeclParser {
    * scoped to it, for a name wanted in one function only.
    */
   protected lazy val importDecl: Parser[ImportDecl] =
-    op("import") ~> dottedName ~ opt(importTail) ^^ {
-      case path ~ None                => ImportDecl(path)
-      case path ~ Some(Left(_))       => ImportDecl(path, wildcard = true)
-      case path ~ Some(Right(sels))   => ImportDecl(path, sels)
-    }
+    op("import") ~> dottedName ~ opt(importTail) ~ opt(op("as") ~> ident) ^^ {
+      case path ~ None ~ alias          => ImportDecl(path, alias = alias)
+      case path ~ Some(Left(_)) ~ alias => ImportDecl(path, wildcard = true, alias = alias)
+      case path ~ Some(Right(sels)) ~ alias => ImportDecl(path, sels, alias = alias)
+    } ^? (
+      { case d if d.alias.isEmpty || (!d.wildcard && d.selectors.isEmpty) => d },
+      _ =>
+        "a rename here would have nothing to name — a wildcard brings in every member, and a " +
+          "selector list carries its own 'as' per name, as 'a.b.{c as d}'",
+    )
 
   /** The wildcard's `.*` is **one token**, which is why it is matched here rather than as a `.`
    * followed by the multiplication operator. Nothing about the written form changes; what it buys

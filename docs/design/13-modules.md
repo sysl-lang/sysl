@@ -8,9 +8,11 @@ full, the `import` statement in all five of its forms shortening that path for t
 that writes it, `private` / `private[M]` deciding which of those spellings a given file is allowed
 to write at all, no declaration allowed to name in its signature a type that does not reach as far
 as it does, and the graph those references make held to being acyclic. The capability clause (§4) is
-**not yet implemented**: the propagation it needs is the sweep §6 now makes available, but the
-*target* a propagated requirement would be checked against waits on open item (a), the
-project-config doc. Two written docs already lean on modules: `capabilities.md` attaches
+**not yet implemented**: the propagation it needs is the sweep §6 now makes available, and the
+clause does not currently parse at all. What it is *not* waiting for any more is the target — that
+used to be the stated blocker, and it is stale: `Target` is a real value with a registry of ten
+targets, a `--target` flag and a `targets` command. What is genuinely missing from open item (a) is
+the `sysl.conf` schema and platform-file selection, neither of which a `no alloc` check needs. Two written docs already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
 `cross-platform.md` fixes that "module names follow the directory tree relative to the project
 root." This chapter defines what a module **is** so those have something to name, and consolidates
@@ -256,11 +258,19 @@ import std.fs.read                 // read(p)          — one member, unqualifi
 import std.fs.{read, write}        // read(p), write(…) — several
 import std.fs.*                    // every public member of std.fs, unqualified
 import std.fs.{read as rd}         // rd(p)            — renamed
+import std.fs.read as rd           // rd(p)            — the same, unbraced
 import std.fs                      // fs.read(p)       — the module itself, member access by name
+import std.fs as f                 // f.read(p)        — the module under a shorter name
 ```
 
-The selective `{a, b}`, the wildcard `*`, and the `{a as b}` rename are Scala 3's import
-syntax unchanged. `import std.fs` (the last form) brings the module *name* `fs` into scope, so its
+The selective `{a, b}`, the wildcard `*`, and both spellings of the rename are Scala 3's import
+syntax unchanged. The **unbraced** `as` belongs to the bare-path form alone, where exactly one thing
+is being named: after a wildcard there is nothing for one word to rename, and a selector list
+carries its own `as` per name, so both are refused rather than quietly ignored. It renames whatever
+the path turned out to name — a member or a module — because which of the two it is is settled by
+the same longest-prefix rule everything else here uses, and a reader wanting a shorter word should
+not have to know the answer first. Renaming a module is the case the braced form cannot express at
+all: there is no selector list to hang it on. `import std.fs` (the last form) brings the module *name* `fs` into scope, so its
 members are reached qualified by the final segment — the self-documenting `fs.read` that says at
 the call site where the name came from, without listing members. The wildcard is the terse
 opposite; the selective form is the middle. One syntax serves all three of the styles the earlier
