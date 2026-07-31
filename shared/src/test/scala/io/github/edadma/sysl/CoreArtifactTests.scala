@@ -101,6 +101,27 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "what the library costs a program that does not use it" - {
+
+    // The hold-back is decided over whichever core a compilation was handed, so it is already in
+    // force against the embedded one — a library declaration is analyzed and emitted only once
+    // something reaches it. That is worth pinning on its own: it is the reason an artifact's object
+    // half is the only thing linking can save, the rest having never been emitted in the first
+    // place.
+
+    "nothing of it, when nothing reaches it" in {
+      defines(against(Core.embedded, "var x = 2 + 3\nvar y = x * 2\n"))
+        .filter(_.startsWith(Library.key(""))) shouldBe empty
+    }
+
+    "and the surface it does reach, when something does" in {
+      // Discriminating against the above: the same compilation, one statement further on, has to
+      // carry the library or the first assertion would hold for a compiler that emitted nothing.
+      defines(against(Core.embedded, "print(1)\n"))
+        .filter(_.startsWith(Library.key(""))) should not be empty
+    }
+  }
+
   "a program compiled against the decoded core emits exactly what one compiled against the source does" - {
 
     "for a program that reaches nothing of the library at all" in {

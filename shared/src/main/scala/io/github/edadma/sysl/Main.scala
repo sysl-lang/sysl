@@ -27,6 +27,18 @@ import scopt.OParser
  * which it got. `build-lib` is what turns the first into the second, and the only difference
  * downstream is what the compilation *cost*: an artifact is a linear decode where source is a parse.
  *
+ * **`--core-lib` is the same thing for the standard module**, which every program is compiled against
+ * whether or not it names one. Built by `build-lib --core` and given back here, it replaces the copy
+ * of the library the compiler carries: the signatures arrive decoded instead of parsed, and the half
+ * that was already compiled is linked rather than emitted a second time into every program.
+ *
+ * **It falls back where `--lib` refuses**, and the asymmetry is the point. A `--lib` that cannot be
+ * read leaves the program's calls into that library with nothing to resolve them, so there is nothing
+ * to do but stop. The core is the one library the compiler always has its own copy of, so an artifact
+ * that is missing, corrupt, or built by another sysl costs a warning and the built-in copy — a
+ * compilation that would have succeeded does not start failing because an optimization was
+ * unavailable.
+ *
  * **Everything after a bare `--` belongs to the program being run**, not to sysl: it is passed
  * straight through to the executable, which is what lets `sysl run prog.sysl -- -v file` reach a
  * `main(args: []string)` without sysl having to decide whether `-v` was meant for it. The split is
@@ -48,6 +60,7 @@ case class Config(
     target: Option[String] = None,
     libs: List[String] = Nil,
     core: Boolean = false,
+    coreLib: Option[String] = None,
     programArgs: List[String] = Nil,
 )
 
@@ -97,6 +110,10 @@ case class Config(
         .action((l, c) => c.copy(libs = c.libs :+ l))
         .text("a library to compile against — a '.syslib' artifact or a source root; " +
           "may be given more than once"),
+      opt[String]("core-lib")
+        .action((l, c) => c.copy(coreLib = Some(l)))
+        .text("a prebuilt standard module to compile against, from 'build-lib --core'; " +
+          "one that cannot be read costs a warning, not the compilation"),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
@@ -125,10 +142,26 @@ private[sysl] def execute(cfg: Config): Int = {
     case Left(err) => return fail(err)
     case Right(t)  => t
 
+  // Building the standard module against a prebuilt copy of itself is the one combination that
+  // cannot mean anything: the declarations being compiled are the ones the artifact holds. Refused
+  // rather than ignored, since ignoring it leaves a command line that reads as though it were used.
+  if cfg.core && cfg.coreLib.isDefined then
+    return fail("--core-lib compiles against the standard module, and 'build-lib --core' is what builds it")
+
+  // Which standard module this compilation is compiled against. A prebuilt one arrives here;
+  // anything else — including a named one that could not be read — leaves the copy the compiler
+  // carries, which is why this warns where a bad `--lib` refuses.
+  val (core, coreSymbols, coreObject) = cfg.coreLib.map(loadCore) match
+    case None                => (Core.embedded, Set.empty[String], None)
+    case Some(Right(loaded)) => loaded
+    case Some(Left(err)) =>
+      Console.err.println(s"sysl: warning: $err — compiling against the built-in standard module")
+      (Core.embedded, Set.empty[String], None)
+
   // Building a library stops here — there is no program to link it into. An artifact is **for a
   // machine**, exactly as an rlib is, because half of it is compiled object code; the generic half
   // travels as trees because there is nothing to compile until a caller fixes its type arguments.
-  if cfg.command == "build-lib" then return buildLibrary(cfg, sources, target)
+  if cfg.command == "build-lib" then return buildLibrary(cfg, sources, target, core)
 
   // Running the result is what makes `run` different from `build`, and only this machine can do
   // that — so a cross target is refused here rather than built and then failed to execute.
@@ -171,13 +204,15 @@ private[sysl] def execute(cfg: Config): Int = {
   val read           = decoded.collect { case Right(r) => r }
   val libraryTrees   = read.flatMap(_._1)
 
-  // What the library already compiled, so this module declares those rather than defining them a
-  // second time. Their bodies arrive from the archive at link time.
-  val precompiled = read.flatMap(_._2).toSet
+  // What the libraries already compiled, so this module declares those rather than defining them a
+  // second time. Their bodies arrive from the archives at link time. The standard module's are in
+  // here on the same footing as a named library's: what a prebuilt core buys a program is exactly
+  // that its share of the library stops being emitted into every one.
+  val precompiled = read.flatMap(_._2).toSet ++ coreSymbols
 
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
-  val compiled = Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled) match
+  val compiled = Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, core) match
     case Left(err) => return report(err)
     case Right((ir, notes)) =>
       if cfg.explainEscapes then
@@ -188,7 +223,7 @@ private[sysl] def execute(cfg: Config): Int = {
   // The compilation is settled, so the object halves are written where `clang` can be given a path
   // to them. They exist only for the linker's sake and are cleaned up on every path out of here,
   // including the ones that failed.
-  val objects = unpacked.collect { case Right((_, obj)) => obj }.map { obj =>
+  val objects = (unpacked.collect { case Right((_, obj)) => obj } ::: coreObject.toList).map { obj =>
     val path = createTempFile("sysl-lib-", ".o")
     writeBytes(path, obj)
     path
@@ -247,8 +282,8 @@ private def discard(path: String): Unit =
  * program is compiled against* — into an artifact that builds and then collides with the built-in
  * copy at whatever link tried to use it.
  */
-private def buildLibrary(cfg: Config, sources: List[Source], target: Target): Int =
-  LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty) match
+private def buildLibrary(cfg: Config, sources: List[Source], target: Target, core: Core): Int =
+  LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty, core) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
       val out = cfg.output.getOrElse(defaultOutputName(cfg.file) + LibraryArtifact.extension)
@@ -264,6 +299,23 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target): In
       outcome match
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $out"); 0
+
+/** A prebuilt standard module read back: the trees to compile against, the symbols its object half
+ * already defines, and that object half itself.
+ *
+ * The failure is returned rather than reported, because the caller does not treat it as one. Every
+ * way this can go wrong — a path that is not there, a file that is not ours, one built by another
+ * sysl, a tree that will not decode — leaves a compilation that can still be run against the copy
+ * the compiler carries, and the only thing lost is the work the artifact would have saved.
+ */
+private def loadCore(path: String): Either[String, (Core, Set[String], Option[Array[Byte]])] = {
+  val bytes =
+    try readBytes(path)
+    catch case e: Exception => return Left(s"cannot read $path: ${e.getMessage}")
+
+  LibraryArtifact.unpack(path, bytes).flatMap((meta, obj) =>
+    Core.read(path, meta).map((core, symbols) => (core, symbols, Some(obj))))
+}
 
 /** Which machine this invocation is for: the one it names, or this one. A machine sysl has no entry
  * for is reported rather than guessed at — the guess would be a module that looks right and is

@@ -64,8 +64,8 @@ object LibraryArtifact {
    * against it is handed a diagnostic pointing into somebody else's source. `main` is optional
    * (`13 §7`), so a library having none is not a complaint.
    */
-  def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty)
-      : Either[String, (String, String)] = {
+  def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty,
+            core: Core = Core.embedded): Either[String, (String, String)] = {
     val parsed = sources.map(SyslParser.parse)
 
     parsed.collect { case Left(e) => e } match
@@ -76,7 +76,7 @@ object LibraryArtifact {
         rootless(units) match
           case Some(err) => Left(err)
           case None =>
-            Compiler.compileLibrary(units, target, building)
+            Compiler.compileLibrary(units, target, building, core)
               .map((ir, compiled) => (ir, metadata(units, compiled)))
   }
 

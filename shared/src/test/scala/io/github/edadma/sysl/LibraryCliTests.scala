@@ -53,6 +53,27 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
     out
   }
 
+  /** The standard module built into an artifact, which is what `--core-lib` consumes. Built once —
+   * it is the slowest thing in this file, and every test below wants the same one.
+   */
+  private lazy val core: String = {
+    val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
+
+    cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
+    out
+  }
+
+  /** A driver run with its diagnostics captured, since for `--core-lib` the warning *is* the
+   * observation: falling back and linking both exit 0, and only stderr tells them apart.
+   */
+  private def diagnostics(cfg: Config): (Int, String) = {
+    val captured = new java.io.ByteArrayOutputStream
+
+    val status = Console.withErr(captured)(cli(cfg))
+
+    (status, captured.toString)
+  }
+
   private def corrupt(bytes: Array[Byte]): String = {
     val path = createTempFile("sysl-cli-bad-", LibraryArtifact.extension)
     writeBytes(path, bytes)
@@ -180,6 +201,75 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "--core-lib" - {
+
+    "runs a program whose share of the standard module came from the artifact" in {
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // Exiting 0 is the whole assertion, and it is a strong one. Every core symbol the artifact
+      // defines is one this program only *declares* — so if the object half were not handed to the
+      // linker, or held different symbols than its metadata says, this would not link at all.
+      val (status, notes) = diagnostics(Config(command = "run", file = program("print(21 * 2)"),
+        coreLib = Some(core)))
+
+      status shouldBe 0
+      notes should not include "warning"
+    }
+
+    "builds a library against one too, which is the other thing that gets compiled" in {
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val out = createTempFile("sysl-cli-against-core-", LibraryArtifact.extension)
+
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = libraryRoot(), output = Some(out), coreLib = Some(core)))
+
+      status shouldBe 0
+      notes should not include "warning"
+    }
+
+    "falls back to the built-in copy rather than failing, and says so" - {
+
+      // The asymmetry with `--lib` is deliberate. A library that cannot be read leaves the calls
+      // into it with nothing to resolve them, so there is nothing to do but stop. The core is the
+      // one library the compiler always has its own copy of, so every one of these compiles.
+      def fallsBack(what: String, path: String): Unit =
+        what in {
+          val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
+            coreLib = Some(path)))
+
+          status shouldBe 0
+          notes should include("warning")
+        }
+
+      fallsBack("when it is not there at all",
+        s"${createTempDirectory("sysl-cli-nocore-")}/absent${LibraryArtifact.extension}")
+
+      fallsBack("when it is not one of ours", corrupt("not a library\n".getBytes))
+
+      fallsBack("when another sysl built it", corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes))
+
+      fallsBack("when it is truncated", corrupt("syslib 1 900\nshort".getBytes))
+
+      fallsBack("when its metadata will not decode", corrupt(LibraryArtifact.pack("0\nrubbish", Array.empty)))
+    }
+
+    "and having fallen back, emits the standard module rather than declaring it" in {
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // The claim the fallback rests on: what it falls back *to* is a complete compilation. A
+      // warning followed by a link against symbols nobody defines would be worse than refusing.
+      val (status, notes) = diagnostics(Config(command = "run", file = program("print(21 * 2)"),
+        coreLib = Some(corrupt("not a library\n".getBytes))))
+
+      status shouldBe 0
+      notes should include("warning")
+    }
+  }
+
   "build-lib --core" - {
 
     "builds the standard module, which nothing else may declare" in {
@@ -202,6 +292,17 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
         case Left(err) => fail(err)
 
       deleteFile(out)
+    }
+
+    "refuses to build the standard module against a prebuilt copy of itself" in {
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+
+      // The one combination that cannot mean anything: the declarations being compiled are the ones
+      // the artifact holds. Refused before the artifact is even read — ignoring it would leave a
+      // command line reading as though it were used, which is the failure worth preventing.
+      cli(Config(command = "build-lib", file = CoreLib.root.get, core = true,
+        coreLib = Some(s"${createTempDirectory("sysl-cli-core-")}/any${LibraryArtifact.extension}")))
+        .should(not be 0)
     }
 
     "and without it the same root is refused, because the module is the library's" in {
