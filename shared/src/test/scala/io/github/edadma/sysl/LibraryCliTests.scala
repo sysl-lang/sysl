@@ -421,49 +421,99 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       isFile(out) shouldBe false
     }
 
-    "and the worked example in the tree builds and runs" in {
+    "and the binding it makes possible really matches, at offsets nothing could have guessed" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      // `examples/regex` is the one place a reader can see the whole shape at once, which is exactly
-      // what makes it rot: every other test here builds its library out of a string. The same
-      // reasoning as `ExampleTests` — nothing else in the suite reads those files.
-      val root = List("examples/regex", "../examples/regex", "../../examples/regex").find(isDirectory)
-
-      assume(root.isDefined, "examples/regex not reachable from the working directory")
-
-      val out = createTempFile("sysl-cli-example-", LibraryArtifact.extension)
-
-      cli(Config(command = "build-lib", file = s"${root.get}/lib", output = Some(out))) shouldBe 0
-
-      val printed = ran(Config(command = "run", file = s"${root.get}/match.sysl", libs = List(out)))
-      val lines   = printed.linesIterator.toList
-
-      lines.take(3) shouldBe List("aab      0..3", "abbbb    0..5", "ba       no match")
-
-      // The message is the C library's own, and BSD and glibc word it differently — so what is
-      // pinned is that it arrived through `from_cstring` at all, rather than which library wrote it.
-      lines(3) should startWith("a[ is not a pattern: ")
-      lines(3).length should be > "a[ is not a pattern: ".length
-    }
-
-    "and the binding really matches, at offsets nothing could have guessed" in {
-      assume(Toolchain.clangAvailable, "clang not available")
-
-      val root = List("examples/regex", "../examples/regex", "../../examples/regex").find(isDirectory)
-
-      assume(root.isDefined, "examples/regex not reachable from the working directory")
-
-      // The example's own output is a weak witness: all three of its matches begin at 0 and one runs
-      // to the end, so a binding that answered `0..len` to anything that matched would produce it.
-      // Every case here is chosen so that only real POSIX matching gives the number — a match that
-      // starts and ends mid-string, greediness with a ceiling, an anchor that refuses, a negated
-      // class, case sensitivity, a group under a quantifier, and an empty match.
+      // A binding built the way a real one is: the C holds everything only a header knows — the size
+      // of a `regex_t`, `REG_EXTENDED`, the layout of a `regmatch_t` — and the sysl side holds an
+      // opaque pointer and four integers.
       //
-      // The offsets are POSIX and portable. The message for the bad pattern is the C library's own
-      // and is worded differently by BSD and glibc, so only its presence is pinned.
-      val out = createTempFile("sysl-cli-rxprobe-", LibraryArtifact.extension)
+      // Every case below is chosen so that only real POSIX matching gives the number. A test whose
+      // matches all began at 0 would be satisfied by a binding that answered `0..len` to anything
+      // that matched at all, which is the coincidence worth ruling out: here a match starts and ends
+      // mid-string, a bounded repeat has to stop at its ceiling, an anchor refuses, a class is
+      // negated, case matters, a group carries a quantifier, and one match is empty.
+      //
+      // The offsets are POSIX and portable. The message for the bad pattern is the C library's own,
+      // worded differently by BSD and glibc, so only its presence is pinned.
+      val regexShim =
+        """#include <regex.h>
+          |#include <stdlib.h>
+          |
+          |void *probe_rx_new(void) { return calloc(1, sizeof(regex_t)); }
+          |
+          |void probe_rx_free(void *re) {
+          |    if (re) { regfree((regex_t *)re); free(re); }
+          |}
+          |
+          |int probe_rx_compile(void *re, const char *pattern) {
+          |    return regcomp((regex_t *)re, pattern, REG_EXTENDED);
+          |}
+          |
+          |int probe_rx_exec(void *re, const char *s, long *so, long *eo) {
+          |    regmatch_t m;
+          |
+          |    if (regexec((regex_t *)re, s, 1, &m, 0) != 0) return 0;
+          |
+          |    *so = (long)m.rm_so;
+          |    *eo = (long)m.rm_eo;
+          |
+          |    return 1;
+          |}
+          |
+          |void probe_rx_error(void *re, int code, char *buf, unsigned long n) {
+          |    regerror(code, (regex_t *)re, buf, (size_t)n);
+          |}
+          |""".stripMargin
 
-      cli(Config(command = "build-lib", file = s"${root.get}/lib", output = Some(out))) shouldBe 0
+      val binding =
+        """module rx
+          |
+          |extern "probe_rx_new" c_new() -> *u8
+          |extern "probe_rx_free" c_free(re: *u8)
+          |extern "probe_rx_compile" c_compile(re: *u8, pattern: *u8) -> int
+          |extern "probe_rx_exec" c_exec(re: *u8, s: *u8, so: *i64, eo: *i64) -> int
+          |extern "probe_rx_error" c_error(re: *u8, code: int, buf: *u8, n: u64)
+          |
+          |struct Match
+          |    start: usize
+          |    end: usize
+          |
+          |struct Regex
+          |    handle: *u8
+          |
+          |    find(self, s: string) -> Option[Match]
+          |        val subject = cstring(s)
+          |
+          |        var so: i64 = 0i64
+          |        var eo: i64 = 0i64
+          |
+          |        if c_exec(self.handle, subject.ptr, &so, &eo) == 1 then
+          |            Some(Match(usize(so), usize(eo)))
+          |        else
+          |            None
+          |    end find
+          |
+          |    free(self) = c_free(self.handle)
+          |end Regex
+          |
+          |compile(pattern: string) -> Result[Regex, string]
+          |    val re   = c_new()
+          |    val p    = cstring(pattern)
+          |    val code = c_compile(re, p.ptr)
+          |
+          |    if code == 0 then
+          |        Ok(Regex(re))
+          |    else
+          |        var buf: [256]u8
+          |
+          |        c_error(re, code, &buf[0], 256u64)
+          |        c_free(re)
+          |        Err(from_cstring(&buf[0]).unwrap_or("not a pattern"))
+          |end compile
+          |""".stripMargin
+
+      val out = artifactOf(rootWithC("rx", binding, "regex.c" -> regexShim))
 
       val prog =
         """import rx.*
