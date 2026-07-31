@@ -217,14 +217,14 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  /** `ByteSink` — the one writer the prelude does supply.
+  /** `ByteSink` — the one writer the library does supply.
    *
    * It exists because a specifier describes the field the **whole** value occupies (`14 §2`), so an
    * implementation rendering more than one part has to gather them before it can pad what they came
    * to. Every such implementation was writing the same dozen lines. It is ordinary sysl over
    * `Buf[u8]`, which is why it could not be written until a growable array could.
    */
-  "the sink the prelude supplies" - {
+  "the sink the library supplies" - {
     "keeps what is written into it" in {
       run("""var g = byte_sink()
             |var w: *Writer = &g

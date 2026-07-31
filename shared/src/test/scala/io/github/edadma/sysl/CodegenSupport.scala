@@ -16,6 +16,10 @@ trait CodegenSupport extends Matchers { this: Assertions =>
    * standard module a surface at a time, and an expectation with the name baked in either fails for
    * a reason that has nothing to do with what it is testing, or — if it is a negative — quietly
    * stops testing anything at all.
+   *
+   * **This is the rendered form, and an emitted symbol is not.** A key separates with `$` and this
+   * shows it with `.`, so an assertion about IR wants `Library.key` directly — `@sysl$args_of`, not
+   * `@sysl.args_of`. Reaching for this one there fails in a way that looks like the move went wrong.
    */
   protected def lib(name: String): String = Modules.show(Library.key(name))
 
@@ -88,7 +92,7 @@ trait CodegenSupport extends Matchers { this: Assertions =>
   /** One emitted function, for a test that counts instructions rather than looking for one.
    *
    * A whole-module count is not what such a test means: the module also holds the ARC runtime and
-   * whatever prelude functions the program reached, and either can grow without the lowering under
+   * whatever library functions the program reached, and either can grow without the lowering under
    * test having changed.
    */
   protected def defineOf(out: String, name: String): String =

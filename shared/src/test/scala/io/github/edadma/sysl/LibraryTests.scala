@@ -221,7 +221,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
 
     "is what a format hole builds, which the compiler names rather than resolves" in {
-      // `Library.key("FormatSpec")` and the `FormatSpec` the prelude's `display_str` wrote have to
+      // `Library.key("FormatSpec")` and the `FormatSpec` the library's `display_str` wrote have to
       // be one type, or this is a signature mismatch inside the library.
       run("print(f\"[${str(42)}%5s]\")\nprint(f\"[${1.5}%8.3f]\")") shouldBe "[   42]\n[   1.500]\n"
     }
@@ -275,14 +275,18 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
-  "a moved declaration whose own signature names one that has not moved" - {
+  "a moved declaration whose own signature names other moved ones" - {
 
-    // `Display.display` is declared `(self, out: *Writer, fmt: FormatSpec)`: `FormatSpec` is beside it
-    // in the standard module and `Writer` is still the prelude's, so matching an `impl` against it
-    // reads one name in each part. That direction — a standard-module declaration reaching back into
-    // the prelude — is what this group is for, and nothing before the move exercised it.
+    // `Display.display` is declared `(self, out: *Writer, fmt: FormatSpec)`, and all three names are
+    // now the standard module's. What the group holds is that a program's `impl` is matched against
+    // the trait's signature as the *library* reads it: every one of those three is a word a program
+    // may also declare, and the two below are what say the trait keeps meaning its own.
+    //
+    // The group was written when `Writer` was still the prelude's and this spanned the two halves.
+    // That direction is still live — `args_of` reaches `print` and `exit`, and the renderers reach
+    // `sysl_snprintf` — it is simply no longer what these two exercise.
 
-    "an impl matches the trait's signature across both parts of the library" in {
+    "an impl matches the trait's signature, every name in it the library's" in {
       run(
         """struct P
           |    x: int
@@ -546,9 +550,10 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
 
     "and a program's own 'from_utf8' leaves both of the library's callers alone" in {
-      // A shape none of the earlier moves had: this one is called from *both* sides of the drain —
-      // by `line_text` in the standard module and by `args_of`, still in the prelude. A program
-      // that means something else by the word has to leave both of those meaning the library's.
+      // A shape none of the earlier moves had: this one has *two* library callers, `line_text` and
+      // `args_of`, reached by two different routes — one from a program's own `for` over `lines`,
+      // the other from the entry point, which names the conversion by key rather than by the word.
+      // A program that means something else by that word has to leave both meaning the library's.
       runWith(
         """from_utf8(b: []u8) -> string = "mine"
           |
@@ -602,9 +607,11 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       out.map(_.contains("@Buf.push.int(")) shouldBe Right(false)
     }
 
-    // `Index` has NOT moved, so this impl block spans the two halves: a standard-module subject
-    // implementing a prelude trait. The lowered method is named under the *subject's* key.
-    "and its impl of a trait that has not moved is keyed under the subject, not the trait" in {
+    // A library `impl` is keyed under its *subject*, not its trait — which is what lets `Buf`'s row
+    // sit with `Buf` however the two are split across files, and is why the seam never had to decide
+    // which of a pair an `impl` belongs to. Written when `Index` was still the prelude's and this
+    // spanned the halves; the keying it pins is unchanged by their having joined.
+    "and its impl of a trait declared elsewhere is keyed under the subject, not the trait" in {
       val out = Compiler.compileToLlvm(
         """var b: Buf[int] = buf()
           |b.push(7)
@@ -614,9 +621,10 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
 
     "a program may declare a 'Buf' of its own, and what the library builds on still means the library's" in {
-      // `StrBuilder` is still in the prelude and holds a `&Buf[u8]`, so this is the cross-seam
-      // shape again — but with a *generic*, where the program's own is not even the same arity of
-      // thing. The library's `Buf` is what `str_builder()` gathers into whatever the word means here.
+      // `StrBuilder` holds a `&Buf[u8]`, so the library reaches its own `Buf` through a second
+      // declaration rather than at the call — and with a *generic*, where the program's own is not
+      // even the same arity of thing. The library's is what `str_builder()` gathers into, whatever
+      // the word means here.
       run(
         """struct Buf[T]
           |    only: T

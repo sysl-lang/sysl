@@ -9,12 +9,12 @@ package io.github.edadma.sysl
  * to shrink.
  *
  * The four `va_*` forms belong here permanently. Each is an **ABI primitive** that no sysl body
- * could implement, in the same category as `sizeof`, so there is nothing to put in the prelude
+ * could implement, in the same category as `sizeof`, so there is nothing to put in the library
  * (`12` §9). `from_utf8_unchecked` is permanent for the same reason from the other direction: every
  * safe route to a `string` carries the UTF-8 guarantee, so the one operation that sets it aside can
  * only come from underneath the language. The other three are the temporary ones: all three are now
  * desugarings onto a `Display`, and what keeps them here is the sink each supplies — standard output
- * for `print`, a fresh buffer for `str` and `format` — neither of which the prelude can name yet.
+ * for `print`, a fresh buffer for `str` and `format` — neither of which the library can name yet.
  */
 trait SpecialForms extends Closures {
 
@@ -110,7 +110,7 @@ trait SpecialForms extends Closures {
 
   /** `from_utf8_unchecked(b)` — a `[]u8` taken as a `string` without looking at it.
    *
-   * This is the whole of what the prelude's `from_utf8` cannot write for itself: it validates, and
+   * This is the whole of what the library's `from_utf8` cannot write for itself: it validates, and
    * then it needs somewhere to say "these bytes are a string now". `04` puts the unchecked form in
    * the `*T` tier deliberately — breaking the UTF-8 invariant breaks `char`'s downstream — so the
    * spelling is long and greppable rather than convenient.
@@ -177,7 +177,7 @@ trait SpecialForms extends Closures {
   /** The `display` a value renders through, and the value in whatever width that renderer takes.
    *
    * The answers are `14 §3`'s one dispatch rule, applied to rendering: a **built-in** reaches the
-   * prelude renderer its membership provides (`§5`), a **user type** the member its `impl` produced,
+   * library renderer its membership provides (`§5`), a **user type** the member its `impl` produced,
    * and a **bounded type parameter** the trait's own method, since which implementation runs is
    * monomorphization's to decide once a concrete type is known. A **trait object** answers with a
    * slot rather than a name, since which `display` runs is a word in its table — and it has one

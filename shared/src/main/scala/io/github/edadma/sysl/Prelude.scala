@@ -39,29 +39,16 @@ package io.github.edadma.sysl
  * status, which is what `11-error-handling.md` says a trap does under the `os` capability — and it
  * is the reason those two need no compiler support of their own.
  *
- * **`args_of` is how a program's arguments become a `[]string`**, and it is here because every line
- * of it is ordinary sysl. What the platform hands the entry point is C's
- * `argc` and `argv` — a count and a vector of NUL-terminated byte runs — and what a sysl program
- * asks for is a slice of strings, so something has to walk the one and build the other. Doing it in
- * the prelude is what keeps the pair out of every sysl signature: a `main(args: []string)` is called
- * with the result of this, and the two foreign types are named in one place instead of in each
- * program that wants its arguments.
+ * **Most of the library is now in the standard module** — the rendering, reading, text, buffer,
+ * builder and argument surfaces all live under `lib/sysl/`. What is left here is what they stand
+ * on: the `print*` family and the `extern`s above, and the `Option` and `Result` every fallible
+ * answer arrives in.
  *
- * Each run's length is found by looking for the terminator rather than by calling `strlen`, so the
- * conversion asks the platform for nothing beyond the two values it was handed. The bytes are then
- * **validated and copied**: a `string` owns what it holds, so an argument outlives the vector it
- * came from and nothing a program does to it reaches memory the platform still owns. An argument
- * that is not UTF-8 stops the program the way `unwrap` does, with the offset of the byte that made
- * it ill-formed — `04` puts that check at the boundary, and this is one.
- *
- * **Most of the library is now in the standard module** — the rendering, reading, text, buffer and
- * builder surfaces all live under `lib/sysl/`. What is left here is what they stand on and what has
- * not moved yet: the `print*` family and the `extern`s above, `args_of` below, and the `Option` and
- * `Result` every fallible answer arrives in.
- *
- * `args_of` is written *against* the moved half — it names `Buf`, `buf` and `from_utf8` with no
- * import, because a name written in either part of the library is looked for among the library's
- * own first. That direction is the whole reason the drain can proceed one surface at a time.
+ * What remains is what the moved half is written *against*, and it is reached from there with no
+ * import — `args_of` names `Buf`, `buf` and `from_utf8` in its own module and `print`, `exit`, `Ok`
+ * and `Err` in this one, because a name written in either part of the library is looked for among
+ * the library's own first. That both directions work is the whole reason the drain can proceed one
+ * surface at a time.
  *
  * None of this costs an unused program anything: the enums' members are generic, so one exists
  * only where a call asks for it, a top-level function is analyzed and emitted only if something
@@ -198,27 +185,6 @@ object Prelude {
       |            print("panic:", msg)
       |            exit(1)
       |end Result
-      |
-      |args_of(argc: i32, argv: **u8) -> []string
-      |    var out: Buf[string] = buf()
-      |    var i = 0
-      |
-      |    while i < int(argc)
-      |        var p = argv[i]
-      |        var n = 0usize
-      |
-      |        while p[n] != 0u8
-      |            n += 1usize
-      |
-      |        from_utf8(p[0..<n]) match
-      |            Ok(s) -> out.push(s)
-      |            Err(e) ->
-      |                print("panic: command-line argument", i, "is not UTF-8 at byte", e.offset)
-      |                exit(1)
-      |
-      |        i += 1
-      |
-      |    out.view()
       |
       |""".stripMargin
 

@@ -28,8 +28,13 @@ be unwound deliberately rather than discovered later.
 
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
 
-A short **prelude** (`Prelude`) of ordinary sysl source — the `Option` and `Result` enums — is
-parsed once and hoisted ahead of the user's own declarations.
+The library every compilation carries is in two places, and `Library` is what knows which. A short
+**prelude** (`Prelude`) of ordinary sysl source — the `Option` and `Result` enums, the `print*`
+family, and the handful of C `extern`s underneath them — is parsed once and hoisted ahead of the
+user's own declarations, in the same anonymous root module a headerless program is in. The
+**standard module** `sysl` (`13 §8`) is the rest, and it is real files under `lib/sysl` rather than a
+string inside the compiler. Declarations are moving from the first to the second one surface at a
+time; a name resolves the same way whichever it is in, and only the emitted symbol tells them apart.
 
 ## What runs today
 
@@ -41,7 +46,7 @@ before they appear and may be mutually recursive).
   platform's own start-up code calls is passed two values — there is no crt0 of sysl's to write, and
   a compiled program is an ordinary hosted C program that clang links libc to. The two are taken
   whether or not anything asks for them, and a program that declares `main(args: []string)`
-  (`13 §7`) gets them as a slice through one call to the prelude's `args_of`. **A sysl `main` is
+  (`13 §7`) gets them as a slice through one call to the library's `args_of`. **A sysl `main` is
   therefore emitted under a reserved symbol**, since the one it is written as is already taken by the
   function the platform starts at; the reserved name holds two `$` separators, which no key can
   (`Modules.qualify` writes one), so it cannot collide with any module's declaration.

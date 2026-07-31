@@ -66,7 +66,7 @@ trait CallCore extends Literals with TraitObjects {
     // whatever the argument's type is, and an expression that never arrives is the one thing
     // inference must not conclude a slot from. A diverging argument against a *written* parameter
     // is untouched — it is dead code, and that parameter still has a layout.
-    // A callable's parameters have no names a program wrote — the call trait's are the prelude's —
+    // A callable's parameters have no names a program wrote — the call trait's are the library's —
     // so what a mismatch there names is the *position*, which is the only thing the caller can see.
     for ((t, (pname, pty)), i) <- ts.zip(params).zipWithIndex do
       val which = if positional then s"the ${ordinal(i + 1)} argument of $what" else s"'$pname' of '$what'"

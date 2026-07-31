@@ -51,7 +51,7 @@ trait AnalyzerBase {
    * the library's declarations are keyed under the root module exactly as a headerless program's
    * are, so the key cannot answer it. The compilation that *builds* a library module is the one
    * case where the source is the library's without being the copy the compiler carries, and it has
-   * to be, or the rest of the library could not name what it declares: the prelude's
+   * to be, or the rest of the library could not name what it declares: the library's
    * `impl Display for (A, B)` calls `display_pad` and resolves it among the library's own, and while
    * `lib/sysl/render.sysl` is being compiled that is the file in front of it.
    */
@@ -588,9 +588,9 @@ trait AnalyzerBase {
    */
   protected val externsUsed = mutable.LinkedHashSet.empty[String]
 
-  /** Every function name something has called, which is what decides whether a **prelude** function
-   * is worth analyzing and emitting at all: the printing surface lives there now, and a program that
-   * never prints should carry none of it.
+  /** Every function name something has called, which is what decides whether a **library** function
+   * is worth analyzing and emitting at all, in either half of it: the printing surface is the
+   * largest thing that hangs off this, and a program that never prints should carry none of it.
    */
   protected val funcsUsed = mutable.LinkedHashSet.empty[String]
 
@@ -864,7 +864,7 @@ trait AnalyzerBase {
    *
    * The definition-time pass of `14 §4` walks a generic body exactly as an ordinary one is walked,
    * so it registers instantiations exactly as an ordinary one does — a `Box[T]`, a call to another
-   * generic function, a prelude renderer reached by a `print`. None of those is a real
+   * generic function, a library renderer reached by a `print`. None of those is a real
    * instantiation: `T` is not a type anything can be laid out at, and nothing at run time reaches
    * them. Dropping what the pass registered is what keeps a diagnostics-only walk from putting a
    * type parameter into the emitted module.

@@ -346,7 +346,7 @@ class Utf8Tests extends AnyFreeSpec with RunSupport with CodegenSupport {
       out.map(_.contains("@sysl.str.from_bytes")) shouldBe Right(false)
     }
 
-    // Layout is the documented exception — a non-generic prelude type is instantiated where it is
+    // Layout is the documented exception — a non-generic library type is instantiated where it is
     // declared — so the cost is one type line, and it is worth pinning that it stays one.
     "its error type costs exactly one line of layout" in {
       val out = Compiler.compileToLlvm("print(1)")

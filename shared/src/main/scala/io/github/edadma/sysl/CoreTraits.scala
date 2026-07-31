@@ -9,10 +9,10 @@ package io.github.edadma.sysl
  *
  * **Everything in this file is a spelling**, which is what a program writes, and a consumer holding
  * a resolved key goes through `Library.spelling` before asking. The two used to coincide and no
- * longer do: `Display` and `Hash` are in the standard module and filed under `sysl$Display` and
- * `sysl$Hash`, while `Add`, `Ord` and the rest are still the prelude's and keyed by their own names.
- * Which of the two a trait is in is a fact this table deliberately does not hold — where a trait
- * lives is not what its operator is.
+ * longer do: a trait in the standard module is filed under `sysl$Display`, not `Display`, and a
+ * table written in keys would have to be edited every time a declaration moved. Which half of the
+ * library a trait is in is a fact this table deliberately does not hold — where a trait lives is not
+ * what its operator is, and `Library` is the one place that has to know.
  *
  * **The memberships have to be a rule rather than a table of `impl`s**, because the integer family
  * is open: `i5` and `u12` are types a program may name, so there is no finite list of scalars to

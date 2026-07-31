@@ -284,7 +284,7 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
   /** What the four of them are *not*, each pinned because it would otherwise be a hole. */
   "what the new surface does not quietly become" - {
     // `02`'s orphan rule reaches the library's own types exactly as it reaches everything else.
-    "a prelude type is not a home for a program's 'impl' of a prelude trait" in {
+    "a library type is not a home for a program's 'impl' of a library trait" in {
       err("""impl Display for CString
             |    display(self, out: *Writer, fmt: FormatSpec) = display_str("x", out, fmt)
             |print(1)

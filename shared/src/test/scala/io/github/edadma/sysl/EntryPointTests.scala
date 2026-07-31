@@ -9,7 +9,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * fixed order — statements first, `main` after — and the only signatures are `main()` and
  * `main(args: []string)`.
  *
- * The arguments arrive as a slice of `string` and never as C's pair: the prelude's `args_of` walks
+ * The arguments arrive as a slice of `string` and never as C's pair: the library's `args_of` walks
  * the vector, finds each run's terminator, validates its bytes and copies them into strings the
  * program owns. The zeroth is the executable's own path, which is what the platform passes and no
  * test can predict — so an assertion here is about `args[1..]` or about the count.
@@ -428,11 +428,34 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
                 |""".stripMargin, "one") shouldBe "99 not the vector\nmain sees 2\n"
     }
 
-    "while the conversion itself is a prelude name a program may not take" in {
-      err("""args_of(argc: i32, argv: **u8) -> []string
-            |    print("mine")
-            |    []
-            |""".stripMargin) should include("function 'args_of' is already declared")
+    // The conversion used to be a name a program could not take, because the prelude declared it in
+    // the same root module a headerless program is in. In the standard module it is `sysl.args_of`,
+    // so the word is a program's to spend — and the entry point goes on calling the library's, which
+    // it names by key and never by what the word resolves to at the top level.
+    "while the conversion is a word the program may spend on something else" in {
+      runWith("""args_of(n: int) -> string = "mine"
+                |
+                |main(args: []string)
+                |    print(args_of(1), args.len)
+                |""".stripMargin, "one", "two") shouldBe "mine 3\n"
+    }
+
+    // Both meanings at once, which is the thing neither half says on its own: the shadowed word is
+    // the program's, the path still reaches the library's, and the entry point — which named it by
+    // key — agrees with the path rather than with the word. A program's own `args_of` takes an int,
+    // so resolution picking the wrong one either way would not type-check.
+    //
+    // The vector is a local of `main` because a top-level `var` is a local of the *entry point* and
+    // `main` cannot see it (§7) — nothing to do with the conversion, but it is what a first attempt
+    // writes.
+    "and the library's is still there under its path, beside the program's own" in {
+      runWith("""args_of(n: int) -> string = "mine"
+                |
+                |main(args: []string)
+                |    var vec: [1]*u8 = [c"direct"]
+                |
+                |    print(args_of(1), sysl.args_of(1i32, &vec[0])[0], args.len)
+                |""".stripMargin, "one", "two") shouldBe "mine direct 3\n"
     }
   }
 
@@ -455,12 +478,16 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
                             |    print(args.len)
                             |""".stripMargin))
 
-      out should include("@args_of(i32 %argc, ptr %argv)")
+      out should include(s"@${Library.key("args_of")}(i32 %argc, ptr %argv)")
       out should include("call void @$$main(")
     }
 
     // The conversion reaches `from_utf8`, `Buf` and the printing a panic needs, so leaving it in a
     // program that never asks for its arguments would be the whole of that surface for nothing.
+    //
+    // These two are deliberately the *bare* name where the assertion above is the qualified one: a
+    // negative reads better wide, since `sysl$args_of` contains `args_of` and so either spelling
+    // trips it. Narrowing them to `lib(...)` would leave a stray unqualified emission unnoticed.
     "a program with no main carries none of the conversion" in {
       ir("""print("hi")""") should not include "args_of"
     }

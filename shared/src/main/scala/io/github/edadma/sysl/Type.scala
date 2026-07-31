@@ -151,7 +151,7 @@ object Type {
       throw new IllegalStateException(s"the trait '$name' reached codegen as a type of its own")
   }
 
-  /** The call trait a callable's type names (`12 §6`), which the prelude declares one of per arity.
+  /** The call trait a callable's type names (`12 §6`), which the library declares one of per arity.
    *
    * The arity is in the name for the reason a tuple's is in its base: one declaration cannot promise
    * a `call` of an arity it does not know, so each arity is its own trait and each is written out.
@@ -162,7 +162,7 @@ object Type {
     /** The trait a callable of `n` parameters implements. */
     def base(n: Int): String = s"Fn$n"
 
-    /** How many parameters the widest declared call trait takes. Past this the prelude has nothing
+    /** How many parameters the widest declared call trait takes. Past this the library has nothing
      * to offer and the diagnostic says so, exactly as it does for a tuple too wide to compare.
      */
     val maxArity = 4
@@ -473,7 +473,7 @@ object Type {
    * What it is not is *declared*. Its base name holds a `$`, which no identifier and no module name
    * may, so nothing a program can write collides with it and nothing looks it up among the
    * declarations. The **arity is part of the base**, so each arity is its own key — that is what
-   * lets the prelude write one implementation per arity (`impl[A, B] Eq for (A, B)`) and have the
+   * lets the library write one implementation per arity (`impl[A, B] Eq for (A, B)`) and have the
    * two not collide, which a shared base would not.
    */
   final class Tuple(elems: List[Type]) extends Struct(Tuple.base(elems.length), elems) {

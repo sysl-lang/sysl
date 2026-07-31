@@ -408,10 +408,12 @@ imports a module depends on it whether or not it goes on to write the shorter sp
 because a file's imports are meant to be readable as what it needs, and a dependency that came and
 went with a use would not be.
 
-Two things sit outside the graph. The **prelude** is the language rather than a module, so writing
-`print` is not a dependency on anything. And the **anonymous root module** (§1) can be depended on
-by nothing, having no name for another module to write — a program's root files depend on the
-modules beneath them, and the dependency never runs back.
+Three things sit outside the graph. The **prelude** is the language rather than a module, so writing
+`print` is not a dependency on anything. The **standard module** `sysl` (§8) is auto-imported into
+every file, and an edge every file has says nothing — worse, it would make the library's own files
+depend on themselves. And the **anonymous root module** (§1) can be depended on by nothing, having
+no name for another module to write — a program's root files depend on the modules beneath them, and
+the dependency never runs back.
 
 Three things follow from acyclicity:
 
@@ -498,7 +500,7 @@ costs nothing, since the conversion below is reached only by the other one.
 
 **`args` is a slice of `string`.** What the platform hands a program is C's pair — a count, and a
 vector of NUL-terminated byte runs — and neither of those appears in a sysl signature anywhere. The
-pair is converted by the prelude's `args_of`, which finds each run's end, validates its bytes, and
+pair is converted by the library's `args_of`, which finds each run's end, validates its bytes, and
 **copies** them into strings the program owns: an argument therefore outlives the vector it came from
 and holds no memory the platform is still responsible for. The zeroth element is the program's own
 path, because that is what the platform passes and withholding it would be inventing a different
@@ -793,9 +795,11 @@ happens. Lifting that needs a library initializer the program calls before `main
 - **No relative or wildcard-path imports.** An import names a module by its full dotted path from
   the project root; there is no `import ..sibling` or path-relative form. Absolute names keep a
   reference's meaning independent of where the importing file sits.
-- **No implicit prelude-style auto-import beyond the language prelude.** The prelude (`Option`,
-  `Result`, `print`, the scalar types — `09`, `11`) is in scope everywhere without an import;
-  nothing else is. A module earns visibility by being imported or fully qualified.
+- **No implicit auto-import beyond the language's own.** What every file gets for free is the
+  prelude (`Option`, `Result`, `print`, the scalar types — `09`, `11`) and the standard module
+  `sysl` (§8), which between them are the library rather than a second mechanism. Nothing else is: a
+  module earns visibility by being imported or fully qualified, and a compilation does not gain
+  unqualified names by having a library on hand.
 - **No implicits — no Scala-style `given`/`using`.** A term-level value selected by *searching* the
   scope for something of the right type is out of scope, and deliberately. Introducing a given
   anywhere in scope can change what resolves in a file that did not change and whose dependencies'
@@ -857,10 +861,12 @@ happens. Lifting that needs a library initializer the program calls before `main
   own `build-lib --core` compiles. What that module should *contain* is the open half, and it is the
   question the whole exercise was for.
 
-  The prelude is still where most of it is, and moving a declaration across is one declaration at a
-  time rather than a switch: every unqualified name in every program resolves through the library, so
-  a change that moved all of it at once would put the whole surface onto a path nothing had exercised
-  and a single hole in it would fail everything with nothing to bisect.
+  The prelude is what has not moved across yet, and moving a declaration is one declaration at a time
+  rather than a switch: every unqualified name in every program resolves through the library, so a
+  change that moved all of it at once would put the whole surface onto a path nothing had exercised
+  and a single hole in it would fail everything with nothing to bisect. What is left there is the
+  `print*` family, the C `extern`s beneath it, and `Option` and `Result`; when it is empty the
+  mechanism goes away and what a program starts with is a module.
 
   The pressure is real and predates the mechanism: the first program to want mathematics found none
   — `guide/fft` declares `sin`, `cos` and `sqrt` as C externs of its own and writes its own absolute
