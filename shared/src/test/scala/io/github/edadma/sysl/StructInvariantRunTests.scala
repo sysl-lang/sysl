@@ -152,6 +152,18 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
     exits(Account + "var a = Account(5)\nvar p = &a\n(*p).balance = -2")
   }
 
+  // The walk survives a pointer because the pointee's type names the struct: `(*p).a.n` reaches
+  // `Outer`'s clause through `p`'s static type exactly as `o.a.n` reaches it through `o`. What no
+  // pointer can do is name a struct *above* its own pointee — that is the ignored test at the bottom.
+  "a nested field write through a pointer to the enclosing struct is checked" - {
+    "a write that keeps the invariant proceeds" in {
+      run(Outer + "var o = Outer(Inner(1), 5)\nvar p = &o\n(*p).a.n = 4\nprint(o.a.n, o.b)") shouldBe "4 5\n"
+    }
+    "a write that breaks it traps" in {
+      exits(Outer + "var o = Outer(Inner(1), 5)\nvar p = &o\n(*p).a.n = 9")
+    }
+  }
+
   "a field write into an array element is checked" - {
     "an in-range write proceeds" in {
       run(Account + "var xs = [Account(1), Account(2)]\nxs[0].balance = 5\nprint(xs[0].balance)") shouldBe "5\n"

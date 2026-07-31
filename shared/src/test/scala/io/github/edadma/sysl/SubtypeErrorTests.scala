@@ -76,6 +76,21 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  /* A pointer is where a constraint would be lost if the type system let go of it: an `Age` flows
+   * freely as an `int` by value (§1), but a `*int` into an `Age`'s storage would be a door to a
+   * write no range check sees. Both spellings are refused where the alias is created — value
+   * transparency does not extend one level up. */
+  "a pointer does not shed the constraint" - {
+    "a transparent subtype's address does not coerce to its base's pointer" in {
+      err("type Age = int within 0..150\nvar x: Age = 50\nvar q: *int = &x\n*q = 999\nprint(x)") should
+        include("declared *int but the value is *Age")
+    }
+    "nor does a derived subtype's" in {
+      err("type Slot = new u8 within 0..<200\nvar x = Slot(50)\nvar q: *u8 = &x\n*q = 255\nprint(u8(x))") should
+        include("declared *byte but the value is *Slot")
+    }
+  }
+
   /** A constrained cast traps rather than reporting, and `16 §4` says why: a value outside the range
    * is a bug in the code that made it, not a condition to handle. So there is no `T.try(x)` — but a
    * simple enum has one, which makes it the first thing anyone writes here. The whole of what the
