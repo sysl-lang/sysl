@@ -74,6 +74,25 @@ class BufTests extends AnyFreeSpec with RunSupport {
           |print(s.len, total, s[4])""".stripMargin
       ) shouldBe "5 10 4\n"
     }
+
+    /* The view is the WRITABLE form, and these two facts together are why: a read site pays nothing
+     * for it, because `[]T` widens to `[]const T` on its own, while a read-only view would foreclose
+     * mutating a buffer in place — which is the only route a sort or a reverse could ever take, since
+     * `set` reaches one element at a time. Strictly more capable, at no cost to the readers. */
+    "and that view may be written, while still satisfying a reader that asks for a read-only one" in {
+      run(
+        """total(xs: []const int) -> int
+          |    var s = 0
+          |    for x in xs do s += x
+          |    s
+          |var b: &Buf[int] = buf()
+          |b.push(3)
+          |b.push(4)
+          |var v = b.view()
+          |v[0] = 10
+          |print(total(b.view()), b.at(0))""".stripMargin
+      ) shouldBe "14 10\n"
+    }
   }
 
   // A list somebody *leaves*: taking an element out of the middle, and cutting a length down to a

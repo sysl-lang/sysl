@@ -396,6 +396,59 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(nested[0].len, nested[1].len, give().len)
             |""".stripMargin) shouldBe "6 3 2\n3 2 2\n"
     }
+
+    /* Widening at a return, and the distinction the section never has to state because it reads as
+     * obvious — that assigning the *field* replaces which elements are viewed, and is not a write
+     * *through* the view. A rule implemented at the subscript could easily refuse both. */
+    "widens at a result, and a field holding one may still be reassigned" in {
+      run("""widen(xs: []int) -> []const int = xs
+            |struct Holder
+            |    items: []const int
+            |var a = [1, 2, 3]
+            |var b = [9, 9]
+            |var h = Holder(a[0..])
+            |h.items = b[0..]
+            |print(widen(a[0..]).len, h.items[0])
+            |""".stripMargin) shouldBe "3 9\n"
+    }
+
+    /* The bit has to survive being *stored*, not merely passed — a container holds its element as a
+     * type argument, and a type argument is where a bit on a type gets dropped. Both a generic the
+     * program writes and one the prelude supplies, since they instantiate by different routes. */
+    "and survives a round trip through a generic container, written or supplied" in {
+      val cell = """struct Cell[T]
+                   |    item: T
+                   |    got(self) -> T = self.item
+                   |end Cell
+                   |val k: [4]int = [1, 2, 3, 4]
+                   |var r: Cell[[]const int] = Cell(k[0..])
+                   |""".stripMargin
+
+      run(cell + "print(r.got().len, r.got()[2])") shouldBe "4 3\n"
+      err(cell + "r.got()[0] = 9") should include("views elements it may not write")
+
+      err("""val k: [4]int = [1, 2, 3, 4]
+            |var o: Option[[]const int] = Some(k[0..])
+            |o.unwrap()[0] = 9
+            |""".stripMargin) should include("views elements it may not write")
+    }
+
+    /* A writable view stored the same way keeps *its* form, which is what makes the test above mean
+     * something: the two instantiations are distinct types rather than one that took whichever bit
+     * arrived first. That distinctness is what mangling the bit buys. */
+    "while the writable form stored the same way is a different instantiation, and still writes" in {
+      run("""struct Cell[T]
+            |    item: T
+            |    got(self) -> T = self.item
+            |end Cell
+            |var a = [1, 2, 3]
+            |val k: [4]int = [1, 2, 3, 4]
+            |var w: Cell[[]int] = Cell(a[0..])
+            |var r: Cell[[]const int] = Cell(k[0..])
+            |w.got()[0] = 9
+            |print(w.got().len, r.got().len, a[0])
+            |""".stripMargin) shouldBe "3 4 9\n"
+    }
   }
 
   /** The three sequence types answer the same questions, so the questions are asked of all three at
