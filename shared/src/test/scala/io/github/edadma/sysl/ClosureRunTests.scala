@@ -83,6 +83,167 @@ class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** The other half of `§6`'s static/dynamic pair. The bare arrow above is the bound; these are the
+    * four positions where a concrete type is required and a callable is therefore a `&Fn` — an
+    * annotated `var`, a parameter, a struct field, a return type, and an element of a collection.
+    * `§5`'s claim is that a declared function reaches all of them, being the capture-free closure.
+    */
+  "a declared function is erased into a &Fn" - {
+    "an annotated var holds one, and calling the name calls the function" in {
+      run("""twice(a: int) -> int = a * 2
+            |
+            |var f: &Fn(int) -> int = twice
+            |print(f(21))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    "a parameter typed as the object takes one" in {
+      run("""twice(a: int) -> int = a * 2
+            |apply(f: &Fn(int) -> int, x: int) -> int = f(x)
+            |
+            |print(apply(twice, 21))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // `§6`'s own example of the stored case, down to the field name.
+    "a struct field holds one" in {
+      run("""greet()
+            |    print("clicked")
+            |
+            |struct Button
+            |    on_click: &Fn() -> unit
+            |
+            |var b = Button(greet)
+            |b.on_click()
+            |""".stripMargin) shouldBe "clicked\n"
+    }
+
+    "a function returns one" in {
+      run("""twice(a: int) -> int = a * 2
+            |pick() -> &Fn(int) -> int = twice
+            |
+            |print(pick()(21))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // Two of them in one array is what tells a per-function wrapper from a shared one: a single
+    // struct standing for both would call whichever was built last, twice.
+    "an array holds several, and each one calls its own function" in {
+      run("""inc(a: int) -> int = a + 1
+            |dec(a: int) -> int = a - 1
+            |
+            |var fs: [2]&Fn(int) -> int = [inc, dec]
+            |print(fs[0](10), fs[1](10))
+            |""".stripMargin) shouldBe "11 9\n"
+    }
+
+    // The object's arguments are the only thing that says which instantiation is wanted, since a
+    // generic function's name stands for no single one.
+    "a generic function is instantiated by what the object asks for" in {
+      run("""ident[T](x: T) -> T = x
+            |
+            |var f: &Fn(int) -> int = ident
+            |print(f(7))
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    "an extern is one as well" in {
+      run("""extern "abs" c_abs(x: i32) -> i32
+            |
+            |var f: &Fn(i32) -> i32 = c_abs
+            |print(f(-5i32))
+            |""".stripMargin) shouldBe "5\n"
+    }
+
+    // A generic type's argument is a concrete slot like any other, so a callable goes into one and
+    // comes back out callable — including through the library's own enums, where it also has to
+    // survive being taken apart by a pattern.
+    "a generic type holds one, and so does an Option" in {
+      run("""inc(a: int) -> int = a + 1
+            |
+            |struct Holder[T]
+            |    item: T
+            |
+            |var h: Holder[&Fn(int) -> int] = Holder(inc)
+            |print(h.item(41))
+            |""".stripMargin) shouldBe "42\n"
+
+      run("""inc(a: int) -> int = a + 1
+            |
+            |var o: Option[&Fn(int) -> int] = Some(inc)
+            |o match
+            |    Some(f) -> print(f(41))
+            |    None -> print("none")
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    "the boxed and the inlined form take the same function in one program" in {
+      run("""twice(a: int) -> int = a * 2
+            |apply(f: int -> int, x: int) -> int = f(x)
+            |
+            |var boxed: &Fn(int) -> int = twice
+            |print(apply(twice, 5), boxed(5))
+            |""".stripMargin) shouldBe "10 10\n"
+    }
+
+    "a signature that does not fit the object is refused, and the message names the function" in {
+      err("""twice(a: int) -> int = a * 2
+            |var f: &Fn(int, int) -> int = twice
+            |""".stripMargin) should include("'twice' takes 1 argument, but 2 arguments were given")
+
+      err("""twice(a: int) -> int = a * 2
+            |var f: &Fn(string) -> int = twice
+            |""".stripMargin) should include("'a' of 'twice' is int, but string was given")
+
+      err("""twice(a: int) -> int = a * 2
+            |var f: &Fn(int) -> string = twice
+            |""".stripMargin) should include("should yield string, but its body yields int")
+    }
+
+    // Two refusals that must survive the rule above, since it turns on a context pushing its own
+    // type down onto a name: a trait object that is not a call trait has nothing to ask a function
+    // for, and a nested function is not a value however it is asked (`§5a`).
+    "a trait object that is not a call trait still takes an ordinary value, not a function" in {
+      run("""trait Show
+            |    show(self) -> string
+            |
+            |struct P
+            |    x: int
+            |
+            |impl Show for P
+            |    show(self) -> string = "P!"
+            |
+            |var s: &Show = P(1)
+            |print(s.show())
+            |""".stripMargin) shouldBe "P!\n"
+    }
+
+    "and a nested function is refused with the reason its environment gives" in {
+      err("""main()
+            |    twice(a: int) -> int = a * 2
+            |    var f: &Fn(int) -> int = twice
+            |""".stripMargin) should include("is a nested function, so it is called where it is written")
+    }
+
+    /** A function named where nothing wants a callable. The name is not undefined — the declaration
+      * is on the line above — and reporting it as such sends the reader after a typo instead of at
+      * what is missing, which is a context saying which call trait to build it into.
+      */
+    "a function named where nothing wants a callable says what is missing, not that it is undefined" in {
+      for src <- List(
+          "twice(a: int) -> int = a * 2\nprint(twice)",
+          "twice(a: int) -> int = a * 2\nvar n: int = twice",
+          "trait Show\n    show(self) -> string\n\ntwice(a: int) -> int = a * 2\nvar s: &Show = twice",
+        )
+      do
+        val e = err(src)
+
+        e should include("'twice' is a function")
+        e should include("no address of its own")
+        e should not include "undefined name"
+    }
+  }
+
   "what a body captures" - {
     "a value is copied in when the closure is formed" in {
       run("""apply(f: int -> int, x: int) -> int = f(x)

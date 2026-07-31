@@ -202,14 +202,21 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       * *called*, because there is nothing to pass. `12 § Open e` (a named function as a first-class
       * value) and `12 § Open f` (a symbol for a sysl definition) are the two halves of it.
       *
-      * The diagnostic is also wrong about what happened: the name is defined, it is a function, and
-      * what is missing is a way to take its address.
+      * The gap is unchanged; what the diagnostic *says* about it is no longer wrong. It used to
+      * report the name as undefined, which is false of a name declared on the line above and sends
+      * the reader hunting for a typo. It now says the name is a function, where a function is a
+      * value, and that there is no address to fall back on — which is the whole of what is missing.
       */
     "a function's address, which is what a C callback is" in {
-      err("cmp(a: *u8, b: *u8) -> int = 0\nprint(&cmp == null)") should include("undefined name 'cmp'")
+      val addr = err("cmp(a: *u8, b: *u8) -> int = 0\nprint(&cmp == null)")
+
+      addr should include("'cmp' is a function")
+      addr should include("no address of its own")
+      addr should not include "undefined name"
+
       err("extern qsort(b: *u8, n: usize, sz: usize, c: *u8)\ncmp(a: *u8, b: *u8) -> int = 0\n" +
         "var xs: [2]i32 = [2, 1]\nqsort(&xs[0], 2usize, 4usize, cmp)\nprint(xs[0])") should
-        include("undefined name 'cmp'")
+        include("'cmp' is a function")
     }
 
     // The same gap from the other side: a function pointer C hands back cannot be invoked, so

@@ -310,4 +310,40 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         include("a slice does not record whether its owner's count is atomic")
     }
   }
+
+  /** The three sequence types answer the same questions, so the questions are asked of all three at
+    * once. Each of these reaches the array, the slice and the string by a different path in the
+    * compiler, and a claim about "a sequence" is satisfied by whichever one a test happens to pick —
+    * which is exactly how a gap survives a dense suite.
+    */
+  "array, slice and string answer the same three questions" - {
+    "length" in {
+      run("""var a = [1, 2, 3]
+            |var s = a[..]
+            |print(a.len, s.len, "abc".len)
+            |""".stripMargin) shouldBe "3 3 3\n"
+    }
+
+    // A string indexes in bytes and yields a `u8` (`04 §`), which is why `97` and not `'a'`.
+    "an index" in {
+      run("""var a = [1, 2, 3]
+            |var s = a[..]
+            |print(a[0], s[0], "abc"[0])
+            |""".stripMargin) shouldBe "1 1 97\n"
+    }
+
+    "and a slice of themselves" in {
+      run("""var a = [1, 2, 3]
+            |var s = a[..]
+            |print(a[1..].len, s[1..].len, "abcd"[1..].len)
+            |""".stripMargin) shouldBe "2 2 3\n"
+    }
+
+    // Where they part, and it is deliberate: a string has bytes and characters both, so iterating
+    // one directly would have to pick, and the message makes the program pick instead.
+    "but iterating a string directly is refused, since it would have to choose bytes or characters" in {
+      err("""for c in "ab" do print(c)""") should
+        include("iterated as 's.bytes' or 's.chars'")
+    }
+  }
 }

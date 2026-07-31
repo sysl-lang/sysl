@@ -240,7 +240,7 @@ What exists today, as compiler-provided members:
 `chars` is the one of the properties that is not a projection of the words already there: it hands
 back a cursor over the bytes, which `for` walks through `Iterate` (`14 §7`). It is compiler-provided
 rather than an `impl` on `string` for the same reason the other two are — a built-in has no body to
-write a member in — and the type it gives back is an ordinary prelude struct, so nothing about the
+write a member in — and the type it gives back is an ordinary library struct, so nothing about the
 member form is special.
 
 **The last two rows are where the property/method line falls for a built-in, and they fall on

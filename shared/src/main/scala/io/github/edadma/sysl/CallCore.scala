@@ -134,8 +134,15 @@ trait CallCore extends Literals with TraitObjects {
     }
   }
 
-  /** Whether an argument is one whose type the *context* has to supply (`12 §5`, `§6`). */
-  private def callableArg(a: Expr): Boolean = a match
+  /** Whether an expression is one whose type the *context* has to supply (`12 §5`, `§6`).
+   *
+   * The two shapes are the two ways of writing a callable that is not already a value: a literal,
+   * whose parameters are typed by what asks for it, and the name of a declared function, which is
+   * not a value at all until something says which call trait to build it into. Neither can be
+   * analyzed first and converted afterwards, which is what separates them from every other
+   * expression a converting context meets.
+   */
+  protected def callableArg(a: Expr): Boolean = a match
     case _: Lambda => true
     case Ident(n)  => lookupOpt(n).isEmpty && funcKey(n).isDefined
     case _         => false

@@ -46,7 +46,7 @@ This replaces the old design's split into compile-time `trait`s and structural r
 - **Any type may carry an `impl`, the built-ins and the composed types included.** `impl Show for
   int` is as ordinary as `impl Show for Point`, `impl Show for []int` is as ordinary as either, and
   `5.show()` resolves by the same rule `p.show()` does. This is not a convenience: a `Show` that
-  cannot cover `int` is a `Show` no library can be written against, and the prelude's own `Show` —
+  cannot cover `int` is a `Show` no library can be written against, and the library's own `Show` —
   the one that lets `str` stop being a compiler builtin, and lets `print`'s desugaring aim at a
   method instead of six names (`04`, *Printing*) — is the first thing that needs it. Every type has
   one **owner key** its members are filed under: a struct or an enum by the name it was declared
@@ -520,9 +520,15 @@ made into an object when every method:
 The middle rule excludes **every trait in the operator catalog** — `add(self, rhs: Self) -> Self`
 first among them — and that is the right answer rather than a limitation: `14`'s traits describe an
 operator over two values of one type, which is a question about types known at compile time. They
-are for bounds. It also means every type reaching a table got there through a source `impl`, so
-every slot is a function that exists — a compiler-provided membership (`14 §5`) is an instruction,
-not something a pointer can name.
+are for bounds.
+
+Every type reaching a table also got there through a **source `impl`**, so every slot is a function
+that exists — but that is a rule of its own rather than a consequence of the one above, and
+`Display` is why it has to be. `Display` is compiler-provided (`14 §5`) *and* object-safe, so
+nothing in the list excludes it: an `int` satisfies a `Display` bound and `print` finds its
+rendering, and only the erasure refuses it. So the refusal is made where the erasure is, and the
+diagnostic names the rule rather than reporting a type mismatch — the membership is real, and a
+reader told otherwise would go looking for a conformance they already have.
 
 ### Forming and using one
 
@@ -736,6 +742,14 @@ reason a generic numeric routine in sysl reads worse than the same routine writt
 
 ## Details still to settle
 
+- **Whether a built-in should be erasable into a `&Display`.** *Object safety* refuses every
+  compiler-provided membership on the grounds that what the compiler provides is an instruction, and
+  for the operator catalog that is exactly right. `Display` is the one place the reason does not
+  reach: a built-in's rendering is a **library function** (`display_int`, `display_str`, …), which is
+  precisely the thing a table slot can hold, so the refusal there is the blanket rule rather than the
+  argument behind it. Whether to synthesize those slots — which is what a heterogeneous
+  `[3]&Display` of `1`, `"hi"`, `true` would need — is a question about what the language should
+  offer, not about whether the code is right. Refused today, and the diagnostic names the rule.
 - **Laws / invariants on traits.** The old `trait` could assert invariants ("`Ord` is a total
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.

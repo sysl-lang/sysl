@@ -102,7 +102,7 @@ Three decisions make this cheap enough to apply everywhere:
   so a rule that fires *after* its children are done — comparing two branch types, say — still
   points at the construct that raised it rather than at whatever was visited last.
 
-A `Pos` holds the `Source` it points into, which is what keeps the prelude's positions and the
+A `Pos` holds the `Source` it points into, which is what keeps the library's positions and the
 user's file's from being confused for one another, and what lets a diagnostic render itself
 without any pass having to carry the source text alongside the message.
 

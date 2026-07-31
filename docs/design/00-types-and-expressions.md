@@ -868,7 +868,7 @@ the library is where its catalog rows live. So:
 - **A user may write `impl MyTrait for (int, string)`**, because their trait is local and that is
   the half of the orphan rule that permits it.
 - **A user may not write `impl Eq for (int, string)`**, because the trait and the type are both the
-  prelude's. That is the existing rule producing the expected answer, not a new one.
+  library's. That is the existing rule producing the expected answer, not a new one.
 
 The one implementation consequence is that structural rows are **written per arity** rather than
 once, because sysl has no way to be generic over arity and is not getting one. **The stated maximum

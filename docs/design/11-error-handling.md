@@ -1,7 +1,7 @@
 # Design Decisions: Error Handling
 
 **Status:** ratifies the error model the implementation already carries — `Option`, `Result`,
-the postfix `?`, the prelude's combinators up to `unwrap`/`expect` (§8), and the trapping runtime
+the postfix `?`, the library's combinators up to `unwrap`/`expect` (§8), and the trapping runtime
 checks — and settles the two decisions it left implicit: **traps abort** (no unwinding, no
 `catch`), and **`?` requires an exact error-type match** for now, with type-converting `?` designed
 but deferred. The recoverable half rests on
@@ -25,7 +25,7 @@ tells you the only way it "fails" is if the program is already wrong.
 
 ## 1. `Option[T]` and `Result[T, E]`
 
-The two recoverable-failure types are **ordinary generic enums** from the prelude, not compiler
+The two recoverable-failure types are **ordinary generic enums** from the library, not compiler
 built-ins (`09 §4`):
 
 ```
@@ -178,9 +178,9 @@ the same footing as C's `assert` compiled out by `NDEBUG`.
   (`char.try`, `Color.try`), validate before dividing — turning the bug back into a `Result` at
   the point where untrusted input enters.
 
-## 8. The prelude's combinators, and how `unwrap` stops the program
+## 8. The library's combinators, and how `unwrap` stops the program
 
-The conveniences on `Option` and `Result` are **ordinary members in the prelude** (`09 §4`,
+The conveniences on `Option` and `Result` are **ordinary members in the library** (`09 §4`,
 `10 §4`), not compiler knowledge. The *total* ones ask a question or supply a fallback:
 
 - `Option`: `is_some()`, `is_none()`, `unwrap_or(default)`
@@ -195,7 +195,7 @@ The *forcing* ones hand over the payload and stop the program when there is none
 recording: it is what keeps "a bug is a trap" from meaning "the compiler must know the name of
 every way to trap". Two pieces make it possible. The diverging arm has a type — `never` (`00 §11`)
 — so `None -> exit(1)` sits beside `Some(v) -> v` and the `match` still has the payload's type. And
-the departure itself is an `extern` (`12 §1`): the prelude declares `exit(code: int) -> never`, so
+the departure itself is an `extern` (`12 §1`): the library declares `exit(code: int) -> never`, so
 stopping is a call, not an intrinsic.
 
 ```
@@ -210,7 +210,7 @@ This is §6's split in action: **the decision to stop is the language's, the act
 the environment's.** On a hosted target the action is what §6 specifies — print a diagnostic, exit
 non-zero — and it is reached through the C library's `exit`, which flushes what was printed on its
 way out (`abort` would not have to). A freestanding target supplies its own departure and the
-prelude's `exit` is simply never called. The compiler's *own* checks — a bounds test, a failed cast
+library's `exit` is simply never called. The compiler's *own* checks — a bounds test, a failed cast
 — still trap through `llvm.trap` and print nothing; reconciling those two so that every stop says
 why is `§ Open c`.
 

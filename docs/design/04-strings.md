@@ -307,7 +307,7 @@ operators take, and it is what keeps a string's contents something a reader can 
 ## Printing
 
 `print(a, b, c)` writes each value, a space between and a newline at the end. It is **not a function
-built into the compiler**: it is a desugaring onto ordinary prelude functions, one per *kind* of
+built into the compiler**: it is a desugaring onto ordinary library functions, one per *kind* of
 value, chosen by each argument's static type.
 
 ```
