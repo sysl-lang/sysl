@@ -142,3 +142,12 @@ allocator-free everywhere.
   publishing rather than guessing at them upfront.
 - **`requires` granularity** — module-level only, or also finer? Module-level is the unit for
   now.
+- **The clause spends two ordinary words, and one of them is wanted.** `no alloc` and `requires
+  alloc` are read by the lexer, so `no`, `alloc` and `requires` are all reserved and none of them may
+  name anything. `guide/slab` ran into it immediately: an allocator's central function is called
+  `alloc` in every language that has one, and that is the one name it cannot have — it is spelled
+  `take` there. The cost is small and the shape of it is not, because it falls hardest on exactly the
+  code that *provides* the capability the word gates. Neither the clause nor the word is wrong; what
+  is worth deciding is whether a capability's name has to be a keyword at all, or whether the clause
+  can read an ordinary identifier in that position the way `import` reads a module path — which
+  would give `alloc`, `os` and `posix` back to programs and keep the clause reading the same.

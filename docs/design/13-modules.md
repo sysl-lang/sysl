@@ -473,8 +473,24 @@ keyword is taken. Every program that writes statements at the top of a file alre
 there to mean "a local of the entry point", and redefining it as a module member would not fail to
 compile — it would silently change name resolution, those bindings becoming visible to every
 function in the module. That is a breaking change that still builds, which is the worst kind. So
-mutable module-level state waits for a customer that asks for it by name; nothing yet has. What
-programs actually wanted was a **table**, which is read-only, and that is `val`.
+mutable module-level state waits for a customer that asks for it by name. What programs wanted up to
+now was a **table**, which is read-only, and that is `val`.
+
+**A customer has arrived, and it is an allocator.** `guide/slab` needs a static arena — one region,
+at one address, for the life of the program, which is what a file-scope array is in C — and there is
+no way to declare one. A module-level `val` is written once, so `&` of one is refused outright and
+nothing can be carved out of it; a top-level `var` is a local of the entry point that no function
+can see. So the region is declared where the program starts and threaded as a `*u8` through every
+function that touches it. That is tolerable in a program of seven sections and it does not stay
+tolerable: an allocator is what every other part of a no-heap program asks for storage, so "pass the
+arena in" ends up a parameter on every function that might ever allocate — which is the argument a
+capability system makes for itself, arrived at from the wrong direction.
+
+What is *not* settled is the spelling, and the paragraph above says why it is the hard part: `var`
+means "a local of the entry point" in every program that writes statements at the top of a file, and
+redefining it would silently change name resolution rather than fail to compile. So the customer is
+recorded here and the word is still open — a distinct keyword, a `static` modifier on a `val`, or an
+attribute are all forms that would not collide.
 
 A program in which no file carries a statement is a complete program that does nothing: the entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,

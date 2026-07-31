@@ -892,8 +892,20 @@ work:
   that alignment, which is written into §5 above. What remains open is **the maximum permitted `N`**
   (the back end stops at 128 today, which is a toolchain fact and not a ruling); whether `i1`/`u1`
   are allowed and how they relate to `bool`; and whether packed structs lay out an `i5` field in
-  exactly 5 bits (the bitfield / hardware register payoff) — the one genuinely open storage question,
-  since it is about a *field* rather than a standalone value.
+  exactly 5 bits (the bitfield / hardware register payoff), since it is about a *field* rather than a
+  standalone value.
+- **Storage declared at a required alignment**, the sibling of the packed question above and the
+  direction nothing covers: `packed` would lower a struct's alignment, and there is no way to *raise*
+  a declaration's. `guide/slab` is the customer. A `[N]u8` region is aligned to one, because that is
+  what a byte needs, so a region declared the obvious way is aligned for nothing that could be carved
+  out of it — and the allocator rounds its own base up, paying up to `alignof(T) - 1` bytes of the
+  region and one block of capacity for a fact the declaration could have stated. The rounding is what
+  a real allocator does anyway, since its *caller's* region is wherever it is, so nothing is blocked
+  — which is why this is recorded rather than urgent. What it costs today is that no program can
+  promise an alignment it needs: a DMA buffer on a cache-line boundary and a page-aligned table are
+  both unwritable, and neither has a workaround, because rounding up inside a region you were given
+  is not the same as *being* aligned. C spells it `alignas` and Rust `#[repr(align(N))]`; it wants to
+  be the same attribute mechanism `packed` wants, which is why the two are recorded together.
 - ~~**Statement/block grammar:** which keywords open indented blocks (`then` / `do` / `=`).~~
   **Settled, and settled the same way for all of them:** an introducer is **required for a one-line
   body and optional before an indented block**, since the `Newline`+`Indent` the lexer emits already

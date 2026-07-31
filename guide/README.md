@@ -45,6 +45,7 @@ its half of the evidence lives.
 | `datetime` | a conversion that can succeed twice — wall clocks, timelines, and daylight saving |
 | `matrix` | an operator whose result is neither operand's type — a vector space, then Gaussian elimination |
 | `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts and struct invariants |
+| `slab` | raw storage — reinterpreting bytes as a typed pointer, `sizeof`/`alignof`, and a free list threaded through the free blocks themselves |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

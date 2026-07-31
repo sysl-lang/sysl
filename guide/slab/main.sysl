@@ -1,0 +1,227 @@
+// The checks. Every line of output begins `ok`, so the whole of stdout is the assertion.
+//
+// Two element types are run over the same shape of region throughout — a sixteen-byte `Node` and an
+// eight-byte `Cell` — because a slab whose block size is measured rather than written down is only
+// demonstrably measured if two different sizes come out right. The counts differ by exactly the
+// ratio of their widths, and that is the claim.
+//
+// **The alignment section is the finding, not a feature.** It asserts that a region declared the
+// obvious way begins wherever it happens to and that the allocator corrects for it, which is the
+// evidence that the language cannot ask for an aligned one.
+
+check(name: string, got: string, want: string)
+    if got == want then print(s"ok    $name = $got")
+    else print(s"FAIL  $name = $got, wanted $want")
+end check
+
+struct Node
+    value: int
+    next: *Node
+
+struct Cell
+    bits: i64
+
+// **The regions are threaded from the entry point rather than declared beside the code that uses
+// them, and that is a finding.** A static arena wants module scope — one region, one address, for
+// the life of the program, which is what a file-scope array is in C. sysl has no such storage: a
+// module-level `val` is written once, so `&` of one is refused outright, and a top-level `var` is a
+// local of the entry point that no function can see. So the region is declared where the program
+// starts and passed as a `*u8` to everything that touches it.
+//
+// The threading is harmless here and would not stay harmless. An allocator is the thing every other
+// part of a no-heap program asks for storage, so "pass the arena in" becomes a parameter on every
+// function that might ever allocate — which is the argument a capability system makes for itself,
+// arrived at from the wrong direction.
+
+section_what_a_block_costs()
+    print("-- what a block costs")
+
+    check("a Node is its two fields plus the padding between them", str(sizeof(Node)), "16")
+    check("a Cell is its one field", str(sizeof(Cell)), "8")
+    check("both are aligned to a word", str(alignof(Node)), str(alignof(Cell)))
+    check("a block must hold the link that threads it", str(sizeof(Cell) >= sizeof(*u8)), "true")
+
+    // The measurement is what makes one allocator serve both types. A hardcoded block size would
+    // have to be one or the other.
+    check("and one is twice the other", str(sizeof(Node) / sizeof(Cell)), "2")
+end section_what_a_block_costs
+
+section_carving_a_region(one: *u8, two: *u8)
+    print("-- carving a region into blocks")
+
+    var nodes: Slab[Node] = slab_over(one, 256usize)
+    var cells: Slab[Cell] = slab_over(two, 256usize)
+
+    // Whatever the rounding costs, it costs less than one alignment, so the counts are the region
+    // over the block size give or take a block.
+    check("the region holds this many nodes", str(nodes.made >= 15usize && nodes.made <= 16usize), "true")
+    check("and twice as many cells", str(cells.made >= 31usize && cells.made <= 32usize), "true")
+
+    // Every block is on the list before anything is taken.
+    check("every node block starts free", str(free_count(&nodes)), str(nodes.made))
+    check("every cell block starts free", str(free_count(&cells)), str(cells.made))
+end section_carving_a_region
+
+section_the_intrusive_list(region: *u8)
+    print("-- the free list lives in the free blocks themselves")
+
+    // A `Cell` is exactly one address wide, so writing one writes exactly the bytes the link
+    // occupies. That is what makes the claim below an equality rather than an "it changed".
+    var s: Slab[Cell] = slab_over(region, 256usize)
+
+    // The list is threaded back to front, so the head is block zero and each link points at the
+    // block above it. Walking by address and walking by link have to agree.
+    var head = s.free
+    var second = next_free(head)
+
+    check("the head is the lowest block", str(usize(head) == usize(s.first)), "true")
+    check("and the next is one block above it", str(usize(second) - usize(head)), str(sizeof(Cell)))
+    check("so the list and the addresses agree", str(usize(second) == usize(s.first) + sizeof(Cell)), "true")
+
+    // The link really is inside the block: writing the block *is* writing the list. Nothing else
+    // could be true of an intrusive list, and nothing in the language checks it for us — this is
+    // the whole of what makes a block that is in use and a block that is free two different things
+    // rather than two states of one.
+    var c: *Cell = ptr_cast(head)
+
+    c.bits = 0
+    check("writing the block wrote the link", str(next_free(head) == null), "true")
+
+    // And the converse, which is the rule a caller has to keep: a block that is *out* of the list
+    // may be written freely, because the list no longer runs through it.
+    var fresh: Slab[Cell] = slab_over(region, 256usize)
+    var taken = take(&fresh)
+    var counted = free_count(&fresh)
+
+    taken.bits = -1
+
+    check("a block in hand is not on the list", str(free_count(&fresh)), str(counted))
+    check("and writing it left the list alone", str(free_count(&fresh)), str(fresh.made - 1usize))
+end section_the_intrusive_list
+
+section_allocating_and_releasing(region: *u8)
+    print("-- allocating and releasing")
+
+    var s: Slab[Node] = slab_over(region, 256usize)
+    var before = free_count(&s)
+
+    var a = take(&s)
+    var b = take(&s)
+
+    check("two allocations came off the list", str(free_count(&s)), str(before - 2usize))
+    check("and they are different blocks", str(a != b), "true")
+    check("the first is block zero", str(index_of(&s, a)), "0")
+    check("the second is block one", str(index_of(&s, b)), "1")
+
+    // The storage is usable, which is the only thing the caller actually wanted.
+    a.value = 11
+    a.next = b
+    b.value = 22
+    b.next = null
+
+    check("a block holds what was written into it", str(a.value + a.next.value), "33")
+
+    release(&s, a)
+    check("releasing put one back", str(free_count(&s)), str(before - 1usize))
+
+    release(&s, b)
+    check("and the other", str(free_count(&s)), str(before))
+end section_allocating_and_releasing
+
+section_reuse(region: *u8)
+    print("-- a released block is the one handed out next")
+
+    var s: Slab[Node] = slab_over(region, 256usize)
+
+    var a = take(&s)
+    var b = take(&s)
+    var c = take(&s)
+
+    check("three blocks, in order", str(index_of(&s, c)), "2")
+
+    // The list is a stack, so the most recently released block is the next one out. That is not a
+    // requirement of a slab — a queue would allocate just as correctly — but it is what threading
+    // the list through the blocks gives for free, and asserting it is what shows the link is really
+    // being written and read rather than the count merely being kept.
+    release(&s, b)
+
+    // The cast is bound before it is passed, and it has to be: `index_of` infers its `T` from the
+    // argument, and the argument is a `ptr_cast` waiting to be told what to be. Neither can go
+    // first, so the annotation goes on a name.
+    var head: *Node = ptr_cast(s.free)
+
+    check("the released block is the head", str(index_of(&s, head)), "1")
+
+    var again = take(&s)
+    check("and comes straight back out", str(again == b), "true")
+
+    release(&s, a)
+    release(&s, c)
+    var d = take(&s)
+    check("last released, first out", str(again == b && d == c), "true")
+end section_reuse
+
+section_exhaustion(region: *u8)
+    print("-- exhaustion answers rather than trapping")
+
+    var s: Slab[Cell] = slab_over(region, 256usize)
+    var made = s.made
+    var taken = 0usize
+    var last: *Cell = null
+
+    while true do
+        var p = take(&s)
+
+        if p == null then break
+
+        last = p
+        taken += 1
+
+    check("every block came out", str(taken), str(made))
+    check("and the list is empty", str(free_count(&s)), "0")
+
+    // A slab that is out of blocks says so. It is a `*T`, so `null` is the answer it has — this is
+    // the one place the raw tier's null is the right shape rather than a shortcoming.
+    check("a further request answers null", str(take(&s) == null), "true")
+
+    release(&s, last)
+    check("releasing one makes it answer again", str(take(&s) == last), "true")
+end section_exhaustion
+
+section_alignment(region: *u8)
+    print("-- the alignment the language cannot ask for")
+
+    // A `[N]u8` is aligned to one, because that is what a byte needs. So the region's own start is
+    // not aligned for anything carved out of it, and the allocator has to round up. This is the
+    // finding: the rounding is correct for an allocator and unnecessary here.
+    var s: Slab[Node] = slab_over(region, 256usize)
+    var start = usize(region)
+    var base = usize(s.first)
+
+    check("the blocks start aligned for what they hold", str(base % alignof(Node)), "0")
+    check("at or above where the region did", str(base >= start), "true")
+    check("having paid less than one alignment for it", str(base - start < alignof(Node)), "true")
+
+    // And the rounding is not free: whatever it costs comes out of the region, so a region that
+    // began misaligned holds one fewer block than the arithmetic on its size alone would say.
+    var without = 256usize / sizeof(Node)
+
+    check("the region gave up at most one block for it", str(without - s.made <= 1usize), "true")
+
+    // The arithmetic itself is total and is worth pinning apart from the allocator, since every
+    // block address rests on it.
+    check("rounding a value already on the boundary leaves it", str(aligned_up(16usize, 8usize)), "16")
+    check("and one past it goes to the next", str(aligned_up(17usize, 8usize)), "24")
+    check("aligning to one is the identity", str(aligned_up(17usize, 1usize)), "17")
+end section_alignment
+
+var region_a: [256]u8 = [0u8; 256]
+var region_b: [256]u8 = [0u8; 256]
+
+section_what_a_block_costs()
+section_carving_a_region(&region_a[0], &region_b[0])
+section_the_intrusive_list(&region_a[0])
+section_allocating_and_releasing(&region_a[0])
+section_reuse(&region_a[0])
+section_exhaustion(&region_b[0])
+section_alignment(&region_a[0])

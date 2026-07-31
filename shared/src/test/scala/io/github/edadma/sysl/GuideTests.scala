@@ -278,6 +278,26 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
     )
   }
 
+  // The one program that *makes* storage rather than being handed it. `guide/kernel` is
+  // allocator-free and indexes three fixed tables it was given; this is what a program would have to
+  // write before it could have them, so it is written with no allocator itself — which is what puts
+  // the free list inside the free blocks and the whole program in the raw tier.
+  "slab — raw storage, an intrusive free list, and blocks measured rather than written down" in {
+    val out = guide("slab")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 37
+    sections(out) shouldBe List(
+      "-- what a block costs",
+      "-- carving a region into blocks",
+      "-- the free list lives in the free blocks themselves",
+      "-- allocating and releasing",
+      "-- a released block is the one handed out next",
+      "-- exhaustion answers rather than trapping",
+      "-- the alignment the language cannot ask for",
+    )
+  }
+
   "matrix — an operator whose result is neither operand's type" in {
     val out = guide("matrix")
 
