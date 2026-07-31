@@ -202,6 +202,50 @@ appending a field cannot move an existing field's offset.
 
 ---
 
+## 7. A library may carry C
+
+**A `.c` file dropped anywhere in a library's tree is compiled with it and archived beside it.**
+Nothing declares it and nothing lists it: the walk of §5 step 1 already visits every directory, and a
+C file found there is compiled for the same target and becomes one more member of the `.syslib`.
+The sysl side reaches it through the `extern` that was already the way to name a symbol the linker
+has (`12` §1) — so the language gains nothing, and the whole of the feature is in the build.
+
+**It exists because a binding to a real C library cannot be written without it.** Three things are
+reachable from C and from nothing else, and each of them blocks an ordinary POSIX interface:
+
+- **A caller-allocated opaque type.** `regcomp` wants a `regex_t` the caller supplies, and its size
+  is 32 bytes on Darwin and 64 under glibc. A program can only allocate storage whose size it knows.
+- **A macro.** `REG_EXTENDED`, `O_RDONLY`, `SIGKILL` are `#define`s. They have no symbol, so there is
+  nothing for a linker to resolve and nothing for `extern` to name.
+- **A shape with no sysl spelling** — an untagged union, a bitfield, an inline function.
+
+Each becomes an ordinary function in three lines of C. `size_t f(void) { return sizeof(regex_t); }`
+is a symbol; so is `int f(void) { return REG_EXTENDED; }`. Better still, a shim that *allocates* the
+opaque type hands back a pointer and the sysl side never learns the size at all.
+
+**The alternative is transcription, and transcription is silently wrong.** A hand-written `struct
+regex_t` with the fields of one platform's header compiles everywhere and is correct on one machine.
+Nothing checks it — sysl's own `sizeof` would report what sysl laid out, not what C did, so even that
+comparison is a tautology. Getting it wrong writes past the end of the caller's storage. The number
+has to come from the headers, and C is what reads headers.
+
+**A member is named after the path it was found at**, directories included — `demo/util.c` becomes
+`demo.util.o`. A basename alone would not do: `ar r` replaces by name, so two modules each holding a
+`util.c` would have the second evict the first, and the library would ship missing whatever only the
+first defined. The one collision that survives this is a directory called `sysl` holding a `code.c`,
+which would take the name the library's own compiled half uses; it is refused rather than archived.
+
+**The C files are fingerprinted with the sysl ones.** A library's shims are as much its source as its
+modules are, and an artifact that did not change when one was edited is a stale artifact nothing
+would notice was stale.
+
+**Cross-compiling a library that includes headers needs that target's headers.** This is not a cost
+the design imposes — it is the requirement being honest. A binding to POSIX regex cannot be built for
+a platform whose `regex_t` nobody can see. C that includes nothing cross-compiles like any other
+object. The standard module under `lib/sysl` includes no headers and reaches libc by symbol alone, so
+it goes on building for any target the toolchain can lower for; that is worth keeping, and it is a
+property of what that library happens to need rather than a rule about where C may live.
+
 ## Open (not yet decided)
 
 - **a. `opaque` structs.** A struct whose layout is withheld from its interface entirely, usable

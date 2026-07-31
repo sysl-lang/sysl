@@ -236,6 +236,332 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "a library carrying C" - {
+
+    /* A C file beside a library's sysl, compiled with it and archived into the same artifact
+     * (`15 §7`). It is what makes a binding to a real C library writable: `sizeof(regex_t)`, the
+     * value of a macro like `REG_EXTENDED`, an anonymous union — each is reachable from C and from
+     * nothing else, and a few lines of C turn each into an ordinary function `extern` can declare.
+     *
+     * The sysl side needs nothing new. That is the claim these tests are really pinning: the whole
+     * feature lives in the build, and a shim is reached by the `extern` that was already there. */
+
+    val shim = "int demo_seven(void) { return 7; }\n"
+
+    val usingShim =
+      """module demo
+        |
+        |extern "demo_seven" c_seven() -> int
+        |
+        |seven_times(n: int) -> int = c_seven() * n
+        |""".stripMargin
+
+    def rootWithC(module: String, sysl: String, cFiles: (String, String)*): String = {
+      val root = createTempDirectory("sysl-cli-clib-")
+      val dir  = s"$root/$module"
+
+      createDirectory(dir)
+      writeFile(s"$dir/lib.sysl", sysl)
+      cFiles.foreach((name, text) => writeFile(s"$dir/$name", text))
+      root
+    }
+
+    /** A driver run with the program's own output captured — `run` prints what the child wrote, so
+     * this is what lets a test assert the answer C computed rather than only that the link held.
+     */
+    def ran(cfg: Config): String = {
+      val captured = new java.io.ByteArrayOutputStream
+
+      Console.withOut(captured)(cli(cfg)) shouldBe 0
+      captured.toString
+    }
+
+    def fingerprintOf(out: String): String =
+      LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _)) match
+        case Right((_, _, fingerprint)) => fingerprint
+        case Left(err)                  => fail(err)
+
+    "is archived as a member of its own, named after where it was found" in {
+      val out = artifactOf(rootWithC("demo", usingShim, "shim.c" -> shim))
+
+      Ar.members(readBytes(out)) match
+        case Right(members) =>
+          // The directory is kept in the name, which is what makes it unique across the library.
+          members.find(_.name == "demo.shim.o").map(_.body.length).getOrElse(0) should be > 0
+        case Left(why) => fail(why)
+    }
+
+    "and a program calling through the library reaches it" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // The sharp shape, and not merely a program calling C directly: `demo$seven_times` lives in
+      // the library's own compiled member and leaves `demo_seven` undefined, so the linker has to
+      // resolve one member of the archive from another. An artifact that carried the shim but did
+      // not index it would compile, link the first member, and fail here.
+      ran(Config(command = "run", file = program("print(demo.seven_times(3))"),
+        libs = List(artifactOf(rootWithC("demo", usingShim, "shim.c" -> shim))))) shouldBe "21\n"
+    }
+
+    "which is what makes a caller-allocated C type bindable" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // The case the feature exists for. `regex_t` has to be allocated by the caller and its size is
+      // known only to the target's own headers — 32 bytes here, 64 under glibc — so a sysl program
+      // has no way to spell the storage. The shim allocates it, and the sysl side never learns the
+      // size at all: it holds an opaque `*u8` and the numbers stay where they are checked.
+      //
+      // `REG_EXTENDED` is the same problem in miniature. It is a `#define`, so it has no symbol to
+      // link against and nothing but C can read it.
+      val regexShim =
+        """#include <regex.h>
+          |#include <stdlib.h>
+          |
+          |void *demo_regex_new(void) { return malloc(sizeof(regex_t)); }
+          |
+          |int demo_regex_compile(void *re, const char *pattern) {
+          |    return regcomp((regex_t *)re, pattern, REG_EXTENDED);
+          |}
+          |
+          |int demo_regex_matches(void *re, const char *s) {
+          |    return regexec((regex_t *)re, s, 0, NULL, 0) == 0;
+          |}
+          |
+          |void demo_regex_free(void *re) {
+          |    regfree((regex_t *)re);
+          |    free(re);
+          |}
+          |""".stripMargin
+
+      val binding =
+        """module rx
+          |
+          |extern "demo_regex_new" regex_new() -> *u8
+          |extern "demo_regex_compile" regex_compile(re: *u8, pattern: *u8) -> int
+          |extern "demo_regex_matches" regex_matches(re: *u8, s: *u8) -> int
+          |extern "demo_regex_free" regex_free(re: *u8)
+          |""".stripMargin
+
+      val prog =
+        """var re = rx.regex_new()
+          |print(rx.regex_compile(re, c"^a+b$") == 0)
+          |print(rx.regex_matches(re, c"aaab") == 1)
+          |print(rx.regex_matches(re, c"xyz") == 1)
+          |rx.regex_free(re)
+          |""".stripMargin
+
+      // Discriminating on purpose: a match, and a non-match of the same pattern. A binding that
+      // returned a constant, or one whose `regex_t` was too small to survive being written into,
+      // would pass on the first line and fail on one of the others.
+      ran(Config(command = "run", file = program(prog),
+        libs = List(artifactOf(rootWithC("rx", binding, "regex.c" -> regexShim))))) shouldBe
+        "true\ntrue\nfalse\n"
+    }
+
+    "and two modules may each hold a file of the same name" in {
+      // `ar r` replaces by name, so a member name built from the basename alone would have the
+      // second of these silently evict the first — and the library would ship missing whatever only
+      // the first defined. Nothing else in the suite would notice.
+      val root = createTempDirectory("sysl-cli-two-c-")
+
+      for (module, symbol, value) <- List(("one", "one_util", 1), ("two", "two_util", 2)) do {
+        createDirectory(s"$root/$module")
+        writeFile(s"$root/$module/lib.sysl",
+          s"""module $module
+             |
+             |extern "$symbol" util() -> int
+             |""".stripMargin)
+        writeFile(s"$root/$module/util.c", s"int $symbol(void) { return $value; }\n")
+      }
+
+      val out = createTempFile("sysl-cli-two-c-", LibraryArtifact.extension)
+
+      cli(Config(command = "build-lib", file = root, output = Some(out))) shouldBe 0
+
+      Ar.members(readBytes(out)) match
+        case Right(members) => members.map(_.name) should contain allOf ("one.util.o", "two.util.o")
+        case Left(why)      => fail(why)
+
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // And both still resolve, which is the part the member names are in aid of.
+      ran(Config(command = "run", file = program("print(one.util() + two.util())"),
+        libs = List(out))) shouldBe "3\n"
+    }
+
+    "while a C file that would take the code member's name is refused" in {
+      // The one collision the naming scheme cannot rule out by construction, and the worst: this
+      // member would evict the object the whole library is, leaving an artifact that builds, reads
+      // back perfectly, and fails to link every program that uses it.
+      val root = createTempDirectory("sysl-cli-clash-")
+
+      createDirectory(s"$root/demo")
+      writeFile(s"$root/demo/lib.sysl", library)
+      createDirectory(s"$root/sysl")
+      writeFile(s"$root/sysl/code.c", "int f(void) { return 0; }\n")
+
+      val out = createTempFile("sysl-cli-clash-", LibraryArtifact.extension)
+      val (status, notes) = diagnostics(Config(command = "build-lib", file = root, output = Some(out)))
+
+      status should not be 0
+      notes should include(LibraryArtifact.codeMember)
+    }
+
+    "a C file that does not compile stops the build and names itself" in {
+      // The error path. Without the file in the message the user is handed clang's complaint about a
+      // path under a temporary directory, with nothing saying which of their sources it came from.
+      val root = rootWithC("demo", library, "broken.c" -> "int oops(void) { return \n")
+      val out  = createTempFile("sysl-cli-bad-c-", LibraryArtifact.extension)
+
+      deleteFile(out)
+
+      val (status, notes) = diagnostics(Config(command = "build-lib", file = root, output = Some(out)))
+
+      status should not be 0
+      notes should include("broken.c")
+      isFile(out) shouldBe false
+    }
+
+    "and the binding it makes possible really matches, at offsets nothing could have guessed" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // A binding built the way a real one is: the C holds everything only a header knows — the size
+      // of a `regex_t`, `REG_EXTENDED`, the layout of a `regmatch_t` — and the sysl side holds an
+      // opaque pointer and four integers.
+      //
+      // Every case below is chosen so that only real POSIX matching gives the number. A test whose
+      // matches all began at 0 would be satisfied by a binding that answered `0..len` to anything
+      // that matched at all, which is the coincidence worth ruling out: here a match starts and ends
+      // mid-string, a bounded repeat has to stop at its ceiling, an anchor refuses, a class is
+      // negated, case matters, a group carries a quantifier, and one match is empty.
+      //
+      // The offsets are POSIX and portable. The message for the bad pattern is the C library's own,
+      // worded differently by BSD and glibc, so only its presence is pinned.
+      val regexShim =
+        """#include <regex.h>
+          |#include <stdlib.h>
+          |
+          |void *probe_rx_new(void) { return calloc(1, sizeof(regex_t)); }
+          |
+          |void probe_rx_free(void *re) {
+          |    if (re) { regfree((regex_t *)re); free(re); }
+          |}
+          |
+          |int probe_rx_compile(void *re, const char *pattern) {
+          |    return regcomp((regex_t *)re, pattern, REG_EXTENDED);
+          |}
+          |
+          |int probe_rx_exec(void *re, const char *s, long *so, long *eo) {
+          |    regmatch_t m;
+          |
+          |    if (regexec((regex_t *)re, s, 1, &m, 0) != 0) return 0;
+          |
+          |    *so = (long)m.rm_so;
+          |    *eo = (long)m.rm_eo;
+          |
+          |    return 1;
+          |}
+          |
+          |void probe_rx_error(void *re, int code, char *buf, unsigned long n) {
+          |    regerror(code, (regex_t *)re, buf, (size_t)n);
+          |}
+          |""".stripMargin
+
+      val binding =
+        """module rx
+          |
+          |extern "probe_rx_new" c_new() -> *u8
+          |extern "probe_rx_free" c_free(re: *u8)
+          |extern "probe_rx_compile" c_compile(re: *u8, pattern: *u8) -> int
+          |extern "probe_rx_exec" c_exec(re: *u8, s: *u8, so: *i64, eo: *i64) -> int
+          |extern "probe_rx_error" c_error(re: *u8, code: int, buf: *u8, n: u64)
+          |
+          |struct Match
+          |    start: usize
+          |    end: usize
+          |
+          |struct Regex
+          |    handle: *u8
+          |
+          |    find(self, s: string) -> Option[Match]
+          |        val subject = cstring(s)
+          |
+          |        var so: i64 = 0i64
+          |        var eo: i64 = 0i64
+          |
+          |        if c_exec(self.handle, subject.ptr, &so, &eo) == 1 then
+          |            Some(Match(usize(so), usize(eo)))
+          |        else
+          |            None
+          |    end find
+          |
+          |    free(self) = c_free(self.handle)
+          |end Regex
+          |
+          |compile(pattern: string) -> Result[Regex, string]
+          |    val re   = c_new()
+          |    val p    = cstring(pattern)
+          |    val code = c_compile(re, p.ptr)
+          |
+          |    if code == 0 then
+          |        Ok(Regex(re))
+          |    else
+          |        var buf: [256]u8
+          |
+          |        c_error(re, code, &buf[0], 256u64)
+          |        c_free(re)
+          |        Err(from_cstring(&buf[0]).unwrap_or("not a pattern"))
+          |end compile
+          |""".stripMargin
+
+      val out = artifactOf(rootWithC("rx", binding, "regex.c" -> regexShim))
+
+      val prog =
+        """import rx.*
+          |
+          |show(pat: string, s: string) =
+          |    compile(pat) match
+          |        Ok(re) ->
+          |            re.find(s) match
+          |                Some(m) -> print(f"${m.start}..${m.end}")
+          |                None -> print("none")
+          |            re.free()
+          |
+          |        Err(why) -> print(f"error: ${why}")
+          |
+          |show("[0-9]+", "abc123def")
+          |show("cat|dog", "hotdog stand")
+          |show("a{2,3}", "aaaa")
+          |show("^abc$", "xabcx")
+          |show("^abc$", "abc")
+          |show("[^aeiou]+", "aeixyzou")
+          |show("ABC", "xxabcxx")
+          |show("(ab)+", "zzababab!!")
+          |show("x*", "yyy")
+          |show("a{3,1}", "aaa")
+          |""".stripMargin
+
+      val lines = ran(Config(command = "run", file = program(prog), libs = List(out))).linesIterator.toList
+
+      lines.take(9) shouldBe
+        List("3..6", "3..6", "0..3", "none", "0..3", "3..6", "none", "2..8", "0..0")
+
+      lines(9) should startWith("error: ")
+      lines(9).length should be > "error: ".length
+    }
+
+    "and editing only the C changes what the artifact fingerprints as" in {
+      // A library's shims are as much its source as its modules are. An artifact that did not change
+      // when one of them was edited is a stale artifact nothing would notice was stale — which is
+      // exactly the failure `Core.read`'s fingerprint check exists to catch for the sysl half.
+      val before = fingerprintOf(artifactOf(rootWithC("demo", usingShim, "shim.c" -> shim)))
+      val after =
+        fingerprintOf(artifactOf(rootWithC("demo", usingShim,
+          "shim.c" -> "int demo_seven(void) { return 8; }\n")))
+
+      before should not be after
+    }
+  }
+
   "--lib pointed at an artifact" - {
 
     "compiles a program against it" in {

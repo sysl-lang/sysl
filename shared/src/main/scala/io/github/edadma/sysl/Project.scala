@@ -23,18 +23,33 @@ object Project {
    * Naming a single **file** compiles that file alone, as the root module with nothing else in it.
    */
   def collect(path: String): List[Source] =
-    if isDirectory(path) then walk(path, Nil)
+    if isDirectory(path) then walk(path, Nil, ".sysl")
     else List(Source(path, readFile(path), Nil))
 
-  /** One directory of the project: its own `.sysl` files, then the sub-directories under it. A
-   * directory holding no source is not a module and contributes nothing; it is still walked, since
-   * modules further down are reached through it.
+  /** The C files of a library, which a `.sysl` file reaches by `extern` and the build compiles
+   * alongside it (`15 §7`).
+   *
+   * The same walk as `collect` and deliberately so: a C file belongs to the directory it was found
+   * in exactly as a sysl file does, which is what lets its object be named after a path that is
+   * unique across the library. It is a *separate* call rather than a second list out of one walk
+   * because every caller wants one or the other — a compilation wants the sysl and never the C, and
+   * only `build-lib` wants both.
+   *
+   * Naming a single file is not offered. A library is reached by naming its module (`13 §3`), so it
+   * is a directory before it is anything else, and a lone C file is not a library.
    */
-  private def walk(path: String, dir: List[String]): List[Source] = {
-    val entries = listFiles(path).toList.sorted
-    val here    = entries.filter(f => isFile(f) && f.endsWith(".sysl")).map(f => Source(f, readFile(f), dir))
+  def cSources(path: String): List[Source] =
+    if isDirectory(path) then walk(path, Nil, ".c") else Nil
 
-    here ::: entries.filter(isDirectory).flatMap(sub => walk(sub, dir :+ basename(sub)))
+  /** One directory of the project: its own files of the wanted kind, then the sub-directories under
+   * it. A directory holding no source is not a module and contributes nothing; it is still walked,
+   * since modules further down are reached through it.
+   */
+  private def walk(path: String, dir: List[String], ext: String): List[Source] = {
+    val entries = listFiles(path).toList.sorted
+    val here    = entries.filter(f => isFile(f) && f.endsWith(ext)).map(f => Source(f, readFile(f), dir))
+
+    here ::: entries.filter(isDirectory).flatMap(sub => walk(sub, dir :+ basename(sub), ext))
   }
 
   /** The last segment of a path, whichever separator the platform wrote it with. */

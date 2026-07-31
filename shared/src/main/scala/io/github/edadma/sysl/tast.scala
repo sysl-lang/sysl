@@ -599,4 +599,15 @@ case class TProgram(
      * belonging to whatever links it.
      */
     entryPoint: Boolean = true,
+    /** The modules that declared `no alloc` (`13 §4`). The analyzer has already held each of them to
+     * making no heap storage of its own; what this carries the answer forward for is the one
+     * allocation no expression in the tree spells — the **promotion** of a local array whose slice
+     * outlives its frame, which escape analysis decides after the walk has finished (`05`).
+     */
+    noAllocModules: Set[String] = Set.empty,
+    /** The module whose terms the statements in `main` were written in — the file that carries the
+     * program's entry point (`13 §7`). Every other body says which module it belongs to in its own
+     * key; these have no key, so the answer is carried here.
+     */
+    mainModule: String = Modules.root,
 )

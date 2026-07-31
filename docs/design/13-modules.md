@@ -370,6 +370,10 @@ that doc left to here.
   a narrowing clause **must appear consistently in every file of the module** — the compiler
   rejects a module whose files disagree. The redundancy buys local legibility: you can never open
   a file in a `no alloc` module and fail to see that it is `no alloc`.
+- **Each clause takes a line of its own**, below the header rather than beside it, which is what
+  keeps `module oskit.arch no alloc requires os` from being a line anyone has to read. A file that
+  declares **no** module may still carry one, since the anonymous root module of §1 is a module like
+  any other and a one-file program is exactly that case.
 
 ```
 // oskit/arch/cpu.sysl          // oskit/arch/mmu.sysl
@@ -388,6 +392,13 @@ no alloc                        no alloc            // same clause, enforced ide
   analysis uses for mutual recursion (`05`) is still needed *within* a module, where sibling files
   share one scope and may call each other freely; it is the cross-module direction that the DAG
   removes.
+- **For `alloc`, the check is finer than the declaration, and the standard library is why.** The
+  paragraph above describes what a *declared* requirement does, and `alloc` is mostly not declared —
+  it is inferred from use. Inferring it per module would put the whole of `sysl` on one side of a
+  line that runs through the middle of it, since `print` allocates nothing and `from_utf8` does, so
+  the inferred half is asked of **what a module calls** rather than of which modules it depends on.
+  `capabilities.md § Propagation` carries the argument; what belongs here is that this does not
+  weaken §6, which is still what makes a *declared* requirement answerable in one sweep.
 
 ## 5. Platform selection rides the same name
 
