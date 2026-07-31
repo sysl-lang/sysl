@@ -299,7 +299,7 @@ object Prelude {
       |    failed(*self) -> bool = false
       |
       |trait Reader
-      |    read(*self, into: []u8) -> []u8
+      |    read(*self, into: []u8) -> []const u8
       |    failed(*self) -> bool = false
       |
       |struct FormatSpec
@@ -792,7 +792,7 @@ object Prelude {
       |stdin() -> FdReader = fd_reader(0)
       |
       |impl Reader for FdReader
-      |    read(*self, into: []u8) -> []u8
+      |    read(*self, into: []u8) -> []const u8
       |        if into.len == 0usize then return into
       |
       |        var k = sysl_read(self.fd, &into[0], into.len)
@@ -817,7 +817,7 @@ object Prelude {
       |struct Lines
       |    src: *Reader
       |    chunk: []u8
-      |    have: []u8
+      |    have: []const u8
       |    at: usize
       |    held: &Buf[u8]
       |    done: bool

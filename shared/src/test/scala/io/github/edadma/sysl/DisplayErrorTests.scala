@@ -128,7 +128,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
      * here rather than trusted not to. */
     "may not keep the bytes it is written" in {
       err("""struct Bad
-            |    held: []u8
+            |    held: []const u8
             |impl Writer for Bad
             |    write(*self, bytes: []const u8)
             |        self.held = bytes

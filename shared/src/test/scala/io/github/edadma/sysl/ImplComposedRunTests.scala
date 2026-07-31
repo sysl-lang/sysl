@@ -155,7 +155,7 @@ class ImplComposedRunTests extends AnyFreeSpec with RunSupport {
           |    tag(self) -> string
           |impl Tag for string
           |    tag(self) -> string = "text"
-          |impl Tag for []u8
+          |impl Tag for []const u8
           |    tag(self) -> string = "bytes"
           |var s = "hi"
           |print(s.tag())

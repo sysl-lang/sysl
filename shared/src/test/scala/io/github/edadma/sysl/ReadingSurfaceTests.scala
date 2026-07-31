@@ -39,14 +39,14 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
    */
   private val byteReader =
     """struct Bytes
-      |    src: []u8
+      |    src: []const u8
       |    at: usize
       |end Bytes
       |
-      |bytes_reader(b: []u8) -> Bytes = Bytes(b, 0usize)
+      |bytes_reader(b: []const u8) -> Bytes = Bytes(b, 0usize)
       |
       |impl Reader for Bytes
-      |    read(*self, into: []u8) -> []u8
+      |    read(*self, into: []u8) -> []const u8
       |        var n = 0usize
       |
       |        while n < into.len && self.at < self.src.len
@@ -185,7 +185,7 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
           |end Empty
           |
           |impl Reader for Empty
-          |    read(*self, into: []u8) -> []u8 = into[0..<0usize]
+          |    read(*self, into: []u8) -> []const u8 = into[0..<0usize]
           |
           |var e = Empty(0)
           |var room: [4]u8
@@ -563,7 +563,7 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
            |end Trickle
            |
            |impl Reader for Trickle
-           |    read(*self, into: []u8) -> []u8
+           |    read(*self, into: []u8) -> []const u8
            |        if into.len == 0usize then return into
            |
            |        self.inner.read(into[0..<1usize])
@@ -583,12 +583,12 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
     "a reader may hand back its own buffer rather than fill the one it was given" in {
       val src =
         """struct Canned
-          |    text: []u8
+          |    text: []const u8
           |    at: usize
           |end Canned
           |
           |impl Reader for Canned
-          |    read(*self, into: []u8) -> []u8
+          |    read(*self, into: []u8) -> []const u8
           |        if self.at > 0usize then return self.text[0..<0usize]
           |
           |        self.at = 1usize
@@ -612,7 +612,7 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
           |end Stutter
           |
           |impl Reader for Stutter
-          |    read(*self, into: []u8) -> []u8
+          |    read(*self, into: []u8) -> []const u8
           |        var text = if self.step == 0 then "first\n" else if self.step == 1 then "" else "late\n"
           |
           |        self.step += 1
