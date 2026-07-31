@@ -254,6 +254,76 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
           |    print(args.len)
           |""".stripMargin)
     }
+
+    /* Everything above reaches a part of the library some earlier step needed. These reach the rest
+     * of it, because divergence is not a property of the library as a whole — the artifact carries
+     * declarations one at a time, and a surface no program here touches is one where the two paths
+     * could disagree with the suite staying green. What makes them cheap enough to be worth having
+     * is that a byte-for-byte IR comparison needs no toolchain. */
+
+    "for one that builds a string, which reaches the growable buffer under the builder" in {
+      // `StrBuilder` holds a `&Buf[u8]`, so this monomorphizes a library generic *behind* a library
+      // struct — a layout the program never names and cannot get from the precompiled half.
+      sameBothWays(
+        """var b = str_builder()
+          |b.push("count: ")
+          |b.push_char('#')
+          |print(b.finish(), b.len, b.is_empty)
+          |""".stripMargin)
+    }
+
+    "for one that hashes, which reaches the mixers a built-in's membership renders through" in {
+      // A built-in has no lowered `int.hash` to call; the trait resolves to a mixer chosen by type.
+      // Which mixer is a decision made over the core, so it is one the two paths could differ on.
+      sameBothWays(
+        """h[T: Hash](x: T) -> u64 = x.hash()
+          |print(h(7), h("x"), h(true))
+          |""".stripMargin)
+    }
+
+    "for one that implements an operator, which resolves through the library's own Add" in {
+      // `+` on a program's own struct is a library trait bound satisfied by a program `impl` — the
+      // trait declaration comes from the artifact and the table is built here.
+      sameBothWays(
+        """struct V
+          |    x: int
+          |impl Add for V
+          |    add(self, rhs: V) -> V = V(self.x + rhs.x)
+          |print((V(1) + V(2)).x)
+          |""".stripMargin)
+    }
+
+    "for one that reads lines, which reaches the library's reader surface and its buffering" in {
+      // The heaviest thing in the library that a program can reach by name: `Lines` holds a reader,
+      // a fixed array, a slice, and a `Buf` all at once.
+      sameBothWays(
+        """var r = stdin()
+          |for line in lines(&r)
+          |    print(line)
+          |end for
+          |""".stripMargin)
+    }
+
+    "for one that hands bytes to C, which reaches the owned NUL-terminated copy" in {
+      sameBothWays(
+        """var c = cstring("hi")
+          |print(c.len)
+          |""".stripMargin)
+    }
+
+    "for one that passes a read-only view into the library, the type being the library's to declare" in {
+      // `[]const u8` is what the printing and text surfaces take. A program that spells it reaches
+      // the same declarations through a different door than `print` does, and the view's constness
+      // is carried in the artifact's own encoding of the type rather than re-derived from source.
+      sameBothWays(
+        """count(b: []const u8) -> usize
+          |    var n = 0usize
+          |    for c in chars_of(b) do n += 1
+          |    n
+          |end count
+          |print(count("hello".bytes))
+          |""".stripMargin)
+    }
   }
 
   "what the artifact's object half already holds" - {
