@@ -35,8 +35,10 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       case Right(r)  => r
       case Left(err) => fail(s"the library did not build: $err")
 
-  /** The metadata as a consumer reads it back. */
-  private def metadata: (List[Program], Set[String]) =
+  /** The metadata as a consumer reads it back: the trees, the precompiled symbols, and the
+   * fingerprint of the source it was built from.
+   */
+  private def metadata: (List[Program], Set[String], String) =
     LibraryArtifact.read("demo.syslib", built._2) match
       case Right(r)  => r
       case Left(err) => fail(s"the metadata did not read back: $err")
@@ -102,7 +104,10 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
     }
 
     "refuses a truncated one rather than handing back a short object" in {
-      LibraryArtifact.unpack("x.syslib", "syslib 1 500\nshort".getBytes) match
+      // The version travels from the constant rather than being written out, so that a bump to the
+      // container format leaves this testing truncation instead of quietly testing the version
+      // check that now fires ahead of it.
+      LibraryArtifact.unpack("x.syslib", s"syslib ${LibraryArtifact.Version} 500\nshort".getBytes) match
         case Left(err) => err should include("truncated")
         case Right(_)  => fail("a truncated artifact was accepted")
     }
@@ -125,8 +130,8 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       val (ir, meta) = printing("say", "hello")
 
       LibraryArtifact.read("say.syslib", meta) match
-        case Right((_, syms)) => syms shouldBe Set("say$hello")
-        case Left(err)        => fail(err)
+        case Right((_, syms, _)) => syms shouldBe Set("say$hello")
+        case Left(err)           => fail(err)
 
       ir should include("define void @say$hello(")
       ir should include(s"declare void @${Library.key("printi")}(")
@@ -149,8 +154,8 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       }
       val trees = built.flatMap { (_, meta) =>
         LibraryArtifact.read("x.syslib", meta) match
-          case Right((t, _)) => t
-          case Left(err)     => fail(err)
+          case Right((t, _, _)) => t
+          case Left(err)        => fail(err)
       }
       val syms = Set("say$hello", "shout$loud")
       val emitted =
@@ -192,9 +197,9 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
    * driver does it — decoded metadata for the trees, the unpacked object handed to the linker.
    */
   private def linked(program: String): (String, Either[String, (Int, String)]) = {
-    val (ir, _)       = built
-    val (trees, syms) = metadata
-    val obj           = createTempFile("sysl-test-", ".o")
+    val (ir, _)          = built
+    val (trees, syms, _) = metadata
+    val obj              = createTempFile("sysl-test-", ".o")
 
     Toolchain.compileObject(ir, obj) match
       case Left(err) => fail(s"the library did not assemble: $err")

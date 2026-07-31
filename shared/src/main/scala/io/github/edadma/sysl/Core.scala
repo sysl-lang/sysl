@@ -86,7 +86,19 @@ object Core {
    * to. The symbols the artifact's object half already defines come back beside it: they are what a
    * program **declares** rather than defines a second time, and they belong to the caller that has
    * a linker to hand them to.
+   *
+   * **An artifact built from a different `lib/sysl` is refused here**, which is the one check a
+   * consumer of the *standard* module can make and a consumer of any other library cannot: the
+   * compiler carries the source this was supposed to be built from, so it can say whether it was
+   * (`Std.fingerprint`). Without it the artifact is built separately and can drift — and a stale one
+   * decodes and links perfectly well, it is simply the wrong library, which is the worst way for
+   * this to fail. Refusing puts it on the path a corrupt one already takes: a warning, and the copy
+   * the compiler carries.
    */
   def read(name: String, metadata: String): Either[String, (Core, Set[String])] =
-    LibraryArtifact.read(name, metadata).map((units, precompiled) => (new Core(units), precompiled))
+    LibraryArtifact.read(name, metadata).flatMap((units, precompiled, source) =>
+      if source == Std.fingerprint then Right((new Core(units), precompiled))
+      else
+        Left(s"$name was built from a different standard module than this compiler carries — " +
+          "rebuild it with 'sysl build-lib lib --core'"))
 }

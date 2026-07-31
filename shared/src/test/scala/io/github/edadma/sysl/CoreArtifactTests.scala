@@ -64,6 +64,19 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
   /** The same program with the core's object half linked rather than emitted. */
   private def linked(program: String): String = against(decoded, program, precompiled)
 
+  /** The core's metadata with one of its files changed, which is what an edit to `lib/sysl` after an
+   * artifact was built amounts to.
+   */
+  private lazy val drifted: String = {
+    val edited = Std.sources.head
+
+    LibraryArtifact.build(
+      new Source(edited.name, edited.text + "\nunreachable() -> int = 1\n", edited.dir) :: Std.sources.tail,
+      Target.default, LibraryArtifact.core) match
+      case Right((_, meta)) => meta
+      case Left(err)        => fail(s"the altered core did not build: $err")
+  }
+
   /** The symbols a module defines, and the ones it leaves to the linker. */
   private def defines(ir: String): Set[String] = symbols(ir, "define")
   private def declares(ir: String): Set[String] = symbols(ir, "declare")
@@ -119,6 +132,35 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       // carry the library or the first assertion would hold for a compiler that emitted nothing.
       defines(against(Core.embedded, "print(1)\n"))
         .filter(_.startsWith(Library.key(""))) should not be empty
+    }
+  }
+
+  "an artifact built from a different standard module than the compiler carries" - {
+
+    // The failure this exists for is the quiet one. The artifact is built separately from the
+    // compiler that consumes it, so the two drift: build one, edit `lib/sysl`, and every compilation
+    // afterwards is against a standard module that is not the one in the tree. A stale artifact
+    // decodes and links perfectly — it is simply the wrong library, and nothing else would notice.
+
+    "is refused, rather than compiled against" in {
+      Core.read("stale.syslib", drifted) match
+        case Left(err) => err should include("different standard module")
+        case Right(_)  => fail("a core built from other source was accepted")
+    }
+
+    "while the one built from what the compiler carries is accepted" in {
+      // Discriminating against the above: without this the refusal could be unconditional, which
+      // would reject every artifact and look exactly as green.
+      Core.read("sysl.syslib", artifact._2) shouldBe a[Right[?, ?]]
+    }
+
+    "and the fingerprint is what tells them apart" in {
+      LibraryArtifact.fingerprint(Std.sources) shouldBe Std.fingerprint
+      LibraryArtifact.fingerprint(Std.sources.reverse) shouldBe Std.fingerprint
+      LibraryArtifact.fingerprint(
+        Std.sources.map(s => new Source(s"/elsewhere/${Project.basename(s.name)}", s.text, s.dir)))
+        .shouldBe(Std.fingerprint)
+      LibraryArtifact.fingerprint(Std.sources.tail) should not be Std.fingerprint
     }
   }
 
@@ -237,8 +279,8 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       fromDisk match
         case Right((_, meta)) =>
           LibraryArtifact.read("disk.syslib", meta) match
-            case Right((_, syms)) => syms shouldBe precompiled
-            case Left(err)        => fail(err)
+            case Right((_, syms, _)) => syms shouldBe precompiled
+            case Left(err)           => fail(err)
         case Left(err) => fail(s"the core library did not build from disk: $err")
     }
   }

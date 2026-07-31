@@ -74,6 +74,23 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
     (status, captured.toString)
   }
 
+  /** An artifact whose header promises more than the file holds. The version comes from the constant
+   * rather than being written out, so that a bump to the container format leaves these testing
+   * truncation rather than the version check that would otherwise fire ahead of it.
+   */
+  private def truncated: Array[Byte] = s"syslib ${LibraryArtifact.Version} 900\nshort".getBytes
+
+  /** The real core's metadata wearing somebody else's fingerprint — a readable, decodable artifact
+   * that is simply not the standard module this compiler carries.
+   */
+  private def stale: String = {
+    val meta = LibraryArtifact.unpack(core, readBytes(core)) match
+      case Right((m, _)) => m
+      case Left(err)     => fail(err)
+
+    "0000000000000000" + meta.drop(meta.indexOf('\n'))
+  }
+
   private def corrupt(bytes: Array[Byte]): String = {
     val path = createTempFile("sysl-cli-bad-", LibraryArtifact.extension)
     writeBytes(path, bytes)
@@ -174,7 +191,7 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
     "refuses a truncated one" in {
       cli(Config(command = "emit-llvm", file = program("print(1)"),
-        libs = List(corrupt("syslib 1 900\nshort".getBytes)))) should not be 0
+        libs = List(corrupt(truncated)))) should not be 0
     }
 
     "refuses one that is not there at all" in {
@@ -251,9 +268,15 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
       fallsBack("when another sysl built it", corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes))
 
-      fallsBack("when it is truncated", corrupt("syslib 1 900\nshort".getBytes))
+      fallsBack("when it is truncated", corrupt(truncated))
 
-      fallsBack("when its metadata will not decode", corrupt(LibraryArtifact.pack("0\nrubbish", Array.empty)))
+      fallsBack("when its metadata will not decode",
+        corrupt(LibraryArtifact.pack("0000000000000000\n0\nrubbish", Array.empty)))
+
+      // The one a developer actually meets: build the artifact, then edit `lib/sysl`. It decodes and
+      // would link perfectly — it is simply no longer the standard module in the tree — so nothing
+      // but the fingerprint would catch it, and a silently wrong library is the worst of the five.
+      fallsBack("when it was built from a different lib/sysl", corrupt(LibraryArtifact.pack(stale, Array.empty)))
     }
 
     "and having fallen back, emits the standard module rather than declaring it" in {
@@ -280,7 +303,7 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
 
       LibraryArtifact.unpack(out, readBytes(out)).flatMap(r => LibraryArtifact.read(out, r._1)) match
-        case Right((trees, syms)) =>
+        case Right((trees, syms, fingerprint)) =>
           // Every symbol is the standard module's own. The renderers reach the library's
           // `sysl_snprintf` and the library's `putbytes` under them, and **none of those is in
           // here** — a library defines its own declarations and nobody else's, and the core library
@@ -289,6 +312,12 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
           syms should not be empty
           syms.filterNot(_.startsWith(s"${Std.module}${Modules.sep}")) shouldBe empty
           trees.flatMap(_.module.map(_.show)).distinct shouldBe List(Std.module)
+
+          // And it fingerprints as the library the compiler carries, though this one was walked off
+          // disk and named by where it was found while the carried copy is named by where the
+          // generator read it. If the fingerprint were over paths rather than contents, the guard in
+          // `Core.read` would reject every artifact the documented command produces.
+          fingerprint shouldBe Std.fingerprint
         case Left(err) => fail(err)
 
       deleteFile(out)

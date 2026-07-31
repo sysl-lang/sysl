@@ -48,6 +48,22 @@ object Std {
   val sources: List[Source] =
     CoreSource.files.map((name, text) => Source(name, text, List(module)))
 
+  /** What the library's source amounts to, for telling a prebuilt artifact built from *this* library
+   * from one built from a different version of it.
+   *
+   * The artifact is built separately from the compiler that consumes it, and the two can therefore
+   * fall out of step: build one, edit `lib/sysl`, and every compilation after that would be against
+   * a standard module that is not the one in the tree. Nothing else would notice — a stale artifact
+   * decodes perfectly and links perfectly, it is just the wrong library. This is what an artifact is
+   * held to on the way in ([[Core.read]]).
+   *
+   * It composes with the other guard rather than duplicating it: edit `lib/sysl` and rebuild the
+   * compiler, and this moves, so a stale artifact is caught here; edit and *don't* rebuild, and
+   * `CoreSource` is the stale thing, which is what `CoreLibraryTests` is for. Between them there is
+   * no gap.
+   */
+  lazy val fingerprint: String = LibraryArtifact.fingerprint(sources)
+
   /** The parsed standard module, parsed once. */
   lazy val parsed: List[Program] =
     sources.map(s =>
