@@ -66,6 +66,77 @@ class RawStorageRunTests extends AnyFreeSpec with RunSupport with CodegenSupport
     run(src) shouldBe "1 4 8 8 8 1\n"
   }
 
+  /** Claims other chapters make about storage, asked in the language for the first time.
+   *
+   * Every one of these was previously checkable only against `Layout` — the compiler's internal
+   * model — which is a different assertion from the one the chapter makes: `Layout` is what the
+   * compiler believes, and these are what a *program* is told. They agree here because `sizeof` is
+   * that same measurement surfaced, and pinning them at this seam is what keeps the prose honest.
+   */
+  "what other chapters claim about storage, now that a program can ask" - {
+    "`15 §1` — fields are laid out in declaration order and never reordered" in {
+      val src =
+        """struct Ordered
+          |    a: u8
+          |    b: i64
+          |var o = Ordered(1u8, 2)
+          |print(sizeof(Ordered) == 16, usize(&o.b) - usize(&o.a))""".stripMargin
+
+      run(src) shouldBe "true 8\n"
+    }
+    "`03` — a data enum's payload is one region, so four variants of one scalar are one scalar wide" in {
+      val src =
+        """enum Step
+          |    Wait(ticks: int)
+          |    Move(by: int)
+          |    Tick(n: int)
+          |    Flag(f: u8)
+          |print(sizeof(Step))""".stripMargin
+
+      run(src) shouldBe "8\n"
+    }
+    "`09 § Open a` — an Option of a reference is sixteen bytes, which is the tag width it wants to narrow" in {
+      run("struct Node\n    v: int\nprint(sizeof(Option[&Node]))") shouldBe "16\n"
+    }
+    "`03` — a pointer to a trait is two words, since it carries the table too" in {
+      val src =
+        """trait Shape
+          |    area(self) -> int
+          |print(sizeof(*Shape), sizeof(&Shape), alignof(*Shape))""".stripMargin
+
+      run(src) shouldBe "16 16 8\n"
+    }
+    "`03` — a weak reference is an address like the other two, and the same width" in {
+      run("struct Node\n    v: int\nprint(sizeof(weak Node), alignof(weak Node))") shouldBe "8 8\n"
+    }
+    "`00 §5` — an odd width costs what LLVM makes it cost, not its bit count over eight" in {
+      run("print(sizeof(u12), alignof(u12), sizeof(u96), alignof(u96))") shouldBe "2 2 16 16\n"
+    }
+    "`16 §5` — a constrained subtype is laid out as the type it constrains" in {
+      val src =
+        """type Age = int within 0..150
+          |print(sizeof(Age) == sizeof(int), alignof(Age) == alignof(int))""".stripMargin
+
+      run(src) shouldBe "true true\n"
+    }
+    /** An array of them is a different question and the language refuses one outright, which is why
+     * this asks only about the type itself — see the companion in the error suite.
+     */
+    "`00 §13` — a zero-sized type occupies nothing, and is still aligned to something" in {
+      run("print(sizeof(unit), alignof(unit))") shouldBe "0 1\n"
+    }
+    "a struct field that occupies nothing changes neither measurement" in {
+      val src =
+        """struct WithNothing
+          |    a: int
+          |    n: unit
+          |    b: int
+          |print(sizeof(WithNothing), alignof(WithNothing))""".stripMargin
+
+      run(src) shouldBe "8 4\n"
+    }
+  }
+
   "both are compile-time constants, so they stand where a constant is required" - {
     "in a 'const'" in {
       run("struct Node\n    v: int\n    n: *Node\nconst BLOCK: usize = sizeof(Node)\nprint(BLOCK)") shouldBe "16\n"

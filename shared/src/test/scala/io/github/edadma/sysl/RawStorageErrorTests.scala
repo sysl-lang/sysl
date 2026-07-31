@@ -119,6 +119,34 @@ class RawStorageErrorTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
+  /** The operands with no width to give. `Layout` answers with a `sys.error` for each of these,
+   * because nothing inside the compiler ever asks — so the question is whether the *diagnostic*
+   * arrives first, which is what keeps a reader's typo from ending in a stack trace.
+   */
+  "an operand that has no storage is refused before it is measured" - {
+    "a bare trait name, which is only ever the pointee of a pointer" in {
+      err("trait Shape\n    area(self) -> int\nprint(sizeof(Shape))") should not be empty
+    }
+    "a name that is not a type at all" in {
+      err("print(sizeof(Nope))") should not be empty
+    }
+    "a name that is a value rather than a type" in {
+      err("var n = 3\nprint(sizeof(n))") should not be empty
+    }
+    "a generic given the wrong number of arguments" in {
+      err("print(sizeof(Option[int, int]))") should not be empty
+    }
+  }
+
+  /** Found by asking `sizeof` about one: `unit` has a width, and an array of it is refused anyway.
+   * The two are not in tension — the array rule is about there being no element to address, not
+   * about the width being zero — but a reader who has just been told the width is a number can
+   * reasonably try, so the refusal is pinned beside the measurement.
+   */
+  "a zero-sized type has a width, and an array of one is still refused" in {
+    err("print(sizeof([8]unit))") should include("occupies no storage")
+  }
+
   /** A type's own size cannot be part of its own layout — C's "incomplete type", reached here
    * through the array bound that asks. It used to end the compiler with a stack trace about a `void`
    * alignment; the diagnostic the reader is owed is the cycle, at the `sizeof` that closed it.
