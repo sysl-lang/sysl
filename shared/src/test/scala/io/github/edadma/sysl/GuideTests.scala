@@ -257,9 +257,9 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
 
   // The one program whose subject is the checking rather than the computing: two implementations of
   // the same buffer, one keeping where the elements end and one computing it, driven through every
-  // scenario side by side and required to agree. What it cannot do is break a contract — a violated
-  // `require` traps, so the program would end rather than report — and those claims are asserted in
-  // `RingClaimTests` instead.
+  // scenario side by side and required to agree. What this run cannot do is break a contract — a
+  // violated `require` traps, so the program would end rather than report — and those claims are
+  // the `#test` functions the case below runs.
   "ring — bounded indices, and an invariant that found a redundant field" in {
     val out = guide("ring")
 
@@ -280,15 +280,18 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
 
   // The other half of the ring's evidence, and the half its own run cannot produce: a refusal
   // traps, and a trap ends the run rather than reporting into it. Each of these passes by not
-  // coming back (`testing.md`).
+  // coming back (`testing.md`). This was `RingClaimTests`, asserting the same claims from Scala
+  // against cut-down copies of the ring's shapes; it is now stated in sysl against the shapes
+  // themselves, which is what `#test(should_trap)` bought.
   //
   // The count is asserted for the reason the check counts above are: a `should_trap` test that
   // stopped being compiled would look exactly like one that passed, since there would be no failing
-  // line to see. What keeps the traps themselves honest is the two ordinary tests beside them —
-  // they build the same fixtures and *return*, so a trap that fired while a ring was being set up
-  // would fail those rather than quietly satisfying the ones that expect it.
+  // line to see. What keeps the traps themselves honest is that **every refusal is written beside
+  // the call that is not refused** — the ordinary tests build the same fixtures and *return*, so a
+  // trap that fired while a ring was being set up would fail those rather than quietly satisfying
+  // the ones that expect it.
   "ring — the refusals, which the program's own run cannot assert" in {
-    guideTests("ring") should have length 9
+    guideTests("ring") should have length 18
   }
 
   // The one program that *makes* storage rather than being handed it. `guide/kernel` is
