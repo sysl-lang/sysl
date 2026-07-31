@@ -144,6 +144,28 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       Library.known -- Library.declared shouldBe Set.empty
     }
 
+    // `Library.key` is a lookup from a spelling to the module that declares it, so a spelling in two
+    // of the library's modules would give one of them an answer that is silently the other's. It is
+    // a real hazard now that there is more than one module and no machinery guarding it: this is the
+    // guard, and it is enough because `key` is only ever asked about `known`.
+    "each in exactly one of the library's modules" in {
+      val declaredIn =
+        for
+          u <- Core.embedded.units
+          n <- Library.names(u.body) if Library.known(n)
+        yield n -> Compiler.moduleOf(u)
+
+      declaredIn.groupMap(_._1)(_._2).filter(_._2.distinct.length > 1) shouldBe empty
+      declaredIn.map(_._1).toSet shouldBe Library.known
+    }
+
+    "and `key` names that module, wherever in the library it turned out to be" in {
+      // The one that moved, which is why this is a lookup rather than the standard module's
+      // qualification: a `main` taking arguments reaches it from inside the compiler.
+      Library.key("args_of") shouldBe Modules.qualify("sysl.args", "args_of")
+      Library.key("Option") shouldBe Modules.qualify(Std.module, "Option")
+    }
+
     "and the traits the operator catalog names" in {
       CoreTraits.required.keySet -- Library.declared shouldBe Set.empty
     }

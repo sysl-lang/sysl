@@ -196,6 +196,79 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     }
   }
 
+  "the edges of the arrangement" - {
+    // A submodule is a directory and nothing more, so nothing stops at one level. Pinned because
+    // every part of the machinery — the generator's walk, the derivation of a file's module, the
+    // path a program writes — is written once and would be just as green if it only ever handled
+    // one segment.
+    "a submodule of a submodule is reached the same way" in {
+      irAgainstTree(
+        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl.text.utf8", "d.sysl", "module sysl.text.utf8\ndecode(n: int) -> int = n * 3"),
+      )(
+        "main.sysl" -> "sysl.text.utf8.decode(7)",
+      ) should include(s"call i32 @${Modules.qualify("sysl.text.utf8", "decode")}")
+    }
+
+    // `import a.b.c` binds the last segment as the module's short name, which is a rule about
+    // imports rather than about the library — so the library's submodules get it too, and the terse
+    // spelling a program cannot write unasked-for is one it can ask for.
+    "an imported submodule is named by its last segment" in {
+      irAgainstTree(tree*)(
+        "main.sysl" -> "import sysl.sys\nsys.flag(21)",
+      ) should include(s"call i32 @${sysKey("flag")}")
+    }
+
+    // The wildcard offers only what is visible from where it was written (`13 §3`), and a submodule
+    // is where a library keeps what it does not offer — so the two meet here rather than in theory.
+    //
+    // "Undefined" and not the restriction, which is what an ordinary module's wildcard says too: a
+    // wildcard passes over what it cannot see rather than offering it and refusing. The standard
+    // module answers the other way for the same name (`VisibilityTests`) because it is reached at a
+    // step of its own where the name *is* a candidate — a submodule has no such step, which is the
+    // point of it being a submodule.
+    "a wildcard over a submodule does not offer what it keeps" in {
+      errAgainstTree(kept*)(
+        "main.sysl" -> "import sysl.sys.*\nhold(21)",
+      ) should include("undefined function 'hold'")
+    }
+
+    "while naming it in a selector is refused where the selector is written" in {
+      errAgainstTree(kept*)(
+        "main.sysl" -> "import sysl.sys.hold\nhold(21)",
+      ) should include("'sysl.sys.hold' is private to module 'sysl'")
+    }
+
+    // A scope argument is one segment, resolved outward from the declaration (`13 §2`), so a
+    // submodule names itself by its own last segment — `private[sys]` inside `sysl.sys`. That makes
+    // `sysl` *outside* it: the ancestor direction does not run both ways, and a submodule can keep
+    // something from the standard module as well as the other way round.
+    "a submodule may keep something from the standard module too" in {
+      errAgainstTree(
+        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
+        ("sysl.sys", "sys.sysl", "module sysl.sys\nprivate[sys] hold(n: int) -> int = n * 2"),
+      )(
+        "main.sysl" -> "mark(21)",
+      ) should include("'sysl.sys.hold' is private to module 'sysl.sys'")
+    }
+
+    "while `private[sysl]` on the same declaration reaches the whole library, which is the widening" in {
+      irAgainstTree(kept*)(
+        "main.sysl" -> "mark(21)",
+      ) should include(s"call i32 @${sysKey("hold")}")
+    }
+
+    // A program's own directory tree makes its own module names, and a module of the library is
+    // refused only where the library actually carries it — so a name that merely *looks* like one
+    // of the library's is the program's to use.
+    "a program may declare a module under a library name the library does not carry" in {
+      irAgainstTree(tree*)(
+        "mine.sysl" -> "module sysl.other\nflag(n: int) -> int = n + 5",
+        "main.sysl" -> "sysl.other.flag(21)",
+      ) should include(s"call i32 @${Modules.qualify("sysl.other", "flag")}")
+    }
+  }
+
   // The real library, which is what all of the above was for. Five names left the set every program
   // gets for free: the four C functions the printing and reading are built on, and the argument
   // conversion nearly nobody calls.

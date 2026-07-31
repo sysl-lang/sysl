@@ -128,7 +128,10 @@ object Library {
    */
   lazy val declared: Set[String] = names(decls)
 
-  private def names(stmts: List[Stmt]): Set[String] = stmts.flatMap {
+  /** The spellings a set of statements declares at the top level. Reachable from a test, which is
+   * what holds `key`'s lookup to naming exactly one declaration per spelling.
+   */
+  private[sysl] def names(stmts: List[Stmt]): Set[String] = stmts.flatMap {
     case d: ConstDecl  => List(d.name)
     case d: ValDecl    => List(d.name)
     case d: FuncDecl   => List(d.name)
