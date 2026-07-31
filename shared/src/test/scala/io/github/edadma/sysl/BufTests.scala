@@ -20,6 +20,17 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class BufTests extends AnyFreeSpec with RunSupport {
 
+  /** `Buf` is `sysl.buf`'s: a growable sequence is something a program asks for, not something the
+   * language desugars onto. Written once here so that each program below is about the sequence.
+   */
+  private val importing = "import sysl.buf.*\n\n"
+
+  override protected def run(src: String): String = super.run(importing + src)
+
+  override protected def exits(src: String): Unit = super.exits(importing + src)
+
+  override protected def panics(src: String, message: String): Unit = super.panics(importing + src, message)
+
   "the basic shape" - {
     "push, len, and read back" in {
       run(

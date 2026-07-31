@@ -670,7 +670,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     "and its own 'putbytes', which the writer table still resolves past" in {
       // The `print` on the last line is itself the check: every renderer writes through the
       // library's sink, so if the program's had been picked there would be no output at all.
-      run("""putbytes(b: []const u8) -> int = 7
+      run("""import sysl.buf.byte_sink
+            |
+            |putbytes(b: []const u8) -> int = 7
             |
             |var g = byte_sink()
             |var w: *Writer = &g
@@ -688,7 +690,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     // that before, and a generic is exactly where a key could have been dropped without a failure.
     "an instantiation a program asks for is keyed by the module the generic is declared in" in {
       val out = Compiler.compileToLlvm(
-        """var b: Buf[int] = buf()
+        """import sysl.buf.*
+          |
+          |var b: Buf[int] = buf()
           |b.push(7)
           |print(b[0usize], b.len())""".stripMargin)
 
@@ -704,7 +708,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     // spanned the halves; the keying it pins is unchanged by their having joined.
     "and its impl of a trait declared elsewhere is keyed under the subject, not the trait" in {
       val out = Compiler.compileToLlvm(
-        """var b: Buf[int] = buf()
+        """import sysl.buf.*
+          |
+          |var b: Buf[int] = buf()
           |b.push(7)
           |print(b[0usize])""".stripMargin)
 
@@ -714,8 +720,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     "a program may declare a 'Buf' of its own, and what the library builds on still means the library's" in {
       // `StrBuilder` holds a `&Buf[u8]`, so the library reaches its own `Buf` through a second
       // declaration rather than at the call — and now across two of its own modules, since the
-      // builder is `sysl.text`'s and the buffer is `sysl`'s. With a *generic*, too, where the
-      // program's own is not even the same arity of thing.
+      // builder is `sysl.text`'s and the buffer is `sysl.buf`'s. With a *generic*, too, where the
+      // program's own is not even the same arity of thing, and with the program's `Buf` reached by
+      // the bare word while the library's is reached by neither of the imports written here.
       run(
         """import sysl.text.str_builder
           |
@@ -738,7 +745,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |    only: T
           |
           |var mine: Buf[int] = Buf(9)
-          |var theirs: sysl.Buf[int] = buf()
+          |var theirs: sysl.buf.Buf[int] = sysl.buf.buf()
           |
           |theirs.push(3)
           |print(mine.only, theirs[0usize], theirs.len())
@@ -746,10 +753,13 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
 
     "a sink the library supplies gathers a rendering that pads across the whole value" in {
-      // `ByteSink` is why `Buf` had to move with it: it is the writer a multi-part `Display`
-      // gathers into before its specifier can pad what the parts came to.
+      // `ByteSink` is why it sits with `Buf`: it is the writer a multi-part `Display` gathers into
+      // before its specifier can pad what the parts came to, and it is ordinary sysl over the
+      // buffer. Three modules meet in one body here — the sink's, the validator's, and `sysl`'s own
+      // renderers, which arrive with nothing written because `print` is what desugars onto them.
       run(
-        """import sysl.text.from_utf8
+        """import sysl.buf.byte_sink
+          |import sysl.text.from_utf8
           |
           |struct Pair
           |    a: int
@@ -874,7 +884,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     // meaning the library's, which is the whole distinction these two make.
     "a program may declare an 'Index' of its own, and a subscript still means the library's" in {
       run(
-        """trait Index[I, E]
+        """import sysl.buf.*
+          |
+          |trait Index[I, E]
           |    lookup(self, i: I) -> E
           |
           |var b: Buf[int] = buf()
@@ -901,7 +913,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       // The advice spelled `'Index'` literally while resolving `IndexSet` by key — the standing
       // defect, found again by the audit rather than by a failure.
       refused(
-        """var b: Buf[int] = buf()
+        """import sysl.buf.*
+          |
+          |var b: Buf[int] = buf()
           |
           |b.push(1)
           |b[0usize] += 2

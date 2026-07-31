@@ -53,7 +53,7 @@ class TrailingCommaTests extends AnyFreeSpec with RunSupport with CodegenSupport
     }
 
     "a type-argument list" in {
-      run("var b: &Buf[int,] = buf()\nb.push(7)\nprint(b.at(0))") shouldBe "7\n"
+      run("import sysl.buf.*\n\nvar b: &Buf[int,] = buf()\nb.push(7)\nprint(b.at(0))") shouldBe "7\n"
     }
 
     "a type-parameter list" in {

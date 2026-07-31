@@ -167,7 +167,7 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // indirect call the trait's own methods are.
     "a required trait's method is callable on the object by name" in {
       run(
-        "import sysl.text.from_utf8\n\n" + shape +
+        "import sysl.buf.byte_sink\nimport sysl.text.from_utf8\n\n" + shape +
           """var o: &Shape = Rect(3, 4)
             |var g = byte_sink()
             |o.display(&g, FormatSpec(0, -1, false))
@@ -197,7 +197,7 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // type must render differently.
     "two implementations behind one object type render differently" in {
       run(
-        shape +
+        "import sysl.buf.*\n\n" + shape +
           """struct Dot
             |    v: int
             |impl Shape for Dot

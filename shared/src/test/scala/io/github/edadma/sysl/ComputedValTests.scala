@@ -312,7 +312,9 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // carry a reference — the region it runs in lets go of the buffer before the next one starts.
     "an initializer may allocate on the way to a plain value" in {
       val src =
-        """total() -> int
+        """import sysl.buf.*
+          |
+          |total() -> int
           |    var b: &Buf[int] = buf()
           |    for i in 0..<5 do b.push(i)
           |    var s = 0
@@ -379,7 +381,9 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // stands, and it may hold whatever a `var` may.
     "a local 'val' still holds what a module one may not" in {
       val src =
-        """head() -> int
+        """import sysl.buf.*
+          |
+          |head() -> int
           |    var b: &Buf[int] = buf()
           |    b.push(3)
           |    val xs = b.view()

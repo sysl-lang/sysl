@@ -11,6 +11,14 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class DisplayRunTests extends AnyFreeSpec with RunSupport {
 
+  /** `Display`, `Writer` and the renderers are the standard module's, since `print` desugars onto
+   * them. The one sink the library supplies is `sysl.buf`'s, being ordinary sysl over the growable
+   * buffer, so the programs that gather into one ask for it.
+   */
+  private val importing = "import sysl.buf.*\n\n"
+
+  override protected def run(src: String): String = super.run(importing + src)
+
   /** A pair whose rendering is unmistakable — punctuation the two fields could not have produced
    * on their own, so a call that reached the wrong renderer shows up as missing text rather than
    * as a plausible wrong number.

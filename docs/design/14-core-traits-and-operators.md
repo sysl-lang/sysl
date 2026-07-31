@@ -297,15 +297,23 @@ Three decisions, each following Rust's experience rather than its packaging:
 `*self` on both methods is what makes a writer stateful — a counter, a latch, a buffer — while
 staying object-safe for a raw object (`02`), so a sink needs no allocator.
 
-**Which writers the library supplies: one, `ByteSink`.** The two that `print` and `str` themselves
-use are the compiler's, and the standard-output one has to be — it holds no state, and there is no
-struct with no fields to give it. Its `write` is the library's own `putbytes`, which is one of the two
-seams a freestanding target replaces — the other being `FdReader.read`, below.
+**Which writers the library supplies: one, `ByteSink`, and it is `sysl.buf`'s.** The two that `print`
+and `str` themselves use are the compiler's, and the standard-output one has to be — it holds no
+state, and there is no struct with no fields to give it. Its `write` is the library's own `putbytes`,
+which is one of the two seams a freestanding target replaces — the other being `FdReader.read`, below.
+
+That the sink is imported while `Writer`, `Display`, `FormatSpec` and the renderers are not is the
+line `04` draws, applied here: a `print` is a keyword and reaches all four of those for itself, so
+they stay free; a program *gathering* into a sink has written the word `byte_sink` and can say where
+it comes from. The sink sits with `Buf` rather than in a module of its own because it is a dozen
+lines over one, and `13 §6` would refuse the two being split with the dependency running both ways.
 
 The other was `07`'s *Not yet* until a `[]T` could be sized while running, and once `Buf[T]` existed
 it was a dozen lines of ordinary sysl:
 
 ```
+module sysl.buf
+
 struct ByteSink
     bytes: &Buf[u8]
 

@@ -339,7 +339,7 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     // `Group.area` calls `area` through the table, and one of the parts is another `Group`. Nothing
     // in the implementation knows that, which is the point: the recursion is in the values.
     "reaches itself through the table when it holds itself" in {
-      val out = run(shape +
+      val out = run("import sysl.buf.*\n\n" + shape +
         """struct Group
           |    parts: &Buf[&Shape]
           |impl Shape for Group

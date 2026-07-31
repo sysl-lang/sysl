@@ -422,7 +422,9 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
     // it is called on a value, read as a property, or found through a trait object.
     "a library member a program calls is emitted" in {
       val out = Compiler.compileToLlvm(
-        """var g = byte_sink()
+        """import sysl.buf.byte_sink
+          |
+          |var g = byte_sink()
           |var w: *Writer = &g
           |display_str("x", w, FormatSpec(0, -1, false))
           |print(g.text().len)""".stripMargin,

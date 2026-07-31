@@ -472,6 +472,11 @@ could not leave either — `sysl.text` had a caller in `sysl`, and moving it wou
 Moving the reading surface first is what freed it. Which surface moves first is therefore decided by
 the graph and not by which one is tidiest to move.
 
+The library's tree as it stands, read as edges: `sysl.sys` needs nothing; `sysl` reaches `sysl.sys`;
+`sysl.buf` reaches `sysl`; `sysl.text` reaches `sysl` and `sysl.buf`; `sysl.io` reaches all four;
+`sysl.args` reaches `sysl`, `sysl.buf` and `sysl.text`. Every edge runs away from the standard module
+and none runs back, which is what makes any of them removable from a program that never asks.
+
 Three things follow from acyclicity:
 
 - **Modules can be compiled in dependency order, and independent modules in parallel.** A

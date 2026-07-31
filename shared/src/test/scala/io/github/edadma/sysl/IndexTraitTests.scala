@@ -26,6 +26,19 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class IndexTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
+  /** `Index` and `IndexSet` are the standard module's, since a subscript is what reaches them — but
+   * the library type they are demonstrated on is `sysl.buf`'s, so the programs here ask for it.
+   */
+  private val importing = "import sysl.buf.*\n\n"
+
+  override protected def run(src: String): String = super.run(importing + src)
+
+  override protected def err(src: String): String = super.err(importing + src)
+
+  override protected def ir(src: String): String = super.ir(importing + src)
+
+  override protected def panics(src: String, message: String): Unit = super.panics(importing + src, message)
+
   /** A trait with an index type and an element type, and a struct that keeps two of it. */
   private val get =
     """trait Get[I, E]

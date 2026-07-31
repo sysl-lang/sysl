@@ -104,7 +104,9 @@ class RecursiveTeardownRunTests extends AnyFreeSpec with RunSupport {
   // graph apart is a program's own responsibility rather than the language's.
   "two types that hold each other are reclaimed once the loop is cleared" in {
     val src =
-      """struct Waiter
+      """import sysl.buf.*
+        |
+        |struct Waiter
         |    id: int
         |    on: Option[&Held]
         |struct Held

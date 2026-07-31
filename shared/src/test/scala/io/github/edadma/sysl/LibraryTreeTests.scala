@@ -379,5 +379,35 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     "though naming the cursor itself does need one" in {
       errOf("main.sysl" -> "var c: Chars = \"ab\".chars") should include("unknown type 'Chars'")
     }
+
+    // An array literal makes a `[]T` and a `for` walks anything that implements `Iterate`, so
+    // nothing the language does reaches the growable sequence: a program that wants one asks.
+    "put the growable sequence behind an import" in {
+      errOf("main.sysl" -> "var b: Buf[int] = buf()") should include("unknown type 'Buf'")
+    }
+
+    "and the sink built on it, which is a program's only supplied Writer" in {
+      errOf("main.sysl" -> "var g = byte_sink()") should include("undefined function 'byte_sink'")
+    }
+
+    "while an import reaches the generic, whose instantiation is keyed by the module it moved to" in {
+      irOf(
+        "main.sysl" -> "import sysl.buf.*\n\nvar b: Buf[int] = buf()\nb.push(7)\nprint(b[0usize])",
+      ) should include(s"@${Library.key("Buf")}.push.int(")
+    }
+
+    // The sink could move because nothing the language does reaches it: a render lays out storage
+    // the compiler chose, not a `ByteSink`. So a program may still make itself printable — naming
+    // `Display`, `Writer`, `FormatSpec` and a renderer, all of them the standard module's — with
+    // no import written at all, which is the half of `04`'s line that did *not* move.
+    "while making a value printable still needs nothing named at all" in {
+      irOf(
+        "main.sysl" ->
+          ("struct P\n    n: int\n\n" +
+            "impl Display for P\n" +
+            "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"p\", out, fmt)\n\n" +
+            "print(f\"[${P(1)}%4s]\")\n"),
+      ) should include(s"@${Library.key("display_str")}(")
+    }
   }
 }

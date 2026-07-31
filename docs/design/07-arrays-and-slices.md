@@ -150,6 +150,11 @@ compiler knows: a `[]T` field for the storage, a count of how much of it is live
 `remove`, `truncate`, `at`, `set`, `view`, `len`, `cap`, `is_empty`, `clear`. That it can be written at all is
 the interesting part, and it is what the section above bought.
 
+It lives in **`sysl.buf`**, with the `ByteSink` written over it, so a program that wants one writes
+`import sysl.buf.*`. Nothing in the language reaches it — an array literal makes a `[]T` and a `for`
+walks whatever implements `Iterate` — which is the test `13 §8` applies: what a program cannot avoid
+needing arrives free, and what it has to ask for it asks for.
+
 **Three of those shorten it, and they are one operation.** `truncate(n)` lowers the count to `n`,
 and does nothing where `n` is a length the buffer does not have — a length past the end names no
 element, so unlike an index there is nothing for it to read and nothing to stop the program about.
@@ -181,6 +186,8 @@ array is a struct, so how a push is seen follows from how it is held, which is a
 already makes the author write:
 
 ```
+import sysl.buf.*
+
 var p: &Buf[int] = buf()
 var q = p                       // one buffer, two names: q sees every push through p
 var c = *p                      // a copy, because copying a struct is what that means

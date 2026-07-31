@@ -430,7 +430,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       // `Buf[string]` of its own, and neither is what a program asking for a `Buf[int]` needs. The
       // pair is the discriminating part: the same declaration is linked at one argument and compiled
       // at another, in one program.
-      val ir = linked("var b: Buf[int] = buf()\nb.push(1)\nprint(b.len())\n")
+      val ir = linked("import sysl.buf.*\n\nvar b: Buf[int] = buf()\nb.push(1)\nprint(b.len())\n")
 
       precompiled should contain(s"${Library.key("Buf")}.push.byte")
       precompiled should not contain s"${Library.key("Buf")}.push.int"

@@ -292,7 +292,9 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "an item of a container" in {
-      run("""var bag: Buf[&Fn(int) -> int] = buf()
+      run("""import sysl.buf.*
+            |
+            |var bag: Buf[&Fn(int) -> int] = buf()
             |
             |bag.push(k -> k * 7)
             |print(bag[0usize](3))

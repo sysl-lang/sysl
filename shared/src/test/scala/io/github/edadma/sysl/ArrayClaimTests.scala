@@ -17,6 +17,13 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
+  /** An array and a slice are the language's; the growable sequence built on them is `sysl.buf`'s,
+   * so the programs here that reach for one say so and the rest are unchanged.
+   */
+  private def growable(src: String): String = run("import sysl.buf.*\n\n" + src)
+
+  private def growableErr(src: String): String = err("import sysl.buf.*\n\n" + src)
+
   "a compiler-provided property written with parentheses says so, rather than denying the member" - {
 
     "on a fixed array, whose length is a constant" in {
@@ -181,7 +188,7 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     """a type indexed through 'Index' is a call rather than a walk to an address, so its element is
       |not a place and a compound assignment is refused rather than read-and-written-back""".stripMargin in {
-      err("var b: Buf[int] = buf()\nb.push(1)\nb[0] += 5") should
+      growableErr("var b: Buf[int] = buf()\nb.push(1)\nb[0] += 5") should
         include("would evaluate the receiver and the index twice")
     }
   }
@@ -197,7 +204,7 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "a container is walked through its view rather than by implementing a cursor" in {
-      run("var b: Buf[int] = buf()\nfor i in 0..<3 do b.push(i * 7)\nvar sum = 0\n" +
+      growable("var b: Buf[int] = buf()\nfor i in 0..<3 do b.push(i * 7)\nvar sum = 0\n" +
         "for x in b.view() do sum += x\nprint(sum)") shouldBe "21\n"
     }
   }
@@ -205,42 +212,42 @@ class ArrayClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "the growable array the chapter says is ordinary sysl" - {
 
     "gives up every member the chapter lists, and 'is_empty' besides" in {
-      run("var b: Buf[int] = buf()\nfor i in 0..<5 do b.push(i)\n" +
+      growable("var b: Buf[int] = buf()\nfor i in 0..<5 do b.push(i)\n" +
         "print(b.len(), b.cap(), b.is_empty(), b.at(2), b.view().len)") shouldBe "5 8 false 2 5\n"
     }
 
     "'truncate' does nothing where the length is one the buffer does not have" in {
-      run("var b: Buf[int] = buf()\nfor i in 0..<5 do b.push(i)\nb.truncate(99usize)\nprint(b.len())")
+      growable("var b: Buf[int] = buf()\nfor i in 0..<5 do b.push(i)\nb.truncate(99usize)\nprint(b.len())")
         .shouldBe("5\n")
     }
 
     "'remove' shifts the survivors down and hands the element back" in {
-      run("var b: Buf[int] = buf()\nfor i in 0..<5 do b.push(i)\nvar gone = b.remove(1)\n" +
+      growable("var b: Buf[int] = buf()\nfor i in 0..<5 do b.push(i)\nvar gone = b.remove(1)\n" +
         "print(gone, b.len(), b.at(0), b.at(1), b.at(2), b.at(3))") shouldBe "1 4 0 2 3 4\n"
     }
 
     "'clear' is 'truncate(0)', and 'set' and 'pop' reach the ends" in {
-      run("var b: Buf[int] = buf()\nfor i in 0..<3 do b.push(i)\nb.set(0, 42)\n" +
+      growable("var b: Buf[int] = buf()\nfor i in 0..<3 do b.push(i)\nb.set(0, 42)\n" +
         "b.pop() match\n    Some(v) -> print(v, b.at(0))\n    None -> print(0, 0)\n" +
         "b.clear()\nprint(b.len(), b.is_empty())") shouldBe "2 42\n0 true\n"
     }
 
     """a COPY of a Buf taken before a removal reads the shifted elements at the length it was copied
       |at — the sentence the chapter draws out of the spare capacity holding values""".stripMargin in {
-      run("var b: Buf[int] = buf()\nfor i in 0..<5 do b.push(i)\nvar copy = b\nvar gone = b.remove(1)\n" +
+      growable("var b: Buf[int] = buf()\nfor i in 0..<5 do b.push(i)\nvar copy = b\nvar gone = b.remove(1)\n" +
         "print(copy.len(), copy.at(0), copy.at(1), copy.at(4))\nprint(b.len(), b.at(1))")
         .shouldBe("5 0 2 4\n4 2\n")
     }
 
     "a view taken before a growth keeps its own storage and its own length" in {
-      run("var g: Buf[int] = buf()\nfor i in 0..<4 do g.push(i * 10)\nvar before = g.view()\n" +
+      growable("var g: Buf[int] = buf()\nfor i in 0..<4 do g.push(i * 10)\nvar before = g.view()\n" +
         "for i in 0..<20 do g.push(999)\nprint(before.len, before[0], before[3], g.len())")
         .shouldBe("4 0 30 24\n")
     }
 
     """how a push is seen follows from how the buffer is held, which is a choice the language
       |already makes the author write""".stripMargin in {
-      run("var p: &Buf[int] = buf()\np.push(1)\nvar q = p\nvar c = *p\np.push(2)\nprint(q.len(), c.len())")
+      growable("var p: &Buf[int] = buf()\np.push(1)\nvar q = p\nvar c = *p\np.push(2)\nprint(q.len(), c.len())")
         .shouldBe("2 1\n")
     }
   }

@@ -115,8 +115,10 @@ class SubtypeProduceSiteTests extends AnyFreeSpec with RunSupport with CodegenSu
     // written `T` and only the instantiation says it is constrained. The check has to follow the
     // argument, not the spelling.
     "an item pushed into a container instantiated at the subtype" in {
-      run(Age + "var b: Buf[Age] = buf()\nb.push(30)\nprint(b[0])") shouldBe "30\n"
-      exits(Age + "var b: Buf[Age] = buf()\nb.push(200)\nprint(b[0])")
+      val holding = "import sysl.buf.*\n\n" + Age
+
+      run(holding + "var b: Buf[Age] = buf()\nb.push(30)\nprint(b[0])") shouldBe "30\n"
+      exits(holding + "var b: Buf[Age] = buf()\nb.push(200)\nprint(b[0])")
     }
   }
 

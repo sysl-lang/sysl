@@ -65,7 +65,7 @@ class GenericsClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport
 
     """a parameter bounded by 'Index' is subscripted and dispatches through it — this only ever
       |worked because the definition-time pass was dropping the complaint""".stripMargin in {
-      run("idx[T: Index[usize, int]](x: T) -> int = x[0usize]\nvar b: Buf[int] = buf()\n" +
+      run("import sysl.buf.*\n\nidx[T: Index[usize, int]](x: T) -> int = x[0usize]\nvar b: Buf[int] = buf()\n" +
         "b.push(42)\nprint(idx(b))") shouldBe "42\n"
     }
 
