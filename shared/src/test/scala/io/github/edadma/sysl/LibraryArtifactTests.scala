@@ -129,8 +129,8 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
         case Left(err)        => fail(err)
 
       ir should include("define void @say$hello(")
-      ir should include("declare void @printi(")
-      ir should not include "define void @printi("
+      ir should include(s"declare void @${Library.key("printi")}(")
+      ir should not include s"define void @${Library.key("printi")}("
     }
 
     "so two libraries that both print can be linked into one program" in {

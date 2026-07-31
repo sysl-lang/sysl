@@ -46,9 +46,9 @@ class StringCodegenTests extends AnyFreeSpec with CodegenSupport {
   // length-bounded `%.*s` — would stop early. The sink walks the byte count instead.
   "printing goes by length rather than by terminator" in {
     val out  = ir("""print("hi")""")
-    val sink = defineOf(out, "putbytes")
+    val sink = defineOf(out, Library.key("putbytes"))
 
-    mainOf(out) should include regex raw"call void @prints\(\{ ptr, ptr, i64 \} .+\)"
+    mainOf(out) should include regex raw"call void @${keyRe("prints")}\(\{ ptr, ptr, i64 \} .+\)"
     sink should include regex raw"extractvalue \{ ptr, ptr, i64 \} %t\d+, 2"
     sink should include regex raw"call i32 @putchar\(i32 %t\d+\)"
     out.linesIterator.filter(_.startsWith("@.str")).foreach(_ should not include "%s")
@@ -60,22 +60,17 @@ class StringCodegenTests extends AnyFreeSpec with CodegenSupport {
   "each argument is rendered by its own call" in {
     val out = irMain("""print(1, 2, "x", 3, 4)""")
 
-    out.linesIterator.map(_.trim).filter(_.startsWith("call void @print")).map(_.takeWhile(_ != '(')).toList shouldBe
-      List(
-        "call void @printi",
-        "call void @printc",
-        "call void @printi",
-        "call void @printc",
-        "call void @prints",
-        "call void @printc",
-        "call void @printi",
-        "call void @printc",
-        "call void @printi",
-        "call void @printc",
-      )
+    val renderers = List("printi", "printu", "printr", "printb", "printc", "prints").map(Library.key).toSet
+    val called    = (l: String) => l.stripPrefix("call void @").takeWhile(_ != '(')
 
-    out should include("call void @printc(i32 32)") // the separator
-    out should include("call void @printc(i32 10)") // the terminator
+    out.linesIterator.map(_.trim)
+      .filter(l => l.startsWith("call void @") && renderers(called(l)))
+      .map(called).toList shouldBe
+      List("printi", "printc", "printi", "printc", "prints", "printc", "printi", "printc", "printi", "printc")
+        .map(Library.key)
+
+    out should include(s"call void @${Library.key("printc")}(i32 32)") // the separator
+    out should include(s"call void @${Library.key("printc")}(i32 10)") // the terminator
   }
 
   "comparison is a call, and every operator reads its answer" in {

@@ -319,7 +319,7 @@ print(n, 2.5, "done")     ⟶     printi(long(n))
                                 printc('\n')
 ```
 
-The prelude declares `printi`, `printu`, `printr`, `printb`, `printc`, and `prints`, and every one
+The library declares `printi`, `printu`, `printr`, `printb`, `printc`, and `prints`, and every one
 of them is sysl a program could have written. What the compiler knows is those six *names* and the
 rule that widens an argument to the width its renderer takes — an integer to `long` or `ulong` by
 its own signedness, a float to `real` — so that the library needs one function per kind rather than
@@ -339,7 +339,7 @@ printing a number reaches nothing that allocates — a `string` is reference-cou
 
 The integer and float renderings call `snprintf`, which is formatting rather than I/O. Doing them in
 sysl is a small job for the integers and a large one for the floats, so they wait until there is a
-target without a C library to make it worth it. The prelude reaches `snprintf` and `putchar` under
+target without a C library to make it worth it. The library reaches `snprintf` and `putchar` under
 link names (`12` §1), so both stay free for a program to declare itself.
 
 **Where this goes.** `Display` has landed (`14 §6`), and the seam being a name is what let it: a

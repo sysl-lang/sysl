@@ -396,15 +396,18 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe "199990000\n"
     }
 
-    // Nothing is emitted for a member no program calls: the two prelude enums are generic, so
-    // their members exist only once an instantiation asks for one. A top-level prelude *function*
-    // is dropped the same way, by reachability — printing an int reaches three of them and none of
-    // the rest, so the whole printing surface does not land in every program.
+    // Nothing is emitted for a member no program calls: the two library enums are generic, so their
+    // members exist only once an instantiation asks for one. A top-level library *function* is
+    // dropped the same way, by reachability — printing an int reaches three of them and none of the
+    // rest, so the whole printing surface does not land in every program.
     //
-    // A **non-generic** prelude type's members are held back by the same reachability, which is
+    // A **non-generic** library type's members are held back by the same reachability, which is
     // what lets the library carry `ByteSink` at all: eager members would have put its three, and
     // the two `Buf[u8]` members they reach, into every program that prints a number.
-    "an unused prelude declaration costs nothing in the output" in {
+    //
+    // The set is exact rather than a `should contain`, which is the only form that can say a fourth
+    // definition did *not* appear.
+    "an unused library declaration costs nothing in the output" in {
       val out = Compiler.compileToLlvm("print(1)")
       val defined = out.map(
         _.linesIterator.filter(l => l.startsWith("define") && !l.startsWith("define private"))
@@ -412,7 +415,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
           .toSet,
       )
 
-      defined shouldBe Right(Set("@printi", "@printc", "@putbytes", "@main"))
+      defined shouldBe Right(List("printi", "printc", "putbytes").map(n => s"@${Library.key(n)}").toSet + "@main")
     }
 
     // And the other half of that bargain: a member the program *does* reach has to arrive, whether

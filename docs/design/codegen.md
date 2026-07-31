@@ -29,12 +29,12 @@ be unwound deliberately rather than discovered later.
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
 
 The library every compilation carries is in two places, and `Library` is what knows which. A short
-**prelude** (`Prelude`) of ordinary sysl source — the `Option` and `Result` enums, the `print*`
-family, and the handful of C `extern`s underneath them — is parsed once and hoisted ahead of the
-user's own declarations, in the same anonymous root module a headerless program is in. The
-**standard module** `sysl` (`13 §8`) is the rest, and it is real files under `lib/sysl` rather than a
-string inside the compiler. Declarations are moving from the first to the second one surface at a
-time; a name resolves the same way whichever it is in, and only the emitted symbol tells them apart.
+**prelude** (`Prelude`) of ordinary sysl source — now just the `Option` and `Result` enums — is
+parsed once and hoisted ahead of the user's own declarations, in the same anonymous root module a
+headerless program is in. The **standard module** `sysl` (`13 §8`) is everything else, and it is real
+files under `lib/sysl` rather than a string inside the compiler. Declarations have been moving from
+the first to the second one surface at a time; a name resolves the same way whichever it is in, and
+only the emitted symbol tells them apart.
 
 ## What runs today
 

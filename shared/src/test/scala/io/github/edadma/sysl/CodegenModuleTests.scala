@@ -40,7 +40,7 @@ class CodegenModuleTests extends AnyFreeSpec with CodegenSupport {
     "an int goes to the signed renderer, widened to its width" in {
       val out = ir("print(42)")
 
-      mainOf(out) should include("call void @printi(i64 %t1)")
+      mainOf(out) should include(s"call void @${Library.key("printi")}(i64 %t1)")
       mainOf(out) should include("sext i32 42 to i64")
       out should include("""c"%lld\00"""")
     }
@@ -48,15 +48,15 @@ class CodegenModuleTests extends AnyFreeSpec with CodegenSupport {
     "a float is emitted as a hex double and rendered via %g" in {
       val out = ir("print(1.5)")
 
-      mainOf(out) should include("call void @printr(double 0x3FF8000000000000)")
+      mainOf(out) should include(s"call void @${Library.key("printr")}(double 0x3FF8000000000000)")
       out should include("""c"%g\00"""")
     }
 
     "multiple args are separated by a printed space" in {
       val out = irMain("print(1, 2)")
 
-      out should include("call void @printc(i32 32)")
-      out.linesIterator.count(_.contains("@printi")) shouldBe 2
+      out should include(s"call void @${Library.key("printc")}(i32 32)")
+      out.linesIterator.count(_.contains(s"@${Library.key("printi")}")) shouldBe 2
     }
   }
 }

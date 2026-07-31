@@ -232,17 +232,21 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
                 |""".stripMargin) should contain("id.int")
     }
 
-    // The prelude was already held back by reachability, but from `funcsUsed` — which records a name
+    // The library was already held back by reachability, but from `funcsUsed` — which records a name
     // wherever it was written, dead code included.
-    "a prelude function reached only from dead code is not emitted either" in {
+    //
+    // Both names are read off `Library`, and the negative is why: `contain` on a set is element
+    // equality, so a bare `"printr"` stops matching the moment the declaration is keyed under a
+    // module — and a negative that matches nothing passes whatever the compiler emitted.
+    "a library function reached only from dead code is not emitted either" in {
       val out = defined("""unused()
                           |    print(1.5)
                           |end unused
                           |print(2)
                           |""".stripMargin)
 
-      out should not contain "printr"
-      out should contain("printi")
+      out should not contain Library.key("printr")
+      out should contain(Library.key("printi"))
     }
 
     "an unused member of a type the program does use is not emitted" in {
@@ -290,7 +294,7 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       val out = defined(point + "print(Point(3, 4))")
 
       out should contain("Point.display")
-      out should contain("putbytes")
+      out should contain(Library.key("putbytes"))
     }
 
     "and the program prints what it should" in {

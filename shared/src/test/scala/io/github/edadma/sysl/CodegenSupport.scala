@@ -23,6 +23,14 @@ trait CodegenSupport extends Matchers { this: Assertions =>
    */
   protected def lib(name: String): String = Modules.show(Library.key(name))
 
+  /** A library key for use inside `include regex`, with the module separator escaped.
+   *
+   * `Modules.sep` is `$`, which a regex reads as an end-of-input anchor rather than as a character —
+   * so `sysl$printi` unescaped matches nothing at all, and the assertion fails as though the symbol
+   * were missing. Every `include regex` naming a library symbol goes through this.
+   */
+  protected def keyRe(name: String): String = Library.key(name).replace("$", "\\$")
+
   /** The IR for a program that must compile. */
   protected def ir(src: String): String =
     Compiler.compileToLlvm(src) match {

@@ -864,9 +864,9 @@ happens. Lifting that needs a library initializer the program calls before `main
   The prelude is what has not moved across yet, and moving a declaration is one declaration at a time
   rather than a switch: every unqualified name in every program resolves through the library, so a
   change that moved all of it at once would put the whole surface onto a path nothing had exercised
-  and a single hole in it would fail everything with nothing to bisect. What is left there is the
-  `print*` family, the C `extern`s beneath it, and `Option` and `Result`; when it is empty the
-  mechanism goes away and what a program starts with is a module.
+  and a single hole in it would fail everything with nothing to bisect. What is left there is
+  `Option` and `Result`; when it is empty the mechanism goes away and what a program starts with is
+  a module.
 
   The pressure is real and predates the mechanism: the first program to want mathematics found none
   — `guide/fft` declares `sin`, `cos` and `sqrt` as C externs of its own and writes its own absolute

@@ -26,7 +26,7 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     "a printed scalar calls its renderer directly" in {
       val out = irMain("print(5)")
 
-      out should include regex """call void @printi\(i64 %t\d+\)"""
+      out should include regex raw"""call void @${keyRe("printi")}\(i64 %t\d+\)"""
       out should not include "insertvalue { ptr, ptr }"
     }
 
@@ -66,7 +66,7 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     "reaches standard output through the prelude's own byte sink" in {
       defineOf(ir(point + "print(Point(1, 2))"), "sysl.w.out.write") should
-        include("call void @putbytes({ ptr, ptr, i64 } %b)")
+        include(s"call void @${Library.key("putbytes")}({ ptr, ptr, i64 } %b)")
     }
   }
 

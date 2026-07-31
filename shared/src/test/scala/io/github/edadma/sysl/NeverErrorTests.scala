@@ -147,10 +147,22 @@ class NeverErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "externs" - {
-    // The prelude declares `exit`, so a program that declares it again is really the ordinary
-    // duplicate-name case — which is the point: an extern shares the one function namespace.
+    // An extern shares the one function namespace with everything else in its module, which is what
+    // this says — a second declaration of the name is the ordinary duplicate, not a separate
+    // foreign-name space that happens to collide.
     "an extern shares the function namespace" in {
-      err("extern exit(code: int) -> never\nprint(1)") should include("function 'exit' is already declared")
+      err("f() -> int = 1\nextern f() -> int\nprint(1)") should include("function 'f' is already declared")
+    }
+
+    // The library's `exit` is `sysl.exit` and a program's own is its own, so declaring one is no
+    // longer the clash it was while the prelude held the name. The *symbol* is another matter: both
+    // resolve to `@exit`, since an extern's symbol is what was written and cannot be qualified — so
+    // this is the one shape where two library-and-program declarations share a linker name, and it
+    // has to stay a single `declare`.
+    "a program may declare its own 'exit', and the two share one declaration" in {
+      val out = Compiler.compileToLlvm("extern exit(code: int) -> never\nprint(1)\nexit(0)")
+
+      out.map(_.linesIterator.count(_.contains("declare void @exit("))) shouldBe Right(1)
     }
 
     "two externs cannot share a name" in {

@@ -588,6 +588,36 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
           |    None -> print("no")
           |""".stripMargin) shouldBe "☃\nno\n"
     }
+
+    // The printing surface became shadowable by moving, and it is the one surface where that could
+    // go wrong silently: `print` is a desugaring the *compiler* writes, so if it resolved the
+    // renderer by spelling rather than by key, `print(1)` would quietly call the program's function
+    // and every printing test in the suite would still pass while printing the wrong thing.
+    "a program may declare its own 'printi', and 'print' still reaches the library's" in {
+      // The program's takes an `int` and yields a `string` where the library's takes a `long` and
+      // yields nothing, so resolution picking the wrong one either way would not type-check.
+      run("""printi(n: int) -> string = "mine"
+            |
+            |print(printi(1))
+            |print(42)
+            |""".stripMargin) shouldBe "mine\n42\n"
+    }
+
+    // Same question one layer down, at the sink every renderer writes through — and this one the
+    // compiler names in the *emitted IR* rather than in a desugaring (`WriterEmitter`), so it is a
+    // different mechanism reaching the same declaration.
+    "and its own 'putbytes', which the writer table still resolves past" in {
+      // The `print` on the last line is itself the check: every renderer writes through the
+      // library's sink, so if the program's had been picked there would be no output at all.
+      run("""putbytes(b: []u8) -> int = 7
+            |
+            |var g = byte_sink()
+            |var w: *Writer = &g
+            |
+            |display_str("hi", w, FormatSpec(0, -1, false))
+            |print(putbytes("x".bytes), g.text().len)
+            |""".stripMargin) shouldBe "7 2\n"
+    }
   }
 
   "a moved GENERIC, which is what a growable sequence is" - {

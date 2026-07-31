@@ -66,17 +66,17 @@ class ScalarCodegenTests extends AnyFreeSpec with CodegenSupport {
     ir("var f: f32 = 1.5\nprint(f)") should include("fptrunc double 0x3FF8000000000000 to float")
   }
 
-  // `print` picks one prelude renderer per *kind* of value and widens to the width that renderer
+  // `print` picks one library renderer per *kind* of value and widens to the width that renderer
   // takes, so a narrow integer is extended at the call rather than each width having a renderer.
   "printing widens each value to the width its renderer takes" in {
     val byteMain = irMain("var b: byte = 9\nprint(b)")
 
     byteMain should include regex raw"zext i8 %t\d+ to i64"
-    byteMain should include regex raw"call void @printu\(i64 %t\d+\)"
+    byteMain should include regex raw"call void @${keyRe("printu")}\(i64 %t\d+\)"
 
-    irMain("var n: long = 9\nprint(n)") should include regex raw"call void @printi\(i64 %t\d+\)"
-    irMain("var u: ulong = 9\nprint(u)") should include regex raw"call void @printu\(i64 %t\d+\)"
-    irMain("var f: f32 = 1.5\nprint(f)") should include regex raw"call void @printr\(double %t\d+\)"
+    irMain("var n: long = 9\nprint(n)") should include regex raw"call void @${keyRe("printi")}\(i64 %t\d+\)"
+    irMain("var u: ulong = 9\nprint(u)") should include regex raw"call void @${keyRe("printu")}\(i64 %t\d+\)"
+    irMain("var f: f32 = 1.5\nprint(f)") should include regex raw"call void @${keyRe("printr")}\(double %t\d+\)"
   }
 
   // Signedness picks the renderer, and the renderer picks the conversion it hands `snprintf`.
@@ -87,11 +87,11 @@ class ScalarCodegenTests extends AnyFreeSpec with CodegenSupport {
   }
 
   // Encoding a code point is sysl in the library, not a runtime helper the compiler emits.
-  "printing a char goes to the prelude's encoder" in {
+  "printing a char goes to the library's encoder" in {
     val out = ir("print('A')")
 
-    mainOf(out) should include("call void @printc(i32 65)")
-    out should include("define void @printc(i32 %ch.param) {")
+    mainOf(out) should include(s"call void @${Library.key("printc")}(i32 65)")
+    out should include(s"define void @${Library.key("printc")}(i32 %ch.param) {")
     out should not include "@sysl.utf8"
   }
 
