@@ -1,5 +1,7 @@
 package io.github.edadma.sysl
 
+import io.github.edadma.cross_platform.*
+
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -47,14 +49,31 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
 
   /** One program compiled against one core, through the entry point the driver itself uses — so the
    * two sides below differ in the core and in nothing else.
+   *
+   * `linked` is what the core's object half already defines, which the program declares rather than
+   * emits a second time. Empty is the compilation every program gets today.
    */
-  private def against(core: Core, program: String): String =
-    Compiler.compiledWith(List(Source("<input>", program)), Nil, Target.default, Set.empty, core) match
+  private def against(core: Core, program: String, linked: Set[String] = Set.empty): String =
+    Compiler.compiledWith(List(Source("<input>", program)), Nil, Target.default, linked, core) match
       case Right((ir, _)) => ir
       case Left(err)      => fail(s"the program did not compile:\n$err")
 
   private def sameBothWays(program: String): Unit =
     against(decoded, program) shouldBe against(Core.embedded, program)
+
+  /** The same program with the core's object half linked rather than emitted. */
+  private def linked(program: String): String = against(decoded, program, precompiled)
+
+  /** The symbols a module defines, and the ones it leaves to the linker. */
+  private def defines(ir: String): Set[String] = symbols(ir, "define")
+  private def declares(ir: String): Set[String] = symbols(ir, "declare")
+
+  private def symbols(ir: String, form: String): Set[String] =
+    ir.linesIterator.filter(_.startsWith(s"$form ")).flatMap { line =>
+      val at = line.indexOf('@')
+
+      Option.when(at >= 0)(line.drop(at + 1).takeWhile(c => c != '(' && c != ' '))
+    }.toSet
 
   "the two cores are genuinely different objects" - {
 
@@ -200,6 +219,92 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
             case Right((_, syms)) => syms shouldBe precompiled
             case Left(err)        => fail(err)
         case Left(err) => fail(s"the core library did not build from disk: $err")
+    }
+  }
+
+  "a program that LINKS the core's object half rather than emitting it" - {
+
+    // This is what the whole exercise is for, and it is the half nothing consumes yet: the trees
+    // above establish that an artifact *means* what the source means, and these establish what is
+    // gained by taking it — a program that reaches the printing surface no longer carries a copy of
+    // it. Nothing routes an ordinary compilation here; the core is still handed over as source.
+
+    "declares the printing surface instead of defining it" in {
+      val ir = linked("print(1)\n")
+
+      ir should include(s"declare void @${Library.key("printi")}(")
+      ir should not include s"define void @${Library.key("printi")}("
+    }
+
+    "and every definition it loses is one the artifact holds, or the module's own runtime" in {
+      // The claim that matters. Linking is allowed to change the IR — that is the point — but only in
+      // ways that account for themselves, and anything else would be a second compilation rather than
+      // the same one with its bodies elsewhere.
+      //
+      // Two kinds of definition go, and they go for different reasons. A library function the
+      // artifact compiled becomes a **declaration**, resolved at the link. The ARC runtime is not
+      // that: it is emitted on demand by the bodies that need it, so a module that stopped emitting
+      // those bodies stops needing it, and it simply is not there. It leaves no declaration behind
+      // because nothing links to it — see the next test.
+      val program = "print(1)\nprint(\"two\")\nprint(3.5)\n"
+      val fromSrc = against(Core.embedded, program)
+      val fromLib = linked(program)
+
+      val (nowLinked, nowUnneeded) = (defines(fromSrc) -- defines(fromLib)).partition(precompiled)
+
+      nowLinked should not be empty
+      declares(fromLib) -- declares(fromSrc) shouldBe nowLinked
+      nowUnneeded.filterNot(_.startsWith("arc.")) shouldBe empty
+
+      // And nothing appeared out of nowhere: every symbol the linked module defines, the source one
+      // defined too.
+      defines(fromLib) -- defines(fromSrc) shouldBe empty
+    }
+
+    "and the runtime it drops is module-private, which is why the artifact may carry one too" in {
+      // What makes the line above safe rather than lucky. `arc.retain` and its neighbours are emitted
+      // with `private` linkage, so the artifact's copy and a program's own are different symbols and
+      // the linker never sees a pair. Were they external, a program that still needed the runtime for
+      // its *own* counted values would collide with the library that shipped one.
+      artifact._1 should include("define private void @arc.retain(")
+      against(Core.embedded, "var s = \"x\"\nprint(s)\n") should include("define private void @arc.retain(")
+    }
+
+    "while a generic is built here even at a type the library already shipped one instantiation of" in {
+      // A generic has no compiled form until a caller fixes its arguments, so what an artifact can
+      // carry is instantiations rather than the generic — the library pushes onto a `Buf[u8]` and a
+      // `Buf[string]` of its own, and neither is what a program asking for a `Buf[int]` needs. The
+      // pair is the discriminating part: the same declaration is linked at one argument and compiled
+      // at another, in one program.
+      val ir = linked("var b: Buf[int] = buf()\nb.push(1)\nprint(b.len())\n")
+
+      precompiled should contain(s"${Library.key("Buf")}.push.byte")
+      precompiled should not contain s"${Library.key("Buf")}.push.int"
+      defines(ir) should contain(s"${Library.key("Buf")}.push.int")
+    }
+
+    "and it runs, with the library's bodies coming from the artifact's object file" in {
+      // The end of the claim: the symbols the module stopped defining resolve at the link, and the
+      // program prints what it printed when it carried its own copy of them.
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val program = "print(1)\nprint(\"two\")\nprint(3.5)\nprint(true)\n"
+      val obj     = createTempFile("sysl-core-", ".o")
+      val exe     = createTempFile("sysl-core-", "")
+
+      Toolchain.compileObject(artifact._1, obj, Target.default) match
+        case Left(err) => fail(s"the core library did not assemble: $err")
+        case Right(_)  => ()
+
+      val ran = Toolchain.build(linked(program), exe, Target.default, List(obj)).map { _ =>
+        val r = exec(List(exe))
+
+        (r.exitCode, r.stdout)
+      }
+
+      deleteFile(obj)
+      deleteFile(exe)
+      ran shouldBe Right((0, "1\ntwo\n3.5\ntrue\n"))
     }
   }
 }
