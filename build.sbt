@@ -107,7 +107,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       // Off-side-rule lexer base (see docs/design/front-end.md).
       "io.github.edadma"         %%% "indentation"              % "0.0.5",
       // Cross-platform I/O boundary (see docs/design/cross-platform.md).
-      "io.github.edadma"         %%% "path"                     % "0.0.6",
+      "io.github.edadma"         %%% "path"                     % "0.0.7",
       "io.github.edadma"         %%% "cross_platform"           % "0.1.8",
 //      "com.lihaoyi" %%% "pprint" % "0.9.6" % "test",
     ),
