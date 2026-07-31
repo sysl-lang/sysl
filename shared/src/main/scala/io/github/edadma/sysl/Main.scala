@@ -27,6 +27,10 @@ import scopt.OParser
  * which it got. `build-lib` is what turns the first into the second, and the only difference
  * downstream is what the compilation *cost*: an artifact is a linear decode where source is a parse.
  *
+ * **An artifact is an `ar` archive** (`LibraryArtifact`), so it reaches the linker as it stands and
+ * only the members that resolve something are pulled in. Building one therefore needs an `llvm-ar`
+ * as well as a `clang`; `--ar` names it where it is somewhere a search would not look.
+ *
  * **`--core-lib` is the same thing for the standard module**, which every program is compiled against
  * whether or not it names one. Built by `build-lib --core` and given back here, it replaces the copy
  * of the library the compiler carries: the signatures arrive decoded instead of parsed, and the half
@@ -71,6 +75,7 @@ case class Config(
     coreLib: Option[String] = None,
     noCoreLib: Boolean = false,
     coreSearch: String = LibraryArtifact.coreDefault,
+    ar: Option[String] = None,
     programArgs: List[String] = Nil,
 )
 
@@ -128,6 +133,9 @@ case class Config(
         .action((_, c) => c.copy(noCoreLib = true))
         .text("compile against the copy of the standard module built into the compiler, " +
           "ignoring any prebuilt one"),
+      opt[String]("ar")
+        .action((a, c) => c.copy(ar = Some(a)))
+        .text("the llvm-ar to build a library with; defaults to searching for one"),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
@@ -170,7 +178,7 @@ private[sysl] def execute(cfg: Config): Int = {
 
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
-  val (core, coreSymbols, coreObject) = chooseCore(cfg) match
+  val (core, coreSymbols, coreArchive) = chooseCore(cfg) match
     case Left(err) => return fail(err)
     case Right(c)  => c
 
@@ -191,18 +199,18 @@ private[sysl] def execute(cfg: Config): Int = {
   // names is read off the name, so a program that depends on a library need not know how it shipped.
   val (artifacts, roots) = cfg.libs.partition(LibraryArtifact.isArtifact)
 
-  // Both halves are read into memory here and neither touches the disk yet: everything below may
-  // still refuse the compilation, and a temporary file written before that has to be cleaned up on
-  // every one of those paths. The object half is materialized once there is a link to do.
+  // Only the metadata is read here. The object half stays in the file and reaches the linker as the
+  // archive it already is — there is nothing to unwrap, nothing to write to a temporary, and nothing
+  // to clean up on the paths below that refuse the compilation.
   val unpacked =
-    try artifacts.map(p => LibraryArtifact.unpack(p, readBytes(p)))
+    try artifacts.map(p => LibraryArtifact.metadataOf(p, readBytes(p)))
     catch case e: Exception => return fail(s"cannot read a library: ${e.getMessage}")
 
   unpacked.collectFirst { case Left(e) => e } match
     case Some(e) => return fail(e)
     case None    => ()
 
-  val decoded = artifacts.zip(unpacked).collect { case (p, Right((meta, _))) => LibraryArtifact.read(p, meta) }
+  val decoded = artifacts.zip(unpacked).collect { case (p, Right(meta)) => LibraryArtifact.read(p, meta) }
 
   decoded.collectFirst { case Left(e) => e } match
     case Some(e) => return fail(e)
@@ -236,42 +244,35 @@ private[sysl] def execute(cfg: Config): Int = {
         else notes.foreach(Console.err.println)
       ir
 
-  // The compilation is settled, so the object halves are written where `clang` can be given a path
-  // to them. They exist only for the linker's sake and are cleaned up on every path out of here,
-  // including the ones that failed.
-  val objects = (unpacked.collect { case Right((_, obj)) => obj } ::: coreObject.toList).map { obj =>
-    val path = createTempFile("sysl-lib-", ".o")
-    writeBytes(path, obj)
-    path
-  }
+  // What the linker is handed: the artifacts themselves. A `.syslib` **is** an archive, so it goes on
+  // the link line as it stands and the linker takes only the members that resolve something.
+  val archives = artifacts ::: coreArchive.toList
 
-  try
-    cfg.command match
-      case "emit-llvm" =>
-        stdout(compiled); 0
+  cfg.command match
+    case "emit-llvm" =>
+      stdout(compiled); 0
 
-      case "build" =>
-        val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
+    case "build" =>
+      val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
 
-        Toolchain.build(compiled, exe, target, objects) match
-          case Left(err) => fail(err)
-          case Right(_)  => Console.err.println(s"wrote $exe"); 0
+      Toolchain.build(compiled, exe, target, archives) match
+        case Left(err) => fail(err)
+        case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
-      case "run" =>
-        val exe = createTempFile("sysl-", "")
+    case "run" =>
+      val exe = createTempFile("sysl-", "")
 
-        Toolchain.build(compiled, exe, target, objects) match
-          case Left(err) => discard(exe); fail(err)
-          case Right(_) =>
-            val result = exec(exe :: cfg.programArgs)
-            discard(exe)
-            stdout(result.stdout)
-            if result.stderr.nonEmpty then Console.err.print(result.stderr)
-            result.exitCode
+      Toolchain.build(compiled, exe, target, archives) match
+        case Left(err) => discard(exe); fail(err)
+        case Right(_) =>
+          val result = exec(exe :: cfg.programArgs)
+          discard(exe)
+          stdout(result.stdout)
+          if result.stderr.nonEmpty then Console.err.print(result.stderr)
+          result.exitCode
 
-      case other =>
-        fail(s"unknown command '$other'")
-  finally objects.foreach(discard)
+    case other =>
+      fail(s"unknown command '$other'")
 }
 
 /** Removes a temporary file, whether or not it is there.
@@ -298,7 +299,14 @@ private def discard(path: String): Unit =
  * program is compiled against* — into an artifact that builds and then collides with the built-in
  * copy at whatever link tried to use it.
  */
-private def buildLibrary(cfg: Config, sources: List[Source], target: Target, core: Core): Int =
+private def buildLibrary(cfg: Config, sources: List[Source], target: Target, core: Core): Int = {
+  // Before the library is compiled rather than after. Compiling it is the slow part and the archiver
+  // is not needed until the end, so discovering it late would make "there is no llvm-ar" a thing a
+  // user waited for the whole build to be told.
+  val ar = Toolchain.findAr(cfg.ar) match
+    case Left(err)   => return fail(err)
+    case Right(path) => path
+
   LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty, core) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
@@ -311,17 +319,26 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
 
       parentOf(out).foreach(createDirectories)
 
-      val obj = createTempFile("sysl-", ".o")
+      // The members are named rather than left as whatever a temporary file was called, so an
+      // artifact holds the same names wherever it was built and `ar t` shows a reader something they
+      // can make sense of. A directory of our own is what makes naming them possible.
+      val staging  = createTempDirectory("sysl-lib-")
+      val code     = s"$staging/${LibraryArtifact.codeMember}"
+      val metadata = s"$staging/${LibraryArtifact.metadataMember}"
 
       val outcome =
-        for _ <- Toolchain.compileObject(ir, obj, target)
-        yield writeBytes(out, LibraryArtifact.pack(meta, readBytes(obj)))
+        for
+          _ <- Toolchain.compileObject(ir, code, target)
+          _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(meta, target), metadata, target)
+          _ <- Toolchain.archive(List(code, metadata), out, ar)
+        yield ()
 
-      deleteFile(obj)
+      List(code, metadata, staging).foreach(discard)
 
       outcome match
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $out"); 0
+}
 
 /** The standard module this compilation gets, or why it has none.
  *
@@ -341,7 +358,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
  * requiring one would be a deadlock with nothing to break it — the bootstrap case in its purest form,
  * and the reason the carried copy is kept at all.
  */
-private def chooseCore(cfg: Config): Either[String, (Core, Set[String], Option[Array[Byte]])] =
+private def chooseCore(cfg: Config): Either[String, (Core, Set[String], Option[String])] =
   if cfg.noCoreLib || cfg.core then Right((Core.embedded, Set.empty, None))
   else
     cfg.coreLib.orElse(Option.when(isFile(cfg.coreSearch))(cfg.coreSearch)) match
@@ -351,20 +368,21 @@ private def chooseCore(cfg: Config): Either[String, (Core, Set[String], Option[A
           s"or pass --no-core-lib to compile against the copy built into the compiler")
 
 /** A prebuilt standard module read back: the trees to compile against, the symbols its object half
- * already defines, and that object half itself.
+ * already defines, and the archive to link that half from — which is the file itself, since it is
+ * already the archive the linker wants.
  *
  * Every way this can go wrong — a file that is not ours, one built by another sysl, one built from
  * other sources than the compiler carries, a tree that will not decode — is a failure of the same
  * kind as not finding it at all, and is reported rather than worked around. A standard module that
  * cannot be read is not a standard module.
  */
-private def loadCore(path: String): Either[String, (Core, Set[String], Option[Array[Byte]])] = {
+private def loadCore(path: String): Either[String, (Core, Set[String], Option[String])] = {
   val bytes =
     try readBytes(path)
     catch case e: Exception => return Left(s"cannot read $path: ${e.getMessage}")
 
-  LibraryArtifact.unpack(path, bytes).flatMap((meta, obj) =>
-    Core.read(path, meta).map((core, symbols) => (core, symbols, Some(obj))))
+  LibraryArtifact.metadataOf(path, bytes).flatMap(meta =>
+    Core.read(path, meta).map((core, symbols) => (core, symbols, Some(path))))
 }
 
 /** Which machine this invocation is for: the one it names, or this one. A machine sysl has no entry

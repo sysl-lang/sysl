@@ -41,6 +41,21 @@ reads — the same convention `sysl run <path> -- <args>` follows.
 
 That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with clang.
 
+Every program is compiled against the standard module, which is built once after a clone:
+
+```bash
+sbt "syslJVM/run build-lib lib --core"   # writes .sysl/core.syslib
+```
+
+A compilation with no `--core-lib` looks there and stops if it finds nothing, the same as a C
+compiler that cannot find its libc. `--no-core-lib` compiles against the copy built into the
+compiler, which is what the test suite uses and what makes the first build possible.
+
+Building a library also needs an **`llvm-ar`**, because a `.syslib` is an `ar` archive whose members
+are objects for the machine it was built *for*: a platform archiver indexes only its own format and
+silently drops the rest. On a Mac, Homebrew's LLVM is deliberately off the `PATH`, so sysl looks in
+`/opt/homebrew/opt/llvm/bin` as well; `--ar` names one anywhere else.
+
 The JS and Native cross-targets exist in the build but the JVM target is the working one during
 development.
 

@@ -796,13 +796,36 @@ A library is **analyzed before anything is written**. A library that does not ch
 by whoever built it; without that check the artifact ships anyway and every program that links
 against it is handed a diagnostic pointing into somebody else's source.
 
-**The container is ours rather than `ar`.** An `.rlib` is an `ar` archive holding `.o` members beside
-`lib.rmeta`, and that was the obvious thing to copy. It does not survive the platform tools: macOS
-`ar` runs `ranlib`, which silently drops a member that is not Mach-O, and suppressing the index only
-moves the failure to the linker, which reads every member and refuses. Rust gets away with it by
-wrapping the metadata in an object file with the section marked excluded — which needs an object
-writer *and* reader per platform to get back out. A `.syslib` is instead a text header, the metadata,
-and the object bytes.
+**The container is an `ar` archive**, which is what an `.rlib` is and for the same reason: the linker
+already reads one, so the compiled half needs no unwrapping and a member is pulled in only to resolve
+something a program actually left undefined.
+
+The metadata rides inside it the way Rust's does — **wrapped in a real object file**, as one
+`private` constant in a section of its own. That is not decoration, and the shape of the alternative
+is worth recording. A *raw* archive member is silently dropped by macOS's `ranlib`; suppressing the
+index only moves the failure to the linker, which reads every member and refuses with
+`archive member 'lib.smeta' not a mach-o file`. Wrapped, the member is an object like any other, and
+being `private` it exports no symbol — so nothing ever gives the linker a reason to pull it in, and it
+costs the linked program nothing.
+
+Reading it back needs **no object-file parser**: the member is found by scanning for a marker and the
+payload carries its own length. That matters more than it sounds, because the objects in an artifact
+are for the machine it was built *for*. A compiler that had to parse them could not read the metadata
+of a library it had cross-built, which is the ordinary case rather than the exotic one.
+
+Producing one needs an **`llvm-ar`** alongside `clang`, and for the same reason. A platform archiver
+indexes only its own object format: asked on macOS to archive an ELF object, the system `ar` exits 0,
+prints a `ranlib` warning, and writes an archive with the member **missing** — a cross-built library
+that is silently empty. `llvm-ar` indexes every format, so one archiver covers every target. `--ar`
+names it where a search would not find it, which on a Mac is the usual case: Homebrew deliberately
+keeps its LLVM off the `PATH`, so the tool is installed, works, and is invisible to `which`.
+
+Member selection and dead-striping are **two mechanisms, and the second is not made redundant by the
+first**. The linker takes only the members it needs, but it takes each one *entire*, and a member
+holds many definitions; `-dead_strip` (Mach-O) and `--gc-sections` (ELF, paired with
+`-ffunction-sections` when the library was compiled) remove the rest of a member pulled in for one
+function. Without the second, a program whose whole text is `print(1)` carried all 61 of the standard
+module's symbols.
 
 **What this does not yet reach:** a library function that reads a module-level `val` is left out of
 the precompiled half, because a `val`'s storage is written by the entry point and a library has none.

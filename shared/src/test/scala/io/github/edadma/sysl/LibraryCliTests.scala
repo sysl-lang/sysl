@@ -127,19 +127,27 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
   private def libraryOwn(ir: String, form: String): Set[String] =
     symbols(ir, form).filter(_.startsWith(Library.key("")))
 
-  /** An artifact whose header promises more than the file holds. The version comes from the constant
+  /** An artifact carrying given metadata and nothing the linker would want. Assembled rather than
+   * built, because every one of these is a container a toolchain would refuse to produce.
+   */
+  private def artifactOfMeta(meta: String): Array[Byte] =
+    FakeAr(LibraryArtifact.metadataMember -> LibraryArtifact.frame(meta))
+
+  /** An artifact whose frame promises more than the member holds. The version comes from the constant
    * rather than being written out, so that a bump to the container format leaves these testing
    * truncation rather than the version check that would otherwise fire ahead of it.
    */
-  private def truncated: Array[Byte] = s"syslib ${LibraryArtifact.Version} 900\nshort".getBytes
+  private def truncated: Array[Byte] =
+    FakeAr(LibraryArtifact.metadataMember ->
+      LibraryArtifact.framed(s"syslib ${LibraryArtifact.Version} 900", "short"))
 
   /** The real core's metadata wearing somebody else's fingerprint — a readable, decodable artifact
    * that is simply not the standard module this compiler carries.
    */
   private def stale: String = {
-    val meta = LibraryArtifact.unpack(core, readBytes(core)) match
-      case Right((m, _)) => m
-      case Left(err)     => fail(err)
+    val meta = LibraryArtifact.metadataOf(core, readBytes(core)) match
+      case Right(m)  => m
+      case Left(err) => fail(err)
 
     "0000000000000000" + meta.drop(meta.indexOf('\n'))
   }
@@ -153,13 +161,21 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
   "build-lib" - {
 
     "writes an artifact that carries both halves" in {
-      val out = artifact()
+      val out   = artifact()
+      val bytes = readBytes(out)
 
-      LibraryArtifact.unpack(out, readBytes(out)) match
-        case Right((meta, obj)) =>
-          meta should include("demo$double")
-          obj.length should be > 0
-        case Left(err) => fail(err)
+      LibraryArtifact.metadataOf(out, bytes) match
+        case Right(meta) => meta should include("demo$double")
+        case Left(err)   => fail(err)
+
+      // The compiled half is not read back through any of our own code, so the check that it is
+      // there has to be made against the container: a member of the name it was archived under, with
+      // something in it. An artifact whose object half went missing would still decode perfectly and
+      // fail at the link of every program that used it.
+      Ar.members(bytes) match
+        case Right(members) =>
+          members.find(_.name == LibraryArtifact.codeMember).map(_.body.length).getOrElse(0) should be > 0
+        case Left(why) => fail(why)
     }
 
     "names the artifact after the root when no output is given" in {
@@ -177,6 +193,34 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
     "refuses a root holding no source rather than writing an empty artifact" in {
       cli(Config(command = "build-lib", file = createTempDirectory("sysl-cli-empty-"))) should not be 0
+    }
+
+    "takes the archiver it is told to use" in {
+      // Worth pinning both ways round. That a named archiver is *used* is what the failing case below
+      // cannot show on its own — an option that was read and then ignored would refuse a bad path
+      // exactly as loudly while quietly building every library with something else.
+      val ar = Toolchain.findAr(None) match
+        case Right(path) => path
+        case Left(why)   => cancel(why)
+
+      val out = createTempFile("sysl-cli-named-ar-", LibraryArtifact.extension)
+
+      cli(Config(command = "build-lib", file = libraryRoot(), output = Some(out), ar = Some(ar))) shouldBe 0
+
+      LibraryArtifact.metadataOf(out, readBytes(out)) should matchPattern { case Right(_) => }
+    }
+
+    "refuses an archiver it cannot run rather than searching for another" in {
+      // Someone who wrote down which archiver to use is owed the error. Falling back would build the
+      // library with a different tool than the one asked for and say nothing about it — and the whole
+      // reason to name one is a machine where the one that would be found is the wrong one.
+      val out = createTempFile("sysl-cli-bad-ar-", LibraryArtifact.extension)
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = libraryRoot(), output = Some(out),
+          ar = Some(s"${createTempDirectory("sysl-cli-noar-")}/llvm-ar")))
+
+      status should not be 0
+      notes should include("--ar")
     }
 
     "refuses a library that does not check, and writes nothing" in {
@@ -310,11 +354,15 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
     "reports a link that fails rather than falling over cleaning up after it" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      // An object half the linker cannot read is the reachable way to fail a link, and what it
-      // caught was the cleanup: `createTempFile` reserves a name and the toolchain is what writes
-      // to it, so deleting the executable of a build that never produced one threw — and the stack
-      // trace stood where the linker's own message should have been.
-      val junk = corrupt(LibraryArtifact.pack("0\n", "not an object file".getBytes))
+      // A member the linker cannot read is the reachable way to fail a link, and what it caught was
+      // the cleanup: `createTempFile` reserves a name and the toolchain is what writes to it, so
+      // deleting the executable of a build that never produced one threw — and the stack trace stood
+      // where the linker's own message should have been.
+      //
+      // The metadata is well-formed and only the compiled half is rubbish, which is what puts the
+      // failure at the link rather than at the read: everything the compiler does succeeds.
+      val junk = corrupt(FakeAr(LibraryArtifact.codeMember -> "not an object file".getBytes,
+        LibraryArtifact.metadataMember -> LibraryArtifact.frame("0\n")))
 
       cli(Config(command = "run", file = program("print(1)"), libs = List(junk))) should not be 0
     }
@@ -369,17 +417,23 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
       refuses("when it is not one of ours", corrupt("not a library\n".getBytes))
 
-      refuses("when another sysl built it", corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes))
+      // A real archive of real objects that is simply somebody else's library — a `.a` from a C
+      // project renamed. Every part of reading it works up to the part that looks for our metadata.
+      refuses("when it is an archive with nothing of ours in it",
+        corrupt(FakeAr("foreign.o" -> Array[Byte](7, 7))))
+
+      refuses("when another sysl built it",
+        corrupt(FakeAr(LibraryArtifact.metadataMember ->
+          LibraryArtifact.framed(s"syslib ${LibraryArtifact.Version + 1} 0"))))
 
       refuses("when it is truncated", corrupt(truncated))
 
-      refuses("when its metadata will not decode",
-        corrupt(LibraryArtifact.pack("0000000000000000\n0\nrubbish", Array.empty)))
+      refuses("when its metadata will not decode", corrupt(artifactOfMeta("0000000000000000\n0\nrubbish")))
 
       // The one a developer actually meets: build the artifact, then edit `lib/sysl`. It decodes and
       // would link perfectly — it is simply no longer the standard module in the tree — so nothing
       // but the fingerprint would catch it, and a silently wrong library is the worst of the five.
-      refuses("when it was built from a different lib/sysl", corrupt(LibraryArtifact.pack(stale, Array.empty)))
+      refuses("when it was built from a different lib/sysl", corrupt(artifactOfMeta(stale)))
     }
 
     "is not needed by name, the artifact being looked for where build-lib --core puts it" - {
@@ -522,7 +576,7 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
       cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
 
-      LibraryArtifact.unpack(out, readBytes(out)).flatMap(r => LibraryArtifact.read(out, r._1)) match
+      LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _)) match
         case Right((trees, syms, fingerprint)) =>
           // Every symbol is the standard module's own. The renderers reach the library's
           // `sysl_snprintf` and the library's `putbytes` under them, and **none of those is in

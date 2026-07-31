@@ -1,5 +1,7 @@
 package io.github.edadma.sysl
 
+import java.nio.charset.StandardCharsets.UTF_8
+
 import io.github.edadma.cross_platform.*
 
 import org.scalatest.freespec.AnyFreeSpec
@@ -69,47 +71,164 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** An artifact carrying given metadata, and object code the linker would have taken seriously.
+   *
+   * The metadata rides in a member of its own here rather than inside an object file, because that is
+   * exactly what the reader is entitled to assume: it finds the payload by scanning member bytes for
+   * a marker, so *how* the bytes got into the member is the object writer's business and not its own.
+   * A fixture that had to run clang to say what happens to a damaged length would be a fixture that
+   * could not say it at all.
+   */
+  private def artifact(meta: String, code: Array[Byte] = Array[Byte](1, 2, 3)): Array[Byte] =
+    FakeAr(LibraryArtifact.codeMember -> code, LibraryArtifact.metadataMember -> LibraryArtifact.frame(meta))
+
   "the container" - {
 
-    "carries the metadata and the object code as one file" in {
-      val packed = LibraryArtifact.pack("meta", Array[Byte](1, 2, 3))
+    "hands back the metadata buried in it" in {
+      LibraryArtifact.metadataOf("x.syslib", artifact("meta")) shouldBe Right("meta")
+    }
 
-      LibraryArtifact.unpack("x.syslib", packed) match
-        case Right((meta, obj)) => meta shouldBe "meta"; obj.toList shouldBe List[Byte](1, 2, 3)
-        case Left(err)          => fail(err)
+    "finds it wherever in the archive it happens to sit" in {
+      // Member order is the archiver's to choose, and the reader must not depend on having been the
+      // one that chose it.
+      val reversed =
+        FakeAr(LibraryArtifact.metadataMember -> LibraryArtifact.frame("meta"),
+          LibraryArtifact.codeMember -> Array[Byte](1, 2, 3))
+
+      LibraryArtifact.metadataOf("x.syslib", reversed) shouldBe Right("meta")
     }
 
     "keeps a boundary that holds when the metadata is not ASCII" in {
-      // The length in the header is in **bytes**, and the metadata carries the library's own source
-      // text, which is UTF-8. Counting characters would put the object's first byte inside the text.
-      val packed = LibraryArtifact.pack("π≈3", Array[Byte](7, 7))
-
-      LibraryArtifact.unpack("x.syslib", packed) match
-        case Right((meta, obj)) => meta shouldBe "π≈3"; obj.toList shouldBe List[Byte](7, 7)
-        case Left(err)          => fail(err)
+      // The length in the frame is in **bytes**, and the metadata carries the library's own source
+      // text, which is UTF-8. Counting characters would end it somewhere inside that text.
+      LibraryArtifact.metadataOf("x.syslib", artifact("π≈3")) shouldBe Right("π≈3")
     }
 
-    "refuses a file that is not one of ours rather than reading it as one" in {
-      LibraryArtifact.unpack("x.syslib", "not a library at all\n".getBytes) match
+    "reads its own member rather than a marker the compiled half happens to contain" in {
+      // The compiled half carries the library's string literals, which are the only bytes of an
+      // artifact a user chooses — so a library whose own source spelled the marker out would, on a
+      // plain scan, have its metadata read out of the middle of its own text. Naming the member is
+      // what settles which one is meant, and the fixture puts the impostor first so that member order
+      // cannot be what makes this pass.
+      val impostor = LibraryArtifact.framed("syslib 1 4", "junk")
+      val mixed =
+        FakeAr(LibraryArtifact.codeMember -> impostor,
+          LibraryArtifact.metadataMember -> LibraryArtifact.frame("the real one"))
+
+      LibraryArtifact.metadataOf("x.syslib", mixed) shouldBe Right("the real one")
+    }
+
+    "keeps one that holds when the metadata itself contains the marker" in {
+      // A library whose own source spelled out the marker would otherwise be one whose metadata was
+      // found in the middle of itself. The length is what settles it: the *first* marker is the real
+      // one, and everything after it is payload counted in bytes.
+      val awkward = "before " + new String(LibraryArtifact.framed("syslib 99 4", "junk"), UTF_8) + " after"
+
+      LibraryArtifact.metadataOf("x.syslib", artifact(awkward)) shouldBe Right(awkward)
+    }
+
+    "refuses a file that is not an archive rather than reading it as one" in {
+      LibraryArtifact.metadataOf("x.syslib", "not a library at all\n".getBytes) match
         case Left(err) => err should include("is not a sysl library")
         case Right(_)  => fail("a foreign file was read as a library")
-      }
+    }
+
+    "refuses an archive that carries no metadata, which is any other library" in {
+      // A `.a` from a C project is a real archive full of real objects, and every part of reading it
+      // works until the part that looks for something only we put there.
+      LibraryArtifact.metadataOf("x.syslib", FakeAr("foreign.o" -> Array[Byte](7, 7))) match
+        case Left(err) => err should include("carries no metadata")
+        case Right(_)  => fail("an archive with no metadata was read as a library")
+    }
 
     "refuses one built by a different compiler, and says to rebuild it" in {
-      val stale = s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes
+      val stale = LibraryArtifact.framed(s"syslib ${LibraryArtifact.Version + 1} 0")
 
-      LibraryArtifact.unpack("x.syslib", stale) match
+      LibraryArtifact.metadataOf("x.syslib", FakeAr(LibraryArtifact.metadataMember -> stale)) match
         case Left(err) => err should include("rebuild it with 'sysl build-lib'")
         case Right(_)  => fail("an artifact from another format version was accepted")
     }
 
-    "refuses a truncated one rather than handing back a short object" in {
+    "refuses a truncated one rather than handing back half the metadata" in {
       // The version travels from the constant rather than being written out, so that a bump to the
       // container format leaves this testing truncation instead of quietly testing the version
       // check that now fires ahead of it.
-      LibraryArtifact.unpack("x.syslib", s"syslib ${LibraryArtifact.Version} 500\nshort".getBytes) match
+      val short = LibraryArtifact.framed(s"syslib ${LibraryArtifact.Version} 500", "short")
+
+      LibraryArtifact.metadataOf("x.syslib", FakeAr(LibraryArtifact.metadataMember -> short)) match
         case Left(err) => err should include("truncated")
         case Right(_)  => fail("a truncated artifact was accepted")
+    }
+  }
+
+  "the artifact a real toolchain writes" - {
+
+    // Everything above reads a container this suite assembled. This is the one that reads a container
+    // `clang` and `llvm-ar` produced, which is the only way to find out whether the metadata survives
+    // the round trip through an object file at all — a constant nothing refers to is exactly the kind
+    // of thing a compiler is entitled to delete.
+
+    /** A library built and archived for a given machine: the artifact's bytes, the metadata that went
+     * in, and the metadata that came back out.
+     */
+    def roundTrip(target: Target): (Array[Byte], String, Either[String, String]) = {
+      val ar = Toolchain.findAr(None) match
+        case Right(path) => path
+        case Left(why)   => cancel(why)
+
+      val (ir, meta) = LibraryArtifact.build(sources, target) match
+        case Right(r)  => r
+        case Left(err) => fail(s"the library did not build: $err")
+
+      val staging  = createTempDirectory("sysl-artifact-")
+      val code     = s"$staging/${LibraryArtifact.codeMember}"
+      val metadata = s"$staging/${LibraryArtifact.metadataMember}"
+      val out      = s"$staging/demo${LibraryArtifact.extension}"
+
+      val built =
+        for
+          _ <- Toolchain.compileObject(ir, code, target)
+          _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(meta, target), metadata, target)
+          _ <- Toolchain.archive(List(code, metadata), out, ar)
+        yield readBytes(out)
+
+      val bytes = built match
+        case Right(b)  => b
+        case Left(err) => fail(s"the artifact was not built: $err")
+
+      List(code, metadata, out, staging).foreach(p => try deleteFile(p) catch case _: Exception => ())
+
+      (bytes, meta, LibraryArtifact.metadataOf(out, bytes))
+    }
+
+    "carries metadata that survives being buried in an object file" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val (_, wrote, read) = roundTrip(Target.default)
+
+      // Byte-for-byte, because anything less passes for a payload truncated at its first NUL or
+      // padded by the assembler, and both of those decode far enough to look fine.
+      read shouldBe Right(wrote)
+    }
+
+    "carries it out of one cross-built for a machine whose objects this one cannot even run" in {
+      // The gap this closes is real and was open: every other test here runs on the machine the suite
+      // is on, so the ELF half of every per-format decision — the section the metadata sits in, the
+      // long-name convention `llvm-ar` writes, the archive layout `Ar` walks — had never once been
+      // executed. Building for Linux from anywhere exercises all three without needing a Linux.
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val elf = if Target.default == Target.x86_64Linux then Target.aarch64MacOS else Target.x86_64Linux
+      val (bytes, wrote, read) = roundTrip(elf)
+
+      read shouldBe Right(wrote)
+
+      // And it really was cross-built: the compiled member is in the other machine's object format,
+      // so this cannot be passing by having quietly produced a host artifact.
+      val code = Ar.members(bytes).map(_.find(_.name == LibraryArtifact.codeMember).map(_.body.take(4)))
+
+      code.map(_.map(_.toList)) shouldBe
+        Right(Some(if elf.os == Os.Linux then List[Byte](0x7f, 'E', 'L', 'F') else List[Byte](-49, -6, -19, -2)))
     }
   }
 

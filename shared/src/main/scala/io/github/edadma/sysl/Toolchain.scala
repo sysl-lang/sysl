@@ -4,8 +4,15 @@ import io.github.edadma.cross_platform.*
 
 /** Glue between the pure compiler and an installed LLVM toolchain: it writes the generated IR
  * to a temporary `.ll`, links it with `clang`, and runs the result. All filesystem and process
- * access goes through `cross_platform`, so this works on every backend (JVM/JS/Native) — the
- * only external requirement is a `clang` on the PATH.
+ * access goes through `cross_platform`, so this works on every backend (JVM/JS/Native).
+ *
+ * **Two external tools are required: a `clang`, and — to build a library — an `llvm-ar`.** The
+ * second is not a preference for LLVM's archiver over the platform's. A `.syslib` is an `ar` archive
+ * (`LibraryArtifact`) whose members are objects for the machine it was *built for*, which is not
+ * necessarily the machine it was built on, and a platform archiver only understands its own format:
+ * asked to archive an ELF object on macOS, the system `ar` exits 0, prints a `ranlib` warning, and
+ * writes an archive with the member **missing**. A cross-built library would be silently empty.
+ * `llvm-ar` indexes every format, so one archiver covers every target.
  */
 object Toolchain {
 
@@ -14,6 +21,65 @@ object Toolchain {
    */
   lazy val clangAvailable: Boolean =
     exec(Seq("clang", "--version")).exitCode == 0
+
+  /** Where an `llvm-ar` is looked for, in order, when none was named.
+   *
+   * The PATH first, since a toolchain installed to be used is on it. Then the places a package
+   * manager puts an LLVM that it deliberately keeps *off* the PATH — Homebrew does this so that its
+   * LLVM does not shadow the system clang, which means the common case on a Mac is that `llvm-ar` is
+   * installed, works, and is invisible to `which`. Finding it there is the difference between a
+   * toolchain that works out of the box and one that starts with an error message.
+   */
+  private val arCandidates: List[String] =
+    List(
+      "llvm-ar",
+      "/opt/homebrew/opt/llvm/bin/llvm-ar",
+      "/usr/local/opt/llvm/bin/llvm-ar",
+    )
+
+  /** The archiver to use, or why there is none.
+   *
+   * A named one is **not** searched for and not fallen back from: someone who wrote down which
+   * archiver to use is owed an error when it is not there, rather than a library quietly built with
+   * a different one.
+   */
+  def findAr(named: Option[String]): Either[String, String] = named match
+    case Some(path) =>
+      Either.cond(runs(path), path, s"cannot run '$path' — --ar names the llvm-ar to build libraries with")
+    case None =>
+      searched.toRight(
+        "cannot find llvm-ar, which building a library needs — install LLVM, or name one with --ar. " +
+          "The platform's own 'ar' is not a substitute: it indexes only its own object format, and " +
+          "drops the members of a library built for another machine without failing")
+
+  /** The search, made once. Each candidate costs a process to rule out, and nothing about the answer
+   * changes between two builds in one run — of which a test suite does many.
+   */
+  private lazy val searched: Option[String] = arCandidates.find(runs)
+
+  private def runs(path: String): Boolean =
+    try exec(Seq(path, "--version")).exitCode == 0
+    catch case _: Exception => false
+
+  /** Objects gathered into an archive the linker takes as it is.
+   *
+   * `r` replaces, `c` creates without remarking on it, and `s` writes the symbol index — the index
+   * being the whole reason this is a subprocess rather than thirty lines of `Ar`: building one means
+   * reading the symbol table of every member, in whichever object format the target uses.
+   *
+   * The output is removed first because `r` *merges* into an archive that is already there. Rebuilding
+   * a library whose sources had shrunk would otherwise keep the members of the previous build, and
+   * they would still resolve, so nothing would go wrong until the stale definition was the one linked.
+   */
+  def archive(objects: List[String], out: String, ar: String): Either[String, Unit] = {
+    try if exists(out) then deleteFile(out)
+    catch case e: Exception => return Left(s"cannot replace $out: ${e.getMessage}")
+
+    val result = exec(ar :: "rcs" :: out :: objects)
+
+    if result.exitCode == 0 then Right(())
+    else Left(s"$ar failed (exit ${result.exitCode}):\n${result.stderr.trim}")
+  }
 
   /** Links an IR module into a native executable at `exe`, for a given machine.
    *
@@ -31,9 +97,9 @@ object Toolchain {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    // A library archive goes on the command line after the module that calls into it, which is what
-    // the linker's left-to-right scan wants: a member is pulled in to resolve a symbol already
-    // undefined, so an archive listed first would be scanned before anything needed it.
+    // An archive goes on the command line after the module that calls into it, which is what the
+    // linker's left-to-right scan wants: a member is pulled in to resolve a symbol already undefined,
+    // so an archive listed first would be scanned before anything needed it and contribute nothing.
     val result = exec(
       List("clang", s"--target=${target.triple}", "-Wno-override-module") ::: deadStrip(target) :::
         List(ll) ::: archives ::: List("-o", exe))
@@ -45,11 +111,12 @@ object Toolchain {
 
   /** Ask the linker to drop what nothing reaches.
    *
-   * **A library's object half is one `.o` named on the command line, and a named object is linked
-   * entire** — unlike an archive member, which is pulled only to resolve something already
-   * undefined. So without this, every symbol a library compiled lands in every binary that links it:
-   * a program whose whole text is `print(1)` carried all 61 of the standard module's symbols,
-   * including the reader, the string builder and the hashes, none of which it can reach.
+   * **This is the second of two mechanisms, and it is not made redundant by the first.** Because a
+   * `.syslib` is an archive, the linker already pulls in only the members that resolve something
+   * undefined — but a member is pulled *entire*, and one member holds many definitions. Dead-striping
+   * is what removes the rest of a member that was pulled in for one function. Without it a program
+   * whose whole text is `print(1)` carried all 61 of the standard module's symbols, the reader and
+   * the string builder and the hashes among them, none of which it can reach.
    *
    * The two spellings are not interchangeable. Mach-O resolves at **atom** granularity, so
    * `-dead_strip` needs nothing from the compile step. ELF resolves at **section** granularity and
