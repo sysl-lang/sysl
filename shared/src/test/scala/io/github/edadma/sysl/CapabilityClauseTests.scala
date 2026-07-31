@@ -229,11 +229,11 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
   "what the guarantee is worth is readable in the output" - {
 
-    // What `no alloc` covers today is a module's own text, and a call out of it is not yet part of
-    // the question. `print` reaches library code that builds strings, so an allocator is declared
-    // for a program whose every line the compiler has checked allocates nothing — which is the
-    // difference between "this module makes no heap storage" and "this program has no heap".
-    "a program that is allocator-free all the way down declares no allocator at all" ignore {
+    // The claim is about **calls**, not about the declaration. `malloc` and `free` are declared
+    // together with the ARC helpers, which an allocator-free program still emits: it holds slices,
+    // and retaining one it was handed is what those helpers are. Reaching the `free` inside them
+    // takes storage that was made, and this program makes none.
+    "no function of an allocator-free program calls the allocator" in {
       val out = ir(
         """no alloc
           |
@@ -250,9 +250,30 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
           |""".stripMargin,
       )
 
-      out shouldNot include("@malloc")
-      out shouldNot include("@free(")
+      out shouldNot include("call ptr @malloc")
       out should include("declare i32 @putchar")
+    }
+
+    // A call out of the module is the other half of `13 §4`, and `line_text` is what it catches:
+    // the module's own text makes nothing, and the library function it calls validates bytes into a
+    // fresh `string`. Without the reachability half this compiles, and the output holds one real
+    // call to the allocator in a module that declared it would make none.
+    "a call into a function that allocates is refused too" in {
+      val e = errOf(
+        "thing/a.sysl" -> "module thing\nno alloc\n\ntext(b: []const u8) -> string = line_text(b)\n",
+        "main.sysl" -> "var bytes: [2]u8 = [104u8, 105u8]\nprint(thing.text(bytes[0..<2]))\n",
+      )
+
+      e should include("which makes heap storage")
+      e should include("may only call what is allocator-free itself")
+    }
+
+    // The same rule the other way: printing is reached constantly from allocator-free code and does
+    // not allocate, so it is not refused. A capability that refused `print` would be one no kernel
+    // could carry.
+    "and printing, which an allocator-free module does constantly, is not" in {
+      runOf("thing/a.sysl" -> "module thing\nno alloc\n\nsay(n: int)\n    print(\"n is\", n)\n",
+        "main.sysl" -> "thing.say(3)") shouldBe "n is 3\n"
     }
 
     "and the same program without the clause is not obliged to say so" in {

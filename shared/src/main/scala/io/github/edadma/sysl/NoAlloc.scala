@@ -25,17 +25,100 @@ trait NoAlloc extends AnalyzerBase {
   protected def noAlloc(module: String): Boolean =
     moduleNarrows.get(module).exists(_.contains(Capability.Alloc))
 
-  /** Reports every construction that makes heap storage in a module that declared `no alloc`.
+  /** Reports every construction that makes heap storage in a module that declared `no alloc`, and
+   * every call out of one that arrives somewhere that does.
    *
    * The `main` statements are checked under the module of the file that carries them, since they are
    * that file's code however little they look like a declaration.
    */
-  protected def checkNoAlloc(funcs: List[TFunc], vals: List[TVal], main: List[TStmt], mainModule: String)
-      : Unit = {
-    for f <- funcs if noAlloc(Modules.moduleOf(f.name)) do scan(f.body)
-    for v <- vals if noAlloc(Modules.moduleOf(v.symbol)) do scan(v.init)
-    if noAlloc(mainModule) then scan(main)
+  protected def checkNoAlloc(
+      funcs: List[TFunc],
+      vals: List[TVal],
+      vtables: List[TVtable],
+      main: List[TStmt],
+      mainModule: String,
+  ): Unit = {
+    // Lazily, because building it walks every body in the program: a compilation with no clause
+    // anywhere — which is almost all of them — should pay nothing at all for this pass.
+    lazy val allocator = new Allocators(funcs, vtables)
+
+    for f <- funcs if noAlloc(Modules.moduleOf(f.name)) do
+      scan(f.body)
+      allocator.blame(f.body)
+    for v <- vals if noAlloc(Modules.moduleOf(v.symbol)) do
+      scan(v.init)
+      allocator.blame(v.init)
+    if noAlloc(mainModule) then
+      scan(main)
+      allocator.blame(main)
   }
+
+  /** Which functions make heap storage, and which trees reach one (`13 §4` — *propagation is over
+   * the module graph*).
+   *
+   * **The diagnostic lands at the call rather than at the import**, and the reason is the standard
+   * library: `sysl` is one module and is half allocator-free, so a rule stated over modules would
+   * refuse every `no alloc` module that names anything at all — `print` and `from_utf8` are the same
+   * module, and only one of them allocates. What `capabilities.md` asks for is that an
+   * allocator-free module "can only import and call things that are themselves no-alloc-compatible",
+   * and calls are what this is stated over.
+   *
+   * The reachable set is the one `Reachability` computes, which **over-approximates** where a call's
+   * target is decided at run time: a method-table slot is answered with what every table for that
+   * trait put there. That is the right direction to be wrong in — a refusal names a function the
+   * program might really arrive at — and it is why the answer is cached per tree rather than
+   * recomputed.
+   */
+  private class Allocators(funcs: List[TFunc], vtables: List[TVtable]) {
+
+    /** The functions whose own bodies make heap storage. A library's do; a program's do wherever it
+     * was allowed to write one.
+     */
+    private val direct: Set[String] = funcs.filter(f => firstAllocation(f.body).isDefined).map(_.name).toSet
+
+    /** An allocating function this tree can arrive at, if there is one. */
+    private def reached(x: Any): Option[String] =
+      Reachability.reachedFrom(List(x), funcs, vtables).calls.find(direct)
+
+    /** Reports the **smallest** sub-tree that still reaches an allocator, which is as close to the
+     * call as the tree can put the caret: a body reaches one through some statement, that statement
+     * through some expression, and the descent stops where no part of the node answers on its own.
+     *
+     * Descending rather than testing every node is what keeps this one reachability walk per level
+     * instead of one per node.
+     */
+    def blame(x: Any): Unit =
+      for who <- reached(x) do
+        val site = narrow(x)
+
+        recover(())(at(position(site))(err(s"this reaches '${Modules.show(who)}', which makes heap " +
+          "storage, and this module declared 'no alloc' — an allocator-free module may only call " +
+          "what is allocator-free itself")))
+
+    private def narrow(x: Any): Any =
+      parts(x).find(c => reached(c).isDefined).map(narrow).getOrElse(x)
+
+    private def parts(x: Any): List[Any] = x match
+      case _: Type         => Nil
+      case xs: Iterable[?] => xs.toList
+      case p: Product      => p.productIterator.toList
+      case _               => Nil
+
+    /** Where the caret goes: the node's own position, or the first one under it that has one — a
+     * statement wrapping an expression carries none of its own.
+     */
+    private def position(x: Any): Option[Pos] = x match
+      case p: Positioned if p.pos.isDefined => p.pos
+      case _                                => parts(x).flatMap(c => position(c).toList).headOption
+  }
+
+  /** The first construction under `x` that makes heap storage, wherever it is. */
+  private def firstAllocation(x: Any): Option[TExpr] = x match
+    case _: Type                            => None
+    case e: TExpr if allocates(e).isDefined => Some(e)
+    case xs: Iterable[?]                    => xs.iterator.flatMap(firstAllocation).nextOption()
+    case p: Product                         => p.productIterator.flatMap(firstAllocation).nextOption()
+    case _                                  => None
 
   /** What a node allocates, said the way a reader would say it, or nothing for a node that does not.
    *
