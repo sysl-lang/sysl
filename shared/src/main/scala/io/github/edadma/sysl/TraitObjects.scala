@@ -130,8 +130,19 @@ trait TraitObjects extends TypeResolution {
         // Named by the trait the slot is for, not by the member's own name alone: a type may
         // implement one trait at more than one argument list, and a table for `&Sink[int]` whose
         // slot pointed at the `Sink[string]` member would be a table pointing at the wrong thing.
-        val fname           = traitMemberName(ty, from, m.name)
-        val (params, rtype) = funcInsts(fname)
+        val fname = traitMemberName(ty, from, m.name)
+
+        // A member whose signature did not match the trait's was reported where the `impl` is
+        // written and never registered, so there is nothing here to point a slot at. Errors are
+        // collected rather than thrown, so this line is reached *after* that report — and reading
+        // the table straight out of the map turned a diagnostic the compiler already had into a
+        // stack trace with no diagnostic at all. What is owed here is a second collected error, so
+        // that the conformance report is what a reader is left holding.
+        val (params, rtype) = funcInsts.getOrElse(
+          fname,
+          err(s"${show(ty)} has no '${m.name}' that '${show(tr)}' can point a slot at — the one it " +
+            s"declares does not match what '${qn(from.name)}' asks for"),
+        )
 
         funcsUsed += fname
         // Object safety already refused a trait with an associated function in it, so every member

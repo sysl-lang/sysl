@@ -162,6 +162,24 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
         "'out' of 'display_int' is *Writer, but &Writer was given")
     }
+
+    /* A member whose signature does not match the trait's is reported at the `impl` and never
+     * registered. Errors are collected rather than thrown, so the erasure that follows still runs
+     * and finds no function for the slot — and reading it straight out of the table turned a
+     * diagnostic the compiler already had into a stack trace with no diagnostic at all. */
+    "and a member at the wrong signature is reported rather than crashing the table builder" in {
+      val e = err("""struct Counter
+                    |    n: usize
+                    |impl Writer for Counter
+                    |    write(*self, bytes: []u8)
+                    |        self.n += bytes.len
+                    |var c: Counter
+                    |var w: *Writer = &c
+                    |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin)
+
+      e should include("parameter 'bytes' of method 'write' is []byte, but trait 'Writer' declares []const byte")
+      e should include("has no 'write' that 'Writer' can point a slot at")
+    }
   }
 
   "a format specifier" - {
