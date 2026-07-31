@@ -20,8 +20,12 @@ package io.github.edadma.sysl
  *
  * It has to carry *something*, and that is not a packaging accident. The standard module is what
  * every program is compiled against, so it cannot be a thing a compilation goes looking for on disk
- * and may not find. How it is carried — as text, as a checked-in `AstCodec` artifact — changes what
- * a compilation *costs* and nothing about what it means, so the two questions are kept apart.
+ * and may not find. This is that guarantee, and `Core.embedded` is it seen as a library.
+ *
+ * **What a given compilation was handed is a different question**, and it is `Core` that answers it:
+ * a program may be compiled against a `.syslib` whose trees never went through the parser, and every
+ * question about which declarations are the library's has to be answered over the one it actually
+ * got. This file is only the copy that is always available.
  *
  * **It is more than one file, and that is load-bearing rather than tidiness.** `Display.display`
  * names `Writer`, which is declared in the other one: a module's members are one set however many
@@ -53,10 +57,4 @@ object Std {
     )
 
   def decls: List[Stmt] = parsed.flatMap(_.body)
-
-  /** Whether a declaration came from here rather than from the program being compiled. Sources
-   * compare by identity, so a user file that happened to be called `lib/sysl/display.sysl` is not
-   * this one.
-   */
-  def declares(s: Positioned): Boolean = s.pos.exists(p => sources.exists(_ eq p.source))
 }

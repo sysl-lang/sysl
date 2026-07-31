@@ -45,9 +45,16 @@ trait AnalyzerBase {
    */
   protected def building: Set[String]
 
+  /** The standard module this compilation is compiled against, and where its trees came from
+   * (`Core`). It is carried rather than looked up because a compilation may be handed a library
+   * artifact instead of the copy the compiler embeds, and every question about *which* declarations
+   * are the library's has to be answered over the one it actually got.
+   */
+  protected def core: Core
+
   /** Whether a declaration written in `module` is one the **library** supplies.
    *
-   * Normally that is a question about which file it came from and nothing else (`Library.owns`), and
+   * Normally that is a question about which file it came from and nothing else (`Core.owns`), and
    * it is asked of the `Source` rather than of the module because a `Source` is the stronger answer:
    * a user file that happened to sit at `lib/sysl/render.sysl` is not one of the library's. The
    * compilation that *builds* a library module is the one
@@ -57,7 +64,27 @@ trait AnalyzerBase {
    * `lib/sysl/render.sysl` is being compiled that is the file in front of it.
    */
   protected def libraryOwns(d: Positioned, module: String): Boolean =
-    Library.owns(d) || building(module)
+    core.owns(d) || building(module)
+
+  /** Whether a declaration keyed `key` was **supplied** to this compilation by the library, rather
+   * than being one this compilation is producing. It is what decides whether a body is analyzed only
+   * once something reaches it, so that a program that never prints carries no printing surface.
+   *
+   * The `building` half is not a detail. `core.owns` asks which `Source` a declaration came from,
+   * and a compilation *building* the library can be handed the very `Source` objects the compiler
+   * embeds — the sbt task that builds the core artifact has them in memory and no reason to go to
+   * disk for a second copy. Asking ownership alone there holds back every function in the library,
+   * nothing reaches any of them, and the artifact comes out with an **empty object half**: it still
+   * carries every tree, so every program that used it would compile and run, and the whole point of
+   * precompiling would be silently gone. Read off disk the same source answers the other way, so the
+   * two builds of one library would disagree with nothing failing.
+   *
+   * This is the reverse of `libraryOwns`, which asks whether a declaration counts as the library's
+   * for *scope* — and there a library being built has to count, or the rest of it could not name what
+   * it declares.
+   */
+  protected def suppliedByLibrary(d: Positioned, key: String): Boolean =
+    core.owns(d) && !building(Modules.moduleOf(key))
 
   /** Every module the program is made of, by name, including the anonymous root one when a file
    * declared no header. It is what tells a dotted reference that names a module from one that
@@ -102,7 +129,7 @@ trait AnalyzerBase {
    * among them — it is a module's declaration like any other, and not visible from a named module
    * that did not name it.
    *
-   * Filled during hoisting from `Library.owns`, which is the one question about where a declaration
+   * Filled during hoisting from `Core.owns`, which is the one question about where a declaration
    * came from; this is that answer indexed by what a program writes, for the lookups that have a
    * name and no declaration to ask about.
    */
@@ -139,7 +166,7 @@ trait AnalyzerBase {
         // have handed the library's own signatures whatever the program declared under the same
         // name; it stays because nothing a program declares is the library's to reach, and a rule
         // that holds only while the two are in different modules is one waiting to be broken.
-        if currentFile.exists(Library.source) then
+        if currentFile.exists(core.source) then
           library.orElse(Option.when(declared(own) && visible(own))(own))
         else if declared(own) && visible(own) then Some(own)
         else

@@ -799,6 +799,18 @@ the precompiled half, because a `val`'s storage is written by the entry point an
 Such a function is compiled in the consuming program instead, where the initialization it depends on
 happens. Lifting that needs a library initializer the program calls before `main`.
 
+**And the standard module is not yet linked, only buildable.** `build-lib --core` produces a
+`.syslib` for `sysl`, and nothing consumes it: an ordinary compilation is handed the trees the
+compiler embeds, and emits a definition for every part of the library it reaches. So a program still
+takes a *source* dependence on the standard module — it re-derives every signature in it before
+checking its own first line — which is the one thing this section exists to remove and the last place
+it has not been removed. What stands in the way is not the mechanism, which is the same one a user's
+library already goes through; it is that the compiler builds the artifact and every compilation
+consumes it, so a bad one is not a failing test but a compiler that cannot compile anything, with the
+tests that would diagnose it unable to run. Which library a compilation is compiled against is
+therefore a **parameter** of it rather than an ambient fact, so that the two can be run side by side
+and the artifact held to meaning what the source means.
+
 ## 9. What is deliberately absent
 
 - **No file-as-module.** The file is a contribution, not a unit; there is no per-file namespace

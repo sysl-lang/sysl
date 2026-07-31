@@ -56,11 +56,12 @@ object Compiler {
    * exactly as one compiled alone does.
    */
   def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
-                   precompiled: Set[String] = Set.empty): Either[String, (String, List[String])] = {
+                   precompiled: Set[String] = Set.empty, core: Core = Core.embedded)
+      : Either[String, (String, List[String])] = {
     val parsed = sources.map(SyslParser.parse)
 
     parsed.collect { case Left(e) => e } match
-      case Nil  => analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled)
+      case Nil  => analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled, core)
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -108,10 +109,10 @@ object Compiler {
    * `building` names the shipped library's own modules where *this* is the compilation producing
    * them, so that the compiler does not supply the files it is being asked to compile.
    */
-  def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty)
-      : Either[String, (String, Set[String])] =
+  def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
+                     core: Core = Core.embedded): Either[String, (String, Set[String])] =
     for
-      typed    <- Analyzer.analyze(units, building)
+      typed    <- Analyzer.analyze(units, building, core)
       promoted <- Escape.check(typed)
     yield
       val mine            = units.map(moduleOf).toSet
@@ -140,10 +141,10 @@ object Compiler {
    * mistake in it a mistake at all. Pruning is therefore the last thing that happens to the tree, and
    * the only thing between the checks and the lowering.
    */
-  private def analyzed(units: List[Program], target: Target, precompiled: Set[String] = Set.empty)
-      : Either[String, (String, List[String])] =
+  private def analyzed(units: List[Program], target: Target, precompiled: Set[String] = Set.empty,
+                       core: Core = Core.embedded): Either[String, (String, List[String])] =
     for
-      typed    <- Analyzer.analyze(units)
+      typed    <- Analyzer.analyze(units, core = core)
       promoted <- Escape.check(typed)
     yield
       // Pruning still runs, and still from `main`: a library function this program never calls is

@@ -30,8 +30,11 @@ package io.github.edadma.sysl
  * *expected* type when the arguments alone do not determine them — which is what lets `None`
  * and `Ok(5)` take their type from the context they appear in.
  */
-class Analyzer private (protected val units: List[Program], protected val building: Set[String])
-    extends ProgramWalk with ExprAnalysis {
+class Analyzer private (
+    protected val units: List[Program],
+    protected val building: Set[String],
+    protected val core: Core,
+) extends ProgramWalk with ExprAnalysis {
 
   /** Every error the walk found, rendered and in source order. */
   def errors: List[String] = diagnostics
@@ -54,8 +57,9 @@ object Analyzer {
    * out of hoisting, since the pass that registers every signature already runs over the whole set
    * before any body is checked.
    */
-  def analyze(units: List[Program], building: Set[String] = Set.empty): Either[String, TProgram] = {
-    val analyzer = new Analyzer(units, building)
+  def analyze(units: List[Program], building: Set[String] = Set.empty, core: Core = Core.embedded)
+      : Either[String, TProgram] = {
+    val analyzer = new Analyzer(units, building, core)
 
     val outcome =
       try Right(analyzer.analyze())

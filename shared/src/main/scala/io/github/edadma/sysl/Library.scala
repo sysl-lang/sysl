@@ -1,6 +1,6 @@
 package io.github.edadma.sysl
 
-/** The library every compilation carries, and the one place that says where it comes from.
+/** What is true of the standard module however a compilation was handed it.
  *
  * Two questions run through the analyzer and both are about the same thing. **Is this declaration
  * the library's rather than the program's** — which decides whether it is in scope everywhere with
@@ -17,10 +17,13 @@ package io.github.edadma.sysl
  * and nothing spelled `FormatSpec` is found — and it would have stopped working at every one of
  * those sites at once, which is the failure this exists to prevent. So they ask here instead.
  *
- * **The library is now one thing: the standard module.** It was two for the length of the drain —
- * declarations moved out of the prelude a surface at a time, and every question below was answered
- * over both halves so that which one a declaration was in was a fact no caller had to hold. The
- * prelude is empty and gone, and what is left is that the answers are now about a module.
+ * **The two questions have since parted, and where the line falls is the point of this file.** The
+ * first one is about *these* trees: whether a declaration is the library's is answered by which
+ * source it came from, and which sources those are depends on whether the compilation parsed the
+ * library or decoded it. It moved to `Core`, which a compilation is given. The second is about the
+ * standard module as such — its name, the key a declaration in it is filed under, the spelling a key
+ * renders as, which names the compiler reaches for itself — and none of that turns on the carrier.
+ * That is what is left here.
  *
  * **`CoreTraits` speaks spellings, and its consumers translate.** What that table holds is which
  * operator each trait's method *is*, which is a fact about the source language rather than about
@@ -35,41 +38,14 @@ object Library {
    */
   val modules: List[String] = List(Std.module)
 
-  /** The library's declarations, each with the terms it reads names in.
+  /** Every declaration the library carries, as the compiler carries it.
    *
-   * The library imports nothing and needs to import nothing — `resolveName` looks a name written in
-   * a library declaration up among the library's own first, by the spelling rather than by the key,
-   * so one file reaches another with no import to write.
-   *
-   * Each program carries **its own source**, which is what says a name is being read *in* the
-   * library.
-   *
-   * `building` is the modules this compilation is **producing** rather than being supplied with,
-   * which is how the library's own source gets compiled at all: pointed at `lib`, the compiler would
-   * otherwise hand a copy of `sysl` to the files that declare it, and every name in them would be
-   * declared twice.
+   * The **embedded** copy specifically, and that is the right one for the questions asked of this:
+   * what the library declares, which the compiler-known names are held to, is a claim about the
+   * source under `lib/sysl` rather than about whatever a given compilation was handed. A
+   * compilation's own core is `Core`, which it is given rather than looks up.
    */
-  def scoped(building: Set[String] = Set.empty): List[(Scope, Stmt)] =
-    if building(Std.module) then Nil
-    else Std.parsed.flatMap(p => p.body.map((Scope(Std.module, Imports.empty, Some(p.source)), _)))
-
-  /** Whether a source is one of the library's own — what tells a name being read *in* the library
-   * from one being read in the program.
-   */
-  def source(s: Source): Boolean = Std.sources.exists(_ eq s)
-
-  /** Every declaration the library carries. */
-  def decls: List[Stmt] = Std.decls
-
-  /** Whether a declaration is the library's rather than the program's.
-   *
-   * Asked of the **position** rather than of the module, though the two now agree: a `Source` is a
-   * stronger answer than a name, since a user file that happened to sit at `lib/sysl/display.sysl`
-   * is not this one. While the prelude existed the two *disagreed* — its declarations were keyed
-   * under the root module, and so are a headerless program's, so a program declaring an `Ok` of its
-   * own would have been told its own type was the library's.
-   */
-  def owns(decl: Positioned): Boolean = Std.declares(decl)
+  def decls: List[Stmt] = Core.embedded.decls
 
   /** The key the library's declaration named `name` is filed under — what the compiler names one
    * by, wherever it names one rather than reading a name out of source.

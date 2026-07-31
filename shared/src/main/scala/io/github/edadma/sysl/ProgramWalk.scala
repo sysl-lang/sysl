@@ -50,7 +50,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
 
       u -> base.copy(imports = inScope(base)(gatherImports(u.body, autoImported(here))))
     }
-    val body = Library.scoped(building) ::: files.flatMap((u, s) => u.body.map((s, _)))
+    val body = core.scoped(building) ::: files.flatMap((u, s) => u.body.map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -181,7 +181,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // out by the table that says which names have no body rather than by its declaration form.
     val (fromLibrary, ours) = funcDecls.values.toList
       .filter(f => f.tparams.isEmpty && !externDecls.contains(f.name))
-      .partition(Library.owns)
+      .partition(f => suppliedByLibrary(f, f.name))
 
     for f <- ours do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
@@ -193,7 +193,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // queue rather than from here.
     val (libraryMembers, ourMembers) = members.toList
       .filter(f => !defaultOrigin.get(f.name).exists(brokenDefaults))
-      .partition(f => f.tparams.isEmpty && Library.owns(f))
+      .partition(f => f.tparams.isEmpty && suppliedByLibrary(f, f.name))
 
     for f <- ourMembers do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))

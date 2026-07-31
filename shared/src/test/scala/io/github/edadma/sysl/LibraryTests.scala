@@ -24,7 +24,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
     "every declaration the library ships is its own" in {
       Library.decls should not be empty
-      Library.decls.filterNot(Library.owns) shouldBe empty
+      Library.decls.filterNot(Core.embedded.owns) shouldBe empty
     }
 
     "nothing a program declares is" in {
@@ -34,13 +34,13 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       val mine = parsed("struct Ok\n    n: int\n\ndouble(n: int) -> int = n * 2\n")
 
       mine.length shouldBe 2
-      mine.filter(Library.owns) shouldBe empty
+      mine.filter(Core.embedded.owns) shouldBe empty
     }
 
     "a declaration with no position at all is not the library's" in {
       // A synthesized node carries none, and `owns` is asked of nodes the compiler built as well as
       // of ones it parsed — a wrong answer here would hand a desugaring the library's scope.
-      Library.owns(FuncDecl("f", Nil, Nil, None, Nil)) shouldBe false
+      Core.embedded.owns(FuncDecl("f", Nil, Nil, None, Nil)) shouldBe false
     }
   }
 
@@ -99,7 +99,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       // is left to say is that it is not empty and that all of it is the library's — the second is
       // what `Library.owns` answers, and an empty module would make it vacuously true.
       Std.decls should not be empty
-      Std.decls.forall(Library.owns) shouldBe true
+      Std.decls.forall(Core.embedded.owns) shouldBe true
       Library.decls shouldBe Std.decls
     }
 
