@@ -1,6 +1,15 @@
 # Capabilities
 
-**Status:** core mechanism decided. Capabilities govern the allocator / OS / POSIX boundary
+**Status:** core mechanism decided, and the **module half is built** — `no alloc` and `requires`
+are read from a file's header, the files of a module are held to agreeing, and `no alloc` is
+enforced both against the module's own constructions and against what its calls arrive at. The
+**target half is not**: nothing declares what a target offers, so a module's effective set is
+everything it did not narrow away, and `requires` is documentation until there is a target that
+could fail to satisfy it. Only `alloc` narrows — the other three gate standard-library modules that
+are not written, and a clause enforcing nothing would read in a source file as a guarantee the
+compiler never made, so `no os` is refused with that as the reason.
+
+Capabilities govern the allocator / OS / POSIX boundary
 that lets one language span safe application code and allocator-free kernel/driver code. The
 mechanism spans three layers — project config (targets declare capabilities), the module
 system (propagation, per-module restriction), and the type system (`alloc` gates the memory
@@ -88,6 +97,21 @@ fit within the target's capabilities.
   at the import, not deep in codegen.
 - On a no-`os` target, importing any module that requires `os` fails at resolution.
 
+**Where the `alloc` diagnostic actually lands, and why it is the call rather than the import.** The
+rule above is stated over modules, and the standard library is why the check cannot be: `sysl` is
+one module and is **half allocator-free**. `print` and `from_utf8` are declarations of the same
+module and only one of them allocates, so a module-grained rule would refuse every `no alloc` module
+that named anything at all — including the printing that allocator-free code does constantly. So the
+question asked is the one this section's first bullet also asks: what does this module *call*. A
+`no alloc` module is refused where it reaches a function that makes heap storage, and the message
+points at the smallest part of the body that still reaches it.
+
+The reachable set **over-approximates** where a call's target is decided at run time — a method-table
+slot is answered with what every table for that trait put there — which is the direction to be wrong
+in, since a refusal then names a function the program might really arrive at. An `extern` is not
+followed at all: what a C function does is not this compiler's to know, and `capabilities.md` already
+allows an allocator-free module the `malloc` and `free` it provides itself through `*T`.
+
 ## What `alloc` gates, precisely
 
 **Requires `alloc`** (heap-backed):
@@ -140,5 +164,22 @@ allocator-free everywhere.
   that unblocks the work at hand (root, active target, capabilities, build flags, platform-file
   selection); let real needs drive versioning, dependency resolution, workspaces, and
   publishing rather than guessing at them upfront.
-- **`requires` granularity** — module-level only, or also finer? Module-level is the unit for
-  now.
+- **`requires` granularity** — module-level only, or also finer? Module-level is the unit a
+  *declaration* is written at, and that has not changed. What did change is that the **question**
+  turned out to be finer than the declaration: `alloc` is checked against what a module calls, for
+  the reason § *Propagation* gives, so a `requires alloc` written on `sysl` would say something
+  false about most of it. Whether `requires` should be writable on a declaration — so that a library
+  can mark the handful of its functions that need an allocator, rather than the module that holds
+  them — is the open half, and the standard library is the case that asks for it.
+- **A module is the unit, and rendering is what does not fit in it.** Both guide programs written to
+  be allocator-free hit the same thing when the clause arrived, one function apart: a machine that
+  makes no heap storage sits beside the function that turns its error into a sentence, and that
+  function builds a string. `guide/bytecode`'s `vm` carries the clause and its `describe` moved out
+  to the caller — which is the shape freestanding code has anyway, so the clause found the seam
+  rather than creating one. `guide/kernel` cannot carry it at all, because its machine and its checks
+  are one module. Nothing here is wrong; what it says is that **a module is a coarse unit for this
+  question**, and it is the same observation the granularity bullet above makes from the other end.
+- **Narrowing is enforced for `alloc` alone.** `os`, `posix` and `threads` are read and refused with
+  the reason: each gates which standard-library modules exist, and those modules are not written.
+  They become narrowings the day there is something for them to gate, and the grammar already
+  carries them.
