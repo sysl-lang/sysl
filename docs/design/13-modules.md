@@ -842,10 +842,10 @@ guesses. A missing artifact is therefore an error naming the command that builds
 that is corrupt, truncated, built by another sysl, or built from other sources than these — a
 standard module that cannot be read is not a standard module.
 
-**`--no-core-lib` is the one route to the copy the compiler carries.** That copy exists because sysl
-has no released compiler to build its first artifact with, and because the compiler's own tests have
-to run in a tree where nothing has been built yet; it is reached by asking for it, never by a lookup
-coming up empty. The distinction is what keeps it honest. A fallback taken silently would be a
+**`--no-core-lib` is the one route to the copy the compiler carries.** That copy is there for the
+compiler's own unit tests, which have to run in a tree where nothing has been built — and, once, for
+the bootstrap, since there was no released sysl to build the first artifact with. It is reached by
+asking for it, never by a lookup coming up empty. The distinction is what keeps it honest. A fallback taken silently would be a
 fallback taken *always* — nobody would have any reason to build an artifact — and the path meant for
 the rarest of circumstances would quietly become the only one anyone ever ran. It has a second use
 once it exists: compiling one program both ways is how the two paths are held to meaning the same
