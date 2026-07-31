@@ -24,16 +24,17 @@ object Tests {
    * for, and a type parameter leaves nothing to call at all, since a generic has no compiled form
    * until a caller fixes its arguments.
    *
+   * A variadic tail needs no case of its own: `12 §9` already requires a named parameter in front of
+   * one, so a function that could take a tail has taken a parameter and is refused by that.
+   *
    * Each is reported where the attribute is rather than where the signature is, because the attribute
    * is the part that is wrong: the function is a perfectly good function, and it is `#test` that made
    * a promise about it that it cannot keep.
    */
   def problem(f: FuncDecl): Option[String] =
-    if f.params.nonEmpty || f.variadic then
+    if f.params.nonEmpty then
       Some(s"a '#test' function takes no parameters, and '${Modules.bare(f.name)}' takes " +
-        (if f.variadic && f.params.isEmpty then "a variadic tail"
-         else if f.params.length == 1 then "one"
-         else s"${f.params.length}") +
+        (if f.params.length == 1 then "one" else s"${f.params.length}") +
         " — 'sysl test' calls it with nothing, so there is nowhere for an argument to come from")
     else if f.tparams.nonEmpty then
       Some(s"a '#test' function has no type parameters, and '${Modules.bare(f.name)}' declares " +

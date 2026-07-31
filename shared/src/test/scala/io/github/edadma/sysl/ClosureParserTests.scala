@@ -129,8 +129,8 @@ class ClosureParserTests extends AnyFreeSpec with ParseSupport {
   "the callable's type" - {
     /** The type written on a single parameter, which is where every spelling below is legal. */
     def paramType(src: String): TypeRef = prog(s"f(g: $src)\n    0\n") match {
-      case List(FuncDecl(_, _, List(Param(_, t, _)), _, _, _, _, _, _)) => t
-      case other                                                        => fail(s"unexpected $other")
+      case List(f: FuncDecl) if f.params.length == 1 => f.params.head.typ
+      case other                                     => fail(s"unexpected $other")
     }
 
     "the bare arrow takes one domain" in {
@@ -185,8 +185,8 @@ class ClosureParserTests extends AnyFreeSpec with ParseSupport {
 
     "a result list is still a result list beside one" in {
       prog("f(g: int -> int) -> int, int\n    0, 0\n") match {
-        case List(FuncDecl(_, _, _, Some(TupleType(parts, true)), _, _, _, _, _)) =>
-          parts shouldBe List(NamedType("int"), NamedType("int"))
+        case List(f: FuncDecl) if f.retType.exists(_.isInstanceOf[TupleType]) =>
+          f.retType shouldBe Some(TupleType(List(NamedType("int"), NamedType("int")), true))
         case other => fail(s"unexpected $other")
       }
     }
@@ -198,9 +198,9 @@ class ClosureParserTests extends AnyFreeSpec with ParseSupport {
            |
            |    inner(n)
            |""".stripMargin) match {
-      case List(FuncDecl("outer", _, _, _, stmts, _, _, _, _)) =>
-        stmts.head shouldBe a[FuncDecl]
-        stmts.head.asInstanceOf[FuncDecl].name shouldBe "inner"
+      case List(f: FuncDecl) if f.name == "outer" =>
+        f.body.head shouldBe a[FuncDecl]
+        f.body.head.asInstanceOf[FuncDecl].name shouldBe "inner"
       case other => fail(s"unexpected $other")
     }
   }
