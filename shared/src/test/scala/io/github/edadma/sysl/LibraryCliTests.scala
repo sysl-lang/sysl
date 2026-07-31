@@ -421,6 +421,31 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       isFile(out) shouldBe false
     }
 
+    "and the worked example in the tree builds and runs" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // `examples/regex` is the one place a reader can see the whole shape at once, which is exactly
+      // what makes it rot: every other test here builds its library out of a string. The same
+      // reasoning as `ExampleTests` — nothing else in the suite reads those files.
+      val root = List("examples/regex", "../examples/regex", "../../examples/regex").find(isDirectory)
+
+      assume(root.isDefined, "examples/regex not reachable from the working directory")
+
+      val out = createTempFile("sysl-cli-example-", LibraryArtifact.extension)
+
+      cli(Config(command = "build-lib", file = s"${root.get}/lib", output = Some(out))) shouldBe 0
+
+      val printed = ran(Config(command = "run", file = s"${root.get}/match.sysl", libs = List(out)))
+      val lines   = printed.linesIterator.toList
+
+      lines.take(3) shouldBe List("aab      0..3", "abbbb    0..5", "ba       no match")
+
+      // The message is the C library's own, and BSD and glibc word it differently — so what is
+      // pinned is that it arrived through `from_cstring` at all, rather than which library wrote it.
+      lines(3) should startWith("a[ is not a pattern: ")
+      lines(3).length should be > "a[ is not a pattern: ".length
+    }
+
     "and editing only the C changes what the artifact fingerprints as" in {
       // A library's shims are as much its source as its modules are. An artifact that did not change
       // when one of them was edited is a stale artifact nothing would notice was stale — which is
