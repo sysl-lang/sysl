@@ -79,12 +79,19 @@ object LibraryArtifact {
   /** A fingerprint of the source a library was built from, carried in the artifact so that a
    * consumer can tell one built from *these* files from one built from different ones.
    *
-   * **It is over the files' contents and their base names, never their paths.** The same library is
-   * built from wherever its root happens to be — `sysl build-lib lib --core` walks `lib/sysl` off
-   * disk and names each file by the path it was found at, while the copy the compiler carries names
-   * them by where the generator read them. Those two are the same library and have to fingerprint
-   * the same, or the guard this exists for would fire on every artifact ever built. Sorting is for
-   * the same reason: a directory listing decides nothing.
+   * **It is over the files' contents and their places in the library, never the paths they were
+   * found at.** The same library is built from wherever its root happens to be — `sysl build-lib lib
+   * --core` walks `lib/sysl` off disk and names each file by the path it was found at, while the copy
+   * the compiler carries names them by where the generator read them. Those two are the same library
+   * and have to fingerprint the same, or the guard this exists for would fire on every artifact ever
+   * built. Sorting is for the same reason: a directory listing decides nothing.
+   *
+   * A file's place is its **directory below the root** and its name, and not the name alone. A
+   * library is a tree, so two of its modules may each hold a `read.sysl` — and keying by the name
+   * would give them one key between them, at which point the sort is deciding by input order what
+   * two files with one name hash as, and the same library fingerprints two ways depending on the
+   * order it was read in. Which is precisely the guard failing open: a stale artifact that hashed
+   * the other way would be accepted.
    *
    * FNV-1a rather than a cryptographic digest, because the question is *did these files change*, not
    * *did someone forge them* — and a `MessageDigest` is not on every platform this cross-builds to.
@@ -98,7 +105,9 @@ object LibraryArtifact {
       for c <- s do
         h = (h ^ c.toLong) * 0x100000001b3L
 
-    for s <- sources.map(s => (Project.basename(s.name), s.text)).sortBy(_._1) do
+    def place(s: Source): String = (s.dir.getOrElse(Nil) :+ Project.basename(s.name)).mkString("/")
+
+    for s <- sources.map(s => (place(s), s.text)).sortBy(_._1) do
       mix(s._1)
       mix(Nul)
       mix(s._2)

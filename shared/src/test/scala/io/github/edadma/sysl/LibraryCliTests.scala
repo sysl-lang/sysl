@@ -904,14 +904,15 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
       LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _)) match
         case Right((trees, syms, fingerprint)) =>
-          // Every symbol is the standard module's own. The renderers reach the library's
-          // `sysl_snprintf` and the library's `putbytes` under them, and **none of those is in
-          // here** — a library defines its own declarations and nobody else's, and the core library
-          // is the one place that rule is under the most pressure, since the whole of the rest of
-          // the library is what it was compiled against.
+          // Every symbol is one of the library's own modules'. A library defines its own
+          // declarations and nobody else's, and the core library is the one place that rule is under
+          // the most pressure, since the whole of the rest of the library is what it was compiled
+          // against. `sysl.args` is in here as well as `sysl`, which is the point of building the
+          // whole tree rather than the standard module alone.
           syms should not be empty
-          syms.filterNot(_.startsWith(s"${Std.module}${Modules.sep}")) shouldBe empty
-          trees.flatMap(_.module.map(_.show)).distinct shouldBe List(Std.module)
+          syms.filterNot(s => Library.modules.contains(Modules.moduleOf(s))) shouldBe empty
+          syms.map(Modules.moduleOf).size should be > 1
+          trees.flatMap(_.module.map(_.show)).distinct.sorted shouldBe Library.modules
 
           // And it fingerprints as the library the compiler carries, though this one was walked off
           // disk and named by where it was found while the carried copy is named by where the

@@ -300,9 +300,15 @@ then in the library**, and nowhere else — a sibling module's names are not in 
 neither are the root module's, which have no path to be reached by at all (§1). The standard module
 is reachable two ways and they agree: it is auto-imported into every file, so it answers at the
 import step and takes part in the wildcard rules above, and it is also the last step on its own, so
-a name it declares resolves even where a file's imports say nothing. **A file of the library itself
-inverts the first two** — a name written there means the library's before it means the module's,
-since nothing a program declares is the library's to reach.
+a name it declares resolves even where a file's imports say nothing.
+
+**The library's own files take the same three steps.** They are files of modules, and the module each
+is in is one of the library's, so "this module first" can only ever hand a library file the library's
+own declaration — there is nothing for a special order to protect it from. A file of the library may
+therefore also *import*, which is what a library of more than one module needs: `sysl.sys` naming
+something of `sysl.text` is naming another module's declaration and says so exactly as any other file
+would. Only the standard module is auto-imported (§8); a submodule of it is an offer like any other
+library's.
 
 **Every step is filtered by §2, the library's included.** A member the library keeps to itself is not
 an answer to a program's bare name, exactly as a sibling file's private helper is not: the search
@@ -442,12 +448,20 @@ imports a module depends on it whether or not it goes on to write the shorter sp
 because a file's imports are meant to be readable as what it needs, and a dependency that came and
 went with a use would not be.
 
-Two things sit outside the graph. The **standard module** `sysl` (§8) is auto-imported into every
-file, so writing `print` is not a dependency on anything: an edge every file has says nothing —
-worse, it would make the library's own files depend on themselves. And the **anonymous root module**
-(§1) can be depended on by nothing, having
+The **anonymous root module** (§1) sits outside the graph: it can be depended on by nothing, having
 no name for another module to write — a program's root files depend on the modules beneath them, and
 the dependency never runs back.
+
+**The standard module does not.** Writing `print` records an edge on `sysl` like any other reference,
+and that is deliberate rather than an oversight in the rule. For a program the edge is inert — nothing
+in the library can point back at a program's module, so it can never close a cycle — but *within the
+library* it is the whole of what keeps the split honest: a submodule of `sysl` that uses the free
+names depends on `sysl`, so `sysl` may not turn round and depend on it. That is a real constraint and
+it decides the library's own layout. `sysl` reaches `sysl.sys` for the C functions its printing is
+built on, so `sysl.sys` may name nothing of `sysl`'s — which is why it holds the externs and nothing
+else, and why the argument conversion, which calls `buf`, `from_utf8`, `print` and `exit`, is
+`sysl.args` and not part of `sys`. A module that depends on nothing is what a platform module should
+be anyway; the rule is what says so out loud.
 
 Three things follow from acyclicity:
 
@@ -550,11 +564,16 @@ costs nothing, since the conversion below is reached only by the other one.
 
 **`args` is a slice of `string`.** What the platform hands a program is C's pair — a count, and a
 vector of NUL-terminated byte runs — and neither of those appears in a sysl signature anywhere. The
-pair is converted by the library's `args_of`, which finds each run's end, validates its bytes, and
-**copies** them into strings the program owns: an argument therefore outlives the vector it came from
-and holds no memory the platform is still responsible for. The zeroth element is the program's own
-path, because that is what the platform passes and withholding it would be inventing a different
-convention than every other language's.
+pair is converted by the library's `sysl.args.args_of`, which finds each run's end, validates its
+bytes, and **copies** them into strings the program owns: an argument therefore outlives the vector it
+came from and holds no memory the platform is still responsible for. The zeroth element is the
+program's own path, because that is what the platform passes and withholding it would be inventing a
+different convention than every other language's.
+
+It sits in a submodule and not in `sysl`, so `args_of` is not a word every file has: a `main(args:
+[]string)` reaches it without naming anything, because the entry point names it by key rather than by
+resolving the word, and a program handed an `argv` by something *other* than the platform writes the
+path. Which is what a submodule is for — the free names are the ones a program cannot avoid needing.
 
 **An argument that is not UTF-8 stops the program**, with the offset of the byte that made it
 ill-formed. `04` puts the validation of bytes computed at run time at the boundary they arrive
@@ -1026,3 +1045,12 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   linker's discard between them — so the two are different things and the difference is measurable.
   It is the same question as `14 §8 a`'s — which module the trait catalog lives in once there is more
   than one — asked about a second body of code.
+
+  **The *where* now admits a shape, which narrows the *what*.** `lib/sysl` is a tree: a directory
+  under it is a submodule of `sysl` by §1's ordinary rule, and only `sysl` itself is auto-imported, so
+  a name put in a submodule is a name a program has to ask for. That turns "what belongs in the
+  standard library" into two questions that can be answered separately — what a program cannot avoid
+  needing, which is what the language desugars onto and belongs in `sysl`, and what a program should
+  have to name, which is everything else. Whether a submodule can be marked private to its parent, so
+  that the library can have workings that are not a public surface at all, is (c); `private[sysl]` on
+  each declaration reaches the same place today, one declaration at a time.

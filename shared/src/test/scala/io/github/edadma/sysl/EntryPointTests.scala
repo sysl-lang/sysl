@@ -256,7 +256,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
                 |""".stripMargin
 
     "with the offset of the byte that made it ill-formed" in {
-      panics(bad + "var args = args_of(1i32, &vec[0])\nprint(args.len)\n",
+      panics(bad + "var args = sysl.args.args_of(1i32, &vec[0])\nprint(args.len)\n",
         "panic: command-line argument 0 is not UTF-8 at byte 0")
     }
 
@@ -264,7 +264,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       panics("""var ok: [3]u8 = [0x68u8, 0x69u8, 0u8]
                |""".stripMargin + bad +
         """var vec2: [2]*u8 = [&ok[0], &run[0]]
-          |var args = args_of(2i32, &vec2[0])
+          |var args = sysl.args.args_of(2i32, &vec2[0])
           |print(args.len)
           |""".stripMargin,
         "command-line argument 1 is not UTF-8")
@@ -273,7 +273,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "while a well-formed vector converts" in {
       run("""var a: [3]u8 = [0x68u8, 0x69u8, 0u8]
             |var vec: [1]*u8 = [&a[0]]
-            |var args = args_of(1i32, &vec[0])
+            |var args = sysl.args.args_of(1i32, &vec[0])
             |
             |print(args.len, args[0])
             |""".stripMargin) shouldBe "1 hi\n"
@@ -281,7 +281,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
     "and an empty vector converts to an empty slice" in {
       run("""var vec: [1]*u8 = [c"unused"]
-            |var args = args_of(0i32, &vec[0])
+            |var args = sysl.args.args_of(0i32, &vec[0])
             |
             |print(args.len)
             |""".stripMargin) shouldBe "0\n"
@@ -429,9 +429,9 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     // The conversion used to be a name a program could not take, because the prelude declared it in
-    // the same root module a headerless program is in. In the standard module it is `sysl.args_of`,
-    // so the word is a program's to spend — and the entry point goes on calling the library's, which
-    // it names by key and never by what the word resolves to at the top level.
+    // the same root module a headerless program is in. It is `sysl.args.args_of` now — a submodule's
+    // name, so it is not even among the ones a file gets for free — and the entry point goes on
+    // calling the library's, which it names by key and never by what the word resolves to.
     "while the conversion is a word the program may spend on something else" in {
       runWith("""args_of(n: int) -> string = "mine"
                 |
@@ -454,7 +454,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
                 |main(args: []string)
                 |    var vec: [1]*u8 = [c"direct"]
                 |
-                |    print(args_of(1), sysl.args_of(1i32, &vec[0])[0], args.len)
+                |    print(args_of(1), sysl.args.args_of(1i32, &vec[0])[0], args.len)
                 |""".stripMargin, "one", "two") shouldBe "mine direct 3\n"
     }
   }

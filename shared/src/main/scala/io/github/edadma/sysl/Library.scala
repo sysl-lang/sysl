@@ -33,10 +33,28 @@ package io.github.edadma.sysl
  */
 object Library {
 
-  /** The **named** modules the library contributes, which every file may write the names of without
-   * importing them (`AutoImport`) and which a program may also reach by their full path.
+  /** The **named** modules the library's own source declares — what `sysl build-lib --core` is
+   * producing, and the only compilation allowed to declare any of them.
+   *
+   * Read off the library's own headers rather than written down, because a module is a directory
+   * and the library is a tree: adding a directory under `lib/sysl` is how a submodule comes into
+   * being, and a list kept beside that would have to be edited in step with it or would quietly
+   * leave the new module out of the build that is supposed to be producing it.
+   *
+   * What a given compilation was *handed* is `Core.modules`, and that is the one to ask about
+   * scope. This is about the source in the tree, like everything else here.
    */
-  val modules: List[String] = List(Std.module)
+  lazy val modules: List[String] = Core.embedded.modules
+
+  /** The library modules every file may write the names of without importing them (`AutoImport`,
+   * `13 §8`).
+   *
+   * **Only the standard module**, which is the whole of what auto-importing is for: a program
+   * cannot avoid needing what the language desugars onto, so those names arriving unasked-for is
+   * honest. A submodule is an offer rather than part of the language, and is reached by naming it
+   * or importing it exactly as any other module is (`13 §3`).
+   */
+  val autoImported: List[String] = List(Std.module)
 
   /** Every declaration the library carries, as the compiler carries it.
    *
@@ -50,11 +68,32 @@ object Library {
   /** The key the library's declaration named `name` is filed under — what the compiler names one
    * by, wherever it names one rather than reading a name out of source.
    *
-   * Every library declaration is in the standard module, so this is that module's qualification and
-   * nothing else. It was a lookup over what had moved for as long as the drain ran; what it records
-   * now is that there is nowhere else for a library declaration to be.
+   * A lookup, because a library declaration is in whichever of the library's modules declares it
+   * and the compiler reaches some that are not in the standard one — `args_of` is what builds a
+   * `main`'s argument list and lives with the other things a hosted platform hands over. Spelling
+   * the standard module's qualification here instead, as this once did, is the claim that there is
+   * nowhere else for a library declaration to be, and a name that moved would then be looked up
+   * under a module that no longer declares it: found by nothing, and reported as a compiler
+   * exception rather than as anything a reader could act on.
+   *
+   * A name the library does not declare falls back to the standard module's qualification, which is
+   * a key that resolves to nothing — the same answer as before, at the same site. `LibraryTests`
+   * is what holds `known` to being declared, so nothing reaches that fallback in a tree that passes.
    */
-  def key(name: String): String = Modules.qualify(Std.module, name)
+  def key(name: String): String = located.getOrElse(name, Modules.qualify(Std.module, name))
+
+  /** Every spelling the library declares, against the key its own module files it under.
+   *
+   * One spelling in two library modules would lose one of them here. That is worth no machinery:
+   * `key` is only ever asked about `known`, and `LibraryTests` holds that set to naming exactly one
+   * declaration apiece.
+   */
+  private lazy val located: Map[String, String] =
+    Core.embedded.units.flatMap { u =>
+      val module = Compiler.moduleOf(u)
+
+      names(u.body).map(n => n -> Modules.qualify(module, n))
+    }.toMap
 
   /** The library's own spelling of a key, or `None` where the key is not the library's.
    *
@@ -62,12 +101,12 @@ object Library {
    * `Type.Bound`'s are keys by the time either is looked at, and the tables the compiler holds about
    * its own traits are spelled the way a program writes them.
    *
-   * A key is the library's when it is in the standard module, which nothing but the library may
-   * declare — a *program's* own `FormatSpec` is keyed under the module its file is in, and that is
-   * never this one.
+   * A key is the library's when it is in one of the library's modules, none of which anything but
+   * the library may declare — a *program's* own `FormatSpec` is keyed under the module its file is
+   * in, and that is never one of these.
    */
   def spelling(k: String): Option[String] =
-    Option.when(Modules.moduleOf(k) == Std.module)(Modules.bare(k))
+    Option.when(modules.contains(Modules.moduleOf(k)))(Modules.bare(k))
 
   /** The enum `?` unwraps, paired with its success and failure variant names (`09 §4`).
    *
@@ -89,7 +128,10 @@ object Library {
    */
   lazy val declared: Set[String] = names(decls)
 
-  private def names(stmts: List[Stmt]): Set[String] = stmts.flatMap {
+  /** The spellings a set of statements declares at the top level. Reachable from a test, which is
+   * what holds `key`'s lookup to naming exactly one declaration per spelling.
+   */
+  private[sysl] def names(stmts: List[Stmt]): Set[String] = stmts.flatMap {
     case d: ConstDecl  => List(d.name)
     case d: ValDecl    => List(d.name)
     case d: FuncDecl   => List(d.name)

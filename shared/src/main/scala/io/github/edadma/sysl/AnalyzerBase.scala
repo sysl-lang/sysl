@@ -66,6 +66,21 @@ trait AnalyzerBase {
   protected def libraryOwns(d: Positioned, module: String): Boolean =
     core.owns(d) || building(module)
 
+  /** Whether a declaration written in `module` is one the library **offers unqualified** — that is,
+   * one of the names in scope everywhere with no import (`13 §8`, `libraryNames`).
+   *
+   * Not every library declaration is. Only the standard module's names arrive unasked-for; a
+   * submodule's are reached by naming the module or importing it, like any other module's
+   * (`Library.autoImported`). Without the second half, splitting the library into submodules would
+   * put every name back into every file by another route and change nothing at all.
+   *
+   * A module the core does not carry is left alone, which is what keeps this about the *library*: a
+   * compilation building some other library is also one whose declarations `libraryOwns` counts,
+   * and what that library offers unqualified is its own affair (`AutoImport.including`).
+   */
+  protected def libraryOffers(d: Positioned, module: String): Boolean =
+    libraryOwns(d, module) && (Library.autoImported.contains(module) || !core.carries(module))
+
   /** Whether a declaration keyed `key` was **supplied** to this compilation by the library, rather
    * than being one this compilation is producing. It is what decides whether a body is analyzed only
    * once something reaches it, so that a program that never prints carries no printing surface.
@@ -176,15 +191,15 @@ trait AnalyzerBase {
         // first: it is the likelier thing to have been meant.
         def restricted = Option.when(declared(own))(own).orElse(library).map(reachable)
 
-        // A name written **in the library** means the library's, and is looked for there first —
-        // the one place the first two steps are inverted. It mattered most while part of the library
-        // sat in the root module a headerless program is also in, where "this module first" would
-        // have handed the library's own signatures whatever the program declared under the same
-        // name; it stays because nothing a program declares is the library's to reach, and a rule
-        // that holds only while the two are in different modules is one waiting to be broken.
-        if currentFile.exists(core.source) then
-          offered.orElse(Option.when(declared(own) && visible(own))(own)).orElse(restricted)
-        else if declared(own) && visible(own) then Some(own)
+        // A name written in the library takes these same three steps, and used to take a fourth
+        // order of its own: the library's names were looked for ahead of the file's own module. That
+        // mattered while part of the library sat in the root module a headerless program is also in,
+        // where "this module first" would have handed the library's own signatures whatever the
+        // program declared under the same name. Every library file is in a library module now, so
+        // `own` can only ever be the library's, and the inversion had nothing left to protect — while
+        // it did cost the library the ability to import, since the inverted order had no import step
+        // in it at all. Which a library of more than one module needs, the same way anyone does.
+        if declared(own) && visible(own) then Some(own)
         else
           // A declaration this file may not name is not a candidate, so the search goes on rather
           // than stopping at it: a file that imported a `width` said which one it meant, and a

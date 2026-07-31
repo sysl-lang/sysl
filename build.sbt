@@ -39,11 +39,16 @@ ThisBuild / publishTo := sonatypePublishToBundle.value
 
 // The core library's own source, embedded into the compiler that ships it.
 //
-// `lib/sysl/*.sysl` is where the standard module is *written* -- ordinary sysl files, read by the
-// same driver a user's library goes through. But a compiler has to carry it: the standard module is
-// what every program is compiled against, so it cannot be something a compilation goes looking for
-// on disk and may not find. Generating the carrier from the files rather than hand-keeping a copy
+// `lib/sysl` is where the standard module is *written* -- ordinary sysl files, read by the same
+// driver a user's library goes through. But a compiler has to carry it: the standard module is what
+// every program is compiled against, so it cannot be something a compilation goes looking for on
+// disk and may not find. Generating the carrier from the files rather than hand-keeping a copy
 // beside them is what makes the files the fact.
+//
+// It is a **tree** and not a flat directory. A module is a directory (`13 s1`), so a submodule of
+// `sysl` is a directory under `lib/sysl`, and a listing one level deep would leave the files that
+// declare it out of the compiler while they sat in plain sight in the tree -- the exact failure the
+// generator exists to prevent, arrived at from the other side.
 def syslLiteral(s: String): String =
   s.flatMap {
     case '"'  => "\\\""
@@ -58,12 +63,23 @@ lazy val embedCoreLibrary = Def.task {
   val utf8 = java.nio.charset.StandardCharsets.UTF_8
   val out  = (Compile / sourceManaged).value / "io" / "github" / "edadma" / "sysl" / "CoreSource.scala"
   val dir  = (ThisBuild / baseDirectory).value / "lib" / "sysl"
-  val files = Option(dir.listFiles).getOrElse(Array.empty).filter(_.getName.endsWith(".sysl")).sortBy(_.getName)
+
+  // Sorted by the path below `lib/sysl` rather than by the bare file name, so that what a
+  // compilation sees does not depend on the order a directory happened to list, and two files of
+  // different submodules that share a name stay apart. Separators are normalised because the name
+  // is a diagnostic's file name and half of a module's, neither of which is the build host's
+  // business.
+  val files =
+    (dir ** "*.sysl").get
+      .map(f => IO.relativize(dir, f).getOrElse(sys.error(s"$f is not under $dir")).replace('\\', '/') -> f)
+      .sortBy(_._1)
 
   if (files.isEmpty) sys.error(s"the core library has no source files at $dir")
 
   val entries =
-    files.map(f => s"""    ("lib/sysl/${f.getName}", ${syslLiteral(IO.read(f, utf8))}),""").mkString("\n")
+    files.map { case (path, f) =>
+      s"""    ("lib/sysl/$path", ${syslLiteral(IO.read(f, utf8))}),"""
+    }.mkString("\n")
   val text =
     s"""package io.github.edadma.sysl
        |

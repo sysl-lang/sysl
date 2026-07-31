@@ -70,8 +70,13 @@ object Imports {
  */
 object AutoImport {
 
-  /** The modules to bring in unqualified, if a compilation has them. */
-  def modules: List[String] = Library.modules ::: extra
+  /** The modules to bring in unqualified, if a compilation has them.
+   *
+   * The library's own auto-imported list rather than everything it contributes: a submodule of
+   * `sysl` is reached by naming it, so its names arriving unasked-for would put the library's whole
+   * surface back into every file — which is the thing splitting it up is for.
+   */
+  def modules: List[String] = Library.autoImported ::: extra
 
   private var extra: List[String] = Nil
 

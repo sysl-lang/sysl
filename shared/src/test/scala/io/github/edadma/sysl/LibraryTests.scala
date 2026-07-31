@@ -75,23 +75,20 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
-  "the standard module, which is the whole of the library" - {
+  "the standard module, which every program is compiled against" - {
 
-    "says in every one of its headers what `Std.module` says" in {
-      // `module` is a constant so that nothing has to parse to ask which module a name is in. This
-      // is what holds it to the source it stands for — and it is asked of every file, because a
-      // second module hiding among them would be a module nothing auto-imports and no header
-      // announces.
+    "says in one of the library's headers what `Std.module` says" in {
+      // `module` is a constant so that nothing has to parse to ask which module the auto-imported
+      // names are in. This is what holds it to the source it stands for.
       Std.parsed should not be empty
-      Std.parsed.map(_.module.map(_.show)).distinct shouldBe List(Some(Std.module))
+      Std.parsed.map(_.module.map(_.show)) should contain(Some(Std.module))
     }
 
     "is made of more than one file, each of which the driver would build the same way" in {
       // `Display.display` names `Writer` from the other file. That direction is what says a module's
       // members are one set however many files they came from, and it is why neither file imports
       // the other.
-      Std.sources.length should be > 1
-      Std.sources.map(_.dir).distinct shouldBe List(Some(List(Std.module)))
+      Std.sources.count(_.dir.contains(List(Std.module))) should be > 1
     }
 
     "declares the whole of what the library declares" in {
@@ -106,6 +103,17 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     "is a module every file may write the names of without importing it" in {
       Library.modules should contain(Std.module)
       AutoImport.modules should contain(Std.module)
+    }
+
+    // A submodule is where the library puts what a program should have to ask for, so the one thing
+    // that must stay true of it is that asking is required — its names are not among the free ones.
+    "which the library's submodules are not" in {
+      Library.modules.filterNot(_ == Std.module) should not be empty
+      for m <- Library.modules if m != Std.module do AutoImport.modules should not contain m
+    }
+
+    "and every file sits in one of them, however deep the tree goes" in {
+      Std.sources.map(_.dir.get.mkString(".")).distinct.sorted shouldBe Library.modules
     }
   }
 
@@ -134,6 +142,28 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       // A name here that the library does not declare is a call that resolves to nothing, reached
       // from inside the compiler where no diagnostic is waiting for it.
       Library.known -- Library.declared shouldBe Set.empty
+    }
+
+    // `Library.key` is a lookup from a spelling to the module that declares it, so a spelling in two
+    // of the library's modules would give one of them an answer that is silently the other's. It is
+    // a real hazard now that there is more than one module and no machinery guarding it: this is the
+    // guard, and it is enough because `key` is only ever asked about `known`.
+    "each in exactly one of the library's modules" in {
+      val declaredIn =
+        for
+          u <- Core.embedded.units
+          n <- Library.names(u.body) if Library.known(n)
+        yield n -> Compiler.moduleOf(u)
+
+      declaredIn.groupMap(_._1)(_._2).filter(_._2.distinct.length > 1) shouldBe empty
+      declaredIn.map(_._1).toSet shouldBe Library.known
+    }
+
+    "and `key` names that module, wherever in the library it turned out to be" in {
+      // The one that moved, which is why this is a lookup rather than the standard module's
+      // qualification: a `main` taking arguments reaches it from inside the compiler.
+      Library.key("args_of") shouldBe Modules.qualify("sysl.args", "args_of")
+      Library.key("Option") shouldBe Modules.qualify(Std.module, "Option")
     }
 
     "and the traits the operator catalog names" in {
