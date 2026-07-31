@@ -270,12 +270,17 @@ trait Hoisting extends HoistMembers {
       if s.tparams.nonEmpty then
         at(s.pos)(err(s"invariants on generic structs are not supported yet — '${s.name}'"))
       else
-        val cond = s.invariants.reduce((a, b) => Binary("&&", a, b))
+        val cond   = s.invariants.reduce((a, b) => Binary("&&", a, b))
+        val ftypes = s.fields.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty))))
+
         funcDecls(ikey) = FuncDecl(ikey, Nil, s.fields, Some(NamedType("bool")),
           List(ExprStmt(cond)), Map.empty, variadic = false).setPos(s.pos)
         declScope(ikey) = currentScope
-        funcInsts(ikey) =
-          (s.fields.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty)))), Type.Bool)
+        funcInsts(ikey) = (ftypes, Type.Bool)
+
+        // What the clauses may read is settled here, where the field types have just been resolved
+        // and the whole aliasing rule that rests on them is still ahead (`16 §6`).
+        checkInvariantReads(s, ftypes.toMap)
 
     case _ =>
 

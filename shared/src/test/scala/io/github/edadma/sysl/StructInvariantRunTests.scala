@@ -154,7 +154,8 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
 
   // The walk survives a pointer because the pointee's type names the struct: `(*p).a.n` reaches
   // `Outer`'s clause through `p`'s static type exactly as `o.a.n` reaches it through `o`. What no
-  // pointer can do is name a struct *above* its own pointee — that is the ignored test at the bottom.
+  // pointer can do is name a struct *above* its own pointee, which is why a pointer that would be
+  // typed below one is refused where it is made — `StructInvariantErrorTests` has that half.
   "a nested field write through a pointer to the enclosing struct is checked" - {
     "a write that keeps the invariant proceeds" in {
       run(Outer + "var o = Outer(Inner(1), 5)\nvar p = &o\n(*p).a.n = 4\nprint(o.a.n, o.b)") shouldBe "4 5\n"
@@ -310,13 +311,150 @@ class StructInvariantRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  // Walking outward reaches every enclosing struct a *place* names, and a pointer names none of
-  // them: `&o.a` hands out somewhere to write with no way back to the struct whose invariant that
-  // write can break. So the clause holds everywhere except through an alias, which is the one hole
-  // checking at the write cannot close — it is a rule about what may be aliased, not an emission.
-  // Ignored because that rule is undecided; if the answer is a static refusal rather than a trap,
-  // this becomes an error test asserting the message instead.
-  "a write through an alias into a field an invariant reads is not silently allowed" ignore {
-    exits(Outer + "wreck(p: *Inner)\n    p.n = 9\nend wreck\nvar o = Outer(Inner(1), 5)\nwreck(&o.a)")
+  /* A `*self` method reached through a field is the one severed place left, since there are no
+   * parameter modes and so no other way to hand a callee somewhere to write without writing `&`.
+   * It is allowed rather than refused, because the **call site** still knows the whole place: `o.a`
+   * is the receiver, `o` is right there, and the clause is re-run the moment the call returns. So
+   * the method mutates an `Inner` knowing nothing of any `Outer`, and the promise is kept at the
+   * boundary instead of inside.
+   */
+  "a mutating method call on a field an invariant reads is re-checked at the call" - {
+    val Bumping =
+      """|struct Inner
+         |    n: int
+         |
+         |    set(*self, v: int)
+         |        self.n = v
+         |struct Outer
+         |    a: Inner
+         |    b: int
+         |    invariant a.n <= b
+         |""".stripMargin
+
+    "a call that leaves the invariant true proceeds" in {
+      run(Bumping + "var o = Outer(Inner(1), 5)\no.a.set(4)\nprint(o.a.n, o.b)") shouldBe "4 5\n"
+    }
+
+    "the boundary value is allowed" in {
+      run(Bumping + "var o = Outer(Inner(1), 5)\no.a.set(5)\nprint(o.a.n)") shouldBe "5\n"
+    }
+
+    "a call that breaks it traps" in {
+      exits(Bumping + "var o = Outer(Inner(1), 5)\no.a.set(9)")
+    }
+
+    // The same call on a receiver that lies below nothing is checked by nobody, which is what "pay
+    // as you promise" means here: the re-check is attached to the place, not to the method.
+    "and the same method on a free value is untouched" in {
+      run(Bumping + "var i = Inner(1)\ni.set(9)\nprint(i.n)") shouldBe "9\n"
+    }
+
+    // Two levels down, where the struct that owns the clause is neither the receiver nor its
+    // immediate owner — the walk out of the place is what finds it, so depth costs nothing.
+    "a receiver two fields below the clause is found by the same walk" in {
+      val deep =
+        """|struct Inner
+           |    n: int
+           |
+           |    set(*self, v: int)
+           |        self.n = v
+           |struct Middle
+           |    i: Inner
+           |struct Top
+           |    m: Middle
+           |    cap: int
+           |    invariant m.i.n <= cap
+           |""".stripMargin
+
+      run(deep + "var t = Top(Middle(Inner(1)), 5)\nt.m.i.set(4)\nprint(t.m.i.n)") shouldBe "4\n"
+      exits(deep + "var t = Top(Middle(Inner(1)), 5)\nt.m.i.set(9)")
+    }
+  }
+
+  /* What the rule leaves alone. An alias has to be refused only where its type stops carrying a
+   * promise the storage has, so the address of a field no clause reads, a view that may not write,
+   * and a method of a struct that lies inside nothing are all ordinary.
+   */
+  "an alias that carries every promise its storage has is left alone" - {
+    val Spare =
+      """|struct Inner
+         |    n: int
+         |struct Outer
+         |    a: Inner
+         |    b: int
+         |    c: int
+         |    invariant a.n <= b
+         |""".stripMargin
+
+    "a pointer to a field no clause reads" in {
+      run(Spare + "bump(p: *int)\n    *p = 9\nvar o = Outer(Inner(1), 5, 0)\nbump(&o.c)\nprint(o.c)") shouldBe "9\n"
+    }
+
+    "a read-only view of an array a clause reads" in {
+      val grid =
+        """|struct Grid
+           |    items: [2]int
+           |    cap: int
+           |    invariant items[0] <= cap
+           |""".stripMargin
+
+      run(grid + "var g = Grid([1, 2], 5)\nvar v: []const int = g.items[0..<2]\nprint(v[1])") shouldBe "2\n"
+    }
+
+    // A view's `len` is the struct's own three words rather than somebody else's elements, so a
+    // clause may read it — the one thing on the near side of a view hop.
+    "a clause reading a view's length" in {
+      run("struct Buf\n    xs: []int\n    invariant xs.len > 0\nvar b = Buf([1, 2, 3])\nprint(b.xs.len)") shouldBe "3\n"
+    }
+
+    // A string is immutable, so a view of one carries no licence to write and there is no promise
+    // for it to drop — which is why the refusal above is about writable views rather than views.
+    "part of a string field a clause reads" in {
+      val named =
+        """|struct Named
+           |    name: string
+           |    invariant name.len >= 2
+           |""".stripMargin
+
+      run(named + "var n = Named(\"abcd\")\nprint(n.name[0..<2])") shouldBe "ab\n"
+    }
+
+    // The refinement the library forced: a view field points somewhere else, so the elements are not
+    // the receiver's storage to lose and a pointer at one is not a pointer into the receiver. This is
+    // the shape of `CString.ptr`, and a rule about every pointer a `*self` method returns would have
+    // taken it away.
+    "a '*self' method handing out a pointer past a view hop" in {
+      val viewing =
+        """|struct Cell
+           |    bytes: []u8
+           |    n: int
+           |
+           |    at(*self) -> *u8
+           |        &self.bytes[0]
+           |struct Outer
+           |    a: Cell
+           |    b: int
+           |    invariant a.n <= b
+           |""".stripMargin
+
+      run(viewing + "var o = Outer(Cell([7, 8], 1), 5)\nvar p = o.a.at()\nprint(*p)") shouldBe "7\n"
+    }
+
+    // A struct that is nobody's field can never be a severed receiver, so its methods may hand out
+    // pointers into it however they like — even in a program where some *other* struct has a clause.
+    "a '*self' method of a struct that lies inside nothing" in {
+      val free =
+        """|struct Guarded
+           |    m: int
+           |    invariant m >= 0
+           |struct Free
+           |    n: int
+           |
+           |    at(*self) -> *int
+           |        &self.n
+           |""".stripMargin
+
+      run(free + "var g = Guarded(1)\nvar f = Free(1)\nvar p = f.at()\n*p = 9\nprint(f.n, g.m)") shouldBe "9 1\n"
+    }
   }
 }

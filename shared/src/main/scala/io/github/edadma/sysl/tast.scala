@@ -316,16 +316,21 @@ case class TStructNew(struct: Type.Struct, args: List[TExpr]) extends TExpr { de
  */
 case class TStructInvCheck(value: TExpr, struct: Type.Struct, invFn: String) extends TExpr { def ty: Type = struct }
 
-/** A field write into a struct that carries `invariant` clauses (`16 §6`): `store` performs the write,
- * then `recv` — the struct being mutated — is re-read and passed to `invFn`, trapping on a false
- * result. Yields the stored value, so `s.f = v` remains an expression of the field's type. Covers a
- * direct `s.f = v`, a compound `s.f op= v`, and a through-pointer `(*p).f = v`.
+/** Something that may have changed a struct carrying `invariant` clauses (`16 §6`): `after` runs,
+ * then `recv` — the struct that could have been mutated — is re-read and passed to `invFn`, trapping
+ * on a false result. Yields what `after` yields, so `s.f = v` remains an expression of the field's
+ * type.
  *
- * These **nest** where a place is written inside more than one struct that carries clauses: `o.a.n`
- * wraps the store in `Inner`'s check and that in `Outer`'s, so the inner one runs first.
+ * Two things wear this. A **write** into the struct: a direct `s.f = v`, a compound `s.f op= v`, a
+ * through-pointer `(*p).f = v`, or one nested inside — `o.a.n = 9`. And a **`*self` method call on a
+ * field of it**: `o.a.bump()` hands the callee somewhere to write that no longer names the `Outer`,
+ * so the clause is re-run where the whole place is still known, which is the call site.
+ *
+ * These **nest** where a place lies inside more than one struct that carries clauses: `o.a.n` wraps
+ * the store in `Inner`'s check and that in `Outer`'s, so the inner one runs first.
  */
-case class TCheckedStore(store: TExpr, recv: TExpr, struct: Type.Struct, invFn: String) extends TExpr {
-  def ty: Type = store.ty
+case class TRecheck(after: TExpr, recv: TExpr, struct: Type.Struct, invFn: String) extends TExpr {
+  def ty: Type = after.ty
 }
 
 /** Construction of an enum value: a simple enum's integer constant, or a data enum's variant
@@ -434,7 +439,7 @@ case class TExprStmt(expr: TExpr)                         extends TStmt
  * method a compound operator lowers to when it is not an instruction (`14 §3`), and the `invariant`
  * re-check the receiver needs once the write lands (`05`).
  *
- * The check is carried here rather than wrapped around a store node, as `TCheckedStore` wraps one,
+ * The check is carried here rather than wrapped around a store node, as `TRecheck` wraps one,
  * because these writes are not expressions and there is nothing for a node to wrap.
  *
  * `constraint` is the compound arm's counterpart of `TUpdate.check` — a plain arm's value carries

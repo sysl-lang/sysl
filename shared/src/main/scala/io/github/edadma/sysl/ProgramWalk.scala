@@ -245,6 +245,10 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // finally settled and the graph can be held to being acyclic (`13 §6`).
     checkModuleGraph()
 
+    // Which structs can lie inside one that carries invariant clauses is likewise only settled now,
+    // so the rule about what a `*self` method may let out of the call is asked here (`16 §6`).
+    checkSelfAliasing((tfuncs ++ closureFuncs).toList)
+
     val externs = externsUsed.toList.map { name =>
       val (params, rtype) = funcInsts(name)
       val e               = externDecls(name)

@@ -332,6 +332,60 @@ where each half alone would not be.
 
 Invariants on a **generic** struct are not supported and say so.
 
+### What may be aliased
+
+Everything above is discharged by walking outward through the **place** being written, so the whole
+obligation rests on the place still naming the struct. A pointer is where that runs out:
+
+```
+wreck(p: *Inner)
+    p.n = 9
+
+wreck(&o.a)        // a `*Inner`, and an `Inner` knows of no `Outer`
+```
+
+No amount of checking at the write closes this, because inside `wreck` there is no `Outer` to re-read
+and no way to learn there ever was one. It is a rule about **what may be aliased**, and the rule is
+the one this project's aliasing model already suggests: *an alias is safe when its type still carries
+every promise over the memory it can reach.* What that buys is that the rule restricts alias
+**creation**, which is local and a question about types, rather than alias **use**, which needs the
+borrow checker `03` rejects. Four things follow, and none of them follows for a program that declares
+no invariants — each is a question asked about a clause, and there is no clause to ask about.
+
+**A pointer or a writable view that would be typed below a clause is refused where it is made.**
+`&o.a` above, and `&o.b`, and a `g.items[0..<2]` that may be written where a clause reads `items[0]`.
+The refusal is about the clause rather than about the struct: `&o.c`, where no clause mentions `c`, is
+ordinary, and so is `&o` itself, whose `*Outer` names the struct and is checked by the ordinary walk.
+A `[]const T` is ordinary too, since giving up the write is exactly what makes a view carry no promise
+it could break.
+
+**A mutating method call on such a field is allowed, and re-checks the clause when it returns.**
+`o.a.set(4)` hands `set` the same severed `*Inner`, and it is allowed because the *call site* still
+knows the whole place: `o` is right there, so the clause is re-run the moment the call returns. There
+are no parameter modes (`12 §2`), so a receiver is the only way a callee is handed somewhere to write
+without an `&` in the caller's own source — which is why this one channel is worth keeping open, and
+why keeping it open costs a mutating method nothing.
+
+**A `*self` method may not let a pointer into its receiver outlive the call.** That is what makes the
+paragraph above sound: a `set` that returned `&self.n`, or stored it where the caller can still reach
+it, would hand out the severed alias by a route no `&` in the caller spells. The check is local to the
+body, and it is asked only of methods whose struct can *be* a field of one carrying clauses — a struct
+that lies inside nothing can never have a severed receiver, so its methods are left alone. Storage on
+the far side of a reference or a view is not the receiver's to lose either, so `&self.bytes[0]` where
+`bytes` is a `[]u8` is ordinary.
+
+**A clause may only read storage the struct owns.** All of the above is a rule about aliases of the
+struct's own bytes, so a clause reading through a pointer, a reference, or a view's *elements* is
+refused where it is written: what is on the far side has an identity of its own, every other alias of
+it is outside this struct's sight, and no rule about `&` could make such a clause hold. A view's `len`
+is on the near side — the three words are stored in the struct — and may be read.
+
+What none of this does is make a `*T` safe, and it does not try to. A pointer handed to a *third*
+function that stores it is out of reach of a local check, exactly as `03` says every guarantee about a
+raw pointer is out of reach. What the rule buys is that the **silent** severing — the one that looks
+like ordinary code, reads like ordinary code, and leaves a clause quietly false — is refused, and that
+the one channel left open is the one whose promise is kept at the boundary.
+
 ## 7. Contracts on a function
 
 ```
@@ -434,30 +488,22 @@ made every arithmetic operator a produce site nobody had written down, so `Slot(
 already has the type is not produced again. `type Slot = new u8 within 0..<200` is §1's own example
 row. The two forms that compute and store in one step, `a += e` and `a++`, were the other omission.
 
-**f. A write through an alias into a field an invariant reads.** §6's obligation is discharged by
-walking outward through the *place* being written, and a pointer is where the places run out:
+**~~f. A write through an alias into a field an invariant reads.~~** **Closed.** The answer is written
+into §6 as *What may be aliased*, and it is the first of the three candidates that were open here —
+refuse `&` on a field an enclosing invariant reads, which is statically knowable because a clause names
+what it reads. The cruder rule was not taken: `&o.c`, where no clause mentions `c`, is left alone.
 
-```
-struct Inner
-    n: int
-struct Outer
-    a: Inner
-    b: int
-    invariant a.n <= b
+What settling it turned up is that one refusal is not enough on its own, and the other three parts are
+the reason this took a section rather than a sentence. A **writable view** of such a field is the same
+licence to write by another spelling. A **mutating method call** on the field is the same severed
+pointer again, but recoverable rather than refusable — the call site still knows the whole place, so it
+re-runs the clause at the return, and that is what keeps `o.a.set(4)` an ordinary thing to write; it is
+also the only such channel, because `12 §2` leaves the language with no parameter modes. And that in
+turn is sound only if a **`*self` method finishes with its receiver when it returns**, which is a rule
+about method bodies that no rule about `&` at a call site could have implied.
 
-wreck(p: *Inner)
-    p.n = 9
-
-var o = Outer(Inner(1), 5)
-wreck(&o.a)        // `Outer`'s invariant is now false, and nothing said so
-```
-
-Inside `wreck` there is no `Outer` to re-read and no way to learn there ever was one, so no amount of
-checking at the write closes this. It is the only hole left in "checked at every write", and it is a
-rule about **what may be aliased** rather than about what is emitted — which is the shape of SPARK's
-answer, and the aliasing model this project has otherwise adopted. The candidates: refuse `&` on a
-field that an enclosing invariant reads (statically knowable, since a clause names the fields it
-reads); refuse it on any field of a struct carrying clauses at all (cruder, and it forbids handing
-out `&o.b`, which is harmless); or state the limit and leave it, which is what an invariant means in
-C++ too. The first looks right, and nothing turns on it until a program wants such a pointer. The
-case is pinned by an ignored test, so whichever way it goes the evidence is already written down.
+The corpus was measured before any of it was written, and the answer was zero: no `&` and no writable
+view anywhere below a clause, so nothing in `guide/` or `lib/` had to change. Two library functions
+did shape the rule — a reader stored in a returned cursor is why the no-escape rule is about `*self`
+alone and not about every pointer parameter, and a `&self.bytes[0]` over a `[]u8` field is why a
+reference or a view hop ends it.

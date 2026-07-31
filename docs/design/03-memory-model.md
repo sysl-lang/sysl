@@ -54,6 +54,14 @@ garbage-collected. That trade — small runtime cost for large simplicity — is
 reason to exist. It is *easier than Rust* by construction, because the hard part of Rust is
 exactly the part sysl does not have.
 
+There is one place the language asks a question about aliasing anyway, and the shape of it is worth
+noting here because it is the counterpart of this decision rather than a retreat from it. A struct's
+`invariant` clauses (`16 §6`) are re-checked at every write, and the write is found by walking the
+*place* — which a pointer typed below the struct escapes. The answer is a rule about which aliases may
+be **created**, which is local and decided from types alone; it never asks where an alias is *used*,
+which is the question that needs lifetimes. A program that declares no invariants is not asked
+anything at all.
+
 ## The three modes
 
 ### `T` — value

@@ -10,7 +10,7 @@ import scala.collection.mutable
  * in-progress object and the recursion terminates; `cycleCheck` is what rejects a cycle that has
  * no indirection to break it.
  */
-trait TypeResolution extends GenericInstantiation {
+trait TypeResolution extends GenericInstantiation with Aliasing {
 
   /** Resolves a type in the current function's substitution — the identity map outside a
    * generic instantiation.

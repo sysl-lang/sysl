@@ -86,7 +86,12 @@ trait CollectionExprAnalysis extends ExprSupport {
       // safe: the view records the property, so it carries it wherever it is bound or passed rather
       // than losing it at the end of the expression that made it. Slicing a `val` was refused for
       // exactly as long as there was no type to say that in.
-      val viewIsConst = readOnly(tr)
+      //
+      // A `[]const T` the context asked for is answered directly, the way the two forms above answer
+      // one, rather than by making a writable view and then giving the ability up. The result is the
+      // same view either way; what it changes is that a writable one is never made, so asking for a
+      // read-only view of storage no writable view may be taken of is the ordinary thing it reads as.
+      val viewIsConst = readOnly(tr) || expected.exists(Type.readOnlyView)
 
       val elem = tr.ty match
         case Type.Ref(Type.Array(_, e), false) => e
@@ -128,6 +133,9 @@ trait CollectionExprAnalysis extends ExprSupport {
         if tr.ty == Type.Str then Type.Str
         else Type.Slice(elem, readOnly = viewIsConst || Type.readOnlyView(tr.ty))
 
+      // A view that may be written is an alias like any other, so it is refused where a `&` would be:
+      // over storage inside a struct whose invariant reads it (`16 §6`).
+      checkSliceable(tr, viewTy)
       TSlice(tr, lo.map(bound), hi.map(bound), inclusive, viewTy)
 
     case Index(receiver, index) =>
