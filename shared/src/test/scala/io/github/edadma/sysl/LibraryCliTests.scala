@@ -74,6 +74,27 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
     (status, captured.toString)
   }
 
+  /** A driver run with its emitted module captured. `emit-llvm` prints, so this is what lets a test
+   * see *which* standard module a compilation was given rather than only that it succeeded: the
+   * library arriving prebuilt is a declaration where the built-in copy is a definition.
+   */
+  private def emitted(cfg: Config): String = {
+    val captured = new java.io.ByteArrayOutputStream
+
+    Console.withOut(captured)(cli(cfg)) shouldBe 0
+    captured.toString
+  }
+
+  /** The standard module's own symbols an emitted module `define`s or `declare`s, which is how a
+   * test tells a library that was linked from one that was compiled in.
+   */
+  private def libraryOwn(ir: String, form: String): Set[String] =
+    ir.linesIterator.filter(_.startsWith(s"$form ")).flatMap { line =>
+      val at = line.indexOf('@')
+
+      Option.when(at >= 0)(line.drop(at + 1).takeWhile(c => c != '(' && c != ' '))
+    }.filter(_.startsWith(Library.key(""))).toSet
+
   /** An artifact whose header promises more than the file holds. The version comes from the constant
    * rather than being written out, so that a bump to the container format leaves these testing
    * truncation rather than the version check that would otherwise fire ahead of it.
@@ -349,6 +370,62 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
       status shouldBe 0
       notes should include("warning")
+    }
+  }
+
+  "--no-core-lib" - {
+
+    /* The compiler keeps its own copy of the standard module, and discovery means that copy is
+     * normally reached only by an artifact being absent — which is a fact about the filesystem, not
+     * about the command line. These say the flag reaches it on purpose. */
+
+    "does not read the artifact at the default path, even a broken one" in {
+      // The discriminating pair: this exact artifact at this exact path warns without the flag (the
+      // discovery section above), so silence here is the artifact going unread rather than a
+      // corruption that happens not to be worth mentioning.
+      val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
+        noCoreLib = true, coreSearch = corrupt("not a library\n".getBytes)))
+
+      status shouldBe 0
+      notes should not include "warning"
+    }
+
+    "and takes the built-in copy with a good artifact sitting right there" in {
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+
+      // Which module was used, not merely that one was: the same program at the same path, told to
+      // use the artifact and told not to. Exiting 0 both ways would hold for a flag that did
+      // nothing, so the assertion is on the seam the flag moves — what the artifact already holds
+      // is declared when it is linked and defined when it is not.
+      val src    = program("print(21 * 2)")
+      val linked = emitted(Config(command = "emit-llvm", file = src, coreSearch = core))
+      val carried = emitted(Config(command = "emit-llvm", file = src, noCoreLib = true, coreSearch = core))
+
+      libraryOwn(linked, "define") shouldBe empty
+      libraryOwn(linked, "declare") should not be empty
+      libraryOwn(carried, "define") should not be empty
+    }
+
+    "and what it compiles is whole, not a program relying on the artifact anyway" in {
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      // Linking is the assertion. The artifact's object half is not handed to the linker here, so
+      // every core symbol this program calls has to have been emitted into it.
+      val (status, notes) = diagnostics(Config(command = "run", file = program("print(21 * 2)"),
+        noCoreLib = true, coreSearch = core))
+
+      status shouldBe 0
+      notes should not include "warning"
+    }
+
+    "but is refused beside --core-lib, which asks for the other one" in {
+      // Two spellings a character apart, so a typo lands here. Refused rather than resolved by
+      // precedence: either precedence discards half of what the command line asked for, silently.
+      // The path names nothing, which says the refusal comes before the artifact is read.
+      cli(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
+        coreLib = Some(s"${createTempDirectory("sysl-cli-both-")}/any${LibraryArtifact.extension}")))
+        .should(not be 0)
     }
   }
 

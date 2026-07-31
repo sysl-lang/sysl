@@ -809,14 +809,47 @@ the precompiled half, because a `val`'s storage is written by the entry point an
 Such a function is compiled in the consuming program instead, where the initialization it depends on
 happens. Lifting that needs a library initializer the program calls before `main`.
 
-**And the standard module is not yet linked by default.** Which library a compilation is compiled
-against is a **parameter** of it rather than an ambient fact, and handed a core artifact a
-compilation does the whole of the above: it declares what the artifact compiled, monomorphizes the
-generics here, and links. What is missing is the routing — nothing *builds* the core artifact as part
-of the build and nothing hands it to an ordinary compilation, which still gets the trees the compiler
-embeds and emits a definition for every part of the library it reaches. So a program still takes a
-*source* dependence on the standard module, re-deriving every signature in it before checking its own
-first line, and that is the last place this section has not reached.
+**And the standard module is linked by default, once it has been built.** Which library a compilation
+is compiled against is a **parameter** of it rather than an ambient fact — which is what lets two
+cores be handed to two compilations and compared — but the parameter has a default, and the default
+is found rather than named:
+
+```
+sysl build-lib lib --core          # once, after a clone; writes .sysl/core.syslib
+sysl run prog.sysl                 # finds it there, with nothing to remember
+```
+
+One path at both ends. `build-lib --core` with no `-o` writes to `.sysl/core.syslib`, and a
+compilation with no `--core-lib` looks there; naming the path is for the cases where it is somewhere
+else. Handed one, a compilation does the whole of the above: it declares what the artifact compiled,
+monomorphizes the generics here, and links — rather than re-deriving every signature in the standard
+module before checking its own first line.
+
+**The artifact is not committed.** It is object code for one machine, and building it takes under a
+second, so a clone or a fresh worktree builds its own. That makes drift the thing to guard against
+rather than staleness in the repository: the artifact carries a **fingerprint of the core sources it
+was built from** — a 64-bit FNV-1a over each file's basename and contents in sorted order, run
+through `fmix64` — and a compilation refuses one whose fingerprint is not the one the compiler
+carries. Sorting by basename rather than by path is what lets the artifact built from `lib/sysl` on
+disk match the copy the compiler generated from the same files, which are named by where each was
+read.
+
+**It falls back where `--lib` refuses**, and the asymmetry is the point. A `--lib` that cannot be read
+leaves the program's calls into that library with nothing to resolve them, so there is nothing to do
+but stop. The core is the one library the compiler always has its own copy of, so an artifact that is
+missing, corrupt, or built from other sources costs a warning and the built-in copy — a compilation
+that would have succeeded does not start failing because an optimization was unavailable. Nothing at
+the default path is the ordinary state of a fresh tree and says nothing at all; something
+*unreadable* there warns like any other, because that is the shape a drifted artifact takes and
+silence is what would let it go on being ignored. `--no-core-lib` asks for the built-in copy on
+purpose, which is what makes "compile it both ways and compare" a thing one command can do.
+
+**The copy the compiler carries is bootstrap scaffolding, not an invariant.** No real toolchain
+embeds its standard library: clang ships no libc, and rustc ships precompiled `libstd.rlib` beside
+the binary in a sysroot whose absence is a hard error, not a fallback. sysl carries one because it
+has no released compiler to bootstrap from yet and its own tests must run in a tree where nothing has
+been built. The endpoint is the sysroot: the standard module installed beside the compiler, found
+there, and its absence reported rather than papered over.
 
 Two properties make the switch safe to make one step at a time, and both are pinned rather than
 assumed. The artifact **means what the source means**: one program compiled both ways emits the same

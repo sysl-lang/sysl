@@ -44,6 +44,12 @@ import scopt.OParser
  * compilation that would have succeeded does not start failing because an optimization was
  * unavailable.
  *
+ * **`--no-core-lib` asks for that built-in copy on purpose**, ignoring whatever is on disk. It exists
+ * because the fallback is silent when the artifact is merely absent, which makes "which standard
+ * module did this compilation actually use" a question about the filesystem rather than about the
+ * command line; this is the answer that does not depend on the filesystem. The two should agree, and
+ * running a compilation both ways is how that is checked.
+ *
  * **Everything after a bare `--` belongs to the program being run**, not to sysl: it is passed
  * straight through to the executable, which is what lets `sysl run prog.sysl -- -v file` reach a
  * `main(args: []string)` without sysl having to decide whether `-v` was meant for it. The split is
@@ -66,6 +72,7 @@ case class Config(
     libs: List[String] = Nil,
     core: Boolean = false,
     coreLib: Option[String] = None,
+    noCoreLib: Boolean = false,
     coreSearch: String = LibraryArtifact.coreDefault,
     programArgs: List[String] = Nil,
 )
@@ -120,6 +127,10 @@ case class Config(
         .action((l, c) => c.copy(coreLib = Some(l)))
         .text("a prebuilt standard module to compile against, from 'build-lib --core'; " +
           "one that cannot be read costs a warning, not the compilation"),
+      opt[Unit]("no-core-lib")
+        .action((_, c) => c.copy(noCoreLib = true))
+        .text("compile against the copy of the standard module built into the compiler, " +
+          "ignoring any prebuilt one"),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
@@ -153,6 +164,12 @@ private[sysl] def execute(cfg: Config): Int = {
   // rather than ignored, since ignoring it leaves a command line that reads as though it were used.
   if cfg.core && cfg.coreLib.isDefined then
     return fail("--core-lib compiles against the standard module, and 'build-lib --core' is what builds it")
+
+  // Naming an artifact and refusing all of them at once has no reading either way round, and the two
+  // spellings are near enough that a typo produces exactly this line. Refused rather than resolved by
+  // precedence, since whichever precedence were chosen would silently discard half of what was asked.
+  if cfg.noCoreLib && cfg.coreLib.isDefined then
+    return fail("--no-core-lib and --core-lib ask for different standard modules")
 
   // Which standard module this compilation is compiled against. A prebuilt one arrives here;
   // anything else — including a named one that could not be read — leaves the copy the compiler
@@ -311,7 +328,14 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
 /** The standard module this compilation gets, and where it was looked for.
  *
  * Three places, in order: the one `--core-lib` names, the one sitting at the default path, and the
- * copy the compiler carries. **Only the first two can warn, and they warn about different things.**
+ * copy the compiler carries. `--no-core-lib` skips straight to the third — the compiler keeps its own
+ * copy so that it can be bootstrapped and so that its tests need nothing built first, and this is how
+ * that copy is reached on purpose rather than by an artifact happening to be absent. What it is for is
+ * telling the two apart: a compilation that behaves one way against a prebuilt standard module and
+ * another way against the built-in one has a bug in the artifact path, and this flag is what turns
+ * that into two runs of one command.
+ *
+ * **Only the first two can warn, and they warn about different things.**
  * A named artifact that cannot be read is worth saying out loud — somebody asked for it by name and
  * did not get it. A default path with nothing at it is the ordinary state of a fresh clone and says
  * nothing at all; but a default path with something *unreadable* at it warns like any other, because
@@ -324,7 +348,8 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
  * (`CoreArtifactTests`), and the fingerprint is what stops them from meaning different things.
  */
 private def chooseCore(cfg: Config): (Core, Set[String], Option[Array[Byte]]) =
-  cfg.coreLib.orElse(Option.when(isFile(cfg.coreSearch))(cfg.coreSearch)).map(loadCore) match
+  if cfg.noCoreLib then (Core.embedded, Set.empty, None)
+  else cfg.coreLib.orElse(Option.when(isFile(cfg.coreSearch))(cfg.coreSearch)).map(loadCore) match
     case None                => (Core.embedded, Set.empty, None)
     case Some(Right(loaded)) => loaded
     case Some(Left(err)) =>
