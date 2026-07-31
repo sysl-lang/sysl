@@ -300,4 +300,53 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
         include("'<' is not defined for *int")
     }
   }
+
+  /** What reaching *through* a mode gets you, asked of every mode at once. A value, a `&T` and a
+    * `*T` all reach the thing they point at; a `weak T` is the one that does not, because it may be
+    * gone — and that is `03`'s design rather than a gap, so the refusal is pinned beside the three
+    * that work.
+    */
+  "reaching through the modes" - {
+    "a field is read through a value, a counted reference and a raw pointer alike" in {
+      run("""struct P
+            |    x: int
+            |
+            |var owned = P(7)
+            |var r: &P = P(8)
+            |var p: *P = &owned
+            |print(owned.x, r.x, p.x)
+            |""".stripMargin) shouldBe "7 8 7\n"
+    }
+
+    "and a method is called the same three ways" in {
+      run("""struct P
+            |    x: int
+            |
+            |    get(self) -> int = self.x
+            |
+            |var owned = P(7)
+            |var r: &P = P(8)
+            |var p: *P = &owned
+            |print(owned.get(), r.get(), p.get())
+            |""".stripMargin) shouldBe "7 8 7\n"
+    }
+
+    "an array is indexed and sliced through them too" in {
+      run("""var arr = [1, 2, 3]
+            |var p: *[3]int = &arr
+            |var r: &[3]int = [4, 5, 6]
+            |print(arr[0], p[0], r[0], arr[1..].len, p[1..].len, r[1..].len)
+            |""".stripMargin) shouldBe "1 1 4 2 2 2\n"
+    }
+
+    "but nothing is read off a weak reference, which may be gone" in {
+      err("""struct P
+            |    x: int
+            |
+            |var r: &P = P(8)
+            |var w: weak P = r
+            |print(w.x)
+            |""".stripMargin) should include("may be gone, so nothing is read off one directly")
+    }
+  }
 }
