@@ -1,7 +1,12 @@
 package io.github.edadma.sysl
 
-/** The standard module, `sysl` — the module every program is compiled against, and the whole of the
- * library (`13 § Open h`).
+/** The library the compiler carries: the standard module `sysl` that every program is compiled
+ * against, and the submodules beneath it (`13 § Open h`).
+ *
+ * **`sysl` is the auto-imported part and not the whole of it.** `lib/sysl` is a tree, so a directory
+ * under it is a submodule by `13 §1`'s ordinary rule, and only the standard module's names are the
+ * ones every file gets for free. That is what a submodule is for: what a program cannot avoid
+ * needing goes in `sysl`, and what it should have to ask for goes below.
  *
  * What a program starts with is a *module*, not a set of declarations threaded in beside it. It was
  * the latter once: a `Prelude` of sysl source held in a string inside the compiler, keyed under the
@@ -34,13 +39,14 @@ package io.github.edadma.sysl
  */
 object Std {
 
-  /** The module these declarations belong to. Every file's header says the same thing, and a test
-   * holds them to agreeing — this is a constant so that nothing has to parse to ask the question.
+  /** The **auto-imported** module, and the root of the library's tree: every other module the
+   * library carries is below it. A constant so that nothing has to parse to ask which module the
+   * free names are in; which modules there are in total is `Library.modules`, read off the headers.
    */
   val module: String = "sysl"
 
-  /** The standard module's files, in the order the generator found them — that is, sorted by
-   * name, so that what a compilation sees does not depend on a directory listing.
+  /** The library's files, in the order the generator found them — that is, sorted by name, so that
+   * what a compilation sees does not depend on a directory listing.
    *
    * Each carries the directory it sits in below `lib/`, which is the module its header has to agree
    * with (`13 §1`), so these are the same `Source` values the driver would build from disk.

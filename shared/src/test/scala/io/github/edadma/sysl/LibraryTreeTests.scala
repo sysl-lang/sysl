@@ -164,6 +164,19 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
         "main.sysl" -> "sysl.sys.flag(21)",
       ) should include("undefined function 'widen'")
     }
+
+    // Writing a free name is a reference like any other, so a submodule using one depends on `sysl`
+    // — which is inert for a program, since nothing in the library can point back at one, and is the
+    // whole constraint on the library's own layout. It is what decides that a module `sysl` reaches
+    // holds only what needs nothing.
+    "and a submodule the standard module reaches may not reach back, even through a free name" in {
+      errAgainstTree(
+        ("sysl", "core.sysl", "module sysl\nimport sysl.sys.flag\nmark(n: int) -> int = flag(n)"),
+        ("sysl.sys", "sys.sysl", "module sysl.sys\nflag(n: int) -> int = mark(n) * 2"),
+      )(
+        "main.sysl" -> "mark(21)",
+      ) should include("modules may not depend on each other")
+    }
   }
 
   "what a submodule keeps to itself" - {
@@ -180,6 +193,53 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
       irAgainstTree(kept*)(
         "main.sysl" -> "mark(21)",
       ) should include(s"call i32 @${sysKey("hold")}")
+    }
+  }
+
+  // The real library, which is what all of the above was for. Five names left the set every program
+  // gets for free: the four C functions the printing and reading are built on, and the argument
+  // conversion nearly nobody calls.
+  "the standard library's own submodules" - {
+    "keep the platform's C functions out of every program's namespace" in {
+      errOf(
+        "main.sysl" -> "var b: [4]u8 = [65u8, 66u8, 67u8, 0u8]\nvar p = sysl_memchr(&b[0], 65, 4usize)",
+      ) should include("undefined function 'sysl_memchr'")
+    }
+
+    "and out of reach even where a program names the module they are in" in {
+      errOf(
+        "main.sysl" -> "var b: [4]u8 = [65u8, 66u8, 67u8, 0u8]\nvar p = sysl.sys.sysl_memchr(&b[0], 65, 4usize)",
+      ) should include("'sysl.sys.sysl_memchr' is private to module 'sysl'")
+    }
+
+    "while the printing built on them is reached with no import at all" in {
+      irOf("main.sysl" -> """print("hi")""") should include(s"call void @${Library.key("prints")}")
+    }
+
+    // Public, because a vector that is not the platform's is the only way to reach the failure at
+    // all — but a name a program has to ask for, which is the difference a submodule makes.
+    "leave the argument conversion reachable, under the path that names it" in {
+      irOf(
+        "main.sysl" -> "var v: [1]*u8 = [c\"x\"]\nvar a = sysl.args.args_of(1i32, &v[0])\nprint(a.len)",
+      ) should include(s"call { ptr, ptr, i64 } @${Library.key("args_of")}")
+    }
+
+    "and not under a bare one" in {
+      errOf(
+        "main.sysl" -> "var v: [1]*u8 = [c\"x\"]\nvar a = args_of(1i32, &v[0])",
+      ) should include("undefined function 'args_of'")
+    }
+
+    // The compiler names it by key rather than by resolving the word, so where it lives is the
+    // library's business and not something a `main` had to be told about.
+    "though a 'main' taking arguments still gets it without naming anything" in {
+      irOf(
+        "main.sysl" -> "main(args: []string)\n    print(args.len)\n",
+      ) should include(s"@${Library.key("args_of")}(i32 %argc, ptr %argv)")
+    }
+
+    "and `exit` stays a word every program has, which is why it is not in `sys`" in {
+      irOf("main.sysl" -> "exit(3)") should include("call void @exit(")
     }
   }
 }

@@ -49,7 +49,9 @@ before they appear and may be mutually recursive).
   platform's own start-up code calls is passed two values — there is no crt0 of sysl's to write, and
   a compiled program is an ordinary hosted C program that clang links libc to. The two are taken
   whether or not anything asks for them, and a program that declares `main(args: []string)`
-  (`13 §7`) gets them as a slice through one call to the library's `args_of`. **A sysl `main` is
+  (`13 §7`) gets them as a slice through one call to the library's `sysl.args.args_of` — named by the
+  key it is filed under rather than by resolving the word, which is why moving it into a submodule of
+  the library changed nothing about what a `main` may be written as. **A sysl `main` is
   therefore emitted under a reserved symbol**, since the one it is written as is already taken by the
   function the platform starts at; the reserved name holds two `$` separators, which no key can
   (`Modules.qualify` writes one), so it cannot collide with any module's declaration.

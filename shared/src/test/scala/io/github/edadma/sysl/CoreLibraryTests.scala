@@ -102,8 +102,13 @@ class CoreLibraryTests extends AnyFreeSpec with Matchers {
     declared("sysl/display.sysl").collect { case t: TraitDecl => t.name } shouldBe List("Display")
 
     // Which is the claim, rather than "the library imports nothing": a file may well have a sibling
-    // module of the library to import, and none of them has itself.
+    // module of the library to import, and none of them has itself. The two import forms spell the
+    // module differently — a selector list or a wildcard names it outright, and a bare path names it
+    // with the imported name still on the end — so which segments are the module is read off the
+    // form.
     for p <- Std.parsed; i <- p.body.collect { case i: ImportDecl => i } do
-      i.path.mkString(".") should not startWith p.module.map(_.show).get
+      val named = if i.selectors.nonEmpty || i.wildcard then i.path else i.path.init
+
+      named.mkString(".") should not be p.module.map(_.show).get
   }
 }

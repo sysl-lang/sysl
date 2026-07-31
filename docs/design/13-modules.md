@@ -448,12 +448,20 @@ imports a module depends on it whether or not it goes on to write the shorter sp
 because a file's imports are meant to be readable as what it needs, and a dependency that came and
 went with a use would not be.
 
-Two things sit outside the graph. The **standard module** `sysl` (§8) is auto-imported into every
-file, so writing `print` is not a dependency on anything: an edge every file has says nothing —
-worse, it would make the library's own files depend on themselves. And the **anonymous root module**
-(§1) can be depended on by nothing, having
+The **anonymous root module** (§1) sits outside the graph: it can be depended on by nothing, having
 no name for another module to write — a program's root files depend on the modules beneath them, and
 the dependency never runs back.
+
+**The standard module does not.** Writing `print` records an edge on `sysl` like any other reference,
+and that is deliberate rather than an oversight in the rule. For a program the edge is inert — nothing
+in the library can point back at a program's module, so it can never close a cycle — but *within the
+library* it is the whole of what keeps the split honest: a submodule of `sysl` that uses the free
+names depends on `sysl`, so `sysl` may not turn round and depend on it. That is a real constraint and
+it decides the library's own layout. `sysl` reaches `sysl.sys` for the C functions its printing is
+built on, so `sysl.sys` may name nothing of `sysl`'s — which is why it holds the externs and nothing
+else, and why the argument conversion, which calls `buf`, `from_utf8`, `print` and `exit`, is
+`sysl.args` and not part of `sys`. A module that depends on nothing is what a platform module should
+be anyway; the rule is what says so out loud.
 
 Three things follow from acyclicity:
 
@@ -556,11 +564,16 @@ costs nothing, since the conversion below is reached only by the other one.
 
 **`args` is a slice of `string`.** What the platform hands a program is C's pair — a count, and a
 vector of NUL-terminated byte runs — and neither of those appears in a sysl signature anywhere. The
-pair is converted by the library's `args_of`, which finds each run's end, validates its bytes, and
-**copies** them into strings the program owns: an argument therefore outlives the vector it came from
-and holds no memory the platform is still responsible for. The zeroth element is the program's own
-path, because that is what the platform passes and withholding it would be inventing a different
-convention than every other language's.
+pair is converted by the library's `sysl.args.args_of`, which finds each run's end, validates its
+bytes, and **copies** them into strings the program owns: an argument therefore outlives the vector it
+came from and holds no memory the platform is still responsible for. The zeroth element is the
+program's own path, because that is what the platform passes and withholding it would be inventing a
+different convention than every other language's.
+
+It sits in a submodule and not in `sysl`, so `args_of` is not a word every file has: a `main(args:
+[]string)` reaches it without naming anything, because the entry point names it by key rather than by
+resolving the word, and a program handed an `argv` by something *other* than the platform writes the
+path. Which is what a submodule is for — the free names are the ones a program cannot avoid needing.
 
 **An argument that is not UTF-8 stops the program**, with the offset of the byte that made it
 ill-formed. `04` puts the validation of bytes computed at run time at the boundary they arrive
