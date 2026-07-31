@@ -40,15 +40,27 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       |larger[T: Ord](a: T, b: T) -> T = if a < b then b else a
       |""".stripMargin
 
+  /** A second library, so that "more than one `--lib`" has something to be more than one of. Its
+   * module is distinct from `demo`'s, which is what makes a program calling both able to say which
+   * it meant.
+   */
+  private val other =
+    """module extra
+      |
+      |triple(n: int) -> int = n * 3
+      |""".stripMargin
+
   /** A library tree on disk, as the driver reads one: a root, with the module in a directory under
    * it whose name is the module's.
    */
-  private def libraryRoot(): String = {
+  private def libraryRoot(): String = rootOf("demo", library)
+
+  private def rootOf(module: String, text: String): String = {
     val root = createTempDirectory("sysl-cli-lib-")
-    val dir  = s"$root/demo"
+    val dir  = s"$root/$module"
 
     createDirectory(dir)
-    writeFile(s"$dir/lib.sysl", library)
+    writeFile(s"$dir/lib.sysl", text)
     root
   }
 
@@ -59,10 +71,12 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
   }
 
   /** A built artifact, and the paths that made it. */
-  private def artifact(): String = {
+  private def artifact(): String = artifactOf(libraryRoot())
+
+  private def artifactOf(root: String): String = {
     val out = createTempFile("sysl-cli-", LibraryArtifact.extension)
 
-    cli(Config(command = "build-lib", file = libraryRoot(), output = Some(out))) shouldBe 0
+    cli(Config(command = "build-lib", file = root, output = Some(out))) shouldBe 0
     out
   }
 
@@ -98,15 +112,20 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
     captured.toString
   }
 
-  /** The standard module's own symbols an emitted module `define`s or `declare`s, which is how a
-   * test tells a library that was linked from one that was compiled in.
+  /** The symbols an emitted module `define`s or `declare`s. Which of the two a library's symbol
+   * appears under is how a test tells a library that was **linked** from one that was compiled in,
+   * and it is the only difference visible from outside.
    */
-  private def libraryOwn(ir: String, form: String): Set[String] =
+  private def symbols(ir: String, form: String): Set[String] =
     ir.linesIterator.filter(_.startsWith(s"$form ")).flatMap { line =>
       val at = line.indexOf('@')
 
       Option.when(at >= 0)(line.drop(at + 1).takeWhile(c => c != '(' && c != ' '))
-    }.filter(_.startsWith(Library.key(""))).toSet
+    }.toSet
+
+  /** The same, narrowed to the standard module's own. */
+  private def libraryOwn(ir: String, form: String): Set[String] =
+    symbols(ir, form).filter(_.startsWith(Library.key("")))
 
   /** An artifact whose header promises more than the file holds. The version comes from the constant
    * rather than being written out, so that a bump to the container format leaves these testing
@@ -208,6 +227,55 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       cli(Config(command = "run", file = program("print(demo.double(1))"), libs = List(artifact())))
 
       listFiles(tempDir).count(_.contains("sysl-lib-")) shouldBe before
+    }
+  }
+
+  "several --lib at once" - {
+
+    /* The flag is unbounded and the help text says so, which is a claim about behaviour and was the
+     * one thing here nothing checked — every other test in this file passes exactly one. What makes
+     * more than one worth its own section is that the driver *partitions* them, unions their symbol
+     * sets, and concatenates their sources and their object files: four places where a second
+     * library either arrives or silently does not. */
+
+    "links two artifacts, both of which the program calls" in {
+      val prog = program("print(demo.double(21))\nprint(extra.triple(2))")
+
+      val ir = emitted(Config(command = "emit-llvm", file = prog,
+        libs = List(artifact(), artifactOf(rootOf("extra", other)))))
+
+      // Declared, not defined — which says both object halves were accounted for. Exiting 0 would
+      // hold for a compilation that quietly compiled the second library in from source instead.
+      symbols(ir, "declare") should contain allOf ("demo$double", "extra$triple")
+      symbols(ir, "define") should contain noneOf ("demo$double", "extra$triple")
+    }
+
+    "and does so whichever order they are given in" in {
+      val prog = program("print(demo.double(21))\nprint(extra.triple(2))")
+      val two  = List(artifact(), artifactOf(rootOf("extra", other)))
+      val ir   = emitted(Config(command = "emit-llvm", file = prog, libs = two.reverse))
+
+      symbols(ir, "declare") should contain allOf ("demo$double", "extra$triple")
+    }
+
+    "and mixes an artifact with a source root, which is the other shape of the same flag" in {
+      val prog = program("print(demo.double(21))\nprint(extra.triple(2))")
+
+      val ir = emitted(Config(command = "emit-llvm", file = prog,
+        libs = List(artifact(), rootOf("extra", other))))
+
+      // The sharp one: the same compilation holds one library it links and one it compiles, so a
+      // partition that dropped either half would show here and nowhere else.
+      symbols(ir, "declare") should contain("demo$double")
+      symbols(ir, "define") should contain("extra$triple")
+      symbols(ir, "define") should not contain "demo$double"
+    }
+
+    "and runs, which is what says both object halves reached the linker" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      cli(Config(command = "run", file = program("print(demo.double(21) + extra.triple(2))"),
+        libs = List(artifact(), artifactOf(rootOf("extra", other))))) shouldBe 0
     }
   }
 
