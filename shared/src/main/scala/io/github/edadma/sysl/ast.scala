@@ -670,13 +670,45 @@ case class ModuleName(parts: List[String]) extends Positioned {
   def show: String = parts.mkString(".")
 }
 
-/** One file's parse: the module it contributes to, its statements, and the source it came from.
+/** Which way a capability clause points (`capabilities.md`, `13 §4`).
+ *
+ * The two are not opposites of one degree: `Narrows` *removes* a capability the target offers and
+ * is enforced at every use inside the module, while `Requires` states a dependency the module
+ * already has by using it, and buys one early diagnostic instead of one per use.
+ */
+enum CapabilityDirection:
+
+  /** `no alloc` — the module gives the capability up, so using it here is an error. */
+  case Narrows
+
+  /** `requires alloc` — the module cannot be built where the capability is missing. */
+  case Requires
+
+/** One capability clause of a file's header: `no alloc`, `requires alloc` (`13 §4`).
+ *
+ * The name is kept as written rather than resolved to a member of the core set, because which names
+ * are capabilities is a property of the project's configuration and not of the grammar
+ * (`capabilities.md` — "the set is extensible"). The analyzer is what holds the set and what says
+ * so when a clause names something that is not in it.
+ */
+case class CapabilityClause(direction: CapabilityDirection, name: String) extends Positioned
+
+/** One file's parse: the module it contributes to, the capabilities its header declares, its
+ * statements, and the source it came from.
  *
  * `module` is absent for a file that declares no header, which puts it in the **anonymous root
  * module** — the module whose name is the empty path. A single-file program is exactly that case,
  * which is why one needs no header to compile.
  *
+ * `capabilities` is a property of the *module* written on each of its files, so it is read per file
+ * and held to agreeing across them (`13 §4`).
+ *
  * `source` is carried because a file is the unit several module rules are stated over, and a
  * diagnostic about one has to name it even where the file holds nothing to point at.
  */
-case class Program(body: List[Stmt], module: Option[ModuleName], source: Source)
+case class Program(
+    body: List[Stmt],
+    module: Option[ModuleName],
+    capabilities: List[CapabilityClause],
+    source: Source,
+)

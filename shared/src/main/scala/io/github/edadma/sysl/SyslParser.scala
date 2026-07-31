@@ -53,7 +53,7 @@ class SyslParser(val source: Source) extends DeclParser {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      capabilityClause | importDecl | implDecl | declaration | varDecl | returnStmt |
+      misplacedCapability | importDecl | implDecl | declaration | varDecl | returnStmt |
         breakStmt | continueStmt | requireStmt | ensureStmt | multiAssign |
         resultListStmt | exprStmt,
     )
@@ -161,22 +161,37 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val moduleHeader: Parser[ModuleName] =
     at(op("module") ~> dottedName ^^ ModuleName.apply)
 
-  /** The capability clause `13 §4` and `capabilities.md` specify and nothing implements — `no alloc`
-   * to narrow a module below its target, `requires alloc` to declare what it cannot do without.
-   *
-   * It is matched only to be refused, for the reason `noVisibility` is matched: both documents
-   * describe this clause in detail, so a reader writes exactly what the design tells them to and is
-   * answered with "newline expected" at the head of a line the design told them to write. Saying
-   * what is true of the clause instead costs one rule.
+  /** A capability clause: `no alloc` narrowing the module below what its target offers, or
+   * `requires alloc` declaring what it cannot be built without (`13 §4`, `capabilities.md`).
    *
    * `no` and `alloc` are **reserved**, not contextual, so they are matched with `op` — a `softWord`
-   * matches an identifier and these never lex as one, which is why the words were already spoken for
-   * and the clause still had nowhere to go.
+   * matches an identifier and these never lex as one. Every other capability's name is an ordinary
+   * identifier, which is why the name is read either way and left to the analyzer to recognize: the
+   * set is a property of the project rather than of the grammar.
    */
-  protected lazy val capabilityClause: Parser[Nothing] =
-    (op("no") ~ op("alloc") | op("requires") ~ (op("alloc") | ident)) ~> err(
-      "a module's capability clause is designed but not built: 'capabilities.md' and '13 §4' " +
-        "specify 'no alloc' and 'requires alloc', and nothing enforces either yet")
+  protected lazy val capabilityClause: Parser[CapabilityClause] =
+    at(
+      op("no") ~> capabilityName ^^ (CapabilityClause(CapabilityDirection.Narrows, _)) |
+        op("requires") ~> capabilityName ^^ (CapabilityClause(CapabilityDirection.Requires, _)),
+    )
+
+  /** The name in a capability clause. `alloc` is a reserved word, because the clause reads it, so it
+   * would never arrive as an identifier; the rest of the set is spelled the ordinary way.
+   */
+  protected lazy val capabilityName: Parser[String] = op("alloc") ^^^ "alloc" | ident
+
+  /** A capability clause written where a statement goes, which is refused for the reason
+   * `noVisibility` is: the clause has a place, and a reader who writes it in the wrong one should be
+   * told which place that is rather than answered with "newline expected".
+   *
+   * It is a *header*, not a statement, because it is a property of the module and the module is
+   * settled before anything in the file runs — and because a clause part-way down a file would read
+   * as though the statements above it were outside its reach.
+   */
+  protected lazy val misplacedCapability: Parser[Nothing] =
+    capabilityClause ~> err(
+      "a capability clause belongs in the file's header, on the lines directly after 'module' and " +
+        "before everything else — it is a property of the whole module, not of the statements below it")
 
   /** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — the Scala forms (`13 §3`).
    *
@@ -590,11 +605,23 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val statements: PackratParser[List[Stmt]] =
     opt(newlines) ~> repsep(statement, newlines) <~ opt(newlines)
 
-  /** A file: an optional module header, then its statements. A file with no header contributes to
-   * the anonymous root module, which is what lets a one-file program be written with no ceremony.
+  /** A file: an optional module header, the capability clauses that go with it, then its
+   * statements. A file with no header contributes to the anonymous root module, which is what lets
+   * a one-file program be written with no ceremony — and it may still narrow itself, since the root
+   * module is a module like any other.
    */
   protected lazy val program: PackratParser[Program] =
-    opt(newlines) ~> opt(moduleHeader) ~ statements ^^ { case m ~ body => Program(body, m, source) }
+    opt(newlines) ~> opt(moduleHeader) >> { m =>
+      // A clause goes on a line of its own, which is what both `13 §4` and `capabilities.md` show
+      // and what keeps `module m no alloc requires os` from being a line anyone has to read. The
+      // exception is a file that declares no module: the root module is a module like any other, and
+      // there is no header for its clause to sit below, so there the clause may open the file.
+      val lead = if m.isDefined then success(List.empty[CapabilityClause]) else opt(capabilityClause) ^^ (_.toList)
+
+      lead ~ rep(newlines ~> capabilityClause) ~ statements ^^ {
+        case first ~ rest ~ body => Program(body, m, first ::: rest, source)
+      }
+    }
 
   // --- entry points --------------------------------------------------------------------
 

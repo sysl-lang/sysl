@@ -225,6 +225,28 @@ trait AnalyzerBase {
     if to != currentModule && to != Modules.root && moduleNames(to) then
       moduleEdges.getOrElseUpdate((currentModule, to), currentPos)
 
+  // --- capabilities ---------------------------------------------------------------------
+
+  /** What each module gave up, and where the clause that said so was written (`13 §4`).
+   *
+   * It is keyed by module rather than by file because a capability is a property of the module —
+   * which is why every file of one has to state the same clause, and why the position kept is
+   * whichever file said it first: a use site is refused by the module's rule, and any of its files
+   * is as good a place to read that rule from as another.
+   *
+   * A module with no clause has no entry, so the common case — every module in almost every program
+   * — costs a lookup that finds nothing rather than an entry of its own.
+   */
+  protected val moduleNarrows = mutable.LinkedHashMap.empty[String, Map[String, Option[Pos]]]
+
+  /** What each module declared it cannot be built without, the other direction of the same clause.
+   *
+   * A requirement is documentation plus an early diagnostic (`capabilities.md`): using a gated
+   * feature already implies the requirement, so nothing here changes what a module may do. What it
+   * changes is what a *dependent* is told, and when.
+   */
+  protected val moduleRequires = mutable.LinkedHashMap.empty[String, Map[String, Option[Pos]]]
+
   // --- visibility -----------------------------------------------------------------------
 
   /** Where a **restricted** declaration may be named from (`13 §2`): the file that wrote it, and —

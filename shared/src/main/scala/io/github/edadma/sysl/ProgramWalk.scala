@@ -13,7 +13,14 @@ import scala.collection.mutable
  *
  * `units` is supplied by the class: the files being analyzed together.
  */
-trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility with ModuleGraph with InitOrder {
+trait ProgramWalk
+    extends Hoisting
+    with StmtAnalysis
+    with SignatureVisibility
+    with ModuleGraph
+    with Capabilities
+    with NoAlloc
+    with InitOrder {
 
   protected def units: List[Program]
 
@@ -32,6 +39,9 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
   def analyze(): TProgram = {
     checkLocations()
     checkLibraryModules()
+    // What a module may do is settled before anything in it is read, because the first construction
+    // the walk reaches is already a question about it.
+    readCapabilities()
     moduleNames ++= units.map(moduleOf)
     // The library's own modules are modules like any other, and are known for the same reason a
     // file's header is: what they are called is settled before a single name is resolved.
@@ -263,15 +273,24 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // Which `val` needs which is settled by what their initializers reach, so the order they are
     // filled in can only be worked out once every body those initializers call has been analyzed —
     // the same reason the module graph is held to being acyclic here rather than earlier.
+    val allFuncs = (tfuncs ++ closureFuncs).toList
+
+    // Asked of the finished tree, because what allocates is a node rather than a place in the
+    // analyzer — and asked here rather than after `analyze` returns, so that a module doing what it
+    // declared it would not is one of this walk's diagnostics like any other.
+    checkNoAlloc(allFuncs, tvals.toList, tmain, mainScope.module)
+
     TProgram(
       structInsts.values.filterNot(abstracted).toList,
       enumInsts.values.filterNot(e => e.simple || abstracted(e)).toList,
       vtables.values.toList,
       externs,
-      orderVals(tvals.toList, (tfuncs ++ closureFuncs).toList, vtables.values.toList),
-      (tfuncs ++ closureFuncs).toList,
+      orderVals(tvals.toList, allFuncs, vtables.values.toList),
+      allFuncs,
       tmain,
       tentry,
+      noAllocModules = moduleNarrows.collect { case (m, caps) if caps.contains(Capability.Alloc) => m }.toSet,
+      mainModule = mainScope.module,
     )
   }
 

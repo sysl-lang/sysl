@@ -90,7 +90,7 @@ private class Escape(program: TProgram) {
         (who, walk)
       }
 
-    val refused = borrowed ::: walks.flatMap(_._2.escape)
+    val refused = borrowed ::: walks.flatMap(noAllocPromotion) ::: walks.flatMap(_._2.escape)
 
     if refused.nonEmpty then Left(Diagnostic.report(refused))
     else
@@ -191,6 +191,13 @@ private class Escape(program: TProgram) {
 
     /** Why each of them moved, in the order the escapes were found. */
     val why = mutable.ListBuffer.empty[String]
+
+    /** The same promotions with their parts still separate — the array, where the view that carried
+     * it out was written, and how — for the one reader that has to say something else about them: a
+     * module that declared `no alloc` has nowhere to promote into, so what is silent everywhere else
+     * is a diagnostic there.
+     */
+    val sites = mutable.ListBuffer.empty[(String, Option[Pos], String)]
 
     /** Whether any confined view left the frame at all, promotable or not. This is what a parameter
      * summary asks — "does the callee let this outlive the call" is a yes/no, and the roots that
@@ -392,6 +399,7 @@ private class Escape(program: TProgram) {
 
       for name <- v.named if !promoted(name) do
         why += Diagnostic.explain(s"'$name' is promoted to the heap, because this view of it $how", at.pos)
+        sites += ((name, at.pos, how))
 
       promoted ++= v.named
       gotOut = true
@@ -407,6 +415,34 @@ private class Escape(program: TProgram) {
           ),
         )
     }
+  }
+
+  /** A promotion in a module that declared `no alloc`, said as the refusal it is there.
+   *
+   * Promotion is deliberately silent everywhere else (`05 § Promotion is silent, not hidden`) — the
+   * program means what it said and the storage quietly moves. A module that gave the allocator up
+   * has nowhere for it to move to, so the same fact has to be reported, and it is reported against
+   * the view that leaves the frame rather than against the array: the array is fine, and what the
+   * reader has to change is where its contents go.
+   *
+   * The body's module is read off the function's key, or is the entry point's for the statements a
+   * program runs, which belong to the file that carries them however little they look declared.
+   */
+  private def noAllocPromotion(walk: (Option[String], Walk)): List[String] = {
+    val (who, w) = walk
+    val module   = who.map(Modules.moduleOf).getOrElse(program.mainModule)
+
+    if !program.noAllocModules(module) then Nil
+    else
+      w.sites.toList.map((name, pos, how) =>
+        Diagnostic.render(
+          s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
+            "and this module declared 'no alloc', so there is nothing to move it into. Keep the view " +
+            "inside the frame, or take the storage from a caller as a '[]T' parameter, which is " +
+            "already wherever its owner put it",
+          pos,
+        ),
+      )
   }
 
   /** The arrays a body declares for itself, which are the ones it may move to the heap. A `[N]T`
