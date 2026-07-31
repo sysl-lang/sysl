@@ -446,6 +446,59 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       lines(3).length should be > "a[ is not a pattern: ".length
     }
 
+    "and the binding really matches, at offsets nothing could have guessed" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = List("examples/regex", "../examples/regex", "../../examples/regex").find(isDirectory)
+
+      assume(root.isDefined, "examples/regex not reachable from the working directory")
+
+      // The example's own output is a weak witness: all three of its matches begin at 0 and one runs
+      // to the end, so a binding that answered `0..len` to anything that matched would produce it.
+      // Every case here is chosen so that only real POSIX matching gives the number — a match that
+      // starts and ends mid-string, greediness with a ceiling, an anchor that refuses, a negated
+      // class, case sensitivity, a group under a quantifier, and an empty match.
+      //
+      // The offsets are POSIX and portable. The message for the bad pattern is the C library's own
+      // and is worded differently by BSD and glibc, so only its presence is pinned.
+      val out = createTempFile("sysl-cli-rxprobe-", LibraryArtifact.extension)
+
+      cli(Config(command = "build-lib", file = s"${root.get}/lib", output = Some(out))) shouldBe 0
+
+      val prog =
+        """import rx.*
+          |
+          |show(pat: string, s: string) =
+          |    compile(pat) match
+          |        Ok(re) ->
+          |            re.find(s) match
+          |                Some(m) -> print(f"${m.start}..${m.end}")
+          |                None -> print("none")
+          |            re.free()
+          |
+          |        Err(why) -> print(f"error: ${why}")
+          |
+          |show("[0-9]+", "abc123def")
+          |show("cat|dog", "hotdog stand")
+          |show("a{2,3}", "aaaa")
+          |show("^abc$", "xabcx")
+          |show("^abc$", "abc")
+          |show("[^aeiou]+", "aeixyzou")
+          |show("ABC", "xxabcxx")
+          |show("(ab)+", "zzababab!!")
+          |show("x*", "yyy")
+          |show("a{3,1}", "aaa")
+          |""".stripMargin
+
+      val lines = ran(Config(command = "run", file = program(prog), libs = List(out))).linesIterator.toList
+
+      lines.take(9) shouldBe
+        List("3..6", "3..6", "0..3", "none", "0..3", "3..6", "none", "2..8", "0..0")
+
+      lines(9) should startWith("error: ")
+      lines(9).length should be > "error: ".length
+    }
+
     "and editing only the C changes what the artifact fingerprints as" in {
       // A library's shims are as much its source as its modules are. An artifact that did not change
       // when one of them was edited is a stale artifact nothing would notice was stale — which is
