@@ -77,6 +77,8 @@ case class Config(
     coreSearch: String = LibraryArtifact.coreDefault,
     ar: Option[String] = None,
     programArgs: List[String] = Nil,
+    filter: Option[String] = None,
+    failFast: Boolean = false,
 )
 
 @main def sysl(args: String*): Unit = {
@@ -106,6 +108,18 @@ case class Config(
           opt[Unit]("core")
             .action((_, c) => c.copy(core = true))
             .text("this library is sysl's own standard module, which the compiler otherwise supplies"),
+        ),
+      cmd("test")
+        .action((_, c) => c.copy(command = "test"))
+        .text("run the '#test' functions of a sysl module")
+        .children(
+          arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
+          opt[String]("filter")
+            .action((f, c) => c.copy(filter = Some(f)))
+            .text("run only the tests whose name or module holds this text"),
+          opt[Unit]("fail-fast")
+            .action((_, c) => c.copy(failFast = true))
+            .text("stop at the first test that fails"),
         ),
       cmd("emit-llvm")
         .action((_, c) => c.copy(command = "emit-llvm"))
@@ -189,6 +203,9 @@ private[sysl] def execute(cfg: Config): Int = {
 
   // Running the result is what makes `run` different from `build`, and only this machine can do
   // that — so a cross target is refused here rather than built and then failed to execute.
+  //
+  // `test` is the same and refuses it in `TestRunner`, where the rest of what it does is: it is one
+  // compilation and one link like the two above, and then a run per test rather than a run.
   if cfg.command == "run" && !Target.host.contains(target) then
     return fail(s"'run' executes what it builds, and '${target.name}' is not this machine — " +
       s"use 'sysl build --target ${target.name}'")
@@ -234,6 +251,17 @@ private[sysl] def execute(cfg: Config): Int = {
   // that its share of the library stops being emitted into every one.
   val precompiled = read.flatMap(_._2).toSet ++ coreSymbols
 
+  // What the linker is handed: the artifacts themselves. A `.syslib` **is** an archive, so it goes on
+  // the link line as it stands and the linker takes only the members that resolve something.
+  val archives = artifacts ::: coreArchive.toList
+
+  // A test build is its own compilation and branches before the one below, rather than sharing it:
+  // it keeps the `#test` functions every other build drops, and it lowers a different entry point
+  // (`Tests`). Everything up to here — the libraries, the standard module, the target — is the same,
+  // which is why the branch is here and not at the top.
+  if cfg.command == "test" then
+    return TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, core, archives)
+
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled = Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, core) match
@@ -243,10 +271,6 @@ private[sysl] def execute(cfg: Config): Int = {
         if notes.isEmpty then Console.err.println("no arrays were promoted to the heap")
         else notes.foreach(Console.err.println)
       ir
-
-  // What the linker is handed: the artifacts themselves. A `.syslib` **is** an archive, so it goes on
-  // the link line as it stands and the linker takes only the members that resolve something.
-  val archives = artifacts ::: coreArchive.toList
 
   cfg.command match
     case "emit-llvm" =>

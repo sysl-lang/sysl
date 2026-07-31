@@ -103,11 +103,57 @@ class SyslParser(val source: Source) extends DeclParser {
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
   protected lazy val declaration: PackratParser[Stmt] =
-    implVisibility |
+    testDecl |
+      implVisibility |
       visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
         case Visibility.Public ~ d => d
         case v ~ d                 => restrict(v, d)
       }
+
+  /** A function carrying `#test`, which is a declaration with a line in front of it (`testing.md`).
+   *
+   * The attribute is its own line and the declaration follows on the next, which is why the newlines
+   * between them are consumed here: the statement separator would otherwise end the statement at the
+   * attribute, leaving a prefix with nothing to attach to. Everything about the declaration itself is
+   * still `declaration`'s — a test may be `private`, and is written exactly as any other function.
+   *
+   * Only a function may carry it, and the refusal below is what says so. A struct or a `val` with
+   * `#test` above it is a mistake about what a test *is* rather than a syntax error, so it is
+   * answered with the sentence rather than with the list of forms the grammar could still have read.
+   */
+  protected lazy val testDecl: PackratParser[Stmt] =
+    testAttr ~ (newlines ~> visibility ~ funcDecl) ^^ {
+      case a ~ (Visibility.Public ~ (f: FuncDecl)) => f.copy(test = Some(a))
+      case a ~ (v ~ (f: FuncDecl))                 => restrict(v, f.copy(test = Some(a)))
+      case _ ~ (_ ~ other)                         => other
+    } | testAttr ~> newlines ~> err(
+      "'#test' marks a function as a unit test, and only a function — there is nothing for " +
+        "'sysl test' to call in any other declaration",
+    )
+
+  /** `#test`, and the three things it may say about the test: the name a report gives it, that it is
+   * a run which should not come back, and the text such a run should have printed on its way out.
+   */
+  protected lazy val testAttr: PackratParser[TestAttr] =
+    at(op("#") ~> testWord ~> opt(op("(") ~> testArgs <~ op(")")) ^^ (_.getOrElse(TestAttr(None, false, None))))
+
+  /** The attribute's name. `test` stays an ordinary identifier — reserving it would spend the word
+   * out of every program's namespace for the sake of one line per test, which is the trade `alloc`
+   * made and the one `capabilities.md § Open` is still paying for.
+   */
+  protected lazy val testWord: Parser[Unit] =
+    accept("'test'", { case t: lexical.Identifier if t.chars == "test" => () }) |
+      ident >> (n => err(s"'$n' is not an attribute sysl knows — '#test' is the only one"))
+
+  private lazy val testArgs: Parser[TestAttr] =
+    contractMsg ~ opt(op(",") ~> testExpectation) ^^ {
+      case d ~ e => TestAttr(Some(d), e.isDefined, e.flatten)
+    } | testExpectation ^^ (e => TestAttr(None, true, e))
+
+  /** `should_trap`, alone or with the substring a trapping run must have printed. */
+  private lazy val testExpectation: Parser[Option[String]] =
+    accept("'should_trap'", { case t: lexical.Identifier if t.chars == "should_trap" => () }) ~>
+      opt(op(":") ~> contractMsg)
 
   /** A modifier written in front of an `impl` block, refused where it stands.
    *

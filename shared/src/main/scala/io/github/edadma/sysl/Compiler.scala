@@ -80,6 +80,33 @@ object Compiler {
       case errs => Left(errs.mkString("\n"))
   }
 
+  /** The same compilation as a **test build**: the IR whose entry point dispatches to one `#test`
+   * function by name, and the tests it can be asked for (`testing.md`).
+   *
+   * This is the one compilation that keeps the tests and drops the program — `Tests.only` says why —
+   * and the tests come back beside the IR because the runner needs both: the binary to execute and
+   * the list to execute it for. Working the list out twice, once here and once by reading the tree
+   * again, is how the two come to disagree about what a test is called.
+   */
+  def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
+                   precompiled: Set[String] = Set.empty, core: Core = Core.embedded)
+      : Either[String, (String, List[TTest])] = {
+    val parsed = sources.map(SyslParser.parse)
+
+    parsed.collect { case Left(e) => e } match
+      case errs if errs.nonEmpty => Left(errs.mkString("\n"))
+      case _ =>
+        val units = libraries ::: parsed.collect { case Right(p) => p }
+
+        for
+          typed    <- Analyzer.analyze(units, core = core)
+          promoted <- Escape.check(typed)
+        yield
+          val kept = Tests.only(typed)
+
+          (Codegen.generate(kept.copy(precompiled = precompiled), promoted, target), kept.tests)
+  }
+
   /** A **library** lowered on its own: the IR for everything in it that could be compiled ahead of
    * time, and the names of those functions.
    *
@@ -112,7 +139,11 @@ object Compiler {
   def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
                      core: Core = Core.embedded): Either[String, (String, Set[String])] =
     for
-      typed    <- Analyzer.analyze(units, building, core)
+      analysed <- Analyzer.analyze(units, building, core)
+      // A library ships no tests. They are the library author's, they run against the sources rather
+      // than against the artifact, and emitting them would put a function nothing can call into every
+      // program that links it — with the helpers only it reaches dragged in behind.
+      typed    = Tests.strip(analysed)
       promoted <- Escape.check(typed)
     yield
       val mine            = units.map(moduleOf).toSet
@@ -151,7 +182,11 @@ object Compiler {
       // dropped from the tree exactly as before. What `precompiled` changes is only what happens to
       // the ones it *does* call — declared rather than defined, with the body coming from the
       // library's object file at link time.
-      val pruned = Reachability.prune(typed)
+      //
+      // The tests go first, and they go **after** the analysis above rather than instead of it: a
+      // `#test` that does not compile is an error in a build that would never have run it, which is
+      // what makes it safe to leave one beside the code it tests (`Tests`).
+      val pruned = Reachability.prune(Tests.strip(typed))
 
       (Codegen.generate(pruned.copy(precompiled = precompiled), promoted, target), promoted.explanations)
 }

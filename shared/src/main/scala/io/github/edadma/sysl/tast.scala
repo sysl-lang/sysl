@@ -570,6 +570,26 @@ case class TVal(symbol: String, ty: Type, init: TExpr, computed: Boolean)
  */
 case class TEntry(func: String, argsFn: Option[String])
 
+/** One `#test` function, as the runner needs it (`testing.md`).
+ *
+ * `func` is the key the function is filed under, which is what makes it reachable and what the
+ * dispatcher matches an argument against. Everything else is for the report: what to call the test,
+ * whether returning is the outcome it was after, and where to point a reader whose test failed.
+ *
+ * The position is carried here because it is the *attribute's*, not the function's, and it is the
+ * only place a reader can be sent that is certainly about the test rather than about the code under
+ * it. A test that failed has no diagnostic of its own — it has an exit status — so this stands in
+ * for one.
+ */
+case class TTest(
+    func: String,
+    display: String,
+    shouldTrap: Boolean,
+    expected: Option[String],
+    file: String,
+    line: Int,
+)
+
 /** A whole program: hoisted struct, enum, and function declarations, the method tables its trait
  * objects dispatch through, the externs it calls, the module-level `val`s it reads, plus the
  * top-level statements that make up `main`. Only data enums appear in `enums` — a simple enum
@@ -610,4 +630,12 @@ case class TProgram(
      * key; these have no key, so the answer is carried here.
      */
     mainModule: String = Modules.root,
+    /** The `#test` functions the sources declared, in the order they were written (`testing.md`).
+     *
+     * They are carried on the program rather than looked up from `funcs` because what a test *is* —
+     * its reported name, what it expects — lives in the attribute, and the typed function is the
+     * ordinary function it would have been without one. A compilation that is not a test build
+     * drops both this and the functions it names: `Tests.strip`.
+     */
+    tests: List[TTest] = Nil,
 )

@@ -34,7 +34,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val funcTexts       = own.map(genFunction)
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
-    val mainText = if program.entryPoint then genMain(program.vals, program.main, program.entry) else ""
+    val mainText =
+      if !program.entryPoint then ""
+      else if program.tests.nonEmpty then genTestMain(program.vals, program.tests)
+      else genMain(program.vals, program.main, program.entry)
     // The tables come after the bodies because a table only exists for a type something erased, and
     // it may ask for an adapter, which the queue below is what emits.
     val vtableText = program.vtables.map(genVtable).mkString
@@ -59,6 +62,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       out ++= "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n"
       out ++= "declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)\n"
     if usesSnprintf then out ++= "declare i32 @snprintf(ptr, i64, ptr, ...)\n"
+    // The test dispatcher's one dependency, and the only thing in a test build that is not also in an
+    // ordinary one. It is declared from the shape of the program rather than from a flag set while
+    // emitting, because the entry point is emitted after this line runs.
+    if program.entryPoint && program.tests.nonEmpty then out ++= "declare i32 @strcmp(ptr, ptr)\n"
     if usesVarargs then
       out ++= "declare void @llvm.va_start.p0(ptr)\n"
       out ++= "declare void @llvm.va_end.p0(ptr)\n"
@@ -71,7 +78,8 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // declare one symbol twice.
     val declared = mutable.Set("llvm.trap") ++
       (if heap then Set("malloc", "free") else Set.empty) ++
-      (if usesSnprintf then Set("snprintf") else Set.empty)
+      (if usesSnprintf then Set("snprintf") else Set.empty) ++
+      (if program.entryPoint && program.tests.nonEmpty then Set("strcmp") else Set.empty)
 
     // An aggregate does not cross to a foreign callee as itself: the convention the other side was
     // compiled against says which registers it arrives in, so that is what the declaration names
@@ -187,6 +195,70 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     releaseAll()
     emitTerm("ret i32 0")
+    finishFunction("define i32 @main(i32 %argc, ptr %argv)")
+  }
+
+  /** `@main` for a **test build**: the entry point `sysl test` drives, which runs the one test named
+   * on its command line and nothing else (`testing.md`).
+   *
+   * **One test to a process, chosen from outside.** A test that fails does so by trapping, and a trap
+   * takes the process with it — so a runner that called them in a loop would learn the name of the
+   * first failure and nothing after it. Dispatching on an argument instead means one compile and one
+   * short-lived process per test, and a test's verdict is then the exit status the platform already
+   * reports.
+   *
+   * The status says which of three things happened, and the runner reads all three: `0` for a test
+   * that returned, whatever the platform makes of a trap for one that did not, and `2` for a name
+   * that matches nothing here — which is a runner and a binary that disagree, not a test result.
+   *
+   * The computed `val`s are laid down first, exactly as an ordinary entry point lays them down. A
+   * test reads a module's storage the same way any other function does, and skipping the
+   * initialization here would leave it reading zeros.
+   */
+  private def genTestMain(vals: List[TVal], tests: List[TTest]): String = {
+    startFunction()
+    promoted = promotions(None)
+    pushTemps()
+    pushOwned()
+
+    for v <- vals if v.computed do
+      pushTemps()
+      emit(s"store ${v.ty.llvm} ${genExpr(v.init)}, ptr @${v.symbol}")
+      popTemps()
+
+    val named   = freshLabel("test.named")
+    val missing = freshLabel("test.missing")
+    val enough  = freshTemp()
+
+    emit(s"$enough = icmp sgt i32 %argc, 1")
+    emitTerm(s"br i1 $enough, label %$named, label %$missing")
+
+    emitLabel(named)
+    val slot = freshTemp(); emit(s"$slot = getelementptr ptr, ptr %argv, i64 1")
+    val want = freshTemp(); emit(s"$want = load ptr, ptr $slot")
+
+    // Each arm compares the wanted name against one test's key and calls it on a match. The keys are
+    // interned with the terminator `strcmp` reads to, which an ordinary sysl string constant does not
+    // carry: a `string` knows its own length and has never had a use for one.
+    for t <- tests do
+      val run  = freshLabel("test.run")
+      val next = freshLabel("test.next")
+      val cmp  = freshTemp(); emit(s"$cmp = call i32 @strcmp(ptr $want, ptr ${stringGlobal(t.func + "\u0000")})")
+      val hit  = freshTemp(); emit(s"$hit = icmp eq i32 $cmp, 0")
+
+      emitTerm(s"br i1 $hit, label %$run, label %$next")
+      emitLabel(run)
+      emit(s"call void @${symbolOf(t.func)}()")
+      emitTerm("ret i32 0")
+      emitLabel(next)
+
+    // Falling off the end of the arms and arriving with no name at all are the same answer: this
+    // binary has no such test. They share a block rather than each getting one, because a runner
+    // reading the status cannot tell them apart and there is nothing it would do differently.
+    emitTerm(s"br label %$missing")
+    emitLabel(missing)
+    emitTerm("ret i32 2")
+
     finishFunction("define i32 @main(i32 %argc, ptr %argv)")
   }
 

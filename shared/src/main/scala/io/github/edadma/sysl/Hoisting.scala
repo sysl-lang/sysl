@@ -215,6 +215,15 @@ trait Hoisting extends HoistMembers {
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkBoundNames(f.name, f.bounds)
       checkSolvedDefaults("the function", f.name, f.tdefaults)
+      // A `#test` is registered here with everything else a declaration says about itself, so that
+      // the runner's list is in declaration order without anything having to sort it afterwards.
+      // The checks run at the attribute, which is the part a diagnostic is about (`Tests`).
+      for a <- f.test do
+        at(a.pos) {
+          Tests.problem(f).foreach(err)
+          funcInsts.get(key).map(_._2).flatMap(Tests.resultProblem(f, _)).foreach(err)
+          tests += Tests.describe(key, a)
+        }
 
     // An `extern`'s **symbol** is not qualified, and cannot be: it names something the linker
     // already has, which knows nothing about sysl's modules. So the key the program calls it by

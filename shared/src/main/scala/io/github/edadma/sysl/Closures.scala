@@ -378,7 +378,7 @@ trait Closures extends CallAnalysis {
       case VarDecl(n, _, init)   => init.foreach(walk(_, bound)); bound + n
       case ValDecl(n, _, v, _)   => walk(v, bound); bound + n
       case ConstDecl(n, _, v, _) => walk(v, bound); bound + n
-      case FuncDecl(_, _, ps, _, b, _, _, _, _) => scoped(b, bound ++ ps.map(_.name)); bound
+      case f: FuncDecl => scoped(f.body, bound ++ f.params.map(_.name)); bound
       // A closure inside this one captures from further out through this one, so what it reads is
       // read here too — which is what makes capture reach through a nesting (`12 §5a`).
       case Lambda(ps, b) => scoped(b, bound ++ ps.map(_.name)); bound
