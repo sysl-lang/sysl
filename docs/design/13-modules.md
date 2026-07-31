@@ -844,12 +844,14 @@ the default path is the ordinary state of a fresh tree and says nothing at all; 
 silence is what would let it go on being ignored. `--no-core-lib` asks for the built-in copy on
 purpose, which is what makes "compile it both ways and compare" a thing one command can do.
 
-**The copy the compiler carries is bootstrap scaffolding, not an invariant.** No real toolchain
-embeds its standard library: clang ships no libc, and rustc ships precompiled `libstd.rlib` beside
-the binary in a sysroot whose absence is a hard error, not a fallback. sysl carries one because it
-has no released compiler to bootstrap from yet and its own tests must run in a tree where nothing has
-been built. The endpoint is the sysroot: the standard module installed beside the compiler, found
-there, and its absence reported rather than papered over.
+**The copy the compiler carries is a choice, not a necessity.** No other toolchain embeds its
+standard library: clang ships no libc, and rustc ships precompiled `libstd.rlib` beside the binary in
+a sysroot whose absence is a hard error rather than a fallback. Both put the library *alongside* the
+compiler in a known place. sysl carries one instead, deliberately: it has no released compiler to
+bootstrap from, and its own tests have to run in a tree where nothing has been built yet. What that
+costs is the standing obligation to keep the carried copy in step with `lib/sysl` — met by
+generating it from those files on every build and asserting file-for-file that the two agree, so the
+files are the fact and the carrier cannot disagree with them.
 
 Two properties make the switch safe to make one step at a time, and both are pinned rather than
 assumed. The artifact **means what the source means**: one program compiled both ways emits the same
