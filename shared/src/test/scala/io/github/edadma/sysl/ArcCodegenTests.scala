@@ -10,6 +10,12 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
   private val point = "struct Point\n    x: int\n    y: int\n"
 
+  // A monomorphized name carries its generic's **key**, so the library's `Option` appears here as
+  // `sysl$Option` — and inside a regex the `$` has to be escaped, since it would otherwise read as
+  // an end-of-input anchor and match nothing at all.
+  private val opt   = Library.key("Option")
+  private val optRe = keyRe("Option")
+
   "a box is the strong count, the deallocation hook, the weak count, and the payload" in {
     val out = ir(point + "var p: &Point = Point(1, 2)")
 
@@ -82,7 +88,7 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
     val out = ir(src)
 
     out should include("define private void @arc.copy.Node(%struct.Node %v) {")
-    out should include("call void @arc.copy.Option.ref.Node(%enum.Option.ref.Node %t1)")
+    out should include(s"call void @arc.copy.$opt.ref.Node(%enum.$opt.ref.Node %t1)")
   }
 
   // The tag is read straight off the value, since it is the aggregate's own first member; the
@@ -92,12 +98,12 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
     val src = "struct Node\n    value: int\n    next: Option[&Node]\nvar n: &Node = Node(1, None)"
     val out = ir(src)
 
-    out should include("define private void @arc.dispose.Option.ref.Node(%enum.Option.ref.Node %v) {")
-    out should include regex raw"extractvalue %enum\.Option\.ref\.Node %v, 0\n  %t\d+ = icmp eq i32 %t\d+, 0"
+    out should include(s"define private void @arc.dispose.$opt.ref.Node(%enum.$opt.ref.Node %v) {")
+    out should include regex raw"extractvalue %enum\.${optRe}\.ref\.Node %v, 0\n  %t\d+ = icmp eq i32 %t\d+, 0"
     out should include regex
-      raw"getelementptr %enum\.Option\.ref\.Node, ptr %t\d+, i32 0, i32 1\n" +
-      raw"  %t\d+ = load %Option\.ref\.Node\.Some, ptr %t\d+"
-    out should include regex raw"extractvalue %Option\.ref\.Node\.Some %t\d+, 0\n  call void @arc\.release\("
+      raw"getelementptr %enum\.${optRe}\.ref\.Node, ptr %t\d+, i32 0, i32 1\n" +
+      raw"  %t\d+ = load %${optRe}\.ref\.Node\.Some, ptr %t\d+"
+    out should include regex raw"extractvalue %${optRe}\.ref\.Node\.Some %t\d+, 0\n  call void @arc\.release\("
   }
 
   "an ordinary reference counts with a plain load and store" in {

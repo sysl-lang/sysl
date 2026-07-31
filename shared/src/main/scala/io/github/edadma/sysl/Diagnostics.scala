@@ -9,8 +9,8 @@ package io.github.edadma.sysl
  */
 
 /** A named source text: the unit a `Pos` points into. Sources are compared by identity, so the
- * prelude and the user's file stay distinct even though a program is made of both, and a
- * diagnostic against a prelude declaration quotes the prelude rather than the wrong file.
+ * library and the user's file stay distinct even though a program is made of both, and a
+ * diagnostic against a library declaration quotes the library's own file rather than the wrong one.
  *
  * `dir` is where the file sits, as the directory segments between the project root and it — so a
  * file at `std/fs/read.sysl` carries `["std", "fs"]` and one at the root carries `Nil`. A module
@@ -120,7 +120,7 @@ object Diagnostic {
   val limit: Int = 5
 
   /** A message rendered against a position when there is one, and on its own when there is not —
-   * a synthesized node (the prelude's, a desugaring's) may have no place to point at, and that
+   * a synthesized node (the library's, a desugaring's) may have no place to point at, and that
    * is a reason to say less rather than to say nothing.
    */
   def render(msg: String, pos: Option[Pos]): String =

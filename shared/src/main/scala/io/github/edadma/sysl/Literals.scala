@@ -150,7 +150,7 @@ trait Literals extends TypeResolution {
         "a value as text")
 
   /** Widens a value to the one width a renderer takes, leaving one that is already there alone.
-   * The prelude carries one rendering per *kind* rather than one per type, so every integer meets
+   * The library carries one rendering per *kind* rather than one per type, so every integer meets
    * `long` or `ulong` and every float meets `real` on the way in.
    */
   protected def widen(t: TExpr, to: Type): TExpr = if t.ty == to then t else TCast(t, to).setPos(t.pos)
@@ -158,7 +158,7 @@ trait Literals extends TypeResolution {
   /** The same, for the value a `Display` renderer is handed.
    *
    * One kind of value does not *widen* into its renderer: an integer past 64 bits has no width to
-   * widen to that would still hold it, so it arrives as the digits `str` writes and the prelude is
+   * widen to that would still hold it, so it arrives as the digits `str` writes and the library is
    * left with the padding. Rendering it any other way would truncate silently, which is the one
    * outcome a renderer must not have — the number would simply print as its low half.
    */

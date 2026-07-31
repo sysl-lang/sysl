@@ -240,7 +240,7 @@ trait TraitLookup extends MemberVisibility {
     case Type.Array(n, elem) => Some((s"[$n]", List(elem)))
     // A tuple's shape is its **arity**, since that is the whole of what an implementation can be
     // written for at once: there is no way to be generic over how many parts a tuple has, so a
-    // pair and a triple are two shapes and the prelude writes one implementation for each.
+    // pair and a triple are two shapes and the library writes one implementation for each.
     case t: Type.Tuple       => Some((Type.Tuple.shape(t.targs.length), t.targs))
     case _                   => None
 
@@ -514,10 +514,10 @@ trait TraitLookup extends MemberVisibility {
 
     wrongArgs.headOption.orElse(unmetCondition).orElse(tooWide(tr, t))
 
-  /** Why a **tuple** does not implement one of the traits the prelude provides structurally: not
+  /** Why a **tuple** does not implement one of the traits the library provides structurally: not
    * because of what its parts are, but because of how many there are.
    *
-   * Arity is a shape (`00 §13`), and there is no way to be generic over one — so the prelude writes
+   * Arity is a shape (`00 §13`), and there is no way to be generic over one — so the library writes
    * an implementation per arity and stops somewhere. Saying where it stopped is the whole of the
    * advice, since the fix is not another `impl` but a type with a name.
    */

@@ -232,7 +232,7 @@ trait MethodCalls extends CallCore {
   /** `5.display(out, fmt)` — the rendering a built-in's `Display` membership provides (`14 §5`).
    *
    * It is `5.add(3)`'s sibling and exists for the same reason: a built-in has no `impl` block, so
-   * there is no lowered `int.display` to call. What it has is a renderer the prelude already writes,
+   * there is no lowered `int.display` to call. What it has is a renderer the library already writes,
    * declared in the argument order `Display` does, so naming it here is the whole lowering — and it
    * is what lets a `Display` written for a struct render the struct's own fields without leaving
    * the allocation-free path the sink exists for.
@@ -262,7 +262,7 @@ trait MethodCalls extends CallCore {
   /** `k.hash()` — the mixing a built-in's `Hash` membership provides (`14 §5`).
    *
    * `builtinDisplay`'s sibling, and built the same way for the same reason: a built-in has no
-   * `impl` block, so the lowering is a prelude function named here. Where `Display` writes into a
+   * `impl` block, so the lowering is a library function named here. Where `Display` writes into a
    * sink this returns a number, so what the widening is for is the law rather than the signature —
    * every integer, `char`, and `bool` reaches one mixer at 64 bits, so two values that compare
    * equal across widths hash equal too.

@@ -40,7 +40,7 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   "what the documents claim" - {
 
-    // `14 §2`'s note that a prelude declaration nothing reaches costs the output nothing was only
+    // `14 §2`'s note that a library declaration nothing reaches costs the output nothing was only
     // ever half the rule: the program's own declarations were emitted whether or not anything
     // called them.
     "a function nothing calls is not emitted" in {

@@ -248,7 +248,7 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  "every arity the prelude declares" - {
+  "every arity the library declares" - {
     "none through four" in {
       run("""zero(f: () -> int) -> int = f()
             |one(f: int -> int) -> int = f(1)
@@ -261,7 +261,7 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "0 1 3\n6 10\n"
     }
 
-    "and five is where the prelude stops" in {
+    "and five is where the library stops" in {
       err("""f(g: (int, int, int, int, int) -> int) -> int = 0
             |""".stripMargin) should include("takes up to 4 parameters")
     }

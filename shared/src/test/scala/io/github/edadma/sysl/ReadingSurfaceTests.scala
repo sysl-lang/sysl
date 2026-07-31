@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The prelude's input half: `Reader`, `FdReader`, `find_byte`, and the `Lines` cursor `getline`
+/** The library's input half: `Reader`, `FdReader`, `find_byte`, and the `Lines` cursor `getline`
  * belongs to.
  *
  * Almost everything here runs, because what is being checked is that bytes arrive where the program
@@ -13,7 +13,7 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
 
-  /** The prelude offers no way to turn a path into a file descriptor, and deliberately: `Reader` is
+  /** The library offers no way to turn a path into a file descriptor, and deliberately: `Reader` is
    * about bytes arriving, not about where a program got its descriptors. So every program here opens
    * its own, which is also the demonstration that `FdReader` is not tied to standard input.
    */
@@ -70,7 +70,7 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
       |
       |    c_close(fd)""".stripMargin
 
-  /** The prelude reads in 4096-byte bites. Nothing outside it should care, but the cases either side
+  /** The library reads in 4096-byte bites. Nothing outside it should care, but the cases either side
    * of a boundary are exactly where an off-by-one lives, so the tests that sit on one say which
    * number they are sitting on — and are the reminder if it ever changes.
    */
@@ -684,12 +684,12 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  /** None of this costs a program that reads nothing, which is the rule `14 §2` states for a prelude
-   * member and the reason the surface can live in the prelude at all.
+  /** None of this costs a program that reads nothing, which is the rule `14 §2` states for a library
+   * member and the reason the surface can live in the library at all.
    */
   "a program that reads nothing carries none of it" - {
     "the platform's read and memchr are not declared" in {
-      val ir = Compiler.compileToLlvm("print(1)", "<input>").getOrElse(fail("the prelude broke"))
+      val ir = Compiler.compileToLlvm("print(1)", "<input>").getOrElse(fail("the library broke"))
 
       ir should not include "@read("
       ir should not include "@memchr("

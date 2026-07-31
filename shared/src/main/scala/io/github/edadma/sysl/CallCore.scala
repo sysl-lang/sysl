@@ -176,7 +176,7 @@ trait CallCore extends Literals with TraitObjects {
     checkArity(s"function '$shown'", f.params.length, variadic, args.length)
 
     // An extern is declared in the output only if something reaches it, which is what keeps an
-    // unused one — the prelude's `exit`, in a program that never panics — out of the module.
+    // unused one — the library's `exit`, in a program that never panics — out of the module.
     if externDecls.contains(f.name) then externsUsed += f.name
 
     val (name, pre) =

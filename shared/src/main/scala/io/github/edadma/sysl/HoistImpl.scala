@@ -134,7 +134,7 @@ trait HoistImpl extends ImplConformance {
         writtenShapes((impl.traitName, h)) = outer.label
 
     // Last of the checks about the block as a whole, because every one above it is more specific:
-    // a block with no home is often also one the prelude has already written, and being told which
+    // a block with no home is often also one the library has already written, and being told which
     // implementation already covers the type is the more useful half of that.
     checkCoherence(impl, outer.label)
 
@@ -478,8 +478,9 @@ trait HoistImpl extends ImplConformance {
       case _: Poisoned      => None
 
   /** What a diagnostic says about where a declaration lives. The library's own answers "the
-   * library's", not "the prelude's": part of it is a module a program can name and import, and
-   * naming the mechanism that supplies it tells a reader to look for something they cannot write.
+   * library's" rather than naming the mechanism that supplies it — that is a fact about the
+   * compiler, and a reader told it goes looking for something they cannot write. The library is a
+   * module they *can* name and import, so that is what a diagnostic offers them.
    */
   protected def whose(module: Option[String]): String = module match
     case None                         => "is the library's"

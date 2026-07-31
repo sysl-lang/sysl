@@ -309,7 +309,7 @@ class CoreTraitRunTests extends AnyFreeSpec with RunSupport with CodegenSupport 
       err("""var a: Option[u8] = Some(3u8)
             |var b: Option[u8] = Some(3u8)
             |print(a == b)
-            |""".stripMargin) should include("'==' is not defined for Option[byte]")
+            |""".stripMargin) should include(s"'==' is not defined for ${lib("Option")}[byte]")
     }
 
     // What it costs to write by hand, and that the payload's own equality is what answers it. The

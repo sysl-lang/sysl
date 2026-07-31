@@ -282,7 +282,7 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
     }
   }
 
-  "the traits the prelude provides structurally" - {
+  "the traits the library provides structurally" - {
     "equality compares part by part" in {
       run("""print((1, 2) == (1, 2), (1, 2) == (1, 3), (1, "a") == (1, "a"))""") shouldBe "true false true\n"
     }
@@ -377,7 +377,7 @@ class TupleTests extends AnyFreeSpec with ParseSupport with RunSupport with Code
 
     // §13 says a user may not write `impl Eq for (int, string)` — and that this is the existing
     // rule producing the expected answer rather than a new one. The message is the shape rule's.
-    "and the prelude's own rows may not be given a second implementation" in {
+    "and the library's own rows may not be given a second implementation" in {
       err("""impl Eq for (int, int)
             |    eq(self, rhs: Self) -> bool = true
             |print(1)

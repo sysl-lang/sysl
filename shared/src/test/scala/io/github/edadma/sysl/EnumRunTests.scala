@@ -49,7 +49,7 @@ class EnumRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "and is wide enough for a variant whose payload is itself an enum" in {
       ir(step + "var o: Option[Step] = Some(Lock(1u8))\nprint(o.is_some())") should
-        include("%enum.Option.Step = type { i32, [2 x i32] }")
+        include(s"%enum.${Library.key("Option")}.Step = type { i32, [2 x i32] }")
     }
 
     // The union is what makes this the interesting case: four variants writing four different

@@ -32,7 +32,7 @@ trait SignatureVisibility extends TypeResolution {
     case OneFile(file: Source, module: String)
 
   /** How far one declaration reaches, read off what its modifier recorded. A declaration with no
-   * entry was unmarked, and a `private` in a context with no file behind it — the prelude's, or one
+   * entry was unmarked, and a `private` in a context with no file behind it — the library's, or one
    * the compiler synthesized — restricts nothing there is anywhere to restrict it to.
    */
   protected def reachOf(key: String): Reach = declAccess.get(key) match
@@ -233,7 +233,7 @@ trait SignatureVisibility extends TypeResolution {
     case WeakType(inner)    => namesIn(inner, skip)
     case ArrayType(_, elem) => namesIn(elem, skip)
     case TupleType(parts, _) => parts.flatMap(namesIn(_, skip))
-    // A callable mentions the prelude's call trait, which is public and is nobody's to hide; what a
+    // A callable mentions the library's call trait, which is public and is nobody's to hide; what a
     // signature can expose through one is its parameters and its result, so those are what is walked.
     case f: FnType           => (f.params :+ f.ret).flatMap(namesIn(_, skip))
 

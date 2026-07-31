@@ -184,7 +184,7 @@ case class TCompare(operands: List[TExpr], cmps: List[TCmp]) extends TExpr { def
 
 /** Several expressions evaluated in order for their effects, yielding nothing. `print(a, b, c)`
  * desugars to one of these — a call per value, with the separators between — which is what lets the
- * printing itself live in the prelude rather than in codegen.
+ * printing itself live in the library rather than in codegen.
  */
 case class TSeq(exprs: List[TExpr]) extends TExpr { def ty: Type = Type.Unit }
 
@@ -198,7 +198,7 @@ case class TStr(arg: TExpr) extends TExpr { def ty: Type = Type.Str }
 /** The built-in `from_utf8_unchecked(b)` — the bytes of a `[]u8` as a `string`, with nothing
  * checked (`04 § Validity`).
  *
- * It is here rather than in the prelude for the reason the `va_*` forms are: no sysl body can build
+ * It is here rather than in the library for the reason the `va_*` forms are: no sysl body can build
  * a `string`, since every safe route to one already has the UTF-8 guarantee behind it. The bytes are
  * **copied** into a fresh owning string rather than shared with the slice — a `[]u8` is mutable and
  * a `string` is not, so aliasing the source would let a later write break the invariant of a value
@@ -226,7 +226,7 @@ case class TStdout() extends TExpr { def ty: Type = Type.Ptr(Type.Trait(Library.
  * reaches, and it writes into a growable buffer whose bytes this yields as a fresh `string`.
  *
  * That buffer is the second sink the compiler provides, for the sibling of `TStdout`'s reason — a
- * growable byte buffer is not something sysl can express yet (`07`, *Not yet*), so the prelude
+ * growable byte buffer is not something sysl can express yet (`07`, *Not yet*), so the library
  * could no more declare this writer than the other one.
  *
  * `slot` is set where the value is a **trait object** whose trait requires `Display`: the renderer is
@@ -505,11 +505,11 @@ case class TFunc(
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones
- * the program actually calls reach here, so an `extern` the prelude offers and nobody uses costs
+ * the program actually calls reach here, so an `extern` the library offers and nobody uses costs
  * the output nothing.
  *
  * `name` is what the program calls it by and `symbol` is what the linker resolves; they differ only
- * where the declaration gave a link name. Two declarations may share one symbol — the prelude's
+ * where the declaration gave a link name. Two declarations may share one symbol — the library's
  * `snprintf` and a program's own — so the module declares each *symbol* once.
  */
 case class TExtern(name: String, symbol: String, params: List[Type], retTy: Type,
@@ -542,7 +542,7 @@ case class TVal(symbol: String, ty: Type, init: TExpr, computed: Boolean)
 /** The `main` a program declared, which runs after its top-level statements (`13 §7`).
  *
  * `func` is the key the function is filed under, which is what makes it reachable; `argsFn` names the
- * prelude function that turns the platform's `argc`/`argv` into the `[]string` it wants, and is
+ * library function that turns the platform's `argc`/`argv` into the `[]string` it wants, and is
  * absent for a `main` that takes no parameters — so a program that does not ask for its arguments
  * carries none of the conversion.
  */

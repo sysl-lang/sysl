@@ -510,8 +510,8 @@ case class FuncDecl(
  * `link` is the optional leading string of `extern "snprintf" fmt(…)`: the symbol the linker
  * resolves, when that differs from the name the program calls it by. Absent, the two are the same.
  * The distinction exists because a symbol's spelling belongs to whoever exported it — it may be
- * taken already, or shaped nothing like sysl — and because a declaration in the prelude would
- * otherwise spend a name out of every program's namespace.
+ * taken already, or shaped nothing like sysl — and because a library declaration reaching a C name
+ * directly would otherwise spend that word out of every program's namespace.
  *
  * `variadic` is the trailing `...` of `extern printf(fmt: *u8, ...) -> int`: the C ellipsis, which a
  * sysl function may carry too (`12-functions-and-closures.md` §1, §9) under the same rules for what

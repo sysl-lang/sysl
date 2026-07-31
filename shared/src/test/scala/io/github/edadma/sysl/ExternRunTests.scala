@@ -4,7 +4,7 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** Tier-2 runtime behavior of `extern` and `never`: a call into the C library that really links
  * and runs, a diverging call that really stops the program, and the two forcing combinators the
- * prelude now writes on top of them.
+ * library writes on top of them.
  *
  * The externs used here are the ones every hosted target has — `abs` for a result and `exit` for a
  * departure — so the suite needs nothing beyond the libc the toolchain already links.
@@ -52,9 +52,9 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
       run(src) shouldBe "7 7\n"
     }
 
-    // Why the prelude's own externs carry link names: `print` renders through `snprintf`, and a
+    // Why the library's own externs carry link names: `print` renders through `snprintf`, and a
     // program is still free to declare `snprintf` for itself and have both reach libc's.
-    "the prelude leaves the C names it renders through free" in {
+    "the library leaves the C names it renders through free" in {
       val src =
         """extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
           |var buf: [8]u8
@@ -171,7 +171,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
     }
 
     // What a variadic call leaves behind still reaches the pipe, because the departure is the
-    // prelude's `exit` and `exit` flushes what was written.
+    // library's `exit` and `exit` flushes what was written.
     "what it printed survives a departure taken right after it" in {
       val src =
         s"""extern printf(fmt: *u8, ...) -> int
@@ -193,7 +193,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
    * input by construction, and a test that wanted to feed bytes in would need a runner that passes
    * its own stdin down.
    *
-   * These are the raw form, and they stay raw on purpose: the prelude now supplies `Reader` and the
+   * These are the raw form, and they stay raw on purpose: the library supplies `Reader` and the
    * `Lines` cursor over `read(2)` (`ReadingSurfaceTests`), and the point of keeping the bare `extern`
    * pinned here is that it is still all a program needs. A surface built on top of the language does
    * not change what the language asks for.
@@ -609,7 +609,7 @@ class ExternRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  "the prelude's unwrap and expect" - {
+  "the library's unwrap and expect" - {
     "Option hands over the value it holds" in {
       val src =
         """half(n: int) -> Option[int]

@@ -11,11 +11,11 @@ import org.scalatest.matchers.should.Matchers
  * carry shows up here rather than in a hand-written fixture that happens to avoid it. The small cases
  * below exist for the shapes it does not reach and for the ways the format goes wrong.
  *
- * It is round-tripped in **both halves**, the prelude and the standard module, because the library is
- * being drained from one into the other: whichever half holds a declaration is the half whose
- * comparison is doing the work, and covering only the shrinking one would quietly stop testing most
- * of the language. A count of lines or declarations is deliberately not asserted anywhere here for
- * the same reason — it would measure the drain rather than the codec.
+ * It is round-tripped **whole**, every file of it, rather than one file standing for the rest — a
+ * declaration shape the codec cannot carry is as likely to be in the one file left out. A count of
+ * lines or declarations is deliberately not asserted anywhere here: the library grows, and such a
+ * threshold measures that rather than the codec. The one count that is asserted is over positions,
+ * and it guards against the comparisons holding vacuously rather than describing the library.
  *
  * **Structural equality alone is not enough to pin this.** A position is deliberately not a
  * constructor parameter, so `==` ignores it entirely — a codec that dropped every position would pass
@@ -55,30 +55,22 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     here ::: below
   }
 
-  "the prelude" - {
+  "the library" - {
+
+    // One file rather than all of them where a test is about a single `Program`'s round trip. It is
+    // the first in module order, so which one it is does not depend on a directory listing.
+    val one = Std.parsed.head
 
     "round-trips to a structurally equal tree" in {
-      val original = Program(Prelude.decls, None, Prelude.origin)
-      val back     = roundTrip(List(original))
-
-      back should have length 1
-      back.head.body shouldBe original.body
-    }
-
-    "round-trips with every position intact" in {
-      val original = Program(Prelude.decls, None, Prelude.origin)
-      val back     = roundTrip(List(original))
-
-      positionsOf(back.head.body) shouldBe positionsOf(original.body)
-    }
-
-    // The standard module is where most of the library now lives, so round-tripping only the
-    // prelude would test a shrinking half of what the codec has to carry.
-    "and so does the standard module, which is the other half of what a codec must carry" in {
       val back = roundTrip(Std.parsed)
 
       back should have length Std.parsed.length
       back.map(_.body) shouldBe Std.parsed.map(_.body)
+    }
+
+    "round-trips with every position intact" in {
+      val back = roundTrip(Std.parsed)
+
       positionsOf(back.map(_.body)) shouldBe positionsOf(Std.parsed.map(_.body))
     }
 
@@ -86,43 +78,33 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       // Guards the two tests above: if the trees somehow had no positions, their comparisons would
       // hold vacuously and a codec that dropped every one of them would pass.
       //
-      // Counted over the WHOLE library rather than the prelude alone. The prelude is being drained
-      // into the standard module a surface at a time and is heading for empty, so a threshold on it
-      // is a threshold that fails on some future move for a reason that has nothing to do with the
-      // codec — which is exactly what it did.
-      //
-      // The two comparisons this guards cover one half each, which is what keeps the pairing honest
-      // as the balance shifts: whichever half holds the declarations is the half whose comparison is
-      // doing the work. The prelude's will end up trivially true, and is deleted with the prelude.
+      // Counted over the library through `Library.decls` rather than over a file, so the threshold
+      // does not move when a declaration moves between files.
       val stamped = positionsOf(Library.decls).count(_.isDefined)
 
       stamped should be > 1000
     }
 
     "rebinds to the caller's own Source, so a decoded declaration is still the library's" in {
-      val original = Program(Prelude.decls, None, Prelude.origin)
-      val back     = roundTrip(List(original), Map(Prelude.origin.name -> Prelude.origin))
+      val back = roundTrip(List(one), Map(one.source.name -> one.source))
 
       // `Library.owns` is identity on the Source, and it is what decides whether an unreached
       // declaration may be dropped — so a decoded tree has to land on the same object.
-      back.head.source should be theSameInstanceAs Prelude.origin
+      back.head.source should be theSameInstanceAs one.source
       back.head.body.forall(Library.owns) shouldBe true
     }
 
     "reconstructs a usable Source when the caller supplies none" in {
-      val original = Program(Prelude.decls, None, Prelude.origin)
-      val back     = roundTrip(List(original))
+      val back = roundTrip(List(one))
 
-      back.head.source.name shouldBe Prelude.origin.name
-      back.head.source.text shouldBe Prelude.origin.text
+      back.head.source.name shouldBe one.source.name
+      back.head.source.text shouldBe one.source.text
       // The text is carried so a diagnostic against a library declaration can quote its line.
-      back.head.source.line(1) shouldBe Prelude.origin.line(1)
+      back.head.source.line(1) shouldBe one.source.line(1)
     }
 
     "encodes deterministically, so an artifact can be cached and diffed" in {
-      val original = Program(Prelude.decls, None, Prelude.origin)
-
-      AstCodec.encode(List(original)) shouldBe AstCodec.encode(List(original))
+      AstCodec.encode(Std.parsed) shouldBe AstCodec.encode(Std.parsed)
     }
   }
 

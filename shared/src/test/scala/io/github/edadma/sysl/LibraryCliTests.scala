@@ -191,8 +191,8 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
       LibraryArtifact.unpack(out, readBytes(out)).flatMap(r => LibraryArtifact.read(out, r._1)) match
         case Right((trees, syms)) =>
-          // Every symbol is the standard module's own. The renderers reach the prelude's
-          // `sysl_snprintf` and the prelude's `putbytes` under them, and **none of those is in
+          // Every symbol is the standard module's own. The renderers reach the library's
+          // `sysl_snprintf` and the library's `putbytes` under them, and **none of those is in
           // here** — a library defines its own declarations and nobody else's, and the core library
           // is the one place that rule is under the most pressure, since the whole of the rest of
           // the library is what it was compiled against.

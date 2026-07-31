@@ -25,12 +25,12 @@ trait SpecialForms extends Closures {
   protected val specialFormNames: Set[String] =
     Set("print", "str", "format", "from_utf8_unchecked", "va_start", "va_end", "va_arg", "va_copy")
 
-  /** `print(a, b, …)` — each value rendered by the prelude function its type reaches, a space
+  /** `print(a, b, …)` — each value rendered by the library function its type reaches, a space
    * between and a newline at the end.
    *
    * This is a **desugaring**, not a builtin: the compiler knows a handful of *names* the way it
    * already knows `Option`'s variants, and implements no printing of its own. A scalar reaches the
-   * prelude renderer for its width; everything else reaches its own `Display`, which is what
+   * library renderer for its width; everything else reaches its own `Display`, which is what
    * putting the seam at a name was for.
    *
    * The space and the newline go out as *characters* rather than one-character strings, so that
@@ -48,10 +48,10 @@ trait SpecialForms extends Closures {
     TSeq(parts :+ printChar('\n'))
   }
 
-  /** One value, rendered by the prelude function that takes its type.
+  /** One value, rendered by the library function that takes its type.
    *
    * Every argument is widened to the one width its renderer takes — the integers to `long` or
-   * `ulong`, the floats to `real` — so the prelude needs one function per *kind* rather than one
+   * `ulong`, the floats to `real` — so the library needs one function per *kind* rather than one
    * per type, which sysl has no overloading to hide anyway.
    *
    * A scalar keeps this direct path rather than going through its `Display` (`14 §8 b`): the two

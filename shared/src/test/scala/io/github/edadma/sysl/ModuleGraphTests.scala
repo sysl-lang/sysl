@@ -187,9 +187,9 @@ class ModuleGraphTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ) shouldBe "42\n"
     }
 
-    // The prelude is the language rather than a module, and it is keyed in the root module — so if
-    // a use of `print` were an edge, every named module would depend on the root and every program
-    // with a root file that reaches into one would be a cycle.
+    // The standard module is auto-imported everywhere, so it is outside the dependency graph (`13
+    // §6`) — if a use of `print` were an edge, every named module would depend on it and the
+    // library's own files would depend on themselves.
     "a module that prints, reached from a root file that prints" in {
       runIn(
         ("", "main.sysl", "print(geom.twice(21))"),

@@ -6,12 +6,11 @@ import org.scalatest.matchers.should.Matchers
 /** Compiling a program **against a library**, with the library crossing as an `AstCodec` artifact
  * and its names arriving by auto-import (`13 §3`, `13 § Open d`, `13 § Open h`).
  *
- * **This exists to prove the pieces before the prelude is asked to rely on them.** Replacing the
- * prelude with a standard module in one step would mean that a mistake anywhere in the path — the
- * artifact, the linking, the auto-import — breaks every program at once, with 4000 failing tests
- * and nothing to bisect. So the same path is built and exercised against a library that **nothing
- * depends on**: if any of it is wrong, the prelude still works and these tests say which piece it
- * was. The switch is then a change to `AutoImport.modules`, not a rewrite.
+ * **This exists to prove the pieces on a library nothing depends on.** It was written before the
+ * standard module relied on any of them: a mistake in the artifact, the linking or the auto-import
+ * would otherwise have broken every program at once, with 4000 failing tests and nothing to
+ * bisect. It goes on earning its place for the same reason in reverse — these tests fail alone,
+ * where the same defect reached through `sysl` fails everything.
  *
  * The library is `devlib/demo`, kept deliberately useless. What it is not useless *about* is shape
  * coverage: a generic is the reason a library ships bodies rather than signatures (it is

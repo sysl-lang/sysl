@@ -238,7 +238,7 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("not exhaustive")
     }
 
-    "the prelude's Option members are checked against the element type" in {
+    "the library's Option members are checked against the element type" in {
       err(
         """var a: Option[int] = Some(1)
           |print(a.unwrap_or("no"))""".stripMargin

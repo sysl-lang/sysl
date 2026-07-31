@@ -89,8 +89,8 @@ object LibraryArtifact {
    * would be one name, and which of them a call meant would depend on what else was linked.
    *
    * It is also what makes the split above exact. Everything the compiler supplied is keyed outside
-   * the library's own modules, and that stops being true the moment the library is in the module the
-   * prelude is in.
+   * the library's own modules, and that stops being true the moment a library is allowed to declare
+   * one of them.
    */
   private def rootless(units: List[Program]): Option[String] =
     units.find(u => Compiler.moduleOf(u) == Modules.root).map(u =>

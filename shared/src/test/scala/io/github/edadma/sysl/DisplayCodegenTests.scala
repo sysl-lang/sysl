@@ -64,7 +64,7 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
         s"""call void @Point\\.display\\(%struct\\.Point %t\\d+, \\{ ptr, ptr \\} %t\\d+, $spec %t\\d+\\)"""
     }
 
-    "reaches standard output through the prelude's own byte sink" in {
+    "reaches standard output through the library's own byte sink" in {
       defineOf(ir(point + "print(Point(1, 2))"), "sysl.w.out.write") should
         include(s"call void @${Library.key("putbytes")}({ ptr, ptr, i64 } %b)")
     }

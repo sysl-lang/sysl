@@ -245,7 +245,10 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       out should include("--> t.sysl:3:1")
     }
 
-    "an error about a prelude type still quotes the user's file" in {
+    // The negative names the library's own directory rather than a source name of the compiler's.
+    // It used to say `<prelude>`, which was that string literal's `Source.name` — a name nothing
+    // carries now, so the assertion would hold whatever the diagnostic pointed at.
+    "an error about a library type still quotes the user's file" in {
       val src =
         """f() -> Option[int]
           |    Some("x")
@@ -253,7 +256,7 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       val out = diag(src)
 
       out should include("--> t.sysl:2:")
-      out should not include "<prelude>"
+      out should not include "lib/sysl"
     }
   }
 

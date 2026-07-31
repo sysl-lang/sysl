@@ -211,7 +211,7 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
   }
 
   "which name wins" - {
-    // The order is `13 §3`'s: this module, then the imports, then the prelude.
+    // The order is `13 §3`'s: this module, then the imports, then the library.
     "a declaration of this module beats an import of the same name" in {
       runIn(("", "main.sysl", "import geom.twice\ntwice(n: int) -> int = n * 10\nprint(twice(4))"), geom) shouldBe
         "40\n"
@@ -233,7 +233,7 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
       ) shouldBe "9\n"
     }
 
-    "an import does not hide the prelude unless it names it" in {
+    "an import does not hide a library name unless it offers one" in {
       runIn(("", "main.sysl", "import geom.*\nprint(twice(21))"), geom) shouldBe "42\n"
     }
   }
@@ -498,12 +498,34 @@ class ImportTests extends AnyFreeSpec with CodegenSupport with RunSupport with P
       ) shouldBe "7\n"
     }
 
-    // The prelude is looked in after the imports, so a module's own name for something wins — from
-    // any file that is not itself in the root module, where the prelude's declarations live.
-    "and a wildcard shadows a prelude name for the file that wrote it" in {
-      runIn(
+    // A written wildcard offering a name the standard module also offers is the two-wildcard case,
+    // not a shadowing one — the standard module is auto-imported, and an auto-import is exactly a
+    // wildcard every file starts with (`AutoImport`), so the pair is ambiguous by §3's rule and the
+    // message names both.
+    //
+    // This is what a prelude answered differently: it sat *below* the imports as a third step, so a
+    // written wildcard beat it silently. The behaviour changed when the last declaration left, which
+    // is the one place the drain is visible in a program rather than only in a symbol.
+    "and a wildcard offering a library name is ambiguous rather than shadowing it" in {
+      errIn(
         ("", "main.sysl", "print(m.use())"),
         ("m", "m.sysl", "module m\nimport a.*\nuse() -> int =\n    var o: Option = Option(7)\n    o.n"),
+        ("a", "a.sysl", "module a\nstruct Option\n    n: int"),
+      ) should include(s"'Option' is offered by '${Std.module}.*' and 'a.*'")
+    }
+
+    // And §3's stated fixes both work, which is what makes the ambiguity a nuisance rather than a
+    // wall: name the module, or import the one you meant selectively.
+    "which either of the fixes it names resolves" in {
+      runIn(
+        ("", "main.sysl", "print(m.use())"),
+        ("m", "m.sysl", "module m\nimport a.*\nuse() -> int =\n    var o: a.Option = a.Option(7)\n    o.n"),
+        ("a", "a.sysl", "module a\nstruct Option\n    n: int"),
+      ) shouldBe "7\n"
+
+      runIn(
+        ("", "main.sysl", "print(m.use())"),
+        ("m", "m.sysl", "module m\nimport a.Option\nuse() -> int =\n    var o: Option = Option(7)\n    o.n"),
         ("a", "a.sysl", "module a\nstruct Option\n    n: int"),
       ) shouldBe "7\n"
     }

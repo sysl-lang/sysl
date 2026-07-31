@@ -28,13 +28,16 @@ be unwound deliberately rather than discovered later.
 
 The CLI (`sysl run` / `sysl build` / `sysl emit-llvm`) links the emitted IR with `clang`.
 
-The library every compilation carries is in two places, and `Library` is what knows which. A short
-**prelude** (`Prelude`) of ordinary sysl source — now just the `Option` and `Result` enums — is
-parsed once and hoisted ahead of the user's own declarations, in the same anonymous root module a
-headerless program is in. The **standard module** `sysl` (`13 §8`) is everything else, and it is real
-files under `lib/sysl` rather than a string inside the compiler. Declarations have been moving from
-the first to the second one surface at a time; a name resolves the same way whichever it is in, and
-only the emitted symbol tells them apart.
+The library every compilation carries is the **standard module** `sysl` (`13 §8`) — ordinary sysl
+source in real files under `lib/sysl`, parsed once and hoisted ahead of the user's own declarations,
+and auto-imported into every file so its names arrive unqualified. `Library` is the one place that
+answers which key a library declaration is filed under, since the compiler names some of them for
+itself rather than reading them out of source.
+
+There was a **prelude** beside it for a time — a string literal inside the compiler, keyed under the
+anonymous root module a headerless program is also in — and its declarations were drained into the
+standard module one surface at a time. It is gone; `Library.key` is now that module's qualification
+and nothing else.
 
 ## What runs today
 
@@ -63,7 +66,7 @@ before they appear and may be mutually recursive).
 
 - **A module reaches another's members by naming them in full** (`13 §3`): `std.fs.read(p)`,
   `geom.Point`, `geom.Shape.Round(7)`. An unqualified name is looked for in the module it is
-  written in, then among the file's imports, then in the prelude, so two modules may each declare a
+  written in, then among the file's imports, so two modules may each declare a
   `Point`, a `size`, or a variant `Round`. Every table is keyed by the **qualified** name
   (`Modules`), with `$` between the module and the declaration so the prefix can never be confused
   with a member (`Point.dist`) or an instantiation (`f.int`); `$` is legal in an LLVM symbol, so
@@ -111,7 +114,7 @@ before they appear and may be mutually recursive).
   reported at the declaration, which then stays public so one mistake stays one diagnostic. A
   restriction decides who may write a name and makes no second namespace — a private declaration
   still spends its name in its module, and an enum's variants carry its own. A name a file may not
-  reach is **not a candidate**: resolution goes on through the file's imports and the prelude, and
+  reach is **not a candidate**: resolution goes on through the file's imports, and
   reports the restriction only where nothing else answers. A wildcard offers only what is visible;
   a selector naming something private is refused at the import. File-private functions are not
   emitted `internal` (`13 § Open g`) — one LLVM module means it would buy nothing until separate
@@ -132,8 +135,8 @@ before they appear and may be mutually recursive).
 - **Two modules may not depend on each other** (`13 §6`). The graph is over **references** rather
   than imports, because a qualified path reaches another module with no import to scan for: an edge
   is recorded wherever resolution finds a name belonging elsewhere, and an import adds one whether or
-  not the name it bought is ever written. Nothing depends on the **prelude** or on the root module —
-  one is the language and the other has no name to be written. The check runs at the end of the
+  not the name it bought is ever written. Nothing depends on the **standard module** or on the root
+  module — one is auto-imported everywhere and the other has no name to be written. The check runs at the end of the
   walk, since an edge can be made by a body only reached through an instantiation, and each cycle it
   reports is broken at the reference the message points at so that an unrelated one elsewhere is
   found too. The message is the chain (`'a' depends on 'b', which depends on 'a'`), turned to begin
@@ -291,7 +294,7 @@ before they appear and may be mutually recursive).
   buffer through a trait object. A hole's format specifier travels to the `Display` it calls and is
   **acted on** there: every library renderer pads through one `display_pad`, and an implementation
   applies the same call to its own complete text.
-- **`Option[T]` / `Result[T, E]` and `?`.** Both come from the prelude as ordinary generic
+- **`Option[T]` / `Result[T, E]` and `?`.** Both come from the library as ordinary generic
   enums. The postfix `?` unwraps the success payload of one, or returns from the enclosing
   function early with the failure re-wrapped in *that* function's return type — so `?` needs
   the caller to return the same one, and to propagate the same error type.
@@ -363,12 +366,12 @@ before they appear and may be mutually recursive).
   exits **unwind in reverse**, so a path that leaves the chain early passes through exactly the
   releases for the operands it built. A lone comparison has nothing to short-circuit and stays
   straight-line.
-- **`print(a, b, …)`** — a **desugaring onto prelude functions**, not a builtin and not a user
+- **`print(a, b, …)`** — a **desugaring onto library functions**, not a builtin and not a user
   function. Each argument becomes a call to the renderer its static type reaches — `printi`,
   `printu`, `printr`, `printb`, `printc`, `prints` — widened to the width that renderer takes, with
   `printc(' ')` between and `printc('\n')` at the end. An integer **wider than 64 bits** is the one
   that is not widened, because there is nothing to widen it to: it renders itself with `str` and the
-  string goes to `prints`. Every one of those is sysl in the prelude
+  string goes to `prints`. Every one of those is sysl in the library
   (`04`, *Printing*); the compiler knows the six names and the widening rule and emits no printing
   code of its own. They all write through one sink, `putbytes`, which walks a byte count rather
   than stopping at a terminator, because a sysl string may hold an interior NUL and every `%s`
@@ -494,7 +497,7 @@ arity.
 10. **Generics are monomorphized with local inference only.** Type arguments come from the
     argument types and the expected type of the expression; there is no unification across a
     whole function body and no explicit type application at a call site. A parameter nothing
-    determines is an error rather than a default. `?` is wired to the prelude's `Option` and
+    determines is an error rather than a default. `?` is wired to the library's `Option` and
     `Result` **by name**, standing in for the eventual trait that will describe "can be
     short-circuited".
 11. **A generic body is checked against its bounds and no further.** All of `14` is implemented, `§4`

@@ -1,25 +1,22 @@
 package io.github.edadma.sysl
 
-/** The standard module, `sysl` — the module every program is compiled against, and what the prelude
- * is being emptied into (`13 § Open h`).
+/** The standard module, `sysl` — the module every program is compiled against, and the whole of the
+ * library (`13 § Open h`).
  *
- * The end state is that this holds everything `Prelude` holds today and `Prelude` holds nothing, at
- * which point the prelude mechanism goes away and what a program starts with is a *module* rather
- * than a set of declarations threaded in beside it. The way there is one declaration at a time. A
- * switch would put every unqualified name in every program onto a path nothing had ever exercised,
- * and a single hole in it fails every test at once with nothing to bisect; a move puts **one**
- * declaration onto that path, so what breaks names what is wrong.
+ * What a program starts with is a *module*, not a set of declarations threaded in beside it. It was
+ * the latter once: a `Prelude` of sysl source held in a string inside the compiler, keyed under the
+ * anonymous root module. Its declarations were drained into this one a surface at a time, both
+ * mechanisms live throughout, so that there was no commit at which neither worked. A switch would
+ * have put every unqualified name in every program onto a path nothing had ever exercised, where a
+ * single hole fails every test at once with nothing to bisect; a move put **one** declaration onto
+ * that path, so what broke named what was wrong.
  *
- * The two mechanisms therefore coexist, and there is no commit at which neither works. A declaration
- * here is reached exactly as one in `Prelude` is — `Library` is the one thing that knows which of
- * the two a name is in, and by the end it will know only this one.
- *
- * **The source is real files, under `lib/sysl`.** That is the difference between a standard
- * module and a second prelude: the prelude is a string literal inside the compiler and could never
- * be anything else, while these are ordinary sysl files a driver reads exactly as it reads a user's
- * library — which is what `sysl build-lib` is pointed at, and what makes the library's own source
- * something a reader can open. What the compiler carries is **generated from them** (`CoreSource`,
- * written by `build.sbt`), so the files are the fact and the carrier cannot disagree with them.
+ * **The source is real files, under `lib/sysl`.** That is what a prelude could never be: a string
+ * literal has no other form, while these are ordinary sysl files a driver reads exactly as it reads
+ * a user's library — which is what `sysl build-lib` is pointed at, and what makes the library's own
+ * source something a reader can open. What the compiler carries is **generated from them**
+ * (`CoreSource`, written by `build.sbt`), so the files are the fact and the carrier cannot disagree
+ * with them.
  *
  * It has to carry *something*, and that is not a packaging accident. The standard module is what
  * every program is compiled against, so it cannot be a thing a compilation goes looking for on disk

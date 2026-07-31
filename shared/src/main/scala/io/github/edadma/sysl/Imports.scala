@@ -4,7 +4,7 @@ package io.github.edadma.sysl
  *
  * An import never grants access to anything: a public member is reachable fully-qualified with no
  * import at all, so every binding here is a second, shorter spelling of a path that already works.
- * That is what keeps this a lookup table consulted between the current module and the prelude,
+ * That is what keeps this a lookup table consulted between the current module and the library,
  * rather than a visibility rule woven through resolution.
  *
  * The three maps are the three things an import can bind, and they are kept apart because they are
@@ -35,7 +35,7 @@ case class Imports(
 
 object Imports {
 
-  /** A scope that imports nothing: the prelude's, a compiler-synthesized declaration's, and every
+  /** A scope that imports nothing: the library's, a compiler-synthesized declaration's, and every
    * file's until it writes an `import`.
    */
   val empty: Imports = Imports()
@@ -57,7 +57,7 @@ object Imports {
  * A module is auto-imported only where it is actually present, so a program compiled without the
  * library is unaffected rather than carrying a wildcard over a module that does not exist.
  *
- * **The dependency graph is not told.** `13 §6` puts the prelude outside the graph on the grounds
+ * **The dependency graph is not told.** `13 §6` puts the standard module outside the graph on the grounds
  * that it is the language rather than a module, and a library every file gets for free is in the
  * same position: an edge from every file to it would say nothing, and would make the library's own
  * files depend on themselves.
@@ -113,7 +113,7 @@ case class Scope(module: String, imports: Imports, file: Option[Source] = None)
 
 object Scope {
 
-  /** The scope of a declaration that has no file behind it — the prelude's, and anything the
+  /** The scope of a declaration that has no file behind it — the library's, and anything the
    * compiler synthesized.
    */
   val root: Scope = Scope(Modules.root, Imports.empty)

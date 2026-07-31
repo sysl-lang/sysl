@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** Tier-2: the prelude's `Option` and `Result`, and the postfix `?` that unwraps them or
+/** Tier-2: the library's `Option` and `Result`, and the postfix `?` that unwraps them or
  * returns the enclosing function early with the failure re-wrapped.
  */
 class TryRunTests extends AnyFreeSpec with RunSupport {

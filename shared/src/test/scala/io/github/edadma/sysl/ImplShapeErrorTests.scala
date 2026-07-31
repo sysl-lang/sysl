@@ -211,7 +211,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
             |""".stripMargin) should include(
         s"an 'impl' may be written only in the module that declares the trait or in one that " +
           s"declares a type named in the subject, and '${lib("Eq")}' is the library's while " +
-          "nothing in 'Option' is declared outside the library — so this one has no home")
+          s"nothing in '${lib("Option")}' is declared outside the library — so this one has no home")
     }
 
     // A catalog trait the compiler already provides for a built-in is refused one step earlier

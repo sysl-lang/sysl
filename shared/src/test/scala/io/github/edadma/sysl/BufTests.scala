@@ -354,7 +354,7 @@ class BufTests extends AnyFreeSpec with RunSupport {
 
   "what stops the program" - {
     // Reading past the end is a panic rather than a trap, because a `Buf` is written in sysl and
-    // what sysl has to stop with is the prelude's own `exit` — so it can say what went wrong.
+    // what sysl has to stop with is the library's own `exit` — so it can say what went wrong.
     "reading past the last element says which index and how many there were" in {
       panics(
         """var b: &Buf[int] = buf()

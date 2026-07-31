@@ -7,10 +7,11 @@ import scala.collection.mutable
  *
  * **Why this exists.** A library's declarations reach a program as an abstract syntax tree, and the
  * only route to one today is the parser — a packrat combinator grammar, which memoizes every rule at
- * every position and is the slow end of practical parsing. Measured on the prelude (592 lines): 49 ms
- * warm and 316 ms cold, of which lexing is 11 ms, so the grammar is the cost rather than the reading.
- * A standard library an order of magnitude larger would spend that on every compilation of every
- * program. This format is the same tree in a shape that costs a single linear pass.
+ * every position and is the slow end of practical parsing. Measured when this was written, over the
+ * 592 lines of sysl the library then was: 49 ms warm and 316 ms cold, of which lexing is 11 ms, so
+ * the grammar is the cost rather than the reading. The library is larger now and headed further that
+ * way, and every program pays it on every compilation. This format is the same tree in a shape that
+ * costs a single linear pass.
  *
  * **The shape, and why it is fast.** Every node is written as a **tag followed by its children**, and
  * a tag fixes how many children follow — so the reader never looks ahead, never backtracks, and needs

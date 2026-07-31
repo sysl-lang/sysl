@@ -154,7 +154,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
    * **The signature is C's**, whether or not anything asks for the arguments, because this is the
    * function the platform's own start-up code calls and that code passes two values. Taking them here
    * is what lets a declared `main(args: []string)` be handed a slice: the pair is converted by an
-   * ordinary prelude call, and neither `argc` nor `argv` appears in a sysl signature anywhere.
+   * ordinary library call, and neither `argc` nor `argv` appears in a sysl signature anywhere.
    */
   private def genMain(vals: List[TVal], stmts: List[TStmt], entry: Option[TEntry]): String = {
     startFunction()

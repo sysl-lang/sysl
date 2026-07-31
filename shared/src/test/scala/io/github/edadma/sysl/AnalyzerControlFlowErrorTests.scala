@@ -274,7 +274,7 @@ class AnalyzerControlFlowErrorTests extends AnyFreeSpec with CodegenSupport {
             |    var x = g()?
             |    x
             |end f
-            |""".stripMargin) should include("may only be used in a function returning Option")
+            |""".stripMargin) should include(s"may only be used in a function returning ${lib("Option")}")
     }
 
     "may not propagate an error the function does not return" in {

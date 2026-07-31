@@ -231,7 +231,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
     }
   }
 
-  "the prelude's Option and Result" - {
+  "the library's Option and Result" - {
     "Option answers whether it holds a value, and falls back when it does not" in {
       val src =
         """half(n: int) -> Option[int]
@@ -319,7 +319,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
 
     // A member calling another member of the same generic enum — is_none is written as the negation
     // of is_some — instantiates the second one from the first's own substitution.
-    "a prelude member calling another member instantiates it too" in {
+    "a library member calling another member instantiates it too" in {
       val src =
         """var a: Option[real] = Some(0.5)
           |var b: Option[real] = None
@@ -420,7 +420,7 @@ class EnumMemberRunTests extends AnyFreeSpec with RunSupport {
 
     // And the other half of that bargain: a member the program *does* reach has to arrive, whether
     // it is called on a value, read as a property, or found through a trait object.
-    "a prelude member a program calls is emitted" in {
+    "a library member a program calls is emitted" in {
       val out = Compiler.compileToLlvm(
         """var g = byte_sink()
           |var w: *Writer = &g

@@ -278,7 +278,7 @@ class TraitRunTests extends AnyFreeSpec with RunSupport {
   /** A trait may be implemented for a **built-in** type, not only a struct or an enum.
    *
    * A language whose `Show` cannot cover `int` has a `Show` no library can use, so this is what
-   * makes a trait worth having at all — and it is also what a prelude `Show` needs before `str` and
+   * makes a trait worth having at all — and it is also what a library `Show` needs before `str` and
    * `print` can stop being compiler builtins. Nothing here is special-cased: every type has an owner
    * key its members are filed under, so `5.show()` takes the same path `p.show()` does.
    */

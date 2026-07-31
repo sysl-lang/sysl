@@ -28,9 +28,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
 
     "nothing a program declares is" in {
-      // The two are keyed the same way — a headerless program's declarations are the root module's
-      // exactly as the library's are — so the answer cannot come from the key, and this is the test
-      // that says it does not.
+      // Asked of the `Source` rather than of the module, which is the stronger question: it stays
+      // right for a user file that happened to sit where the library's do, and it was the *only*
+      // workable question while the library still had declarations in the root module.
       val mine = parsed("struct Ok\n    n: int\n\ndouble(n: int) -> int = n * 2\n")
 
       mine.length shouldBe 2
@@ -46,9 +46,11 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
   "a key and the spelling it stands for" - {
 
-    "a spelling the prelude still holds makes the key it is filed under" in {
-      Library.key("Option") shouldBe "Option"
-      Modules.moduleOf(Library.key("Option")) shouldBe Modules.root
+    // Every library spelling is the standard module's now, `Option` included — it was the last to
+    // move, and while it had not this pair said the two answers were different.
+    "a library spelling makes a key in the standard module, never in the root one" in {
+      Modules.moduleOf(Library.key("Option")) shouldBe Std.module
+      Modules.moduleOf(Library.key("Option")) should not be Modules.root
     }
 
     "a spelling the standard module holds makes that module's key" in {
@@ -65,15 +67,15 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       Library.spelling(Modules.qualify("geom", "Option")) shouldBe None
     }
 
-    "and neither has a program's own root-module declaration of a name that has moved" in {
-      // A program may write `struct FormatSpec` now, and it is keyed `FormatSpec` — which is where
-      // the library's used to be. Asking which module a key is in would call that one the library's;
-      // asking whether it is the key the library gives that spelling does not.
+    "and neither has a program's own declaration of a name the library also declares" in {
+      // A program may write `struct FormatSpec`, and in a headerless file it is keyed `FormatSpec` —
+      // which is where the library's used to be. The library's is `sysl$FormatSpec`, so the bare key
+      // is the program's and has no library spelling.
       Library.spelling("FormatSpec") shouldBe None
     }
   }
 
-  "the standard module the library is being drained into" - {
+  "the standard module, which is the whole of the library" - {
 
     "says in every one of its headers what `Std.module` says" in {
       // `module` is a constant so that nothing has to parse to ask which module a name is in. This
@@ -92,11 +94,13 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       Std.sources.map(_.dir).distinct shouldBe List(Some(List(Std.module)))
     }
 
-    "declares what it declares, and the prelude no longer does" in {
+    "declares the whole of what the library declares" in {
+      // The two halves used to be checked against each other here. There is one half now, so what
+      // is left to say is that it is not empty and that all of it is the library's — the second is
+      // what `Library.owns` answers, and an empty module would make it vacuously true.
       Std.decls should not be empty
       Std.decls.forall(Library.owns) shouldBe true
-      Prelude.decls.exists(Std.declares) shouldBe false
-      Std.decls.exists(Prelude.declares) shouldBe false
+      Library.decls shouldBe Std.decls
     }
 
     "is a module every file may write the names of without importing it" in {
@@ -186,14 +190,30 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       ir.isRight shouldBe true
     }
 
-    "and a program may not declare one of its own over it, while it is still the prelude's" in {
-      // A name the prelude holds shares the program's namespace, so this is a clash rather than
-      // shadowing. Pinned because it is exactly what changes when the declaration moves, and the
-      // change should be a failing test rather than a surprise — see the group below for the
-      // other side of it.
-      Compiler.compileToLlvm("enum Option\n    Yes\n    No\n") match
-        case Left(e)  => e should include("already declared")
-        case Right(_) => fail("a program redeclared 'Option' and was not told")
+    // `Option` was the last name a program could not take: the prelude held it in the root module a
+    // headerless program is also in, so declaring one was a clash rather than shadowing. It moved,
+    // and the clash went with it — which is worth a test of its own because `?` reaches the
+    // library's `Option` by a route no program writes, so this is where picking the program's would
+    // show up.
+    "and a program may declare its own 'Option', which '?' does not reach" in {
+      run("""enum Option
+            |    Yes
+            |    No
+            |
+            |mine() -> Option = Yes
+            |
+            |g() -> sysl.Option[int] = Some(3)
+            |
+            |f() -> sysl.Option[int]
+            |    var x = g()?
+            |    Some(x + 1)
+            |end f
+            |
+            |print(f().unwrap())
+            |mine() match
+            |    Yes -> print("yes")
+            |    No -> print("no")
+            |""".stripMargin) shouldBe "4\nyes\n"
     }
   }
 
@@ -241,10 +261,11 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
 
     "which does not reach into the library, whose own signatures still mean the library's" in {
-      // The prelude is in the root module and so is a headerless program, so "this module first"
-      // would hand `display_pad(text, out, fmt: FormatSpec)` the *program's* struct — and the whole
-      // printing surface would fail inside the library against a type its source never named. The
-      // rendering below is what walks every one of those signatures.
+      // A name written in a library file means the library's before it means the module's — the one
+      // place resolution inverts its first two steps. Without it `display_pad(text, out, fmt:
+      // FormatSpec)` would take the *program's* struct, and the whole printing surface would fail
+      // inside the library against a type its source never named. The rendering below walks every
+      // one of those signatures.
       run(
         """struct FormatSpec
           |    n: int

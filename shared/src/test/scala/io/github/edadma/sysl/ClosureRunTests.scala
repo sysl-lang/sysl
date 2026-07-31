@@ -284,7 +284,7 @@ class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) should include("write '&Fn(int) -> int'")
     }
 
-    "a callable wider than the prelude declares says where to go instead" in {
+    "a callable wider than the library declares says where to go instead" in {
       err("""f(g: (int, int, int, int, int) -> int) -> int = 0
             |""".stripMargin) should include("pass a struct of them")
     }

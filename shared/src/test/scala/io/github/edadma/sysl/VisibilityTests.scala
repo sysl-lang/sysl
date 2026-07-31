@@ -352,7 +352,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
       ) shouldBe "22\n"
     }
 
-    "the prelude still answers where only a private declaration would have" in {
+    "the library still answers where only a private declaration would have" in {
       runIn(
         ("", "main.sysl", "print(geom.go())"),
         ("geom", "g.sysl", "module geom\nprivate print(n: int) -> int = n"),

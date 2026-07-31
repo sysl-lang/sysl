@@ -297,7 +297,7 @@ class AnalyzerDeclErrorTests extends AnyFreeSpec with CodegenSupport {
     /** A declaration is judged once, but its name can be mentioned any number of times, and each
       * mention used to rebuild the type and raise the same complaint again at its own position. The
       * report also landed wherever the walk had last looked rather than at the declaration — for a
-      * program whose only mistake was its first line, that was a trait in the prelude.
+      * program whose only mistake was its first line, that was a trait in the library.
       */
     "a mistake in an enum declaration is reported once, at the declaration" - {
       def occurrences(haystack: String, needle: String): Int =

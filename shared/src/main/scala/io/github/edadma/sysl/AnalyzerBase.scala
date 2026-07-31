@@ -47,9 +47,10 @@ trait AnalyzerBase {
 
   /** Whether a declaration written in `module` is one the **library** supplies.
    *
-   * Normally that is a question about which file it came from and nothing else (`Library.owns`) —
-   * the library's declarations are keyed under the root module exactly as a headerless program's
-   * are, so the key cannot answer it. The compilation that *builds* a library module is the one
+   * Normally that is a question about which file it came from and nothing else (`Library.owns`), and
+   * it is asked of the `Source` rather than of the module because a `Source` is the stronger answer:
+   * a user file that happened to sit at `lib/sysl/render.sysl` is not one of the library's. The
+   * compilation that *builds* a library module is the one
    * case where the source is the library's without being the copy the compiler carries, and it has
    * to be, or the rest of the library could not name what it declares: the library's
    * `impl Display for (A, B)` calls `display_pad` and resolves it among the library's own, and while
@@ -97,9 +98,9 @@ trait AnalyzerBase {
    *
    * It is a lookup rather than a set of keys because the two differ: a declaration the standard
    * module carries is keyed `sysl$FormatSpec` and is still written `FormatSpec`, and what a use site
-   * has is the spelling. That also tells the library's root-module declarations from a *program's* —
-   * which are a module's like any other, and so are not visible from a named module that did not
-   * name them — since only the library's are entered here.
+   * has is the spelling. Only the library's are entered here, so a *program's* `FormatSpec` is not
+   * among them — it is a module's declaration like any other, and not visible from a named module
+   * that did not name it.
    *
    * Filled during hoisting from `Library.owns`, which is the one question about where a declaration
    * came from; this is that answer indexed by what a program writes, for the lookups that have a
@@ -132,11 +133,12 @@ trait AnalyzerBase {
         val own     = Modules.qualify(currentModule, written)
         val library = libraryNames.get(written).filter(declared)
 
-        // A name written **in the library** means the library's, and is looked for there first.
-        // Part of the library is still in the root module, which is where a headerless program's
-        // declarations are too, so "this module first" would otherwise hand the prelude's own
-        // signatures whatever the program happened to declare under the same name — and nothing a
-        // program declares is the library's to reach, whichever module the two share.
+        // A name written **in the library** means the library's, and is looked for there first —
+        // the one place the first two steps are inverted. It mattered most while part of the library
+        // sat in the root module a headerless program is also in, where "this module first" would
+        // have handed the library's own signatures whatever the program declared under the same
+        // name; it stays because nothing a program declares is the library's to reach, and a rule
+        // that holds only while the two are in different modules is one waiting to be broken.
         if currentFile.exists(Library.source) then
           library.orElse(Option.when(declared(own) && visible(own))(own))
         else if declared(own) && visible(own) then Some(own)
@@ -184,7 +186,7 @@ trait AnalyzerBase {
 
   /** Records that whatever is being read now depends on `to`.
    *
-   * A module does not depend on itself, and nothing depends on the **root** module: the prelude
+   * A module does not depend on itself, and nothing depends on the **root** module: the library
    * lives there and is the language rather than a module (`13 §8`), and a program's own root-module
    * declarations are its files' alone, since the root module has no name for anything else to
    * write. So the root is a module that only ever depends, and can never be depended on.
@@ -223,7 +225,7 @@ trait AnalyzerBase {
   /** A resolved key, or a diagnostic where what it names is not visible here.
    *
    * A name the current module declares but may not use is **reported** rather than passed over, so
-   * that resolution does not quietly fall through to an import or the prelude and answer with
+   * that resolution does not quietly fall through to an import or the library and answer with
    * something else. The name was found; what is wrong is that it is not for this file to write, and
    * that is what a reader needs told.
    */
@@ -320,7 +322,7 @@ trait AnalyzerBase {
   protected val declScope = mutable.HashMap.empty[String, Scope]
 
   /** The terms a declaration's signature and body are read in. A declaration with no file behind it
-   * — the prelude's, or one the compiler synthesized — imports nothing and is read in the module its
+   * — the library's, or one the compiler synthesized — imports nothing and is read in the module its
    * key names.
    */
   protected def scopeFor(name: String): Scope =

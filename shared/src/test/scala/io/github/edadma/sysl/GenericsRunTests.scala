@@ -20,7 +20,7 @@ class GenericsRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                                        |""".stripMargin)
 
     // Counting only `id`'s own definitions: the module also holds the ARC runtime and whatever
-    // prelude renderers `print` reached, neither of which this is about.
+    // library renderers `print` reached, neither of which this is about.
     out.map(_.linesIterator.count(l => l.startsWith("define") && l.contains("@id."))) shouldBe Right(2)
   }
 

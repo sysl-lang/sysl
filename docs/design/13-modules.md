@@ -155,7 +155,7 @@ is what makes the two rules one rather than two. The five declaration forms take
 own**, since a type nobody outside may name is not one whose variants they may construct.
 
 **A name a file may not reach is not a candidate for it.** Resolution passes over one and goes on
-through the file's imports and the prelude, rather than stopping there — a file that wrote
+through the file's imports, rather than stopping there — a file that wrote
 `import util.width` said which `width` it meant, and a sibling file's private helper of that name is
 not an answer to it. Where nothing else answers at all, the restriction is then reported, because at
 that point it is the whole story and a better one than an undefined name. The two halves of that
@@ -287,9 +287,22 @@ already defined locally or explicitly imported loses to the more specific one, a
 wildcard imports that both offer the same name make an *unqualified* use of it ambiguous (a
 compile error naming both), and the fix is to qualify it or import it selectively.
 
+**The standard module counts as one of those wildcards.** `sysl` is auto-imported into every file
+(§8), so a written `import a.*` where `a` declares an `Option` of its own is the two-wildcard case
+and an unqualified `Option` in that file is a compile error naming both — it does not shadow the
+library's. This is deliberate rather than a consequence nobody wanted: the alternative is a
+precedence tier that makes the library quietly lose to whatever a program imported, which is the
+same silent-capture problem an explicit conflict is being reported to avoid. The two fixes are the
+ordinary ones, `a.Option` or `import a.Option`.
+
 An unqualified name is looked for **in the module it is written in, then among the file's imports,
-then in the prelude**, and nowhere else — a sibling module's names are not in scope unqualified,
-and neither are the root module's, which have no path to be reached by at all (§1). A **dotted**
+then in the library**, and nowhere else — a sibling module's names are not in scope unqualified, and
+neither are the root module's, which have no path to be reached by at all (§1). The standard module
+is reachable two ways and they agree: it is auto-imported into every file, so it answers at the
+import step and takes part in the wildcard rules above, and it is also the last step on its own, so
+a name it declares resolves even where a file's imports say nothing. **A file of the library itself
+inverts the first two** — a name written there means the library's before it means the module's,
+since nothing a program declares is the library's to reach. A **dotted**
 reference names a module by the **longest prefix of it that is one**: a program holding both `a`
 and `a.b` reads `a.b.f` as `a.b`'s `f` rather than as `a`'s `b`, and §1's refusal of a module named
 for a type of its parent is what keeps that from silently hiding a member. Everything left of the
@@ -408,10 +421,10 @@ imports a module depends on it whether or not it goes on to write the shorter sp
 because a file's imports are meant to be readable as what it needs, and a dependency that came and
 went with a use would not be.
 
-Three things sit outside the graph. The **prelude** is the language rather than a module, so writing
-`print` is not a dependency on anything. The **standard module** `sysl` (§8) is auto-imported into
-every file, and an edge every file has says nothing — worse, it would make the library's own files
-depend on themselves. And the **anonymous root module** (§1) can be depended on by nothing, having
+Two things sit outside the graph. The **standard module** `sysl` (§8) is auto-imported into every
+file, so writing `print` is not a dependency on anything: an edge every file has says nothing —
+worse, it would make the library's own files depend on themselves. And the **anonymous root module**
+(§1) can be depended on by nothing, having
 no name for another module to write — a program's root files depend on the modules beneath them, and
 the dependency never runs back.
 
@@ -795,11 +808,10 @@ happens. Lifting that needs a library initializer the program calls before `main
 - **No relative or wildcard-path imports.** An import names a module by its full dotted path from
   the project root; there is no `import ..sibling` or path-relative form. Absolute names keep a
   reference's meaning independent of where the importing file sits.
-- **No implicit auto-import beyond the language's own.** What every file gets for free is the
-  prelude (`Option`, `Result`, `print`, the scalar types — `09`, `11`) and the standard module
-  `sysl` (§8), which between them are the library rather than a second mechanism. Nothing else is: a
-  module earns visibility by being imported or fully qualified, and a compilation does not gain
-  unqualified names by having a library on hand.
+- **No implicit auto-import beyond the standard module.** What every file gets for free is `sysl`
+  (§8) — `Option`, `Result`, `print` and the rest of the library — and the scalar types, which are
+  the language's own (`09`, `11`). Nothing else is: a module earns visibility by being imported or
+  fully qualified, and a compilation does not gain unqualified names by having a library on hand.
 - **No implicits — no Scala-style `given`/`using`.** A term-level value selected by *searching* the
   scope for something of the right type is out of scope, and deliberately. Introducing a given
   anywhere in scope can change what resolves in a file that did not change and whose dependencies'
@@ -861,20 +873,20 @@ happens. Lifting that needs a library initializer the program calls before `main
   own `build-lib --core` compiles. What that module should *contain* is the open half, and it is the
   question the whole exercise was for.
 
-  The prelude is what has not moved across yet, and moving a declaration is one declaration at a time
-  rather than a switch: every unqualified name in every program resolves through the library, so a
-  change that moved all of it at once would put the whole surface onto a path nothing had exercised
-  and a single hole in it would fail everything with nothing to bisect. What is left there is
-  `Option` and `Result`; when it is empty the mechanism goes away and what a program starts with is
-  a module.
+  **The prelude is gone.** What a program starts with is a module, not a set of declarations threaded
+  in beside it. Getting there was one declaration at a time rather than a switch: every unqualified
+  name in every program resolves through the library, so a change that moved all of it at once would
+  have put the whole surface onto a path nothing had exercised, and a single hole in it would have
+  failed everything with nothing to bisect. Thirteen surfaces crossed in that order, and the
+  mechanism was deleted once the last one had.
 
   The pressure is real and predates the mechanism: the first program to want mathematics found none
   — `guide/fft` declares `sin`, `cos` and `sqrt` as C externs of its own and writes its own absolute
   value, and every float program after it would do the same.
 
-  What was wrong with growing the *prelude* instead is worth keeping, because it is the constraint on
+  What was wrong with growing a *prelude* instead is worth keeping, because it is the constraint on
   the answer: a prelude declaration is one every program carries a **layout** for whether or not it is
-  reached (`14 §2`), which is why a prelude cannot simply become a standard library by getting
+  reached (`14 §2`), which is why a prelude could never have become a standard library by getting
   bigger. A library a program links against pays only for what it calls — §8's pruning and the
   linker's discard between them — so the two are different things and the difference is measurable.
   It is the same question as `14 §8 a`'s — which module the trait catalog lives in once there is more

@@ -152,8 +152,8 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   }
 
   "what a module can see" - {
-    // The prelude is in scope everywhere with no import; nothing else is (`13 §8`).
-    "the prelude, wherever it is written" in {
+    // The library is in scope everywhere with no import; nothing else is (`13 §8`).
+    "the library, wherever it is written" in {
       runIn(
         ("", "main.sysl", "print(m.label(2))"),
         ("m", "a.sysl",

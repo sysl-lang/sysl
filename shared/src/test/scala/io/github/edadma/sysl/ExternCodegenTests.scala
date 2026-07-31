@@ -34,7 +34,7 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
         include("declare ptr @f(ptr, ptr)")
     }
 
-    // The prelude declares `exit` for `unwrap` to stop with, and almost no program calls it. An
+    // The library declares `exit` for `unwrap` to stop with, and almost no program calls it. An
     // extern nothing reaches must not reach the output either.
     "an unused extern is not declared" in {
       val out = ir("print(1)")
@@ -89,7 +89,7 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
       out should not include "@say"
     }
 
-    // The whole point: the prelude reaches `snprintf` under a name of its own, so a program may
+    // The whole point: the library reaches `snprintf` under a name of its own, so a program may
     // still declare `snprintf` itself. Two declarations, one symbol, one `declare`.
     "lets two declarations share one symbol" in {
       val src =
@@ -227,7 +227,7 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  "the prelude's forcing combinators" - {
+  "the library's forcing combinators" - {
     // They are members of a generic enum, so one exists per element type and no more — and a
     // program that never forces anything pays for none of it, nor for the `exit` they stop with.
     "unwrap is monomorphized once per element type, not once per call" in {
@@ -239,9 +239,9 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
       val out = ir(src)
 
       // Three calls, two element types.
-      out.linesIterator.count(l => l.startsWith("define") && l.contains("@Option.unwrap")) shouldBe 2
-      out should include("define i32 @Option.unwrap.int(")
-      out should include("define double @Option.unwrap.real(")
+      out.linesIterator.count(l => l.startsWith("define") && l.contains(s"@${Library.key("Option")}.unwrap")) shouldBe 2
+      out should include(s"define i32 @${Library.key("Option")}.unwrap.int(")
+      out should include(s"define double @${Library.key("Option")}.unwrap.real(")
       out should include("declare void @exit(i32)")
     }
 
@@ -251,15 +251,15 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
           |print(a.unwrap(), a.expect("here"))""".stripMargin
       val out = ir(src)
 
-      out should include("define i32 @Option.unwrap.int(")
-      out should include("define i32 @Option.expect.int(")
+      out should include(s"define i32 @${Library.key("Option")}.unwrap.int(")
+      out should include(s"define i32 @${Library.key("Option")}.expect.int(")
     }
 
     "a program that forces nothing carries neither of them" in {
       val out = ir("var a: Option[int] = Some(1)\nprint(a.is_some())")
 
-      out should not include "@Option.unwrap"
-      out should not include "@Option.expect"
+      out should not include s"@${Library.key("Option")}.unwrap"
+      out should not include s"@${Library.key("Option")}.expect"
       out should not include "@exit"
     }
   }

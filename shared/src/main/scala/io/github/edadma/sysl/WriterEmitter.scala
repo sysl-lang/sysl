@@ -3,7 +3,7 @@ package io.github.edadma.sysl
 /** The two sinks a rendering ends in (`14 §6`): standard output, which `print` hands a `Display`,
  * and a growable buffer, whose bytes `str` and an `f"…"` hole turn into a fresh `string`.
  *
- * Both are `*Writer` trait objects, and both are the compiler's rather than the prelude's — not
+ * Both are `*Writer` trait objects, and both are the compiler's rather than the library's — not
  * because either does anything a sysl body could not, but because neither has a *type* sysl can
  * give it. A writer over standard output holds no state, and there is no struct with no fields; a
  * growable byte buffer is `07`'s *Not yet*. What a program writes for itself is an ordinary

@@ -540,9 +540,9 @@ trait TypeResolution extends GenericInstantiation {
           s"no $obj to form")
   }
 
-  /** Holds a written callable to an arity the prelude declares a call trait for.
+  /** Holds a written callable to an arity the library declares a call trait for.
    *
-   * The limit is the prelude's and not the language's, so what it says is where to go next: a
+   * The limit is the library's and not the language's, so what it says is where to go next: a
    * callable this wide is a signature nobody reads, and a struct of the arguments names them.
    */
   protected def checkFnArity(f: FnType): Unit =

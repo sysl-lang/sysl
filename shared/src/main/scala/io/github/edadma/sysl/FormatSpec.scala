@@ -32,7 +32,7 @@ object FormatSpec {
    *
    * A width of `0` and a precision of `-1` mean neither was written, which is the reading `%s` and
    * `%.0s` would otherwise be confused by. Only these three cross the boundary: the numeric flags
-   * belong to a conversion the prelude's own renderers apply, and a type rendering itself has no
+   * belong to a conversion the library's own renderers apply, and a type rendering itself has no
    * conversion letter to interpret.
    */
   def parts(spec: String): (Int, Int, Boolean) = {

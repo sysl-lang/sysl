@@ -455,7 +455,7 @@ class NestedCoverageTests extends AnyFreeSpec with Matchers with RunSupport with
     }
 
     // `11` — a `Result` is an enum like any other, so its two variants cover it and a nested error
-    // enum covers the payload. The customer's shape with the other of the two prelude enums.
+    // enum covers the payload. The customer's shape with the other of the two library enums.
     "a Result is covered through its error's variants" in {
       run(
         """enum Fault

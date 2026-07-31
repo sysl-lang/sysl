@@ -85,7 +85,7 @@ trait ProgramWalk extends Hoisting with StmtAnalysis with SignatureVisibility wi
     // A bad one is reported where the constants above are: at the declaration, since that is the
     // line that is wrong. Without the position these loops set, the complaint landed at whatever the
     // walk had last looked at — for a program whose only mistake was its own first line, that was a
-    // trait in the prelude. Failing here also marks the name broken, so that the mentions of the type
+    // trait in the library. Failing here also marks the name broken, so that the mentions of the type
     // further down abandon their own statements without repeating what the declaration was already
     // told.
     def eagerly(key: String, decl: Positioned)(build: => Type): Unit =

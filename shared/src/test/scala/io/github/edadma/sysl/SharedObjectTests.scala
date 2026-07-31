@@ -313,7 +313,7 @@ class SharedObjectTests extends AnyFreeSpec with CodegenSupport with RunSupport 
           "it has to be atomic — but it holds a '&Inner'")
     }
 
-    "a shareable generic of the prelude's is ordinary" in {
+    "a shareable generic of the library's is ordinary" in {
       run("""var o: &sync Option[int] = Some(3)
             |print(o.unwrap())
             |""".stripMargin) shouldBe "3\n"
