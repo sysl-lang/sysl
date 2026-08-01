@@ -366,6 +366,30 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |""".stripMargin) shouldBe "64\n"
   }
 
+  "a generic container can size storage while running, now that a bound can promise a value" in {
+    // `07 § Not yet` said a repeat needs a value in its value position and no bound promises one,
+    // so `var storage: []K` was the empty slice and nothing widened it. A trait declaring an
+    // associated function is a bound that promises one, and the repeat is ordinary code.
+    run(
+      """trait Blank
+        |    blank() -> Self
+        |
+        |impl Blank for int
+        |    blank() -> int = -1
+        |
+        |struct Bag[K: Blank]
+        |    items: []K
+        |
+        |    with_room(n: usize) -> Bag[K] = Bag([K.blank(); n])
+        |
+        |main()
+        |    var b: Bag[int] = Bag.with_room(3)
+        |
+        |    b.items[1] = 7
+        |    print(b.items.len, b.items[0], b.items[1], b.items[2])
+        |""".stripMargin) shouldBe "3 -1 7 -1\n"
+  }
+
   "nothing is emitted for an implementation nothing calls" in {
     // Seven constants at two widths is fourteen functions the library declares. A program that asks
     // for one must not carry the other thirteen, which is what reachability is for and what a member
