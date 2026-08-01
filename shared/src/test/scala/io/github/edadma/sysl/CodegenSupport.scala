@@ -48,6 +48,16 @@ trait CodegenSupport extends Matchers { this: Assertions =>
       case Left(e)    => fail(e)
     }
 
+  /** The error message for a program that must be rejected when built for another machine. A
+   * program can be wrong for one target and right for another (`Conditional`), so the rejection is
+   * as much a per-target answer as the IR is.
+   */
+  protected def errFor(target: Target, src: String): String =
+    Compiler.compileToLlvm(src, "<input>", target) match {
+      case Right(out) => fail(s"expected an error, got:\n$out")
+      case Left(e)    => e
+    }
+
   /** The error message for a program that must be rejected. */
   protected def err(src: String): String =
     Compiler.compileToLlvm(src) match {
@@ -152,7 +162,7 @@ trait CodegenSupport extends Matchers { this: Assertions =>
     }
 
   private def resultOf(core: Core, fs: Seq[(String, String)]): Either[String, String] =
-    Compiler.compiledWith(files(fs*), Nil, Target.default, Set.empty, core).map(_._1)
+    Compiler.compiledWith(files(fs*), Nil, Target.default, Set.empty, Some(core)).map(_._1)
 
   private def compiled(sources: List[Source]): String =
     Compiler.compile(sources) match {

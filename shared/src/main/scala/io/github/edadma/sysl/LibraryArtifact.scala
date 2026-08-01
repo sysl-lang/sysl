@@ -173,8 +173,9 @@ object LibraryArtifact {
    * (`13 §7`), so a library having none is not a complaint.
    */
   def build(sources: List[Source], target: Target = Target.default, building: Set[String] = Set.empty,
-            core: Core = Core.embedded, native: List[Source] = Nil): Either[String, (String, String)] = {
-    val parsed = sources.map(SyslParser.parse)
+            core: Option[Core] = None, native: List[Source] = Nil)
+      : Either[String, (String, String)] = {
+    val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case errs if errs.nonEmpty => Left(errs.mkString("\n"))

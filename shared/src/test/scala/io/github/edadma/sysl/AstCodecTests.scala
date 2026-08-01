@@ -59,19 +59,19 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
 
     // One file rather than all of them where a test is about a single `Program`'s round trip. It is
     // the first in module order, so which one it is does not depend on a directory listing.
-    val one = Std.parsed.head
+    val one = Std.parsed(Target.default).head
 
     "round-trips to a structurally equal tree" in {
-      val back = roundTrip(Std.parsed)
+      val back = roundTrip(Std.parsed(Target.default))
 
-      back should have length Std.parsed.length
-      back.map(_.body) shouldBe Std.parsed.map(_.body)
+      back should have length Std.parsed(Target.default).length
+      back.map(_.body) shouldBe Std.parsed(Target.default).map(_.body)
     }
 
     "round-trips with every position intact" in {
-      val back = roundTrip(Std.parsed)
+      val back = roundTrip(Std.parsed(Target.default))
 
-      positionsOf(back.map(_.body)) shouldBe positionsOf(Std.parsed.map(_.body))
+      positionsOf(back.map(_.body)) shouldBe positionsOf(Std.parsed(Target.default).map(_.body))
     }
 
     "carries enough positions to be worth carrying" in {
@@ -92,7 +92,7 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       // declaration may be dropped — so a decoded tree handed the embedded core's own `Source` has
       // to land on that object rather than on a copy of it.
       back.head.source should be theSameInstanceAs one.source
-      back.head.body.forall(Core.embedded.owns) shouldBe true
+      back.head.body.forall(Library.carried.owns) shouldBe true
     }
 
     "reconstructs a usable Source when the caller supplies none" in {
@@ -105,7 +105,7 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     }
 
     "encodes deterministically, so an artifact can be cached and diffed" in {
-      AstCodec.encode(Std.parsed) shouldBe AstCodec.encode(Std.parsed)
+      AstCodec.encode(Std.parsed(Target.default)) shouldBe AstCodec.encode(Std.parsed(Target.default))
     }
   }
 

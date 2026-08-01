@@ -44,7 +44,7 @@ object Library {
    * What a given compilation was *handed* is `Core.modules`, and that is the one to ask about
    * scope. This is about the source in the tree, like everything else here.
    */
-  lazy val modules: List[String] = Core.embedded.modules
+  lazy val modules: List[String] = carried.modules
 
   /** The library modules every file may write the names of without importing them (`AutoImport`,
    * `13 §8`).
@@ -63,7 +63,23 @@ object Library {
    * source under `lib/sysl` rather than about whatever a given compilation was handed. A
    * compilation's own core is `Core`, which it is given rather than looks up.
    */
-  def decls: List[Stmt] = Core.embedded.decls
+  def decls: List[Stmt] = carried.decls
+
+  /** The copy of the library the compiler carries, read for the machine sysl is **running** on.
+   *
+   * **Every question on this object is about the standard module as such** — which modules it
+   * declares, which key a name is filed under, which names the compiler is allowed to spell for
+   * itself — and none of them is a question a target has an opinion about. A target *could* have
+   * one, since the library is sysl source and may gate on the machine (`Conditional`); what says it
+   * does not is a rule, and the rule is that **a name in [[known]] is declared on every target**. A
+   * library that gated one of those away would be a library the compiler could compile nothing with
+   * on that target, whatever this said — so the choice is only between failing at the gated name and
+   * failing here, and `LibraryTests` holds every target in the registry to declaring all of them.
+   *
+   * What a given *compilation* was handed is `Core`, which it is given rather than looks up. This is
+   * the copy in the tree, and it is the one a test asking about the library itself wants.
+   */
+  def carried: Core = Core.embedded(Target.default)
 
   /** The key the library's declaration named `name` is filed under — what the compiler names one
    * by, wherever it names one rather than reading a name out of source.
@@ -89,7 +105,7 @@ object Library {
    * declaration apiece.
    */
   private lazy val located: Map[String, String] =
-    Core.embedded.units.flatMap { u =>
+    carried.units.flatMap { u =>
       val module = Compiler.moduleOf(u)
 
       names(u.body).map(n => n -> Modules.qualify(module, n))

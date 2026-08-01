@@ -175,6 +175,103 @@ and the alternative — a storage type that varies per target — would put a ta
 above ever looks at it. What is per-target is the number of bytes *copied* out of it, which is
 the target's own `va_list` and not sysl's storage for one.
 
+## Conditional compilation
+
+Everything above is a fact the *compiler* reads about the machine. `#if` is the one place a
+**program** reads one, and it exists because the machines genuinely differ in ways a library
+cannot paper over: a syscall number, a struct a header lays out two ways, a symbol one libc
+exports and the other does not.
+
+```
+#if macos
+extern "printf" say(fmt: *u8, ...) -> i32
+#else
+extern "printf_chk" say(fmt: *u8, ...) -> i32
+#endif
+```
+
+`#if` / `#elif` / `#else` / `#endif`, nesting freely, and **the branches are exclusive** — the
+first whose condition holds is the one that contributes, and a group inside a branch that was not
+taken contributes nothing however its own condition reads.
+
+### It gates lines, before the lexer sees anything
+
+A line in a branch this build is not for is **replaced by an empty line, not removed**, and so is
+every directive line. After the pass the file is an ordinary sysl file that happens to have some
+blank lines in it, and nothing downstream knows any of this happened.
+
+Replaced rather than removed because **every line below a gate has to keep the number it was
+written at**. Deleting them would leave the messages right and the carets somewhere else, and
+nothing would say so.
+
+**A directive sits at the margin, column 1.** That is a rule, not a convention. Sysl is
+indentation-sensitive, and indentation is how the language reads block structure — so a gate
+written *in* that channel would look like it takes part in a nesting it has nothing to do with,
+when in fact the line is gone before anything counts a column. At the margin it is visibly not
+part of the code's shape, which is what it is. It is also how C is written, and it is what keeps a
+declaration's `#test` attribute — indented with its declaration — from ever being mistaken for one
+of these.
+
+**Why lines and not a construct wrapping declarations.** Rust spells this `#[cfg]`, an attribute on
+an item, and can because Rust is brace-delimited: the attribute attaches without moving anything.
+Here the equivalent would have to take an indented block, so adding or removing a platform gate
+would reindent everything inside it — a one-line intent showing up as a whole-body diff. A flat
+marker disturbs nothing.
+
+### The symbols are derived from the target, and the set is closed
+
+| kind | symbols |
+|---|---|
+| operating system | `macos`, `linux`, `windows`, `freestanding` |
+| processor | `aarch64`, `x86_64`, `riscv64`, `x86` |
+| derived | `hosted` (not `freestanding`), `posix` (`macos` or `linux`) |
+
+That is the whole vocabulary. There is no `#define`, nothing a project can add, and **no dependence
+on the project config** that is still open below — which is what let this be built at all. A
+condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter than `||`.
+
+`posix` is a name for the commonest disjunction rather than a replacement for writing it: `#if
+linux || macos` still says the same thing. Old sysl banned `&&` and `||` outright, and this does not
+follow it there — in a flat line-marker scheme the only other way to write a disjunction is to nest
+the groups, which reads far worse for the sake of a boolean evaluator over a set of strings.
+
+**A symbol nobody knows is an error, not false.** The set is closed, so a name outside it is a
+mistake rather than a fact this build happens not to have — and a misspelling that read as false
+would gate code out of the build with nothing said. Silently missing code is the one failure this
+feature cannot be allowed to have, and it is the one C has.
+
+**Every condition is checked, in the branch being taken and the ones being skipped alike.** So the
+misspelling in the Linux half is caught by a macOS build, which is where it would otherwise sit
+until somebody built for Linux.
+
+A target's *name* is not a symbol — it has a `-` in it, which no identifier carries — and writing
+one is told to write `aarch64 && macos` instead, because otherwise the reader is told that `-` is
+not an operator, which is true and no help.
+
+### What is given up, and what is not
+
+**The inactive branch is never syntax-checked.** That is the price of gating text rather than
+trees, it is C's price too, and a Linux branch can therefore rot while the macOS build stays green.
+What finds that is a build for each target — a thing to *run*, not a thing to design around. The
+conditions themselves are the part that is checked everywhere, and they are the part where a
+mistake would otherwise be silent.
+
+**The gate runs before anything knows what a string or a comment is**, so a line that begins at the
+margin with a directive word is a directive even inside a text block or a block comment. Recognizing
+those would mean a second copy of the lexer's rules about literals, in a place where the two could
+drift with nothing to notice — a worse defect than this one. The margin rule is what keeps it rare:
+a text block written anywhere but the top level is indented in the source, whatever its value turns
+out to be.
+
+### The library is subject to it too
+
+`lib/sysl` is sysl source, so it may gate on the machine like any other — which makes "the standard
+module" a question with a target in it, and the compiler's carried copy is parsed per target
+accordingly. The one thing held fixed is that **a name the compiler spells for itself is declared on
+every target**: a library that gated `Option` away for Windows would be a library nothing compiles
+against there, so it is refused in the registry-wide check rather than at the first `?` somebody
+writes.
+
 ## Open
 
 - **The project config.** `sysl.conf`, per-target capability sets (`capabilities.md`'s

@@ -12,6 +12,18 @@ reasoning, so the decision is not re-litigated.
 - **Parser:** a **packrat combinator parser** (`scala-parser-combinators` `PackratParsers`)
   consuming the materialized `List[Token]` the lexer produces.
 
+## Before the lexer: the conditional-compilation gate
+
+One pass runs ahead of everything here. A file is compiled **for** a target (`targets.md`), and
+`#if` lets it say two things about two machines — so before a token exists, the lines of a branch
+this build is not for are blanked out (`targets.md § Conditional compilation`). Blanked rather than
+removed, so every position below a gate is still the position it was written at and the rest of this
+document holds unchanged.
+
+It is the only pass that reads the source as text, and it stays that way deliberately: it knows
+about line starts and nothing else, which is why it is here and not woven into the lexer, where an
+indentation-sensitive gate would have to have an opinion about block structure.
+
 ## Lexer: `IndentationLexical` + a proper token ADT
 
 `IndentationLexical` already solves the genuinely hard part of an indentation-sensitive lexer,

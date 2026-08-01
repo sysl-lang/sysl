@@ -81,13 +81,27 @@ object Std {
    */
   lazy val fingerprint: String = LibraryArtifact.fingerprint(sources)
 
-  /** The parsed standard module, parsed once. */
-  lazy val parsed: List[Program] =
-    sources.map(s =>
-      SyslParser.parse(s) match
-        case Right(p) => p
-        case Left(e)  => sys.error(s"the standard module does not parse: $e"),
+  /** The parsed standard module, **for a target**, parsed once per target.
+   *
+   * The library is sysl source like any other and may gate on the machine it is being built for
+   * (`Conditional`), so which trees it comes to is a question with a target in it. Two targets may
+   * therefore see two different standard modules — that is the point of the feature — and each is
+   * memoized because this is on the path of every compilation that has no artifact to read instead.
+   *
+   * Not a `Map` from the registry built up front: a run compiles for one target and would pay for
+   * ten.
+   */
+  def parsed(target: Target): List[Program] =
+    cache.getOrElseUpdate(
+      target,
+      sources.map(s =>
+        SyslParser.parse(s, target) match
+          case Right(p) => p
+          case Left(e)  => sys.error(s"the standard module does not parse: $e"),
+      ),
     )
 
-  def decls: List[Stmt] = parsed.flatMap(_.body)
+  private val cache = collection.mutable.Map.empty[Target, List[Program]]
+
+  def decls(target: Target): List[Stmt] = parsed(target).flatMap(_.body)
 }

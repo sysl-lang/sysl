@@ -24,7 +24,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
     "every declaration the library ships is its own" in {
       Library.decls should not be empty
-      Library.decls.filterNot(Core.embedded.owns) shouldBe empty
+      Library.decls.filterNot(Library.carried.owns) shouldBe empty
     }
 
     "nothing a program declares is" in {
@@ -34,13 +34,13 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       val mine = parsed("struct Ok\n    n: int\n\ndouble(n: int) -> int = n * 2\n")
 
       mine.length shouldBe 2
-      mine.filter(Core.embedded.owns) shouldBe empty
+      mine.filter(Library.carried.owns) shouldBe empty
     }
 
     "a declaration with no position at all is not the library's" in {
       // A synthesized node carries none, and `owns` is asked of nodes the compiler built as well as
       // of ones it parsed — a wrong answer here would hand a desugaring the library's scope.
-      Core.embedded.owns(FuncDecl("f", Nil, Nil, None, Nil)) shouldBe false
+      Library.carried.owns(FuncDecl("f", Nil, Nil, None, Nil)) shouldBe false
     }
   }
 
@@ -80,8 +80,8 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     "says in one of the library's headers what `Std.module` says" in {
       // `module` is a constant so that nothing has to parse to ask which module the auto-imported
       // names are in. This is what holds it to the source it stands for.
-      Std.parsed should not be empty
-      Std.parsed.map(_.module.map(_.show)) should contain(Some(Std.module))
+      Std.parsed(Target.default) should not be empty
+      Std.parsed(Target.default).map(_.module.map(_.show)) should contain(Some(Std.module))
     }
 
     "is made of more than one file, each of which the driver would build the same way" in {
@@ -95,9 +95,9 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
       // The two halves used to be checked against each other here. There is one half now, so what
       // is left to say is that it is not empty and that all of it is the library's — the second is
       // what `Library.owns` answers, and an empty module would make it vacuously true.
-      Std.decls should not be empty
-      Std.decls.forall(Core.embedded.owns) shouldBe true
-      Library.decls shouldBe Std.decls
+      Std.decls(Target.default) should not be empty
+      Std.decls(Target.default).forall(Library.carried.owns) shouldBe true
+      Library.decls shouldBe Std.decls(Target.default)
     }
 
     "is a module every file may write the names of without importing it" in {
@@ -151,7 +151,7 @@ class LibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     "each in exactly one of the library's modules" in {
       val declaredIn =
         for
-          u <- Core.embedded.units
+          u <- Library.carried.units
           n <- Library.names(u.body) if Library.known(n)
         yield n -> Compiler.moduleOf(u)
 

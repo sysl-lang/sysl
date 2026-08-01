@@ -34,7 +34,7 @@ object Compiler {
    * whether a declaration was read from source or from an artifact.
    */
   def compileTrees(units: List[Program], target: Target = Target.default): Either[String, String] =
-    analyzed(units, target).map(_._1)
+    analyzed(units, target, Set.empty, Core.embedded(target)).map(_._1)
 
   /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
    * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
@@ -56,14 +56,25 @@ object Compiler {
    * exactly as one compiled alone does.
    */
   def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
-                   precompiled: Set[String] = Set.empty, core: Core = Core.embedded)
+                   precompiled: Set[String] = Set.empty, core: Option[Core] = None)
       : Either[String, (String, List[String])] = {
-    val parsed = sources.map(SyslParser.parse)
+    val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
-      case Nil  => analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled, core)
+      case Nil =>
+        analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled, carried(core, target))
       case errs => Left(errs.mkString("\n"))
   }
+
+  /** The standard module a compilation was handed, or the copy the compiler carries **for the target
+   * it is building for**.
+   *
+   * Spelled as an option rather than as a defaulted parameter because the fallback depends on
+   * `target`, and a default argument cannot read another parameter of its own list. Which is the
+   * honest shape anyway: "none was given" and "this particular one was" are different facts, and
+   * only the first has an answer that varies with the machine.
+   */
+  private def carried(core: Option[Core], target: Target): Core = core.getOrElse(Core.embedded(target))
 
   /** The same compilation, keeping the notes the driver may want to show — currently the heap
    * promotions, for `--explain-escapes` (`05`). Separate from `compile` so that the ordinary path
@@ -71,12 +82,12 @@ object Compiler {
    */
   def compiled(sources: List[Source], target: Target = Target.default)
       : Either[String, (String, List[String])] = {
-    val parsed = sources.map(SyslParser.parse)
+    val parsed = sources.map(SyslParser.parse(_, target))
 
     // Every file is parsed before any is rejected, so a syntax error in one does not hide the
     // syntax errors in the rest — the same reason the analyzer reports every mistake it finds.
     parsed.collect { case Left(e) => e } match
-      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target)
+      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target, Set.empty, Core.embedded(target))
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -89,9 +100,9 @@ object Compiler {
    * again, is how the two come to disagree about what a test is called.
    */
   def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
-                   precompiled: Set[String] = Set.empty, core: Core = Core.embedded)
+                   precompiled: Set[String] = Set.empty, core: Option[Core] = None)
       : Either[String, (String, List[TTest])] = {
-    val parsed = sources.map(SyslParser.parse)
+    val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case errs if errs.nonEmpty => Left(errs.mkString("\n"))
@@ -99,7 +110,7 @@ object Compiler {
         val units = libraries ::: parsed.collect { case Right(p) => p }
 
         for
-          typed    <- Analyzer.analyze(units, core = core)
+          typed    <- Analyzer.analyze(units, core = carried(core, target))
           promoted <- Escape.check(typed)
         yield
           val kept = Tests.only(typed)
@@ -137,9 +148,9 @@ object Compiler {
    * them, so that the compiler does not supply the files it is being asked to compile.
    */
   def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
-                     core: Core = Core.embedded): Either[String, (String, Set[String])] =
+                     core: Option[Core] = None): Either[String, (String, Set[String])] =
     for
-      analysed <- Analyzer.analyze(units, building, core)
+      analysed <- Analyzer.analyze(units, building, carried(core, target))
       // A library ships no tests. They are the library author's, they run against the sources rather
       // than against the artifact, and emitting them would put a function nothing can call into every
       // program that links it — with the helpers only it reaches dragged in behind.
@@ -172,8 +183,8 @@ object Compiler {
    * mistake in it a mistake at all. Pruning is therefore the last thing that happens to the tree, and
    * the only thing between the checks and the lowering.
    */
-  private def analyzed(units: List[Program], target: Target, precompiled: Set[String] = Set.empty,
-                       core: Core = Core.embedded): Either[String, (String, List[String])] =
+  private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
+                       core: Core): Either[String, (String, List[String])] =
     for
       typed    <- Analyzer.analyze(units, core = core)
       promoted <- Escape.check(typed)

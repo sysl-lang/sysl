@@ -54,12 +54,12 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
    * emits a second time. Empty is the compilation every program gets today.
    */
   private def against(core: Core, program: String, linked: Set[String] = Set.empty): String =
-    Compiler.compiledWith(List(Source("<input>", program)), Nil, Target.default, linked, core) match
+    Compiler.compiledWith(List(Source("<input>", program)), Nil, Target.default, linked, Some(core)) match
       case Right((ir, _)) => ir
       case Left(err)      => fail(s"the program did not compile:\n$err")
 
   private def sameBothWays(program: String): Unit =
-    against(decoded, program) shouldBe against(Core.embedded, program)
+    against(decoded, program) shouldBe against(Library.carried, program)
 
   /** The same program with the core's object half linked rather than emitted. */
   private def linked(program: String): String = against(decoded, program, precompiled)
@@ -95,7 +95,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     // either came from.
 
     "the decoded one is not the embedded one" in {
-      decoded should not be theSameInstanceAs(Core.embedded)
+      decoded should not be theSameInstanceAs(Library.carried)
     }
 
     "and its declarations belong to it rather than to the embedded copy" in {
@@ -105,12 +105,12 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       val one = decoded.decls.find(_.pos.isDefined).getOrElse(fail("the decoded core carries no positions"))
 
       decoded.owns(one) shouldBe true
-      Core.embedded.owns(one) shouldBe false
+      Library.carried.owns(one) shouldBe false
     }
 
     "and it carries the same declarations, so the comparison is between equals" in {
-      decoded.units.map(_.source.name) shouldBe Core.embedded.units.map(_.source.name)
-      decoded.decls.length shouldBe Core.embedded.decls.length
+      decoded.units.map(_.source.name) shouldBe Library.carried.units.map(_.source.name)
+      decoded.decls.length shouldBe Library.carried.decls.length
     }
   }
 
@@ -123,14 +123,14 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     // place.
 
     "nothing of it, when nothing reaches it" in {
-      defines(against(Core.embedded, "var x = 2 + 3\nvar y = x * 2\n"))
+      defines(against(Library.carried, "var x = 2 + 3\nvar y = x * 2\n"))
         .filter(_.startsWith(Library.key(""))) shouldBe empty
     }
 
     "and the surface it does reach, when something does" in {
       // Discriminating against the above: the same compilation, one statement further on, has to
       // carry the library or the first assertion would hold for a compiler that emitted nothing.
-      defines(against(Core.embedded, "print(1)\n"))
+      defines(against(Library.carried, "print(1)\n"))
         .filter(_.startsWith(Library.key(""))) should not be empty
     }
   }
@@ -401,7 +401,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       // those bodies stops needing it, and it simply is not there. It leaves no declaration behind
       // because nothing links to it — see the next test.
       val program = "print(1)\nprint(\"two\")\nprint(3.5)\n"
-      val fromSrc = against(Core.embedded, program)
+      val fromSrc = against(Library.carried, program)
       val fromLib = linked(program)
 
       val (nowLinked, nowUnneeded) = (defines(fromSrc) -- defines(fromLib)).partition(precompiled)
@@ -421,7 +421,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       // the linker never sees a pair. Were they external, a program that still needed the runtime for
       // its *own* counted values would collide with the library that shipped one.
       artifact._1 should include("define private void @arc.retain(")
-      against(Core.embedded, "var s = \"x\"\nprint(s)\n") should include("define private void @arc.retain(")
+      against(Library.carried, "var s = \"x\"\nprint(s)\n") should include("define private void @arc.retain(")
     }
 
     "while a generic is built here even at a type the library already shipped one instantiation of" in {

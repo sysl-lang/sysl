@@ -46,7 +46,7 @@ object TestRunner {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
-    val (ir, tests) = Compiler.compileTests(sources, libraries, target, precompiled, core) match
+    val (ir, tests) = Compiler.compileTests(sources, libraries, target, precompiled, Some(core)) match
       case Left(err)     => return report(err)
       case Right(result) => result
 

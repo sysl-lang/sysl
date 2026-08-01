@@ -96,7 +96,7 @@ class CoreLibraryTests extends AnyFreeSpec with Matchers {
     // `Display.display` names `Writer`, which the *other* file declares, and `13 §6` is why that
     // needs no import: a module's members are one set however many files they came from. It is
     // also what a one-file standard module would never have said.
-    val declared = Std.parsed.map(p => place(p.source) -> p.body).toMap
+    val declared = Std.parsed(Target.default).map(p => place(p.source) -> p.body).toMap
 
     declared("sysl/write.sysl").collect { case t: TraitDecl => t.name } shouldBe List("Writer")
     declared("sysl/display.sysl").collect { case t: TraitDecl => t.name } shouldBe List("Display")
@@ -106,7 +106,7 @@ class CoreLibraryTests extends AnyFreeSpec with Matchers {
     // module differently — a selector list or a wildcard names it outright, and a bare path names it
     // with the imported name still on the end — so which segments are the module is read off the
     // form.
-    for p <- Std.parsed; i <- p.body.collect { case i: ImportDecl => i } do
+    for p <- Std.parsed(Target.default); i <- p.body.collect { case i: ImportDecl => i } do
       val named = if i.selectors.nonEmpty || i.wildcard then i.path else i.path.init
 
       named.mkString(".") should not be p.module.map(_.show).get

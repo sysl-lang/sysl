@@ -192,7 +192,7 @@ private[sysl] def execute(cfg: Config): Int = {
 
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
-  val (core, coreSymbols, coreArchive) = chooseCore(cfg) match
+  val (core, coreSymbols, coreArchive) = chooseCore(cfg, target) match
     case Left(err) => return fail(err)
     case Right(c)  => c
 
@@ -264,7 +264,8 @@ private[sysl] def execute(cfg: Config): Int = {
 
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
-  val compiled = Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, core) match
+  val compiled =
+    Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(core)) match
     case Left(err) => return report(err)
     case Right((ir, notes)) =>
       if cfg.explainEscapes then
@@ -341,7 +342,8 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
     case Some(err) => return fail(err)
     case None      => ()
 
-  LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty, core, native) match
+  LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty, Some(core),
+                        native) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
       // The standard module's default output is the place a compilation looks for it, so that
@@ -397,8 +399,8 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
  * requiring one would be a deadlock with nothing to break it — the bootstrap case in its purest form,
  * and the reason the carried copy is kept at all.
  */
-private def chooseCore(cfg: Config): Either[String, (Core, Set[String], Option[String])] =
-  if cfg.noCoreLib || cfg.core then Right((Core.embedded, Set.empty, None))
+private def chooseCore(cfg: Config, target: Target): Either[String, (Core, Set[String], Option[String])] =
+  if cfg.noCoreLib || cfg.core then Right((Core.embedded(target), Set.empty, None))
   else
     cfg.coreLib.orElse(Option.when(isFile(cfg.coreSearch))(cfg.coreSearch)) match
       case Some(path) => loadCore(path)

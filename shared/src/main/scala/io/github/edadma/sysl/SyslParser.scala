@@ -729,7 +729,24 @@ object SyslParser {
   def parse(src: String, name: String = "<input>"): Either[String, Program] =
     parse(Source(name, src))
 
-  def parse(source: Source): Either[String, Program] = {
+  /** Parses a file for a target.
+   *
+   * **The target reaches the parser because conditional compilation does** (`Conditional`): the
+   * lines of a branch this build is not for are blanked before the lexer is handed anything, so what
+   * is parsed is already the file this target sees. Every other seam is unaffected — the gate is not
+   * applied to an expression fragment or to a string interpolation's contents, neither of which is a
+   * file, and a source with no directives in it is not even copied.
+   */
+  def parse(source: Source, target: Target): Either[String, Program] =
+    Conditional.gate(source, target).flatMap(parsed)
+
+  /** The same, for the machine a caller that names none would get. Spelled as its own overload
+   * rather than as a default argument because only one of these alternatives may carry defaults, and
+   * that one is the `String` form the parser tests are written against.
+   */
+  def parse(source: Source): Either[String, Program] = parse(source, Target.default)
+
+  private def parsed(source: Source): Either[String, Program] = {
     val p = new SyslParser(source)
 
     p.parseProgram match {

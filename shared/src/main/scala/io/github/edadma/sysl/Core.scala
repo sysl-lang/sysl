@@ -75,14 +75,21 @@ final class Core(val units: List[Program]) {
 
 object Core {
 
-  /** The copy the compiler carries, which is what an ordinary compilation is compiled against.
+  /** The copy the compiler carries, as **a given target** sees it — which is what an ordinary
+   * compilation is compiled against.
    *
    * It has to carry *something*: the standard module is what every program is compiled against, so
    * it cannot be a thing a compilation goes looking for on disk and may not find. This is that
    * guarantee, and it is also the fallback — a compilation handed an artifact it cannot read is
    * better off compiling against this than not compiling at all.
+   *
+   * The target is a parameter for the reason it is one everywhere else, and here it is not merely
+   * consistency: the library may gate on the machine (`Conditional`), so a copy parsed for one
+   * target is not the library another target has.
    */
-  lazy val embedded: Core = new Core(Std.parsed)
+  def embedded(target: Target): Core = cache.getOrElseUpdate(target, new Core(Std.parsed(target)))
+
+  private val cache = collection.mutable.Map.empty[Target, Core]
 
   /** A core read out of the metadata half of an artifact (`LibraryArtifact`).
    *

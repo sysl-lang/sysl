@@ -57,7 +57,8 @@ object Analyzer {
    * out of hoisting, since the pass that registers every signature already runs over the whole set
    * before any body is checked.
    */
-  def analyze(units: List[Program], building: Set[String] = Set.empty, core: Core = Core.embedded)
+  def analyze(units: List[Program], building: Set[String] = Set.empty,
+              core: Core = Core.embedded(Target.default))
       : Either[String, TProgram] = {
     val analyzer = new Analyzer(units, building, core)
 
