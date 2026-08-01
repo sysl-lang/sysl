@@ -121,6 +121,11 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       }
 
     check("a generic function with bounds", "f[T: Ord, U: Eq + Hash](a: T, b: U) -> T = a")
+    // The one statement whose payload is another *statement*, so the encoding recurses through
+    // `stmt` rather than bottoming out in expressions. A library exporting an inline function with a
+    // `defer` in it is how this reaches an artifact, and a codec that dropped the payload would
+    // decode to a body that releases nothing and says so nowhere.
+    check("a defer carrying a statement", "f()\n    defer print(\"out\")\n    print(\"in\")")
     check("a variadic extern under a link name", "extern \"snprintf\" fmt(f: *u8, ...) -> int")
     // The two `extern` forms together, since the tag is what tells them apart and a codec that wrote
     // one where the other belonged would still round-trip every field either of them has.

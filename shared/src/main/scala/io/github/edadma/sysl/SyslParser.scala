@@ -54,7 +54,7 @@ class SyslParser(val source: Source) extends DeclParser {
   lazy val statement: PackratParser[Stmt] =
     at(
       misplacedCapability | importDecl | implDecl | declaration | varDecl | returnStmt |
-        breakStmt | continueStmt | requireStmt | ensureStmt | multiAssign |
+        breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign |
         resultListStmt | exprStmt,
     )
 
@@ -68,7 +68,7 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val inlineStatement: PackratParser[Stmt] =
     at(
       importDecl | implDecl | declaration | varDecl | returnStmt |
-        breakStmt | continueStmt | requireStmt | ensureStmt | multiAssign | exprStmt,
+        breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign | exprStmt,
     )
 
   /** `a, b = b, a` — a comma list of places, a comma list of values (`00 §2`).
@@ -501,6 +501,16 @@ class SyslParser(val source: Source) extends DeclParser {
 
   protected lazy val continueStmt: PackratParser[Stmt] =
     op("continue") ~> opt(labelRef) ^^ (lbl => Continue(lbl))
+
+  /** `defer stmt` — what to run on the way out of this block (`03 § defer`).
+   *
+   * What follows is an inline statement, so the whole form is one line: the deferred thing is a
+   * release, and a release that needs a block of its own is a function worth naming. Reading it as
+   * `inlineStatement` rather than `expression` is what lets `defer xs.close()` and
+   * `defer n = 0` both be written, without a result list's comma reaching across the `defer`.
+   */
+  protected lazy val deferStmt: PackratParser[Stmt] =
+    op("defer") ~> inlineStatement ^^ Defer.apply
 
   /** A `'name` label reference, as used before a loop and after `break`/`continue`. */
   protected lazy val labelRef: Parser[String] =

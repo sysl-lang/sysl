@@ -145,7 +145,9 @@ before they appear and may be mutually recursive).
   at the first of its modules by name so that which file the walk started from does not show.
 
 - **Statements:** `var name [: type] = expr`, expression statements (including assignment and
-  compound assignment), `return [expr]`, and `break [expr]` / `continue`. Loop and branch bodies
+  compound assignment), `return [expr]`, `break [expr]` / `continue`, and `defer stmt` — which
+  emits nothing where it stands and lays its statement down at each edge that leaves the enclosing
+  block, ahead of that block's releases (`03 § defer`). Loop and branch bodies
   follow Scala-3 style: `then`/`do` is **required for a one-line body** and **optional before an
   indented block**. Optional `end if` / `end while` / `end loop` / `end for` markers may close a block (`end`
   is a *soft* keyword, not reserved).

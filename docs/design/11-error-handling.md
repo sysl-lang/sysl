@@ -148,6 +148,11 @@ language's targets:
   removes a whole class of "is this exception-safe?" reasoning — the same simplification the
   memory model makes by removing move semantics.
 
+**Nor does it run a deferred statement.** `defer` (`03 § defer`) is the language's scope-exit
+form, and a trap is not an exit — it is the program stopping because its model of itself is
+already wrong. Cleanup code run against that state is how a corrupt program writes its corruption
+out on the way down, so `defer` is for releasing a resource and not for restoring an invariant.
+
 **What a trap *does* is an environment fact (`capabilities.md`).** Under the `os` capability a
 hosted program prints a diagnostic (the check that failed and where) and exits non-zero; a kernel
 installs its own panic handler and enters it. The *decision to stop* is the language's; the

@@ -329,7 +329,24 @@ trait ArcEmitter extends Emitter {
   protected def releaseTemps(): Unit = for (v, ty) <- tempStack.head.reverse do releaseValue(ty, v)
   protected def dropTemps(): Unit    = tempStack = tempStack.tail
 
-  protected def pushOwned(): Unit = owned = mutable.ListBuffer.empty[(String, Type)] :: owned
+  /** Hands a statement to the scope being emitted. Nothing is emitted here — the `defer` itself
+   * costs no instruction, and the statement is laid down at each edge that leaves the block.
+   */
+  protected def deferStmts(stmts: List[TStmt]): Unit = deferrals.head ++= stmts
+
+  /** Runs one scope's deferred statements, last registered first.
+   *
+   * They go **before** that scope's releases, so every local the statement names is still alive
+   * while it runs — including the one holding the resource it is closing, which is the whole point
+   * of the form. Registration order is written order, so `reverse` is the LIFO `03 § defer`
+   * promises.
+   */
+  private def runDeferrals(scope: mutable.ListBuffer[TStmt]): Unit = scope.reverse.foreach(genStmt)
+
+  protected def pushOwned(): Unit = {
+    owned = mutable.ListBuffer.empty[(String, Type)] :: owned
+    deferrals = mutable.ListBuffer.empty[TStmt] :: deferrals
+  }
 
   /** Records a slot that holds a count of its own, after it has been written. */
   protected def ownSlot(name: String, ty: Type): Unit =
@@ -358,7 +375,12 @@ trait ArcEmitter extends Emitter {
       val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
       releaseValue(ty, v)
 
-  protected def popOwned(): Unit = { releaseOwned(); owned = owned.tail }
+  protected def popOwned(): Unit = {
+    runDeferrals(deferrals.head)
+    releaseOwned()
+    owned = owned.tail
+    deferrals = deferrals.tail
+  }
 
   /** Lets go of everything the function holds, for a `return` that leaves from the middle of
    * it. Nothing is popped: the block is terminated straight afterwards, so the scopes that
@@ -366,9 +388,21 @@ trait ArcEmitter extends Emitter {
    */
   protected def releaseAll(): Unit = {
     for frame <- tempStack; (v, ty) <- frame.reverse do releaseValue(ty, v)
-    for scope <- owned; (slot, ty) <- scope.reverse do
-      val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
-      releaseValue(ty, v)
+
+    // **Snapshot first, and it is load-bearing.** A deferred statement is emitted by `genStmt`, and
+    // one containing an `if` or a `match` pushes and pops the very stacks this is walking — so the
+    // scopes must be fixed before any of them runs. A lazy pairing here would read `owned` back
+    // mid-walk and skip the releases of whatever it had moved past, which leaks rather than fails.
+    val scopes = owned.zip(deferrals)
+
+    // Outward, one scope at a time, each running what it deferred before giving up its counts — so
+    // a statement deferred in an inner block still sees the outer block's locals, which are let go
+    // only once the scope that owns them is itself being left.
+    for (scope, ds) <- scopes do
+      runDeferrals(ds)
+      for (slot, ty) <- scope.reverse do
+        val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
+        releaseValue(ty, v)
   }
 
   /** Lets go of everything accrued since a loop was entered, for a `break`/`continue` that leaves
@@ -379,9 +413,17 @@ trait ArcEmitter extends Emitter {
    */
   protected def releaseToDepth(ownedDepth: Int, tempDepth: Int): Unit = {
     for frame <- tempStack.take(tempStack.length - tempDepth); (v, ty) <- frame.reverse do releaseValue(ty, v)
-    for scope <- owned.take(owned.length - ownedDepth); (slot, ty) <- scope.reverse do
-      val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
-      releaseValue(ty, v)
+
+    // Snapshotted before anything runs, for `releaseAll`'s reason. `zip` needs no matching `take`:
+    // the two stacks are the same length, so pairing the bounded one against the whole of the other
+    // stops where the bound does, and the pairs still line up because both are innermost-first.
+    val scopes = owned.take(owned.length - ownedDepth).zip(deferrals)
+
+    for (scope, ds) <- scopes do
+      runDeferrals(ds)
+      for (slot, ty) <- scope.reverse do
+        val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
+        releaseValue(ty, v)
   }
 }
 

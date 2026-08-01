@@ -24,6 +24,11 @@ object TreeWalk {
         case TBreak(Some(e), _) => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TMultiAssign(writes) =>
           for w <- writes; e <- List(w.place, w.value); b <- blocks(e) do forEachStmt(b.stmts)(f)
+        // A deferred statement runs where its block is left rather than where it stands, but it is
+        // still a statement of this body — so every pass that asks what a body contains has to see
+        // it. A walk that stopped here would leave the escape analysis blind to a view a deferred
+        // statement lets out.
+        case TDefer(stmts) => forEachStmt(stmts)(f)
         case _ =>
 
   /** The `break` values that belong to a loop with these body statements — those in its body but

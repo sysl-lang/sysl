@@ -533,6 +533,12 @@ case class Return(value: Option[Expr]) extends Stmt
 case class Break(label: Option[String], value: Option[Expr]) extends Stmt
 case class Continue(label: Option[String]) extends Stmt
 
+/** `defer stmt` — a statement to run on the way out of the block containing it, whichever edge
+ * control leaves by (`03 § defer`). It is registered when control reaches it and not before, so
+ * one in a branch never taken schedules nothing.
+ */
+case class Defer(stmt: Stmt) extends Stmt
+
 /** A design-by-contract clause at the top of a function body. `require` is a precondition,
  * checked once on entry; `ensure` is a postcondition, checked before every return. The optional
  * `msg` accompanies the runtime trap. Inside an `ensure` condition the identifier `result`

@@ -536,6 +536,15 @@ case class TReturn(value: Option[TExpr])                  extends TStmt
 case class TBreak(value: Option[TExpr], depth: Int) extends TStmt
 case class TContinue(depth: Int)                    extends TStmt
 
+/** `defer stmt` — the statements to run on the way out of the block this sits in (`03 § defer`).
+ *
+ * It is a list because one written statement can analyze to several, the way a binding that names
+ * more than one thing does. Reaching this node emits nothing at the point it stands: it hands the
+ * statements to the enclosing scope, which emits them at each edge that leaves it. So a `defer`
+ * control never reaches schedules nothing, and one in a loop body schedules for that iteration.
+ */
+case class TDefer(stmts: List[TStmt]) extends TStmt
+
 /** A user function. Parameters carry their unique names (the codegen allocates a slot for
  * each so the body can read and mutate them uniformly). `requires`/`ensures` are the
  * design-by-contract clauses: each precondition is checked on entry, each postcondition before
