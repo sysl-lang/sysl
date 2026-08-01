@@ -632,6 +632,15 @@ nothing downstream could notice:
 The test is made by **shape** rather than by asking the target's classification, so a program
 accepted for one machine is accepted for every machine.
 
+### What it costs today
+
+**A signature cannot be named once.** Every declaration mentioning a callback spells the whole of it,
+and a real binding mentions one several times — `signal` takes a handler and returns the previous
+one, so its declaration says the same eight tokens twice. This is not this section's restriction:
+`type` declares a **constrained subtype**, whose base must be a scalar (`16 §1`), so `type Handle =
+*u8` is refused in the same words. What would fix it is an alias that is not a subtype, which is a
+question for `16` and not for here.
+
 ## 7. Capture follows the memory model
 
 A closure body may name variables from the scope it is written in; naming one **captures** it.

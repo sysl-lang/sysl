@@ -379,6 +379,250 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** The claims `12 §6a` makes in prose, each run rather than read. */
+  "what the chapter claims" - {
+    /** §6a: *"A call through one goes out under C's convention … the same lowering an `extern` call
+      * gets (§1), aggregates and all."* That is the asymmetry the section turns on — **taking** the
+      * address of a function with an aggregate in its signature is refused, and **calling** through
+      * one is not, because the call site is where the coercion happens and it already knows how.
+      *
+      * `div` returns a two-integer struct, which is exactly the shape the ABI work found was being
+      * read out of the wrong registers — so a right answer here is a real check and not a shrug.
+      */
+    "a call through one coerces an aggregate, where taking the address of one is refused" in {
+      run("""struct div_t
+            |    quot: i32
+            |    rem: i32
+            |
+            |extern dlopen(path: *u8, mode: i32) -> *u8
+            |extern dlsym(handle: *u8, name: *u8) -> *u8
+            |
+            |var d: *extern(i32, i32) -> div_t = ptr_cast(dlsym(dlopen(null, 1i32), c"div"))
+            |var r = d(7i32, 2i32)
+            |
+            |print(r.quot, r.rem)
+            |""".stripMargin) shouldBe "3 1\n"
+    }
+
+    /** §6a: *"The test is made by **shape** rather than by asking the target's classification, so a
+      * program accepted for one machine is accepted for every machine."* A rule that consulted
+      * `CAbi` would answer differently per convention — an aggregate that happens to travel in one
+      * register on one target and not another — and a program would then compile for one machine and
+      * not the next. Checked against four targets whose classifications genuinely differ.
+      */
+    "an address is accepted or refused the same way on every target" in {
+      val ok = """double(n: i32) -> i32 = n * 2
+                 |var f: *extern(i32) -> i32 = &double
+                 |print(f(21))
+                 |""".stripMargin
+
+      for t <- Target.all do irFor(t, ok) should include("@double")
+
+      val no = """struct Point
+                 |    x: i32
+                 |    y: i32
+                 |sum(p: Point) -> i32 = p.x + p.y
+                 |var f: *extern(Point) -> i32 = &sum
+                 |""".stripMargin
+
+      for t <- Target.all do
+        Compiler.compileToLlvm(no, "<input>", t) match
+          case Left(e)  => e should include("an aggregate")
+          case Right(_) => fail(s"the aggregate was accepted for ${t.name}")
+    }
+
+    // §6a: *"`ptr_cast` reaches between an address of code and an address of bytes"* — the direction
+    // the dlsym tests do not cover, which is a callback handed back to a C interface storing them as
+    // `void *`.
+    "an address of code goes back out as an address of bytes" in {
+      run("""extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+            |
+            |compare(a: *u8, b: *u8) -> i32
+            |    var pa: *i32 = ptr_cast(a)
+            |    var pb: *i32 = ptr_cast(b)
+            |    *pa - *pb
+            |
+            |var as_bytes: *u8 = ptr_cast(&compare)
+            |var back: *extern(*u8, *u8) -> i32 = ptr_cast(as_bytes)
+            |var xs = [2i32, 1i32]
+            |
+            |qsort(ptr_cast(&xs[0]), 2usize, 4usize, back)
+            |
+            |print(xs[0], xs[1], as_bytes == null)
+            |""".stripMargin) shouldBe "1 2 false\n"
+    }
+
+    // §6a: *"two compare by address so a program can ask whether one is installed"* — and the
+    // address of one function is not the address of another.
+    "two addresses of one function are equal, and of two functions are not" in {
+      run("""a(n: i32) -> i32 = n
+            |b(n: i32) -> i32 = n
+            |
+            |print(&a == &a, &a == &b)
+            |""".stripMargin) shouldBe "true false\n"
+    }
+  }
+
+  /** The inputs that break code like this: the second occurrence, the empty case, and two internal
+    * notions of identity that disagree.
+    */
+  "the edges" - {
+    // The mangled name carries the signature, so a generic instantiated at two function-pointer
+    // types must get two bodies. Sharing one would be a miscompile that no diagnostic could reach.
+    "a generic at two function-pointer types gets two instantiations" in {
+      run("""struct Box[T]
+            |    value: T
+            |
+            |unwrap[T](b: Box[T]) -> T = b.value
+            |
+            |narrow(n: i32) -> i32 = n * 2
+            |wide(n: i64) -> i64 = n * 3i64
+            |
+            |var a = Box(&narrow)
+            |var b = Box(&wide)
+            |
+            |print(unwrap(a)(21i32), unwrap(b)(14i64))
+            |""".stripMargin) shouldBe "42 42\n"
+    }
+
+    // A mangled name that dropped the signature would collide here, and the symbol would be illegal
+    // besides — `*extern(int) -> int` has characters an LLVM name cannot hold.
+    "and the mangled name of one is a legal symbol" in {
+      val out = ir("""struct Box[T]
+                     |    value: T
+                     |
+                     |double(n: i32) -> i32 = n * 2
+                     |
+                     |var b = Box(&double)
+                     |print(b.value(21))
+                     |""".stripMargin)
+
+      out should include("cfn1")
+      out should not include "*extern"
+    }
+
+    // A `unit` parameter is zero-sized and dropped from the emitted signature (`12 §1`), so the
+    // argument is evaluated for its effect and the ones after it shift up. The positions a
+    // function-pointer call checks against must be the written ones, not the emitted ones.
+    "a zero-sized parameter is dropped from the call but not from the arity" in {
+      run("""second(a: unit, b: i32) -> i32 = b
+            |
+            |var f: *extern(unit, i32) -> i32 = &second
+            |
+            |print(f((), 7i32))
+            |""".stripMargin) shouldBe "7\n"
+
+      err("""second(a: unit, b: i32) -> i32 = b
+            |var f: *extern(unit, i32) -> i32 = &second
+            |print(f(7i32))
+            |""".stripMargin) should include("is called with 2 arguments")
+    }
+
+    // `never` says the callee does not come back, and a call through a pointer has to end the block
+    // exactly as a direct one does — otherwise the code after it is emitted and LLVM rejects it.
+    "a result of 'never' ends the block" in {
+      run("""extern exit(code: i32) -> never
+            |
+            |var stop: *extern(i32) -> never = &exit
+            |
+            |print("before")
+            |stop(0i32)
+            |print("after")
+            |""".stripMargin) shouldBe "before\n"
+    }
+
+    // One returning another, which is what a C interface installing a handler and giving back the
+    // previous one does — `signal` is exactly this shape.
+    "one whose result is another one" in {
+      run("""double(n: i32) -> i32 = n * 2
+            |
+            |chooser() -> *extern(i32) -> i32 = &double
+            |
+            |var pick: *extern() -> *extern(i32) -> i32 = &chooser
+            |
+            |print(pick()(21))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // A function that takes its own address, which is the shape a re-arming signal handler has.
+    "a function that takes its own address" in {
+      run("""extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+            |
+            |compare(a: *u8, b: *u8) -> i32
+            |    var pa: *i32 = ptr_cast(a)
+            |    var pb: *i32 = ptr_cast(b)
+            |    var mine: *extern(*u8, *u8) -> i32 = &compare
+            |    if mine == null then 0i32 else *pa - *pb
+            |
+            |var xs = [2i32, 1i32]
+            |
+            |qsort(ptr_cast(&xs[0]), 2usize, 4usize, &compare)
+            |print(xs[0], xs[1])
+            |""".stripMargin) shouldBe "1 2\n"
+    }
+
+    // Reachability is transitive through an address: the addressed function is kept, and so is
+    // whatever *it* reaches — including another function reached only by its address.
+    "a function reached only through an address that is itself only addressed" in {
+      val out = ir("""extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+                     |
+                     |inner(n: i32) -> i32 = n
+                     |
+                     |compare(a: *u8, b: *u8) -> i32
+                     |    var f: *extern(i32) -> i32 = &inner
+                     |    f(0i32)
+                     |
+                     |var xs = [2i32, 1i32]
+                     |qsort(ptr_cast(&xs[0]), 2usize, 4usize, &compare)
+                     |print(xs[0])
+                     |""".stripMargin)
+
+      out should include("define i32 @compare")
+      out should include("define i32 @inner")
+    }
+
+    "one held in a module-level val" in {
+      run("""double(n: i32) -> i32 = n * 2
+            |
+            |val doubler: *extern(i32) -> i32 = &double
+            |
+            |print(doubler(21))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    /** **A signature cannot be named once**, so every declaration mentioning a callback spells the
+      * whole of it. That is a cost a real binding pays — `signal` alone mentions its handler type
+      * three times — and it is **not this feature's** restriction: `type` declares a constrained
+      * subtype, whose base must be a scalar, so `type Handle = *u8` is refused in exactly the same
+      * words. Both halves are asserted so that a `type` that grows to cover pointers is a test that
+      * fails here and says which one arrived.
+      */
+    "cannot be named once, for the reason no pointer can" in {
+      val fn = err("type Comparison = *extern(*u8, *u8) -> i32\nprint(1)")
+
+      fn should include("a constrained subtype's base must be an integer, a float, or 'char'")
+
+      err("type Handle = *u8\nprint(1)") should
+        include("a constrained subtype's base must be an integer, a float, or 'char'")
+    }
+
+    // A slice of them, which is the table shape a dispatch loop reads.
+    "a slice of them, walked" in {
+      run("""double(n: i32) -> i32 = n * 2
+            |negate(n: i32) -> i32 = 0i32 - n
+            |
+            |var table: &[2]*extern(i32) -> i32 = [&double, &negate]
+            |
+            |sum(fs: []*extern(i32) -> i32, x: i32) -> i32
+            |    var t = 0i32
+            |    for f in fs do t += f(x)
+            |    t
+            |
+            |print(sum(table[..], 10i32))
+            |""".stripMargin) shouldBe "10\n"
+    }
+  }
+
   "what it is not" - {
     /** `*Fn(A) -> R` is an unowned trait object over a callable: two words, a method table beside
       * the value, and an environment at the other end. It stays exactly what it was — this is the
