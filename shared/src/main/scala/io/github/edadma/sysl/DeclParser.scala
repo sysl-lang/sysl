@@ -23,7 +23,7 @@ trait DeclParser extends ExprParser {
    * questions about meaning rather than about shape.
    */
   protected lazy val funcParam: Parser[Param] =
-    at(param ~ opt(op("=") ~> expression) ^^ { case p ~ d => p.copy(default = d) })
+    at(param ~ opt(op("=") ~> expression) ^^ { case p ~ d => p.copy(default = d.map(Placeholders.lift)) })
 
   /** A struct's field, which has no default to declare. Said here rather than left to the
    * "newline expected" a grammar with no place for one would give, because `= v` after a field is a

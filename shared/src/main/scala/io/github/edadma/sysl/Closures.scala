@@ -87,11 +87,21 @@ trait Closures extends CallAnalysis {
     // An annotation is read where one is written and the context supplies the rest. A parameter with
     // neither is the one shape a closure cannot be analyzed at all, and it is reported against the
     // parameter rather than against the literal, since that is where the answer would go.
+    //
+    // A placeholder's parameter is named by the compiler (`12 §5c`), so the advice that fits a
+    // written one — annotate it — names something the program is not able to write. What it is told
+    // instead is the form that has somewhere to put the annotation.
     val ptypes = l.params.zipWithIndex.map { (p, i) =>
       p.typ.map(resolveType(_, tsubst))
         .orElse(want.flatMap((ws, _) => ws.lift(i)))
-        .getOrElse(at(p.pos)(err(s"'${p.name}' has no type here — nothing says what this closure " +
-          s"takes, so write it: '(${p.name}: T) -> …'")))
+        .getOrElse(at(p.pos)(err(
+          if Placeholders.isPlaceholder(p.name) then
+            "this '_' has no type here — nothing says what the closure it stands in takes, so " +
+              "write that closure with a named parameter: '(x: T) -> …'"
+          else
+            s"'${p.name}' has no type here — nothing says what this closure takes, so write it: " +
+              s"'(${p.name}: T) -> …'",
+        )))
     }
 
     lowerClosure(l.params.map(_.name), ptypes, want.flatMap(_._2), l.body, l.pos)

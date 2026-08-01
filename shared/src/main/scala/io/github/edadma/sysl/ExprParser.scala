@@ -75,9 +75,14 @@ trait ExprParser extends SyslParserBase {
 
   /** A closure's body, which is a function's body without the `=`: an expression, or an indented
    * block whose trailing expression is the value.
+   *
+   * The expression form is a statement-level position and closes a placeholder there (`12 §5c`), so
+   * `x -> _ + 1` is a closure yielding a closure rather than one arrow with two parameters. That is
+   * also what lets [[Placeholders.free]] stop at a [[Lambda]]: one can hold no placeholder that is
+   * still looking for its parameter list.
    */
   protected lazy val lambdaBody: PackratParser[List[Stmt]] =
-    suite | expression ^^ (e => List(ExprStmt(e).setPos(e.pos)))
+    suite | expression ^^ (e => List(ExprStmt(Placeholders.lift(e)).setPos(e.pos)))
 
   protected def binOp(sym: String): Parser[(Expr, Expr) => Expr] =
     op(sym) ^^^ ((l: Expr, r: Expr) => Binary(sym, l, r))
@@ -164,8 +169,12 @@ trait ExprParser extends SyslParserBase {
       // A call is the exception: what is wrong with `foo(…)` is nearly always `foo` — it does not
       // exist, or it does not take these arguments — so the callee's own position wins, and the
       // `(` is only the fallback for a callee that somehow has none.
+      // The call is what absorbs a bare `_` argument, which `argument` deliberately left alone, so
+      // the lift happens on the whole call rather than on its parts (`12 §5c`). A call whose
+      // arguments were each big enough to lift where they stood has nothing free left in it, and
+      // this hands it straight back.
       here ~ (op("(") ~> commaList(argument) <~ op(")")) ^^ { case p ~ args =>
-        (e: Expr) => Call(e, args).setPos(e.pos).setPos(p)
+        (e: Expr) => Placeholders.lift(Call(e, args).setPos(e.pos).setPos(p))
       } |
       here <~ op("?") ^^ (p => (e: Expr) => TryExpr(e).setPos(p)) |
       here <~ op("++") ^^ (p => (e: Expr) => PostIncDec("++", e).setPos(p)) |
@@ -196,6 +205,7 @@ trait ExprParser extends SyslParserBase {
   lazy val primary: PackratParser[Expr] =
     at(
       floatLit | intLit | charLit | interpLit | cStrLit | strLit | boolLit | nullLit | layoutOf | selfExpr |
+        placeholderExpr |
         identExpr |
         arrayLit |
         op("(") ~> parenTail,
@@ -238,7 +248,8 @@ trait ExprParser extends SyslParserBase {
    * parameter is refused by the analyzer rather than quietly falling back to the store.
    */
   protected lazy val argument: PackratParser[Expr] =
-    at(ident ~ (op("=") ~> expression) ^^ { case n ~ v => NamedArg(n, v) }) | expression
+    (at(ident ~ (op("=") ~> expression) ^^ { case n ~ v => NamedArg(n, v) }) | expression) ^^
+      Placeholders.liftArg
 
   protected def commaList[T](p: Parser[T]): Parser[List[T]] = commaList1(p) | success(Nil)
 
@@ -257,12 +268,18 @@ trait ExprParser extends SyslParserBase {
     op("[") ~> expression ~ (op(";") ~> expression) <~ op("]") ^^ { case v ~ n => ArrayFill(v, n) } |
       op("[") ~> commaList(expression) <~ op("]") ^^ ArrayLit.apply
 
-  /** After `(`: `)` is unit, one expression is a grouping, more are a tuple. */
+  /** After `(`: `)` is unit, one expression is a grouping, more are a tuple.
+   *
+   * The group is one of the three boundaries a placeholder closes at (`12 §5c`), and it is the one
+   * a program reaches for when the other two fall in the wrong place: `(_ + 1) * 2` multiplies the
+   * closure rather than closing over the product. A tuple is lifted whole, since the parentheses
+   * that delimit it are the same ones.
+   */
   protected lazy val parenTail: PackratParser[Expr] =
     op(")") ^^^ UnitLit() |
       expression ~ rep(op(",") ~> expression) <~ op(")") ^^ {
-        case e ~ Nil  => e
-        case e ~ more => Tuple(e :: more)
+        case e ~ Nil  => Placeholders.lift(e)
+        case e ~ more => Placeholders.lift(Tuple(e :: more).setPos(e.pos))
       }
 
   protected lazy val intLit: Parser[Expr] =
@@ -335,12 +352,19 @@ trait ExprParser extends SyslParserBase {
    *
    * The embedded text is its own little source, so a position inside a hole points into the hole
    * rather than into an unrelated column of the line the string sits on.
+   *
+   * **A hole is therefore a placeholder boundary** (`12 §5c`), and it has to be: the sub-parser
+   * numbers placeholders from zero, so a `_` in a hole and a `_` outside the string would both be
+   * `$ph1` and the lift would build a parameter list naming one thing twice. Closing the hole makes
+   * that unreachable rather than unlikely, since a lifted closure's names never join the outer
+   * tree's free set. What it costs is that a placeholder cannot reach out of a string to close over
+   * the whole of one — the arrow form outside the string is how that is written.
    */
   protected def parseEmbedded(src: String): Either[String, Expr] = {
     val sub = new SyslParser(Source(s"${source.name} (interpolation)", src))
 
     sub.parseExpression match
-      case sub.Success(e, _) => Right(e)
+      case sub.Success(e, _) => Right(Placeholders.lift(e))
       case ns: sub.NoSuccess => Left(s"in interpolation '$src': ${ns.msg}")
   }
 
@@ -350,4 +374,22 @@ trait ExprParser extends SyslParserBase {
   protected lazy val nullLit: Parser[Expr] = op("null") ^^^ NullLit()
 
   protected lazy val identExpr: Parser[Expr] = ident ^^ Ident.apply
+
+  /** `_` in operand position — a closure's parameter with the name left out (`12 §5c`).
+   *
+   * It is tried before [[identExpr]] because `_` lexes as an identifier, and it is matched here
+   * rather than given a token of its own so that the pattern grammar's `_` is untouched: the two
+   * productions never read the same position, so neither has to know about the other.
+   *
+   * What it yields is an ordinary name that the source could not have written, which is what makes
+   * a lifted closure indistinguishable from a written one everywhere downstream. The counter runs
+   * per parser, so the names are unique within the file; a value burned by a production that
+   * backtracked only leaves a gap in the numbering, which nothing reads.
+   */
+  protected lazy val placeholderExpr: Parser[Expr] = wildcard ^^ { _ =>
+    placeholders += 1
+    Ident(Placeholders.fresh(placeholders))
+  }
+
+  private var placeholders = 0
 }
