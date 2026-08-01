@@ -14,6 +14,25 @@ package io.github.edadma.sysl
 
 sealed trait TExpr extends Positioned {
   def ty: Type
+
+  /** The type of the **storage** this node names, as against `ty`, which is the type of the value
+   * read out of it. The two differ only by a `volatile` qualifier (`03 § Device memory`), which the
+   * projection that built the node stripped: a read of a `volatile u32` hands back a `u32`.
+   *
+   * It is recovered from the receiver rather than kept on the node, because the receiver is where
+   * the declaration that wrote the qualifier still is — a struct's field list, an array's element
+   * type, a pointer's pointee. That keeps one statement of the fact instead of two that could drift,
+   * and it is what lets `&regs.status` be a `*volatile u32` and every access through the result stay
+   * an access to a register.
+   */
+  def placeTy: Type = this match
+    case TDeref(operand, t)     => Type.pointee(operand.ty).getOrElse(t)
+    case TIndex(receiver, _, t) => Type.element(receiver.ty).getOrElse(t)
+    case TField(receiver, i, t) =>
+      receiver.ty match
+        case s: Type.Struct if i >= 0 && i < s.fields.length => s.fields(i)._2
+        case _                                               => t
+    case _ => ty
 }
 
 /** An integer, `char`, or simple-enum constant — anything whose value is one whole number. */

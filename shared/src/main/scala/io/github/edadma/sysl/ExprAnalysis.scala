@@ -417,12 +417,14 @@ trait ExprAnalysis
     case Unary("&", e) =>
       val place = analyzePlace(e, "'&'", writes = false)
       checkAddressable(place)
-      TAddrOf(place, Type.Ptr(place.ty))
+      // The address of a register is an address *of a register*, so the qualifier travels with it and
+      // every access through the result stays an access to a device (`03 § Device memory`).
+      TAddrOf(place, Type.Ptr(place.placeTy))
 
     case Unary("*", e) =>
       val t = analyzeExpr(e)
       Type.pointee(t.ty) match
-        case Some(inner)                => TDeref(t, inner)
+        case Some(inner)                => TDeref(t, Type.unqualified(inner))
         // A trait object points somewhere, but it has forgotten what is there, so there is no type
         // to read out — its methods are the whole of what it still offers.
         case None if Type.erased(t.ty) =>
@@ -874,7 +876,7 @@ trait ExprAnalysis
    */
   protected def autoDeref(t: TExpr): TExpr =
     Type.pointee(t.ty) match
-      case Some(inner) => TDeref(t, inner)
+      case Some(inner) => TDeref(t, Type.unqualified(inner))
       case None        => t
 
   /** How a diagnostic names an assignment target. */

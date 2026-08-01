@@ -28,6 +28,11 @@ trait ConstFolding extends ImportResolution {
    */
   protected def resolveType(t: TypeRef, subst: Map[String, Type]): Type
 
+  /** The same, in one of the positions that may carry a `volatile` qualifier — a struct field among
+   * them, which is why this is visible from here.
+   */
+  protected def resolveQualified(t: TypeRef, subst: Map[String, Type]): Type
+
   /** Recognising a scalar type name, which is all a constant may be declared as. */
   protected def scalarType(name: String): Option[Type]
 

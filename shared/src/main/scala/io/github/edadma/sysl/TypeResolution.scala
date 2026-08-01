@@ -109,6 +109,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case RefType(inner, sync)               => RefType(spellSelf(inner, selfRef), sync)
     case WeakType(inner)                    => WeakType(spellSelf(inner, selfRef))
     case ArrayType(len, elem, ro)           => ArrayType(len, spellSelf(elem, selfRef), ro)
+    case VolatileType(inner)                => VolatileType(spellSelf(inner, selfRef))
     case TupleType(parts, r)                => TupleType(parts.map(spellSelf(_, selfRef)), r)
     case f: FnType =>
       f.copy(params = f.params.map(spellSelf(_, selfRef)), ret = spellSelf(f.ret, selfRef))
@@ -124,6 +125,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case RefType(inner, _)  => mentions(inner, tps)
     case WeakType(inner)    => mentions(inner, tps)
     case ArrayType(_, elem, _) => mentions(elem, tps)
+    case VolatileType(inner) => mentions(inner, tps)
     case TupleType(parts, _) => parts.exists(mentions(_, tps))
     case f: FnType          => mentions(f.asTrait, tps)
     case CFnType(params, ret) => params.exists(mentions(_, tps)) || mentions(ret, tps)
@@ -273,10 +275,62 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case TupleType(parts, true) => Type.Results(tupleType(parts.map(resolveType(_, subst))))
     case _                      => resolveType(t, subst)
 
+  /** Resolves a type in one of the three positions a `volatile` qualifier may stand: the pointee of
+   * a `*T`, an element, and a struct field (`03 § Device memory`).
+   *
+   * What the three have in common is that the storage being named is **somebody else's** — a device's
+   * registers, reached through an address the program was handed. Everywhere else a type is resolved
+   * through `resolveType`, whose own `VolatileType` case says why the qualifier means nothing there.
+   */
+  protected def resolveQualified(t: TypeRef, subst: Map[String, Type]): Type = t match
+    case VolatileType(inner) => at(t.pos)(Type.Volatile(volatileScalar(resolveType(inner, subst))))
+    case other               => resolveType(other, subst)
+
+  /** Holds what a `volatile` was written on to a scalar or a raw pointer.
+   *
+   * The qualifier says the compiler must emit exactly the accesses the source wrote, which is a
+   * promise about **one** load and **one** store — so it is only meaningful where an access is one
+   * instruction. An aggregate is qualified by qualifying the fields of it that are registers, which
+   * is what every device header does and what lets a shadow field opt out; anything counted is
+   * refused outright, since a retain that may not be elided is not a request anybody can act on.
+   */
+  private def volatileScalar(t: Type): Type = Type.underlying(t) match
+    case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool => t
+    // A trait object is two words, so an access to one is two accesses however it is written — which
+    // is the one promise the qualifier makes, and the one it could not keep here. It is also nothing
+    // a device could have put there: what the second word points at is a method table this compiler
+    // emitted.
+    case _ if Type.erased(t) =>
+      err(s"'volatile ${show(t)}' is not a type: an object over a trait is a pair of words, so " +
+        "touching one is two accesses whatever the source says — and the table beside the value is " +
+        "this program's, not a device's")
+    case _: Type.Ptr | _: Type.CFn                                  => t
+    case _: Type.Ref | _: Type.Weak | _: Type.View =>
+      err(s"'volatile ${show(t)}' is not a type: the qualifier says every access is emitted exactly " +
+        "as written, and a counted value's accesses come with retains and releases that no rule " +
+        "here could hold still — device memory is reached with a raw pointer")
+    case _: Type.Struct =>
+      err(s"'volatile ${show(t)}' is not a type: a register block is qualified one field at a time, " +
+        s"so write 'volatile' on the fields of '${show(t)}' that are registers — which is also what " +
+        "lets a shadow field in the middle of one stay ordinary")
+    case _ =>
+      err(s"'volatile ${show(t)}' is not a type: 'volatile' qualifies a scalar or a raw pointer, " +
+        "since it promises the one load or the one store the source wrote and nothing else")
+
   private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
     case PtrType(inner) =>
       traitObject(inner, subst, "*")
-        .fold(Type.Ptr(addressable(underIndirection(resolveType(inner, subst)), "'*'")))(Type.Ptr.apply)
+        .fold(Type.Ptr(addressable(underIndirection(resolveQualified(inner, subst)), "'*'")))(Type.Ptr.apply)
+
+    // Everywhere but a field, an element, and a pointee, what is being named is a **value** — what a
+    // binding holds, what a parameter receives, what a call hands back — and a value read out of a
+    // volatile place is an ordinary value. There is nothing left for the qualifier to say by then,
+    // so writing it there would read as a promise about accesses that have already happened.
+    case VolatileType(inner) =>
+      err(s"'volatile ${inner.show}' is the type of *storage*, and this is a value — what a read of a " +
+        s"volatile place hands back is an ordinary '${inner.show}'. The qualifier goes where the " +
+        s"storage is named: a struct field, an element, or the pointee of a '*T', as " +
+        s"'*volatile ${inner.show}'")
     // An atomic reference promises that a second domain may hold the object, which is a promise
     // about everything the object holds (`06 § &sync T`). A trait object is the one shape whose
     // contents are not known here — the type it forgot is settled where a value is erased into one,
@@ -296,14 +350,14 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     // An array holds its elements, so it is no indirection at all and a type cannot contain an
     // array of itself. A slice only points at them, so it breaks a cycle exactly as `*T` does.
     case ArrayType(None, elem, ro) =>
-      Type.Slice(addressable(underIndirection(resolveType(elem, subst)), "a slice"), readOnly = ro)
+      Type.Slice(addressable(underIndirection(resolveQualified(elem, subst)), "a slice"), readOnly = ro)
     // A bound is a compile-time constant, which a `const` is and a call is not (`13 §7`).
     case ArrayType(Some(len), elem, _) =>
       val n = constInt(len) match
         case Some(v) if v >= 0 && v.isValidInt => v.toInt
         case Some(v)                           => err(s"an array cannot have $v elements")
         case None => err("an array length must be a constant — a literal, or a 'const' naming one")
-      Type.Array(n, addressable(resolveType(elem, subst), "an array"))
+      Type.Array(n, addressable(resolveQualified(elem, subst), "an array"))
 
     // A tuple holds its parts the way a struct holds its fields, so a part is resolved exactly as a
     // field is — a `unit` part included, which the layout skips and the parts after it shift past.
@@ -573,6 +627,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case RefType(i, _)       => mentionsAny(i, names)
     case WeakType(i)         => mentionsAny(i, names)
     case ArrayType(_, e, _)  => mentionsAny(e, names)
+    case VolatileType(i)     => mentionsAny(i, names)
     case TupleType(parts, _) => parts.exists(mentionsAny(_, names))
     case f: FnType           => mentionsAny(f.asTrait, names)
     case CFnType(ps, r)      => ps.exists(mentionsAny(_, names)) || mentionsAny(r, names)

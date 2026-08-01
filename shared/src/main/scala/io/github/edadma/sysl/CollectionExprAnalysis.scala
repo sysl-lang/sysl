@@ -158,7 +158,9 @@ trait CollectionExprAnalysis extends ExprSupport {
           // indexes without a cast. A derived one does not: `new` is nominal, and reaching the base
           // is exactly what a written conversion is for.
           Type.repr(ti.ty) match
-            case i: Type.Integer => TIndex(tr, checkedIndexWidth(ti, i), elem)
+            // The element's qualifier stays on the receiver's type and comes off the value read out
+            // of it, exactly as a field's does (`03 § Device memory`).
+            case i: Type.Integer => TIndex(tr, checkedIndexWidth(ti, i), Type.unqualified(elem))
             case other           => err(s"an index must be an integer, not ${show(other)}")
 
         // A type with no elements of its own is indexed through `Index`, whose one method the

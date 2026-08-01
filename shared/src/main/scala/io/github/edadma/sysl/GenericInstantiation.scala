@@ -121,7 +121,7 @@ trait GenericInstantiation extends ConstFolding {
         // The `finally` is what keeps the resolver's own bookkeeping honest whatever happens
         // here: an entry left in `inProgress` would make the next mention of this type look
         // like a cycle, which is a diagnostic about nothing at all.
-        try s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveType(f.typ, subst))))
+        try s.fields = decl.fields.map(f => (f.name, recover(Type.Unknown)(resolveQualified(f.typ, subst))))
         finally
           resolving -= key
           inProgress -= key
@@ -329,6 +329,7 @@ trait GenericInstantiation extends ConstFolding {
       actual match
         case Type.Array(_, e) => unify(elem, e, tparams, sub)
         case _                => ()
+    case VolatileType(inner) => unify(inner, Type.unqualified(actual), tparams, sub)
     case TupleType(parts, _) =>
       actual match
         case t: Type.Tuple if t.targs.length == parts.length =>
@@ -350,8 +351,13 @@ trait GenericInstantiation extends ConstFolding {
     // A trait never binds a type parameter. `f[T](p: *T)` handed a `*Writer` would otherwise
     // instantiate at a type with no layout, and the body could then write `var v: T` for a value
     // that cannot exist; leaving it unsolved reports the inference failure instead.
+    // A qualifier is dropped on the way into a parameter, so `f[T](xs: []T)` handed a
+    // `[]volatile u32` solves `T` as `u32` — and then the argument does not agree with the `[]u32`
+    // that instantiation asks for, which is the message worth reading. Binding `T` to the qualified
+    // type instead would let a generic body promise accesses it cannot promise: the loads and stores
+    // it emits are its own, not the ones the caller wrote (`03 § Device memory`).
     case NamedType(n, Nil) if tparams(n) =>
-      if !sub.contains(n) && !actual.isInstanceOf[Type.Trait] then sub(n) = actual
+      if !sub.contains(n) && !actual.isInstanceOf[Type.Trait] then sub(n) = Type.unqualified(actual)
     // The reference is the declaration's, written in the declaration's terms, so the name it uses
     // is matched against the resolved type by the key it names here — a `Pair[T]` parameter is its
     // own module's `Pair`, whichever module the call that supplied the argument was written in.

@@ -343,6 +343,11 @@ class SyslParser(val source: Source) extends DeclParser {
               s"one — read-only storage is declared with 'val', as 'val name: [N]${t.show}'")
           case n ~ ro ~ t => success(ArrayType(n, t, readOnly = ro.isDefined))
         }) |
+        // `volatile T` (`03 § Device memory`). It stays a soft word like `sync`, so it is special
+        // only in front of another type — a program with a type of its own named `volatile` still
+        // parses, since this alternative needs a second type after the word and the name
+        // alternative below picks up what is left.
+        softVolatile ~> coreType ^^ VolatileType.apply |
         tupleType |
         qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => NamedType(n, args.getOrElse(Nil)) },
     )
@@ -379,6 +384,9 @@ class SyslParser(val source: Source) extends DeclParser {
 
   protected lazy val softSync: Parser[Unit] =
     accept("'sync'", { case t: lexical.Identifier if t.chars == "sync" => () })
+
+  protected lazy val softVolatile: Parser[Unit] =
+    accept("'volatile'", { case t: lexical.Identifier if t.chars == "volatile" => () })
 
   /** `Fn` stays a soft word for the reason `sync` does: it is only special immediately before a
    * parenthesized parameter list, so a program with a type of its own named `Fn` still parses.

@@ -477,6 +477,7 @@ trait HoistImpl extends ImplConformance {
     case RefType(inner, _)   => subjectHomes(inner)
     case WeakType(inner)     => subjectHomes(inner)
     case ArrayType(_, elem, _) => subjectHomes(elem)
+    case VolatileType(inner) => subjectHomes(inner)
     case TupleType(parts, _) => Set(None) ++ parts.flatMap(subjectHomes)
     case f: FnType           => subjectHomes(f.asTrait)
     // A function pointer belongs to no module — its parts may, so they are what is asked.

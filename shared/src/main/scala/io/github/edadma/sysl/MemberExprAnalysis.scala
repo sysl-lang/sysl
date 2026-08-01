@@ -79,7 +79,9 @@ trait MemberExprAnalysis extends ExprSupport {
           val idx = s.fieldIndex(f)
           if idx >= 0 then
             checkFieldVisible(s.base, f)
-            TField(tr, idx, s.fields(idx)._2)
+            // Whatever qualifier the field was declared with stays in the struct's field list and
+            // comes off here: reading a register yields an ordinary value (`03 § Device memory`).
+            TField(tr, idx, Type.unqualified(s.fields(idx)._2))
           else readProperty(tr, s, f)
 
         // An enum has no fields to shadow a member, so every name read off one is a property.

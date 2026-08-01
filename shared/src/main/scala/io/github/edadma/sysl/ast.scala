@@ -212,6 +212,7 @@ sealed trait TypeRef extends Positioned {
     case ArrayType(None, elem, ro)           => s"[]${if ro then "const " else ""}${elem.show}"
     case ArrayType(Some(IntLit(n, _)), e, _) => s"[$n]${e.show}"
     case ArrayType(Some(_), elem, _)         => s"[…]${elem.show}"
+    case VolatileType(inner)              => s"volatile ${inner.show}"
     case TupleType(parts, false)          => s"(${parts.map(_.show).mkString(", ")})"
     case TupleType(parts, true)           => parts.map(_.show).mkString(", ")
     case FnType(List(one), ret, true)     => s"${one.show} -> ${ret.show}"
@@ -243,6 +244,17 @@ case class WeakType(inner: TypeRef) extends TypeRef
  * goes would say a program had a type called "const T".
  */
 case class ArrayType(length: Option[Expr], elem: TypeRef, readOnly: Boolean = false) extends TypeRef
+
+/** `volatile T` — storage a device may change and a read of which may itself do something
+ * (`03 § Device memory`).
+ *
+ * It goes *before* the type rather than after a sigil, the way C's qualifier does and the way
+ * `[]const T`'s does not, because it qualifies the type it is written on rather than the mode
+ * reaching it: `*volatile u32` points at a volatile register, while a `volatile *u32` would be a
+ * pointer that itself sits in device memory. Both are writable and they are different things, which
+ * is the whole reason the position carries meaning.
+ */
+case class VolatileType(inner: TypeRef) extends TypeRef
 
 /** `a, b` where a function's own result list is what is being produced (`12 §5b`) — the callee's
  * side of the form. It is never a value: the analyzer accepts it only where the enclosing

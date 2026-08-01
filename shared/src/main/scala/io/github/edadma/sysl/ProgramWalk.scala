@@ -555,7 +555,10 @@ trait ProgramWalk
     case s: Type.Struct                                            => s.fields.forall(f => uncounted(f._2))
     case e: Type.Enum        => e.variants.forall(_.fields.forall(f => uncounted(f._2)))
     case c: Type.Constrained => uncounted(c.base)
-    case _                   => true
+    // A qualifier says how storage is reached, never what is in it, so the answer is the answer for
+    // what it qualifies — which is always yes, since only a scalar or a raw pointer may carry one.
+    case Type.Volatile(inner) => uncounted(inner)
+    case _                    => true
 
   /** Whether an initializer is a value the object file can carry as it stands: numbers, and the
    * arrays built from them. Everything else is code, which is what `13 §7`'s initialization order is

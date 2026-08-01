@@ -222,6 +222,45 @@ object Type {
     override def toString: String = s"*extern(${params.mkString(", ")}) -> $ret"
   }
 
+  /** `volatile T` — storage whose reads and writes are **effects rather than value computations**
+   * (`03 § Device memory`).
+   *
+   * It qualifies the storage, not the value: what comes back out of a `volatile u32` is an ordinary
+   * `u32`, so this is stripped the moment a place is projected and never becomes the type of an
+   * expression. Where it survives is inside the composites that *name* somebody else's storage — the
+   * pointee of a `*T`, an array or view element, a struct field — which is exactly where a program
+   * has said the storage is a device's rather than its own.
+   *
+   * It lowers to nothing at all: `llvm` delegates, so a register block lays out as the plain struct
+   * it looks like. What the qualifier changes is the instruction that reaches it, and only that.
+   */
+  case class Volatile(inner: Type) extends Type {
+    def llvm: String = inner.llvm
+  }
+
+  /** A type with any `volatile` taken off the front of it — the type of the **value** read out of a
+   * place, as against the type of the place itself. Idempotent, and applied without asking.
+   */
+  def unqualified(t: Type): Type = t match
+    case Volatile(inner) => unqualified(inner)
+    case other           => other
+
+  /** Whether touching storage of this type is an effect, so the access is emitted exactly as
+   * written.
+   *
+   * It looks **through** an array, a struct, and an enum, because a whole-aggregate copy of a
+   * register block reads every register in it and that read is as much an effect as reading one
+   * would be. It does **not** look through a `*T` or a `&T`: copying a pointer at device memory
+   * touches no device, and what is at the far end is the far end's business.
+   */
+  def volatileIn(t: Type): Boolean = t match
+    case _: Volatile         => true
+    case Array(_, elem)      => volatileIn(elem)
+    case s: Struct           => s.fields.exists(f => volatileIn(f._2))
+    case e: Enum             => e.variants.exists(_.fields.exists(f => volatileIn(f._2)))
+    case c: Constrained      => volatileIn(c.base)
+    case _                   => false
+
   /** `&T` — a reference to a reference-counted heap object, and `&sync T` when its refcount is
    * atomic so the reference may cross a concurrency domain. The two are distinct types with no
    * conversion either way: atomicity is fixed when the object is allocated.
@@ -373,6 +412,7 @@ object Type {
     case CFn(ps, r)               => s"*extern(${ps.map(show).mkString(", ")}) -> ${show(r)}"
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem, ro)          => s"[]${if ro then "const " else ""}${show(elem)}"
+    case Volatile(inner)          => s"volatile ${show(inner)}"
     case Abstract(n, _)           => n
     // A call trait is spelled the way it is written rather than the way it is filed, so nothing a
     // reader is told names the arity-carrying declaration behind it (`12 §6`).
@@ -414,6 +454,7 @@ object Type {
     case Weak(inner)      => mentionsAbstract(inner)
     case Array(_, elem)   => mentionsAbstract(elem)
     case Slice(elem, _)   => mentionsAbstract(elem)
+    case Volatile(inner)  => mentionsAbstract(inner)
     case CFn(ps, r)       => ps.exists(mentionsAbstract) || mentionsAbstract(r)
     case _                => false
 
@@ -659,6 +700,11 @@ object Type {
    */
   def repr(t: Type): Type = t match
     case c: Constrained if !c.derived => repr(c.base)
+    // A qualifier says how the storage is reached, never what is in it, so a `volatile u32` agrees
+    // with a `u32` for every question about the value. The distinction that has to survive is the
+    // one *inside* a mode — a `*volatile u32` is not a `*u32` — and stripping at the top leaves that
+    // alone, since neither of those is stripped at all.
+    case Volatile(inner)              => repr(inner)
     case _                            => t
 
   /** Every constrained subtype seen as its ultimate base representation — the identity for explicit
@@ -666,8 +712,9 @@ object Type {
    * type too, since a written conversion (`f64(m)`) is exactly the licence to reach the base.
    */
   def underlying(t: Type): Type = t match
-    case c: Constrained => underlying(c.base)
-    case _              => t
+    case c: Constrained  => underlying(c.base)
+    case Volatile(inner) => underlying(inner)
+    case _               => t
 
   /** The source-level spelling of an instantiated named type: `Box`, `Result[int, string]`. */
   def qualified(base: String, targs: List[Type]): String =
@@ -701,6 +748,10 @@ object Type {
     // checked, and reusing that analysis is the way the bit stops meaning anything.
     case Slice(elem, false) => s"slice.${mangleOne(elem)}"
     case Slice(elem, true)  => s"constslice.${mangleOne(elem)}"
+    // Mangled for the reason the read-only bit is: `*volatile u32` and `*u32` lay out identically
+    // and are reached by different instructions, so an instantiation at one must never share a body
+    // with an instantiation at the other.
+    case Volatile(inner)    => s"volatile.${mangleOne(inner)}"
     case Trait(n, args)    => mangled(n, args)
     // The signature is part of the name for the reason a generic's arguments are: two of these are
     // the same type only where they are called the same way, and a mangled name that dropped the

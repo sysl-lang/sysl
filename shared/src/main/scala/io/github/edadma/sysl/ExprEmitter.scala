@@ -201,8 +201,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // Nothing is stored for a zero-sized value, so its zero is nothing at all — the same empty
     // register every other read of one yields.
     case t if Type.zeroSized(t) => ""
-    // A constrained subtype is laid out as its base, so its zero is the base's zero.
-    case c: Type.Constrained => zero(Type.underlying(c))
+    // A constrained subtype is laid out as its base, so its zero is the base's zero, and a qualified
+    // one is laid out as what it qualifies.
+    case c: Type.Constrained  => zero(Type.underlying(c))
+    case Type.Volatile(inner) => zero(inner)
     case _: Type.Integer  => "0"
     case _: Type.Floating => "0.0"
     case Type.Char        => "0"
@@ -320,9 +322,9 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       fillElements(sliceTy.elem, data, n, v)
       bufferView(sliceTy, box, data, n)
 
-    case TIndex(receiver, index, ty) =>
+    case e @ TIndex(receiver, index, ty) =>
       val p = elementAddr(receiver, index)
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
+      val r = freshTemp(); emit(s"$r = load${vol(e)} ${ty.llvm}, ptr $p"); r
 
     case TSlice(base, lo, hi, inclusive, sliceTy) =>
       genSlice(base, lo, hi, inclusive, sliceTy)
@@ -387,7 +389,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case TLoad(_, ty) if Type.zeroSized(ty) => ""
 
     case TLoad(name, ty) =>
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %$name.addr"); r
+      val r = freshTemp(); emit(s"$r = load${qualifier(ty)} ${ty.llvm}, ptr %$name.addr"); r
 
     case TResult(_) =>
       resultSSA.getOrElse(sys.error("'result' lowered outside an ensure postcondition"))
@@ -396,11 +398,11 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %old.$index.addr"); r
 
     case TGlobal(symbol, ty, _) =>
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr @$symbol"); r
+      val r = freshTemp(); emit(s"$r = load${qualifier(ty)} ${ty.llvm}, ptr @$symbol"); r
 
-    case TDeref(operand, ty) =>
+    case e @ TDeref(operand, ty) =>
       val p = payloadAddr(operand)
-      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
+      val r = freshTemp(); emit(s"$r = load${vol(e)} ${ty.llvm}, ptr $p"); r
 
     case TAddrOf(place, _) =>
       address(place)
@@ -416,12 +418,13 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case TStore(place, value, ty) =>
       val v = genExpr(value)
       val p = address(place)
-      storeInto(ty, p, v)
+      storeInto(ty, p, v, vol(place))
       v
 
     case TUpdate(place, op, value, ty, dispatch, check) =>
+      val q       = vol(place)
       val p       = address(place)
-      val cur     = freshTemp(); emit(s"$cur = load ${ty.llvm}, ptr $p")
+      val cur     = freshTemp(); emit(s"$cur = load$q ${ty.llvm}, ptr $p")
       val v       = genExpr(value)
       val updated = combine(op, ty, value.ty, dispatch, cur, v)
 
@@ -429,20 +432,21 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
       if containsRef(ty) then
         retainValue(ty, updated)
-        emit(s"store ${ty.llvm} $updated, ptr $p")
+        emit(s"store$q ${ty.llvm} $updated, ptr $p")
         releaseValue(ty, cur)
-      else emit(s"store ${ty.llvm} $updated, ptr $p")
+      else emit(s"store$q ${ty.llvm} $updated, ptr $p")
       updated
 
     case TIncDec(place, op, pre, ty, check) =>
       val w   = ty.llvm
+      val q   = vol(place)
       val p   = address(place)
-      val cur = freshTemp(); emit(s"$cur = load $w, ptr $p")
+      val cur = freshTemp(); emit(s"$cur = load$q $w, ptr $p")
       val nv  = freshTemp(); emit(s"$nv = ${if op == "++" then "add" else "sub"} $w $cur, 1")
 
       for c <- check do emitConstraintChecks(nv, c)
 
-      emit(s"store $w $nv, ptr $p")
+      emit(s"store$q $w $nv, ptr $p")
       if pre then nv else cur
 
     case TStr(arg) =>
@@ -773,6 +777,13 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
     case TField(receiver, _, ty) if Type.zeroSized(ty) =>
       genExpr(receiver); ""
+
+    // A register is reached at its own address, because the ordinary lowering below would read the
+    // whole block to get at one field of it — and reading a register block is not a way of reading
+    // one register (`03 § Device memory`).
+    case e @ TField(receiver, _, ty) if Type.volatileIn(e.placeTy) && hasAddress(receiver) =>
+      val p = address(e)
+      val r = freshTemp(); emit(s"$r = load volatile ${ty.llvm}, ptr $p"); r
 
     case TField(receiver, index, ty) =>
       val rv = genExpr(receiver); val r = freshTemp()

@@ -13,6 +13,36 @@ package io.github.edadma.sysl
  */
 trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
 
+  /** The marker that goes on the load or the store reaching a place, which is the whole of what
+   * `volatile` costs (`03 § Device memory`).
+   *
+   * It is asked of the place rather than of the value, because that is where the qualifier lives:
+   * `regs.status` has type `u32` and sits in storage of type `volatile u32`, and the difference
+   * between those two is exactly this word.
+   */
+  protected def vol(place: TExpr): String = qualifier(place.placeTy)
+
+  /** The same marker read off a type directly, for the paths that have the storage's type and not
+   * the node it came from.
+   */
+  protected def qualifier(storage: Type): String = if Type.volatileIn(storage) then " volatile" else ""
+
+  /** Whether `address` can walk to this node without giving it a slot of its own first — which is
+   * every place, and nothing else.
+   *
+   * It exists because reading a field is lowered two ways. Ordinarily the receiver is produced as a
+   * value and the field lifted out of it with `extractvalue`, which is one instruction and needs no
+   * address. A **register** cannot be read that way: lifting one field out of a register block would
+   * mean loading the whole block, and reading a status register is not how you find out what is in a
+   * data register. So a volatile field is reached by walking to its address instead — which is only
+   * possible when the receiver has one.
+   */
+  protected def hasAddress(e: TExpr): Boolean = e match
+    case _: TLoad | _: TGlobal | _: TDeref => true
+    case _: TIndex                         => true
+    case TField(receiver, _, _)            => hasAddress(receiver)
+    case _                                 => false
+
   /** The address of a place, as a `ptr` register or an existing slot name. Every place bottoms
    * out either in a local's stack slot or in a pointer the program already holds, so this walks
    * the field chain with `getelementptr` rather than reading values out with `extractvalue`.
@@ -47,13 +77,13 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * and lets go of the one leaving, in that order, so assigning something to itself never briefly
    * drops the last count.
    */
-  protected def storeInto(ty: Type, p: String, v: String): Unit =
+  protected def storeInto(ty: Type, p: String, v: String, q: String = ""): Unit =
     if containsRef(ty) then
-      val old = freshTemp(); emit(s"$old = load ${ty.llvm}, ptr $p")
+      val old = freshTemp(); emit(s"$old = load$q ${ty.llvm}, ptr $p")
       retainValue(ty, v)
-      emit(s"store ${ty.llvm} $v, ptr $p")
+      emit(s"store$q ${ty.llvm} $v, ptr $p")
       releaseValue(ty, old)
-    else emit(s"store ${ty.llvm} $v, ptr $p")
+    else emit(s"store$q ${ty.llvm} $v, ptr $p")
 
   /** `a, b = b, a` (`00 §2`), in the phases the form promises.
    *
@@ -84,7 +114,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     val curs = writes.zip(addrs).map { (w, p) =>
       if w.op == "=" || p.isEmpty then ""
       else
-        val c = freshTemp(); emit(s"$c = load ${w.place.ty.llvm}, ptr $p")
+        val c = freshTemp(); emit(s"$c = load${vol(w.place)} ${w.place.ty.llvm}, ptr $p")
         held(c, w.place.ty)
     }
     val vals = writes.map(w => held(genExpr(w.value), w.value.ty))
@@ -92,8 +122,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     for ((w, p), (cur, v)) <- writes.zip(addrs).zip(curs.zip(vals)) do
       if p.nonEmpty then
         val ty = w.place.ty
+        val q  = vol(w.place)
 
-        if w.op == "=" then storeInto(ty, p, v)
+        if w.op == "=" then storeInto(ty, p, v, q)
         else
           val updated = combine(w.op, ty, w.value.ty, w.dispatch, cur, v)
 
@@ -103,9 +134,9 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
           // rather than of a second load — which is `TUpdate`'s arrangement, for its reason.
           if containsRef(ty) then
             retainValue(ty, updated)
-            emit(s"store ${ty.llvm} $updated, ptr $p")
+            emit(s"store$q ${ty.llvm} $updated, ptr $p")
             releaseValue(ty, cur)
-          else emit(s"store ${ty.llvm} $updated, ptr $p")
+          else emit(s"store$q ${ty.llvm} $updated, ptr $p")
 
     for (recv, struct, invFn) <- writes.flatMap(_.check).distinct do
       emitInvCheck(genExpr(recv), struct, invFn)
