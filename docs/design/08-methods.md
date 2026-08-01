@@ -251,10 +251,12 @@ either without the parentheses is told which it is and what to write, the way a 
 is.
 
 A user `struct` or `enum` is the case that declares its members in its own body; the built-ins are
-the case where the body is the language. **A built-in has no name in call position for a member**,
-which is why the fallible `u32` → `char` constructor `00 §1` asks for is not the `char.try` that
-chapter first named: it met the same obstacle `string.from_utf8` met and took the same answer, a
-free function (`char_from_u32`). Nothing here is specified and unbuilt.
+the case where the body is the language. A built-in has no body to write members in, so what it has
+comes from an `impl` — and since such a block may now carry a member with no receiver, `u32.bits()`
+is a call and the obstacle that sent the fallible `u32` → `char` constructor to a free function
+(`char_from_u32`) is gone as an obstacle. It is not *only* that: every `impl` is for a trait, so
+`char.try(n)` would need a trait declaring a `try`, which is a stranger thing than the free function
+that exists. Recorded so that the reason is the current one; nothing here is specified and unbuilt.
 
 A compiler-provided member is reached **ahead of** the member table rather than through it, which is
 what puts these names out of reach for an `impl` (`02`): a member declared as `len` on a slice or
@@ -312,10 +314,16 @@ Cursor.none()`. A parameter that neither route reaches is an error at the call, 
 it could not infer; the bound the type wrote on that parameter is checked against what was inferred,
 in the type's name, because the type is where it is written.
 
-Only a struct or an enum has a name that appears in call position, so an associated function is
-declared on one of those or on an `impl` block for one. A block for a built-in or for a composed
-type (`impl[T] Make for []T`) has no name a call could reach it through, and one written there is
-refused at the declaration rather than left as a member nothing could use.
+An associated function needs a name a call can appear in front of, and every type that *has* a name
+may declare one — a struct, an enum, a constrained subtype, and a built-in: `u32.bits()` and
+`real.epsilon()` are calls the same shape as `Box.of(41)`. Through a bound the name is the type
+**parameter**, which is what `02 § Reaching a trait's members without a value` is about, and it is
+the reason a built-in may carry one at all.
+
+A **composed** type is what is left over. `[]int` is a type an `impl` may be written for and not
+something that can stand in call position, and a block matching a shape (`impl[T] Make for []T`) is
+for a whole family at once. A member with no receiver written in either is refused at the
+declaration rather than left as one nothing could use.
 
 A member may introduce **type parameters of its own**, beyond the type's, written in the same
 bracketed list every other generic declaration uses and in the same place — directly after the
@@ -462,8 +470,10 @@ while a public method of that same struct may not, exactly as a public function 
 
 - **Settable properties.** A property is read-only. A getter/setter pair, so that `p.name = v`
   runs code, is a later addition; until then a value that must be written is a field.
-- **Static (type-level) properties and stored associated constants.** Associated *functions*
-  exist; a type-level constant or computed property (`int.max`, `Point.origin` without the call)
-  is deferred with settable properties, since both turn on the same accessor machinery.
+- **Static (type-level) properties and stored associated constants.** An associated *function*
+  reaches everything one would — `real.max_value()`, `Point.origin()` — and a trait may declare one,
+  so what is deferred is only the spelling without the parentheses (`int.max`, `Point.origin`). It
+  waits on settable properties, since both turn on the same accessor machinery, and it is cosmetic
+  rather than a gap in what can be expressed.
 - **Default trait method bodies and trait-level invariants** — those are `02`'s open items, not
   this document's.

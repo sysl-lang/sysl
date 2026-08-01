@@ -732,6 +732,20 @@ object Type {
    */
   def mangle(t: Type): String = mangleOne(t)
 
+  /** The prefix a type's **members** are emitted under, which is the mangling for every type but
+   * one.
+   *
+   * A transparent constrained subtype mangles as its base, deliberately: sharing a representation
+   * is what makes `Vec[Meters]` and `Vec[f64]` one instantiation rather than two identical ones.
+   * Members are the place that rule must not reach — `Age`'s and `int`'s are different bodies, and
+   * naming both `int.describe` gives one symbol two definitions. So a member of a constrained type
+   * is prefixed with the type's own name whichever kind it is, which is also the key its members
+   * are filed under, so a call built from the key and a definition built from the type agree.
+   */
+  def memberSymbol(t: Type): String = t match
+    case c: Constrained => show(c)
+    case other          => mangleOne(other)
+
   /** A memory mode is mangled as a word rather than its sigil, since `*` and `&` are not
    * LLVM-name characters.
    */

@@ -707,38 +707,49 @@ trait rather than only through the operator catalog.
 
 ## Reaching a trait's members without a value
 
-**A type parameter is not a name a call can be written through**, so everything a bound licenses is
-reached through a *value* of the parameter. `T.bits()` is "undefined name 'T'"; and on the other
-side an associated function on a built-in cannot even be declared, since only a struct or an enum
-has a name in call position (`08`). Between them there is no way at all to ask a bound for something
-about the type rather than about a value of it.
+A trait may declare a member with **no receiver** — an associated function — and it is reached
+through the *type* rather than through a value of one:
 
-That is a real gap and `guide/sha2` is what makes it plain. SHA-256 and SHA-512 are one body at two
-widths, and the differences between them — the width, the round count, the table of constants, the
-four mixing functions — are facts about `u32` and `u64` rather than about any particular word. All
-of them have to be trait members carrying a receiver they do not read, and the compression asks
-`self.h[0].bits` for the width of the type it was instantiated at. It works, and it costs nothing at
-run time, and it reads like a workaround because it is one.
+```
+trait Word: Add + Shl + Shr
+    bits() -> Self
+    zero() -> Self
 
-What this wants is a trait member with **no receiver** — an associated function, or the type-level
-constant `08 § Not yet` defers — reachable as `T.bits` where `T` is a bounded parameter. Three
-things have to be decided with it, and none is decided here:
+    shift_in(self, b: u8) -> Self
 
-- **A built-in has to be able to carry one.** The declaration rule above exists because a call needs
-  a name; through a bound the name is the *parameter*, which every type has whether or not it has
-  one of its own. So the rule that refuses `impl Word for u32`'s associated function is about the
-  call site rather than about the `impl`, and reaching it through a bound removes the objection.
-- **It is static dispatch only.** Object safety (§ Object safety) excludes a member with no receiver
-  from a trait object, and that does not change: `*Word` cannot have a slot for something no value
-  selects. A trait that declares one is usable as a bound and not as an object, exactly as one that
-  mentions `Self` twice already is.
-- **It is the same shortfall as "a bound promises behaviour, never a value"** (`14 §7`), one step
-  further along. That entry's three customers want a *value* of `T`; this wants a value **and** a
-  way to ask for it without having one first. Whatever answers this answers that, so they should be
-  decided together.
+rotr[T: Word](x: T, n: T) -> T = (x >> n) | (x << (T.bits() - n))
+```
 
-Until then, a receiver that goes unread is the workaround, and it is a small one — but it is the
-reason a generic numeric routine in sysl reads worse than the same routine written twice.
+`T.bits()` inside a generic body, `Self.bits()` inside a member's, and `u32.bits()` from anywhere
+are the same member reached through three spellings of its type. Nothing about the declaration is
+new — an associated function is what `08` already calls a member with no `self` — and what changed
+is where the name in call position may come from.
+
+**A built-in may carry one.** The rule that refused it said only a struct or an enum has a name a
+call reaches through, and that was about the call site rather than about the `impl`: through a bound
+the name is the *parameter*, which every type has whether or not it has one of its own. So
+`impl Word for u32` may declare `bits()`, and `impl Float for real` declares the zero, the one, the
+epsilon and the two values no literal spells. What is left of the rule is the case it was really
+about — a **composed** type has no name at all, so an `impl` for `[]int` still refuses a member with
+no receiver, and says which half of the requirement it fails.
+
+**It is static dispatch only, and nothing was added to keep it that way.** Object safety
+(§ Object safety) already excludes a member with no receiver, because a table slot is selected *by*
+the receiver and there is nothing here to select with. A trait that declares one is usable as a
+bound and not as an object, exactly as one that mentions `Self` twice already is.
+
+**What it does not answer** is the other half of `14 §7`'s "a bound that promises a value": nothing
+in the operator catalog declares a zero, so `total[T: Add](xs: []T) -> T` still cannot start its
+accumulation. That is now a question about what the catalog declares rather than about whether the
+language can express it — a `Zero` trait with `zero()` is an ordinary trait today, and what is not
+decided is whether the compiler should supply the membership for the open `iN`/`uN` families the way
+`14 §8 a` does for the operators.
+
+A related gap the mechanism makes visible: a routine can now be entirely *about* a type and mention
+it nowhere in its signature, and such a function cannot be called, because inference reads the
+binding and a call cannot write its type arguments (`10 § Open a`). `describe[T: Word]() -> string`
+is well-formed and unreachable. Taking a value of `T` is the workaround, and it is the same one the
+type-argument entry already records.
 
 ## Details still to settle
 

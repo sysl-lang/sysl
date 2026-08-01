@@ -723,13 +723,19 @@ exactly (`§5`), one row further down the catalog.
   no-associated-types rule of `§1`. Not designed here; recorded with its customers so the next one
   does not open it again.
 
-  **A fourth customer sharpened it into two asks rather than one.** `guide/sha2` wants a width, a
-  round count and a table of constants from the *type* it was instantiated at, and gets them
-  through members carrying a receiver they do not read — because a type parameter is not a name a
-  call can be written through at all. So there is the value a bound cannot promise, and separately
-  there is having nowhere to ask for it from. `02 § Reaching a trait's members without a value`
-  records the second half, and the two want deciding together: a member with no receiver, reachable
-  as `T.zero` through a bound, answers both.
+  **The half about having nowhere to ask is answered; the half about what the catalog declares is
+  not.** A trait may declare a member with no receiver and it is reached through the type —
+  `T.zero()` inside a bounded body, `real.zero()` from outside (`02 § Reaching a trait's members
+  without a value`) — and `guide/sha2`, the fourth customer, is written that way now: the width, the
+  round count and the two constant tables are asked of `T` and no longer of a word nobody reads.
+  `sysl.math`'s `Float` declares seven such members, which is what lets its `signum` and `recip` be
+  defaults and what lets a routine generic over the width start a running minimum at `T.infinity()`.
+
+  What is left is exactly the original ask, one step smaller: **no trait in the catalog declares a
+  zero**, so `total[T: Add](xs: []T) -> T` still seeds from `xs[0]`. Writing `trait Zero` with
+  `zero() -> Self` is ordinary code today, so this is no longer a question about what the language
+  can express — it is `§8 a`'s question about whether the compiler supplies the membership for the
+  open `iN` / `uN` families, since no finite list of `impl`s covers them.
 
 - **An enum cannot render its own variant names.** `str` on one is refused and the diagnostic is a
   good one — it names the `impl Display` to write — but for the commonest case what that impl says

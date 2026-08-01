@@ -53,6 +53,30 @@ trait MemberExprAnalysis extends ExprSupport {
         if lookupOpt(written).isEmpty && typeKey(written).isEmpty && traitKey(written).isDefined =>
       traitMember(traitKey(written).get, f)
 
+    // A type in the position a value would be read from. What a type offers under its own name is an
+    // associated function and nothing else — a property and a method are read on a value — so the
+    // parentheses are what is missing, and a name that offers nothing is told that it is a type.
+    case Field(Ident(written), f)
+        if lookupOpt(written).isEmpty && typeKey(written).isEmpty && typeNamed(written).isDefined =>
+      typeNamed(written).get match
+        // Reported rather than raised, because the abstract pass drops an ordinary complaint: this
+        // one is about what a bound licenses, which is exactly what that pass is for.
+        case a: Type.Abstract =>
+          boundAssociated(a, f) match
+            case Some(tr) =>
+              reported(err(s"'$f' is an associated function of '$tr' — call it with '$written.$f()'"))
+            // A property, a method, or nothing a bound licenses at all: the call form's own
+            // complaints, each of which says the right thing about a read as well.
+            case None => callBoundAssociated(a, f, Nil)
+        case concrete =>
+          memberDecls.get((memberKey(concrete, f)._1, f)) match
+            case Some(m) if m.recvMode.isEmpty =>
+              err(s"'$f' is an associated function of '${show(concrete)}' — call it with '$written.$f()'")
+            case Some(_) =>
+              err(s"'$f' is reached on a value of ${show(concrete)}, and '$written' is the type itself")
+            case None =>
+              err(s"'$written' is a type, not a value, and has no associated function '$f'")
+
     // `T::Attr` — a type attribute read with no argument (`First`, `Last`). `T::Attr(x)` is a
     // `Call` over this node, handled beside the other call forms.
     case Field(receiver, f) =>
@@ -157,6 +181,8 @@ trait MemberExprAnalysis extends ExprSupport {
         err(s"'$f' is a property of '${qn(key)}' — read it on a value, as 'value.$f'")
       case Some(m) if m.receiver.isDefined =>
         err(s"'$f' is a method of '${qn(key)}' — call it on a value, as 'value.$f(…)'")
+      case Some(_) =>
+        err(s"'$f' is an associated function of '${qn(key)}' — call it with '$written.$f(…)'")
       case _ if f == "try" =>
         err(s"'${qn(key)}' is a constrained type and has no 'try': a value outside its range is a " +
           s"mistake in the code that produced it rather than a condition to handle, so '$written(x)' " +

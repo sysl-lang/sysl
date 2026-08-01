@@ -144,8 +144,9 @@ class AssociatedGenericErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "there has to be a name to reach it through" - {
 
-    // Only a struct or an enum is named in call position, so a block for anything else would
-    // register an associated function nothing could call.
+    // A composed type is what has none: `[]int` is a type an `impl` may be written for and not
+    // something that can stand in call position, and a block matching a shape is for a family at
+    // once. Either would register an associated function nothing could call.
     "a block matching a shape may not declare one" in {
       err(
         """trait Make
@@ -155,13 +156,28 @@ class AssociatedGenericErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("'made' has no receiver, and '[]T' is not a name a call could reach it through")
     }
 
-    "and neither may a block for a built-in" in {
+    "and neither may a block for a composed type written out in full" in {
       err(
         """trait Make
           |    made(x: int) -> int
-          |impl Make for int
+          |impl Make for []int
           |    made(x: int) -> int = x""".stripMargin,
-      ) should include("'made' has no receiver, and 'int' is not a name a call could reach it through")
+      ) should include("'made' has no receiver, and '[]int' is not a name a call could reach it through")
+    }
+
+    // A built-in does have one, which is the half of the rule that changed: through a bound the name
+    // is the type parameter, and from outside it is the built-in's own name.
+    "a block for a built-in may declare one, and the built-in's name reaches it" in {
+      ir(
+        """trait Make
+          |    made(x: int) -> int
+          |
+          |impl Make for int
+          |    made(x: int) -> int = x + 1
+          |
+          |main()
+          |    print(int.made(41))""".stripMargin,
+      ) should include("call i32 @int.made(i32 41)")
     }
   }
 

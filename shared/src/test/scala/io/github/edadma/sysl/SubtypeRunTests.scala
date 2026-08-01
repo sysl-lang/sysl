@@ -327,4 +327,62 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport {
       }
     }
   }
+
+  /** A transparent subtype shares its base's *representation*, which is what makes `Vec[Meters]` and
+   * `Vec[f64]` one instantiation. It does not share its base's **members**: the two are different
+   * implementations of one trait, and naming both after the base gave one symbol two definitions —
+   * which the back end rejected outright rather than miscompiling, but only at the point where the
+   * program was already built.
+   */
+  "a subtype's members are its own, not its base's" - {
+    val both =
+      Age +
+        """trait Describe
+          |    describe(self) -> string
+          |
+          |impl Describe for Age
+          |    describe(self) -> string = "an age"
+          |
+          |impl Describe for int
+          |    describe(self) -> string = "an int"
+          |
+          |""".stripMargin
+
+    "the subtype and its base may both implement one trait" in {
+      run(both +
+        """main()
+          |    var a = Age(7)
+          |    var b = 7
+          |    print(a.describe(), b.describe())""".stripMargin) shouldBe "an age an int\n"
+    }
+
+    "and each erases to a table of its own" in {
+      run(both +
+        """report(d: *Describe) -> string = d.describe()
+          |
+          |main()
+          |    var a = Age(7)
+          |    var b = 7
+          |    print(report(&a), report(&b))""".stripMargin) shouldBe "an age an int\n"
+    }
+
+    // A derived subtype was never at risk — it mangles under its own name already — so this is the
+    // pair that says the fix is about the transparent one and did not disturb the other.
+    "a derived subtype keeps its own too" in {
+      run(
+        """type Stamp = new i64
+          |
+          |trait Describe
+          |    describe(self) -> string
+          |
+          |impl Describe for Stamp
+          |    describe(self) -> string = "a stamp"
+          |
+          |impl Describe for i64
+          |    describe(self) -> string = "an i64"
+          |
+          |main()
+          |    print(Stamp(1i64).describe(), (1i64).describe())""".stripMargin) shouldBe "a stamp an i64\n"
+    }
+  }
 }

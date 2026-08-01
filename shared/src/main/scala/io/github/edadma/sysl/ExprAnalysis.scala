@@ -632,13 +632,28 @@ trait ExprAnalysis
         if lookupOpt(written).isEmpty && typeKey(written).exists(structDecls.contains) =>
       callAssociated(typeKey(written).get, mname, args, expected)
 
-    case Call(Field(Ident(written), mname), _)
+    case Call(Field(Ident(written), mname), args)
         if lookupOpt(written).isEmpty && typeKey(written).exists(constrainedDecls.contains) =>
-      constrainedMember(typeKey(written).get, written, mname)
+      val n = typeKey(written).get
+
+      // A constrained subtype is a name a call reaches, so an `impl` for one may carry an associated
+      // function exactly as a struct's may. Everything else selected from the name is one of the
+      // mistakes `constrainedMember` has words for.
+      if memberDecls.get((n, mname)).exists(_.recvMode.isEmpty) then callAssociated(n, mname, args, expected)
+      else constrainedMember(n, written, mname)
 
     case Call(Field(Ident(written), mname), _)
         if lookupOpt(written).isEmpty && typeKey(written).isEmpty && traitKey(written).isDefined =>
       traitMember(traitKey(written).get, mname)
+
+    // `T.f(…)` and `real.f(…)` — an associated function reached through a type that is not one of
+    // the declaration tables above: a type parameter, the `Self` a member's body is analyzed under,
+    // or a built-in an `impl` was written for. It is the only way a bound says anything about the
+    // type rather than about a value of it (`02 § Reaching a trait's members without a value`).
+    case Call(Field(Ident(written), mname), args)
+        if lookupOpt(written).isEmpty && typeKey(written).isEmpty && traitKey(written).isEmpty &&
+          typeNamed(written).isDefined =>
+      callTypeAssociated(typeNamed(written).get, mname, args, expected)
 
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args, expected)

@@ -19,12 +19,36 @@ import sysl.sys.*
 // arbitrary base exists in exactly one place, and adding a third floating-point width would be 31
 // bindings and no new mathematics.
 //
-// The required list also holds the handful of operations that need a *literal* of the implementing
-// type -- a signum needs a one to answer with, a reciprocal needs a one to divide, a conversion to
-// radians needs pi over 180. A default may assume of its receiver exactly what the trait declares
-// (`02`), and the trait declares no way to make a constant, so those are written per width even
-// though the body is the same shape both times.
+// **The constants are members too, and they are how the defaults get to be defaults.** A signum
+// needs a one to answer with and a reciprocal needs a one to divide, and neither can be written in a
+// body shared by two widths unless there is a way to ask a type for its own one. `Self.one()` is
+// that way: a member with no receiver, reached through the type rather than through a value of it
+// (`02`), so a generic routine bounded by `Float` can build a value of a width it has never met.
+// What stays per width is what needs a literal that is neither zero nor one -- the two angle
+// conversions, whose factor is pi over 180.
 trait Float: Eq + Ord + Neg + Add + Sub + Mul + Div
+
+    // --- The type's own values, which no receiver is needed to ask for. ---
+
+    // The additive and multiplicative identities, which are what an accumulator starts at and what
+    // the defaults below are written in terms of.
+    zero() -> Self
+    one() -> Self
+
+    // The largest finite value, and the smallest step above one. `epsilon` is what a convergence
+    // test is written against -- a loop that stops when two iterations agree to within a few
+    // epsilons stops at the right point at both widths, and a literal tolerance does not.
+    max_value() -> Self
+    epsilon() -> Self
+
+    // The two values no literal spells. `infinity` is what a running minimum starts at, so that the
+    // first value compared always replaces it; `nan` is the answer to a question that has none.
+    infinity() -> Self
+    nan() -> Self
+
+    // The ratio of a circle's circumference to its diameter, at this width. `sysl.math.pi` is the
+    // same number as a `real`; this is what a routine generic over the width asks for instead.
+    pi() -> Self
 
     // Roots. `sqrt` is the one every float program reaches for and the one hardware has an
     // instruction for; `cbrt` is here because the alternative a program would otherwise write --
@@ -79,28 +103,34 @@ trait Float: Eq + Ord + Neg + Add + Sub + Mul + Div
     // remainder is a library operation rather than an instruction.
     fmod(self, divisor: Self) -> Self
 
-    // Sign, taken three ways because the three answer differently at the edges. `abs` clears the
-    // sign bit and `copysign` copies one across, so both see a negative zero; `signum` is a pair of
-    // comparisons and does not, which is why it answers a zero with that zero rather than with a
-    // one it cannot justify.
+    // Sign, taken two ways because the two answer differently at the edges. `abs` clears the sign
+    // bit and `copysign` copies one across, so both see a negative zero.
     abs(self) -> Self
-    signum(self) -> Self
     copysign(self, sign: Self) -> Self
-
-    // One over the receiver, which is worth a name because a loop that divides by the same value
-    // repeatedly should multiply by this instead.
-    recip(self) -> Self
-
-    // Whether the receiver is one of the two infinities. NaN is not, and answers `false` here as it
-    // does to every comparison.
-    is_infinite(self) -> bool
 
     // Degrees are what a person writes down and radians are what the functions above take, so the
     // conversion belongs beside them rather than in each program that reads an angle from a file.
+    // These two are the whole of what stays per width: the factor is pi over 180, and 180 is not
+    // something a zero and a one can be built up into.
     to_radians(self) -> Self
     to_degrees(self) -> Self
 
     // --- What the trait answers for itself. ---
+
+    // The third reading of a sign, and the one that is arithmetic rather than a bit. It is a pair of
+    // comparisons and so does not see a negative zero, which is why it answers a zero with that zero
+    // rather than with a one it cannot justify -- and a NaN satisfies neither comparison and leaves
+    // by the same arm holding itself.
+    signum(self) -> Self =
+        if self > Self.zero() then Self.one() else if self < Self.zero() then -Self.one() else self
+
+    // One over the receiver, which is worth a name because a loop that divides by the same value
+    // repeatedly should multiply by this instead.
+    recip(self) -> Self = Self.one() / self
+
+    // Whether the receiver is one of the two infinities. Larger in magnitude than the largest finite
+    // value is a condition only they meet, and a NaN fails it the way it fails every comparison.
+    is_infinite(self) -> bool = self.abs() > Self.max_value()
 
     // The only value that is not equal to itself, which is both the definition and the test.
     is_nan(self) -> bool = self != self
@@ -128,6 +158,20 @@ end Float
 
 // Binary64, which is what `real` names and what a float literal is unless it says otherwise.
 impl Float for real
+    zero() -> real = 0.0
+    one() -> real = 1.0
+
+    max_value() -> real = 1.7976931348623157e308
+    epsilon() -> real = 2.220446049250313e-16
+
+    // Neither has a decimal expansion to write down, and these quotients are the definitions IEEE
+    // 754 gives them. Dividing a float by zero is not the error dividing an integer by zero is --
+    // the standard says what the answer is, and this is where the library says it too.
+    infinity() -> real = 1.0 / 0.0
+    nan() -> real = 0.0 / 0.0
+
+    pi() -> real = 3.141592653589793
+
     sqrt(self) -> real = sysl_sqrt(self)
     cbrt(self) -> real = sysl_cbrt(self)
 
@@ -159,18 +203,7 @@ impl Float for real
     fmod(self, divisor: real) -> real = sysl_fmod(self, divisor)
 
     abs(self) -> real = sysl_fabs(self)
-
-    // A NaN receiver satisfies neither comparison and leaves by the last arm holding itself, which
-    // is the answer wanted; so does a zero, which keeps its own sign rather than being told it is
-    // positive.
-    signum(self) -> real = if self > 0.0 then 1.0 else if self < 0.0 then -1.0 else self
-
     copysign(self, sign: real) -> real = sysl_copysign(self, sign)
-    recip(self) -> real = 1.0 / self
-
-    // Larger in magnitude than the largest finite binary64 is a condition only the infinities meet,
-    // and a NaN fails it the way it fails every comparison.
-    is_infinite(self) -> bool = self.abs() > 1.7976931348623157e308
 
     to_radians(self) -> real = self * 0.017453292519943295
     to_degrees(self) -> real = self * 57.29577951308232
@@ -179,6 +212,17 @@ end real
 // Binary32. Every body here is its binary64 counterpart with libm's `f`-suffixed entry point and a
 // literal of this width, which is the duplication the trait exists to keep out of programs.
 impl Float for f32
+    zero() -> f32 = 0.0f32
+    one() -> f32 = 1.0f32
+
+    max_value() -> f32 = 3.4028235e38f32
+    epsilon() -> f32 = 1.1920929e-7f32
+
+    infinity() -> f32 = 1.0f32 / 0.0f32
+    nan() -> f32 = 0.0f32 / 0.0f32
+
+    pi() -> f32 = 3.1415927f32
+
     sqrt(self) -> f32 = sysl_sqrtf(self)
     cbrt(self) -> f32 = sysl_cbrtf(self)
 
@@ -210,11 +254,7 @@ impl Float for f32
     fmod(self, divisor: f32) -> f32 = sysl_fmodf(self, divisor)
 
     abs(self) -> f32 = sysl_fabsf(self)
-    signum(self) -> f32 = if self > 0.0f32 then 1.0f32 else if self < 0.0f32 then -1.0f32 else self
     copysign(self, sign: f32) -> f32 = sysl_copysignf(self, sign)
-    recip(self) -> f32 = 1.0f32 / self
-
-    is_infinite(self) -> bool = self.abs() > 3.4028235e38f32
 
     to_radians(self) -> f32 = self * 0.017453292f32
     to_degrees(self) -> f32 = self * 57.295776f32

@@ -99,6 +99,19 @@ trait MemberLowering extends TypeResolution {
   protected def concrete(name: String): Option[Type] =
     structInsts.get(name).orElse(enumInsts.get(name))
 
+  /** Whether a member's key is a name a call could be written through, which is what a member with
+   * **no receiver** needs and what one with a receiver never asks for.
+   *
+   * Every declared type has one, and so does every built-in that a program spells: `u32.bits()` and
+   * `real.epsilon()` reach an `impl`'s associated function exactly as `Box.of(…)` reaches a struct's.
+   * The test is that the key is the canonical name of the type it resolves to, so an alias reaches
+   * the one implementation rather than registering a second — `int` and `i32` are one key already,
+   * and this asks the same question one layer up.
+   */
+  protected def reachableName(key: String): Boolean =
+    nominal(key).isDefined || constrainedDecls.contains(key) ||
+      scalarType(key).exists(t => Type.show(t) == key)
+
   protected def nominal(name: String): Option[(List[String], Set[String], String)] =
     structDecls
       .get(name)
@@ -170,11 +183,12 @@ trait MemberLowering extends TypeResolution {
 
       checkBoundNames(s"${home.label}.${m.name}", m.bounds)
 
-      // An associated function is reached by naming its type — `Box.of(…)` — and only a struct or
-      // an enum has a name to be reached through. A block for a built-in or a composed type would
-      // register one that nothing could ever call, which is worth saying at the declaration rather
-      // than leaving as a member the program cannot use.
-      if m.receiver.isEmpty && !m.isProperty && nominal(home.key).isEmpty then
+      // An associated function is reached by naming its type — `Box.of(…)`, `u32.bits()` — so the
+      // type needs a name a call can be written through. A composed type has none: `[]int` is a
+      // type an `impl` may be written for and not something that can stand in call position, and a
+      // block matching a shape is for a whole family at once. Such a member would be registered and
+      // never callable, which is worth saying at the declaration.
+      if m.receiver.isEmpty && !m.isProperty && !reachableName(home.key) then
         err(s"'${m.name}' has no receiver, and '${home.label}' is not a name a call could reach it " +
           "through — give it a 'self' parameter")
 

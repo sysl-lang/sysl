@@ -226,6 +226,20 @@ mean something a reader can rely on — a restricted type stays inside its regio
 in the safe direction: forbidding it now rules out nothing that a later rule would have had to keep
 allowing, while allowing it and tightening later would break programs.
 
+**Open: what an `impl` for a built-in reserves, in every program.** A type's members are one
+namespace whatever brought them (`08 § One name, one member`), and a member arrives with its type
+rather than with an import — which is the rule above, working. Together they mean that
+`sysl.math`'s `Float`, which the library ships, permanently claims each of its member names on
+`real` and on `f32` **for every program that compiles**, whether or not it ever mentions the module.
+`guide/fft` met this: it declares a `Zero` trait whose member is spelled `zero`, and cannot
+implement it for either float width, so its generic sum is demonstrated over `int` and over the
+program's own type instead.
+
+Nothing here is a defect — each rule is the one wanted — and the consequence is real and was not
+visible until a library implemented a wide trait for a built-in. What could answer it is a way for a
+member to be reached only where its trait is in scope, which is a different rule from the one above
+and is not designed here. Recorded with its customer.
+
 ### Anything visible outside its file states its types
 
 **A declaration visible beyond the file that declares it carries explicit types.** Inference is

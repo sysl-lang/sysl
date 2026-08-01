@@ -178,6 +178,8 @@ ability to ask for storage at a length worked out while running.
 The other apparent blocker was `§Not yet`'s own: a generic container cannot make its own storage,
 because a repeat needs a value in its value position and no bound promises one. **A `push` arrives
 holding one** — so the value being pushed seeds the new storage, and the question never comes up.
+(A bound *can* promise one now, through a trait member with no receiver; `§Not yet` says what that
+does and does not settle. `Buf` needs none of it, which is why nothing here changed.)
 
 ### What an append does to the other views
 
@@ -395,12 +397,17 @@ implementation:
   it is the zero-value declaration of `§Writing one down`, so `var storage: [16]K` inside a generic
   compiles, holds sixteen zeroed elements, and is refused per **instantiation** rather than at the
   definition — at a `K` with no zero value, naming the instantiated `[16]Node` rather than the
-  parameter. What is genuinely out of reach is storage **sized while running**: the only form that
-  produces one is the repeat, a repeat needs a value in its value position, and no bound promises
-  one — so `var storage: []K` is the empty slice and nothing widens it. That is the shape of what
-  `Buf` does instead, which is why its `push` seeds the new storage with the value it arrived
-  holding. The remedy is `14`'s decision rather than this chapter's — see its `§7` entry on a bound
-  that promises a value, which the bullet above wants for the same reason.
+  parameter.
+
+  Storage **sized while running** was said here to be genuinely out of reach, on the grounds that
+  the only form producing one is the repeat, a repeat needs a value in its value position, and no
+  bound promises one. **That last clause stopped being true.** A trait may declare a member with no
+  receiver (`02 § Reaching a trait's members without a value`), so `[K.blank(); n]` inside a
+  `[K: Blank]` generic is ordinary code and widens with the count it was given. What is left is not
+  a language gap: nothing sysl *ships* declares such a member for the built-ins, so a container that
+  wants to work over every `K` still cannot, and a program writing the trait itself covers whatever
+  types it names. `14 §7` carries that half, and `Buf`'s `push` still seeds new storage with the
+  value it arrived holding — which needs no bound at all and is the better answer where it applies.
 - ~~**Promotion of an escaping local array**~~ (`05`) — **built.** A view that would outlive its
   array now moves the array to a buffer instead of being refused, so a program that means to return
   one writes the ordinary `var buf: [64]u8` and says nothing. What is still refused is storage the
