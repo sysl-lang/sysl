@@ -144,6 +144,133 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
         ("text", "t.sysl", "module text\nprivate scale(n: int) -> int = n * 3\ntwice(n: int) -> int = scale(n)"),
       ) shouldBe "50\n"
     }
+
+    // The two of them land in one LLVM module, so what keeps them apart is the module segment in
+    // the symbol and nothing else. This is the case that decides `13 §2`'s claim about mangling:
+    // drop the segment for a file-private name and these two definitions collide.
+    "which they can only do because the symbol still carries the module" in {
+      val out = irIn(
+        ("", "main.sysl", "print(geom.twice(10) + text.twice(10))"),
+        ("geom", "g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2\ntwice(n: int) -> int = scale(n)"),
+        ("text", "t.sysl", "module text\nprivate scale(n: int) -> int = n * 3\ntwice(n: int) -> int = scale(n)"),
+      )
+
+      out should include("@geom$scale(")
+      out should include("@text$scale(")
+      out should not include "@scale("
+    }
+
+    // A collision is one mistake, so it is one diagnostic. The losing declaration is still
+    // registered under the name, so without care the file that wrote it is then told the name
+    // belongs to its sibling — a name it declares itself, three lines up.
+    "and the file that loses the collision is not also told the name is not its own" in {
+      val out = errIn(
+        ("", "main.sysl", "print(1)"),
+        ("geom", "g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2"),
+        ("geom", "h.sysl", "module geom\nprivate scale(n: int) -> int = n + 1\ntwice(n: int) -> int = scale(n)"),
+      )
+
+      out should include("function 'scale' is already declared")
+      out should not include "private to"
+    }
+  }
+
+  /** What the file level buys the backend (`13 §2`, `13 § Open g`).
+   *
+   * A bare `private` is the one reach that provably never crosses a file boundary, and every file of
+   * a compilation is emitted into one LLVM module — so a declaration at that reach has all of its
+   * callers in the module that defines it, which is what `internal` linkage states. Nothing wider
+   * qualifies: a `private[M]` reaches a whole subtree, and public reaches anyone.
+   */
+  "a file-private declaration is internal to the module that defines it" - {
+    "a bare 'private' function" in {
+      irIn(
+        ("", "main.sysl", "print(geom.twice(10))"),
+        ("geom", "g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2\ntwice(n: int) -> int = scale(n)"),
+      ) should include("define internal i32 @geom$scale(")
+    }
+
+    "while the public one beside it keeps external linkage" in {
+      irIn(
+        ("", "main.sysl", "print(geom.twice(10))"),
+        ("geom", "g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2\ntwice(n: int) -> int = scale(n)"),
+      ) should include("define i32 @geom$twice(")
+    }
+
+    // The discriminating half: a scoped-private declaration is reachable from every file of the
+    // subtree, so its reach is not the file and the linkage is unchanged.
+    "a 'private[M]' one does not qualify, however narrow the subtree" in {
+      val out = irIn(
+        ("", "main.sysl", "print(geom.twice(10))"),
+        ("geom", "g.sysl", "module geom\nprivate[geom] scale(n: int) -> int = n * 2"),
+        ("geom", "h.sysl", "module geom\ntwice(n: int) -> int = scale(n)"),
+      )
+
+      out should include("define i32 @geom$scale(")
+      out should not include "define internal i32 @geom$scale("
+    }
+
+    // `08 § Visibility`: an unmarked member sits at its type's reach, so a member of a file-private
+    // type is file-private without saying so.
+    "an unmarked member of a file-private type" in {
+      ir("""private struct Hidden
+           |    n: int
+           |    scale(self, k: int) -> int = self.n * k
+           |end Hidden
+           |private val h: Hidden = Hidden(3)
+           |print(h.scale(2))
+           |""".stripMargin) should include("define internal i32 @Hidden.scale(")
+    }
+
+    "a private member of a public type" in {
+      val out = ir("""struct Shown
+                     |    n: int
+                     |    private secret(self) -> int = self.n + 1
+                     |    visible(self) -> int = self.secret()
+                     |end Shown
+                     |val s: Shown = Shown(4)
+                     |print(s.visible())
+                     |""".stripMargin)
+
+      out should include("define internal i32 @Shown.secret(")
+      out should include("define i32 @Shown.visible(")
+    }
+
+    // An instantiation is emitted under a name of its own — `geom$pick.int` — and that name has no
+    // visibility of its own, because it is not what anyone wrote. The answer comes from the
+    // declaration it was made from, or a private generic helper in a library would go on exporting
+    // one symbol per instantiation.
+    "an instantiation of a file-private generic, which is emitted under another name" in {
+      val out = irIn(
+        ("", "main.sysl", "print(geom.larger(3, 9))"),
+        ("geom", "g.sysl",
+         "module geom\nprivate pick[T: Ord](a: T, b: T) -> T = if a < b then b else a\n" +
+           "larger(a: int, b: int) -> int = pick(a, b)"),
+      )
+
+      out should include("define internal i32 @geom$pick.int(")
+      out should include("define i32 @geom$larger(")
+    }
+
+    // The entry point is the one symbol the platform resolves, so it stays external whatever the
+    // program said about the function behind it — which is a different symbol, and does not.
+    "a private 'main', whose own symbol is not the entry point" in {
+      val out = ir("private main() -> unit = print(\"hi\")\n")
+
+      out should include("define internal void @$$main(")
+      out should include("define i32 @main(i32 %argc, ptr %argv)")
+    }
+
+    "and it still runs" in {
+      run("private main() -> unit = print(\"hi\")\n") shouldBe "hi\n"
+    }
+
+    "and the program still runs" in {
+      runIn(
+        ("", "main.sysl", "print(geom.twice(10))"),
+        ("geom", "g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2\ntwice(n: int) -> int = scale(n)"),
+      ) shouldBe "20\n"
+    }
   }
 
   "'private[M]' widens to a module and its subtree" - {

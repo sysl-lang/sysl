@@ -127,6 +127,15 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
   private def libraryOwn(ir: String, form: String): Set[String] =
     symbols(ir, form).filter(_.startsWith(Library.key("")))
 
+  /** One function's emitted body, so that two compilations can be compared on what a function does
+   * rather than only on which functions there are.
+   */
+  private def bodyOf(ir: String, name: String): List[String] =
+    ir.linesIterator
+      .dropWhile(l => !(l.startsWith("define ") && l.contains(s"@$name(")))
+      .takeWhile(_ != "}")
+      .toList
+
   /** An artifact carrying given metadata and nothing the linker would want. Assembled rather than
    * built, because every one of these is a container a toolchain would refuse to produce.
    */
@@ -870,6 +879,27 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       libraryOwn(linked, "define") shouldBe empty
       libraryOwn(linked, "declare") should not be empty
       libraryOwn(carried, "define") should not be empty
+    }
+
+    // `13 §8` gives the flag a second use beyond the bootstrap: *compiling one program both ways is
+    // how the two paths are held to meaning the same thing.* The test above pins which module was
+    // used, which is the seam; this one is the claim itself. What may differ is the standard module's
+    // own symbols — declared when linked, defined when carried — so what must agree is the code the
+    // **program** lowers to, which the way its library arrived has no business changing.
+    "and one program compiled both ways lowers to the same program" in {
+      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+
+      val src = program("f(n: int) -> int = n * 2\nprint(f(21))\n")
+      val linked  = emitted(Config(command = "emit-llvm", file = src, coreSearch = core))
+      val carried = emitted(Config(command = "emit-llvm", file = src, noCoreLib = true, coreSearch = core))
+
+      // The two modules do *not* hold the same symbols, and should not: the standard module's own
+      // and the ARC runtime beside them are defined here only when the copy is carried, and come
+      // from the artifact's object otherwise. That difference is the whole point of the flag. What
+      // has to agree is the program's own code — the same source, lowered the same way.
+      for name <- List("f", "main") do
+        bodyOf(linked, name) should not be empty
+        bodyOf(linked, name) shouldBe bodyOf(carried, name)
     }
 
     "and what it compiles is whole, not a program relying on the artifact anyway" in {

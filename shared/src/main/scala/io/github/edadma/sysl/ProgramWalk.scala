@@ -835,7 +835,13 @@ trait ProgramWalk
         err(s"function '${f.name}' should return ${show(declaredResult)}, but its body yields " +
           s"${show(tbody.ty)}")
 
-    TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds)
+    // Both keys are asked because an instantiation does not carry the declaration's. `name` is what
+    // this body is emitted as — `demo$amplify.int` for a generic — and `f.name` is the declaration
+    // it came from, which is what `declAccess` was keyed by. They are the same key for an ordinary
+    // function, and only the second answers for an instantiation; a symbol is file-private if either
+    // says so, since both name the one declaration.
+    TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
+      fileLocal(name) || fileLocal(f.name))
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

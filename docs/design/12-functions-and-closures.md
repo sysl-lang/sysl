@@ -1094,4 +1094,7 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
 - **h. Capability gating for externs.** An `extern` reaching into libc is exactly the kind of thing
   `capabilities.md` exists to gate, and a freestanding `no alloc` target's externs are a different
   set from a hosted one's. Which capability an extern requires — and whether that is a property of
-  the declaration or of the module — waits on capabilities being implemented at all.
+  the declaration or of the module — is still open, but **no longer for want of the mechanism**: the
+  clause is built, and `no alloc` is checked over the module graph. What is left is the decision, and
+  behind it the target half — a build cannot yet refuse a program for the machine it is for, which is
+  what would give the gate teeth.

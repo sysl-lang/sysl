@@ -549,6 +549,10 @@ case class TDefer(stmts: List[TStmt]) extends TStmt
  * each so the body can read and mutate them uniformly). `requires`/`ensures` are the
  * design-by-contract clauses: each precondition is checked on entry, each postcondition before
  * every return, with a `TResult` in an `ensure` standing for the returned value.
+ *
+ * `internal` says every caller of this function is in the module that defines it, so its symbol
+ * needs no external linkage (`13 §2`). It is set for a declaration whose reach is the file that
+ * wrote it, and it is the only thing the emitted linkage depends on.
  */
 case class TFunc(
     name: String,
@@ -559,6 +563,7 @@ case class TFunc(
     requires: List[(TExpr, Option[String])] = Nil,
     ensures: List[(TExpr, Option[String])] = Nil,
     olds: List[TExpr] = Nil,
+    internal: Boolean = false,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones

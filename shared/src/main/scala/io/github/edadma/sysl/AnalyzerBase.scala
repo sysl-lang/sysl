@@ -290,6 +290,25 @@ trait AnalyzerBase {
 
   protected val declAccess = mutable.HashMap.empty[String, Access]
 
+  /** Names two declarations claimed. The duplicate was reported where it was written, and the key
+   * goes on standing for whichever declaration reached it first — so the second one's file is now a
+   * file that wrote the name and cannot reach it.
+   *
+   * Asking about *reach* there would answer a question the reader did not ask, and answer it with
+   * something false-sounding: `private to 'g.sysl'` about a name this file declares three lines up.
+   * A contested name is therefore reachable from anywhere, which costs nothing — the compilation is
+   * already failing on the duplicate.
+   */
+  protected val contestedNames = mutable.Set.empty[String]
+
+  /** Reports a name a second declaration claimed, marking the key contested first so that later uses
+   * of it are not also told whose the name is (`contestedNames`).
+   */
+  protected def duplicate(key: String, msg: String): Nothing = {
+    contestedNames += key
+    err(msg)
+  }
+
   /** Whether a declaration may be named from where the analyzer currently is.
    *
    * A **file**-private one is compared by source identity rather than by name, since two files of
@@ -302,6 +321,19 @@ trait AnalyzerBase {
     case Access(_, Some(m))    => currentModule == m || currentModule.startsWith(s"$m.")
   }
 
+  /** Whether a declaration may be named only from inside the file that wrote it — `13 §2`'s bare
+   * `private`, as opposed to a `private[M]` that widened to a module subtree.
+   *
+   * This is the one reach that provably never crosses a file boundary, and every file of a
+   * compilation lands in the same LLVM module, so a symbol at this reach has all of its callers in
+   * the module that defines it. That is exactly the condition `internal` linkage states, which is
+   * what `Codegen` uses it for.
+   */
+  protected def fileLocal(key: String): Boolean = declAccess.get(key).exists {
+    case Access(Some(_), None) => true
+    case _                     => false
+  }
+
   /** A resolved key, or a diagnostic where what it names is not visible here.
    *
    * A name the current module declares but may not use is **reported** rather than passed over, so
@@ -310,7 +342,7 @@ trait AnalyzerBase {
    * that is what a reader needs told.
    */
   protected def reachable(key: String): String = {
-    if !visible(key) then err(s"'${qn(key)}' is ${restriction(key)}")
+    if !visible(key) && !contestedNames(key) then err(s"'${qn(key)}' is ${restriction(key)}")
     key
   }
 

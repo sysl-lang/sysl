@@ -325,7 +325,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     val declared = Type.stored(f.params).map { case (name, ty) => s"${ty.llvm} %$name.param" }
     val params   = (declared ++ Option.when(f.variadic)("...")).mkString(", ")
-    finishFunction(s"define ${f.retTy.llvm} @${symbolOf(f.name)}($params)")
+    // A file-private declaration has every caller in the module that defines it (`13 §2`), so its
+    // symbol is `internal`: nothing outside may resolve it, and the linker is free to discard it
+    // when nothing inside calls it either — which is what an exported helper in a library artifact
+    // costs today.
+    val linkage = if f.internal then "internal " else ""
+    finishFunction(s"define $linkage${f.retTy.llvm} @${symbolOf(f.name)}($params)")
   }
 
   // --- statements ----------------------------------------------------------------------

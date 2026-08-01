@@ -135,10 +135,20 @@ its internal `private[M]` annotations mean.
 `private` means the enclosing class or package. Making the bare form file-scoped costs nothing in
 expressiveness — module-private is exactly `private[own_module]`, the degenerate case of the
 scoped form, so no separate keyword is needed for it — and it buys the one level that provably
-**never crosses a file boundary**. That is the level at which a declaration can be fully inferred,
-mangling can be skipped, and LLVM `internal` linkage applies; everything wider needs an external
-symbol, because §1's shared module scope means a sibling file can call it. §3 of the module-system
-notes develops what rests on that property.
+**never crosses a file boundary**. That is the level at which a declaration can be fully inferred
+and LLVM `internal` linkage applies; everything wider needs an external symbol, because §1's shared
+module scope means a sibling file can call it. §3 of the module-system notes develops what rests on
+that property.
+
+**What that level does *not* buy is a shorter symbol, and an earlier draft said it did.** The claim
+was that mangling could be skipped for a bare `private`, on the reasoning that a name nothing outside
+the file can write needs nothing outside the file to agree on it. That confuses two boundaries. Every
+file of a compilation is emitted into **one** LLVM module, so a symbol still has to be unique across
+the whole program rather than within its file — and the paragraph above is exactly what makes the
+collision reachable: a file-private name is spent in its module, so two *modules* may each hold a
+private `scale`, and dropping the module segment would leave one `@scale` where there are two
+definitions. The mangling is what keeps them apart, and it stays. `internal` is the part that was
+real, and it is applied.
 
 The cost is honest and worth naming: the everyday module-internal helper is now `private[arch]`
 rather than a bare `private`, so the common case is the wordier one. The alternative — a second
@@ -818,7 +828,10 @@ this chapter's through-line rather than a concession to it.
 
 Two things follow that are worth having in mind rather than being rules of their own. An initializer
 runs code, so it may allocate on its way to a value even though the value itself may not carry a
-reference — which is a question for the `no alloc` capability (§4) once that exists, not for this.
+reference — which is a question for the `no alloc` capability (§4) rather than for this. That
+capability is built, and it already answers this case: an initializer is code like any other, so a
+module that declared `no alloc` is refused one that allocates on its way to a value, at the smallest
+part of the initializer that still reaches an allocator.
 And an initializer that traps takes the program down before any statement of its own has run, which
 is what "before anything else" has to mean if it means anything at all.
 
@@ -964,8 +977,11 @@ the bootstrap, since there was no released sysl to build the first artifact with
 asking for it, never by a lookup coming up empty. The distinction is what keeps it honest. A fallback taken silently would be a
 fallback taken *always* — nobody would have any reason to build an artifact — and the path meant for
 the rarest of circumstances would quietly become the only one anyone ever ran. It has a second use
-once it exists: compiling one program both ways is how the two paths are held to meaning the same
-thing.
+beyond the bootstrap, and the suite now takes it: compiling one program both ways is how the two
+paths are held to meaning the same thing. What that comparison is over is the **program's** own code,
+since the two modules deliberately do not hold the same symbols — the standard module's own, and the
+ARC runtime beside them, are defined in place when the copy is carried and come from the artifact's
+object when it is linked, which is the difference the flag exists to make.
 
 **`build-lib --core` is exempt**, and must be: it is the command that produces the artifact, so
 requiring one would be a deadlock with nothing to break it.
@@ -1052,11 +1068,15 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   reaches: `08 § Visibility` has the rules, of which the load-bearing one is that an unmarked member
   sits at its type's reach and a modifier may only narrow. What is left of this item is (c) — a
   whole *module* private to its parent — which is the same question one level up.
-- **g. What the file level buys the backend — now worth doing.** §2 notes that a bare `private` is
-  the level at which mangling can be skipped and LLVM `internal` linkage applies. Neither is done,
-  and the reason they bought nothing has gone: §8 makes a library a real object file, so a
-  file-private helper in one is an exported symbol that nothing may call and nothing will discard.
-  This is no longer waiting on a decision, only on the work.
+- **~~g. What the file level buys the backend.~~ Done, and half of it was never there to do.** A
+  declaration whose reach is the file it was written in now emits `define internal`, which is what
+  §8 made worth doing: a library is a real object file, so a file-private helper in one was an
+  exported symbol that nothing might call and nothing would discard. It reaches a member as well as
+  a top-level declaration, with no rule of its own — an unmarked member sits at its type's reach
+  (`08 § Visibility`), so a member of a file-private type is file-private, and both answer through
+  the same `declAccess` entry. A `private[M]` declaration is deliberately **not** included: its reach
+  is a whole subtree, so the file is not what bounds its callers. **The other half of the item —
+  skipping the mangling — turned out to be wrong rather than unbuilt, and §2 now says why.**
 
 - **h. What is in the standard library — the *where* is settled, the *what* is not.** A library now
   has somewhere to live and a way to be reached: §8 is the mechanism, `sysl` is the module name every
