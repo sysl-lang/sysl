@@ -188,6 +188,13 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       run("print(nan().abs().is_nan(), nan().signum().is_nan())") shouldBe "true true\n"
     }
 
+    // A magnitude is never negative, and a negative zero is the operand that says whether the
+    // implementation knows it. `if x < 0 then -x else x` fails here — no comparison tells the two
+    // zeroes apart, so the negation never runs and `-0` comes back out of an absolute value.
+    "a magnitude is never negative, not even for a negative zero" in {
+      run("print((-0.0).abs(), (0.0).abs(), (-0.0f32).abs())") shouldBe "0 0 0\n"
+    }
+
     "the reciprocal" in {
       run("print((4.0).recip(), (-0.25).recip(), infinity().recip())") shouldBe "0.25 -4 0\n"
     }
@@ -375,6 +382,76 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  // What the module does where the mathematics runs out. None of these is an error: IEEE 754 says
+  // what each answer is, and a library that trapped instead would be taking a decision away from the
+  // caller who can see which of them matters.
+  "outside the domain" - {
+    "a root and a logarithm of a negative operand are not numbers" in {
+      run("print((-1.0).sqrt().is_nan(), (-1.0).ln().is_nan(), (-2.0).asin().is_nan())")
+        .shouldBe("true true true\n")
+    }
+
+    "the logarithm of zero is the infinity it tends to" in {
+      run("print((0.0).ln(), (0.0).log2(), (0.0).log10())") shouldBe "-inf -inf -inf\n"
+    }
+
+    "a remainder by zero is not a number, where an integer remainder would trap" in {
+      run("print((1.0).fmod(0.0).is_nan(), (0.0).fmod(1.0))") shouldBe "true 0\n"
+    }
+
+    // The three corners C fixes by fiat rather than by limit, and a program is entitled to rely on
+    // them: nothing raised to nothing is one, and a negative power of zero is the infinity.
+    "the corners of a power" in {
+      run("print((0.0).pow(0.0), (0.0).pow(-1.0), (-8.0).pow(2.0), (-8.0).pow(0.5).is_nan())")
+        .shouldBe("1 inf 64 true\n")
+    }
+
+    // What the default's division does when the base has no logarithm to divide by. Worth pinning
+    // because it is the one place a *derived* member can go wrong in a way its parts cannot.
+    "a logarithm in base one" in {
+      run("print((2.0).log(1.0), (1.0).log(1.0).is_nan())") shouldBe "inf true\n"
+    }
+
+    "the top of binary32's range" in {
+      run(
+        """var top: f32 = 3.4028234663852886e38f32
+          |print(top.is_finite(), (top * 2.0f32).is_infinite(), top.recip().is_finite())"""
+          .stripMargin
+      ) shouldBe "true true true\n"
+    }
+  }
+
+  // The payoff of the trait being a trait rather than two sets of functions: a program can bound a
+  // type parameter by it and write the mathematics once. The supertraits are what make the body
+  // below legal — `+` inside a generic needs `Add`, and `Float` requires it so that a caller does
+  // not have to write the bound out.
+  "width-generic mathematics" - {
+    "a program may bound a type parameter by the trait" in {
+      run(
+        """length[T: Float](x: T, y: T) -> T = (x.square() + y.square()).sqrt()
+          |
+          |print(length(3.0, 4.0), length(3.0f32, 4.0f32))""".stripMargin
+      ) shouldBe "5 5\n"
+    }
+
+    // A default is a copy per implementing type rather than one shared body (`02`), so the two
+    // widths get their own `square` and neither is emitted through the other. Counted on the whole
+    // module, since these are library members and not the program's own.
+    "a default is materialized once per width" in {
+      val out = ir(importing + "var x: real = 3.0\nvar y: f32 = 3.0f32\nprint(x.square(), y.square())")
+
+      out.linesIterator.count(l => l.startsWith("define") && l.contains(".square(")) shouldBe 2
+    }
+
+    "and reach the defaults through the bound" in {
+      run(
+        """decibels[T: Float](power: T, reference: T) -> T = (power / reference).log10()
+          |
+          |print(decibels(100.0, 1.0), decibels(100.0f32, 1.0f32))""".stripMargin
+      ) shouldBe "2 2\n"
+    }
+  }
+
   "the error path" - {
     // What the import does and does not gate, which is not the same answer for the two halves of the
     // module. A *name* — `pi`, `min`, `nan` — lives in a submodule and has to be asked for, which is
@@ -416,6 +493,52 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // surface a program may reach, whether or not it imports the module that uses them.
     "the C bindings underneath are the library's own" in {
       err("import sysl.math.*\nprint(sysl_sqrt(2.0))") should include("sysl_sqrt")
+    }
+
+    // The price of the members arriving with the type: the trait's names are now `real`'s and
+    // `f32`'s names, so a program cannot give either width a member of its own by one of them. The
+    // import makes no difference — this is refused with or without it. It is refused rather than
+    // shadowed, which is the answer that matters: two traits offering `sqrt` for one type would
+    // leave a call with no way to say which was meant.
+    "a program may not give a float a member the trait already names" in {
+      val clash =
+        """trait Mine
+          |    sqrt(self) -> real
+          |
+          |impl Mine for real
+          |    sqrt(self) -> real = 42.0""".stripMargin
+
+      err(clash) should include("type 'real' already has a member named 'sqrt'")
+      err(importing + clash) should include("type 'real' already has a member named 'sqrt'")
+    }
+
+    // `real` and `f64` are one type under one owner key (`02`), so the library's implementation is
+    // already there under both spellings and a program cannot add a second. The diagnostic renders
+    // the key, which is why it says `real` for an `impl` written `for f64`.
+    "the widths cannot be implemented for a second time under their other spelling" in {
+      err(importing + "impl Float for f64\n    sqrt(self) -> f64 = 0.0") should
+        include("'real' already implements 'sysl.math.Float'")
+    }
+
+    // The trait is not object-safe, and it is its **supertraits** that decide that: `Eq::eq` takes a
+    // second `Self`, which an erased value has forgotten. So `Float` is for bounds and receivers and
+    // there is no `&Float` to pass around — worth pinning because the requirement list is what would
+    // change it, and the requirement list is there for the operators the defaults use.
+    "there is no trait object over it" in {
+      err(importing + "report(f: &Float) -> real = f.sqrt()") should
+        include("no '&sysl.math.Float' to form")
+    }
+
+    // And the other side of it: a *name* is only the module's inside the module, so a program is
+    // free to declare its own `min` — and while it does, the import cannot also be offering one.
+    "a program may declare a name the module offers, so long as it does not import it too" in {
+      run("print(3.0.hypot(4.0))") shouldBe "5\n"
+
+      super.run(
+        """min(a: string, b: string) -> string = if b < a then b else a
+          |
+          |print(min("pear", "apple"))""".stripMargin
+      ) shouldBe "apple\n"
     }
   }
 }
