@@ -112,7 +112,10 @@ trait TraitObjects extends TypeResolution {
    * names them as a table (`02 § A trait may require another trait`).
    */
   private def vtableFor(tr: Type.Trait, ty: Type, boxed: Boolean): String = {
-    val name = s"vt.${if boxed then "ref." else ""}${Type.mangle(tr)}.${Type.mangle(ty)}"
+    // The **member** prefix rather than the plain mangling, for the reason the members themselves
+    // take it: a transparent subtype and its base have different implementations, and one table
+    // holding both is the same collision one symbol holding two bodies is.
+    val name = s"vt.${if boxed then "ref." else ""}${Type.mangle(tr)}.${Type.memberSymbol(ty)}"
 
     if !vtables.contains(name) then
       val slots = traitMembers(tr.bound, selfBinding(ty)).map { (from, m) =>

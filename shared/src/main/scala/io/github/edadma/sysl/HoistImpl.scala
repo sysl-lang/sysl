@@ -414,7 +414,7 @@ trait HoistImpl extends ImplConformance {
 
         if impl.tparams.isEmpty then
           (ty,
-           MemberHome(ownerKey(ty), show(ty), Type.mangle(ty), head, ref, Nil, Map.empty, Set.empty, "field",
+           MemberHome(ownerKey(ty), show(ty), Type.memberSymbol(ty), head, ref, Nil, Map.empty, Set.empty, "field",
              selfBinding(ty)))
         else
           val shape = head.getOrElse(notGeneric(ref))

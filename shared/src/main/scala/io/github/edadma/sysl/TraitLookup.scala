@@ -292,7 +292,7 @@ trait TraitLookup extends MemberVisibility {
         err(s"'$mname' has type parameters of its own, so ${show(ty)} alone does not say which " +
           "instantiation is meant — call it, and the arguments will")
       case Some(fd) => instantiateFunc(fd, targs)
-      case None     => s"${Type.mangle(ty)}.$mname"
+      case None     => s"${Type.memberSymbol(ty)}.$mname"
   }
 
   /** Whether a member of that name is one the *compiler* provides for the type (`08`).
