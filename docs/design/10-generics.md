@@ -409,5 +409,15 @@ never by a covariant container.
   An instantiation at a **constrained subtype** or a **simple enum** takes that type's own checked
   cast, since the scalar conversion has no meaning for either and the form written under the type's
   name does. So `T(x)` at an `Age` is the `Age(x)` a reader would have written and `T(n)` at a
-  `Colour` is `Colour(n)`, trap included in both. The rule the whole entry comes down to is that
-  `T(x)` means whatever writing the instantiated type's name there would have meant.
+  `Colour` is `Colour(n)`, trap included in both.
+
+  **Construction is deliberately not among the forms it reaches.** A struct's positional constructor
+  takes a field list rather than a value, and a generic body filling in an unknown struct's fields
+  by position is not something to arrive at by accident — so `T(x)` at a struct is refused, naming
+  the struct, exactly as `u8(x)` at one is. What a container that wants to build a `T` reaches for
+  is a bound that says so.
+
+  The **parameter wins** over a declaration of the same name, which closes an inconsistency rather
+  than opening one: `var y: T` inside a `[T]` body has always meant the parameter, and until this
+  was written `T(x)` one line later meant a `struct T` declared elsewhere. A name means one thing in
+  both positions.

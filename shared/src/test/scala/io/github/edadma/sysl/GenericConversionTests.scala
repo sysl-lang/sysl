@@ -255,6 +255,48 @@ class GenericConversionTests extends AnyFreeSpec with RunSupport with CodegenSup
         |""".stripMargin) shouldBe "9 9\n"
   }
 
+  // --- which `T` a name means ----------------------------------------------------------------
+
+  "a type parameter wins over a declaration of the same name, as it already does in type position" in {
+    // The inconsistency this closes: `var y: T` inside a `[T]` body has always meant the parameter,
+    // and `T(x)` meant the struct — so one name meant two things one line apart.
+    run(
+      """struct T
+        |    v: int
+        |
+        |widen[T](b: u8, like: T) -> T = T(b)
+        |
+        |main()
+        |    print(widen(9u8, 0u32), T(3).v)
+        |""".stripMargin) shouldBe "9 3\n"
+  }
+
+  "and over a function of the same name" in {
+    run(
+      """T(x: int) -> int = x * 2
+        |
+        |widen[T](b: u8, like: T) -> T = T(b)
+        |
+        |main()
+        |    print(widen(9u8, 0u32), T(3))
+        |""".stripMargin) shouldBe "9 6\n"
+  }
+
+  "a struct instantiation is refused rather than construction being reached for" in {
+    // Construction takes a field list rather than a value, and a generic body filling in an unknown
+    // struct's fields by position is not something to arrive at by accident.
+    err(
+      """struct P
+        |    a: int
+        |    b: int
+        |
+        |make[T](x: int, like: T) -> T = T(x)
+        |
+        |main()
+        |    print(make(1, P(0, 0)).a)
+        |""".stripMargin) should include("cannot convert int to P")
+  }
+
   "two parameters convert independently in one expression" in {
     run(
       """both[A, B](x: A, y: B) -> A = x + A(B(x) + y)

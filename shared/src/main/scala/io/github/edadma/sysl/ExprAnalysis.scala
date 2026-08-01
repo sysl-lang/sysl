@@ -192,6 +192,22 @@ trait ExprAnalysis
   private def constrainedCast(key: String, args: List[Expr]): TExpr =
     castConstrained(resolveConstrained(key), qn(key), args)
 
+  /** `T(x)` — a conversion whose target is a type in hand rather than a name that was written out.
+   *
+   * The three forms a type's own name reaches in call position, chosen by what the type turns out
+   * to be: the checked cast into a constrained subtype, the checked cast from an integer into a
+   * simple enum, and the scalar conversions. **Construction is deliberately not among them** —
+   * a struct's positional constructor takes a field list rather than a value, and a generic body
+   * filling in an unknown struct's fields by position is not something to arrive at by accident. A
+   * `T` that is a struct is refused here, naming the struct, exactly as `u8(x)` at one is.
+   */
+  private def convertAt(ty: Type, written: String, args: List[Expr]): TExpr = ty match
+    case c: Type.Constrained => castConstrained(c, written, args)
+    case e: Type.Enum        => enumFromIntAt(e, written, args)
+    case other =>
+      if args.length != 1 then err(s"a '$written' conversion takes exactly one value")
+      convert(analyzeExpr(args.head), other)
+
   /** The same cast reached with the subtype in hand rather than with its name, which is what a
    * conversion written at a **type parameter** has: `T(x)` instantiated at an `Age` is the `Age(x)`
    * a reader would have written, and taking any other route would refuse it for not being a scalar
@@ -537,17 +553,15 @@ trait ExprAnalysis
     // have accepted written out. That is what makes the two directions symmetric: `u8(x)` where `x`
     // is a `T` was always ordinary code, checked once the width is concrete, and `T(b)` is the same
     // check at the same moment.
-    case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).isEmpty &&
-        typeNamed(name).isDefined =>
-      typeNamed(name).get match
-        // An instantiation at a constrained subtype or a simple enum takes the checked cast written
-        // under that type's own name, trapping on a value it does not admit, rather than the scalar
-        // conversion that has no meaning for either.
-        case c: Type.Constrained => castConstrained(c, name, args)
-        case e: Type.Enum        => enumFromIntAt(e, name, args)
-        case ty =>
-          if args.length != 1 then err(s"a '$name' conversion takes exactly one value")
-          convert(analyzeExpr(args.head), ty)
+    //
+    // A **parameter is asked about first**, ahead of every declaration table below, because it is
+    // the nearer binding: `var y: T` inside a `[T]` body already means the parameter whatever else
+    // is called `T`, and a name cannot mean the parameter in type position and a declaration in
+    // call position. A built-in is asked about only where no declaration claims the name, which is
+    // where it was asked before.
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty &&
+        (tsubst.contains(name) || (typeKey(name).isEmpty && scalarType(name).isDefined)) =>
+      convertAt(typeNamed(name).get, name, args)
 
     // A constrained subtype's name in call position wraps a base value into the subtype, checking it
     // — `Age(n)`, `Meters(3.0)`. Unlike an implicit produce site, the cast is written, so it applies
