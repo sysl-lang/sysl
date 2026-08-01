@@ -51,7 +51,27 @@ trait ExprParser extends SyslParserBase {
    * spelling of `(x: int) -> …` waiting to disagree with it.
    */
   protected lazy val lambdaParam: Parser[LambdaParam] =
-    at(ident ~ opt(op(":") ~> typeRef) ^^ { case n ~ t => LambdaParam(n, t) })
+    at(
+      ident ~ (op(":") ~> typeRef) <~ noDefault ^^ { case n ~ t => LambdaParam(n, Some(t)) } |
+        ident ^^ (n => LambdaParam(n, None)),
+    )
+
+  /** A closure's parameter declares no default (`12 §2a`). It is matched through the `Fn` trait,
+   * which carries types and no names, so a call through one has nothing to read a default out of —
+   * the same absence that stops a closure being called by name. Said here rather than left to the
+   * "')' expected" a grammar with no place for one would give.
+   *
+   * Reached only where the parameter wrote a **type**, and that is what makes saying it safe. A
+   * parenthesized list is read speculatively — `(x = 1)` is an argument that is a store, and `(a, b)`
+   * is a tuple — so a refusal here that could fire on one of those would refuse it before the rule
+   * that was going to accept it ever ran. `x: int` is an expression in no reading, so having got
+   * that far the list is a closure's parameters and nothing else.
+   */
+  protected lazy val noDefault: Parser[Unit] =
+    op("=") ~> err("a closure's parameter declares no default — a call reaches a closure through " +
+      "'Fn', which carries the types and not the names, so there would be nothing at the call to " +
+      "fill one from. Give the value a name of its own and capture it") |
+      success(())
 
   /** A closure's body, which is a function's body without the `=`: an expression, or an indented
    * block whose trailing expression is the value.

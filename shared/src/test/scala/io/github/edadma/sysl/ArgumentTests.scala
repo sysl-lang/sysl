@@ -253,6 +253,14 @@ class ArgumentTests
       ) shouldBe "7\n"
     }
 
+    // The absence a closure shares with a `&Fn` call: no names travel with it, so there would be
+    // nothing at the call to fill a default from.
+    "a closure's parameter declares none" in {
+      err("""|var f: &Fn(int) -> int = (x: int = 1) -> x
+             |print(f(2))
+             |""".stripMargin) should include("a closure's parameter declares no default")
+    }
+
     "a field declares none" in {
       err("""|struct Point
              |    x: int = 0
