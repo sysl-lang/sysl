@@ -16,7 +16,13 @@ package io.github.edadma.sysl
  * constructor parameter, so structural equality is unaffected by it.
  */
 
-sealed trait Expr extends Positioned
+/** Every expression node is a **case class**, and saying so in the type is what lets a walk that has
+ * nothing to say about any particular node read its children off the product rather than matching
+ * arm by arm (`Aliasing.exprKids`). Such a walk is total by construction, which is the property that
+ * matters: a node added below without a case of its own is descended into rather than silently
+ * treated as a leaf.
+ */
+sealed trait Expr extends Positioned, Product
 
 case class IntLit(value: BigInt, suffix: Option[String]) extends Expr
 case class FloatLit(text: String, suffix: Option[String]) extends Expr

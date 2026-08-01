@@ -124,16 +124,19 @@ trait Aliasing extends AnalyzerBase {
    * the clause walks want a total descent and have nothing to say about any particular node.
    * Expressions reachable only through a *statement* are not here, which is what the walks above
    * fall back to reading everything for.
+   *
+   * There is no fallback for a node this cannot read, because `Expr` is a `Product` and every node
+   * is therefore one. A walk with a fallback would answer "no children" for whatever it did not
+   * recognize, which for a *clause* walk is the dangerous direction: an alias the clause really
+   * makes would go unseen. Stating it in the type is what removes the case that could be wrong.
    */
-  private def exprKids(e: Expr): List[Expr] = e match
-    case p: Product =>
-      p.productIterator.toList.flatMap {
-        case x: Expr         => List(x)
-        case Some(x: Expr)   => List(x)
-        case xs: Iterable[?] => xs.toList.collect { case x: Expr => x }
-        case _               => Nil
-      }
-    case _ => Nil
+  private def exprKids(e: Expr): List[Expr] =
+    e.productIterator.toList.flatMap {
+      case x: Expr         => List(x)
+      case Some(x: Expr)   => List(x)
+      case xs: Iterable[?] => xs.toList.collect { case x: Expr => x }
+      case _               => Nil
+    }
 
   /** Holds a clause to reading storage the struct **owns** (`16 §6`).
    *

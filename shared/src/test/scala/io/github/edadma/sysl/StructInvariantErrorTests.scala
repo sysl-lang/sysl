@@ -96,6 +96,34 @@ class StructInvariantErrorTests extends AnyFreeSpec with CodegenSupport {
         include("whose invariant reads 'a.n'")
     }
 
+    /** The descent through a clause is **total** — it reads each node's children off the case class
+      * rather than matching arm by arm, which is why `Expr` is declared a `Product` (`ast.scala`).
+      * These are the two shapes that descent takes: a child held directly, and children held in a
+      * list. A walk that stopped at either would report *no* reads for the node, the field would drop
+      * out of what the clause is taken to read, and the `&` below would be **allowed** — the one
+      * direction this file exists to rule out.
+      */
+    "a field the clause reaches only through nested forms is still read" in {
+      def wrapping(clause: String) =
+        s"""|struct Outer
+            |    b: int
+            |    c: int
+            |    invariant $clause
+            |""".stripMargin
+
+      // `Unary` inside `Binary` — a child held directly, two levels down.
+      err(wrapping("-b < 0") + "var o = Outer(5, 0)\nvar p = &o.b") should
+        include("whose invariant reads 'b'")
+      // `Compare` — children held in a list, which is the other arm of the same walk.
+      err(wrapping("0 < b < 100") + "var o = Outer(5, 0)\nvar p = &o.b") should
+        include("whose invariant reads 'b'")
+
+      // The control, and the reason these say anything: a field no clause reaches is still ordinary,
+      // so the refusals above are about the descent finding `b` rather than about the struct.
+      irOf("main.sysl" -> (wrapping("0 < b < 100") + "var o = Outer(5, 0)\nvar p = &o.c\nprint(*p)")) should
+        include("define")
+    }
+
     // A clause is read for the paths it names, and a path hidden inside a statement — an `if` used
     // as a value has statement bodies — is one this reading cannot see. So such a clause is taken to
     // read every field, and `c` stops being ordinary. Refusing too much is the safe direction.
