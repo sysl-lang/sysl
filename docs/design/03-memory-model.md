@@ -159,15 +159,22 @@ mechanism it never touches.
 
 `*T` is a bare machine pointer, exactly like C: no length, no refcount, no checks, manual
 lifetime. Pointer arithmetic, `malloc` / `free`, MMIO addresses, and structure-walking live
-here. **It is the only unsafe primitive** — the only way to produce a dangling or wild pointer
-— and it needs no runtime. It is how a kernel, a driver, or the allocator's own internals are
-written.
+here. **It is the only unsafe primitive over data** — the only way to produce a dangling or wild
+pointer to a value — and it needs no runtime. It is how a kernel, a driver, or the allocator's own
+internals are written. Its counterpart over *code* is `*extern(…)`, an address a call may go through
+with nothing checking that the signature is the one the code there was compiled with (`12 §6a`); the
+two are spelled with the same sigil because they carry the same kind of promise.
 
 ## Places: `&`, `*`, and selection
 
 A **place** is something with an address: a local or parameter, a dereference, an **element**, and
 a field of any of them. Everything else — a call result, an arithmetic result, a freshly built
 struct — is a value with no address to take.
+
+A **function** is the one thing outside that division. It is not a place, since nothing holds it and
+there is no slot to point at, and it is not a value either — but `&f` yields its address all the
+same, and the result is a `*extern(…)`, which is code's own address rather than a pointer to
+anything readable (`12 §6a`). The `&` is this one; what differs is only what comes back.
 
 An element carries one wrinkle the other three do not. A slice's elements and a pointer's live
 wherever the storage is, which is somewhere the expression naming them is not, so they have an

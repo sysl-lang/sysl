@@ -545,6 +545,93 @@ position can afford the static side because it introduces the type parameter; th
 must take the dynamic side because a field has one fixed layout. The language routes you to the
 cheaper representation wherever it is possible and to the visible box exactly where it is not.
 
+## 6a. A function's address — `*extern(A, B) -> R`
+
+`Fn` is sysl's answer to "what is the type of a callable", and it is the right one for sysl: a bound
+where the callable is passed down, a boxed object where it is kept, and in both cases something with
+an environment beside it. **C has no notion of an environment.** What a C interface means by a
+function pointer is one word holding the address of code, and a program that could not produce one
+could not be given to any C interface that calls back.
+
+That is not a small set. `qsort` and `bsearch` take a comparison, `signal` and `sigaction` take a
+handler, `atexit` takes a hook, `pthread_create` takes a thread body, `scandir` takes a filter, and
+every library with a `_set_callback` in it takes one of these. All of them could be *declared* — the
+parameter is a `void *` and `*u8` spells that — and none of them could be **called**, because there
+was nothing to pass. The same absence shut the other direction: an address `dlsym` hands back could
+not be called either, so the whole dynamic-loading interface was declarable and useless.
+
+```
+extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+
+compare(a: *u8, b: *u8) -> i32
+    var pa: *i32 = ptr_cast(a)
+    var pb: *i32 = ptr_cast(b)
+    *pa - *pb
+
+var xs = [30i32, 10i32, 20i32]
+
+qsort(ptr_cast(&xs[0]), 3usize, 4usize, &compare)
+```
+
+**`&f` is the address, and the `&` is the same one `03` gives every other address.** A bare `f` keeps
+the meaning §5 gives it — the capture-free closure — because a spelling that meant a sysl callable in
+one slot and a C address in another would be choosing silently between two representations that share
+nothing. Where a `*extern` is wanted, the `&` is written; where a callable is wanted, it is not.
+
+**It is its own type rather than a mode over the call trait.** `*Fn(A) -> R` was already taken, and
+by the right thing: an unowned trait object over a callable, two words, a method table beside the
+value (`02`). Spelling both the same would put a fat pointer where C reads one word, and the mistake
+would be invisible. So the three are three:
+
+| written | what it is | width |
+|---|---|---|
+| `A -> R` at a parameter | a bound over `Fn`, monomorphized and inlined (§6) | nothing |
+| `&Fn(A) -> R` | a heap-boxed callable, counted (§6) | two words |
+| `*extern(A) -> R` | the address of code compiled to C's convention | one word |
+
+It is also not `*T` of anything. A raw pointer addresses a **value** — one that can be read through,
+written through, and measured — and there is no value at the end of this one, so every operation `*T`
+carries would have needed an exception. What an address of code can do is the one thing it is for: be
+called, and be handed to whoever asked for it.
+
+**A call through one goes out under C's convention**, because that is what the type said was at the
+other end — the same lowering an `extern` call gets (§1), aggregates and all. Nothing checks that the
+signature is the signature the code at that address was compiled with; that is the promise the `*`
+announces, and it is the same promise every raw pointer makes.
+
+**`ptr_cast` reaches between an address of code and an address of bytes**, which is how a `*u8` from
+`dlsym` becomes callable and how one goes back to a C interface that stores callbacks as `void *`.
+
+**`null` is a `*extern`**, since "there is no callback, use the default" is a state several C
+interfaces have, and two compare by address so a program can ask whether one is installed.
+
+### What has no address, and why
+
+Each of these is refused because the address would not be an address of what its type says, and
+nothing downstream could notice:
+
+- **A generic function.** It is a body per set of type arguments (`10 §7`), so there is no one body
+  to name. A wrapper calling it at the arguments wanted is what has an address.
+- **A variadic function.** C reads a tail relative to the last named argument, and a `*extern` states
+  the arguments a call passes. A signature that fixed the tail would not be describing a variadic
+  function.
+- **A nested function.** Its environment is the frame it was declared in (§5a), and what would have
+  to travel beside the address is that frame.
+- **A closure.** The same reason with the name taken off: a closure is a struct and an
+  implementation (§8), and one word has nowhere to put the struct.
+- **A `#test` function.** Every build but `sysl test` drops it (`testing.md`), so its address would
+  be of a definition the program does not have.
+- **Any signature carrying an aggregate** — a struct, a tuple, a data enum, a view, a `string`. An
+  aggregate crosses to C in whichever registers that machine's convention names (`targets.md`), and
+  a sysl definition did not put it there. This is the one refusal that is a **restriction rather than
+  a consequence**: what closes it is an adapter emitted beside such a function, entered under the C
+  classification and calling the sysl one. Until there is one, the refusal names the parameter, since
+  an address that is quietly wrong is worse than no address. A callback taking the parts behind a
+  `*T` is the shape that works today, and it is what C interfaces overwhelmingly use anyway.
+
+The test is made by **shape** rather than by asking the target's classification, so a program
+accepted for one machine is accepted for every machine.
+
 ## 7. Capture follows the memory model
 
 A closure body may name variables from the scope it is written in; naming one **captures** it.
@@ -786,9 +873,13 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
 - **No `fn` / `func` / `lambda` keyword.** A function is a name and a parameter list; a closure is
   an arrow. Neither takes an introducer, consistent with the keyword-lightness of the enum,
   struct, and method forms.
-- **No distinct function-pointer type.** A capture-free callable is a `Fn` with an empty
-  environment, spelled the same as any other; there is no `fn(int) -> int` primitive-pointer type
-  beside the trait.
+- ~~**No distinct function-pointer type.**~~ **Corrected, and only at the C boundary.** For sysl's
+  own callables the sentence stands: a capture-free callable is a `Fn` with an empty environment,
+  spelled the same as any other, and there is no `fn(int) -> int` beside the trait. What it was wrong
+  about is the seam — a C function pointer is one word and a `&Fn` is a trait object, so a language
+  that had only the trait could be given to no C interface that calls back. `*extern(A) -> R` is that
+  word and nothing else (§6a). The general rule and the exception are both about representation, and
+  the exception is where the representation is somebody else's to choose.
 - **No currying, no partial application.** `Fn(A, B) -> C` is a two-argument callable, not
   `Fn(A) -> Fn(B) -> C`; a bare arrow type is `A -> B` with a single domain, and multi-argument
   types are parenthesized `(A, B) -> C` (§6), never chained. Partial application is a library
@@ -830,8 +921,12 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
 - **e. Named associated functions and methods as first-class values.** §5 lets a top-level
   function be used as a callable. Whether `Point.origin` or `p.dist` (an associated function, a
   bound method) may likewise be passed as an `Fn` — and how a bound method carries its receiver —
-  joins this chapter with `08` and is not settled here.
-- **f. A symbol for a sysl *definition*.** §1 lets an `extern` name the symbol it resolves to; the
+  joins this chapter with `08` and is not settled here. *(The half of this that was about the C
+  boundary is closed by §6a; what is left is the sysl-callable question, which is what it was always
+  really asking.)*
+- **f. A symbol for a sysl *definition*.** *(Untouched by §6a, which is worth saying because the two
+  look alike: a callback travels as an address at run time and never needs a name, so nothing about
+  giving C a function required deciding what that function is called.)* §1 lets an `extern` name the symbol it resolves to; the
   other direction — a sysl function exported under a chosen symbol, C's side of the same seam — has
   no spelling. It is the same question as how a sysl function's symbol is decided at all, and `13`
   has since settled that, so what is left here is the **spelling** rather than anything to wait for.

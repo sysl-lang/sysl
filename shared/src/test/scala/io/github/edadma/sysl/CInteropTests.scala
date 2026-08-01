@@ -246,33 +246,35 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     * so closing one breaks a test here and the message says which capability arrived.
     */
   "what a C library still cannot be given" - {
-    /** **A sysl function has no address.** So every callback-taking interface above — `qsort`,
-      * `bsearch`, `signal`, `sigaction`, `atexit`, `pthread_create` — can be declared and cannot be
-      * *called*, because there is nothing to pass. `12 § Open e` (a named function as a first-class
-      * value) and `12 § Open f` (a symbol for a sysl definition) are the two halves of it.
+    /** **A function's address was the biggest gap here and is closed** — `*extern(A) -> R` is the
+      * type, `&f` produces one, and `FuncAddressTests` is where the capability is held. What stays
+      * here is the *shape of the mistake a reader still makes*, which is reaching for the address
+      * with the bare name C would let them use.
       *
-      * The gap is unchanged; what the diagnostic *says* about it is no longer wrong. It used to
-      * report the name as undefined, which is false of a name declared on the line above and sends
-      * the reader hunting for a typo. It now says the name is a function, where a function is a
-      * value, and that there is no address to fall back on — which is the whole of what is missing.
+      * A bare `f` is the capture-free closure it has always been (`12 §5`), so what it needs is the
+      * `&` and the message says so rather than reporting a typo.
       */
-    "a function's address, which is what a C callback is" in {
-      val addr = err("cmp(a: *u8, b: *u8) -> int = 0\nprint(&cmp == null)")
+    "a function's address is reached with '&', not with the bare name C allows" in {
+      val addr = err("cmp(a: *u8, b: *u8) -> int = 0\nprint(cmp)")
 
       addr should include("'cmp' is a function")
-      addr should include("no address of its own")
       addr should not include "undefined name"
 
-      err("extern qsort(b: *u8, n: usize, sz: usize, c: *u8)\ncmp(a: *u8, b: *u8) -> int = 0\n" +
-        "var xs: [2]i32 = [2, 1]\nqsort(&xs[0], 2usize, 4usize, cmp)\nprint(xs[0])") should
+      err("extern qsort(b: *u8, n: usize, sz: usize, c: *extern(*u8, *u8) -> int)\n" +
+        "cmp(a: *u8, b: *u8) -> int = 0\nvar xs: [2]i32 = [2, 1]\n" +
+        "qsort(ptr_cast(&xs[0]), 2usize, 4usize, cmp)\nprint(xs[0])") should
         include("'cmp' is a function")
     }
 
-    // The same gap from the other side: a function pointer C hands back cannot be invoked, so
-    // `dlsym` is as unusable as `qsort`.
-    "and calling one C handed back" in {
+    // The other direction is open too, and what stays refused is the step that was skipped: a `*u8`
+    // is an address of bytes and says nothing about a signature, so it is read as a `*extern` first.
+    "and one C handed back is called after it is read as a function pointer, not before" in {
       err("extern dlsym(h: *u8, n: *u8) -> *u8\nvar f = dlsym(null, c\"abs\")\nprint(f(1))") should
         include("is not callable")
+
+      run("extern dlopen(p: *u8, m: i32) -> *u8\nextern dlsym(h: *u8, n: *u8) -> *u8\n" +
+        "var f: *extern(i32) -> i32 = ptr_cast(dlsym(dlopen(null, 1i32), c\"abs\"))\n" +
+        "print(f(-3))") shouldBe "3\n"
     }
 
     /** **A global variable cannot be externed.** `extern` declares functions only, so `stdout`,
@@ -289,16 +291,34 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       run("extern \"__error\" errno_at() -> *i32\nprint(*errno_at() == 0)") shouldBe "true\n"
     }
 
-    /** A callable's *sysl* type is a trait object — three words with a method table — and nothing
-      * about it is a C function pointer. The declaration is accepted, which is the trap: it would
-      * compile and pass the wrong thing. Recorded so that a real C-function-pointer type, when it
-      * arrives, is what an extern is held to instead.
+    /** A callable's *sysl* type is a trait object — two words, a method table beside the value — and
+      * nothing about it is a C function pointer. The bare arrow is refused here for its own reason,
+      * and the advice it gives (`&Fn`) is advice about sysl callables rather than about this seam.
       */
     "a bare arrow in an extern is refused, and names a boxed callable that C could not read" in {
       val e = err("extern qsort(b: *u8, n: usize, sz: usize, cmp: (*u8, *u8) -> int)\nprint(1)")
 
       e should include("only a parameter may be")
       e should include("&Fn(*u8, *u8) -> int")
+    }
+
+    /** **The trap `*extern` exists to keep somebody out of, and it is still open.** A `*Fn` in an
+      * extern's parameter list compiles, and a trait object is two words where C reads one — so the
+      * call would hand over the table and read the value as the callback.
+      *
+      * It is not refused because `12 §1` decided the general question the other way: a `string` and
+      * a `&T` are sysl layouts C has no notion of, and handing one over is the programmer's business,
+      * the same promise `*T` already is. Singling this one out would be a rule the chapter
+      * contradicts. What has changed is that there is now a right answer to reach for, so the cost of
+      * the trap is a spelling somebody did not know rather than a capability they did not have.
+      */
+    "while a '*Fn' in an extern still compiles, being a sysl layout the chapter leaves to its author" in {
+      ir("extern qsort(b: *u8, n: usize, sz: usize, cmp: *Fn(*u8, *u8) -> int)\nprint(1)") should
+        include("define")
+
+      // What it should have said, which does cross as the one word C reads.
+      ir("extern qsort(b: *u8, n: usize, sz: usize, cmp: *extern(*u8, *u8) -> int)\nprint(1)") should
+        include("define")
     }
 
     "the widest C float is not lowered" in {
