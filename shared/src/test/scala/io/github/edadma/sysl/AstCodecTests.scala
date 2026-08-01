@@ -126,6 +126,14 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // one where the other belonged would still round-trip every field either of them has.
     check("an extern variable, beside the function it is not",
       "extern \"environ\" env: **u8\nprivate extern optind: i32\nextern abs(n: int) -> int")
+    // A default is part of what a signature says, so a library that lost one across the artifact
+    // would tell a caller in another project that the argument is missing. The undefaulted
+    // parameter beside it is what keeps the case from passing for a codec that defaulted every
+    // parameter to the same thing.
+    check("a parameter's default, and a named argument at a call",
+      """f(a: int, b: int = 2 + 3, c: string = "x") -> int = a + b
+        |g() -> int = f(1, c = "y")
+        |""".stripMargin)
     check("a struct with members, invariants and a private field",
       """struct Span
         |    private lo: int

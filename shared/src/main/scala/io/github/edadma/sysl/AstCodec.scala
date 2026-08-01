@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 7
+  val Version: Int = 8
 
   private val Magic = "sysl-ast"
 
@@ -136,7 +136,9 @@ object AstCodec {
 
     // -------------------------------------------------------------- pieces
 
-    private def param(p: Param): Unit = { pos(p); sref(p.name); typ(p.typ); vis(p.vis) }
+    private def param(p: Param): Unit = {
+      pos(p); sref(p.name); typ(p.typ); vis(p.vis); opt(p.default)(expr)
+    }
 
     private def bound(b: BoundRef): Unit = { pos(b); sref(b.name); list(b.args)(typ) }
 
@@ -238,6 +240,8 @@ object AstCodec {
         case RangeExpr(lo, hi, inc)  => tok("rng"); opt(lo)(expr); opt(hi)(expr); bool(inc)
         case Assign(op, t, v)        => tok("asg"); sref(op); expr(t); expr(v)
         case Call(callee, as)        => tok("call"); expr(callee); list(as)(expr)
+        case NamedArg(n, v)          => tok("narg"); sref(n); expr(v)
+        case DefaultArg(o, v)        => tok("darg"); opt(o)(sref); expr(v)
         case Index(recv, i)          => tok("idx"); expr(recv); expr(i)
         case Field(recv, n)          => tok("fld"); expr(recv); sref(n)
         case TypeAttr(recv, a)       => tok("tat"); expr(recv); sref(a)
@@ -500,7 +504,7 @@ object AstCodec {
 
     // -------------------------------------------------------------- pieces
 
-    private def param(): Param  = at(Param(sref(), typ(), vis()))
+    private def param(): Param  = at(Param(sref(), typ(), vis(), opt(expr())))
     private def bound(): BoundRef = at(BoundRef(sref(), list(typ())))
     private def bounds(): Map[String, List[BoundRef]] = map(list(bound()))
     private def tdefaults(): Map[String, TypeRef]     = map(typ())
@@ -582,6 +586,8 @@ object AstCodec {
         case "rng"  => RangeExpr(opt(expr()), opt(expr()), bool())
         case "asg"  => Assign(sref(), expr(), expr())
         case "call" => Call(expr(), list(expr()))
+        case "narg" => NamedArg(sref(), expr())
+        case "darg" => DefaultArg(opt(sref()), expr())
         case "idx"  => Index(expr(), expr())
         case "fld"  => Field(expr(), sref())
         case "tat"  => TypeAttr(expr(), sref())

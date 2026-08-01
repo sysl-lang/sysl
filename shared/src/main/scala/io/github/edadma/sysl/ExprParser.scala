@@ -144,7 +144,7 @@ trait ExprParser extends SyslParserBase {
       // A call is the exception: what is wrong with `foo(…)` is nearly always `foo` — it does not
       // exist, or it does not take these arguments — so the callee's own position wins, and the
       // `(` is only the fallback for a callee that somehow has none.
-      here ~ (op("(") ~> commaList(expression) <~ op(")")) ^^ { case p ~ args =>
+      here ~ (op("(") ~> commaList(argument) <~ op(")")) ^^ { case p ~ args =>
         (e: Expr) => Call(e, args).setPos(e.pos).setPos(p)
       } |
       here <~ op("?") ^^ (p => (e: Expr) => TryExpr(e).setPos(p)) |
@@ -207,6 +207,19 @@ trait ExprParser extends SyslParserBase {
    * errors. That is why the empty case is a separate alternative rather than `repsep` with an
    * optional comma hung off it, which would have accepted both.
    */
+  /** One argument at a call: an ordinary expression, or `name = value` standing at the parameter it
+   * names rather than at the one its position would give it (`12 §2a`).
+   *
+   * `name = value` is also a legal expression — assignment yields the value stored — so the two
+   * readings collide and the named argument is the one taken. It is tried first, and only where the
+   * name is a bare identifier with an `=` after it: `p.x = 1` and `b[i] = v` are stores as they
+   * always were, since neither is a name a parameter list could have written. A store to a plain
+   * variable is still reachable in an argument by parenthesizing it, and a name matching no
+   * parameter is refused by the analyzer rather than quietly falling back to the store.
+   */
+  protected lazy val argument: PackratParser[Expr] =
+    at(ident ~ (op("=") ~> expression) ^^ { case n ~ v => NamedArg(n, v) }) | expression
+
   protected def commaList[T](p: Parser[T]): Parser[List[T]] = commaList1(p) | success(Nil)
 
   protected def commaList1[T](p: Parser[T]): Parser[List[T]] = rep1sep(p, op(",")) <~ opt(op(","))

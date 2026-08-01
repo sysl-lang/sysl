@@ -19,12 +19,17 @@ trait CallAnalysis extends OperatorCalls {
    * the way a generic free function's are: from the arguments, and from the type the context expects
    * where the arguments do not determine them.
    */
-  protected def callAssociated(tname: String, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
-    val chosen = pickAssociated(tname, mname, args)
+  protected def callAssociated(tname: String, mname: String, written: List[Expr], expected: Option[Type]): TExpr =
+    val chosen = pickAssociated(tname, mname, written)
 
     memberDecls.get((tname, chosen)) match
       case Some(m) if m.receiver.isEmpty && !m.isProperty =>
         checkMemberVisible(tname, chosen, m)
+        // A member's default is written in its type's file, so the type's key is the scope it is
+        // read in — and it is a top-level declaration, which a member key is not.
+        val args =
+          bindArgs(s"associated function '$tname.$chosen'", Some(tname), m.params, written, m.variadic)
+
         genericMembers.get((tname, chosen)) match
           case Some(fd) => callGenericAssociated(tname, fd, m, args, expected)
           case None =>
@@ -121,8 +126,13 @@ trait CallAnalysis extends OperatorCalls {
           err(s"'&self' needs a reference; a ${show(tr.ty)} on the stack has none — take '*self' instead, " +
             "or put the object behind a '&'")
 
-  protected def constructStruct(name: String, args: List[Expr], expected: Option[Type]): TExpr = {
+  protected def constructStruct(name: String, written: List[Expr], expected: Option[Type]): TExpr = {
     val decl = structDecls(name)
+
+    // A field is a named parameter of the constructor, so a value may be written at the name of the
+    // field it is for. A field declares no default (`12 §2a`), so nothing is filled here — the
+    // constructor still writes every field, and this only lets the call say which is which.
+    val args = bindArgs(s"struct '${qn(name)}'", Some(name), decl.fields, written)
 
     if args.length != decl.fields.length then
       err(s"struct '${qn(name)}' has ${quantity(decl.fields.length, "field")}, but ${supplied(args.length, "value")}")
@@ -157,13 +167,17 @@ trait CallAnalysis extends OperatorCalls {
     else nnew
   }
 
-  protected def constructVariant(key: String, args: List[Expr], expected: Option[Type]): TExpr = {
+  protected def constructVariant(key: String, written: List[Expr], expected: Option[Type]): TExpr = {
     // The key says which module's variant this is; the name inside the enum is what the enum's own
     // declaration and its instantiation both know it by.
     val name  = Modules.split(key)._2
     val ename = variantOwner(key)
     val decl  = enumDecls(ename)
     val vdecl = decl.variants.find(_.name == name).get
+
+    // A variant's payload is named the same way a struct's fields are, and takes a name at the call
+    // for the same reason.
+    val args = bindArgs(s"variant '$name'", Some(ename), vdecl.fields, written)
 
     if vdecl.fields.isEmpty && args.nonEmpty then
       err(s"variant '$name' takes no arguments — write it as '$name'")

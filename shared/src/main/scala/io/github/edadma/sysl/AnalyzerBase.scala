@@ -438,6 +438,22 @@ trait AnalyzerBase {
   /** Runs `body` in the terms the declaration `name` was written in. */
   protected def inDecl[T](name: String)(body: => T): T = inScope(scopeFor(name))(body)
 
+  /** Runs `body` in `name`'s terms **and with nothing local in scope** — how a parameter's default
+   * is analyzed at a call that left the argument out (`12 §2a`).
+   *
+   * `inDecl` alone would put the default in the declaration's module while leaving it looking at
+   * the *caller's* locals, so a default of `n` would quietly find whatever the call site happened
+   * to have called `n`. Emptying the stack is what makes the refusal a refusal: a default naming a
+   * parameter, or anything else nothing at module level declares, is undefined here and says so.
+   */
+  protected def inDefault[T](name: Option[String])(body: => T): T = {
+    val saved = scopes
+
+    scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
+    try name.fold(body)(inDecl(_)(body))
+    finally scopes = saved
+  }
+
   /** Runs `body` in `module` with nothing imported — for the compiler's own declarations, which
    * name everything they use in full.
    */

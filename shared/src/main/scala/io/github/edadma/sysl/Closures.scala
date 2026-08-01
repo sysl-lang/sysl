@@ -10,7 +10,7 @@ import scala.collection.mutable
  * the environment, and from inside a sibling's body, where it is the receiver that body already
  * has. That is what makes mutual recursion a call on the receiver rather than a capture.
  */
-case class Nested(fname: String, env: TExpr, variadic: Boolean = false)
+case class Nested(fname: String, env: TExpr, variadic: Boolean = false, params: List[Param] = Nil)
 
 /** The environment a body reads its captures out of (`12 §7`, `§5a`).
  *
@@ -194,8 +194,8 @@ trait Closures extends CallAnalysis {
       (f, fname)
     }
 
-    val inside = lowered.map((f, fname) => f.name -> Nested(fname, self, f.variadic)).toMap
-    val outer  = lowered.map((f, fname) => f.name -> Nested(fname, here, f.variadic)).toMap
+    val inside = lowered.map((f, fname) => f.name -> Nested(fname, self, f.variadic, f.params)).toMap
+    val outer  = lowered.map((f, fname) => f.name -> Nested(fname, here, f.variadic, f.params)).toMap
 
     // The names are bound **before** any body is analyzed, so a body that does not analyze leaves
     // the group callable and the block is told about its one mistake rather than about that one and
@@ -239,11 +239,17 @@ trait Closures extends CallAnalysis {
   protected def callNested(n: Nested, written: String, args: List[Expr]): TExpr = {
     val (params, result) = funcInsts(n.fname)
 
-    checkArity(s"'$written'", params.length - 1, n.variadic, args.length)
+    // A nested function is a declaration with named parameters like any other, so it takes both a
+    // name at the call and a default (`12 §2a`). Its default carries no owning key: every call to
+    // one is inside the body it was written in, so the terms already in force are its own — and
+    // `bindArgs` empties the locals, which is what keeps a default from reading a capture.
+    val bound = bindArgs(s"'$written'", None, n.params, args, n.variadic)
+
+    checkArity(s"'$written'", params.length - 1, n.variadic, bound.length)
 
     // The environment holds the first slot, so a tail begins one past where a free function's does
     // — the same arithmetic a method's receiver makes.
-    val (declared, tail) = args.splitAt(params.length - 1)
+    val (declared, tail) = bound.splitAt(params.length - 1)
     val supplied2        = declared.zip(params.tail).map((a, p) => analyzeExpr(a, Some(p._2)))
 
     funcsUsed += n.fname

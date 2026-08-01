@@ -178,7 +178,12 @@ trait HoistImpl extends ImplConformance {
     for m <- inherited do
       defaultOrigin(s"${home.symbol}.${m.name}${home.alt}") = s"${impl.traitName}.${m.name}"
 
-    val lowered = hoistMemberList(home, impl.methods ::: inherited, out)
+    // The trait's defaults travel onto the block's own methods, so that a call to a known type fills
+    // them from the same place a call through an object does (`12 §2a`). Doing it here rather than
+    // at the call is what keeps every downstream path — the concrete call, the vtable slot, the
+    // generic body checked against a bound — from having to know a member came from an `impl`.
+    val supplied = impl.methods.map(withTraitDefaults(tr, _))
+    val lowered  = hoistMemberList(home, supplied ::: inherited, out)
 
     // A generic block's members are checkable before anything instantiates them, against the bounds
     // the block wrote on its own parameters — the same walk a generic type's members take. An
@@ -186,6 +191,33 @@ trait HoistImpl extends ImplConformance {
     // which is the whole of what its body may assume wherever it is copied to.
     abstractMembers ++= lowered.filter(_.tparams.nonEmpty).filterNot(f => defaultOrigin.contains(f.name))
   }
+
+  /** One of an `impl` block's methods, carrying whatever defaults the trait declared for it.
+   *
+   * An `impl` may declare none of its own — a call through an object has no implementation to read
+   * one off, so the trait is the only place they can be written — which is what makes this a copy
+   * rather than a merge, and what leaves nothing to decide when the two disagree.
+   *
+   * The copy carries the **trait's** key with it, in a `DefaultArg` wrapped around the expression
+   * itself. A default is analyzed in the terms it was written in, and those are the trait's however
+   * far from it the implementing type sits — the same rule an inherited *body* follows
+   * (`defaultHome`), one declaration part further in. Binding wraps it a second time in the
+   * implementing type's key, and the inner wrapper is the one that decides, which is what makes a
+   * default written in one module mean the same thing implemented in another.
+   *
+   * A method the trait does not declare, or one whose parameters do not line up with it, is left
+   * exactly as written: conformance is what says so, in the words that mistake deserves, and
+   * quietly reshaping the member here would only make that report harder to read.
+   */
+  private def withTraitDefaults(tr: TraitDecl, im: MethodDecl): MethodDecl =
+    tr.methods.find(tm => tm.name == im.name && tm.params.length == im.params.length) match
+      case Some(tm) if tm.params.exists(_.default.isDefined) =>
+        val carried = im.params.zip(tm.params).map { (p, t) =>
+          p.copy(default = t.default.map(d => DefaultArg(Some(tr.name), d).setPos(d.pos)))
+        }
+
+        im.copy(params = carried).setPos(im.pos)
+      case _ => im
 
   /** Where a copied default's body was written, for a member that is one.
    *

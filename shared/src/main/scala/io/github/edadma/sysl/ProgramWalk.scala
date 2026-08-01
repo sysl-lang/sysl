@@ -20,7 +20,8 @@ trait ProgramWalk
     with ModuleGraph
     with Capabilities
     with NoAlloc
-    with InitOrder {
+    with InitOrder
+    with DefaultParams {
 
   protected def units: List[Program]
 
@@ -192,6 +193,11 @@ trait ProgramWalk
     for (key, decl) <- valDecls do
       currentPos = decl.pos
       tvals ++= recoverOpt(analyzeVal(key))
+
+    // And every parameter's default, for the same reason and in the same state: a default is a
+    // module member's expression too, filled at a call but written here, so it is checked where it
+    // is written and whether or not any call takes it (`12 §2a`).
+    checkValueDefaults()
 
     val tfuncs = mutable.ListBuffer.empty[TFunc]
 

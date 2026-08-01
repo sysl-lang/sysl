@@ -53,7 +53,8 @@ trait MethodCalls extends FuncAddress {
         memberDecls.get((base, chosen)) match
           case Some(m) if m.receiver.isDefined && m.tparams.nonEmpty =>
             checkMemberVisible(base, chosen, m)
-            callGenericMethod(genericMembers((base, chosen)), m, targs, tr, args, expected)
+            callGenericMethod(genericMembers((base, chosen)), m, targs, tr,
+              bindArgs(s"method '$base.$chosen'", Some(base), m.params, args, m.variadic), expected)
           case Some(m) if m.receiver.isDefined =>
             checkMemberVisible(base, chosen, m)
             val fname           = memberFuncName(rty, chosen)
@@ -62,10 +63,14 @@ trait MethodCalls extends FuncAddress {
             // the callable and the argument's position rather than the member behind it (`12 §6`).
             val callable = mname == "call" && callableOf(rty).isDefined
             val shown    = if callable then "this callable" else s"method '$fname'"
-            checkArity(shown, params.length - 1, m.variadic, args.length)
+            // The receiver is not among the parameters a call writes arguments for, so it is not
+            // among the ones a name may reach either — `m.params` starts where the arguments do.
+            val bound = bindArgs(shown, Some(base), m.params, args, m.variadic)
+
+            checkArity(shown, params.length - 1, m.variadic, bound.length)
             // A member's tail begins where its declared parameters stop, and the receiver holds one
             // of the slots — so the cut is one past what a free function's would be.
-            val (declared, tail) = args.splitAt(params.length - 1)
+            val (declared, tail) = bound.splitAt(params.length - 1)
             val recvArg  = buildReceiver(m.receiver.get, tr)
             val restArgs = declared.zip(params.tail).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
             funcsUsed += fname
@@ -132,11 +137,23 @@ trait MethodCalls extends FuncAddress {
         val supplied = args.map(probeType)
         val from = s"'$mname' comes from ${quantity(cands.length, "implementation")} of one trait on $subject"
 
+        // Which candidate a call means is read off the arguments it wrote, in the order it wrote
+        // them — so a name, which is exactly a refusal to say what an argument's position is, has
+        // nothing here to choose between them. Said outright, because the alternative is the
+        // "none of them takes (?, ?)" below, which points at the wrong thing.
+        for n <- args.collectFirst { case n: NamedArg => n } do
+          at(n.pos)(err(s"$from, and which is meant is read off the arguments as written — so an " +
+            "argument given by name leaves nothing to tell them apart. Write them in declared order"))
+
         // A candidate that takes a `...` is answered for by its declared parameters alone: the tail
-        // stands at none, so what it may be told apart by stops where they do (`12 §9`).
+        // stands at none, so what it may be told apart by stops where they do (`12 §9`). A default
+        // widens the same count downwards, and for the same reason — a call may stop where the
+        // defaults begin, so what is compared is the prefix the two lists share.
         val fits = cands.filter { c =>
           params(c).exists { ps =>
-            val counted = if variadicMember(owner, c) then supplied.length >= ps.length else supplied.length == ps.length
+            val counted =
+              if variadicMember(owner, c) then supplied.length >= ps.length
+              else supplied.length <= ps.length && supplied.length >= leastMember(owner, c, ps.length)
 
             counted && ps.zip(supplied).forall((p, s) => s.contains(p))
           }
@@ -154,6 +171,14 @@ trait MethodCalls extends FuncAddress {
    */
   private def variadicMember(owner: String, mname: String): Boolean =
     memberDecls.get((owner, mname)).exists(_.variadic)
+
+  /** How few arguments one of a type's members may be called with — its parameters, less the ones a
+   * default stands in for. Asked of the member table for the reason above: a default is not
+   * something a lowered signature records, and `declared` is what to fall back on where the member
+   * itself cannot be found.
+   */
+  private def leastMember(owner: String, mname: String, declared: Int): Int =
+    memberDecls.get((owner, mname)).fold(declared)(m => m.params.count(_.default.isEmpty))
 
   /** `value.m(…)`, where the receiver's type names each candidate's instantiation. */
   protected def pickOverload(rty: Type, base: String, mname: String, args: List[Expr]): String =
@@ -250,15 +275,16 @@ trait MethodCalls extends FuncAddress {
       // everywhere except here.
       val params = inDecl(m.name)(sig.params.map(p => (p.name, rt(p.typ))))
       val key    = Library.key(fname)
+      val bound  = bindArgs("method 'Display.display'", Some(m.name), sig.params, args)
 
-      if args.length != params.length then
+      if bound.length != params.length then
         err(s"method 'Display.display' takes ${quantity(params.length, "argument")}, " +
-          s"but ${supplied(args.length, "argument")}")
+          s"but ${supplied(bound.length, "argument")}")
 
       val self = rendered(buildReceiver(RecvMode.ByValue, recv), to)
 
       funcsUsed += key
-      TCall(key, self :: checkArgs("Display.display", params, args, None), Type.Unit)
+      TCall(key, self :: checkArgs("Display.display", params, bound, None), Type.Unit)
     }
 
   /** `k.hash()` — the mixing a built-in's `Hash` membership provides (`14 §5`).
@@ -326,12 +352,14 @@ trait MethodCalls extends FuncAddress {
         m.params.map(p => (p.name, resolveType(p.typ, selfBinding(rty) ++ decl.tparams.map(_ -> rty))))
       }
 
-      if args.length != params.length then
+      val bound = bindArgs(s"method '$trName.$mname'", Some(decl.name), m.params, args)
+
+      if bound.length != params.length then
         err(s"method '$trName.$mname' takes ${quantity(params.length, "argument")}, " +
-          s"but ${supplied(args.length, "argument")}")
+          s"but ${supplied(bound.length, "argument")}")
 
       val self             = buildReceiver(RecvMode.ByValue, recv)
-      val ts               = checkArgs(s"$trName.$mname", params, args, None)
+      val ts               = checkArgs(s"$trName.$mname", params, bound, None)
       val (_, op, kind)    = CoreTraits.required(trName)
 
       kind match
@@ -362,8 +390,13 @@ trait MethodCalls extends FuncAddress {
             err(s"'$mname' is an associated function of '${tr.show}', so it has no receiver — a value " +
               "cannot be the thing it is called on")
           val params = m.params.map(p => (p.name, resolveType(p.typ, self)))
-          checkArity(s"method '$fname'", params.length, m.variadic, args.length)
-          val (declared, tail) = args.splitAt(params.length)
+          // Checked against the trait's signature, so it is the trait's defaults and the trait's
+          // parameter names that a call inside a generic body may reach for — the same ones every
+          // instantiation will present, which is what makes one walk stand in for all of them.
+          val bound = bindArgs(s"method '$fname'", Some(tr.name), m.params, args, m.variadic)
+
+          checkArity(s"method '$fname'", params.length, m.variadic, bound.length)
+          val (declared, tail) = bound.splitAt(params.length)
           val ts    = declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
           val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
           TCall(fname, recv :: (checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_))), rtype)
@@ -459,14 +492,23 @@ trait MethodCalls extends FuncAddress {
         val callable = Type.Fn.isCall(from.name)
         val fname    = if callable then "this callable" else s"method '${from.name}.$mname'"
 
-        if args.length != params.length then
-          err(s"$fname takes ${quantity(params.length, "argument")}, " +
-            s"but ${supplied(args.length, "argument")}")
+        // The **trait's** declaration is what a call through an object names, so the trait's
+        // defaults are what fill it — which is why they are filled here, before the slot is
+        // reached, and mean the same thing as they do at a call to a known type (`12 §2a`). A
+        // boxed callable is the one member here with no names to give: `Fn`'s parameters are the
+        // compiler's, so `bindArgs` is not asked and a name written at one is refused as it is at
+        // an inlined callable.
+        val bound =
+          if callable then args else bindArgs(fname, Some(from.name), m.params, args)
 
-        val ts    = args.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
+        if bound.length != params.length then
+          err(s"$fname takes ${quantity(params.length, "argument")}, " +
+            s"but ${supplied(bound.length, "argument")}")
+
+        val ts    = bound.zip(params).map { case (a, (_, pty)) => analyzeExpr(a, Some(pty)) }
         val rtype = m.retType.map(resolveReturn(_, subst)).getOrElse(Type.Unit)
 
-        TVCall(recv, slot, checkArgs(fname, params, args, Some(ts), callable), rtype)
+        TVCall(recv, slot, checkArgs(fname, params, bound, Some(ts), callable), rtype)
   }
 
   /** `obj.p` on a `*Trait` or a `&Trait` — a property read through the table, which is the same
