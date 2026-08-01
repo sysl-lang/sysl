@@ -238,6 +238,33 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
              |print(total)""".stripMargin) shouldBe "210000\n"
     }
 
+    // The same iterator left through a `break`, which is the edge the test above does not reach:
+    // the element the round produced is released once by the body's own unwinding, and the option it
+    // came out of belongs to the frame the loop already gave back on the way in. A `break` that
+    // unwound that frame as well would hand the same reference back twice, which is a trap rather
+    // than a wrong answer — so the assertion is that the program finishes at all, many times over.
+    "a 'break' out of an iterator over references does not free the round's element twice" in {
+      run("""struct Cell
+             |    v: int
+             |end Cell
+             |struct Cells
+             |    at: int
+             |    n: int
+             |end Cells
+             |impl Iterate[&Cell] for Cells
+             |    next(*self) -> Option[&Cell]
+             |        if self.at >= self.n then return None
+             |        self.at += 1
+             |        Some(Cell(self.at))
+             |    end next
+             |var total = 0
+             |for _ in 0..<1000
+             |    for c in Cells(0, 20)
+             |        total += c.v
+             |        if c.v == 3 then break
+             |print(total)""".stripMargin) shouldBe "6000\n"
+    }
+
     // `10 §5` — a bound promises behaviour, and `Iterate`'s behaviour is a method, so a generic
     // body may call it. This is the probe that says whether the protocol reaches generic code at
     // all, and it does: `next` is an ordinary bounded method call.

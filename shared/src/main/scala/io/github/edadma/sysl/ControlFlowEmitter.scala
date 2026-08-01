@@ -95,8 +95,8 @@ trait ControlFlowEmitter extends PlaceEmitter {
         if i == terms.length - 1 then successL
         else
           term match
-            case TCondIs(_, pat, false) if bindsAny(pat) => freshLabel("cond.bind")
-            case _                                       => freshLabel("cond.and")
+            case TCondIs(_, List(pat), false) if bindsAny(pat) => freshLabel("cond.bind")
+            case _                                             => freshLabel("cond.and")
 
       term match
         case TCondTest(c) =>
@@ -104,17 +104,19 @@ trait ControlFlowEmitter extends PlaceEmitter {
           emitTerm(s"br i1 $v, label %$nextL, label %$target")
           emitLabel(nextL)
 
-        case TCondIs(subject, pat, negated) =>
-          val sv = genExpr(subject)
-          val ok = if negated then notI1(patternTest(pat, sv)) else patternTest(pat, sv)
+        case TCondIs(subject, pats, negated) =>
+          val sv   = genExpr(subject)
+          val held = pats.map(patternTest(_, sv)).reduce(orI1)
+          val ok   = if negated then notI1(held) else held
           emitTerm(s"br i1 $ok, label %$nextL, label %$target")
           emitLabel(nextL)
 
-          // A negated test binds nothing (the analyzer refused a pattern under `is not` that tried),
-          // so it needs no scope and leaves the failure target where it was.
-          if !negated && bindsAny(pat) then
+          // A negated test binds nothing, and neither does a list of alternatives — the analyzer
+          // refused a pattern that tried in either position — so both leave the failure target where
+          // it was and need no scope.
+          if !negated && pats.length == 1 && bindsAny(pats.head) then
             pushOwned()
-            patternBind(pat, sv)
+            patternBind(pats.head, sv)
             scopes += 1
             // Only a binding that holds a count has anything to give back; the rest of the chain can
             // keep failing straight to where it was already going.
@@ -303,9 +305,6 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val endL  = freshLabel("while.end")
     val elseL = if elseBlock.isDefined then freshLabel("while.else") else endL
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
-    // Recorded before the condition pushes anything, so a `break` or a `continue` from the body
-    // unwinds the bindings the test made for this round along with the body's own scope.
-    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
 
     emitTerm(s"br label %$condL")
     emitLabel(condL)
@@ -313,6 +312,11 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // accumulating in the enclosing statement's region. Both edges out of the test do it — the body,
     // once the bindings have taken their own counts, and the exhausted path with nothing taken.
     pushTemps()
+    // Recorded **after** that frame and **before** the condition's bindings, which is what makes a
+    // `break` or a `continue` unwind exactly what is still owed. The bindings are owed, so the owned
+    // depth is from below them. The condition's temporaries are not: the body was reached through
+    // the `releaseTemps` below, so a `break` that released them again would free them twice.
+    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
     val paths = genCond(cond, bodyL, doneL)
     releaseTemps()
     pushOwned()
@@ -509,13 +513,17 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val endL  = freshLabel("iter.end")
     val elseL = if elseBlock.isDefined then freshLabel("iter.else") else endL
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
-    // `continue` goes back to the test, which is where the next element comes from: an iterating
-    // loop has no step of its own, since advancing is what `next` did.
-    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
 
     emitTerm(s"br label %$condL")
     emitLabel(condL)
     pushTemps()
+    // `continue` goes back to the test, which is where the next element comes from: an iterating
+    // loop has no step of its own, since advancing is what `next` did.
+    //
+    // Recorded **after** the frame the option lives in, and deliberately: the body was reached
+    // through the `releaseTemps` below, so a `break` that unwound that frame as well would give the
+    // option back twice.
+    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
     val opt = genExpr(next)
     val ok  = patternTest(bind, opt)
     emitTerm(s"br i1 $ok, label %$bodyL, label %$doneL")

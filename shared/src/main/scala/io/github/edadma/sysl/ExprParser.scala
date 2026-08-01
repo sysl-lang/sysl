@@ -116,14 +116,18 @@ trait ExprParser extends SyslParserBase {
    * `a is P || q` does not parse as a disjunction of tests — the analyzer is what says why, since a
    * grammar that refused it would have to say "expression expected".
    *
+   * The right side is an arm's left side: `|`-alternatives and all. There is nothing for the `|` to
+   * be ambiguous with, a pattern having no bitwise operator, so the same spelling means the same
+   * thing in both places and neither has to be learned twice.
+   *
    * `is` and `not` are soft words: neither is reserved, so both stay usable as names, and this rule
    * is the only place either is read as a keyword.
    */
   protected lazy val isTest: PackratParser[Expr] =
     at(
-      comparison ~ opt(isWord ~> opt(notWord) ~ pattern) ^^ {
-        case e ~ None          => e
-        case e ~ Some(n ~ pat) => IsPattern(e, pat, n.isDefined)
+      comparison ~ opt(isWord ~> opt(notWord) ~ rep1sep(pattern, op("|"))) ^^ {
+        case e ~ None           => e
+        case e ~ Some(n ~ pats) => IsPattern(e, pats, n.isDefined)
       },
     )
 

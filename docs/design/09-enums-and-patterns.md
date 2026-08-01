@@ -414,6 +414,100 @@ question, and it is the one place a reference to an enum needs the `*`. How a pa
 *typed* when matching through a reference — whether `Some(x)` on a `&Option[T]` binds `x` by
 value (a copy) or as a `&`-projection into the still-living enum — is not yet pinned (§ Open c).
 
+## 12. `is` — one pattern where a condition is wanted
+
+`match` asks a value to choose between several shapes. Very often a program cares about **one**
+shape and has nothing to say about the rest, and §8's rules then make it pay for the arms it did
+not want: an enum match is exhaustive-checked in statement position too, so a one-arm match on an
+`Option` is *forced* to write a do-nothing catch-all. That is not a style preference a programmer
+can decline — it is dead text the language mandates at every such site.
+
+```
+if o is Some(n) then
+    print(n)
+```
+
+**`expr is Pat` tests a pattern and yields a `bool`**, binding whatever the pattern names.
+**`expr is not Pat`** is its negation, which is the early-exit guard: `if o is not Some(_) then
+return`.
+
+**The right side is an arm's left side**, entire — a literal, a range, a wildcard, a variant, a
+struct, a tuple, nested to any depth, and `|`-alternatives (`if s is Idle | Done then …`), which are
+held to §6's rule that alternatives may not bind. There is nothing for the `|` to be ambiguous with,
+a pattern having no bitwise operator, so the same spelling means the same thing in both places and
+neither has to be learned twice.
+
+### Where it may be written, and why the answer is so narrow
+
+**An `is` is a term of an `if`'s or a `while`'s condition and is legal nowhere else.** Not under
+`||`, not under `!`, not on the right of an `=`, not as an argument, not in a guard.
+
+The restriction is about the **binding**, not about the boolean. A `bool` may go anywhere; a name
+may not. Everywhere else in sysl a name is introduced by a declaration whose scope the reader can
+see by looking at the indentation. A binding made by an expression has no such shape, and the
+question "on which paths does this name hold something?" then has to be answered by a rule about
+control flow rather than by looking. Confining `is` to condition position is what keeps the answer
+to one sentence:
+
+> **A binding is live from its own `is` rightward through the rest of the condition, and through
+> the branch that condition guards.**
+
+`||` is excluded by that sentence rather than by a separate rule: there is no path through
+`a is P(x) || b` on which `x` is known to have been bound, so there is nothing for the sentence to
+say. `!` inverts the one edge that would have made the binding. Both are refused with those words
+rather than with a parse error.
+
+### Chaining
+
+**Terms chain with `&&`, and only with `&&`.**
+
+```
+if lookup(id) is Some(row) && row.active && row.age is 18..65 then
+    admit(row)
+```
+
+Chaining is not a convenience — without it the form covers only the *unguarded* sliver. §7 already
+gives a match arm a guard, so the moment a condition appears an unchainable `is` evaporates and the
+reader is back at `match`, writing the three lines the `is` was there to avoid.
+
+`elif` is on the far side of the sentence: it belongs to the `else`, so an `elif`'s condition and
+body cannot read what the `if`'s test bound. So does a `while`'s `else`, which runs on the round
+that ended the loop — the one round on which nothing was bound.
+
+A `while`'s bindings are **per-iteration**: made by the test, released at the bottom of the body,
+made again by the next round's test. That is what makes the drain loop the natural spelling and
+what keeps a loop over a million elements holding one round's refcounts rather than a million.
+
+```
+while reader.next() is Some(line) do
+    print(line)
+```
+
+### Two things that are refused
+
+**A pattern under `is not` may not bind.** `x is not Some(n)` would name `n` on the one path where
+nothing matched it. `x is not Some(_)` is the form that was wanted, and the diagnostic says so.
+
+**A pattern that cannot fail is refused**, rather than folded away to `true`. Both shapes it takes
+are mistakes worth naming: `x is n` is a declaration wearing a test's clothes, and a struct pattern
+with no refutable field is a destructuring that belongs inside the branch it was guarding. A variant
+pattern stays refutable even on a one-variant enum — the tag is read and compared either way, and an
+enum gaining a variant must not change what an existing condition means. Among alternatives it is
+*one* of them being irrefutable that decides it, since that one already answers for the rest.
+
+A pattern in a condition is a pattern, so §11 reaches it too: matching a `&Enum` is written
+`if *e is Some(n)`, and the same hint says so.
+
+### What this is, and what it is not
+
+The **semantics are Rust's `if let` plus its let-chains**; the **spelling `is` is C#'s**
+(`if (x is Point p)`), which is the more readable of the two and reads correctly aloud. Dart's
+`if (x case Pat)` and Swift's `if case let` are the same idea spelled worse.
+
+It is **not** a general pattern-test operator, and it is not a second way to write `match`. Where a
+program has something to say about more than one shape, `match` says it — with exhaustiveness
+checking, which an `is` chain has no way to offer and does not claim.
+
 ---
 
 ## Open (not yet decided)
@@ -444,6 +538,14 @@ Recorded so they are not lost; each needs a decision before the relevant feature
 - **e. Unreachable-arm and redundant-pattern lints.** An arm made unreachable by an earlier
   catch-all, or a literal already covered by an earlier arm, is currently accepted silently; a
   lint would catch dead arms.
+- **f. `is` in a three-clause `for`'s condition.** §12 confines `is` to an `if` and a `while`, and
+  for `||`, `!` and every value position that is a *principle* — there is no branch for the binding
+  to be live through. A three-clause `for`'s condition is not one of those: it guards a body exactly
+  as a `while`'s does, and a binding there would have exactly the same one-sentence reach. It is
+  refused today because the form was built for the two headers that were asked for, and the refusal
+  is recorded here rather than left to be discovered so that relaxing it stays a decision somebody
+  takes. `for x in seq` is a different question and not this one: its header names an iterator, not
+  a condition.
 
 **`sizeof` is settled and has moved.** It was open here because `Layout` is this chapter's, and the
 question was whether the *language* could ask what the compiler already measures. It can, over any

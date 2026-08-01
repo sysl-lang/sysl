@@ -477,4 +477,237 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "41 9 true\n"
     }
   }
+
+  "the right side is an arm's left side, `|`-alternatives and all" - {
+
+    "several alternatives share one answer" in {
+      run("""enum Step
+            |    Work(n: int)
+            |    Idle
+            |    Done
+            |
+            |report(s: Step) -> string
+            |    if s is Idle | Done then "over" else "running"
+            |
+            |print(report(Idle), report(Done), report(Work(1)))
+            |""".stripMargin) shouldBe "over over running\n"
+    }
+
+    "they work under `is not` too" in {
+      run("""var n = 5
+            |if n is not 1 | 2 | 3 then print("outside") else print("inside")
+            |""".stripMargin) shouldBe "outside\n"
+    }
+
+    // The same rule an arm's alternatives are held to (`09 §6`): the branch cannot know which of
+    // them matched, so there is nothing for a name to hold.
+    "and none of them may bind, for the reason an arm's may not" in {
+      err("""enum Step
+            |    Work(n: int)
+            |    Rest(n: int)
+            |
+            |var s: Step = Work(1)
+            |if s is Work(n) | Rest(n) then print(n)
+            |""".stripMargin) should include("alternative patterns joined by '|' cannot bind a name")
+    }
+
+    "and one irrefutable alternative makes the whole test one, since it answers for the rest" in {
+      err("""var n = 1
+            |if n is 1 | _ then print(1)
+            |""".stripMargin) should include("so the test is always true")
+    }
+  }
+
+  "what the neighbouring rules say, asked of `is`" - {
+
+    // `09 §8`: an enum match is exhaustive-checked in statement position too, so the one-arm match
+    // is *forced* to write a do-nothing catch-all. That refusal is the whole reason this feature
+    // exists, so it is asserted here rather than assumed — if it ever stopped being true, `is`
+    // would have lost its motivation and this test is where that would show.
+    "the one-arm statement match `is` replaces really is refused without a catch-all" in {
+      err("""var o: Option[int] = Some(1)
+            |o match
+            |    Some(n) -> print(n)
+            |""".stripMargin) should include("is not exhaustive")
+    }
+
+    "and the `is` form needs no such arm" in {
+      run("""var o: Option[int] = Some(1)
+            |if o is Some(n) then print(n)
+            |""".stripMargin) shouldBe "1\n"
+    }
+
+    // `09 §11`: selection reaches through a memory mode and a pattern does not, so matching a
+    // `&Enum` is written `*e`. A condition is a pattern position, so it inherits the rule and the
+    // hint that goes with it.
+    "a pattern in a condition does not reach through a reference either" in {
+      err("""var o: &Option[int] = Some(1)
+            |if o is Some(n) then print(n)
+            |""".stripMargin) should include("a pattern does not reach through a memory mode")
+    }
+
+    "and the dereference is what makes it match" in {
+      run("""var o: &Option[int] = Some(41)
+            |if *o is Some(n) then print(n + 1)
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // `16` contracts are conditions in the ordinary sense of the word and not in this one: they
+    // guard no branch, so a binding made in one would have nowhere to be live.
+    "a contract is not a condition an `is` may sit in" in {
+      err("""f(o: Option[int]) -> int
+            |    require o is Some(_)
+            |    0
+            |
+            |print(f(Some(1)))
+            |""".stripMargin) should include("'is' tests a pattern in the condition of an 'if' or a 'while'")
+    }
+
+    // `12 §5` — a closure body is an ordinary body, and the scope an `is` opens is the branch's,
+    // so a closure written inside one may capture what the pattern bound.
+    "a closure inside the branch captures what the pattern bound" in {
+      run("""apply(f: int -> int, x: int) -> int = f(x)
+            |
+            |var o: Option[int] = Some(40)
+            |if o is Some(n) then print(apply(m -> m + n, 2))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // `08 § Visibility` — naming every field positionally is reading every field, so the pattern
+    // owes the same check a constructor does. A condition reaches `analyzePattern` by the same route
+    // an arm does, and this is what says so at the seam rather than by inspection.
+    "a positional pattern in a condition owes the same field visibility an arm's does" in {
+      errOf(
+        "shape.sysl" ->
+          """module shape
+            |
+            |struct Point
+            |    x: int
+            |    private y: int
+            |""".stripMargin,
+        "main.sysl" ->
+          """import shape.Point
+            |
+            |f(p: Point) -> int
+            |    if p is Point(a, b) then a else 0
+            |""".stripMargin,
+      ) should include("y")
+    }
+
+    // `16 §5` — a constrained subtype is laid out as its base, so a range pattern over one is a
+    // range over the base's values. Probed rather than assumed: `analyzePattern` asks whether the
+    // scrutinee's type is numeric, and a subtype is a distinct `Type`.
+    "a range pattern reaches a constrained subtype" in {
+      run("""type Small = int within 1..10
+            |
+            |var n: Small = 5
+            |if n is 1..6 then print("low") else print("high")
+            |""".stripMargin) shouldBe "low\n"
+    }
+  }
+
+  "the edge cases, each of which compiles under a rule that is not the one written" - {
+
+    // The binding is declared *after* the subject has been read, so naming it the same thing is a
+    // shadow rather than a cycle. A scope opened too early would make this read the binding.
+    "a binding may shadow the name it was read out of" in {
+      run("""var o: Option[int] = Some(7)
+            |if o is Some(o) then print(o)
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    // Two terms binding different names out of the same subject: the second `is` re-reads the
+    // subject rather than seeing whatever the first bound.
+    "the same subject may be tested twice in one chain" in {
+      run("""var o: Option[int] = Some(20)
+            |if o is Some(n) && o is Some(m) then print(n + m)
+            |""".stripMargin) shouldBe "40\n"
+    }
+
+    // A nested `if is` inside a branch: the inner binding shadows the outer, and the outer is still
+    // live around it. A single flat scope for all bindings would make the inner one clobber it.
+    "a nested is shadows the outer binding without disturbing it" in {
+      run("""var a: Option[int] = Some(1)
+            |var b: Option[int] = Some(2)
+            |if a is Some(n)
+            |    if b is Some(n) then print(n)
+            |    print(n)
+            |""".stripMargin) shouldBe "2\n1\n"
+    }
+
+    // The second `is` is only reachable because the first matched, so a failed first term must not
+    // evaluate the second's *subject* either — not merely skip its test.
+    "a failed is does not evaluate the next term's subject" in {
+      run("""noisy() -> Option[int]
+            |    print("evaluated")
+            |    Some(1)
+            |
+            |var o: Option[int] = None
+            |if o is Some(n) && noisy() is Some(m) then print(n + m) else print("no")
+            |""".stripMargin) shouldBe "no\n"
+    }
+
+    // The binding is the *last* term of the chain, so it is established in the branch's own entry
+    // block rather than in an intermediate one — a different code path from the chains above.
+    "a chain whose last term is the binding one" in {
+      run("""var gate = true
+            |var o: Option[int] = Some(41)
+            |if gate && o is Some(n) then print(n + 1)
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    "a branch that does not finish is still a branch the binding reaches" in {
+      run("""find(xs: []int, want: int) -> int
+            |    for x in xs
+            |        var o: Option[int] = if x == want then Some(x) else None
+            |        if o is Some(hit) then return hit
+            |    -1
+            |
+            |var nums: [3]int = [4, 5, 6]
+            |var xs = nums[..]
+            |print(find(xs, 5), find(xs, 9))
+            |""".stripMargin) shouldBe "5 -1\n"
+    }
+
+    // A refcounted value bound by the test and handed out as the `if`'s value: it leaves the scope
+    // that released it, so it has to have taken a count of its own on the way.
+    "a refcounted binding may be the branch's value" in {
+      run("""var o: Option[string] = Some("hi" + "!")
+            |var s = if o is Some(t) then t else "none"
+            |print(s)
+            |""".stripMargin) shouldBe "hi!\n"
+    }
+
+    // `continue` and `break` leave the body without reaching its bottom, so the releases owed for
+    // the round's binding have to be emitted on those edges too. Repeated enough times that a leak
+    // or a double free is not a coin flip.
+    "a continue out of a while-is body releases the round's binding" in {
+      run("""make(i: int) -> Option[&string]
+            |    if i < 400 then Some("ab" + "cd") else None
+            |
+            |var i = 0
+            |var hits = 0
+            |while make(i) is Some(s)
+            |    i += 1
+            |    if i % 2 == 0 then continue
+            |    hits += 1
+            |print(hits)
+            |""".stripMargin) shouldBe "200\n"
+    }
+
+    "and a break out of one does too" in {
+      run("""make(i: int) -> Option[&string]
+            |    Some("ab" + "cd")
+            |
+            |var rounds = 0
+            |var i = 0
+            |while i < 400
+            |    while make(i) is Some(s)
+            |        rounds += 1
+            |        break
+            |    i += 1
+            |print(rounds)
+            |""".stripMargin) shouldBe "400\n"
+    }
+  }
 }

@@ -182,16 +182,19 @@ case class MatchArm(patterns: List[Pattern], guard: Option[Expr], body: List[Stm
  */
 case class MatchExpr(scrutinee: Expr, arms: List[MatchArm]) extends Expr
 
-/** `subject is Pat` / `subject is not Pat` — one pattern tested where a condition is wanted
+/** `subject is Pat` / `subject is not Pat` — a pattern tested where a condition is wanted
  * (`09 §12`). It yields a `bool` and, in the un-negated form, binds whatever the pattern names for
  * the rest of the condition and the branch the condition guards.
+ *
+ * `patterns` holds the `|`-alternatives an arm's left side may hold, and under the same rule: they
+ * share one answer, so none of them may bind.
  *
  * Its position is checked rather than its type: it is a term of an `if`'s or a `while`'s condition
  * and nowhere else, so that the reach of a binding is one sentence long. Everywhere else the
  * analyzer refuses it, which is why this stays an ordinary `Expr` — the grammar has one place to put
  * it and one rule to give it back.
  */
-case class IsPattern(subject: Expr, pattern: Pattern, negated: Boolean) extends Expr
+case class IsPattern(subject: Expr, patterns: List[Pattern], negated: Boolean) extends Expr
 
 sealed trait TypeRef extends Positioned {
 

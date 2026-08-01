@@ -73,8 +73,8 @@ object TreeWalk {
    * are constants, and its bindings are places rather than reads.
    */
   def condExprs(terms: List[TCondTerm]): List[TExpr] = terms.map {
-    case TCondTest(c)         => c
-    case TCondIs(subj, _, _)  => subj
+    case TCondTest(c)        => c
+    case TCondIs(subj, _, _) => subj
   }
 
   def children(e: TExpr): List[TExpr] = e match

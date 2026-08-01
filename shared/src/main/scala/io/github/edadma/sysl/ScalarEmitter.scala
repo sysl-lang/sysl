@@ -136,7 +136,15 @@ trait ScalarEmitter extends StringEmitter {
         case _    => sys.error(s"unreachable compare '$op'")
     case other => sys.error(s"unreachable compare on ${other.llvm}")
 
-  protected def compareValue(op: String, ty: Type, av: String, bv: String): String =
+  protected def compareValue(op: String, base: Type, av: String, bv: String): String = {
+    // A constrained subtype is laid out as the type it narrows (`16 §1`), so it is compared as that
+    // one — its values are that type's values, and the range it was declared with is checked where
+    // it is *produced* rather than where two of them are ordered. Done here rather than at each
+    // caller because every caller wants it: an ordinary `n < 6` arrives already reduced, and a
+    // pattern's test does not, which is what left `n match 1..6` reaching a signedness question
+    // asked of a type that has no answer to it.
+    val ty = Type.underlying(base)
+
     // Two strings are ordered by their bytes, which is a call rather than an instruction; every
     // operator then reads the same -1 / 0 / 1 the way it would read a subtraction.
     if ty == Type.Str then
@@ -149,6 +157,7 @@ trait ScalarEmitter extends StringEmitter {
       val r     = freshTemp()
       emit(s"$r = $instr ${predicate(op, ty)} ${ty.llvm} $av, $bv")
       r
+  }
 
   // --- conversions ---------------------------------------------------------------------
 

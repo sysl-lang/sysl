@@ -420,9 +420,10 @@ sealed trait TCondTerm
 case class TCondTest(cond: TExpr) extends TCondTerm
 
 /** `subject is Pat` / `subject is not Pat`. The un-negated form's bindings are live from here
- * rightward; the negated form binds nothing, which is why it may hold no binding pattern.
+ * rightward; the negated form binds nothing, which is why it may hold no binding pattern. Several
+ * `patterns` are `|`-alternatives, which share one answer and so may not bind either.
  */
-case class TCondIs(subject: TExpr, pattern: TPattern, negated: Boolean) extends TCondTerm
+case class TCondIs(subject: TExpr, patterns: List[TPattern], negated: Boolean) extends TCondTerm
 
 /** `if cond then … else …` as a value (or unit when there is no else). */
 case class TIf(cond: List[TCondTerm], thenBlock: TBlock, elseBlock: Option[TBlock], ty: Type) extends TExpr

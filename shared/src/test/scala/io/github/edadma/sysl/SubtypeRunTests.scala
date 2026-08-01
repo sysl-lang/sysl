@@ -104,6 +104,51 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport {
     run(Age + "var a: Age = 12\nvar n: int = a\nprint(n + 1)") shouldBe "13\n"
   }
 
+  /** `16 §1` — a subtype is laid out as the type it narrows, so a pattern matches its values as that
+   * type's values. Both forms are here because both reach the same comparison and it had no answer
+   * for a subtype: the compiler **crashed** on either, with a Scala stack trace rather than a
+   * diagnostic, so a program that matched on a constrained value could not be compiled at all.
+   * Found by probing `09 §12`'s claim that a condition takes every pattern an arm does.
+   */
+  "a pattern matches a constrained subtype as the base it narrows" - {
+    val Small = "type Small = int within 1..10\n"
+
+    "a literal pattern" in {
+      run(Small + """var n: Small = 5
+                    |n match
+                    |    5 -> print("five")
+                    |    else print("other")
+                    |""".stripMargin) shouldBe "five\n"
+    }
+
+    "a range pattern" in {
+      run(Small + """var n: Small = 5
+                    |n match
+                    |    1..6 -> print("low")
+                    |    else print("high")
+                    |""".stripMargin) shouldBe "low\n"
+    }
+
+    // An unsigned base picks a different comparison from a signed one, so the reduction has to reach
+    // the *base* rather than stop at any integer — a subtype that dropped to `int` would order these
+    // signed and get the high half of the range wrong.
+    "and one over an unsigned base keeps the unsigned comparison" in {
+      run("""type Big = u8 within 200..255
+            |
+            |var n: Big = 250
+            |n match
+            |    240..255 -> print("high")
+            |    else print("low")
+            |""".stripMargin) shouldBe "high\n"
+    }
+
+    "which a condition's pattern reaches by the same route (`09 §12`)" in {
+      run(Small + """var n: Small = 5
+                    |if n is 1..6 then print("low") else print("high")
+                    |""".stripMargin) shouldBe "low\n"
+    }
+  }
+
   /** `16 §4` lists the places a constrained value is produced, and a struct field is one of them —
    * at construction *and* at every later write, since a field is not read-only.
    */

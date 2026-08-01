@@ -226,27 +226,34 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     if subject.ty == Type.Never then
       err("this expression never produces a value, so there is nothing here for a pattern to match")
 
-    val tpat = analyzePattern(p.pattern, subject.ty)
+    val tpats = p.patterns.map(analyzePattern(_, subject.ty))
 
     // A pattern that matches every value of the type asks a question with one answer. Refused rather
     // than folded away, because the two forms it takes are both a mistake worth naming: `x is n` is a
-    // binding wearing a test's clothes, and `x is Only(v)` on a one-variant enum is a destructuring
-    // that belongs in the branch it guards.
-    if !refutable(tpat) then
+    // binding wearing a test's clothes, and a struct pattern with no refutable field is a
+    // destructuring that belongs in the branch it was guarding. Among alternatives it is one of them
+    // being irrefutable that decides it, since that one already answers for the rest.
+    if !tpats.forall(refutable) then
       err(if p.negated then
             s"this pattern matches every ${show(subject.ty)}, so 'is not' is never true here"
           else
             s"this pattern matches every ${show(subject.ty)}, so the test is always true — " +
               s"take the value apart with 'match', or bind it with 'var'")
 
+    // Alternatives share one answer, so the branch cannot know which of them matched — the same rule
+    // an arm's alternatives are held to (`09 §6`), said in the words this position needs.
+    if tpats.length > 1 && tpats.exists(binds) then
+      err("alternative patterns joined by '|' cannot bind a name — the branch cannot know which of " +
+        "them matched. Write '_' for the parts you are not naming")
+
     // `x is not Some(n)` would name `n` on the one path where nothing matched it. The binder is what
     // is refused, not the negation: `x is not Some(_)` is the early-exit guard the form is for.
-    if p.negated && binds(tpat) then
+    if p.negated && tpats.exists(binds) then
       err("a pattern under 'is not' cannot bind a name — the branch it guards is the one where it " +
         "did not match, so there would be nothing for the name to hold. Write '_' for the parts you " +
         "are not naming")
 
-    TCondIs(subject, tpat, p.negated)
+    TCondIs(subject, tpats, p.negated)
   }
 
   /** `for name in seq` over storage that is already there: each element is copied out by index, and
