@@ -528,6 +528,38 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
             |""".stripMargin) shouldBe "in block\ninner\nafter block\nouter, written second\n"
     }
 
+    // A branch used as a value computes it and then leaves the block, so the defer runs after the
+    // value is fixed — the same rule the function result follows. A defer that runs first would
+    // change what the branch yielded.
+    "a block used as a value runs its defers after the value is computed" in {
+      run("""f(c: bool) -> int
+            |    var n = 1
+            |    var got = if c
+            |        defer n = 99
+            |        n
+            |    else
+            |        0
+            |    print("n after:", n)
+            |    got
+            |
+            |print(f(true))
+            |""".stripMargin) shouldBe "n after: 99\n1\n"
+    }
+
+    // A multi-assignment is a statement in its own right (`00 §2`), and deferring one reaches the
+    // arm-walking that every pass does through a shape it does not otherwise meet inside a `defer`.
+    "a multi-assignment may be the deferred statement" in {
+      run("""f()
+            |    var a = 1
+            |    var b = 2
+            |    defer print(a, b)
+            |    defer a, b = b, a
+            |    print(a, b)
+            |
+            |f()
+            |""".stripMargin) shouldBe "1 2\n2 1\n"
+    }
+
     // A loop's `else` runs when the loop ends without breaking, and it is its own block.
     "a loop's 'else' block carries its own" in {
       run("""for i in 0..<2
