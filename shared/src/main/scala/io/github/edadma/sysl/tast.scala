@@ -407,8 +407,25 @@ case class TTry(
  */
 case class TField(receiver: TExpr, index: Int, ty: Type) extends TExpr
 
+/** One term of an `if`'s or a `while`'s condition — the `&&`-joined chain written out (`09 §12`).
+ *
+ * A condition is a **list** of these rather than one expression because a term may bind: an `is`
+ * that matched leaves names the terms to its right and the guarded branch can read, and that is a
+ * fact about the chain's shape, not about a value. An ordinary condition is a one-element list
+ * holding a [[TCondTest]], so nothing that never writes `is` pays for it.
+ */
+sealed trait TCondTerm
+
+/** A plain boolean term — every condition that says nothing about a pattern. */
+case class TCondTest(cond: TExpr) extends TCondTerm
+
+/** `subject is Pat` / `subject is not Pat`. The un-negated form's bindings are live from here
+ * rightward; the negated form binds nothing, which is why it may hold no binding pattern.
+ */
+case class TCondIs(subject: TExpr, pattern: TPattern, negated: Boolean) extends TCondTerm
+
 /** `if cond then … else …` as a value (or unit when there is no else). */
-case class TIf(cond: TExpr, thenBlock: TBlock, elseBlock: Option[TBlock], ty: Type) extends TExpr
+case class TIf(cond: List[TCondTerm], thenBlock: TBlock, elseBlock: Option[TBlock], ty: Type) extends TExpr
 
 /** `match scrutinee` — arms are tried in order; `ty` is the common arm type (or unit). */
 case class TMatch(scrutinee: TExpr, arms: List[TArm], ty: Type) extends TExpr
@@ -491,7 +508,7 @@ case class TMultiAssign(writes: List[TWrite]) extends TStmt
  * in it carries the loop's value, and `elseBlock` (if present) supplies the value on normal
  * completion. `ty` is the loop's result type — `unit` when nothing carries a value.
  */
-case class TWhile(cond: TExpr, body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
+case class TWhile(cond: List[TCondTerm], body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
 
 /** `loop body` — the same shape with the condition removed, so the only way out is a `break`.
  * `ty` is the type its `break`s meet at, and `never` where it has none: nothing arrives after a

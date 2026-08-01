@@ -106,7 +106,29 @@ trait ExprParser extends SyslParserBase {
       op("&=") | op("|=") | op("^=") | op("<<=") | op(">>=")
 
   lazy val logicalOr: PackratParser[Expr]  = at(chainl1(logicalAnd, binOp("||")))
-  lazy val logicalAnd: PackratParser[Expr] = at(chainl1(comparison, binOp("&&")))
+  lazy val logicalAnd: PackratParser[Expr] = at(chainl1(isTest, binOp("&&")))
+
+  /** `x is Pat`, `x is not Pat` — a pattern where a condition is wanted (`09 §12`).
+   *
+   * It sits **between `&&` and the comparisons**, which is what makes `a is P && b > 0` a chain of
+   * two terms rather than an `is` against a conjunction: the subject and the pattern are each held
+   * tighter than the `&&` that joins one term to the next. Nothing below it can hold an `is`, so
+   * `a is P || q` does not parse as a disjunction of tests — the analyzer is what says why, since a
+   * grammar that refused it would have to say "expression expected".
+   *
+   * `is` and `not` are soft words: neither is reserved, so both stay usable as names, and this rule
+   * is the only place either is read as a keyword.
+   */
+  protected lazy val isTest: PackratParser[Expr] =
+    at(
+      comparison ~ opt(isWord ~> opt(notWord) ~ pattern) ^^ {
+        case e ~ None          => e
+        case e ~ Some(n ~ pat) => IsPattern(e, pat, n.isDefined)
+      },
+    )
+
+  protected lazy val isWord: Parser[Unit]  = softWord("is")
+  protected lazy val notWord: Parser[Unit] = softWord("not")
 
   /** Comparison chains rather than associates: `a < b < c` becomes one `Compare`. */
   lazy val comparison: PackratParser[Expr] =

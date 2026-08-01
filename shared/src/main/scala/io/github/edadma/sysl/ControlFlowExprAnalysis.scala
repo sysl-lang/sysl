@@ -25,8 +25,14 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     // An `if` whose own value is unused hands that down: each branch is a block in statement
     // position, so neither is asked what it yields and the two have nothing to disagree about.
     case IfExpr(cond, thenBody, elseOpt) =>
-      val tc    = analyzeBool(cond)
+      // The condition's own scope wraps the condition and the *then* branch and nothing else, which
+      // is the whole of what an `is` binding's reach has to be said about (`09 §12`). The `else` is
+      // analyzed outside it, and so is an `elif` — the parser nests one into the else branch, so it
+      // is already on the other side of this `popScope` and cannot read a name the test bound.
+      pushScope()
+      val tc    = analyzeCond(cond)
       val tThen = analyzeValueBlock(thenBody, expected, discarded)
+      popScope()
       val tElse = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       // The branches meet at one type, and a branch that does not finish takes the other's. A
       // branch used only for its effect is a different thing: one `unit` branch makes the whole
@@ -49,8 +55,13 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     // Without that, Python's own idiom — walk, `break` on a hit, set a flag in the `else` when
     // nothing hit — would be refused for a disagreement between the flag and a bare `break`.
     case While(label, cond, body, elseOpt) =>
-      val tc            = analyzeBool(cond)
+      // As with `if`: the condition and the body share one scope, so a binding the test made is the
+      // body's to read and is remade each round. The `else` runs when the test finally fails, which
+      // is the one path on which there is nothing bound, so it sits outside.
+      pushScope()
+      val tc            = analyzeCond(cond)
       val (tbody, ctx)  = analyzeLoopBody(expected, label)(analyzeStmts(body))
+      popScope()
       val telse         = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       TWhile(tc, tbody, telse, loopResultType(ctx, telse))
 
@@ -183,6 +194,60 @@ trait ControlFlowExprAnalysis extends ExprSupport {
           at(t.pos)(err("a tuple part has to be a value, and this expression never produces one"))
 
       TStructNew(tupleType(ts.map(_.ty)), ts)
+
+  /** An `if`'s or a `while`'s condition, as the `&&`-joined chain of terms it is (`09 §12`).
+   *
+   * The chain is flattened here rather than left as nested `Binary("&&", …)` because a term may
+   * **bind**, and a binding's reach is "from its own `is` rightward" — which is a statement about
+   * the flat sequence and not about a tree. Left-nesting would put `a is P && g` under the same node
+   * whether `g` reads what `P` bound or not.
+   *
+   * Terms are analyzed left to right, in the scope the caller opened, so each `is` declares into the
+   * scope the terms after it look names up in. Nothing else about a condition changes: a chain with
+   * no `is` in it is the same expressions in the same order, split at the `&&` the emitter was going
+   * to short-circuit at anyway.
+   */
+  protected def analyzeCond(e: Expr): List[TCondTerm] = conjuncts(e).map(condTerm)
+
+  private def conjuncts(e: Expr): List[Expr] = e match
+    case Binary("&&", l, r) => conjuncts(l) ::: conjuncts(r)
+    case other              => List(other)
+
+  private def condTerm(e: Expr): TCondTerm = e match
+    case p: IsPattern => at(p.pos)(condIs(p))
+    // Everything else is an ordinary boolean, and an `is` buried inside one is refused by
+    // `analyzeExpr` — which is where the message lives, since it has to name every position rather
+    // than the one this function happens to be looking at.
+    case other => TCondTest(analyzeBool(other))
+
+  private def condIs(p: IsPattern): TCondIs = {
+    val subject = analyzeExpr(p.subject)
+
+    if subject.ty == Type.Never then
+      err("this expression never produces a value, so there is nothing here for a pattern to match")
+
+    val tpat = analyzePattern(p.pattern, subject.ty)
+
+    // A pattern that matches every value of the type asks a question with one answer. Refused rather
+    // than folded away, because the two forms it takes are both a mistake worth naming: `x is n` is a
+    // binding wearing a test's clothes, and `x is Only(v)` on a one-variant enum is a destructuring
+    // that belongs in the branch it guards.
+    if !refutable(tpat) then
+      err(if p.negated then
+            s"this pattern matches every ${show(subject.ty)}, so 'is not' is never true here"
+          else
+            s"this pattern matches every ${show(subject.ty)}, so the test is always true — " +
+              s"take the value apart with 'match', or bind it with 'var'")
+
+    // `x is not Some(n)` would name `n` on the one path where nothing matched it. The binder is what
+    // is refused, not the negation: `x is not Some(_)` is the early-exit guard the form is for.
+    if p.negated && binds(tpat) then
+      err("a pattern under 'is not' cannot bind a name — the branch it guards is the one where it " +
+        "did not match, so there would be nothing for the name to hold. Write '_' for the parts you " +
+        "are not naming")
+
+    TCondIs(subject, tpat, p.negated)
+  }
 
   /** `for name in seq` over storage that is already there: each element is copied out by index, and
    * the sequence is evaluated once.

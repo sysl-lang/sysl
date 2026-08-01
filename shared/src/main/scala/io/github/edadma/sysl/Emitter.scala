@@ -130,6 +130,13 @@ trait Emitter {
     if a == "true" || b == "true" then "true"
     else { val r = freshTemp(); emit(s"$r = or i1 $a, $b"); r }
 
+  /** Negating an `i1`, with the same constant folded away — what `is not` does to the test its
+   * pattern produced.
+   */
+  protected def notI1(a: String): String =
+    if a == "true" then "false"
+    else { val r = freshTemp(); emit(s"$r = xor i1 $a, true"); r }
+
   // --- hooks provided by the Codegen class ---------------------------------------------
   //
   // The recursive entry points live in the class that walks the tree; the emitting traits call

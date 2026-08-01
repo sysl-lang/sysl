@@ -68,6 +68,15 @@ object TreeWalk {
       TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case _                  => children(e).flatMap(blocks)
 
+  /** The expressions a condition evaluates — the boolean terms, and the subject each `is` tests
+   * (`09 §12`). A pattern holds no expression of its own worth walking: its literals and range ends
+   * are constants, and its bindings are places rather than reads.
+   */
+  def condExprs(terms: List[TCondTerm]): List[TExpr] = terms.map {
+    case TCondTest(c)         => c
+    case TCondIs(subj, _, _)  => subj
+  }
+
   def children(e: TExpr): List[TExpr] = e match
     case TBox(v, _)                 => List(v)
     case TCast(v, _)                => List(v)
@@ -125,11 +134,11 @@ object TreeWalk {
     case TVaPass(ap)                => List(ap)
     case TTry(v, _, _, _, _, _)     => List(v)
     case TField(r, _, _)            => List(r)
-    case TIf(c, t, el, _)           => c :: t.result.toList ::: el.flatMap(_.result).toList
+    case TIf(c, t, el, _)           => condExprs(c) ::: t.result.toList ::: el.flatMap(_.result).toList
     case TMatch(s, arms, _)         => s :: arms.flatMap(a => a.guard.toList ::: a.body.result.toList)
     // A loop's own sub-expressions plus its `else` value; the `break` values are reached through the
     // body statements, so they are not repeated here.
-    case TWhile(c, _, el, _)             => c :: el.flatMap(_.result).toList
+    case TWhile(c, _, el, _)             => condExprs(c) ::: el.flatMap(_.result).toList
     case TFor(_, _, lo, hi, _, _, el, _) => lo :: hi :: el.flatMap(_.result).toList
     case TForEach(_, _, seq, _, el, _)   => seq :: el.flatMap(_.result).toList
     // The cursor's initializer and the `next` call that reads it are both the loop's own, and the

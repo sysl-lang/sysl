@@ -112,6 +112,11 @@ trait SyslParserBase extends PackratParsers {
   /** A block introduced by a keyword, written inline after it or indented under it. */
   protected def body(keyword: String): Parser[List[Stmt]]
 
+  /** One pattern, as a `match` arm writes it. Declared here because a condition may test one too
+   * (`09 §12`), and the two spellings must be the same grammar rather than two that drift.
+   */
+  protected def pattern: Parser[Pattern]
+
   /** A soft keyword: a word that is only special where the grammar expects it, and an ordinary
    * identifier everywhere else (`front-end.md`). `sync`, `Fn`, `end`, `new`, `within` and `where`
    * are all of them, which is why the three below are declared beside it.

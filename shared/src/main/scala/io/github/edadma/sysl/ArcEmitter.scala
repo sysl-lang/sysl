@@ -370,8 +370,20 @@ trait ArcEmitter extends Emitter {
   /** Emits the releases for the innermost scope without popping it — the guard-failure path out
    * of a match arm, where the bindings have been made but the arm is not taken.
    */
-  protected def releaseOwned(): Unit =
-    for (slot, ty) <- owned.head.reverse do
+  protected def releaseOwned(): Unit = releaseSlots(ownedHere)
+
+  /** What the innermost scope holds, for a path that has to give those counts back somewhere other
+   * than where the scope ends.
+   *
+   * A condition's `is` bindings are the case (`09 §12`): the scope is popped at the end of the
+   * branch the condition guards, but a later term of the same condition may fail, and *that* edge
+   * leaves without ever reaching the branch. Its releases are emitted after the success path has
+   * already popped, so the slots have to be read out while the scope is still there.
+   */
+  protected def ownedHere: List[(String, Type)] = owned.head.toList
+
+  protected def releaseSlots(slots: List[(String, Type)]): Unit =
+    for (slot, ty) <- slots.reverse do
       val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
       releaseValue(ty, v)
 

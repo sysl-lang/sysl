@@ -644,7 +644,7 @@ class SyslParser(val source: Source) extends DeclParser {
    * the scrutinee's enum, and as a binding otherwise. A name may be qualified wherever a variant
    * may be, which is every form: a nullary variant is spelled like a name and reached like one.
    */
-  protected lazy val pattern: Parser[Pattern] =
+  override protected lazy val pattern: Parser[Pattern] =
     patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
       structPattern |
       variantPattern |

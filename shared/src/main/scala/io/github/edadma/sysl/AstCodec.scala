@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 9
+  val Version: Int = 10
 
   private val Magic = "sysl-ast"
 
@@ -253,6 +253,7 @@ object AstCodec {
         case ArrayFill(v, c)         => tok("afl"); expr(v); expr(c)
         case IfExpr(c, t, e2)        => tok("if"); expr(c); list(t)(stmt); opt(e2)(b => list(b)(stmt))
         case MatchExpr(s, arms)      => tok("mat"); expr(s); list(arms)(arm)
+        case IsPattern(s, p, neg)    => tok("is"); expr(s); pattern(p); bool(neg)
         case ResultList(vs)          => tok("rl"); list(vs)(expr)
         case While(l, c, b, e2)      => tok("whl"); opt(l)(sref); expr(c); list(b)(stmt); opt(e2)(x => list(x)(stmt))
         case Loop(l, b)              => tok("lop"); opt(l)(sref); list(b)(stmt)
@@ -600,6 +601,7 @@ object AstCodec {
         case "afl"  => ArrayFill(expr(), expr())
         case "if"   => IfExpr(expr(), list(stmt()), opt(list(stmt())))
         case "mat"  => MatchExpr(expr(), list(arm()))
+        case "is"   => IsPattern(expr(), pattern(), bool())
         case "rl"   => ResultList(list(expr()))
         case "whl"  => While(opt(sref()), expr(), list(stmt()), opt(list(stmt())))
         case "lop"  => Loop(opt(sref()), list(stmt()))

@@ -179,6 +179,20 @@ trait PatternAnalysis extends TypeResolution {
     case _: Type.Enum | _: Type.Struct => true
     case _                             => false
 
+  /** Whether a pattern can fail — false for a wildcard, a binding, or a struct whose every field's
+   * sub-pattern is itself irrefutable, since a struct has one form and nothing to test a tag
+   * against. A variant pattern is always refutable even on a one-variant enum: the tag is read and
+   * compared either way, and an enum gaining a variant should not change what an existing pattern
+   * means.
+   *
+   * Used where a test that cannot fail is a mistake rather than a tautology to fold away — the
+   * condition of an `if` or a `while` (`09 §12`).
+   */
+  protected def refutable(p: TPattern): Boolean = p match
+    case _: TWildPattern | _: TBindPattern => false
+    case s: TStructPattern                 => s.args.exists(refutable)
+    case _                                 => true
+
   /** Whether a pattern binds any name (directly or inside a variant's or struct's sub-patterns). */
   protected def binds(p: TPattern): Boolean = p match
     case _: TBindPattern    => true

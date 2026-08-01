@@ -695,6 +695,15 @@ trait ExprAnalysis
         _: RangeExpr | _: ResultList | _: Lambda | _: Tuple) =>
       controlExpr(e, expected, discarded)
 
+    // Reached only where an `is` was written somewhere a condition's terms are not read one by one:
+    // under `||` or `!`, in a `match` guard, in a `require`, on the right of an `=`, as an argument.
+    // The rule is about the binding rather than the test — a `bool` would be harmless, but a name
+    // bound where the reader cannot see which paths reach it is not (`09 §12`).
+    case _: IsPattern =>
+      err("'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere else — its " +
+        "binding is live from here to the end of the condition and through the branch that " +
+        "condition guards, and there is no such branch here. Chain it with '&&', or write 'match'")
+
 
 
   /** `++`/`--` — a step of one, which the base decides the existence of and a constrained place
