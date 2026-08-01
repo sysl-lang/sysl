@@ -371,7 +371,7 @@ class HeapBufferTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     "a buffer as a 'val', since a view in storage that outlives every frame is never let go of" in {
-      err("val xs: []int = [1, 2, 3]") should include("plain data")
+      err("val xs: []int = [1, 2, 3]") should include("a count with nowhere to write the release")
     }
 
     "elements of a type that has no values" in {

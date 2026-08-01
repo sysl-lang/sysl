@@ -98,8 +98,8 @@ private val crc_table: [256]u32 = build_crc_table()
 ```
 
 `13 §7` is where the order those run in is settled. What matters here is that the element type is
-unchanged by the choice: a `val` holds plain data either way, so an array of references is not one of
-these however it is built.
+unchanged by the choice: a module `val` counts nothing either way, so an array of references is not
+one of these however it is built. An array of raw pointers is, since a pointer counts nothing.
 
 ## Storage sized while running
 

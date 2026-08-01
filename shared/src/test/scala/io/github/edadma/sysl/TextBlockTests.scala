@@ -275,11 +275,11 @@ class TextBlockTests extends AnyFreeSpec with Matchers with RunSupport with Code
       val one = err("""val S: string = "ab"
                       |print(S.len)""".stripMargin)
 
-      one should include("plain data")
+      one should include("a count with nowhere to write the release")
       err(s"""val S: string = $Q
              |    ab
              |    $Q
-             |print(S.len)""".stripMargin) should include("plain data")
+             |print(S.len)""".stripMargin) should include("a count with nowhere to write the release")
     }
 
     // `04` — a string literal is a `match` pattern, and a block is a string literal. The arm's

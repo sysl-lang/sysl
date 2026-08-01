@@ -96,10 +96,9 @@ class ExternVarTests
   }
 
   "what the type may be" - {
-    // A `val` is refused a pointer because it owns what it names for the whole run and promises to
-    // be read-only at every depth. An extern variable owns nothing and promises nothing, and every
-    // global worth reaching is a pointer — so the rule that would have made the feature useless is
-    // the one it does not have.
+    // Every global worth reaching is a pointer. A `val` takes one too (`13 §7`); what it refuses is
+    // a counted value, and an extern variable is refused nothing at all, because the storage is the
+    // other side's and so is whatever releasing it would mean.
     "a pointer, which is what nearly every C global is" in {
       ir("extern stdout: *u8\nprint(stdout == null)") should
         include("@stdout = external global ptr")
@@ -161,10 +160,11 @@ class ExternVarTests
     }
   }
 
-  /** A `val` is read-only at every depth and the analyzer refuses both an assignment to one and a
-    * `*T` into it (`13 §7`). An `extern` variable is the one global those rules do not reach, and the
-    * difference is what the storage *is*: `optind` and `optarg` are assigned by ordinary C, and a
-    * declaration that could only read them would name half of `getopt`'s interface.
+  /** A `val` is read-only at every depth: the analyzer refuses both an assignment to one and a `&`
+    * that would take the address of its storage (`13 §7`). An `extern` variable is the one global
+    * those rules do not reach, and the difference is what the storage *is*: `optind` and `optarg`
+    * are assigned by ordinary C, and a declaration that could only read them would name half of
+    * `getopt`'s interface.
     */
   "it is a place, unlike a 'val'" - {
     "assignment reaches it, where a 'val' refuses" in {

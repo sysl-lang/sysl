@@ -306,7 +306,7 @@ way. **A default parameter value is the one position that asks and cannot be ans
 is produced afresh at each call that omits it, in a scope holding none of the caller's locals, so
 what it names has to outlive every frame — and every candidate is closed. A construction is refused
 by the paragraph above; a top-level `var` is a local of the entry point, so naming one is naming the
-caller's locals; and a module-level `val` holds plain data only (`13 §7`), which a reference is not.
+caller's locals; and a module-level `val` counts nothing (`13 §7`), which a reference does.
 So a `weak T` parameter takes no default, and nothing is special-cased to make that so — it falls
 out of what a default may name meeting the one thing a weak reference may not be made from. A `&T`
 parameter is unaffected, because the construction a `weak T` is refused there is exactly what serves

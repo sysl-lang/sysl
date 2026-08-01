@@ -77,7 +77,8 @@ before they appear and may be mutually recursive).
   them.
 
 - **A module-level `val` is a `private` global, filled either by the linker or by `main`**
-  (`13 §7`). A constant tree — numbers, and the arrays and repeats built from them — is written into
+  (`13 §7`). A constant tree — numbers, the arrays and repeats built from them, `null`, and a
+  `ptr_cast` of any of those, which lands as an `inttoptr` constant expression — is written into
   the object file as a `private constant` and nothing runs. Any other initializer is code: the
   symbol becomes a `private global zeroinitializer` and the value is computed and stored in a
   prologue `main` opens with, before the program's own statements. **Which one goes first is the
@@ -85,8 +86,9 @@ before they appear and may be mutually recursive).
   followed through the functions it calls and through a method table by taking every function the
   trait's tables put in the slot. A cycle is reported at the declaration that closes it, and can
   only ever be within one module, since a cross-module edge would need the module graph to cycle.
-  The type is held to **plain data** (no reference, pointer, slice, or `string`), which is what
-  keeps read-only-ness whole and keeps a `val` from being a count nothing releases.
+  The type is held to what **counts nothing** — no reference, weak reference, slice, or `string` —
+  which keeps a `val` from being a count nothing releases. A raw pointer and the address of a
+  function are admitted, since neither owns what it addresses.
 
 - **Only what the program can reach is emitted** (`15 §3`). `Reachability` runs last, over a typed
   program every other pass has already read: it walks out from the statements the entry point runs,

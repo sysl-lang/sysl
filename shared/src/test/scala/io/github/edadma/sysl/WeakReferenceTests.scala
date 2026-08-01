@@ -101,11 +101,11 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
 
       // And the declaration that does outlive every frame cannot hold a reference in the first
       // place, which closes the other half.
-      "and not a module-level 'val', which outlives every frame but holds plain data only" in {
+      "and not a module-level 'val', which outlives every frame and so counts nothing" in {
         err(node + """val fallback: &Node = Node(4)
                      |peek(w: weak Node = fallback) -> int = w.get().unwrap().value
                      |print(peek())
-                     |""".stripMargin) should include("a 'val' holds plain data only")
+                     |""".stripMargin) should include("a count with nowhere to write the release")
       }
     }
   }
@@ -130,6 +130,27 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     "and an atomic reference has no weak form yet" in {
       err(node + "var w: weak sync Node = None") should include(
         "wants the concurrency model of '06'")
+    }
+  }
+
+  // A weak edge takes a word in the referent's header and gives it back when the edge goes, so it
+  // is counted in the sense `13 §7` means: storage that lasts the whole run has nowhere to write
+  // that release. It reads as the outlier of the four refused types, because it is the one that
+  // keeps nothing alive — but what it owes is a decrement, not a lifetime.
+  "a weak reference is counted too, so a module-level 'val' refuses one" - {
+    "directly" in {
+      err(node + """weaken(r: &Node) -> weak Node = r
+                   |val w: weak Node = weaken(Node(1))
+                   |""".stripMargin) should include("a count with nowhere to write the release")
+    }
+
+    "and inside a struct, which is the recursive half of the same rule" in {
+      err(node + """struct Slot
+                   |    back: weak Node
+                   |end Slot
+                   |mk(r: &Node) -> Slot = Slot(r)
+                   |val s: Slot = mk(Node(1))
+                   |""".stripMargin) should include("a count with nowhere to write the release")
     }
   }
 

@@ -107,21 +107,21 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err("me() -> int = n\nval n: int = me()") should include("cannot be initialized")
     }
 
-    // A `val` holds plain data whatever fills it, which is the one rule that did not change: the
+    // A `val` counts nothing whatever fills it, which is the one rule that did not change: the
     // constant form could not have expressed a reference and the computed form must not either.
     "a reference cannot be held in one" in {
       val e = err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nval p: &P = mk()")
 
       e should include("cannot be a 'val'")
-      e should include("plain data")
+      e should include("a count with nowhere to write the release")
     }
 
     "nor a string, which is a view with an owner" in {
-      err("val s: string = \"hi\"") should include("plain data")
+      err("val s: string = \"hi\"") should include("a count with nowhere to write the release")
     }
 
     "nor a slice" in {
-      err("val xs: []int = [1, 2, 3]") should include("plain data")
+      err("val xs: []int = [1, 2, 3]") should include("a count with nowhere to write the release")
     }
 
     // The read-only rule is about the storage, not about how it was filled — a computed table is no
@@ -136,7 +136,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   "what the edges do" - {
     // A struct of numbers is the shape the constant form could not build and the computed one can,
     // so it is the first thing a reader will try.
-    "a struct is plain data and may be computed" in {
+    "a struct of numbers counts nothing and may be computed" in {
       val src =
         """struct Point
           |    x: int
@@ -174,7 +174,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |mk() -> Tree = Leaf
           |val t: Tree = mk()""".stripMargin
 
-      err(src) should include("plain data")
+      err(src) should include("a count with nowhere to write the release")
     }
 
     "an array of structs is computed element by element" in {
@@ -415,8 +415,8 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       )
     }
 
-    // The whole point of the plain-data rule seen from the far side: a struct whose field is a
-    // reference is refused even though the struct itself is a value.
+    // The whole point of the rule seen from the far side: a struct whose field is a reference is
+    // refused even though the struct itself is a value, because the count is still in the storage.
     "a struct with a reference field cannot be a 'val'" in {
       val src =
         """struct Holder
@@ -425,7 +425,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |mk() -> Holder = Holder(3)
           |val h: Holder = mk()""".stripMargin
 
-      err(src) should include("plain data")
+      err(src) should include("a count with nowhere to write the release")
     }
 
     // A computed `val` slices exactly as a written-down one does, and the view it gives carries the

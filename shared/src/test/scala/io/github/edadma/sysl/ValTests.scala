@@ -166,6 +166,177 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
   }
 
+  /** A `val` at pointer type — the file-scope register block (`13 §7`).
+   *
+   * What a `val` promises is that its **own storage** is written once and never again, and holding
+   * an address keeps that promise exactly as holding a number does. It is not a promise about what
+   * the address reaches, and it could not be: slicing a `val` and writing `&v[0]` already yields a
+   * writable `*T` on purpose (`07 § A view that may not be written`), so refusing one here declined
+   * a route to what another route grants.
+   */
+  "a module-level 'val' holds a raw pointer" - {
+
+    // The shape this exists for: an address the datasheet gives as a number, named once and reached
+    // by every function of a driver rather than re-materialised in each.
+    "an address the program was told, reached from several functions" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |struct Uart
+          |    status: u32
+          |    data:   u32
+          |end Uart
+          |val regs: *Uart = ptr_cast(malloc(16))
+          |arm()
+          |    regs.status = 7u32
+          |end arm
+          |fire(b: u32)
+          |    regs.data = b
+          |end fire
+          |arm()
+          |fire(65u32)
+          |print(str(regs.status), str(regs.data))""".stripMargin,
+      ) shouldBe "7 65\n"
+    }
+
+    "and the elements it addresses are read and written through it" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |val cells: *int = ptr_cast(malloc(32))
+          |put(v: int)
+          |    cells[0] = v
+          |end put
+          |put(42)
+          |print(str(cells[0]))""".stripMargin,
+      ) shouldBe "42\n"
+    }
+
+    "an array of them" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |val ps: [2]*u8 = [ptr_cast(malloc(8)), ptr_cast(malloc(8))]
+          |print(str(usize(ps[0]) != usize(ps[1])))""".stripMargin,
+      ) shouldBe "true\n"
+    }
+
+    "a struct with one in it" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |struct Dev
+          |    base: *u32
+          |    id:   int
+          |end Dev
+          |mk() -> Dev = Dev(ptr_cast(malloc(8)), 5)
+          |val d: Dev = mk()
+          |print(str(d.id))""".stripMargin,
+      ) shouldBe "5\n"
+    }
+
+    // The address of a function is the same kind of thing: a machine address that counts nothing.
+    // It was already accepted before pointers were, but only by falling off the end of the type
+    // test rather than by being meant, so it is pinned here now that the rule names it.
+    "the address of a function, and a call through the one it holds" in {
+      run(
+        """g(x: int) -> int = x + 1
+          |val f: *extern(int) -> int = &g
+          |print(str(f(3)))""".stripMargin,
+      ) shouldBe "4\n"
+    }
+
+    // A pointer is not looked through, so what is at the far end is not this storage's business —
+    // which is the whole of why a `*T` is admitted where a `&T` is not.
+    "one whose pointee is itself counted, since a pointer owns nothing at the far end" in {
+      ir(
+        """struct Node
+          |    v: int
+          |end Node
+          |extern malloc(n: usize) -> *u8
+          |val p: *&Node = ptr_cast(malloc(8))
+          |print("ok")""".stripMargin,
+      ) should include("@p")
+    }
+  }
+
+  "a constant address costs no initializer" - {
+
+    // `13 §7` puts a constant tree in the object file and orders nothing, and an address written as
+    // a number is one. It matters where it is used: a freestanding program reaches its registers
+    // before anything has run, and a prologue that had to fill the pointer in first would be no use.
+    "'ptr_cast' of a constant is laid straight in as an 'inttoptr'" in {
+      ir(
+        """const UART: usize = 0x10000000
+          |val regs: *u32 = ptr_cast(UART)
+          |print("ok")""".stripMargin,
+      ) should include("@regs = private constant ptr inttoptr (i64 268435456 to ptr)")
+    }
+
+    "and so is a null one" in {
+      ir("val p: *u32 = null\nprint(\"ok\")") should include("@p = private constant ptr null")
+    }
+
+    // The other side of the same line: an address a call produces is code, so it is a `global` the
+    // prologue writes rather than a `constant` the object file carries.
+    "while an address a call produces is a computed one, as any other computed value is" in {
+      val out = ir(
+        """extern malloc(n: usize) -> *u8
+          |val p: *u8 = malloc(8)
+          |print("ok")""".stripMargin,
+      )
+
+      out should include("@p = private global ptr zeroinitializer")
+      out should not include "@p = private constant"
+    }
+
+    // The ordering rule is over the `val`s themselves, so a pointer one joins the graph like any
+    // other — which is worth pinning because a pointer is the type most likely to be reached for in
+    // a cycle (`13 §7`, "what order the initializers run in").
+    "and a cycle among computed pointer 'val's is still reported" in {
+      err(
+        """val a: *u8 = ptr_cast(usize(b))
+          |val b: *u8 = ptr_cast(usize(a))
+          |print("ok")""".stripMargin,
+      ) should include("cannot be initialized")
+    }
+  }
+
+  "what a pointer 'val' still promises, and what it never did" - {
+
+    // The promise it keeps: its own storage is written once.
+    "the name may not be assigned to" in {
+      err(
+        """const UART: usize = 0x1000
+          |val regs: *u32 = ptr_cast(UART)
+          |regs = ptr_cast(UART)
+          |print("ok")""".stripMargin,
+      ) should include("written once")
+    }
+
+    // The promise it never made: read-only at every depth is about the storage the declaration lays
+    // down, not about what a value inside it addresses. `07 § A view that may not be written` says
+    // the same thing from the other side, and the test below is what makes this one a claim rather
+    // than an assertion about an implementation.
+    "while the storage it addresses is writable, which is what the raw tier means" in {
+      ir(
+        """const UART: usize = 0x1000
+          |val regs: *u32 = ptr_cast(UART)
+          |set()
+          |    regs[0] = 1u32
+          |end set
+          |print("ok")""".stripMargin,
+      ) should include("@regs")
+    }
+
+    // …and the route that was already open, which is the argument for admitting the type at all: a
+    // `val`'s own elements are reachable as a writable `*T` through a view of it, today, on purpose.
+    "because a writable pointer into a 'val' is already reachable through a view of it" in {
+      run(
+        """val k: [4]int = [1, 2, 3, 4]
+          |var s = k[1..<3]
+          |var p = &s[0]
+          |print(str(p[0]))""".stripMargin,
+      ) shouldBe "2\n"
+    }
+  }
+
   "a local 'val'" - {
     "binds like a 'var'" in {
       run("twice() -> int\n    val n = 4\n    n * 2\nend twice\nprint(str(twice()))") shouldBe "8\n"
@@ -264,10 +435,26 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       err("val k: [3]int = [1, 2]") should include("[3]int")
     }
 
-    // Storage that outlives every frame holds plain data: a string is a view with an owner word, so
-    // one in a `val` would be a count nothing ever lets go of. The cost is recorded in `13 §7`.
+    // Storage that outlives every frame is never let go of, so a count taken in one has nowhere to
+    // write the release. A string is a view with an owner word, so it is one. Cost noted in `13 §7`.
     "a string, which is a view with an owner rather than a value" in {
-      err("val s: string = \"hi\"") should include("plain data")
+      err("val s: string = \"hi\"") should include("a count with nowhere to write the release")
+    }
+
+    "a reference, which is the count itself" in {
+      err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nval r: &P = mk()") should
+        include("a count with nowhere to write the release")
+    }
+
+    "a view, whose owner word is a count like any other" in {
+      err("val k: [4]int = [1, 2, 3, 4]\nval s: []const int = k[1..<3]") should
+        include("a count with nowhere to write the release")
+    }
+
+    // The diagnostic says which types are meant and which one is not, because "not plain data" left
+    // a reader looking for a spelling rather than reading the reason.
+    "and the message names what may be held instead" in {
+      err("val s: string = \"hi\"") should include("A raw pointer may be held: it counts nothing")
     }
 
     // The line between the two declarations, from the other side: a `const` sizes an array because

@@ -490,21 +490,27 @@ trait ProgramWalk
 
     if disagree(init.ty, ty) then
       err(s"cannot initialize '${qn(key)}': declared ${show(ty)} but the value is ${show(init.ty)}")
-    checkPlain(ty, key)
+    checkValType(ty, key)
     TVal(key, ty, init, !isStatic(init))
   })
 
-  /** Holds a module-level `val` to **plain data** — numbers, characters, booleans, enums, and the
-   * structs and arrays built from those.
+  /** Holds a module-level `val` to a value that **counts nothing** (`13 §7`).
    *
-   * The rule is about the two promises a `val` makes. It is read-only *at every depth* (`13 §7`), and
-   * a reference, a pointer, or a slice inside one is a route around that: the storage cannot be
-   * written but what it points at can, one dereference away from where the mistake could still be
-   * reported. And it exists for the whole run, so a counted value in one is never let go of — a leak
-   * the program has no way to spell the release of. A `string` is refused by the same test, being a
-   * view with an owner word, and that is the one thing this costs today.
+   * There is one reason and it is about lifetime, not about depth. A module `val` exists for the
+   * whole run and is therefore never let go of, so a counted value in one is a leak with no line to
+   * write the release on — which reaches a `&T`, a `weak T`, a slice, and a `string`, each of which
+   * owes a box or an owner a release. It does not reach a raw pointer, which owns nothing and
+   * releases nothing, or the address of a function, which is the same.
+   *
+   * Read-only *at every depth* is deliberately **not** what this checks, though it once was. That
+   * promise is about the storage the declaration lays down, and it is kept where it is made: `k[0] =
+   * …` and `&k[0]` are both refused. It was never a promise about what a value *inside* the storage
+   * addresses — a `*T` reached through one is the raw tier, where the language guarantees nothing,
+   * and slicing a `val` and writing `&v[0]` already produces one on purpose (`07 § A view that may
+   * not be written`). Refusing a `val` at pointer type declined one route to what another route
+   * grants.
    */
-  private def checkPlain(ty: Type, key: String): Unit =
+  private def checkValType(ty: Type, key: String): Unit =
     // The whole difference between a `val` and a `const` is that a `val` has an address (`13 §7`),
     // and a value with no representation has nothing to put one on. The initializer would still run,
     // which is the only thing such a declaration could have been for — and a statement says that
@@ -512,21 +518,21 @@ trait ProgramWalk
     if Type.zeroSized(ty) then
       err(s"'${qn(key)}' cannot be a 'val': a ${show(ty)} value occupies nothing, so there is no " +
         "storage for the name to stand for — write the call as a statement instead")
-    else if !plain(ty) then
-      err(s"'${qn(key)}' cannot be a 'val': its type is ${show(ty)}, and a 'val' holds plain data " +
-        "only — a reference, a pointer, a slice, or a string in storage that outlives every frame " +
-        "would be neither released nor held to being read-only")
+    else if !uncounted(ty) then
+      err(s"'${qn(key)}' cannot be a 'val': its type is ${show(ty)}, and storage that exists for the " +
+        "whole run is never let go of — a reference, a weak reference, a slice, or a string in one " +
+        "would be a count with nowhere to write the release. A raw pointer may be held: it counts " +
+        "nothing")
 
   // --- `extern` variables ----------------------------------------------------------------
 
   /** Holds one `extern` variable's declared type to being something a symbol could stand for.
    *
    * There is one rule and it is the `val`'s first one, for the same reason: a symbol is an address,
-   * and a value with no representation has nothing to put one at. The `val`'s *second* rule — plain
-   * data only — is deliberately not applied here. It exists to keep a `val` from owning a reference
-   * it can never release and from promising read-only through a pointer, and an `extern` variable
-   * owns nothing and promises nothing: `stdout` is a pointer, `environ` is a pointer to pointers,
-   * and refusing those would leave the declaration unable to name what it was added to reach.
+   * and a value with no representation has nothing to put one at. The `val`'s *second* rule — that
+   * it counts nothing — is deliberately not applied here. It exists to keep a `val` from owning a
+   * count it can never release, and an `extern` variable owns nothing: the storage is the other
+   * side's, and so is whatever releasing it would mean.
    */
   private def checkExternVar(key: String): Unit =
     val ty = externVarType(key)
@@ -535,12 +541,21 @@ trait ProgramWalk
       err(s"'${qn(key)}' cannot be an 'extern' variable: a ${show(ty)} value occupies nothing, so " +
         "there is no storage for the linker to resolve the name to")
 
-  private def plain(t: Type): Boolean = t match
-    case _: Type.Ptr | _: Type.Ref | _: Type.View | _: Type.Trait => false
-    case Type.Array(_, elem)                                      => plain(elem)
-    case s: Type.Struct                                           => s.fields.forall(f => plain(f._2))
-    case e: Type.Enum => e.variants.forall(_.fields.forall(f => plain(f._2)))
-    case c: Type.Constrained => plain(c.base)
+  /** Whether a type carries no refcount anywhere in it, so storage holding one owes no release.
+   *
+   * A `*T` and a `*extern(…) -> R` answer yes and are **not** looked through: a pointer owns nothing
+   * at the far end, so what the far end counts is not this storage's business. A bare trait type
+   * answers no because a value of one is a box the count lives in. Everything built out of parts is
+   * as good as its parts.
+   */
+  private def uncounted(t: Type): Boolean = t match
+    case _: Type.Ptr | _: Type.CFn                  => true
+    case _: Type.Ref | _: Type.Weak | _: Type.View  => false
+    case _: Type.Trait                              => false
+    case Type.Array(_, elem)                        => uncounted(elem)
+    case s: Type.Struct                             => s.fields.forall(f => uncounted(f._2))
+    case e: Type.Enum        => e.variants.forall(_.fields.forall(f => uncounted(f._2)))
+    case c: Type.Constrained => uncounted(c.base)
     case _                   => true
 
   /** Whether an initializer is a value the object file can carry as it stands: numbers, and the
@@ -551,7 +566,15 @@ trait ProgramWalk
     case _: TIntLit | _: TFloatLit | _: TBoolLit => true
     case TArrayLit(elems, _)                     => elems.forall(isStatic)
     case TArrayFill(value, _)                    => isStatic(value)
-    case _                                       => false
+
+    // An address the datasheet gives as a number is a constant like any other, so `ptr_cast` over one
+    // stays in this category rather than becoming code. It matters where it is used: a register block
+    // reached before anything has run is exactly what a freestanding program wants, and an ordered
+    // initializer would be a store to make before the storage could be read.
+    case _: TNullLit                             => true
+    case TCast(v, (_: Type.Ptr) | (_: Type.CFn)) => isStatic(v)
+
+    case _ => false
 
   // --- definition-checked bounds -------------------------------------------------------
 

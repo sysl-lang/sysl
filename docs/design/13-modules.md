@@ -743,15 +743,42 @@ refused, because that is where the promise was made and where it can still be ke
 view of it is a `*T`, the tier `03` excludes on purpose, and is how the view reaches C. Slicing is
 the step between the two, and it is written down.
 
-**A module-level `val` holds plain data** — the numbers, characters, booleans, enums, and the
-structs and arrays built out of those. A reference, a pointer, a slice, or a `string` in one is
-refused, and for two reasons that point the same way. The paragraph above is the first: read-only at
-every depth is a property of *storage*, and a reference inside it is a route around the property, one
-dereference from where the mistake could still be reported. The second is that a module `val` exists
-for the whole run and is therefore never let go of, so a counted value in one is a leak with no line
-to write the release on. The cost this carries today is that `val greeting: string = "hello"` cannot
-be written — a `string` is a view with an owner word, and a static one would need that word to mean
-"nobody", which is `04`'s decision rather than this one.
+**A module-level `val` may not hold a counted value.** A `&T`, a `weak T`, a slice, and a `string`
+are each refused, and the reason is the one thing that is true of module storage and of no other
+storage: it exists for the whole run and is therefore never let go of, so a count taken in one is a
+count with no line to write the release on. The cost this carries today is that
+`val greeting: string = "hello"` cannot be written — a `string` is a view with an owner word, and a
+static one would need that word to mean "nobody", which is `04`'s decision rather than this one.
+
+**A raw pointer may be held, and so may the address of a function.**
+
+```
+const UART: usize = 0x1000_0000
+val regs: *Uart = ptr_cast(UART)
+```
+
+A `*T` counts nothing, so the reason above does not reach it: there is no release to write. What a
+`val` promises is that **its own storage** is written once and never again — the ordinary meaning the
+word carries — and holding an address keeps that promise exactly as holding a number does.
+
+It was refused once, for the depth rule two paragraphs up, and that argument does not survive being
+looked at. Read-only at every depth is a promise about the storage this declaration lays down, and it
+is kept where it is made: `k[0] = …` and `&k[0]` are both refused *there*. It was never a promise
+about what a value inside the storage addresses, and it could not be — slicing a `val` and writing
+`&v[0]` yields a `*T` today, on purpose, and is how a table reaches C (`07 § A view that may not be
+written`). Refusing `val p: *T` declined one route to what another route already grants, which buys a
+program nothing and costs it the one shape that has no substitute: **a device register block named at
+file scope**, reached by every function in the driver rather than re-materialised in each.
+
+The raw tier is where a `*T` lands, here as everywhere: what it addresses, whether that is still
+there, and whether anyone else is writing it are the programmer's to know (`03 § Reinterpreting
+storage`).
+
+**An address that is a constant is laid into the object file**, not stored by a prologue. `ptr_cast`
+over a constant is a constant tree by the rule below, so a `val` at pointer type needs nothing ordered
+and is readable before the first initializer runs — which is what a freestanding program starting at a
+reset vector requires, and it would be no use if the register block were filled in by code that had to
+run first.
 
 **The type is written at module level and inferred inside a block.** Not two rules but one: §2 says
 anything visible outside its file states its types, and a module member always could be. A local
@@ -776,8 +803,9 @@ private val crc_table: [256]u32 = build_crc_table()
 ```
 
 The two forms are told apart by what the initializer *is*, not by how it is written. A constant tree
-— a number, an array of them, a repeat `[v; n]` (`07`) — is laid straight into the object file, runs
-nothing, and needs nothing ordered. Anything else is code, and code runs somewhere.
+— a number, an array of them, a repeat `[v; n]` (`07`), `null`, and a `ptr_cast` of any of those — is
+laid straight into the object file, runs nothing, and needs nothing ordered. Anything else is code,
+and code runs somewhere.
 
 **A value that has to be *checked* is code, whatever it looks like.** A `val` at a constrained type
 (`16`) is written as a plain number and would otherwise be laid down by the rule above — which would

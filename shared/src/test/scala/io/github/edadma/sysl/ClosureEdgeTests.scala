@@ -560,7 +560,7 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "a module-level 'val' may not hold one, for the reason it holds no reference" in {
       err("""val greeter: &Fn(int) -> string = k -> "x"
-            |""".stripMargin) should include("a 'val' holds plain data only")
+            |""".stripMargin) should include("a count with nowhere to write the release")
     }
 
     "two of them are not compared" in {

@@ -98,12 +98,14 @@ of promise a wrong parameter list is. The one type refused is one that occupies 
 symbol is an address and a value with no representation has nothing to put one at.
 
 **It is a place, and a writable one** — which is the one respect in which it is unlike every other
-global the language has. A module-level `val` is read-only at every depth and holds plain data only
+global the language has. A module-level `val` is read-only at every depth and counts nothing
 (`13 §7`), because it owns what it names for the whole run and promises never to change it. An
 `extern` variable owns nothing and promises nothing: the storage is C's, C writes it, and `optind = 1`
 before a `getopt` loop is ordinary usage of the interface being reached. Refusing the write would
-leave the declaration able to name only half of what it was added for, and refusing the *pointers*
-that a `val` is refused would leave it able to name almost nothing at all.
+leave the declaration able to name only half of what it was added for. The *type* rule does not
+carry over either, and there is one case where that still shows: a `&T` is refused a `val` because
+nothing would ever release it, and an `extern` variable may name whatever the other side laid down,
+because releasing it was never this program's job.
 
 **Two rules follow from having no body, and both are already written elsewhere.** The escape
 analysis assumes the worst of it — every argument may be kept, and the result may view any of them
