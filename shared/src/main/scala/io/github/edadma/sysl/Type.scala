@@ -215,8 +215,9 @@ object Type {
   case class CFn(params: List[Type], ret: Type) extends Type {
     def llvm: String = "ptr"
 
-    /** How the call is written at the machine level, which the emitter needs in front of an
-     * indirect callee exactly as it does in front of a variadic one.
+    /** The written spelling, so a debug rendering reads the way the program does. What a diagnostic
+     * shows goes through `show`, and what the emitter writes in front of an indirect callee is the
+     * *result* type alone — neither reaches this.
      */
     override def toString: String = s"*extern(${params.mkString(", ")}) -> $ret"
   }
