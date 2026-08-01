@@ -396,8 +396,16 @@ structs lower to named aggregates (`%struct.Name = type { … }`); construction 
 `insertvalue` chain, and a field read is `extractvalue`. A **write** instead computes the
 place's address — a local's own slot, a loaded pointer value, or a `getelementptr` chain over
 either — and `store`s through it, which is one mechanism for `x = v`, `s.f = v`, `*p = v`, and
-`p.f = v` alike. `*T` and `&T` are both the opaque `ptr`; inside a mangled name a memory mode
-is spelled as a word (`ptr.` / `ref.` / `sync.`), since a sigil is not an LLVM name character.
+`p.f = v` alike. A place whose storage is qualified `volatile` (`03 § Device memory`) takes the
+marker on the instruction — `load volatile` / `store volatile` — and that is the whole of what the
+qualifier costs; the field itself is laid out exactly as an unqualified one, so a register block is
+the same aggregate it looks like. A qualified **field** is the one exception to the `extractvalue`
+read above: it is reached at its own address instead, because loading the aggregate to lift one field
+out of it would read every register in the block. A whole-aggregate access is marked whenever the
+type holds a qualified field anywhere in it. `*T` and `&T` are both the opaque `ptr`; inside a
+mangled name a memory mode is spelled as a word (`ptr.` / `ref.` / `sync.` / `volatile.`), since a
+sigil is not an LLVM name character, and the qualifier is mangled for the reason a view's read-only
+bit is — one layout, two sets of instructions, so no instantiation may share a body across them.
 A `&T` addresses a **box** `%arc.T = type { i64, ptr, i64, T }` — a **three-word header** and then
 the payload, so reading through one is a `getelementptr` past it. The words are the strong count,
 the function that destroys the payload, and the **weak** count (`03`), and the header is named on its

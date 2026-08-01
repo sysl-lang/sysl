@@ -33,6 +33,13 @@ trait ConstFolding extends ImportResolution {
    */
   protected def resolveQualified(t: TypeRef, subst: Map[String, Type]): Type
 
+  /** A written type with any `volatile` taken off the front of it — for the one place that reads a
+   * field list as a **parameter** list, where what travels is the value rather than the storage.
+   */
+  protected def unqualifiedRef(t: TypeRef): TypeRef = t match
+    case VolatileType(inner) => unqualifiedRef(inner)
+    case other               => other
+
   /** Recognising a scalar type name, which is all a constant may be declared as. */
   protected def scalarType(name: String): Option[Type]
 

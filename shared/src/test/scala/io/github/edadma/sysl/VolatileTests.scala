@@ -209,6 +209,19 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
       defineOf(ir(src), "read") should include("load volatile i32")
     }
+
+    // The two qualifiers are about different things and compose: `const` says this handle may not
+    // write, `volatile` says the elements are a device's. A read-only device register wants both.
+    "and 'const' composes with it, being a property of the view rather than of the element" in {
+      val src =
+        """struct Gpio
+          |    bank: [4]volatile u32
+          |val gpio: *Gpio = ptr_cast(usize(0x40000000))
+          |peek(xs: []const volatile u32) -> u32 = xs[0]
+          |print(peek(gpio.bank[0..4]))""".stripMargin
+
+      defineOf(ir(src), "peek") should include("load volatile i32")
+    }
   }
 
   // A copy of a whole register block reads every register in it, and that is as much an effect as
@@ -289,6 +302,33 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "a type that occupies nothing, since there is no access to describe" in {
       err("struct S\n    a: volatile unit\nprint(0)") should
         include("'volatile' qualifies a scalar or a raw pointer")
+    }
+
+    // A constrained subtype is the claim that a value has been checked, and a device did not check
+    // anything — so reading a register at one would hand back the claim through a field selection
+    // that looks like any other.
+    "a constrained subtype, whose whole content is that a value was checked" in {
+      val src =
+        """type Level = int within 0..7
+          |struct Ctl
+          |    lvl: volatile Level
+          |print(0)""".stripMargin
+
+      err(src) should include("Declare the register at int and convert what you read")
+    }
+
+    // The other side of that line: `new` alone changes a type's identity and promises nothing about
+    // which values it has, so there is nothing a register could arrive holding that it contradicts.
+    "while a bare 'new' derivation, which constrains no value, is admitted" in {
+      val src =
+        """type Raw = new u32
+          |struct Ctl
+          |    raw: volatile Raw
+          |val c: *Ctl = ptr_cast(usize(4096))
+          |get() -> Raw = c.raw
+          |print(u32(get()))""".stripMargin
+
+      defineOf(ir(src), "get") should include("load volatile i32")
     }
 
     // The qualifier is not a modifier that stacks, and writing it twice is a mistake worth naming
@@ -411,22 +451,46 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  // The customer the whole feature is for: no OS, no prologue that has run, and a driver that has to
-  // be right from the first instruction.
-  "on a freestanding target, which is what this is for" in {
+  // The customer the whole feature is for, as a whole driver rather than as a fragment: no OS, no
+  // prologue that has run, and every access to the device is one the source wrote.
+  "a driver on a freestanding target, which is what this is for" - {
     val riscv = Target.all.find(_.name == "riscv64-freestanding").get
-    val out = irFor(
-      riscv,
-      uart +
-        """putc(c: u32) -> unit
-          |    while regs.status == 0u32 do ()
-          |    regs.data = c
-          |putc(65u32)""".stripMargin,
-    )
 
-    out should include("@regs = private constant ptr inttoptr (i64 268435456 to ptr)")
-    out should include("load volatile i32")
-    out should include("store volatile i32")
+    /** A UART driver of the shape a bring-up actually has: a shadow field configured once, a status
+     * register polled, a data register written per byte.
+     */
+    val driver = uart +
+      """init(rate: u32) -> unit
+        |    regs.baud = rate
+        |putc(c: u32) -> unit
+        |    while regs.status & 0x20u32 == 0u32 do ()
+        |    regs.data = c
+        |puts(s: []const u8) -> unit
+        |    for b in s do putc(u32(b))
+        |boot() -> unit
+        |    init(115200u32)
+        |    puts("hi".bytes)
+        |boot()""".stripMargin
+
+    "the register block is readable before anything has run" in {
+      irFor(riscv, driver) should
+        include("@regs = private constant ptr inttoptr (i64 268435456 to ptr)")
+    }
+
+    // The poll is the reason the qualifier exists: an unmarked load here is a loop that spins on the
+    // value it saw first.
+    "the status poll is a volatile load inside the loop" in {
+      val body = defineOf(irFor(riscv, driver), "putc")
+
+      body should include("load volatile i32")
+      body should include("store volatile i32")
+    }
+
+    // Configuring the shadow field touches no register at all, which is what per-field qualifying
+    // buys and what a qualifier on the whole struct would have cost.
+    "while configuring the shadow field touches no device" in {
+      defineOf(irFor(riscv, driver), "init") should not include "volatile"
+    }
   }
 
   // A register block is a type like any other, so it may be declared in one module and driven from
@@ -469,6 +533,37 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       case Right(List(back)) => back.body shouldBe parsed.body
       case Right(other)      => fail(s"expected one program, got ${other.length}")
       case Left(e)           => fail(s"decode failed: $e")
+  }
+
+  // `16 §6`'s rule and this one meet at a struct that holds registers, and the answer is that such a
+  // struct carries no invariant. A check is a call taking every field, so it reads the whole block
+  // however few fields the clause names — which at a device is not a redundant read.
+  "a struct that holds a register carries no invariant" - {
+    "even where the clause reads only the ordinary fields beside it" in {
+      val src =
+        """struct Uart
+          |    status: volatile u32
+          |    baud:   u32
+          |    invariant baud > 0u32
+          |print(0)""".stripMargin
+
+      err(src) should include("holds the register 'status', so it carries no invariant")
+    }
+
+    "while the same struct without the clause is ordinary" in {
+      ir(uart + "go() = regs.baud = 1u32\ngo()") should include("store i32 1")
+    }
+
+    // The rule is about the register, not about invariants: a struct with no registers keeps them.
+    "and a struct with no registers keeps its invariants" in {
+      val src =
+        """struct Account
+          |    balance: int
+          |    invariant balance >= 0
+          |print(Account(1).balance)""".stripMargin
+
+      ir(src) should include("@Account$inv")
+    }
   }
 
   // A generic body's loads and stores are its own rather than the ones a caller wrote, so a type

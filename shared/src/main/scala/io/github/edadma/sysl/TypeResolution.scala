@@ -295,6 +295,16 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
    * refused outright, since a retain that may not be elided is not a request anybody can act on.
    */
   private def volatileScalar(t: Type): Type = Type.underlying(t) match
+    // A constrained subtype is the claim that a value **has been checked** (`16 §4`), and a register
+    // holds whatever the device put there. Reading one at such a type would hand back that claim
+    // unchecked, through a field selection that looks like any other — and the `ptr_cast` that made
+    // the pointer is too far away to read as the licence for it. Declaring the register at the base
+    // and converting what comes back puts the check where the value arrives, which is one written
+    // conversion and the whole of the fix.
+    case _ if constrains(t) =>
+      err(s"'volatile ${show(t)}' is not a type: a register holds whatever the device put in it, and " +
+        s"${show(t)} is the claim that a value has been checked. Declare the register at " +
+        s"${show(Type.underlying(t))} and convert what you read")
     case _: Type.Integer | _: Type.Floating | Type.Char | Type.Bool => t
     // A trait object is two words, so an access to one is two accesses however it is written — which
     // is the one promise the qualifier makes, and the one it could not keep here. It is also nothing
@@ -316,6 +326,14 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case _ =>
       err(s"'volatile ${show(t)}' is not a type: 'volatile' qualifies a scalar or a raw pointer, " +
         "since it promises the one load or the one store the source wrote and nothing else")
+
+  /** Whether a type constrains which **values** it has, as against merely having an identity of its
+   * own. A bare `new` derivation is nominal and asserts nothing about a value (`16 §2`), so there is
+   * nothing for a register to arrive holding that the type would have promised was checked.
+   */
+  private def constrains(t: Type): Boolean = t match
+    case c: Type.Constrained => c.lo.isDefined || c.hi.isDefined || c.predFn.isDefined || constrains(c.base)
+    case _                   => false
 
   private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
     case PtrType(inner) =>

@@ -185,6 +185,13 @@ memory: the compiler guarantees nothing, the code is auditable by grep, and it i
 scheduler and the allocator are written. Kernel code does not use `&sync T`; it uses a raw
 pointer and a spinlock, as C does.
 
+**`volatile` is not one of these, and the mistake is worth naming.** C's own reference material used
+to recommend the qualifier for "shared-memory variables", and it is wrong: `volatile` constrains the
+*compiler* — it stops accesses being elided, merged or reordered relative to one another — and says
+nothing about other cores, about ordering, or about tearing. It is for device memory (`03 § Device
+memory`) and for nothing else. Two threads sharing a counter want `Atomic[T]` from this list, or a
+`&sync Mutex[T]` above it; a `volatile` counter is a race with a keyword in front of it.
+
 **Refcount ordering.** Atomic retain is a relaxed increment — no ordering is needed to add a
 reference you already hold. Atomic release is a decrement with release ordering, followed on
 the zero transition by an acquire fence before the destructor runs, so every prior write from

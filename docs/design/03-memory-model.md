@@ -547,6 +547,140 @@ withholding the operator. The future carve-out already has its home: an `opaque`
 a`) withholds its layout entirely, and *no `sizeof`* is on the list of what that costs — the type
 opts out, rather than `sizeof` opting in.
 
+## Device memory
+
+`ptr_cast` gets a driver to the register block. It does not get it a *correct* driver, and the
+missing half is this: an optimizer is entitled to assume that reading the same storage twice yields
+the same value, that a store nobody reads is a store nobody needs, and that two accesses in a row may
+be one wider access. Every one of those assumptions is false at a device. `while regs.status == 0 do
+()` is a loop that reads a register until the hardware changes it, and a compiler that hoisted the
+read out would spin forever on the first value it saw.
+
+So sysl has C's qualifier, spelled the way C spells it — in the type:
+
+```
+struct Uart
+    status: volatile u32
+    data:   volatile u32
+    baud:   u32              // a shadow value in RAM, not a register
+
+const UART: usize = 0x1000_0000
+val regs: *Uart = ptr_cast(UART)
+
+putc(c: u32) -> unit
+    while regs.status & 0x20u32 == 0u32 do ()
+    regs.data = c
+```
+
+> A **`volatile`** place is one whose reads and writes are **effects, not value computations**. It may
+> change without the program changing it, and reading it may itself do something. So the compiler
+> emits exactly the accesses the source wrote, exactly once each, in the order written — never
+> adding, dropping, merging, or moving them relative to one another.
+
+**Touching it is the point.** That is the whole of the definition and it is worth reading twice,
+because the qualifier is so often taken for something it is not.
+
+**It constrains the compiler, not the machine.** No atomicity, no ordering against another core, no
+protection from a torn read. C spent two decades learning this and now says the same thing: for
+talking to another thread, `06` has `&sync T`, `Mutex[T]`, `Atomic[T]` and explicit orderings, and
+none of them is spelled `volatile`. A program that reaches for this word to share a counter has
+written a race with a keyword in front of it.
+
+### It qualifies storage, and a value read out of storage is an ordinary value
+
+This is the rule everything else follows from. `regs.status` has type `u32` — not `volatile u32` —
+because what a load hands back is a number, and a number is not somewhere a device can write. What is
+qualified is the *place*, and the qualifier lives in the three types that name a place somebody else
+owns:
+
+```
+status: volatile u32           // a field
+bank:   [4]volatile u32        // an element — a GPIO bank
+p:      *volatile u32          // a pointee — the lone register
+```
+
+Everywhere else the type being written is the type of a **value**: what a `var` holds, what a
+parameter receives, what a function hands back, what a type argument stands for. `volatile` is
+refused in all of them, and the diagnostic says which spelling was wanted — a program that writes
+`var x: volatile u32` almost always meant `*volatile u32`.
+
+**Per field, not per aggregate.** C also allows `volatile struct Uart`; sysl does not, and the block
+above shows why. `baud` is a shadow value the driver keeps in ordinary memory beside the registers,
+and every real device header has one — a reserved word, a cached configuration, a software flag. A
+qualifier on the whole struct would sweep it in. Qualifying per field is the same power with the
+opt-out, it is what CMSIS and every other vendor header already does (`__IO uint32_t CR1;`), and it
+makes the restriction below a check on one scalar instead of a walk of a type.
+
+**Only a scalar or a raw pointer may be qualified.** The promise is about *the* load and *the* store
+the source wrote, so it is only meaningful where an access is one instruction. A counted value is
+refused outright: a `&T`, a `weak T`, a slice and a `string` come with retains and releases the
+compiler places, and a retain that may not be elided is not a request anybody could act on. A trait
+object is refused for a plainer reason — it is two words, so touching one is two accesses whatever
+the source says, and the table beside the value is this compiler's rather than a device's. Device
+memory is reached with a raw pointer, which is the tier this belongs to.
+
+**A constrained subtype is refused too, and this one is about trust rather than instructions.** A
+`Level = int within 0..7` is the claim that a value *has been checked* (`16 §4`); a register holds
+whatever the device put there. `lvl: volatile Level` would hand that claim back unchecked through a
+field selection indistinguishable from any other, with the `ptr_cast` that made the pointer too far
+away to read as the licence. So the register is declared at the base and what comes back is
+converted — one written conversion, checked, at the point the value arrives. A bare `new` derivation
+is admitted, since it changes a type's identity and promises nothing about which values it has.
+
+**A struct that holds a register carries no `invariant`.** The two rules meet here, and the answer is
+about the *struct* rather than about the clause because a check is a call taking every field: it
+reads the whole block however few fields the clause names, so an invariant written over the shadow
+value beside the registers would make writing that shadow an access to the device. There is nothing
+to hold the clause true either — a device changes a register between the check and the instruction
+after it, with no alias anywhere for `16 §6` to restrict. A register is checked where it is read.
+
+### What the compiler does with it
+
+A qualified access lowers to LLVM's `load volatile` / `store volatile`, which is exactly the barrier
+this needs: it stops the reordering, elision and merging above, and stops nothing else. There is no
+runtime cost and no runtime component.
+
+**A qualified field is reached at its own address**, not lifted out of the block. An ordinary field
+read loads the aggregate and takes the field out of it, which is free after optimization and correct
+for ordinary memory. It is neither at a device: reading a `Uart` to find out what is in `status` also
+reads `data`, and reading a data register is how a FIFO is popped. So a place walk is what a
+qualified field gets — one `getelementptr`, one `load volatile`, and nothing else touched.
+
+**A whole block copied is a copy of every register in it.** `var u = *regs` is one access to each
+register, which is as much an effect as one access to one of them, so the aggregate access is marked
+too. Whether a driver wants that is the driver's business; what it does not get is a silent
+unqualified read of hardware.
+
+**An address taken of a register is the address of a register.** `&regs.status` has type
+`*volatile u32`, so a driver may hand one register to a helper and every access the helper makes is
+still an access to a device. The qualifier travelling with the address is what makes the type
+useful at all — without it, a driver would have to be one function.
+
+**A type parameter never binds to a qualified type.** `first[T](xs: []T)` handed a
+`[]volatile u32` solves `T` as `u32`, and the argument then does not agree with the `[]u32` the
+instantiation asks for — which is the message worth reading. The reason is not squeamishness: the
+loads and stores a generic body emits are *its* accesses, written once and shared by every
+instantiation, and it cannot promise to have written the ones a particular caller had in mind.
+
+**It is not reserved.** `volatile` is special only in front of another type, so a program with a
+variable, a field, a function or a type of its own by that name still compiles — the same
+arrangement `sync` has after `&`.
+
+### What it does not interact with
+
+Two neighbours look as though they should have something to say here and do not, which is worth
+writing down so the question is not reopened.
+
+**The aliasing rule (`16 §6`)** refuses an alias typed below a promise, reasoning about *places* and
+what a clause reads. A volatile access is still an access to a place with a type, and nothing about
+`16 §6` licenses eliding or reordering one — the assumption it does license is about who may *write*
+through an alias, not about how many times a read happens. The two are orthogonal, and the one place
+they touch is settled above: a struct holding a register carries no clause for the rule to be about.
+
+**`[]const T`** composes with it and means a different thing: `const` is a property of the *view* —
+these elements may not be written through this handle — while `volatile` is a property of the
+*element*. A read-only device register is `[]const volatile u32`, and both words are doing work.
+
 ## Slices keep their backing alive
 
 A slice is **three words**, not two:

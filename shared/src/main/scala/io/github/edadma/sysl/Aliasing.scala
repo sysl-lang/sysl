@@ -149,9 +149,24 @@ trait Aliasing extends AnalyzerBase {
    *
    * A view's `len` is the exception, and it is not really one: the three words are stored in the
    * struct, so the length is the struct's own and the elements are not.
+   *
+   * A struct holding a **register** carries no invariant at all (`03 § Device memory`), and the rule
+   * is about the struct rather than about the clause for a reason worth stating: a check is a call
+   * taking *every* field, so it reads the whole block however few fields the clause names. On real
+   * hardware that is not a redundant read — reading a data register pops a FIFO — so a clause over
+   * the shadow field beside the registers would make writing that field an access to every one of
+   * them. There is nothing to keep the clause true either: a device changes a register between the
+   * check and the instruction after it, with no alias anywhere for `16 §6` to restrict.
    */
   protected def checkInvariantReads(decl: StructDecl, ftypes: Map[String, Type]): Unit = {
     val fields = decl.fields.map(_.name).toSet
+
+    for (name, t) <- ftypes if Type.volatileIn(t) do
+      err(s"'${decl.name}' holds the register '$name', so it carries no invariant — a check reads " +
+        "every field of the struct, so one written over the ordinary fields beside a register would " +
+        "make writing them an access to the device. And a device changes a register between the " +
+        "check and the instruction after it, which is what no clause could hold. Check a register " +
+        "where it is read")
 
     def indirect(t: Type): Boolean = t match
       case _: Type.Ptr | _: Type.Ref | _: Type.Weak | _: Type.View => true

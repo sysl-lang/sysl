@@ -296,6 +296,11 @@ The `const` sits after the brackets, where `sync` sits after the `&`, and for th
 is a property of the *view*, not of the element type. `[N]const T` is not a type — an array is
 storage rather than a view of it, and storage written once is what `val` declares.
 
+That the two positions mean different things is what lets both be written at once. `[]const volatile
+u32` is a read-only view of device registers (`03 § Device memory`): `const` says this handle may not
+write, and `volatile` says the elements are a device's, so every read through it is emitted exactly
+as the source wrote it. Neither word could stand in for the other.
+
 **It is one type with a bit, not two types.** Both forms are the same three words, reach through
 the same instructions, and keep the same thing alive; what the bit changes is only what may be
 *done* with the view. So a `[]T` is accepted wherever a `[]const T` is wanted:

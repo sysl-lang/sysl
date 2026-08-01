@@ -307,12 +307,18 @@ trait Hoisting extends HoistMembers {
         at(s.pos)(err(s"invariants on generic structs are not supported yet — '${s.name}'"))
       else
         val cond   = s.invariants.reduce((a, b) => Binary("&&", a, b))
-        val ftypes = s.fields.map(p => (p.name, recover(Type.Unknown)(resolveType(p.typ, Map.empty))))
+        val ftypes = s.fields.map(p => (p.name, recover(Type.Unknown)(resolveQualified(p.typ, Map.empty))))
 
-        funcDecls(ikey) = FuncDecl(ikey, Nil, s.fields, Some(NamedType("bool")),
+        // The synthetic function takes the fields by value, so its parameters are written without
+        // whatever qualifier the field carried — a `volatile u32` field is a `u32` argument, exactly
+        // as it is everywhere else a register is read. A clause that reads one is refused below;
+        // stripping here is what keeps that the *only* thing said about it.
+        val params = s.fields.map(p => p.copy(typ = unqualifiedRef(p.typ)).setPos(p.pos))
+
+        funcDecls(ikey) = FuncDecl(ikey, Nil, params, Some(NamedType("bool")),
           List(ExprStmt(cond)), Map.empty, variadic = false).setPos(s.pos)
         declScope(ikey) = currentScope
-        funcInsts(ikey) = (ftypes, Type.Bool)
+        funcInsts(ikey) = (ftypes.map((n, t) => (n, Type.unqualified(t))), Type.Bool)
 
         // What the clauses may read is settled here, where the field types have just been resolved
         // and the whole aliasing rule that rests on them is still ahead (`16 §6`).
