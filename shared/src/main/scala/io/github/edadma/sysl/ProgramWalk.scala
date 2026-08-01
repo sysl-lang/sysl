@@ -549,11 +549,10 @@ trait ProgramWalk
    * as good as its parts.
    */
   private def uncounted(t: Type): Boolean = t match
-    case _: Type.Ptr | _: Type.CFn                  => true
-    case _: Type.Ref | _: Type.Weak | _: Type.View  => false
-    case _: Type.Trait                              => false
-    case Type.Array(_, elem)                        => uncounted(elem)
-    case s: Type.Struct                             => s.fields.forall(f => uncounted(f._2))
+    case _: Type.Ptr | _: Type.CFn                                 => true
+    case _: Type.Ref | _: Type.Weak | _: Type.View | _: Type.Trait => false
+    case Type.Array(_, elem)                                       => uncounted(elem)
+    case s: Type.Struct                                            => s.fields.forall(f => uncounted(f._2))
     case e: Type.Enum        => e.variants.forall(_.fields.forall(f => uncounted(f._2)))
     case c: Type.Constrained => uncounted(c.base)
     case _                   => true
@@ -571,7 +570,7 @@ trait ProgramWalk
     // stays in this category rather than becoming code. It matters where it is used: a register block
     // reached before anything has run is exactly what a freestanding program wants, and an ordered
     // initializer would be a store to make before the storage could be read.
-    case _: TNullLit                                    => true
+    case _: TNullLit                                      => true
     case TCast(_: TIntLit, (_: Type.Ptr) | (_: Type.CFn)) => true
 
     case _ => false
