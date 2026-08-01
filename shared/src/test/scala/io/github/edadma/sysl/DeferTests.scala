@@ -546,6 +546,27 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
             |""".stripMargin) shouldBe "n after: 99\n1\n"
     }
 
+    // A deferred statement carrying its own branch is what makes the teardown walk re-entrant: it is
+    // emitted by the same `genStmt` that pushes and pops the scope stacks the walk is in the middle
+    // of. Counted locals on both sides of it, and a `return` from the middle so the whole-function
+    // unwind is the path taken, since that is the walk with more than one scope to get wrong.
+    "a deferred statement may itself branch, while the scopes are being unwound" in {
+      run("""struct Box
+            |    n: int
+            |
+            |f(c: bool) -> int
+            |    var a: &Box = Box(1)
+            |    for i in 0..<2
+            |        var b: &Box = Box(2)
+            |        defer if c then print("chose", a.n, b.n) else print("other", b.n)
+            |        if i == 1 then return a.n + b.n
+            |    0
+            |
+            |print(f(true))
+            |print(f(false))
+            |""".stripMargin) shouldBe "chose 1 2\nchose 1 2\n3\nother 2\nother 2\n3\n"
+    }
+
     // A multi-assignment is a statement in its own right (`00 §2`), and deferring one reaches the
     // arm-walking that every pass does through a shape it does not otherwise meet inside a `defer`.
     "a multi-assignment may be the deferred statement" in {

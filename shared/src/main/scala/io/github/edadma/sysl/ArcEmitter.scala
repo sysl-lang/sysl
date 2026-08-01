@@ -388,10 +388,17 @@ trait ArcEmitter extends Emitter {
    */
   protected def releaseAll(): Unit = {
     for frame <- tempStack; (v, ty) <- frame.reverse do releaseValue(ty, v)
+
+    // **Snapshot first, and it is load-bearing.** A deferred statement is emitted by `genStmt`, and
+    // one containing an `if` or a `match` pushes and pops the very stacks this is walking — so the
+    // scopes must be fixed before any of them runs. A lazy pairing here would read `owned` back
+    // mid-walk and skip the releases of whatever it had moved past, which leaks rather than fails.
+    val scopes = owned.zip(deferrals)
+
     // Outward, one scope at a time, each running what it deferred before giving up its counts — so
     // a statement deferred in an inner block still sees the outer block's locals, which are let go
     // only once the scope that owns them is itself being left.
-    for (scope, ds) <- owned.zip(deferrals) do
+    for (scope, ds) <- scopes do
       runDeferrals(ds)
       for (slot, ty) <- scope.reverse do
         val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
@@ -406,10 +413,13 @@ trait ArcEmitter extends Emitter {
    */
   protected def releaseToDepth(ownedDepth: Int, tempDepth: Int): Unit = {
     for frame <- tempStack.take(tempStack.length - tempDepth); (v, ty) <- frame.reverse do releaseValue(ty, v)
-    // `zip` needs no matching `take`: the two stacks are the same length, so pairing the bounded
-    // one against the whole of the other stops where the bound does, and the pairs still line up
-    // because both are innermost-first.
-    for (scope, ds) <- owned.take(owned.length - ownedDepth).zip(deferrals) do
+
+    // Snapshotted before anything runs, for `releaseAll`'s reason. `zip` needs no matching `take`:
+    // the two stacks are the same length, so pairing the bounded one against the whole of the other
+    // stops where the bound does, and the pairs still line up because both are innermost-first.
+    val scopes = owned.take(owned.length - ownedDepth).zip(deferrals)
+
+    for (scope, ds) <- scopes do
       runDeferrals(ds)
       for (slot, ty) <- scope.reverse do
         val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $slot")
