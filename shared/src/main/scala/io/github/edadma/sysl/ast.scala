@@ -65,6 +65,28 @@ case class RangeExpr(lo: Option[Expr], hi: Option[Expr], inclusive: Boolean) ext
 case class Assign(op: String, target: Expr, value: Expr) extends Expr
 
 case class Call(callee: Expr, args: List[Expr]) extends Expr
+
+/** `name = value` at a call — the argument stands at the parameter it names rather than at the one
+ * its position would have given it (`12 §2a`).
+ *
+ * It is an `Expr` so that it travels in `Call.args` beside the positional arguments it is mixed
+ * with, and every call form binds its arguments before looking at any of them. Reaching
+ * `analyzeExpr` means it was written somewhere no declaration is being called, which is what the
+ * arm there reports.
+ */
+case class NamedArg(name: String, value: Expr) extends Expr
+
+/** A parameter's default, spliced in at a call that left the argument out (`12 §2a`).
+ *
+ * Synthesized by argument binding and never parsed, so it carries the position of the default as
+ * written rather than one of its own.
+ *
+ * `owner` is the key of the declaration the default was written in, and is the scope it is analyzed
+ * under: a default names what its own file names, wherever it is called from. It is absent for a
+ * **nested** function, whose declaration has no key of its own and whose every call is inside the
+ * body it was written in — so the scope already in force is the one it was written in.
+ */
+case class DefaultArg(owner: Option[String], value: Expr) extends Expr
 case class Index(receiver: Expr, index: Expr)   extends Expr
 case class Field(receiver: Expr, name: String)  extends Expr
 
@@ -270,8 +292,17 @@ case class BoundRef(name: String, args: List[TypeRef] = Nil) extends Positioned 
  * `vis` is a **field's** — how far the field may be read from (`08 § Visibility`). A function
  * parameter is named by nobody outside the signature it is written in, so it carries the unmarked
  * default and the grammar gives it no place to write anything else.
+ *
+ * `default` is a **parameter's** — the value a call that leaves the argument out stands there
+ * instead (`12 §2a`). It is the mirror image of `vis`: a field declares none, and the grammar gives
+ * a field no place to write one, because what a field falls back to is a different question (`07`).
  */
-case class Param(name: String, typ: TypeRef, vis: Visibility = Visibility.Public) extends Positioned
+case class Param(
+    name: String,
+    typ: TypeRef,
+    vis: Visibility = Visibility.Public,
+    default: Option[Expr] = None,
+) extends Positioned
 
 /** How an instance member takes its receiver — the memory-mode sigil written before `self`.
  * A property receiver is implicit and not spelled, so it is absent here (a property carries no

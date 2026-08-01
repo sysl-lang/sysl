@@ -457,9 +457,11 @@ arity.
    function, so one inside a loop does not grow the stack per iteration), but there is no
    SSA/`phi` construction — `if`/`match` values route through a stack slot.
 4. **Functions are keyword-less with mandatory `(params)`.** Parameterless functions
-   (`name -> T`), inner `def`, default arguments, and the pure/effect (`def` vs plain)
-   distinction are all deferred. The keyword-less form is disambiguated from a call by the
-   typed parameter list and a following body.
+   (`name -> T`), inner `def`, and the pure/effect (`def` vs plain) distinction are deferred.
+   ~~default arguments~~ are built (`12 §2a`), together with calling by name; both are resolved in
+   the analyzer, which fills the gaps and reorders the list, so a call reaches the emitter already
+   positional and complete and nothing here changed. The keyword-less form is disambiguated from a
+   call by the typed parameter list and a following body.
 5. **Reference counting is emitted where it is obviously needed, and nowhere elided.** Every
    named slot takes a count and gives it back; every temporary is released when its statement
    or branch ends; every function retains its parameters and returns a count already taken.

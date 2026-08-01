@@ -16,6 +16,23 @@ trait DeclParser extends ExprParser {
   protected lazy val param: Parser[Param] =
     at(ident ~ (op(":") ~> typeRef) ^^ { case n ~ t => Param(n, t) })
 
+  /** A function's parameter, which unlike a struct's field may say what a call that leaves it out
+   * gets instead (`12 §2a`). The default is a full `expression`, so a call, a conditional, or
+   * anything else that yields a value may stand there; whether it *may* — a suffix, naming nothing
+   * local, reaching as far as the declaration does — is the analyzer's, since all three are
+   * questions about meaning rather than about shape.
+   */
+  protected lazy val funcParam: Parser[Param] =
+    at(param ~ opt(op("=") ~> expression) ^^ { case p ~ d => p.copy(default = d) })
+
+  /** A struct's field, which has no default to declare. Said here rather than left to the
+   * "newline expected" a grammar with no place for one would give, because `= v` after a field is a
+   * reasonable thing to try and the reason it is refused is not guessable from the failure.
+   */
+  protected lazy val fieldParam: Parser[Param] =
+    param <~ (op("=") ~> err("a field declares no default — what an unwritten field gets is decided " +
+      "by the constructor that builds the value, not by the field") | success(()))
+
   /** A function declaration, Scala-style but keyword-less: `name[T…](params) -> ret = expr` or
    * a block body, `-> ret` optional (absent ⇒ `unit`). It is tried before an expression
    * statement; a bare call `foo(1)` fails here (its arguments are not `name: type` bindings,
@@ -81,7 +98,7 @@ trait DeclParser extends ExprParser {
     op("...") ^^^ (Nil, true) |
       // The variadic marker is tried before the trailing comma, so `f(a: int, ...)` still reads the
       // comma as the separator it is; `f(a: int,)` falls through to the trailing-comma case.
-      repsep(param, op(",")) ~ opt(op(",") ~> op("...")) <~ opt(op(",")) ^^ { case ps ~ dots =>
+      repsep(funcParam, op(",")) ~ opt(op(",") ~> op("...")) <~ opt(op(",")) ^^ { case ps ~ dots =>
         (ps, dots.isDefined)
       }
 
@@ -123,7 +140,7 @@ trait DeclParser extends ExprParser {
   private lazy val structItem: Parser[StructPart] =
     restrictedMember ^^ (StructPart.Mem(_)) |
       invariantClause ^^ (StructPart.Inv(_)) |
-      visibility ~ param ^^ { case v ~ f => StructPart.Fld(f.copy(vis = v).setPos(f.pos)) }
+      visibility ~ fieldParam ^^ { case v ~ f => StructPart.Fld(f.copy(vis = v).setPos(f.pos)) }
 
   /** A member of a type's own body, which is the one kind that may say how far it is visible. */
   protected lazy val restrictedMember: PackratParser[MethodDecl] =
@@ -192,7 +209,7 @@ trait DeclParser extends ExprParser {
    * as the separators they are.
    */
   protected lazy val methodParams: Parser[(Option[RecvMode], List[Param], Boolean)] =
-    receiver ~ rep(op(",") ~> param) ~ opt(op(",") ~> op("...")) <~ opt(op(",")) ^^ {
+    receiver ~ rep(op(",") ~> funcParam) ~ opt(op(",") ~> op("...")) <~ opt(op(",")) ^^ {
       case r ~ ps ~ dots => (Some(r), ps, dots.isDefined)
     } |
       paramList ^^ { case (ps, variadic) => (None, ps, variadic) }
@@ -228,7 +245,7 @@ trait DeclParser extends ExprParser {
 
   protected lazy val enumVariant: Parser[EnumVariantDecl] =
     at(
-      ident ~ (op("(") ~> commaList(param) <~ op(")")) ^^ { case n ~ fs => EnumVariantDecl(n, None, fs) } |
+      ident ~ (op("(") ~> commaList(fieldParam) <~ op(")")) ^^ { case n ~ fs => EnumVariantDecl(n, None, fs) } |
         ident ~ (op("=") ~> expression) ^^ { case n ~ v => EnumVariantDecl(n, Some(v), Nil) } |
         ident ^^ (n => EnumVariantDecl(n, None, Nil)),
     )

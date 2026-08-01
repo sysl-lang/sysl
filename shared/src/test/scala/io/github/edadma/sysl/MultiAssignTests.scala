@@ -434,11 +434,22 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
       progError("if a, b = 1, 2\n    print(1)") should not be empty
     }
 
-    // A comma is already a separator in an argument list and assignment is already an expression,
-    // so `print(a, b = 1, 2)` is three arguments and not a multiple assignment. That is the reason
-    // the form commits only at statement level: below one, the comma always means something else.
+    // A comma is already a separator in an argument list, so `print(a, b = 1, 2)` is three arguments
+    // and not a multiple assignment. That is the reason the form commits only at statement level:
+    // below one, the comma always means something else.
+    //
+    // What the middle argument *is* changed with `12 §2a`: `b = 1` at a call is now the named
+    // argument it reads as, not the assignment it used to be. That is a decision about the call and
+    // not about this form, which is why the count is what matters here — three arguments either way.
     "a comma below statement level goes on meaning what it meant" in {
       prog("print(a, b = 1, 2)") shouldBe
+        List(printStmt(Ident("a"), NamedArg("b", i(1)), i(2)))
+    }
+
+    // And the escape from that collision, which belongs beside it: parentheses make the store a
+    // store again, so the reading this test used to pin is still reachable and still one argument.
+    "and a parenthesized one is the assignment it always was" in {
+      prog("print(a, (b = 1), 2)") shouldBe
         List(printStmt(Ident("a"), Assign("=", Ident("b"), i(1)), i(2)))
     }
 

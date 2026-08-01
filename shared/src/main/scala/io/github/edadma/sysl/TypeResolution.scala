@@ -686,7 +686,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
    */
   protected def foreignVaByValue(e: ExternDecl): Set[Int] =
     e.params.zipWithIndex.collect {
-      case (Param(_, NamedType(n, Nil), _), i) if scalarType(n).contains(Type.VaList) => i
+      case (Param(_, NamedType(n, Nil), _, _), i) if scalarType(n).contains(Type.VaList) => i
     }.toSet
 
 }

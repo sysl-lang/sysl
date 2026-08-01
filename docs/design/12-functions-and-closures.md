@@ -219,6 +219,104 @@ are the by-value / by-pointer / by-reference choices spelled with the mode sigil
 parameter makes the identical choice with the identical spelling. One rule covers receivers and
 parameters both.
 
+## 2a. A default value, and calling by name
+
+There are two things a call may leave to the declaration: an argument's **value**, where the
+parameter names one to fall back on, and an argument's **position**, where the call names the
+parameter instead.
+
+```
+open(path: string, mode: int = 0o644, append: bool = false) -> int
+
+open("log")                                   // both defaults taken
+open("log", 0o600)                            // the first written, the second taken
+open("log", append = true)                    // the second written by name, the first taken
+open(append = true, path = "log")             // both by name, in neither's declared order
+```
+
+### A default is a suffix, and it is written in the declaration's terms
+
+**A parameter with no default may not come after one that has.** Arguments are written in order, so
+nothing could leave out the earlier one and still supply the later — the identical sentence `10 §3`
+writes about a *type* parameter's default, holding for the identical reason. One rule, two argument
+lists.
+
+**A default is an expression and it is evaluated at the call**, standing exactly where the argument
+would have been written. So a default of `now()` is a fresh call per call site rather than one value
+computed once and shared, which is the only reading under which defaulting to something that
+allocates is safe.
+
+What it is analyzed *in* is the **declaration's** scope, not the caller's: a default names what the
+function's own file names, so one that reaches a helper keeps reaching that helper when called from
+a module which has never heard of it. And it sees **nothing local** — not the caller's variables, and
+not the function's own parameters. `f(n: int, xs: []int = zeros(n))` is refused rather than quietly
+finding some `n` at the call site: the parameters are bound by the very call being assembled, and a
+default that read one would fix an evaluation order among arguments that nothing else in the language
+fixes.
+
+**A default is exposed, so `13 §2` applies** — a declaration may not be more visible than what it
+names. A public function whose default calls a private one has published a call its callers can
+neither write nor see. The parameter's *type* was already covered by that rule; its default is the
+same kind of promise, made in the same place, and read by the same callers.
+
+### Where a default may not go
+
+- **A variadic parameter list takes none.** C reads a variadic call's tail relative to the last named
+  argument (§9), and a default makes *where the tail starts* a question the call cannot answer — one
+  argument that might be the last declared parameter or might be the first of the tail.
+- **An `impl` block's member takes none.** A call through a trait object holds something that has
+  forgotten which type it is (`02`), so there is no implementation to read a default off. The
+  **trait's** declaration is what such a call names, and that is where the default belongs — filled
+  before the dispatch, so it means the same thing through an object as through a known type.
+- **A closure takes none.** An arrow's parameters are matched through the `Fn` trait (§6), which
+  carries types and no names; there is nothing at that call to read a default out of, which is the
+  same absence that stops a closure being called by name.
+- **A `#test` function takes none, because it takes no parameters at all** (`testing.md`). A default
+  looks as though it should rescue that — every parameter would have a value, so the runner's call
+  could be written with none — and it does not, because that call is *emitted* rather than analyzed.
+  Nothing fills a default there, and a signature the runner cannot satisfy is refused whether or not
+  a value was written beside it.
+
+**And a default may not lead back to the argument it is filling.** `f(n: int = f())` asks for the
+default in order to produce the default, and each arrival is a call that left the argument out, so
+it would fill forever — the same refusal `10 §3` makes at the type level, made at the other argument
+list. It reaches through several declarations too: two functions defaulting to each other are one
+cycle written twice. What is refused is the *filling*, not the recursion, so an ordinary recursive
+function whose default is something else is untouched.
+
+### Calling by name
+
+**An argument may name the parameter it stands at**, and its position then means nothing:
+`open(append = true, path = "log")` is `open("log", 0o644, true)`. The rules are the ones the shape
+forces.
+
+- **Every positional argument comes before the first named one.** Once a name has been written, which
+  parameter a bare expression would stand at has no answer worth guessing at, and writing its name is
+  the fix.
+- **A parameter may be given once.** Naming one that a positional argument already filled is refused,
+  and so is naming one twice.
+- **A name has to be one the declaration wrote.** A misspelling is caught here rather than read as
+  something else.
+
+**This works wherever the call has a declaration to read names off**: a function, an `extern`, a
+method, an associated function, and a **struct's or a variant's constructor**, whose fields are named
+parameters like any other. It does not work through a `&Fn` object or a `*extern(A) -> R` (§6a) —
+both are a signature of types with no names, so a call through one has nothing to match a name
+against, and that is said rather than left to a confusing "no such parameter".
+
+A constructor therefore takes names but no defaults: a field *has* a name, and a field declares no
+default, which is `07`'s question rather than this chapter's.
+
+### `f(x = 1)` is a named argument, and is no longer an assignment
+
+Assignment is an expression in sysl — `x = 1` yields the value stored — so before this feature
+`f(x = 1)` was a call passing the result of a store to `x`. **The named argument wins.** Every
+language that spells a named argument this way makes the same trade and it is the right one: the
+store-and-pass reading is a C idiom nobody reaches for on purpose, while a named argument is read at
+every call that uses one. Where the store really is meant, parentheses say so — `f((x = 1))` — and a
+name matching no parameter is *refused* rather than quietly falling back on the old reading, so no
+existing call changes meaning without being told.
+
 ## 3. `return`, and the trailing-expression result
 
 A function yields a value two ways, and they compose:

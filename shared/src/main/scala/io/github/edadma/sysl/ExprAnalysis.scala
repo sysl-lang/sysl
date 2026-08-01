@@ -445,6 +445,19 @@ trait ExprAnalysis
 
       compareChain(ts, ops.indices.map(i => compareLink(ops(i), ts(i), ts(i + 1))).toList)
 
+    // A parameter's default, spliced in where the argument was not written (`12 §2a`). It is
+    // analyzed in the declaration's own terms and with nothing local in scope, which is what makes
+    // it mean the same thing from every module that calls the function.
+    case DefaultArg(owner, e) =>
+      at(e.pos)(filling(e.pos)(inDefault(owner)(analyzeExpr(e, expected))))
+
+    // Argument binding replaces every one of these before a call's arguments are looked at, so one
+    // arriving here was written where nothing is being called by name — in an array literal, on the
+    // right of an operator, or at a call through something that carries no parameter names.
+    case NamedArg(name, _) =>
+      err(s"'$name = …' names an argument, and this is not a call to a declaration that names its " +
+        s"parameters — write the value on its own, or '($name = …)' for the assignment")
+
     // `b[i] = v` on a type with no elements of its own is `IndexSet`, and it is a call rather than a
     // store because a trait's method gives back a value and never an address — so there is no place
     // for the ordinary path to write through, and the trait says as much by taking the value.

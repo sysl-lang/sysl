@@ -15,7 +15,7 @@ package io.github.edadma.sysl
  * right. `probe` is what makes that recoverable — an attempt that fails leaves no diagnostic behind,
  * so an overload set can be tried without the failures reaching the programmer.
  */
-trait CallCore extends Literals with TraitObjects {
+trait CallCore extends Literals with TraitObjects with ArgumentBinding {
 
   /** Producing the receiver a method's `self` sigil asked for — by value, by address, or by
    * reference. Supplied by `CallAnalysis`, which is mixed in last: it is the one step every route to
@@ -173,12 +173,16 @@ trait CallCore extends Literals with TraitObjects {
     case _: Type.Floating => TFloatLit("0x0p+0", ty)
     case _                => TIntLit(0, ty)
 
-  protected def callFunction(f: FuncDecl, args: List[Expr], expected: Option[Type]): TExpr = {
+  protected def callFunction(f: FuncDecl, written: List[Expr], expected: Option[Type]): TExpr = {
     // A variadic callee — foreign or sysl's own — fixes only where its declared parameters stop;
     // everything after them is the tail, checked by the rule below rather than against a parameter.
     val variadic = f.variadic
 
     val shown = qn(f.name)
+
+    // Names placed and defaults filled before anything else reads the list, so everything below —
+    // the arity check, the generic solve, `checkArgs` — sees the call written out in full.
+    val args = bindArgs(s"function '$shown'", Some(f.name), f.params, written, variadic)
 
     // A `#test` function has one caller and it is not in the program (`testing.md`). Every build but
     // `sysl test` drops it, so a call would compile and then fail at the *link*, naming a symbol
