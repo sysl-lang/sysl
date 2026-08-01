@@ -97,17 +97,49 @@ object Toolchain {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    // An archive goes on the command line after the module that calls into it, which is what the
-    // linker's left-to-right scan wants: a member is pulled in to resolve a symbol already undefined,
-    // so an archive listed first would be scanned before anything needed it and contribute nothing.
-    val result = exec(
-      List("clang", s"--target=${target.triple}", "-Wno-override-module") ::: deadStrip(target) :::
-        List(ll) ::: archives ::: List("-o", exe))
+    val result = exec(linkCommand(ll, archives, exe, target))
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())
     else Left(s"clang failed (exit ${result.exitCode}):\n${result.stderr.trim}")
   }
+
+  /** The whole of what is handed to the driver to link one program, as a list, so that what a target
+   * decides about it can be asserted without a machine of that kind to link on.
+   *
+   * The order is the linker's and not a style: an archive goes **after** the module that calls into
+   * it, because the scan is left to right and a member is pulled in only to resolve a symbol already
+   * undefined — an archive listed first would be scanned before anything needed it and contribute
+   * nothing. The system libraries go after both for exactly the same reason, since the library's own
+   * object is one of the things that calls them.
+   */
+  private[sysl] def linkCommand(ll: String, archives: List[String], exe: String,
+                                target: Target): List[String] =
+    List("clang", s"--target=${target.triple}", "-Wno-override-module") ::: deadStrip(target) :::
+      List(ll) ::: archives ::: systemLibraries(target) ::: List("-o", exe)
+
+  /** The system libraries a program is linked against beyond the ones the driver passes itself.
+   *
+   * There is one, and it is the mathematics: `sysl.math` binds libm, and **where libm lives is a
+   * property of the host rather than of the library**. A Darwin program gets it from `libSystem`,
+   * which the driver already links, and a Windows one from the CRT; a program hosted on ELF has to
+   * say `-lm`, and until it did, every float program built for Linux failed at the link naming
+   * `sqrt` — while the same program built on a Mac linked and ran. That is the worst shape a
+   * portability bug can have, because the machine that finds it is not the machine that is being
+   * developed on.
+   *
+   * Freestanding gets nothing, and that is the case the `Os` match is written for rather than a
+   * default falling out of it: there is no libc on a bare target, so `-lm` there would fail the link
+   * of a kernel that never asked for mathematics.
+   *
+   * **This is the fixed part of a question `15 § Open c` answers in general.** A module of externs
+   * should be able to say which library resolves them, and when it can, this becomes what the
+   * standard module's own directive says rather than a list the driver carries.
+   */
+  private[sysl] def systemLibraries(target: Target): List[String] =
+    target.os match
+      case Os.Linux                                  => List("-lm")
+      case Os.MacOS | Os.Windows | Os.Freestanding   => Nil
 
   /** Ask the linker to drop what nothing reaches.
    *

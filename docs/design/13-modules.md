@@ -1132,9 +1132,31 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   failed everything with nothing to bisect. Thirteen surfaces crossed in that order, and the
   mechanism was deleted once the last one had.
 
-  The pressure is real and predates the mechanism: the first program to want mathematics found none
-  — `guide/fft` declares `sin`, `cos` and `sqrt` as C externs of its own and writes its own absolute
-  value, and every float program after it would do the same.
+  The pressure was real and predated the mechanism: the first program to want mathematics found none
+  — `guide/fft` declared `sin`, `cos` and `sqrt` as C externs of its own and wrote its own absolute
+  value, and every float program after it would have done the same. **`sysl.math` answers that one,
+  and what it settles is bigger than the functions in it.** A module of free functions could not have
+  worked: there is no overloading (`12` §1), so `sqrt` over binary64 and `sqrt` over binary32 would
+  have needed two names and every caller would have had to track which width it was holding. What the
+  module ships instead is a **trait implemented for the built-in float types**, which `02` allows for
+  exactly this reason — so `x.sqrt()` is the same three words at either width, and the widths are told
+  apart by the receiver rather than by the caller.
+
+  That shape draws a line the rest of the standard library can be built along. A trait member whose
+  result C computes is *required* of each width and binds to that width's libm entry point; a member
+  that is arithmetic over the others is a **default**, written once and inherited by both. So the
+  logarithm in an arbitrary base exists in one place, and a third floating-point width would be
+  bindings and no new mathematics. The C declarations themselves are in `sysl.sys` with the rest of
+  what the library asks of its host, so the surface a freestanding target would have to supply is one
+  file.
+
+  **It also shows what an import does and does not gate, which is not one answer.** A *name* in a
+  submodule has to be asked for — `pi`, `min` and `nan` all need the import, which is §1's rule and
+  the reason `sysl.math` is a submodule. A **member** does not: §2 puts an `impl` outside the
+  visibility rule in both directions, so implementing the trait for `real` files those methods under
+  `real`'s owner key and a program reaches them wherever it holds a float. Adding a submodule of
+  methods on a built-in therefore widens what every program can call without any program importing
+  anything, and whether that is the wanted answer is (b)'s question asked from the other side.
 
   What was wrong with growing a *prelude* instead is worth keeping, because it is the constraint on
   the answer: a prelude declaration is one every program carries a **layout** for whether or not it is
@@ -1153,8 +1175,8 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   that the library can have workings that are not a public surface at all, is (c); `private[sysl]` on
   each declaration reaches the same place today, one declaration at a time.
 
-  **Five modules in, one boundary case decided the shape of the rule.** `sysl.sys`, `sysl.buf`,
-  `sysl.text`, `sysl.io` and `sysl.args` all fell out of "does the language reach it". The
+  **Six modules in, one boundary case decided the shape of the rule.** `sysl.sys`, `sysl.buf`,
+  `sysl.text`, `sysl.io`, `sysl.args` and `sysl.math` all fell out of "does the language reach it". The
   `display_*` renderers do not: no desugaring names one, so the letter of the rule puts them in a
   `sysl.fmt` — and the split was *tried*, works, and needs nothing else to move once the tuple rows
   go with it, `13 §6` notwithstanding. They stay in `sysl` anyway, and the reason sharpens the rule
