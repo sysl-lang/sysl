@@ -127,6 +127,49 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       out should contain("sane")
     }
 
+    // A deferred call is written where the block is and runs where the block ends, so the only thing
+    // naming it is the `TDefer` the body carries. Nothing in the walk has a case for that node — the
+    // descent follows it by shape — which is exactly why it is worth a test: the shape descent is a
+    // promise about nodes added later, and a promise nothing measures is one nobody would miss.
+    "a function reached only from a 'defer' is emitted" in {
+      val out = defined("""bye() -> unit = print("bye")
+                          |main() -> unit =
+                          |    defer bye()
+                          |    print("hi")
+                          |""".stripMargin)
+
+      out should contain("bye")
+    }
+
+    "and it runs, in the order a deferred call runs in" in {
+      run("""bye() -> unit = print("bye")
+            |main() -> unit =
+            |    defer bye()
+            |    print("hi")
+            |""".stripMargin) shouldBe "hi\nbye\n"
+    }
+
+    // A default is produced afresh at each call that omits it, so a function named only there is
+    // reached through the call site rather than through anything the declaration emits — the same
+    // shape-descent promise as `defer`, one node kind over.
+    "a function reached only from a default parameter value is emitted" in {
+      val out = defined("""seed() -> int = 41
+                          |takes(n: int = seed() + 1) -> int = n
+                          |print(takes())
+                          |""".stripMargin)
+
+      out should contain("seed")
+    }
+
+    "and it is dropped when every call supplies the argument" in {
+      val out = defined("""seed() -> int = 41
+                          |takes(n: int = seed() + 1) -> int = n
+                          |print(takes(7))
+                          |""".stripMargin)
+
+      out should not contain "seed"
+    }
+
     // A method table is a constant the program reads a function pointer out of, so what it points at
     // is reachable however little can be proved about the call.
     "a method reached only through a trait object is emitted" in {
