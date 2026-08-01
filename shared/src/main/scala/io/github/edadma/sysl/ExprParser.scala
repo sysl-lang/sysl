@@ -352,12 +352,19 @@ trait ExprParser extends SyslParserBase {
    *
    * The embedded text is its own little source, so a position inside a hole points into the hole
    * rather than into an unrelated column of the line the string sits on.
+   *
+   * **A hole is therefore a placeholder boundary** (`12 §5c`), and it has to be: the sub-parser
+   * numbers placeholders from zero, so a `_` in a hole and a `_` outside the string would both be
+   * `$ph1` and the lift would build a parameter list naming one thing twice. Closing the hole makes
+   * that unreachable rather than unlikely, since a lifted closure's names never join the outer
+   * tree's free set. What it costs is that a placeholder cannot reach out of a string to close over
+   * the whole of one — the arrow form outside the string is how that is written.
    */
   protected def parseEmbedded(src: String): Either[String, Expr] = {
     val sub = new SyslParser(Source(s"${source.name} (interpolation)", src))
 
     sub.parseExpression match
-      case sub.Success(e, _) => Right(e)
+      case sub.Success(e, _) => Right(Placeholders.lift(e))
       case ns: sub.NoSuccess => Left(s"in interpolation '$src': ${ns.msg}")
   }
 

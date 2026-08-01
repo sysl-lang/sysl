@@ -225,5 +225,111 @@ class PlaceholderTests extends AnyFreeSpec with RunSupport with CodegenSupport {
                     |print(apply(_ + base, 5))
                     |""".stripMargin) shouldBe "105\n"
     }
+
+    // `§8` decides representation by escape, and a returned closure is the escaping case — a
+    // different mechanism from the one every test above takes, so passing there is no evidence
+    // about passing here.
+    "including the escaping representation, where the closure outlives the body that made it" in {
+      run("""adder(n: int) -> &Fn(int) -> int = _ + n
+            |
+            |var add40 = adder(40)
+            |print(add40(2))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // `§2a`'s default is produced afresh at each call that omits it, and a closure written there
+    // is refused for having nothing to infer from — the parameter's own declared type is not
+    // pushed into its default. **This is not about placeholders**: the arrow form beside it is
+    // refused the same way, which is what says the gap is `§2a`'s and not `§5c`'s. Both are
+    // asserted so that whichever is fixed cannot quietly leave the other behind.
+    "but not a default parameter value, where nothing pushes the parameter's type into it" in {
+      err("""go(x: int, f: int -> int = _ * 2) -> int = f(x)
+            |print(go(21))
+            |""".stripMargin) should include("this '_' has no type here")
+    }
+
+    "which is the arrow form's answer there too, so the gap is the default's and not the placeholder's" in {
+      err("""go(x: int, f: int -> int = y -> y * 2) -> int = f(x)
+            |print(go(21))
+            |""".stripMargin) should include("'y' has no type here")
+    }
+
+    "though an argument that is written out still reaches the parameter" in {
+      run("""go(x: int, f: int -> int) -> int = f(x)
+            |print(go(21, _ * 2))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // `§5a`'s nested function is the one place a callable is not a closure literal, so its body is
+    // worth asking about separately.
+    "and inside a nested function's body" in {
+      run(apply + """outer(x: int) -> int
+                    |    inner(n: int) -> int = apply(_ + n, x)
+                    |    inner(2)
+                    |
+                    |print(outer(40))
+                    |""".stripMargin) shouldBe "42\n"
+    }
+  }
+
+  "the edge cases, each of which compiles under a rule that is not the one written" - {
+
+    // Two placeholders in one expression that belong to *different* closures, because an inner
+    // argument closed one of them. A lift that collected them together would give the outer
+    // closure two parameters and the inner none.
+    "two closures in one expression, each taking the placeholder nearest it" in {
+      run(apply + "print(apply(_ + apply(_ * 10, 3), 5))\n") shouldBe "35\n"
+    }
+
+    // A closure literal is not callable where it stands, so a partial application has to be bound
+    // before it is called. The arrow form beside it is refused identically, which is what says
+    // this is `§5`'s limit on a literal callee rather than anything the placeholder introduced.
+    "a partial application is bound before it is called, a literal callee being refused" in {
+      run("""sub(a: int, b: int) -> int = a - b
+            |
+            |var take3: &Fn(int) -> int = sub(_, 3)
+            |print(take3(10))
+            |""".stripMargin) shouldBe "7\n"
+    }
+
+    "and calling one where it stands is refused, as calling any closure literal is" in {
+      val placeholder = err("sub(a: int, b: int) -> int = a - b\nprint(sub(_, 3)(10))\n")
+      val arrow       = err("sub(a: int, b: int) -> int = a - b\nprint((x -> sub(x, 3))(10))\n")
+
+      placeholder should include("must be a name, or something whose type says it is callable")
+      arrow should include("must be a name, or something whose type says it is callable")
+    }
+
+    // The parentheses that delimit a tuple are the ones that end the closure, so the whole tuple
+    // is the body rather than each part being its own closure.
+    "a tuple in parentheses is lifted whole, not part by part" in {
+      run("""take(f: int -> (int, int), x: int) -> int
+            |    val t = f(x)
+            |    t.0 + t.1
+            |
+            |print(take((_ + 1, 2), 39))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
+    // A hole is its own little source with its own parser, so it is a boundary — otherwise a `_`
+    // inside one and a `_` outside the string are numbered from zero independently and the lift
+    // builds a parameter list naming one thing twice.
+    "an interpolation hole is a boundary, so a placeholder cannot close over the whole string" in {
+      err("""print(s"${_ + 1}")""" + "\n") should include("this '_' has no type here")
+    }
+
+    // The collision the boundary exists to prevent: the sub-parser numbers from zero, so without
+    // it this expression holds two placeholders both named `$ph1` and the lift builds a parameter
+    // list naming one thing twice — the outer one then reading the inner one's argument.
+    "and a placeholder outside a string is unaffected by a hole in the same expression" in {
+      run(apply + """print(apply(_ + 1, 5), s"${2 + 2}")""" + "\n") shouldBe "6 4\n"
+    }
+
+    // A placeholder standing alone as a statement is a closure of one parameter yielding it, with
+    // nothing to say what it takes — a refusal rather than a crash, which is the only thing the
+    // lift promises about a position nobody would write.
+    "a placeholder alone as a statement is refused rather than crashing" in {
+      err("_\n") should include("this '_' has no type here")
+    }
   }
 }

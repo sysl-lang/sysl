@@ -254,6 +254,14 @@ finding some `n` at the call site: the parameters are bound by the very call bei
 default that read one would fix an evaluation order among arguments that nothing else in the language
 fixes.
 
+**A closure literal is not yet one of the expressions a default may be**, though "standing exactly
+where the argument would have been written" says it should be: an argument there takes the
+parameter's declared type as what it is being used as, and a default does not, so `f: int -> int = y
+-> y * 2` is refused for having nothing to infer `y` from. The placeholder form `= _ * 2` is refused
+identically and for the same reason — this is a gap in what a default is analyzed *against*, not in
+either spelling of the closure. Written out at the call site both forms work. The fix is to expect
+the parameter's own type where the default is analyzed; nothing in this section has to change for it.
+
 **A default is exposed, so `13 §2` applies** — a declaration may not be more visible than what it
 names. A public function whose default calls a private one has published a call its callers can
 neither write nor see. The parameter's *type* was already covered by that rule; its default is the
