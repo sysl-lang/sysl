@@ -31,7 +31,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // that yields what it destructured has taken its own count by the time this runs.
     paths.release()
     emitTerm(s"br label %$endL")
-    paths.emitUnbinds()
+    paths.emitCleanups()
 
     elseBlock.foreach { eb =>
       emitLabel(elseL)
@@ -48,21 +48,22 @@ trait ControlFlowEmitter extends PlaceEmitter {
   }
 
   /** What emitting a condition left open: the owned scopes its `is` terms pushed for their
-   * bindings, and the blocks that give those bindings back on a path that failed *after* one had
-   * already been made.
+   * bindings, and the small blocks that sit on the edges leaving the chain part-way through.
    *
    * The two are separate because they run at different points. `release` closes the success path,
-   * where every binding was made and the branch has finished with them. `emitUnbinds` lays down one
-   * small block per binding term, each releasing that term's own slots and falling into the block
-   * for the term before it — so a chain that fails at its third term gives back exactly the two
-   * bindings its first two made, and a chain that fails at its first gives back nothing.
+   * where every binding was made and the branch has finished with them. `emitCleanups` lays down the
+   * blocks a failing term branches to, each giving back exactly what had been taken by the time
+   * control reached it and falling into the block for the term before it — so a chain that fails at
+   * its third term releases what its first two took, and a chain that fails at its first releases
+   * nothing.
    */
-  protected class CondPaths(scopes: Int, unbinds: List[(String, List[(String, Type)], String)]) {
-    def release(): Unit             = for _ <- 1 to scopes do popOwned()
-    def emitUnbinds(): Unit         =
-      for (label, slots, next) <- unbinds do
+  protected class CondPaths(scopes: Int, cleanups: List[(String, List[(String, Type)], Boolean, String)]) {
+    def release(): Unit = for _ <- 1 to scopes do popOwned()
+
+    def emitCleanups(): Unit =
+      for (label, held, slots, next) <- cleanups do
         emitLabel(label)
-        releaseSlots(slots)
+        if slots then releaseSlots(held) else releaseValues(held)
         emitTerm(s"br label %$next")
   }
 
@@ -81,11 +82,19 @@ trait ControlFlowEmitter extends PlaceEmitter {
    * A pattern's test and its bindings are separated for the reason `genMatch` separates them — the
    * test is a pure read, so a chain may run several before anything is committed to, and a failure
    * retains nothing it then has to hand back.
+   *
+   * **Every term borrows in a region of its own**, which is the discipline the short-circuit `&&`
+   * keeps and which flattening the chain would otherwise have thrown away: a later term's
+   * temporaries exist only on the edges that reached it, so releasing them anywhere the whole chain
+   * meets would release values the incoming path never made. A term that does not bind closes its
+   * region *before* it branches, so both of its edges are already clear; a term that binds cannot,
+   * having to retain out of the very value it is holding, so its failing edge gets a block that
+   * closes the region for it.
    */
   protected def genCond(terms: List[TCondTerm], successL: String, failL: String): CondPaths = {
-    var target  = failL
-    var scopes  = 0
-    var unbinds = List.empty[(String, List[(String, Type)], String)]
+    var target   = failL
+    var scopes   = 0
+    var cleanups = List.empty[(String, List[(String, Type)], Boolean, String)]
 
     for (term, i) <- terms.zipWithIndex do
       // The block a term hands control to when it holds: the branch's own entry for the last term,
@@ -98,9 +107,12 @@ trait ControlFlowEmitter extends PlaceEmitter {
             case TCondIs(_, List(pat), false) if bindsAny(pat) => freshLabel("cond.bind")
             case _                                             => freshLabel("cond.and")
 
+      pushTemps()
+
       term match
         case TCondTest(c) =>
           val v = genExpr(c)
+          popTemps()
           emitTerm(s"br i1 $v, label %$nextL, label %$target")
           emitLabel(nextL)
 
@@ -108,25 +120,43 @@ trait ControlFlowEmitter extends PlaceEmitter {
           val sv   = genExpr(subject)
           val held = pats.map(patternTest(_, sv)).reduce(orI1)
           val ok   = if negated then notI1(held) else held
-          emitTerm(s"br i1 $ok, label %$nextL, label %$target")
-          emitLabel(nextL)
 
           // A negated test binds nothing, and neither does a list of alternatives — the analyzer
-          // refused a pattern that tried in either position — so both leave the failure target where
-          // it was and need no scope.
-          if !negated && pats.length == 1 && bindsAny(pats.head) then
+          // refused a pattern that tried in either position — so both close their region here and
+          // leave the failure target where it was.
+          if negated || pats.length != 1 || !bindsAny(pats.head) then
+            popTemps()
+            emitTerm(s"br i1 $ok, label %$nextL, label %$target")
+            emitLabel(nextL)
+          else
+            // The bind retains out of the subject, so the subject has to still be held when it runs.
+            // That puts the release after the branch on the taken edge, and in a block of its own on
+            // the other.
+            val borrowed = tempsHere
+            val onFail =
+              if borrowed.isEmpty then target
+              else
+                val l = freshLabel("cond.drop")
+                cleanups ::= (l, borrowed, false, target)
+                l
+
+            emitTerm(s"br i1 $ok, label %$nextL, label %$onFail")
+            emitLabel(nextL)
             pushOwned()
             patternBind(pats.head, sv)
             scopes += 1
+            popTemps()
+
             // Only a binding that holds a count has anything to give back; the rest of the chain can
-            // keep failing straight to where it was already going.
+            // keep failing straight to where it was already going. Its region is closed by then, so
+            // this block owes the bindings alone.
             val slots = ownedHere
             if slots.nonEmpty then
               val unbindL = freshLabel("cond.unbind")
-              unbinds ::= (unbindL, slots, target)
+              cleanups ::= (unbindL, slots, true, target)
               target = unbindL
 
-    new CondPaths(scopes, unbinds)
+    new CondPaths(scopes, cleanups)
   }
 
   /** Feeds one branch's value into the merge slot. A branch that does not finish — one that aborts
@@ -301,24 +331,18 @@ trait ControlFlowEmitter extends PlaceEmitter {
     val TWhile(cond, body, elseBlock, ty) = w
     val condL = freshLabel("while.cond")
     val bodyL = freshLabel("while.body")
-    val doneL = freshLabel("while.done")
     val endL  = freshLabel("while.end")
     val elseL = if elseBlock.isDefined then freshLabel("while.else") else endL
     val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    // Recorded before the condition's bindings, so a `break` or a `continue` from the body unwinds
+    // the round's bindings along with the body's own scope. The condition's *borrowing* is not the
+    // loop's to unwind: each term closes its own region (`genCond`), so by the time the body runs
+    // there is nothing of the test left outstanding.
+    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
 
     emitTerm(s"br label %$condL")
     emitLabel(condL)
-    // The condition is re-evaluated every iteration, so whatever it borrows is let go rather than
-    // accumulating in the enclosing statement's region. Both edges out of the test do it — the body,
-    // once the bindings have taken their own counts, and the exhausted path with nothing taken.
-    pushTemps()
-    // Recorded **after** that frame and **before** the condition's bindings, which is what makes a
-    // `break` or a `continue` unwind exactly what is still owed. The bindings are owed, so the owned
-    // depth is from below them. The condition's temporaries are not: the body was reached through
-    // the `releaseTemps` below, so a `break` that released them again would free them twice.
-    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
-    val paths = genCond(cond, bodyL, doneL)
-    releaseTemps()
+    val paths = genCond(cond, bodyL, elseL)
     pushOwned()
     body.foreach(genStmt)
     popOwned()
@@ -326,12 +350,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
     // next round's test, so nothing accumulates across a loop that runs a million times.
     paths.release()
     emitTerm(s"br label %$condL")
-    paths.emitUnbinds()
-
-    emitLabel(doneL)
-    releaseTemps()
-    dropTemps()
-    emitTerm(s"br label %$elseL")
+    paths.emitCleanups()
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)

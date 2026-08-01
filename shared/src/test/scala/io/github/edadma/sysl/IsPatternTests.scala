@@ -400,6 +400,58 @@ class IsPatternTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  "each term of a chain borrows in a region of its own" - {
+
+    // **No `is` here at all**, and that is the point. Flattening the `&&` chain took every condition
+    // in the language off the short-circuit path, and with it the per-branch temp region that path
+    // keeps: a second term's borrowed reference exists only on the edge that reached it, so giving
+    // it back anywhere the whole chain meets is a release of something the incoming path never made.
+    // It fails as invalid IR — "instruction does not dominate all uses" — rather than as a wrong
+    // answer, so a plain `&&` over a borrowing right-hand side is the shape worth pinning.
+    "an ordinary && whose right term borrows, and whose left term is false" in {
+      run("""struct Node
+            |    n: int
+            |
+            |make(i: int) -> &Node = Node(i)
+            |
+            |var gate = false
+            |if gate && make(1).n > 0 then print("yes") else print("no")
+            |""".stripMargin) shouldBe "no\n"
+    }
+
+    "the same in a while, whose test runs the short-circuiting edge every round" in {
+      run("""struct Node
+            |    n: int
+            |
+            |make(i: int) -> &Node = Node(i)
+            |
+            |var i = 0
+            |while i < 400 && make(i).n >= 0
+            |    i += 1
+            |print(i)
+            |""".stripMargin) shouldBe "400\n"
+    }
+
+    // The `is` version of the same thing: the second term's subject is a borrowed value, and it is
+    // only reached when the first matched. Run enough times that a leak or a double free is not a
+    // coin flip.
+    "an is term whose subject borrows, reached only when the term before it held" in {
+      run("""struct Node
+            |    n: int
+            |
+            |lookup(i: int) -> Option[&Node]
+            |    if i % 3 == 0 then Some(Node(i)) else None
+            |
+            |var i = 0
+            |var hits = 0
+            |while i < 600
+            |    if lookup(i) is Some(a) && lookup(a.n + 3) is Some(b) then hits += b.n - a.n
+            |    i += 1
+            |print(hits)
+            |""".stripMargin) shouldBe "600\n"
+    }
+  }
+
   "the shape of what is emitted" - {
 
     // A condition with no `is` in it must generate what it generated before the feature existed:

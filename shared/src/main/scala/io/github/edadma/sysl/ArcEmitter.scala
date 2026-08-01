@@ -326,7 +326,16 @@ trait ArcEmitter extends Emitter {
    * to let go for itself. An iterating loop is the case: what `next` gave back is released on the
    * way into the body and again on the way out of the loop, and those are different blocks.
    */
-  protected def releaseTemps(): Unit = for (v, ty) <- tempStack.head.reverse do releaseValue(ty, v)
+  protected def releaseTemps(): Unit = releaseValues(tempsHere)
+
+  /** What the innermost temp region holds, for an edge that has to give those counts back somewhere
+   * other than where the region is closed — a condition term that branches before it can release,
+   * because the branch it guards retains out of the very value being held (`09 §12`).
+   */
+  protected def tempsHere: List[(String, Type)] = tempStack.head.toList
+
+  protected def releaseValues(vs: List[(String, Type)]): Unit =
+    for (v, ty) <- vs.reverse do releaseValue(ty, v)
   protected def dropTemps(): Unit    = tempStack = tempStack.tail
 
   /** Hands a statement to the scope being emitted. Nothing is emitted here — the `defer` itself
