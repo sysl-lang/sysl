@@ -189,10 +189,16 @@ trait ExprAnalysis
   /** `Name(value)` — an explicit cast into a constrained subtype. The operand is taken at the
    * subtype's base and checked; a value whose base does not agree is a mistake the message names.
    */
-  private def constrainedCast(key: String, args: List[Expr]): TExpr = {
-    val c = resolveConstrained(key)
+  private def constrainedCast(key: String, args: List[Expr]): TExpr =
+    castConstrained(resolveConstrained(key), qn(key), args)
 
-    if args.length != 1 then err(s"a '${qn(key)}' conversion takes exactly one value")
+  /** The same cast reached with the subtype in hand rather than with its name, which is what a
+   * conversion written at a **type parameter** has: `T(x)` instantiated at an `Age` is the `Age(x)`
+   * a reader would have written, and taking any other route would refuse it for not being a scalar
+   * conversion — true, and beside the point, since the form does exist under the type's own name.
+   */
+  private def castConstrained(c: Type.Constrained, written: String, args: List[Expr]): TExpr = {
+    if args.length != 1 then err(s"a '$written' conversion takes exactly one value")
     val v = analyzeExpr(args.head, Some(c.base))
     if disagree(v.ty, c.base) then err(s"cannot make ${show(c)} from ${show(v.ty)}")
     checkInto(v, c)
@@ -526,10 +532,20 @@ trait ExprAnalysis
     // what lets `old` stay an ordinary name outside a postcondition.
     case Call(Ident("old"), args) if oldBuf.isDefined       => oldCall(args)
 
-    // A conversion is written with call syntax, so a scalar type name in call position is one.
-    case Call(Ident(name), args) if lookupOpt(name).isEmpty && scalarType(name).isDefined =>
-      if args.length != 1 then err(s"a '$name' conversion takes exactly one value")
-      convert(analyzeExpr(args.head), scalarType(name).get)
+    // A conversion is written with call syntax, so a type name in call position is one — a built-in,
+    // or a **type parameter**, which every instantiation replaces with a type this same form would
+    // have accepted written out. That is what makes the two directions symmetric: `u8(x)` where `x`
+    // is a `T` was always ordinary code, checked once the width is concrete, and `T(b)` is the same
+    // check at the same moment.
+    case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).isEmpty &&
+        typeNamed(name).isDefined =>
+      typeNamed(name).get match
+        // An instantiation at a constrained subtype takes the cast written under that subtype's own
+        // name, checked and trapping, rather than the scalar conversion that has no meaning for one.
+        case c: Type.Constrained => castConstrained(c, name, args)
+        case ty =>
+          if args.length != 1 then err(s"a '$name' conversion takes exactly one value")
+          convert(analyzeExpr(args.head), ty)
 
     // A constrained subtype's name in call position wraps a base value into the subtype, checking it
     // — `Age(n)`, `Meters(3.0)`. Unlike an implicit produce site, the cast is written, so it applies

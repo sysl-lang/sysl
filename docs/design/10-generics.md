@@ -391,12 +391,21 @@ never by a covariant container.
   **excluded**, not merely deferred: it pushes inference toward undecidable, and no target use
   (an OS, drivers, embedded) needs it. Abstraction over containers is served by traits and
   bounds, not by HKT.
-- **f. A conversion into a type parameter.** `u8(x)` where `x: T` is ordinary code, because `u8` is
-  a type that exists; `T(b)` is "undefined function 'T'", because a parameter is not a name a call
-  can be written through. So a generic function can take a value apart and not put one together,
-  and a symmetric pair of operations ends up half generic: `guide/sha2` writes `top_byte` once and
-  its mirror — building a word out of a byte — twice, as a trait member, where the width is
-  concrete. What this wants is either the conversion forms reaching a parameter of known layout, or
-  the trait-level member `02 § Reaching a trait's members without a value` wants, since a `T.of(b)`
-  would answer it too. The second is the better bet: a conversion into a parameter cannot mean
-  anything for a `T` that turns out to be a struct, and a trait member says which types offer it.
+- ~~**f. A conversion into a type parameter**~~ — **built.** `T(b)` is a conversion, written where
+  the parameter's name stands and resolved at each instantiation, so the two directions of one
+  conversion are one rule: `guide/sha2`'s `top_byte` and `shift_in` sit beside each other, both
+  generic, and `Word` is three members shorter for it.
+
+  The objection recorded here — that a conversion into a parameter cannot mean anything for a `T`
+  that turns out to be a struct — is true and turns out not to be an objection, because it was
+  already the situation in the direction that worked. `u8(x)` where `x: T` says nothing at the
+  definition either; it is checked when the instantiation says what `T` is, and a `T` that is a
+  struct is refused there, naming the struct. `T(b)` is checked at the same moment and says the same
+  thing. Making the inbound direction stricter than the outbound one would have been the odd choice,
+  and a bound that promises the conversion is still writable on top — `02 § Reaching a trait's
+  members without a value` is what a library reaches for when it wants the promise checked at the
+  definition rather than at each use.
+
+  An instantiation at a **constrained subtype** takes that subtype's own checked cast, since the
+  scalar conversion has no meaning for one and the form written under its name does. So `T(x)` at an
+  `Age` is the `Age(x)` a reader would have written, trap included.

@@ -179,6 +179,14 @@ total and needs nothing said about failure, which is what makes it a conversion 
 size is still written — on a target where the widths differ it is a real narrowing, which is exactly
 why.
 
+**The name in front may be a type parameter**, and then the row above is chosen once the
+instantiation says what the parameter is: `T(b)` inside a `[T]` body converts at `u32` and at `f32`
+and is refused at a struct, naming the struct. That is not a second rule — it is the one already in
+force in the other direction, since `u8(x)` where `x` is a `T` has always been settled at the
+instantiation rather than at the definition. A parameter that turns out to be a **constrained
+subtype** takes that subtype's checked cast (`16`) instead, which is what the name written out would
+have meant.
+
 ## Operator precedence
 
 Lowest precedence (binds loosest) at the top; highest (binds tightest) at the bottom. The set
