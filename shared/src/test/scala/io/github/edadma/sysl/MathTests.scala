@@ -53,6 +53,96 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  /** The members with no receiver, which is what lets a body shared by two widths name a value of
+   * whichever width it was instantiated at. Before them, `signum` and `recip` had to be written per
+   * width for want of a one to divide, and a routine generic over the width could not start a
+   * running minimum because `infinity()` answered in `real`.
+   */
+  "the type's own values" - {
+    "each width answers with its own" in {
+      run("print(real.zero(), real.one(), f32.zero(), f32.one())") shouldBe "0 1 0 1\n"
+    }
+
+    // The two the width really decides. Binary32's largest finite value is far below binary64's, so
+    // a `max_value` that had quietly become one number would be caught here and nowhere else.
+    "the largest finite value is the width's, not the widest one's" in {
+      run(
+        """print(real.max_value() > 1.0e308, f32.max_value() < 1.0e39, f32.max_value() > 1.0e38)"""
+      ) shouldBe "true true true\n"
+    }
+
+    "epsilon is the step above one at each width" in {
+      run(
+        """print(real.one() + real.epsilon() > real.one(), f32.one() + f32.epsilon() > f32.one())"""
+      ) shouldBe "true true\n"
+    }
+
+    "the two values no literal spells" in {
+      run(
+        """print(real.infinity().is_infinite(), f32.infinity().is_infinite(),
+          |      real.nan().is_nan(), f32.nan().is_nan())""".stripMargin
+      ) shouldBe "true true true true\n"
+    }
+
+    // The free `infinity()` is the `real` one and answers the same value, which is what keeps the
+    // definition in one place rather than in two that could drift.
+    "the module's own infinity is the real width's" in {
+      run("print(infinity() == real.infinity(), nan().is_nan())") shouldBe "true true\n"
+    }
+
+    "pi is at the width asked for" in {
+      run("print(real.pi() == pi, (f32.pi() - f32(pi)).abs() < f32.epsilon())") shouldBe "true true\n"
+    }
+
+    // The point of all of it: one body, two widths, and a value of the width made inside it.
+    "a routine generic over the width builds values of that width" in {
+      run(
+        """smallest[T: Float](xs: []const T) -> T
+          |    var best = T.infinity()
+          |
+          |    for i in 0..<xs.len do if xs[i] < best then best = xs[i]
+          |
+          |    best
+          |
+          |main()
+          |    var wide: [3]real = [4.0, -2.0, 9.0]
+          |    var narrow: [3]f32 = [1.5f32, 8.0f32, 0.25f32]
+          |    print(smallest(wide[..]), smallest(narrow[..]))""".stripMargin
+      ) shouldBe "-2 0.25\n"
+    }
+
+    // An empty sequence is what a running minimum started at infinity is *for*: there is nothing to
+    // replace the start, and the answer is the start.
+    "the start of a running minimum survives an empty sequence" in {
+      run(
+        """smallest[T: Float](xs: []const T) -> T
+          |    var best = T.infinity()
+          |
+          |    for i in 0..<xs.len do if xs[i] < best then best = xs[i]
+          |
+          |    best
+          |
+          |main()
+          |    var none: [0]f32 = []
+          |    print(smallest(none[..]).is_infinite())""".stripMargin
+      ) shouldBe "true\n"
+    }
+
+    "the defaults that needed a literal are now one body serving both widths" in {
+      run(
+        """var x: real = -4.0
+          |var y: f32 = -4.0f32
+          |print(x.signum(), y.signum(), x.recip(), y.recip())""".stripMargin
+      ) shouldBe "-1 -1 -0.25 -0.25\n"
+    }
+
+    // `signum` answering a zero with that zero rather than with a one is what the comparison pair
+    // buys, and it has to keep holding now that the one it does not answer with comes from `one()`.
+    "signum still hands a zero back unchanged and a NaN back unchanged" in {
+      run("print((0.0).signum(), (-0.0).signum(), nan().signum().is_nan())") shouldBe "0 -0 true\n"
+    }
+  }
+
   "roots, exponentials and logarithms" - {
     "square and cube roots" in {
       run("print((144.0).sqrt(), (27.0).cbrt())") shouldBe "12 3\n"
