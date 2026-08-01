@@ -102,6 +102,12 @@ trait Emitter {
    */
   protected var owned: List[mutable.ListBuffer[(String, Type)]] = Nil
 
+  /** What each scope has been asked to run on its way out — the `defer` stack (`03 § defer`),
+   * innermost first. It sits beside `owned` because it is pushed, popped and unwound with it and
+   * never on its own, so the two are always the same length and one index reaches both.
+   */
+  protected var deferrals: List[mutable.ListBuffer[TStmt]] = Nil
+
   /** The enclosing loops, innermost first, so a `break`/`continue` knows where to jump, what
    * result slot to store into, and how far to unwind the ownership regions on the way out. The
    * depths are the sizes of `owned`/`tempStack` at loop entry, so leaving releases exactly what
@@ -157,6 +163,7 @@ trait Emitter {
     terminated = false
     tempStack = Nil
     owned = Nil
+    deferrals = Nil
     genLoops = Nil
     scratch = mutable.HashMap.empty
     promoted = Set.empty
@@ -240,7 +247,8 @@ trait Emitter {
    * gets written at the moment it is first asked for.
    */
   protected def inFunction(header: String)(gen: => Unit): String = {
-    val saved = (prologue, body, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes)
+    val saved =
+      (prologue, body, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes, deferrals)
 
     startFunction()
     gen
@@ -248,7 +256,7 @@ trait Emitter {
 
     prologue = saved._1; body = saved._2; temp = saved._3; label = saved._4
     terminated = saved._5; tempStack = saved._6; owned = saved._7; scratch = saved._8
-    promoted = saved._9; promotedBoxes = saved._10
+    promoted = saved._9; promotedBoxes = saved._10; deferrals = saved._11
     text
   }
 

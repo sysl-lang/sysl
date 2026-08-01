@@ -105,6 +105,7 @@ class SyslLexical
     "in",
     "break",
     "continue",
+    "defer",
     "match",
     "struct",
     "enum",

@@ -190,6 +190,19 @@ trait StmtAnalysis extends TypeResolution {
       for n <- names do if mutable then declare(n, Type.Unknown) else declareReadOnly(n, Type.Unknown)
     case _                      =>
 
+  /** Whether a `?` sits anywhere in this tree.
+   *
+   * The descent is structural because the operator can be at any depth of any expression, and it
+   * stops at a `Type` — which holds no expression, and whose recursive forms would otherwise be
+   * walked forever.
+   */
+  private def containsTry(x: Any): Boolean = x match
+    case _: Type         => false
+    case _: TTry         => true
+    case xs: Iterable[?] => xs.exists(containsTry)
+    case p: Product      => p.productIterator.exists(containsTry)
+    case _               => false
+
   private def analyzeStmt(stmt: Stmt): List[TStmt] = at(stmt.pos)(analyzeStmtAt(stmt))
 
   /** `a, b = b, a` and `a, b += 1, 2` (`00 §2`).
@@ -397,6 +410,41 @@ trait StmtAnalysis extends TypeResolution {
     case Continue(label) =>
       val (_, depth) = resolveLoop("continue", label)
       List(TContinue(depth))
+
+    // `defer stmt` (`03 § defer`). The statement is analyzed here, where it is written, so it sees
+    // exactly the names in scope at that point — and it is handed to the block rather than emitted,
+    // so nothing runs until the block is left.
+    //
+    // What may be deferred is bounded by what teardown can mean. A jump would leave the block from
+    // inside the code that runs *because* the block is already being left, and there is no second
+    // exit to take. A declaration would bind a name that dies before anything could read it. Both
+    // are refused by name rather than by a general rule, because each is a different mistake.
+    case Defer(inner) =>
+      inner match
+        case _: Return =>
+          err("a deferred statement runs while its block is being left, so it cannot 'return' — " +
+            "there is no exit left to take. Compute what the function returns before the block ends")
+        case _: Break | _: Continue =>
+          err("a deferred statement runs while its block is being left, so it cannot 'break' or " +
+            "'continue' — the loop edge it would take is the one already being taken")
+        case _: Defer =>
+          err("'defer' schedules a statement, and scheduling a scheduling has nothing to run: " +
+            "write the statement itself after this 'defer'")
+        case _: VarDecl | _: ValDecl | _: MultiDecl | _: ConstDecl =>
+          err("a deferred declaration binds a name that dies the moment the statement finishes, " +
+            "so nothing could read it — defer what uses the value instead of what declares it")
+        case _ =>
+
+      val body = analyzeStmts(List(inner))
+
+      // A `?` leaves the function, which is the same exit a `return` would take and is refused for
+      // the same reason. It is read out of the analyzed body rather than the written statement
+      // because `?` is an operator inside an expression, at whatever depth the expression has.
+      if body.exists(containsTry) then
+        err("a deferred statement runs while its block is being left, so a '?' in it has nowhere " +
+          "to return to. Check the result and handle the failure in the deferred statement itself")
+
+      List(TDefer(body))
 
     // A constant is a declaration that was hoisted and folded into its uses (`13 §7`), so where the
     // walk meets one among the entry point's statements there is nothing left to run.

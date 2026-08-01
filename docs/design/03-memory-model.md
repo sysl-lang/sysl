@@ -565,6 +565,106 @@ annotation in the source, exactly as an escaping closure is heap-boxed with no m
 and the route by which the slice outlives it. **`05-escape-analysis.md`** specifies which
 escapes are detected, how the answer crosses a call boundary, and how a promotion is reported.
 
+## `defer` — scope exit for what the language does not own
+
+ARC gives back a `&T`, a `string` and a slice's backing without being asked. It knows nothing
+about the rest: a descriptor from `open`, a `FILE*` from `fopen`, a block from `malloc`, a
+lock taken from a mutex. Those are the C boundary's, and until they are released by hand a
+correct program is one that never takes an early exit — which `?` (`11 §3`) makes the *normal*
+way to leave a function.
+
+**`defer <statement>` runs that statement on the way out of the block containing it.** The
+resource is released beside the call that took it, once, rather than at every exit:
+
+```
+read_count(path: string) -> Result[int, string]
+    var f = fopen(path, "r")
+    if f == null then return Err("cannot open")
+    defer fclose(f)
+
+    var n = parse_header(f)?     # fclose runs here on the failure path
+    var m = parse_body(f)?       # and here
+    n + m                        # and here, after the result is computed
+```
+
+### What runs, and when
+
+**A deferred statement belongs to its block** — a loop body, a branch arm, or the function body
+itself — and runs when control leaves that block by any ordinary route: falling off the end,
+`return`, `break`, `continue`, or a `?` that takes its failure arm. **Several in one block run
+last-registered-first**, so they undo in the reverse of the order they were set up, which is the
+order that lets a later one depend on an earlier one's resource.
+
+**A `defer` runs only if control reached it.** It is a statement, not a declaration: one after
+an early `return` never registered, and one in a branch never taken did not either.
+
+**The whole statement runs at the exit, so everything in it is read there** — not at the `defer`.
+A variable the statement names is read at its exit-time value:
+
+```
+var n = 1
+defer print(n)      # prints 2
+n = 2
+```
+
+This is the second place Go differs: Go evaluates a deferred call's *arguments* where the `defer`
+stands and runs the call later, which means somewhere to keep each captured argument until the
+call happens — a slot per deferred statement, sized and laid out per call. Reading everything at
+the exit needs nothing kept, which is the same reason block scope was chosen over function scope,
+applied to the arguments rather than to the schedule. It is also Zig's rule.
+
+It changes nothing for the form's purpose. `defer fclose(f)` releases the handle bound above it,
+and a program that rebinds `f` between the `defer` and the exit has changed which file is open,
+so closing the one that is actually open is the behaviour that was wanted.
+
+**A trap runs nothing.** `11 §6` settles that a trap aborts without stack cleanup, and `defer`
+does not qualify that: a broken invariant means the program's model of itself is already wrong,
+and running cleanup code against that state is how a corrupt program writes its corruption to
+disk on the way down. `defer` is for releasing a resource, not for restoring an invariant.
+
+### Why the block and not the function
+
+Go's `defer` runs at **function** exit, and sysl's does not. The difference is invisible for
+the common case — a resource taken at the top of a body, released when the body ends, where the
+function *is* the block — and shows up in a loop:
+
+```
+for i in 0..<n
+    var f = fopen(paths[i], "r")
+    defer fclose(f)          # this iteration's file, closed this iteration
+    consume(f)
+```
+
+Block scope closes each file at the end of the iteration that opened it, so the program holds
+one at a time. Function scope would hold all `n` open until the function returned, and — the
+part that decides it here — would need somewhere to record `n` pending statements, a number no
+compiler can bound. That is a per-frame list whose length is discovered while running, which is
+precisely the machinery `11 §6` rejects unwinding for: a freestanding target under `no alloc`
+(`13 §4`) has nowhere to put it. Block scope needs no runtime state at all — the statement is
+emitted at each edge that leaves the block, exactly as ARC's own releases already are.
+
+**Go has two reasons for its choice and sysl has neither.** `recover` only works inside a
+deferred call and a panic unwinds one frame at a time, so the frame has to be the unit; and
+`defer` mutating a named result is how Go wraps an error on the way out. sysl has no unwinding
+and no named results. The languages that came later without `recover` — Zig, Swift — both put
+`defer` at the block.
+
+### Where it sits against the rest of the model
+
+**A deferred statement runs before the block's ARC releases**, so every local it names is still
+alive when it runs — including the one holding the resource it is closing. Leaving from the
+middle unwinds outward: the innermost block runs its deferred statements and then gives up its
+counts, then the block outside it does the same, up to the function's own.
+
+**It owns nothing and allocates nothing.** `defer` takes no count, makes no box, and adds no
+word to any value; a program that does not use it emits nothing for it. That is what keeps it
+available under `no alloc`, where the resources it releases are the only ones there are.
+
+**What it is not** is a destructor. A destructor belongs to a *type* and runs wherever a value
+of that type dies; `defer` belongs to one *place in one body* and runs for the resource that
+body took. Whether sysl should also have the type-bound form — so a `File` closes itself
+wherever it is used — is `§ Open sub-questions`.
+
 ## Shared mutability and concurrency
 
 `&T` permits aliasing and mutation through any reference — the deliberate simplification over
@@ -654,3 +754,14 @@ greppable as everything else here.
   table was refused for putting the cost per-operation and out of sight.
 - **`weak sync T`** — an atomic weak reference, which wants the compare-and-swap upgrade and
   something to race with. Waits on `06`.
+- **A type-bound destructor**, so a `File` closes its descriptor wherever a value of it dies
+  rather than at each place one is taken. `defer` (above) covers the per-site half and is the
+  cheaper one; this is the half that would let a resource be wrapped once and used everywhere.
+  What has to be decided first is not the syntax but where it may run: ARC destroys through a
+  type-erased hook (`§ Who frees it`), so a user destructor is a call the compiler places into
+  that hook, and the questions are whether it may fail, whether it may be reached during
+  teardown of a cycle, and whether a value type gets one at all or only a `&T`. `07 § Length`'s
+  claim that a container would need one to be written **was already withdrawn** — a container
+  whose storage is a `[]T` is destroyed by ARC on its behalf — so the customer for this is the
+  C-boundary resource, the same one `defer` serves, and it should be weighed against just
+  having `defer`.

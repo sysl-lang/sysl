@@ -403,6 +403,12 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       releaseToDepth(loop.ownedDepth, loop.tempDepth)
       emitTerm(s"br label %${loop.continueL}")
 
+    // Reaching a `defer` emits nothing: it hands its statements to the scope, which lays them down
+    // at each edge that leaves the block. Registering here rather than at the top of the block is
+    // what makes a `defer` control never reached schedule nothing.
+    case TDefer(stmts) =>
+      deferStmts(stmts)
+
 }
 
 object Codegen {
