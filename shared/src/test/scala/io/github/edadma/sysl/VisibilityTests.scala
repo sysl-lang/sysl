@@ -652,6 +652,52 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
       ) should include("'make' is public, but its result names 'geom.P', which is private to module 'geom'")
     }
 
+    /** The declarations that are a **name and one type**. They carry no signature, so the hole is
+      * reached by a shorter route than a function's — a module that may write the name holds a value
+      * whose type it cannot write, which is the same hole and not a smaller one.
+      *
+      * A `const` is the third of them and cannot reach this rule at all: `13 §7` holds a constant to
+      * being a scalar, and every scalar is a builtin nobody may restrict. The test below is what says
+      * so, and the check covers `const` anyway so that widening what a constant may hold cannot
+      * quietly reopen what these two had.
+      */
+    "a public module-level 'val'" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |val here: Point = Point(1)
+          |print(1)
+          |""".stripMargin)) should include("'here' is public, but its type names 'Point'")
+    }
+
+    "and a public 'extern' variable, whose storage the linker supplies" in {
+      errIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |extern there: Point
+          |print(1)
+          |""".stripMargin)) should include("'there' is public, but its type names 'Point'")
+    }
+
+    // Why a `const` is not among them: it never gets far enough to be asked. Every user-declared type
+    // is refused as a constant's type before visibility is looked at, so there is no way to write the
+    // leak in the first place — asserted over all four forms a declaration takes rather than one, so
+    // that a form which later became constant-able would show up here.
+    "while a 'const' cannot name a declared type at all, so the question does not arise" in {
+      val declared = List(
+        "Point" -> "struct Point\n    x: int",
+        "Mode"  -> "enum Mode\n    On\n    Off",
+        "Small" -> "type Small = int within 0..<10",
+        "Tag"   -> "type Tag = new int",
+      )
+
+      for (named, base) <- declared do
+        withClue(s"a const of '$named': ") {
+          err(s"$base\nconst c: $named = 5\nprint(1)") should
+            include(s"a constant is a scalar, and $named is not")
+        }
+    }
+
     // Both are restricted; what fails is that one subtree does not contain the other.
     "a 'private[M]' signature naming a type scoped more narrowly than it is" in {
       errIn(
@@ -716,6 +762,34 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
           |id[T](x: T) -> T = x
           |print(id(5))
           |""".stripMargin)) shouldBe "5\n"
+    }
+
+    // The same exemption the function form gets, asked of the three name-and-one-type declarations:
+    // restricted to the file that declares the type, there is nobody who could hold the value and be
+    // unable to name it. These are also what says the refusals above are about the *reaches* rather
+    // than about a `const`, a `val` or an `extern` variable naming a restricted type at all.
+    "a private 'val' and 'extern' variable may each name a private type" in {
+      runIn(("", "main.sysl",
+        """private struct Point
+          |    x: int
+          |private val here: Point = Point(6)
+          |private extern there: Point
+          |print(here.x)
+          |""".stripMargin)) shouldBe "6\n"
+    }
+
+
+    "and a scoped one may name a type its ancestor keeps" in {
+      runIn(
+        ("", "main.sysl", "print(a.b.go())"),
+        ("a.b", "x.sysl",
+         """module a.b
+           |private[a] struct P
+           |    x: int
+           |private[b] val kept: P = P(7)
+           |go() -> int = kept.x
+           |""".stripMargin),
+      ) shouldBe "7\n"
     }
   }
 

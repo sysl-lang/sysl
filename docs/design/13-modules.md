@@ -189,6 +189,15 @@ restricted to that subtree or to anything inside it, and never the other way rou
 declaration is exempt in every case — it is read in one file, and a type it can name at all is
 visible there.
 
+**"Signature" is the shorter word for it, and the rule is not about signatures.** It is about
+everything a declaration says about itself, so it reaches the forms that have no signature at all: a
+field, an enum variant's payload, a type parameter's bound and its default, and the declarations that
+are a **name and one type** — a module-level `val`, and an `extern` variable. Those two are the
+easiest to overlook and are no smaller a hole than a function's result: a module that may write the
+name holds a value of a type it cannot write, which is the whole of what this section refuses. A
+`const` is spared only because it cannot reach the question — §7 holds a constant to being a scalar,
+and every scalar is a builtin nobody may restrict.
+
 **It reaches everything a caller has to be able to write**, which is more than a parameter and a
 result: a struct's fields and an enum variant's payload, since neither has a visibility of its own; a
 type *argument*, since `Box[Point]` names `Point` as much as a bare `Point` does; a trait behind a

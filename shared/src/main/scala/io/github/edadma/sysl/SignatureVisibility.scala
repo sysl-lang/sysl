@@ -123,6 +123,29 @@ trait SignatureVisibility extends TypeResolution {
     // no less able to hand back a type the caller cannot name.
     for (key, d) <- funcDecls.toList do
       expose(key, d.tparams.toSet, d.bounds, signature(d.params, d.retType))
+
+    // The three declarations that are a **name and one type**: a `const`, a module-level `val`, and
+    // an `extern` variable. Each is the same hole a public function returning a private type is,
+    // reached by a shorter route — a module that may write the name holds a value whose type it
+    // cannot write, which is what §2 calls a hole in the restriction rather than a use of it.
+    //
+    // A `val`'s type is an `Option` only because a *local* infers one; a module-level `val` has been
+    // held to stating it, so an absent one is a declaration already reported and there is nothing
+    // here to compare.
+    //
+    // The `const` line has nothing to catch **today** and is here because the rule is one rule: a
+    // constant is held to being a scalar (`13 §7`), and every scalar is a builtin with no declaration
+    // to restrict — so a constant naming a type anyone could make private is refused a step earlier.
+    // Stating it here anyway is what keeps widening what a constant may hold from silently reopening
+    // the hole that `val` and `extern` had, which is the mistake this whole block is fixing.
+    for (key, d) <- constDecls.toList do
+      expose(key, Set.empty, Map.empty, List(("its type", d.typ, d.typ.pos)))
+
+    for (key, d) <- valDecls.toList; t <- d.typ do
+      expose(key, Set.empty, Map.empty, List(("its type", t, t.pos)))
+
+    for (key, d) <- externVarDecls.toList do
+      expose(key, Set.empty, Map.empty, List(("its type", d.typ, d.typ.pos)))
   }
 
   /** A **default** is exposed as surely as a field is, and less obviously: it is the one part of a
