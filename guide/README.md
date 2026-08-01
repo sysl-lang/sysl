@@ -32,9 +32,12 @@ asserts a refusal only through a total operation that answers instead of trappin
 program's own directory and are run by `sysl test <directory>`. Each runs in a process of its own
 and passes by not coming back, so a trap is an observation there rather than the end of the run —
 which is what lets a refusal be stated in sysl, beside the code it is about. `guide/ring` was the
-first to need this; its `tests.sysl` is where that half of the evidence lives, and
-`RingClaimTests` is the same claims asserted from outside, kept because the two routes to them are
-independent.
+first to need this and `guide/ring/tests.sysl` is where that half of its evidence lives.
+
+**Write every refusal beside the call that is not refused.** A `should_trap` test passes for any
+failure at all, its own setup included, so alone it cannot tell "the contract fired" from "nothing
+worked". One call over the line and one call up to it, and the difference between them is the
+contract.
 
 | directory | axis it owns |
 |---|---|
