@@ -80,8 +80,9 @@ object Core {
    *
    * It has to carry *something*: the standard module is what every program is compiled against, so
    * it cannot be a thing a compilation goes looking for on disk and may not find. This is that
-   * guarantee, and it is also the fallback — a compilation handed an artifact it cannot read is
-   * better off compiling against this than not compiling at all.
+   * guarantee — and it is what an unusable artifact at the default path is rebuilt *from*, rather
+   * than a library compiled against in its place (`Main.foundCore`). Reached directly only by
+   * `--no-core-lib`.
    *
    * The target is a parameter for the reason it is one everywhere else, and here it is not merely
    * consistency: the library may gate on the machine (`Conditional`), so a copy parsed for one
@@ -108,8 +109,8 @@ object Core {
    * compiler carries the source this was supposed to be built from, so it can say whether it was
    * (`Std.fingerprint`). Without it the artifact is built separately and can drift — and a stale one
    * decodes and links perfectly well, it is simply the wrong library, which is the worst way for
-   * this to fail. Refusing puts it on the path a corrupt one already takes: a warning, and the copy
-   * the compiler carries.
+   * this to fail. Refusing puts it on the path a corrupt one already takes: at the default path it is
+   * rebuilt from the source the compiler carries, and where `--core-lib` named it the refusal stands.
    */
   def read(name: String, metadata: String, target: Target): Either[String, (Core, Set[String])] =
     LibraryArtifact.read(name, metadata, target).flatMap((units, precompiled, source) =>
