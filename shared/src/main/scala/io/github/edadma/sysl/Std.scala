@@ -92,15 +92,24 @@ object Std {
    * ten.
    */
   def parsed(target: Target): List[Program] =
-    cache.getOrElseUpdate(
-      target,
-      sources.map(s =>
-        SyslParser.parse(s, target) match
-          case Right(p) => p
-          case Left(e)  => sys.error(s"the standard module does not parse: $e"),
+    cache.synchronized(
+      cache.getOrElseUpdate(
+        target,
+        sources.map(s =>
+          SyslParser.parse(s, target) match
+            case Right(p) => p
+            case Left(e)  => sys.error(s"the standard module does not parse: $e"),
+        ),
       ),
     )
 
+  /** **Locked, and it is not decoration.** This was a `lazy val` before it took a target, and a
+   * `lazy val` is initialized exactly once however many threads reach it. A bare mutable `Map` is
+   * not: two compilations for two targets, running at once, can be inside `getOrElseUpdate` together
+   * and leave the table itself broken — which is not a wrong answer but a corrupted one, and it
+   * would show up as something unrelated much later. The suite compiles for several targets from
+   * several threads, so this is a live case rather than a hypothetical one.
+   */
   private val cache = collection.mutable.Map.empty[Target, List[Program]]
 
   def decls(target: Target): List[Stmt] = parsed(target).flatMap(_.body)

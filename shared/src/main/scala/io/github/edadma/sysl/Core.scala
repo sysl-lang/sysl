@@ -87,8 +87,12 @@ object Core {
    * consistency: the library may gate on the machine (`Conditional`), so a copy parsed for one
    * target is not the library another target has.
    */
-  def embedded(target: Target): Core = cache.getOrElseUpdate(target, new Core(Std.parsed(target)))
+  def embedded(target: Target): Core =
+    cache.synchronized(cache.getOrElseUpdate(target, new Core(Std.parsed(target))))
 
+  /** Locked for the reason `Std.parsed`'s is: this was a `lazy val`, which is initialized once
+   * however many threads reach it, and a bare mutable `Map` is not.
+   */
   private val cache = collection.mutable.Map.empty[Target, Core]
 
   /** A core read out of the metadata half of an artifact (`LibraryArtifact`).

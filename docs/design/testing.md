@@ -61,6 +61,12 @@ mechanism yet — the two that will make it one are `packed` (`15 §1`) and the 
 attribute `00 § Open` wants, and neither is designed. The attribute goes on its own line above
 an ordinary function declaration, which may still be `private`.
 
+**A conditional-compilation directive also starts with `#`** (`targets.md § Conditional
+compilation`), and the two never meet: a directive sits at the margin and is gone before the lexer
+runs, while an attribute is indented with the declaration it is on and reaches the grammar as one.
+The words tell them apart in any case — `test` is not one of `if` / `elif` / `else` / `endif`. A
+`#test` inside a gated-out branch is simply not there, so a test build has the tests its target has.
+
 **A test is an ordinary function with a caller nothing else has.** No parameters, no result,
 not generic — all three are the same requirement from different sides, since the runner calls
 it with nothing and reads the answer off whether it returned. They are checked at the

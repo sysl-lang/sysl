@@ -152,9 +152,11 @@ Nothing in this section is an independent decision; it is what §1–§4 and `13
 1. **Discover.** Walk from the project root — whose location is the project-config doc's to settle
    (`13` §Open a). Every directory containing sources is a module, and `readdir` gives its file
    set with no parsing at all.
-2. **Parse** every file. `13` §3 establishes that a qualified reference can create a dependency
-   no header mentions, so the module graph is *not* recoverable from a header scan; discovery
-   reads whole files. This is a parse — no name resolution, no typechecking.
+2. **Parse** every file, **for the target** — the lines of a branch this build is not for are
+   blanked first (`targets.md § Conditional compilation`), so what is parsed is already the file
+   this machine sees. `13` §3 establishes that a qualified reference can create a dependency no
+   header mentions, so the module graph is *not* recoverable from a header scan; discovery reads
+   whole files. This is a parse — no name resolution, no typechecking.
 3. **Order.** Build the module graph, reject a cycle naming the modules on it (`13` §6), and
    topologically sort what remains.
 4. **Collect.** Per module, merge every file's cross-file-visible signatures into the one shared

@@ -248,6 +248,14 @@ A target's *name* is not a symbol — it has a `-` in it, which no identifier ca
 one is told to write `aarch64 && macos` instead, because otherwise the reader is told that `-` is
 not an operator, which is true and no help.
 
+**`posix` here is not `capabilities.md`'s `posix`, and the two are not going to be merged.** This one
+asks *is this a POSIX system*, which is a fact about the machine and is settled by the target. That
+one asks *may this module use POSIX*, which is a permission a project grants and a `no posix` clause
+takes away — so a build can perfectly well be for Linux and deny it. They agree today because
+nothing denies anything yet; they are different questions and would part the moment something did.
+Whether a condition should be able to ask the second one is left with the config that would define
+it (`§ Open`).
+
 ### What is given up, and what is not
 
 **The inactive branch is never syntax-checked.** That is the price of gating text rather than
@@ -272,12 +280,19 @@ every target**: a library that gated `Option` away for Windows would be a librar
 against there, so it is refused in the registry-wide check rather than at the first `?` somebody
 writes.
 
+**An artifact records the target it was built for** and is refused by a build for another, because
+the trees a library ships are now a per-target answer. `13 §8` has the rest.
+
 ## Open
 
 - **The project config.** `sysl.conf`, per-target capability sets (`capabilities.md`'s
   `alloc` / `os` / `posix` / `threads`), and filename-axis platform selection. The registry here
   is the fixed table a config would eventually extend, and deliberately does not try to be one:
   a target's *capabilities* are exactly the part that a project has an opinion about.
+- **Whether a condition may ask about a capability.** `#if` asks only what the *target* says, which
+  is what let it be built while the config is still open. Asking `#if no alloc` is a coherent thing
+  to want and belongs with the config that would define it — and it is where the two `posix` senses
+  above would have to be told apart in the syntax.
 - **32-bit targets.** The emitted code assumes a 64-bit address in places nothing has been asked
   to parameterize. `x86-linux` is in the registry so the refusal has something to name.
 - **Cross-linking.** Building for another machine emits a correct module and then hands it to a

@@ -232,6 +232,27 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
     }
   }
 
+  "the carried library is parsed once per target and kept" - {
+
+    "the same target gets the very same trees back" in {
+      // What replaced a `lazy val` when the library became a per-target question. Parsing the whole
+      // standard module is on the path of every compilation with no artifact to read instead, so a
+      // memo that missed would be a real cost and not only an inelegance.
+      Core.embedded(macos) should be theSameInstanceAs Core.embedded(macos)
+      Std.parsed(linux) should be theSameInstanceAs Std.parsed(linux)
+    }
+
+    "two targets get two" in {
+      Core.embedded(macos) should not be theSameInstanceAs(Core.embedded(linux))
+    }
+
+    "every target in the registry parses at all" in {
+      // The library carries no directives today, so this says the parse is not target-sensitive by
+      // accident. It is what would fail first if one were added that some machine could not read.
+      for t <- Target.all do withClue(s"${t.name}: ") { Std.parsed(t) should not be empty }
+    }
+  }
+
   "a name the compiler spells for itself is declared on every target" in {
     // This is what lets `Library` read the library for one machine and answer for all of them. A
     // library that gated `Option` away for Windows would be a library nothing compiles against
