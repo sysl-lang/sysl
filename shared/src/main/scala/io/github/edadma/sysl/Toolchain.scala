@@ -198,15 +198,30 @@ object Toolchain {
   def compileAndRun(sources: List[Source], libraries: List[Program]): Either[String, (Int, String)] =
     runIr(Compiler.compileWith(sources, libraries), Nil)
 
+  /** The same, compiled against a **prebuilt standard module** rather than the copy the compiler
+   * carries: the trees arrive decoded, the symbols its object half already defines are declared
+   * instead of emitted a second time, and the archive holding them is handed to the linker.
+   *
+   * This is the shape an ordinary `sysl build` has — it is what `.sysl/core.syslib` is *for* — and
+   * the caller supplies the artifact because building one belongs to whoever can decide how often it
+   * is worth doing. Given none, this is the compilation the other overloads perform.
+   */
+  def compileAndRun(sources: List[Source], libraries: List[Program], args: List[String],
+                    core: Option[Core], precompiled: Set[String], archives: List[String])
+      : Either[String, (Int, String)] =
+    runIr(Compiler.compiledWith(sources, libraries, Target.default, precompiled, core).map(_._1),
+          args, archives)
+
   /** `args` are the words the program is started with, which reach it exactly as they would from a
    * shell: the executable's own path arrives ahead of them as the zeroth, since that is what the
    * platform passes and not something this could withhold.
    */
-  private def runIr(compiled: Either[String, String], args: List[String]): Either[String, (Int, String)] =
+  private def runIr(compiled: Either[String, String], args: List[String],
+                    archives: List[String] = Nil): Either[String, (Int, String)] =
     compiled.flatMap { ir =>
       val exe = createTempFile("sysl-", "")
 
-      build(ir, exe).map { _ =>
+      build(ir, exe, Target.default, archives).map { _ =>
         val result = exec(exe :: args)
         deleteFile(exe)
         (result.exitCode, result.stdout)
