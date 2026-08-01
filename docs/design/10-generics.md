@@ -406,6 +406,8 @@ never by a covariant container.
   members without a value` is what a library reaches for when it wants the promise checked at the
   definition rather than at each use.
 
-  An instantiation at a **constrained subtype** takes that subtype's own checked cast, since the
-  scalar conversion has no meaning for one and the form written under its name does. So `T(x)` at an
-  `Age` is the `Age(x)` a reader would have written, trap included.
+  An instantiation at a **constrained subtype** or a **simple enum** takes that type's own checked
+  cast, since the scalar conversion has no meaning for either and the form written under the type's
+  name does. So `T(x)` at an `Age` is the `Age(x)` a reader would have written and `T(n)` at a
+  `Colour` is `Colour(n)`, trap included in both. The rule the whole entry comes down to is that
+  `T(x)` means whatever writing the instantiated type's name there would have meant.

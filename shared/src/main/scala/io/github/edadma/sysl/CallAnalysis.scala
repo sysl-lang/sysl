@@ -272,6 +272,25 @@ trait CallAnalysis extends OperatorCalls {
     TEnumFromInt(t, en)
   }
 
+  /** The same cast reached with the enum in hand rather than with its name, which is what a
+   * conversion written at a **type parameter** has once the instantiation says what the parameter
+   * is. `T(n)` at a `Colour` is the `Colour(n)` a reader would have written; taking the scalar route
+   * instead would refuse it for not being a scalar conversion, which is true and beside the point.
+   */
+  protected def enumFromIntAt(en: Type.Enum, written: String, args: List[Expr]): TExpr = {
+    if !en.simple then
+      err(s"'$written' is ${show(en)} here, which carries data — only a simple enum converts to " +
+        "and from an integer")
+    if args.length != 1 then err(s"'$written' takes exactly one integer argument")
+
+    val t = analyzeExpr(args.head, Some(en.underlying))
+
+    if !Type.repr(t.ty).isInstanceOf[Type.Integer] then
+      err(s"'$written' converts an integer, but the value has type ${show(t.ty)}")
+
+    TEnumFromInt(t, en)
+  }
+
   /** `Color.try(n)` — the fallible constructor: `Some(Color)` for a declared discriminant, `None`
    * otherwise. The result is an ordinary `Option[Color]`, so nothing downstream is special-cased.
    */

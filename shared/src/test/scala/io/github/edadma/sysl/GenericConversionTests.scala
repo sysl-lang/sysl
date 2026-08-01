@@ -153,4 +153,114 @@ class GenericConversionTests extends AnyFreeSpec with RunSupport with CodegenSup
         |    print(f(41))
         |""".stripMargin) shouldBe "42\n"
   }
+
+  // --- the edges, each a type the form means something different at ---------------------------
+
+  "an instantiation at a simple enum takes that enum's checked cast" in {
+    run(
+      """enum Colour
+        |    Red
+        |    Green
+        |    Blue
+        |
+        |into[T](n: int, like: T) -> T = T(n)
+        |
+        |main()
+        |    var c: Colour = into(2, Red)
+        |    print(int(c), Colour::Image(c))
+        |""".stripMargin) shouldBe "2 Blue\n"
+  }
+
+  "and traps on an integer that names no variant" in {
+    exits(
+      """enum Colour
+        |    Red
+        |    Green
+        |    Blue
+        |
+        |into[T](n: int, like: T) -> T = T(n)
+        |
+        |main()
+        |    var c: Colour = into(7, Red)
+        |    print(int(c))
+        |""".stripMargin)
+  }
+
+  "an enum that carries data is told which half of the rule it fails" in {
+    err(
+      """enum Shape
+        |    Circle(r: int)
+        |    Square(s: int)
+        |
+        |into[T](n: int, like: T) -> T = T(n)
+        |
+        |main()
+        |    var s: Shape = into(0, Circle(1))
+        |    print(int(s))
+        |""".stripMargin) should include("carries data")
+  }
+
+  "there is no conversion to bool at a parameter either" in {
+    err(
+      """into[T](n: int, like: T) -> T = T(n)
+        |
+        |main()
+        |    print(into(1, true))
+        |""".stripMargin) should include("cannot convert int to bool")
+  }
+
+  "a pointer target is refused, since making one is not a conversion" in {
+    err(
+      """into[T](n: usize, like: T) -> T = T(n)
+        |
+        |main()
+        |    var x = 1
+        |    print(usize(into(0usize, &x)))
+        |""".stripMargin) should include("cannot convert")
+  }
+
+  "an address reads as a number through a parameter" in {
+    run(
+      """address[T](p: *int, like: T) -> T = T(p)
+        |
+        |main()
+        |    var x = 7
+        |    print(address(&x, 0usize) != 0usize)
+        |""".stripMargin) shouldBe "true\n"
+  }
+
+  "a member of a generic type converts at its own type's parameter" in {
+    run(
+      """struct Packer[T]
+        |    seed: T
+        |
+        |    packed(self, b: u8) -> T = self.seed + T(b)
+        |
+        |main()
+        |    var p = Packer(100u16)
+        |    var q = Packer(100u64)
+        |    print(p.packed(5u8), q.packed(5u8))
+        |""".stripMargin) shouldBe "105 105\n"
+  }
+
+  "a closure inside a generic body converts too" in {
+    run(
+      """widen[T](b: u8, like: T) -> T
+        |    var f = () -> T(b)
+        |
+        |    f()
+        |
+        |main()
+        |    print(widen(9u8, 0u32), widen(9u8, 0.0))
+        |""".stripMargin) shouldBe "9 9\n"
+  }
+
+  "two parameters convert independently in one expression" in {
+    run(
+      """both[A, B](x: A, y: B) -> A = x + A(B(x) + y)
+        |
+        |main()
+        |    print(both(10u16, 5u8), both(10u32, 5u8))
+        |""".stripMargin) shouldBe "25 25\n"
+  }
 }

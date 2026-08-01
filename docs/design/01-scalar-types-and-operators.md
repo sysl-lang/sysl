@@ -183,9 +183,10 @@ why.
 instantiation says what the parameter is: `T(b)` inside a `[T]` body converts at `u32` and at `f32`
 and is refused at a struct, naming the struct. That is not a second rule — it is the one already in
 force in the other direction, since `u8(x)` where `x` is a `T` has always been settled at the
-instantiation rather than at the definition. A parameter that turns out to be a **constrained
-subtype** takes that subtype's checked cast (`16`) instead, which is what the name written out would
-have meant.
+instantiation rather than at the definition. What the form means is whatever writing the instantiated
+type's name there would have meant — so a parameter that turns out to be a **constrained subtype**
+takes that subtype's checked cast (`16`) and one that turns out to be a **simple enum** takes its
+checked cast from an integer (`09`), rather than this table's rows.
 
 ## Operator precedence
 

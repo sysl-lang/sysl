@@ -540,9 +540,11 @@ trait ExprAnalysis
     case Call(Ident(name), args) if lookupOpt(name).isEmpty && typeKey(name).isEmpty &&
         typeNamed(name).isDefined =>
       typeNamed(name).get match
-        // An instantiation at a constrained subtype takes the cast written under that subtype's own
-        // name, checked and trapping, rather than the scalar conversion that has no meaning for one.
+        // An instantiation at a constrained subtype or a simple enum takes the checked cast written
+        // under that type's own name, trapping on a value it does not admit, rather than the scalar
+        // conversion that has no meaning for either.
         case c: Type.Constrained => castConstrained(c, name, args)
+        case e: Type.Enum        => enumFromIntAt(e, name, args)
         case ty =>
           if args.length != 1 then err(s"a '$name' conversion takes exactly one value")
           convert(analyzeExpr(args.head), ty)
