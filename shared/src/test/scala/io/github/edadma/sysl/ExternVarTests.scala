@@ -16,7 +16,12 @@ import org.scalatest.freespec.AnyFreeSpec
  * `environ` to the null terminator is a loop over storage nothing in this program laid down, which
  * terminates only because the address really is the one the loader filled in.
  */
-class ExternVarTests extends AnyFreeSpec with RunSupport with CodegenSupport with ParseSupport {
+class ExternVarTests
+    extends AnyFreeSpec
+    with RunSupport
+    with CodegenSupport
+    with ParseSupport
+    with TestFrameworkSupport {
 
   "the declaration" - {
     "is a name and a type where a function's is a name and a parameter list" in {
@@ -278,6 +283,139 @@ class ExternVarTests extends AnyFreeSpec with RunSupport with CodegenSupport wit
         "b.sysl"    -> "module os\n\nextern environ: **u8",
         "main.sysl" -> "print(1)",
       ) should include("'environ' is already declared")
+    }
+  }
+
+  /** What being a *place* rather than a `val` reaches, asked of each thing a place can do. Every one
+    * of these is a rule written for storage this program owns, met by storage it does not.
+    */
+  "everything a place does, it does" - {
+    // Run rather than read, because what is being asked is that each form reaches the *same* storage:
+    // an increment that read one address and stored to another would still emit a plausible pair of
+    // instructions.
+    "a compound assignment, and an increment, both reaching the one storage" in {
+      run("extern optind: i32\noptind = 1i32\noptind += 4i32\noptind++\nprint(optind)") shouldBe "6\n"
+    }
+
+    // `13 §7` slices a `val` to a `[]const T` because the read-only promise has to travel with the
+    // view. There is no such promise here, so the view is the ordinary writable one — asserted by
+    // *writing through it*, since that is the whole difference between the two types.
+    "slicing yields a view that may be written, where a 'val's yields one that may not" in {
+      err("val t: [4]i32 = [0i32, 0i32, 0i32, 0i32]\nvar v = t[0..<2]\nv[0] = 1i32\nprint(v[0])") should
+        include("views elements it may not write")
+      ir("extern tab: [4]i32\nvar v = tab[0..<2]\nv[0] = 1i32\nprint(v[0])") should include("define")
+    }
+
+    "iterating one walks its elements" in {
+      ir("extern tab: [4]i32\nvar n = 0i32\nfor x in tab\n    n += x\nprint(n)") should
+        include("@tab = external global [4 x i32]")
+    }
+
+    "and a field of an aggregate one is written through" in {
+      val out = ir(
+        """struct Pair
+          |    a: i32
+          |    b: i32
+          |extern the_pair: Pair
+          |the_pair.a = 3i32
+          |print(the_pair.b)""".stripMargin,
+      )
+
+      out should include("getelementptr %struct.Pair, ptr @the_pair, i32 0, i32 0")
+      out should include("store i32 3, ptr")
+    }
+
+    // Its address outlives every frame, so a function may hand one back with nothing promoted and
+    // nothing to decide — which is what `05` says about anything that is not a local.
+    "its address outlives every frame, so a function may hand one back" in {
+      run("extern optind: i32\nwhere_is() -> *i32 = &optind\noptind = 9i32\nprint(*where_is())") shouldBe
+        "9\n"
+    }
+
+    "and it renders like any other value of its type" in {
+      run("extern optind: i32\noptind = 12i32\nprint(f\"[${optind}%4d]\")") shouldBe "[  12]\n"
+    }
+  }
+
+  /** Claims the neighbouring chapters make, asked of the declaration rather than assumed of it. */
+  "what the chapters around it claim" - {
+    // `12 §1`: what crosses the boundary is the programmer's business — a `string` or a `&T` is a
+    // sysl layout C has no notion of, and handing one over is the same promise `*T` already is. That
+    // sentence is about parameters, and this asks whether it holds for storage: it does, and the
+    // consequence is that a nonsense declaration compiles rather than being singled out here.
+    "a sysl layout is the author's business here as it is at a parameter" in {
+      ir("extern s: string\nprint(s == \"\")") should
+        include("@s = external global { ptr, ptr, i64 }")
+    }
+
+    // `15 §2`: a sysl definition is mangled with its module path and an `extern` is the exception,
+    // emitting the raw C symbol. Asked of a *library* module, which is where a key most differs from
+    // a symbol — `sysl.io$lines` against a bare `environ`.
+    "a symbol carries no module even where the key is a library one" in {
+      val out = irAgainstTree(
+        ("sysl", "core.sysl", "module sysl\nextern environ: **u8\nmark(n: int) -> int = n + 1"),
+      )("main.sysl" -> "mark(if environ == null then 0 else 1)")
+
+      out should include("@environ = external global ptr")
+      out should not include s"@${Modules.qualify("sysl", "environ")}"
+    }
+
+    // `capabilities.md`: an `extern` is not followed at all, because what a C function does is not
+    // this compiler's to know. Storage is the same question with a smaller answer — naming it does
+    // nothing at all — so a `no alloc` module writing one is not a narrowing it broke.
+    "a 'no alloc' module writing one is not a narrowing it broke" in {
+      irOf(
+        "drv/a.sysl" -> "module drv\nno alloc\n\nextern optind: i32\n\nreset()\n    optind = 1i32\n",
+        "main.sysl"  -> "drv.reset()\nprint(1)",
+      ) should include("store i32 1, ptr @optind")
+    }
+
+    /** `13 §7`: a module-level `val` may be *computed*, filled by code that runs before the program's
+      * own statements. One filled from C's storage is the case that asks whether the ordering means
+      * anything here — and it does not: what fills `environ` is the loader, which ran before this
+      * program's first instruction, so the read is ordered by the platform rather than by `13 §7`.
+      */
+    "a computed 'val' may be filled from one, and the loader has already filled it" in {
+      run("extern optind: i32\nval start: i32 = optind\nprint(start)") shouldBe "1\n"
+    }
+
+    /** `13 §2` says what is visible outside its file states types that are visible too, and
+      * `SignatureVisibility` holds structs, enums, traits and functions to it. It does **not** hold a
+      * `val` or a `const`, and so it does not hold this either — the same gap, not a new one.
+      *
+      * Pinned rather than closed, because closing it for one of the three would leave the other two
+      * saying the opposite, and which way all three should go is a question about `13 §2` rather than
+      * about this declaration.
+      */
+    // `testing.md`: a test build drops the entry point and dispatches to the `#test` functions
+    // instead, so what a test reaches is reached from a different root. An extern variable read only
+    // from a test still has to be declared, and the storage read is still C's.
+    "a '#test' build declares one that only a test reads" in {
+      val src =
+        """extern optind: i32
+          |
+          |#test("a write to C's storage is read back from it")
+          |round_trips() =
+          |    optind = 7i32
+          |    assert(optind == 7i32, "optind")
+          |""".stripMargin
+
+      testIr(src) should include("@optind = external global i32")
+      allPass(src)
+    }
+
+    "a public one may still name a private type, where a public function may not" in {
+      val hidden = "module os\n\nprivate struct Hidden\n    a: i32\n"
+
+      errOf(
+        "os/env.sysl" -> (hidden + "\nget() -> Hidden = Hidden(1)"),
+        "main.sysl"   -> "print(1)",
+      ) should include("Hidden")
+
+      irOf(
+        "os/env.sysl" -> (hidden + "\nextern there: Hidden"),
+        "main.sysl"   -> "print(1)",
+      ) should include("define")
     }
   }
 
