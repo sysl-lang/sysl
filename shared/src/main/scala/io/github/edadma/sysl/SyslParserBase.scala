@@ -79,6 +79,15 @@ trait SyslParserBase extends PackratParsers {
   protected lazy val ident: Parser[String] =
     accept("identifier", { case t: lexical.Identifier => t.chars })
 
+  /** `_`, which the lexer hands over as an ordinary identifier.
+   *
+   * Two productions read it and they never read the same position: a pattern's wildcard (`09`) and
+   * an expression's placeholder (`12 §5c`). Both go through this one matcher so there is a single
+   * answer to what the token is, rather than two spellings of the test that could drift apart.
+   */
+  protected lazy val wildcard: Parser[Unit] =
+    accept("'_'", { case t: lexical.Identifier if t.chars == "_" => () })
+
   protected val newline: Parser[Unit] = accept("newline", { case lexical.Newline => () })
   protected val indent: Parser[Unit]  = accept("indent", { case lexical.Indent => () })
   protected val dedent: Parser[Unit]  = accept("dedent", { case lexical.Dedent => () })

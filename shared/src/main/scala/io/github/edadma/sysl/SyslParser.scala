@@ -425,7 +425,7 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val varDecl: PackratParser[Stmt] =
     multiDecl("var", mutable = true) |
       op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
-        case n ~ t ~ e => VarDecl(n, t, e)
+        case n ~ t ~ e => VarDecl(n, t, e.map(Placeholders.lift))
       }
 
   /** `val a, b = …` / `var a, b = …` — a binding that names several things (`00 §2`).
@@ -462,10 +462,14 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val valDecl: PackratParser[Stmt] =
     multiDecl("val", mutable = false) |
       op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
-        case n ~ t ~ v => ValDecl(n, t, v)
+        case n ~ t ~ v => ValDecl(n, t, Placeholders.lift(v))
       }
 
-  protected lazy val exprStmt: PackratParser[Stmt] = expression ^^ (e => ExprStmt(e).setPos(e.pos))
+  /** A statement-level expression is the last of the three places a placeholder closes at
+   * (`12 §5c`) — it is what stops one from reaching past the statement it was written in.
+   */
+  protected lazy val exprStmt: PackratParser[Stmt] =
+    expression ^^ (e => ExprStmt(Placeholders.lift(e)).setPos(e.pos))
 
   /** `a, b` standing alone — a function's result list as its trailing expression. It is tried
    * after the assignment form, which starts the same way and is settled by its `=`.
@@ -492,8 +496,8 @@ class SyslParser(val source: Source) extends DeclParser {
   /** What a function hands back: one expression, or the several its result list declares. */
   protected lazy val resultValue: PackratParser[Expr] =
     expression ~ rep(op(",") ~> expression) ^^ {
-      case e ~ Nil  => e
-      case e ~ more => ResultList(e :: more).setPos(e.pos)
+      case e ~ Nil  => Placeholders.lift(e)
+      case e ~ more => ResultList((e :: more).map(Placeholders.lift)).setPos(e.pos)
     }
 
   protected lazy val breakStmt: PackratParser[Stmt] =
@@ -670,9 +674,6 @@ class SyslParser(val source: Source) extends DeclParser {
 
   protected lazy val fieldPattern: Parser[(String, Pattern)] =
     ident ~ opt(op(":") ~> pattern) ^^ { case n ~ p => (n, p.getOrElse(IdentPattern(n))) }
-
-  protected lazy val wildcard: Parser[Unit] =
-    accept("'_'", { case t: lexical.Identifier if t.chars == "_" => () })
 
   /** A pattern literal: any scalar literal, or a negated numeric literal. */
   protected lazy val patternLit: Parser[Expr] =

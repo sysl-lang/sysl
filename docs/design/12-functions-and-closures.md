@@ -611,6 +611,72 @@ lightweight answer, not the general one.
   to mean a struct return, and that is an ABI question rather than a language one. Until it is
   settled, an `extern` result is one type and a comma there does not parse.
 
+## 5c. Leaving the parameter blank — the `_` placeholder
+
+The arrow form of §5 names its parameter and then uses it once. Where the name carries nothing —
+`x -> x + 1`, `x -> x.timestamp` — **`_` stands in for the parameter and the arrow goes away**:
+
+```
+xs.map(_ + 1)                 // xs.map(x -> x + 1)
+xs.filter(_ > 0)              // xs.filter(x -> x > 0)
+xs.sort_by(_.timestamp)       // xs.sort_by(x -> x.timestamp)
+xs.fold(_ + _)                // xs.fold((a, b) -> a + b)
+```
+
+**Each occurrence introduces one parameter, in the order they are written.** `_ + _` is a closure of
+two parameters, not one used twice — a name is what says "this one again", and the placeholder's
+whole purpose is not having one. So `_ - _` on `(7, 2)` is `5`, and a closure that needs its argument
+twice is written with the arrow.
+
+**The closure is the smallest enclosing expression, and exactly three things end one:**
+
+- **a parenthesized group** — `(_ + 1) * 2` is `(x -> x + 1) * 2`, not `x -> (x + 1) * 2`;
+- **a call argument** — `xs.map(_ + 1)` hands `map` a closure rather than becoming one;
+- **a statement-level expression** — a binding's initializer, a `return` value, the right side of an
+  assignment, an expression statement.
+
+Everything else is inside the body and the placeholder reaches out through it: operators, field
+selection, indexing, and the receiver position of a call. So `a[_]` is `x -> a[x]`, `-_` is
+`x -> -x`, and `_.len` is `x -> x.len`.
+
+**A bare `_` standing directly at an argument is absorbed by the call it is an argument of**, which
+is the one case where the argument does not end the closure — there would be nothing left in it but
+the parameter:
+
+```
+xs.map(f(_, 0))               // xs.map(x -> f(x, 0))
+xs.map(f(0, _))               // xs.map(x -> f(0, x))
+xs.map(f(_, _))               // xs.map((x, y) -> f(x, y))
+```
+
+This is the ordinary way to fix some of a function's arguments and leave the rest, and it is a
+**closure that captures the ones it was given** — not currying, and not a partial-application
+mechanism of its own (§10). `f(_, 0)` and `x -> f(x, 0)` are the same closure written twice.
+
+**The types come from the context, exactly as §5's do.** A placeholder closure is an ordinary
+closure by the time anything types it, so a position that says what it takes — a parameter, an
+annotated binding — is what gives the parameter its type, and a position that says nothing is the
+same diagnostic any un-annotated closure gets there:
+
+```
+apply(f: int -> int, x: int) -> int = f(x)
+
+print(apply(_ + 1, 5))                    // 6
+var g: &Fn(int) -> int = _ * 3            // fine — the annotation says what it takes
+var h = _ * 3                             // refused: nothing says what this closure takes
+```
+
+**An array element and a subscript are inside the body, not boundaries**, so `[_ + 1]` is one
+closure yielding a one-element array rather than an array holding one closure. Where the element is
+meant to be the closure, the parenthesized group is what says so — `[(_ + 1)]` — and the arrow form
+is always available and always unambiguous. The three boundaries are kept few on purpose: a rule a
+reader can hold is worth more here than one that guesses right more often, because the two readings
+of a placeholder both compile and only one was meant.
+
+**`_` in a pattern is untouched.** A match arm's `_` is a wildcard pattern (`09`), parsed by the
+pattern grammar, and the placeholder is an *expression*; the two never stand in the same position, so
+neither had to give ground to the other.
+
 ## 6. The type of a callable — the `Fn` trait
 
 A callable's type is the built-in **call trait `Fn`**, written with the parameter and return
@@ -1023,10 +1089,16 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
   that had only the trait could be given to no C interface that calls back. `*extern(A) -> R` is that
   word and nothing else (§6a). The general rule and the exception are both about representation, and
   the exception is where the representation is somebody else's to choose.
-- **No currying, no partial application.** `Fn(A, B) -> C` is a two-argument callable, not
-  `Fn(A) -> Fn(B) -> C`; a bare arrow type is `A -> B` with a single domain, and multi-argument
-  types are parenthesized `(A, B) -> C` (§6), never chained. Partial application is a library
-  concern (a closure that captures the first argument), not a language one.
+- **No currying.** `Fn(A, B) -> C` is a two-argument callable, not `Fn(A) -> Fn(B) -> C`; a bare
+  arrow type is `A -> B` with a single domain, and multi-argument types are parenthesized
+  `(A, B) -> C` (§6), never chained. *(This bullet also said partial application was "a library
+  concern, not a language one". That half is withdrawn — §5c gives `f(_, 0)` as a spelling for it.
+  The substance was right and only the conclusion was wrong: partial application here **is** a
+  closure that captures the arguments it was given, exactly as the bullet described, and what §5c
+  adds is a way to write that closure without naming a parameter. Nothing is curried, no callable
+  gained an arity it did not have, and `f(_, 0)` and `x -> f(x, 0)` are the same closure. A feature
+  being sugar for something already in the language is a reason to spell it, not a reason to
+  refuse it.)*
 - *(An earlier draft of this chapter listed "no variadic parameters" here. That was wrong and is
   reversed: a sysl function may be variadic, and §9 is the feature. Anything C can do, sysl must be
   able to do — a capability C has and sysl lacks is a place sysl cannot be used, and nothing belongs
