@@ -164,7 +164,9 @@ Nothing in this section is an independent decision; it is what §1–§4 and `13
 5. **Check** bodies against the merged scope — parallel across a module's files, and across
    independent modules.
 6. **Emit.** One object file per source file, plus the instantiations of §4.
-7. **Link.** Objects, plus whatever the link directives of §Open c ask for.
+7. **Link.** Objects, then the archives that resolve them, then the system libraries the target needs
+   — left to right, because that is the order the scan pulls archive members in. Which system
+   libraries those are is the driver's answer today and §Open c's in general.
 
 Step 4 never needs a dependency to have been **compiled** — only parsed. That is `13` §2's
 parse-only interface extraction doing the work it was chosen for, and it is what makes steps 4–6
@@ -263,6 +265,24 @@ property of what that library happens to need rather than a rule about where C m
   definition rather than a flag that only `extern` understands.
 - **c. Link directives.** How a module of externs tells the driver to pass `-lc` and friends. Most
   naturally a per-module directive sitting beside the externs it supports.
+
+  **The one library the standard module itself needs is carried by the driver in the meantime**, and
+  the shape of that stopgap is an argument for the general mechanism rather than against it.
+  `sysl.math` binds libm, and where libm *lives* is a property of the host: Darwin keeps it in
+  `libSystem` and Windows in the CRT, both of which the driver links unasked, while a program hosted
+  on ELF has to say `-lm` and a freestanding one must not, having no libc for it to be in. So the
+  driver answers that off the target's `Os` — a decision per object format, written out per case so
+  that a target added to the registry is a decision rather than whichever arm a default reached.
+
+  What that does not scale to is a *program's* externs. A binding to `libpng` or `libz` is written by
+  whoever writes the module, and the driver cannot carry a list of libraries it has never heard of.
+  The stopgap is bounded to the standard module because the standard module is the one the compiler
+  ships; every other module needs this item built.
+
+  It also cannot be tested by linking. A program that calls `sqrt` links on a Mac whether or not
+  `-lm` was passed, so the machine that finds a missing directive is never the machine the compiler
+  was developed on — which makes the assertion one about the *command line*, and `LinkCommandTests`
+  is that.
 - **d. Export to C.** The reverse of `12` §1's `extern`: mangling suppression plus the ABI
   annotation of (b), applied to a *definition* so existing C can call into sysl. A C replacement is
   adopted incrementally, so this direction matters as much as the importing one.
