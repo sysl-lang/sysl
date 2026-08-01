@@ -101,6 +101,65 @@ class MemoryModelClaimTests extends AnyFreeSpec with RunSupport with CodegenSupp
     "and a scalar is referenced without 'int' needing a constructor of its own" in {
       run("var n: &int = 0\nn = 5\nvar m: &int = 7\nprint(*n, *m + *n)") shouldBe "5 12\n"
     }
+
+    // The chapter names five positions and then generalizes past them — "the rule is about the
+    // types, not about the syntax: a T written where a &T is expected goes on the heap, whatever
+    // produced it". These are the positions the list does not name, kept together because each is
+    // reached by a different part of the analyzer: an element type, a tuple part, and a place being
+    // assigned into rather than a binding being introduced.
+    "an array element and a tuple part, neither of which the chapter's list names" in {
+      val src =
+        s"""$point
+           |var arr: [2]&Point = [Point(1, 2), Point(3, 4)]
+           |var tu: (&Point, int) = (Point(5, 6), 7)
+           |print(arr[1].x, tu.0.y, tu.1)
+           |""".stripMargin
+
+      run(src) shouldBe "3 6 7\n"
+    }
+
+    "a place being assigned into, for an element, a field, and one arm of a multi-assignment" in {
+      val src =
+        s"""$point
+           |struct Holder
+           |    p: &Point
+           |var arr: [2]&Point = [Point(1, 1), Point(2, 2)]
+           |arr[0] = Point(8, 0)
+           |var h = Holder(Point(1, 1))
+           |h.p = Point(9, 0)
+           |var a: &Point = Point(1, 1)
+           |var b: &Point = Point(2, 2)
+           |a, b = Point(3, 0), Point(4, 0)
+           |print(arr[0].x, h.p.x, a.x, b.x)
+           |""".stripMargin
+
+      run(src) shouldBe "8 9 3 4\n"
+    }
+
+    // A default is written once at the declaration and produced at each call that omits the
+    // argument, so the expectation has to reach it there rather than at the call — and a named
+    // argument reaches the parameter it names rather than the one in its position. Both spellings
+    // arrived after the positions above were pinned, and nothing had asked whether a construction
+    // standing in either of them is boxed.
+    "a default parameter value, produced per call that omits it" in {
+      val src =
+        s"""$point
+           |from(p: &Point = Point(11, 12)) -> int = p.x + p.y
+           |print(from(), from(Point(1, 2)), from())
+           |""".stripMargin
+
+      run(src) shouldBe "23 3 23\n"
+    }
+
+    "a named argument, which reaches the parameter it names rather than its position" in {
+      val src =
+        s"""$point
+           |pair(n: int, p: &Point) -> int = n + p.x
+           |print(pair(p = Point(5, 0), n = 1))
+           |""".stripMargin
+
+      run(src) shouldBe "6\n"
+    }
   }
 
   "a value copies, and a reference inside one is shared by the copy rather than duplicated" in {
