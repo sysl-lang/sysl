@@ -366,6 +366,19 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |""".stripMargin) shouldBe "64\n"
   }
 
+  "a routine entirely about a type is well-formed and cannot be called" in {
+    // The gap the mechanism makes visible (`10 § Open a`): inference reads the binding, and a call
+    // may not write its type arguments — so a function whose parameter appears nowhere in its
+    // signature has no way to say which instantiation is meant. Taking a value of `T` is the
+    // workaround, and the diagnostic is the one that entry already gives.
+    err(width +
+      """describe[T: Width]() -> usize = T.bits()
+        |
+        |main()
+        |    print(describe[u32]())
+        |""".stripMargin) should include("cannot be given type arguments at a call")
+  }
+
   "a generic container can size storage while running, now that a bound can promise a value" in {
     // `07 § Not yet` said a repeat needs a value in its value position and no bound promises one,
     // so `var storage: []K` was the empty slice and nothing widened it. A trait declaring an
