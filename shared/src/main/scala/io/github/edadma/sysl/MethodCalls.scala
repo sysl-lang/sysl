@@ -128,12 +128,55 @@ trait MethodCalls extends FuncAddress {
    * own to be matched by, so `c.mul(2)` where the candidates take a `Complex` and a `real` is one of
    * the calls that determines nothing (`08 § One name, one member`).
    */
-  protected def pickOverload(owner: String, mname: String, args: List[Expr], subject: String)(
+  protected def pickOverload(
+      owner: String,
+      mname: String,
+      args: List[Expr],
+      subject: String,
+      via: Set[String] = Set.empty,
+  )(
       params: String => Option[List[Type]],
   ): String =
     memberAlts.get((owner, mname)) match
       case None => mname
-      case Some(cands) =>
+      case Some(everything) =>
+        // **A bound answers ahead of everything else.** Inside a generic body `T.zero()` means the
+        // `zero` the bound promised, and at an instantiation the parameter has become an ordinary
+        // type whose table may hold several — so the traits the parameter was bounded by are what
+        // the candidates are narrowed to first. Without this a body is refused for an ambiguity its
+        // own signature already settled, and which the caller has no way to speak to.
+        val all =
+          if via.isEmpty then everything
+          else
+            val named = everything.filter(c => memberTrait.get((owner, c)).exists(via))
+
+            if named.isEmpty then everything else named
+
+        // **Scope decides before the arguments do**, because the two axes answer different
+        // questions and only this one can answer its own. Two implementations of one trait differ
+        // in their argument lists and are told apart by a call's values; two *different traits*
+        // may declare the same name with the same parameters — `zero()` and `zero()` — and nothing
+        // in the call could ever tell those apart. What tells them apart is that a trait's member
+        // is reachable only where the trait can be named (`13 §2`), so a file reaching one of them
+        // has said which by what it imported.
+        val cands = inScope(owner, all)
+
+        if cands.isEmpty then outOfScope(owner, mname, all, subject)
+
+        // One survivor is the whole answer, and it is the ordinary case once two libraries have each
+        // implemented something for a built-in: the arguments are never consulted, which is what
+        // makes a nullary `zero()` resolvable at all.
+        if cands.length == 1 then return cands.head
+
+        // Several still in scope from **different** traits is a use that reached both, and no rule
+        // below can settle it — the argument test is about one trait's implementations. Reported
+        // where it happened, naming what to stop importing or how to say which was meant.
+        val traits = cands.flatMap(c => memberTrait.get((owner, c))).distinct
+
+        if traits.length > 1 then
+          err(s"'$mname' on $subject comes from ${conjoin(traits.map(qn))}, and both are in scope " +
+            "here — nothing in the call says which was meant")
+
         val supplied = args.map(probeType)
         val from = s"'$mname' comes from ${quantity(cands.length, "implementation")} of one trait on $subject"
 
@@ -166,6 +209,23 @@ trait MethodCalls extends FuncAddress {
               "write the argument at the type of the implementation that was meant")
           case _ => err(s"$from, and the arguments do not say which was meant")
 
+  /** The members of `cands` a use site here can actually reach: a type's **own** are always among
+   * them, and one an `impl` brought only where its trait can be named (`13 §2`).
+   */
+  protected def inScope(owner: String, cands: List[String]): List[String] =
+    cands.filter(c => memberTrait.get((owner, c)).forall(traitInScope))
+
+  /** What to say where a type has the member under every spelling and the file may reach none of
+   * them — which is the whole of what an import would have changed, so the message is the import.
+   */
+  protected def outOfScope(owner: String, mname: String, cands: List[String], subject: String): Nothing = {
+    val traits = cands.flatMap(c => memberTrait.get((owner, c))).distinct.map(qn)
+
+    err(s"$subject has '$mname' from ${conjoin(traits)}, and " +
+      (if traits.length == 1 then s"that trait is not in scope here — import it to reach the member"
+       else "none of those traits is in scope here — import the one that was meant"))
+  }
+
   /** Whether one of a type's members takes a `...`, asked of the member table rather than of the
    * lowered signature — a tail is not something a parameter list records.
    */
@@ -185,8 +245,8 @@ trait MethodCalls extends FuncAddress {
     pickOverload(base, mname, args, show(rty))(c => probe(funcInsts(memberFuncName(rty, c))._1.tail.map(_._2)))
 
   /** `Type.f(…)` — an associated function, which has no receiver to drop off the front. */
-  protected def pickAssociated(tname: String, mname: String, args: List[Expr]): String =
-    pickOverload(tname, mname, args, qn(tname))(c => funcInsts.get(s"$tname.$c").map(_._1.map(_._2)))
+  protected def pickAssociated(tname: String, mname: String, args: List[Expr], via: Set[String] = Set.empty): String =
+    pickOverload(tname, mname, args, qn(tname), via)(c => funcInsts.get(s"$tname.$c").map(_._1.map(_._2)))
 
   /** The type an argument already has, with nothing expected of it and nothing said about whatever
    * goes wrong — the ordinary analysis that follows reports that, in the place it belongs.

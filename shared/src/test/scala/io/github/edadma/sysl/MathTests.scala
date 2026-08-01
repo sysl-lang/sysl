@@ -585,21 +585,45 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err("import sysl.math.*\nprint(sysl_sqrt(2.0))") should include("sysl_sqrt")
     }
 
-    // The price of the members arriving with the type: the trait's names are now `real`'s and
-    // `f32`'s names, so a program cannot give either width a member of its own by one of them. The
-    // import makes no difference — this is refused with or without it. It is refused rather than
-    // shadowed, which is the answer that matters: two traits offering `sqrt` for one type would
-    // leave a call with no way to say which was meant.
-    "a program may not give a float a member the trait already names" in {
-      val clash =
+    // The library claims no names. A trait's members are reachable where the **trait** is in scope
+    // (`13 §2`), so `Float` giving `real` a `sqrt` leaves the name free for anyone else's trait to
+    // give it another — which is what keeps a shipped library implementing a wide trait for a
+    // built-in from spending those names on every program that will ever compile.
+    // `super.run`, because this suite's own `run` prepends the import and the point here is a file
+    // that did not write one.
+    "a program may give a float a member the trait already names" in {
+      val mine =
         """trait Mine
           |    sqrt(self) -> real
           |
           |impl Mine for real
-          |    sqrt(self) -> real = 42.0""".stripMargin
+          |    sqrt(self) -> real = 42.0
+          |
+          |main()
+          |    var x: real = 9.0
+          |    print(x.sqrt())""".stripMargin
 
-      err(clash) should include("type 'real' already has a member named 'sqrt'")
-      err(importing + clash) should include("type 'real' already has a member named 'sqrt'")
+      super.run(mine) shouldBe "42\n"
+    }
+
+    // And with both in scope the call is the thing that cannot be resolved — reported where it
+    // happens, naming both traits, rather than one of them silently winning.
+    "a call reaching both traits' member is refused, not silently resolved" in {
+      val both =
+        """import sysl.math.*
+          |
+          |trait Mine
+          |    sqrt(self) -> real
+          |
+          |impl Mine for real
+          |    sqrt(self) -> real = 42.0
+          |
+          |main()
+          |    var x: real = 9.0
+          |    print(x.sqrt())""".stripMargin
+
+      err(both) should include("'sqrt'")
+      err(both) should include("which was meant")
     }
 
     // `real` and `f64` are one type under one owner key (`02`), so the library's implementation is

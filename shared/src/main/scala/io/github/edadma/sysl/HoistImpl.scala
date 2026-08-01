@@ -141,8 +141,23 @@ trait HoistImpl extends ImplConformance {
     // The first implementation of a trait for a type files its members under the names they were
     // written with; each one after it under names that differ, since a type's members are one
     // namespace whatever brought them (`08`). Nothing outside the hoist reads the suffix: every way
-    // of reaching one of these members arrives with the argument list that says which is meant.
-    val home = outer.copy(alt = if already.isEmpty then "" else s".${already.length + 1}")
+    // of reaching one of these members arrives with something that says which is meant — the
+    // argument list for two implementations of one trait, and which trait is in scope for two
+    // different traits.
+    //
+    // A **different trait** holding one of these names takes a suffix too, rather than the refusal
+    // it used to take. A trait's member is reachable only where the trait can be named (`13 §2`), so
+    // two traits declaring one name for a type are two members a use site tells apart — which is
+    // what lets a program declare its own `Zero` for a float width the library has already given a
+    // `zero`. A name held by the type's **own** body is a real collision and is reported per member,
+    // so the search stops at one rather than stepping over it.
+    val floor = if already.isEmpty then 1 else already.length + 1
+
+    def heldByAnother(a: String) =
+      tr.methods.exists(tm => memberTrait.get((outer.key, tm.name + a)).exists(_ != impl.traitName))
+
+    val nth  = LazyList.from(floor).find(i => !heldByAnother(if i == 1 then "" else s".$i")).get
+    val home = outer.copy(alt = if nth == 1 then "" else s".$nth", fromTrait = Some(impl.traitName))
 
     traitImpls((impl.traitName, home.key)) =
       already :+ TraitImpl(impl, written, wkey, home.alt, home.tparams,

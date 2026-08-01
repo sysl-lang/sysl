@@ -61,6 +61,16 @@ trait AnalyzerBase extends Scoping {
   protected var retTy: Type               = Type.Unit
   protected var tsubst: Map[String, Type] = Map.empty
 
+  /** What the body's type parameters were **bounded** by, alongside what they were substituted with.
+   *
+   * `tsubst` says a parameter has become `int` at this instantiation; this says the signature asked
+   * it for `Zero`. Both are needed to reach a member: the substitution finds the type's table, and
+   * the bound says which of the members that table holds under one name was promised — a question
+   * the instantiation would otherwise have no way to answer, since two traits may declare one name
+   * for one type and neither the call's arguments nor its scope is the thing that settled it.
+   */
+  protected var tbounds: Map[String, List[BoundRef]] = Map.empty
+
   /** Whether the function being analyzed declared its result as a **list** (`12 §5b`) rather than
    * as one type. `retTy` is the tuple its parts lay out as either way; this is what says whether
    * the body writes `a, b` or `(a, b)`, and whether a call yielding a list may stand in its result.
@@ -111,6 +121,7 @@ trait AnalyzerBase extends Scoping {
     pendingNested = Nil
     outerNested = Set.empty
     blockDeclares = Set.empty
+    tbounds = Map.empty
   }
 
   /** Runs `body` and then restores every table the emitted program is built from.

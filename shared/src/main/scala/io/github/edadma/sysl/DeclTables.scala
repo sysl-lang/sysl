@@ -271,6 +271,18 @@ trait DeclTables extends Reporting {
    */
   protected val memberAlts = mutable.LinkedHashMap.empty[(String, String), List[String]]
 
+  /** Which trait a member came from, keyed by (type name, the name it is filed under), for the
+   * members an `impl` block brought. A type's **own** members are absent, which is what tells the
+   * two apart at a lookup.
+   *
+   * A member is reachable only where the trait that declared it can be named (`13 §2`), so this is
+   * what a call is filtered by: an entry here is a question to ask of the use site's scope, and no
+   * entry is a member that arrives with its type and is reachable wherever the type is. Without it
+   * every trait in a program would share one namespace per type, and the first library to implement
+   * a wide trait for a built-in would claim those names from everybody.
+   */
+  protected val memberTrait = mutable.LinkedHashMap.empty[(String, String), String]
+
   /** Which trait default a member was copied from, keyed by the name the copy was lowered to.
    *
    * A default is materialized per implementing type (`02`), so one source body becomes several

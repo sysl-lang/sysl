@@ -827,6 +827,9 @@ trait ProgramWalk
     // A member's body sees `Self` alongside whatever type parameters it was instantiated with, so
     // the one substitution answers both questions and nothing downstream has to know the difference.
     tsubst = subst ++ memberSelf.getOrElse(name, Map.empty)
+    // What the signature asked of those parameters, kept beside what they became: an instantiated
+    // body still has to say which trait's member a name on a type parameter meant.
+    tbounds = f.bounds
 
     // A result list is the signature's, and the body produces the tuple its parts lay out as — so
     // the body is analyzed against that tuple, with the list itself recorded beside it as the one
