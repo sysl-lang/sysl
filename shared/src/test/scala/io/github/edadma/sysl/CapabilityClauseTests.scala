@@ -254,11 +254,22 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
   "the rule reaches every place a module's code can be written" - {
 
-    // A `val` holds plain data, so it cannot *be* a string — but its initializer is code like any
+    // A `val` counts nothing, so it cannot *be* a string — but its initializer is code like any
     // other, and joining two strings to measure the result allocates just the same.
     "a module-level val's initializer" in {
       errOf("thing/a.sysl" -> "module thing\nno alloc\n\nval width: usize = (\"a\" + \"b\").bytes.len\n",
         "main.sysl" -> "print(thing.width)") should include("needs an allocator")
+    }
+
+    // …while the `val` a driver module actually wants is admitted, which matters because a driver is
+    // the module most likely to declare this clause. A constant address is a constant tree
+    // (`13 §7`): it runs nothing at all, so there is nothing here for an allocator to be reached by.
+    "but a register block named at file scope runs nothing, so it is admitted" in {
+      irOf(
+        "thing/a.sysl" ->
+          "module thing\nno alloc\n\nconst UART: usize = 0x1000\nval regs: *u32 = ptr_cast(UART)\n",
+        "main.sysl" -> "print(usize(thing.regs))",
+      ) should include("@thing$regs = private constant ptr inttoptr (i64 4096 to ptr)")
     }
 
     "a method of a trait implementation" in {

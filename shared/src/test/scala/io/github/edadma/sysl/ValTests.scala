@@ -254,6 +254,84 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |print("ok")""".stripMargin,
       ) should include("@p")
     }
+
+    "an enum whose payload is one" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |enum Slot
+          |    Empty
+          |    At(p: *u8)
+          |end Slot
+          |mk() -> Slot = At(malloc(8))
+          |val s: Slot = mk()
+          |s match
+          |    At(p) -> print(str(usize(p) != 0))
+          |    Empty -> print("empty")""".stripMargin,
+      ) shouldBe "true\n"
+    }
+
+    "a generic type instantiated at one" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |struct Cell[T]
+          |    p: *T
+          |end Cell
+          |mk() -> Cell[int] = Cell(ptr_cast(malloc(8)))
+          |val c: Cell[int] = mk()
+          |c.p[0] = 6
+          |print(str(c.p[0]))""".stripMargin,
+      ) shouldBe "6\n"
+    }
+
+    // A tuple is a struct with its fields named for their positions, so the recursive half of the
+    // rule reaches it — and reaches it in both directions, which is the discriminating pair.
+    "a tuple with one in it, where a tuple with a reference is still refused" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |mk() -> (int, *u8) = (1, malloc(8))
+          |val t: (int, *u8) = mk()
+          |print(str(t.0))""".stripMargin,
+      ) shouldBe "1\n"
+
+      err(
+        """struct Node
+          |    v: int
+          |end Node
+          |mk() -> (int, &Node) = (1, Node(2))
+          |val t: (int, &Node) = mk()
+          |print("ok")""".stripMargin,
+      ) should include("a count with nowhere to write the release")
+    }
+
+    "and one 'val' is filled from another" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |val a: *u8 = malloc(8)
+          |val b: *u8 = a
+          |print(str(usize(a) == usize(b)))""".stripMargin,
+      ) shouldBe "true\n"
+    }
+
+    // The rule this relaxes is the *module* one — a local `val` was never held to it, since a frame
+    // ends and whatever it counted is released there. Pinned so the two levels stay told apart.
+    "while a local one held a pointer all along, having a frame to end in" in {
+      run(
+        """extern malloc(n: usize) -> *u8
+          |f() -> int
+          |    val p: *int = ptr_cast(malloc(8))
+          |    p[0] = 5
+          |    p[0]
+          |end f
+          |print(str(f()))""".stripMargin,
+      ) shouldBe "5\n"
+    }
+
+    "and another module's is reached by naming it" in {
+      irIn(
+        ("dev", "d.sysl", "module dev\nconst UART: usize = 0x1000\nval regs: *u32 = ptr_cast(UART)"),
+        ("", "main.sysl", "print(str(usize(dev.regs)))"),
+      ) should include("@dev$regs = private constant ptr inttoptr (i64 4096 to ptr)")
+    }
   }
 
   "a constant address costs no initializer" - {
@@ -271,6 +349,52 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
 
     "and so is a null one" in {
       ir("val p: *u32 = null\nprint(\"ok\")") should include("@p = private constant ptr null")
+    }
+
+    // A pointer to a trait is two words (`03`), so its empty value is not the one-word `null` — the
+    // one place the constant form has to look at the type rather than at the tree.
+    "including a null at a trait pointer, which is two words rather than one" in {
+      ir(
+        """trait Shape
+          |    area(self) -> int
+          |end Shape
+          |val p: *Shape = null
+          |print("ok")""".stripMargin,
+      ) should include("@p = private constant { ptr, ptr } zeroinitializer")
+    }
+
+    "and an array of them, element by element" in {
+      ir("val ps: [2]*u8 = [null, null]\nprint(\"ok\")") should
+        include("@ps = private constant [2 x ptr] [ptr null, ptr null]")
+    }
+
+    "and a repeat of one, written out as a global has no loop to run" in {
+      ir("val ps: [3]*u8 = [null; 3]\nprint(\"ok\")") should
+        include("@ps = private constant [3 x ptr] [ptr null, ptr null, ptr null]")
+    }
+
+    // The address of code is the same shape and lands the same way: a reset vector read as
+    // something callable, which is what a freestanding program starts from.
+    "and an address read as the address of a function" in {
+      ir(
+        """const RESET: usize = 0x8000
+          |val entry: *extern() -> unit = ptr_cast(RESET)
+          |print("ok")""".stripMargin,
+      ) should include("@entry = private constant ptr inttoptr (i64 32768 to ptr)")
+    }
+
+    // The whole point, on the target it is for: no OS, no prologue that has run, and the register
+    // block still readable from the first instruction.
+    "on a freestanding target as much as on this one" in {
+      val riscv = Target.all.find(_.name == "riscv64-freestanding").get
+
+      irFor(
+        riscv,
+        """const UART: usize = 0x10000000
+          |val regs: *u32 = ptr_cast(UART)
+          |go() = regs[0] = 1u32
+          |go()""".stripMargin,
+      ) should include("@regs = private constant ptr inttoptr (i64 268435456 to ptr)")
     }
 
     // The other side of the same line: an address a call produces is code, so it is a `global` the

@@ -571,8 +571,8 @@ trait ProgramWalk
     // stays in this category rather than becoming code. It matters where it is used: a register block
     // reached before anything has run is exactly what a freestanding program wants, and an ordered
     // initializer would be a store to make before the storage could be read.
-    case _: TNullLit                             => true
-    case TCast(v, (_: Type.Ptr) | (_: Type.CFn)) => isStatic(v)
+    case _: TNullLit                                    => true
+    case TCast(_: TIntLit, (_: Type.Ptr) | (_: Type.CFn)) => true
 
     case _ => false
 

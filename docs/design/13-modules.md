@@ -761,8 +761,8 @@ A `*T` counts nothing, so the reason above does not reach it: there is no releas
 `val` promises is that **its own storage** is written once and never again — the ordinary meaning the
 word carries — and holding an address keeps that promise exactly as holding a number does.
 
-It was refused once, for the depth rule two paragraphs up, and that argument does not survive being
-looked at. Read-only at every depth is a promise about the storage this declaration lays down, and it
+It was refused once, on the read-only-at-every-depth rule above, and that argument does not survive
+being looked at. Read-only at every depth is a promise about the storage this declaration lays down, and it
 is kept where it is made: `k[0] = …` and `&k[0]` are both refused *there*. It was never a promise
 about what a value inside the storage addresses, and it could not be — slicing a `val` and writing
 `&v[0]` yields a `*T` today, on purpose, and is how a table reaches C (`07 § A view that may not be

@@ -43,18 +43,15 @@ trait StaticEmitter extends Emitter {
       s"[${List.fill(arrayTy.length)(s"$elem $v").mkString(", ")}]"
 
     // A device address written as a number: `inttoptr` is a constant expression, so the pointer is
-    // in the object file rather than stored into it by a prologue.
-    case TNullLit(ty)                          => if ty.llvm == "ptr" then "null" else "zeroinitializer"
-    case TCast(v, _) if isAddressWidth(v.ty)   => s"inttoptr (${v.ty.llvm} ${constantValue(v)} to ptr)"
-    case TCast(v, _)                           => constantValue(v)
+    // in the object file rather than stored into it by a prologue. Only an *integer* read as an
+    // address arrives here, which is what `ProgramWalk.isStatic` admits — a pointer reinterpreted as
+    // another pointer is a name rather than a literal, so it is code and never reaches this.
+    case TCast(v, _) => s"inttoptr (${v.ty.llvm} ${constantValue(v)} to ptr)"
+
+    // A trait pointer is two words, so its empty value is not the one-word `null`.
+    case TNullLit(ty) => if ty.llvm == "ptr" then "null" else "zeroinitializer"
 
     case other => sys.error(s"unreachable constant ${other.getClass.getSimpleName}")
-
-  /** Whether a constant is an *integer* being read as an address, which is the one direction that
-   * needs an `inttoptr` written round it. A pointer reinterpreted as another pointer needs nothing:
-   * one address is the other.
-   */
-  private def isAddressWidth(t: Type): Boolean = Type.underlying(t).isInstanceOf[Type.Integer]
 
   /** A float constant at the width it is stored at.
    *

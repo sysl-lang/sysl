@@ -106,6 +106,17 @@ class ExternVarTests
         include("@environ = external global ptr")
     }
 
+    // The one type rule a `val` still has that this does not: a `&T` in a `val` is a count nothing
+    // would ever release, and storage the other side laid down is not this program's to release at
+    // all. Pinned because `12 §1` says so in prose and the analyzer says it by not asking.
+    "a counted reference, which is the one thing a 'val' still refuses" in {
+      val node = "struct Node\n    v: int\nend Node\n"
+
+      ir(node + "extern r: &Node\nprint(str(r.v))") should include("@r = external global ptr")
+      err(node + "mk() -> &Node = Node(1)\nval r: &Node = mk()") should
+        include("a count with nowhere to write the release")
+    }
+
     "a scalar, laid out as the type says" in {
       ir("extern optind: i32\nprint(optind)") should include("@optind = external global i32")
       ir("extern tzoff: i64\nprint(tzoff)") should include("@tzoff = external global i64")
