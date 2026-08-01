@@ -607,6 +607,27 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     // A slice of them, which is the table shape a dispatch loop reads.
+    /** An allocator-free module (`13 §4`, `capabilities.md`) is held to what its calls **reach**, and
+      * taking an address is a way of reaching. Refusing it is conservative in the right direction:
+      * the address is handed to something this compiler cannot see, so if it were not a use here it
+      * would be no use anywhere.
+      *
+      * The allocator-free half is what makes the test discriminating — a rule that refused every
+      * address would pass the second half of this and mean nothing.
+      */
+    "an address in a 'no alloc' module reaches what the function reaches" in {
+      irOf("thing/a.sysl" ->
+        ("module thing\nno alloc\n\nplain(n: i32) -> i32 = n * 2\n" +
+          "addr() -> *extern(i32) -> i32 = &plain\n"),
+        "main.sysl" -> "print(thing.addr()(21))") should include("define")
+
+      errOf("thing/a.sysl" ->
+        ("module thing\nno alloc\n\nboxes(n: int) -> &int = n\n" +
+          "addr() -> *extern(int) -> &int = &boxes\n"),
+        "main.sysl" -> "print(*thing.addr()(1))") should
+        include("an allocator-free module may only call what is allocator-free itself")
+    }
+
     "a slice of them, walked" in {
       run("""double(n: i32) -> i32 = n * 2
             |negate(n: i32) -> i32 = 0i32 - n
