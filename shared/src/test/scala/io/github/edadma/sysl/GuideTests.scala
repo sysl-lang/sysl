@@ -106,7 +106,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
     val out = guide("fft")
 
     out should not include "FAIL"
-    checks(out) shouldBe 102
+    checks(out) shouldBe 105
     sections(out) shouldBe List(
       "-- complex arithmetic",
       "-- a value that renders its own parts",
