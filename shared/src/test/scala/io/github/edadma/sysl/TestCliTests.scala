@@ -67,6 +67,19 @@ class TestCliTests extends AnyFreeSpec with Matchers {
       cli(Config(command = "test", file = program(passing))) shouldBe 1
     }
 
+    // A test is ordinary code and takes a visibility like anything else, and a file-private one is
+    // emitted with `internal` linkage (`13 §2`). The runner reaches it from the same module, so that
+    // costs it nothing — but it is worth pinning, because a runner that resolved a test by symbol
+    // from outside would fail on exactly this and on nothing else.
+    "a file-private test is still one the runner reaches" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      cli(Config(command = "test", file = program("""#test
+                                                    |private t() =
+                                                    |    assert(true, "up")
+                                                    |""".stripMargin))) shouldBe 0
+    }
+
     // A tree with no tests is not a failure — a program is allowed to have none — but it is worth
     // saying, because the alternative is a silent exit 0 that looks exactly like a run that passed.
     "a tree with no tests exits 0 and says so" in {

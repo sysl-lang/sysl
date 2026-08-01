@@ -137,8 +137,8 @@ trait Hoisting extends HoistMembers {
 
       // A constant, a function, and an enum variant are all *values* a bare name can reach, so the
       // three share one namespace and each pass checks the tables filled before it.
-      if constDecls.contains(key) then err(s"constant '${c.name}' is already declared")
-      else for what <- valueNameHolder(key) do err(s"'${c.name}' is already used by $what")
+      if constDecls.contains(key) then duplicate(key, s"constant '${c.name}' is already declared")
+      else for what <- valueNameHolder(key) do duplicate(key, s"'${c.name}' is already used by $what")
       constDecls(key) = c.copy(name = key).setPos(c.pos)
       declScope(key) = currentScope
       recordAccess(key, c.vis)
@@ -151,8 +151,8 @@ trait Hoisting extends HoistMembers {
     case v: ValDecl =>
       val key = Modules.qualify(currentModule, v.name)
 
-      if valDecls.contains(key) then err(s"'${v.name}' is already declared")
-      else for what <- valueNameHolder(key) do err(s"'${v.name}' is already used by $what")
+      if valDecls.contains(key) then duplicate(key, s"'${v.name}' is already declared")
+      else for what <- valueNameHolder(key) do duplicate(key, s"'${v.name}' is already used by $what")
       // `13 §2` — what is visible outside its file states its types, and a module member always
       // could be. A local `val` states nothing to anyone and infers like a `var`.
       if v.typ.isEmpty then
@@ -169,8 +169,8 @@ trait Hoisting extends HoistMembers {
     case e: ExternVarDecl =>
       val key = Modules.qualify(currentModule, e.name)
 
-      if externVarDecls.contains(key) then err(s"'${e.name}' is already declared")
-      else for what <- valueNameHolder(key) do err(s"'${e.name}' is already used by $what")
+      if externVarDecls.contains(key) then duplicate(key, s"'${e.name}' is already declared")
+      else for what <- valueNameHolder(key) do duplicate(key, s"'${e.name}' is already used by $what")
       externVarDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
       declScope(key) = currentScope
       recordAccess(key, e.vis)
@@ -224,11 +224,11 @@ trait Hoisting extends HoistMembers {
       }
       val key = Modules.qualify(currentModule, f.name)
 
-      if funcDecls.contains(key) then err(s"function '${f.name}' is already declared")
-      else if constDecls.contains(key) then err(s"'${f.name}' is already declared as a constant")
-      else if valDecls.contains(key) then err(s"'${f.name}' is already declared as a 'val'")
+      if funcDecls.contains(key) then duplicate(key, s"function '${f.name}' is already declared")
+      else if constDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a constant")
+      else if valDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a 'val'")
       else if externVarDecls.contains(key) then
-        err(s"'${f.name}' is already declared as an 'extern' variable")
+        duplicate(key, s"'${f.name}' is already declared as an 'extern' variable")
       funcDecls(key) = f.copy(name = key).setPos(f.pos)
       declScope(key) = currentScope
       recordAccess(key, f.vis)
@@ -256,9 +256,9 @@ trait Hoisting extends HoistMembers {
     case e: ExternDecl =>
       val key = Modules.qualify(currentModule, e.name)
 
-      if funcDecls.contains(key) then err(s"function '${e.name}' is already declared")
+      if funcDecls.contains(key) then duplicate(key, s"function '${e.name}' is already declared")
       else if externVarDecls.contains(key) then
-        err(s"'${e.name}' is already declared as an 'extern' variable")
+        duplicate(key, s"'${e.name}' is already declared as an 'extern' variable")
       funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
       externDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
       declScope(key) = currentScope

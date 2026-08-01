@@ -21,6 +21,18 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class MethodClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
+  /** One type carrying a property and a method that compute the same way, so that the only thing
+   * differing between the two halves of a case below is which form is written.
+   */
+  private val node =
+    """struct Node
+      |    n: int
+      |
+      |    doubled -> int = self.n * 2
+      |
+      |    scaled(self, k: int) -> int = self.n * k
+      |""".stripMargin
+
   private val point =
     """struct Point
       |    x: int
@@ -117,6 +129,44 @@ class MethodClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "a member may declare its own type parameters even where its type declares none" in {
       run("struct Counter\n    n: int\n    make[T](x: T) -> Counter = Counter(1)\n" +
         "var c = Counter.make(5)\nprint(c.n)") shouldBe "1\n"
+    }
+  }
+
+  /** *"A property **is** a function with the parameter list left off"* (`§ Properties`) — asked of
+   * every memory mode, which is the one place the claim had never been put.
+   *
+   * The trait surface of it is pinned test by test in `TraitPropertyRunTests` (a bound, a table, a
+   * default, an enum, a built-in), and the body spellings in `MethodRunTests`. What none of them
+   * crosses is `03`'s modes: a claim of the form *"a property behaves as a method does"* is
+   * satisfied by any one receiver, so a suite dense at the plain receiver is no evidence at all
+   * about the others. Both forms are therefore asked of each mode **in one test**.
+   */
+  "a property is read through whatever a method is called through" - {
+    "a counted reference answers both" in {
+      run(node +
+        "prop(x: &Node) -> int = x.doubled\n" +
+        "meth(x: &Node) -> int = x.scaled(2)\n" +
+        "var r: &Node = Node(7)\nprint(prop(r), meth(r))") shouldBe "14 14\n"
+    }
+
+    "a raw pointer answers both" in {
+      run(node +
+        "prop(p: *Node) -> int = p.doubled\n" +
+        "meth(p: *Node) -> int = p.scaled(2)\n" +
+        "var owned = Node(9)\nprint(prop(&owned), meth(&owned))") shouldBe "18 18\n"
+    }
+
+    // The mode that answers neither, which is the discriminating half: `get()` is the only thing to
+    // ask a weak reference, so both forms are refused — and each has to say so in its own words
+    // rather than one of them falling through to a message about a name that does not exist.
+    "a weak reference answers neither, and says the same thing about both" in {
+      val onProp = err(node + "prop(w: weak Node) -> int = w.doubled\nvar r: &Node = Node(7)\nprint(prop(r))")
+      val onMeth = err(node + "meth(w: weak Node) -> int = w.scaled(2)\nvar r: &Node = Node(7)\nprint(meth(r))")
+
+      onProp should include("get()")
+      onProp should include("doubled")
+      onMeth should include("get()")
+      onMeth should include("scaled")
     }
   }
 }
