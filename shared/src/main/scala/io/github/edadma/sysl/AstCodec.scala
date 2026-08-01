@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 8
+  val Version: Int = 9
 
   private val Magic = "sysl-ast"
 
