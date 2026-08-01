@@ -254,4 +254,129 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |    print(u32)
         |""".stripMargin) shouldBe "7\n"
   }
+
+  // --- the neighbouring rules, asked rather than assumed -----------------------------------
+
+  "a member arrives with the type, so no import reaches for one" in {
+    // `13 §2`: an `impl` is outside the visibility rule in both directions — a *name* needs an
+    // import and a *member* does not. That was pinned for methods; a member with no receiver is
+    // reached through the type's name rather than through a value, and the rule holds there too.
+    run(
+      """main()
+        |    print(real.epsilon() < 1.0e-15, real.max_value() > 1.0e308)
+        |""".stripMargin) shouldBe "true true\n"
+  }
+
+  "a name still needs the import the member did not" in {
+    err(
+      """main()
+        |    print(pi)
+        |""".stripMargin) should include("pi")
+  }
+
+  "a compiler-provided member is still out of reach for an impl" in {
+    // `08 § Built-in members`: `copy` is answered ahead of the member table, so a member of that
+    // name would be registered and never found — and having no receiver does not change that.
+    err(
+      """trait Duplicate
+        |    copy() -> string
+        |
+        |impl Duplicate for string
+        |    copy() -> string = ""
+        |""".stripMargin) should include("copy")
+  }
+
+  "one trait at two argument lists is told apart by the argument, with no receiver to help" in {
+    // `02 § One implementation per argument list`. A method has its receiver *and* its arguments to
+    // choose by; an associated function has only the arguments, which is the harder half.
+    run(
+      """trait Of[T]
+        |    of(x: T) -> Self
+        |
+        |impl Of[int] for u8
+        |    of(x: int) -> u8 = u8(x) + 1
+        |
+        |impl Of[bool] for u8
+        |    of(x: bool) -> u8 = if x then 100 else 200
+        |
+        |main()
+        |    print(u8.of(9), u8.of(true), u8.of(false))
+        |""".stripMargin) shouldBe "10 100 200\n"
+  }
+
+  "a constrained subtype is a name a call reaches through" in {
+    run(
+      """type Age = int within 0..150
+        |
+        |trait Oldest
+        |    oldest() -> Self
+        |
+        |impl Oldest for Age
+        |    oldest() -> Age = Age(150)
+        |
+        |main()
+        |    print(int(Age.oldest()))
+        |""".stripMargin) shouldBe "150\n"
+  }
+
+  "a generic type's associated function is reached through a bound at its instantiation" in {
+    run(
+      """struct Box[T]
+        |    v: T
+        |
+        |trait Blank
+        |    blank() -> Self
+        |
+        |impl[T: Blank] Blank for Box[T]
+        |    blank() -> Box[T] = Box(T.blank())
+        |
+        |impl Blank for int
+        |    blank() -> int = 0
+        |
+        |empty[U: Blank]() -> U = U.blank()
+        |
+        |main()
+        |    var b: Box[int] = empty()
+        |    print(b.v)
+        |""".stripMargin) shouldBe "0\n"
+  }
+
+  "a closure body reaches the enclosing parameter's bound" in {
+    run(width +
+      """twice[T: Width](x: T) -> usize
+        |    var f = () -> T.bits() * 2
+        |
+        |    f()
+        |
+        |main()
+        |    print(twice(1u32), twice(1u64))
+        |""".stripMargin) shouldBe "64 128\n"
+  }
+
+  "the pointer-width built-ins carry one too" in {
+    run(
+      """trait Wide
+        |    wide() -> Self
+        |
+        |impl Wide for usize
+        |    wide() -> usize = 64
+        |
+        |main()
+        |    print(usize.wide())
+        |""".stripMargin) shouldBe "64\n"
+  }
+
+  "nothing is emitted for an implementation nothing calls" in {
+    // Seven constants at two widths is fourteen functions the library declares. A program that asks
+    // for one must not carry the other thirteen, which is what reachability is for and what a member
+    // reached through a type has to keep obeying.
+    val out = ir(
+      """main()
+        |    print(real.zero())
+        |""".stripMargin)
+
+    out should include("@real.zero")
+    out should not include "@real.nan"
+    out should not include "@f32.zero"
+  }
 }
