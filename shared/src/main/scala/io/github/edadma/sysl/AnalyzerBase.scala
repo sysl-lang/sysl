@@ -703,6 +703,18 @@ trait AnalyzerBase {
    */
   protected val externsUsed = mutable.LinkedHashSet.empty[String]
 
+  /** Every `extern` **variable** the program declares (`12 §1`), by key. Storage the linker supplies
+   * rather than storage this module lays down, which is the whole of what this table says about it:
+   * a reference to one is the same `TGlobal` a module-level `val`'s name becomes, and the only thing
+   * downstream reads this for is which symbols to declare and whether the name is one at all.
+   */
+  protected val externVarDecls = mutable.LinkedHashMap.empty[String, ExternVarDecl]
+
+  /** The extern variables something in the program actually reads or writes, in the order they were
+   * first reached — the same accounting the externs above get, for the same reason.
+   */
+  protected val externVarsUsed = mutable.LinkedHashSet.empty[String]
+
   /** Every function name something has called, which is what decides whether a **library** function
    * is worth analyzing and emitting at all, in either half of it: the printing surface is the
    * largest thing that hangs off this, and a program that never prints should carry none of it.

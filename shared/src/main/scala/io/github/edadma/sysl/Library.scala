@@ -132,15 +132,16 @@ object Library {
    * what holds `key`'s lookup to naming exactly one declaration per spelling.
    */
   private[sysl] def names(stmts: List[Stmt]): Set[String] = stmts.flatMap {
-    case d: ConstDecl  => List(d.name)
-    case d: ValDecl    => List(d.name)
-    case d: FuncDecl   => List(d.name)
-    case d: ExternDecl => List(d.name)
-    case d: StructDecl => List(d.name)
-    case d: TypeDecl   => List(d.name)
-    case d: TraitDecl  => List(d.name)
-    case d: EnumDecl   => d.name :: d.variants.map(_.name)
-    case _             => Nil
+    case d: ConstDecl     => List(d.name)
+    case d: ValDecl       => List(d.name)
+    case d: FuncDecl      => List(d.name)
+    case d: ExternDecl    => List(d.name)
+    case d: ExternVarDecl => List(d.name)
+    case d: StructDecl    => List(d.name)
+    case d: TypeDecl      => List(d.name)
+    case d: TraitDecl     => List(d.name)
+    case d: EnumDecl      => d.name :: d.variants.map(_.name)
+    case _                => Nil
   }.toSet
 
   /** The names the compiler spells for itself, gathered so that each can be held to being declared.

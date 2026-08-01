@@ -277,17 +277,25 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         "print(f(-3))") shouldBe "3\n"
     }
 
-    /** **A global variable cannot be externed.** `extern` declares functions only, so `stdout`,
-      * `stderr`, `stdin`, `environ`, `optarg` and `optind` have no spelling. Where C also offers a
-      * getter there is a way round — `errno` is `__error()` on Darwin, and the next test uses it —
-      * but `stdout` and `environ` have none.
+    /** **A global variable was the gap that half of `stdio.h` sat behind, and it is closed** —
+      * `extern name: type` is the declaration and `ExternVarTests` is where the capability is held.
+      * What stays here is that the sweep above is no longer only about functions: a header's
+      * variables are as much of its interface as its calls, and `environ` had no way round at all.
       */
     "a global variable, which half of stdio's interface is reached through" in {
-      err("extern stdout: *u8\nprint(1)") should include("'(' expected")
-      err("extern environ: **u8\nprint(1)") should include("'(' expected")
+      spellable(
+        "extern environ: **u8",
+        "extern optind: i32",
+        "extern \"__stdoutp\" stdout: *u8",
+        "extern \"__stderrp\" stderr: *u8",
+        "extern \"__stdinp\" stdin: *u8",
+      )
+
+      ir("extern environ: **u8\nprint(environ == null)") should
+        include("@environ = external global ptr")
     }
 
-    "while a global C also exposes as a function is reachable" in {
+    "while a global C also exposes as a function is reachable that way too" in {
       run("extern \"__error\" errno_at() -> *i32\nprint(*errno_at() == 0)") shouldBe "true\n"
     }
 

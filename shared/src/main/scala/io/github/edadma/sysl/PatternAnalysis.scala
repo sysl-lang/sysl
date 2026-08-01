@@ -77,6 +77,11 @@ trait PatternAnalysis extends TypeResolution {
             case None if valKey(written).isDefined =>
               err(s"'$written' is a 'val', which is read while the program runs, so a pattern cannot " +
                 s"match against it — compare it in a guard, or bind a different name")
+            // An `extern` variable is storage too, and storage the linker fills — so there is even
+            // less of a value here to match against than a `val` offers.
+            case None if externVarKey(written).isDefined =>
+              err(s"'$written' is an 'extern' variable, which is read while the program runs, so a " +
+                s"pattern cannot match against it — compare it in a guard, or bind a different name")
             case None if written != name =>
               err(s"'$written' names no variant of ${show(ty)} and no constant, and a qualified " +
                 s"name cannot bind — write the name a program can declare")

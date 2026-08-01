@@ -64,16 +64,46 @@ extern abs(n: int) -> int
 extern memcpy(dst: *u8, src: *u8, n: usize) -> *u8
 ```
 
-It is a function header and nothing else, and the **absence of a body** is the whole difference:
-everything downstream is the ordinary path. A call to an extern is checked against the declared
-signature, has its arity checked, and lowers to an ordinary call; the result type is optional and
-absent means `unit`, exactly as for a function. Externs live in the one function namespace, so an
-extern and a function cannot share a name. An extern is never generic — there is no body to
-monomorphize.
+It is a function header and the **absence of a body** is the whole difference: everything downstream
+is the ordinary path. A call to an extern is checked against the declared signature, has its arity
+checked, and lowers to an ordinary call; the result type is optional and absent means `unit`, exactly
+as for a function. Externs live in the one function namespace, so an extern and a function cannot
+share a name. An extern is never generic — there is no body to monomorphize. A declaration nothing
+calls is not emitted at all, so declaring more than a program uses costs nothing.
 
-**The name is the symbol.** `extern abs` binds to the C symbol `abs`; there is no separate link
-name to give (`§ Open f`). A declaration nothing calls is not emitted at all, so declaring more
-than a program uses costs nothing.
+**An `extern` also declares a variable, written `name: type`:**
+
+```
+extern environ: **u8
+extern optind: i32
+```
+
+What follows the name is what says which of the two a declaration is — a parameter list makes it a
+function, a type makes it storage — and everything else about the form is shared: the optional link
+name below, the visibility rules, the one declaration per symbol, and the rule that a name unused is
+a name unemitted.
+
+**It is here because a C library's interface is not only its calls.** `stdout`, `stderr` and `stdin`
+are variables, and half of `stdio.h` is reached through them; so are `environ`, `optarg`, `optind`,
+`tzname` and `sys_errlist`. Where C also offers a getter there is a way round — `errno` is `__error()`
+on Darwin, and an ordinary `extern` reaches it — but `stdout` has none that is the same object, since
+`fdopen(1, "w")` is a *different* `FILE` with its own buffer and interleaves wrongly with anything
+already writing to the real one. `environ` has no way round at all. A seam that could call out but
+could not name what the other side had laid down would leave those unreachable, and there is nothing
+a program could write for itself instead.
+
+The type is **written and never inferred**: there is no initializer to infer it from, and what the
+other side laid down is not something this compiler can see. Writing the wrong one is the same kind
+of promise a wrong parameter list is. The one type refused is one that occupies nothing, because a
+symbol is an address and a value with no representation has nothing to put one at.
+
+**It is a place, and a writable one** — which is the one respect in which it is unlike every other
+global the language has. A module-level `val` is read-only at every depth and holds plain data only
+(`13 §7`), because it owns what it names for the whole run and promises never to change it. An
+`extern` variable owns nothing and promises nothing: the storage is C's, C writes it, and `optind = 1`
+before a `getopt` loop is ordinary usage of the interface being reached. Refusing the write would
+leave the declaration able to name only half of what it was added for, and refusing the *pointers*
+that a `val` is refused would leave it able to name almost nothing at all.
 
 **Two rules follow from having no body, and both are already written elsewhere.** The escape
 analysis assumes the worst of it — every argument may be kept, and the result may view any of them
@@ -144,6 +174,7 @@ the identifier after it is what the program calls it by.
 ```
 extern "snprintf" fmt(buf: *u8, n: usize, fmt: *u8, ...) -> int
 extern "abs" magnitude(n: int) -> int
+extern "__stdoutp" stdout: *u8
 ```
 
 Without one the two are the same, which is the common case and stays the default. The separation
@@ -152,6 +183,11 @@ sysl, it may be a name the program wants for something of its own, and — the c
 a declaration in the **library** would otherwise spend that name out of every program's namespace.
 The library renders integers and floats through `snprintf`, and a program that declares `snprintf`
 itself must not collide with it.
+
+The third line above is the case where nothing else would do at all: what a C header calls `stdout`
+is a *macro*, and the symbol behind it is `__stdoutp` on this platform and `stdout` on others. A
+declaration transcribing the header's spelling would reach nothing, and the link name is where that
+difference is written down.
 
 The symbol must be one a linker could resolve — letters, digits, `_`, `$`, `.` — and a string that
 is not is rejected at the declaration rather than emitted as malformed IR. Two declarations may

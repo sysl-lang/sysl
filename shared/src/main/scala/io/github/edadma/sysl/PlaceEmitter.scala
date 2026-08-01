@@ -21,7 +21,7 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     case TLoad(name, _)     => s"%$name.addr"
     // A `val`'s storage is the global itself, so its address needs no instruction to compute — it
     // is what makes indexing one reach into the table rather than copy it out first.
-    case TGlobal(symbol, _) => s"@$symbol"
+    case g: TGlobal         => s"@${g.symbol}"
     case TDeref(operand, _) => payloadAddr(operand)
     // A zero-sized field occupies nothing, so it is wherever its receiver is: the address is never
     // read or written through, and handing back the receiver's keeps the walk to it — and whatever

@@ -395,7 +395,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case TOld(index, ty) =>
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr %old.$index.addr"); r
 
-    case TGlobal(symbol, ty) =>
+    case TGlobal(symbol, ty, _) =>
       val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr @$symbol"); r
 
     case TDeref(operand, ty) =>

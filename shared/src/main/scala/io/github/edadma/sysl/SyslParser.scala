@@ -188,15 +188,16 @@ class SyslParser(val source: Source) extends DeclParser {
     } | success(Visibility.Public)
 
   protected def restrict(v: Visibility, d: Stmt): Stmt = d match
-    case s: StructDecl => s.copy(vis = v).setPos(s.pos)
-    case e: EnumDecl   => e.copy(vis = v).setPos(e.pos)
-    case t: TraitDecl  => t.copy(vis = v).setPos(t.pos)
-    case e: ExternDecl => e.copy(vis = v).setPos(e.pos)
-    case c: ConstDecl  => c.copy(vis = v).setPos(c.pos)
-    case l: ValDecl    => l.copy(vis = v).setPos(l.pos)
-    case f: FuncDecl   => f.copy(vis = v).setPos(f.pos)
-    case t: TypeDecl   => t.copy(vis = v).setPos(t.pos)
-    case other         => other
+    case s: StructDecl    => s.copy(vis = v).setPos(s.pos)
+    case e: EnumDecl      => e.copy(vis = v).setPos(e.pos)
+    case t: TraitDecl     => t.copy(vis = v).setPos(t.pos)
+    case e: ExternDecl    => e.copy(vis = v).setPos(e.pos)
+    case e: ExternVarDecl => e.copy(vis = v).setPos(e.pos)
+    case c: ConstDecl     => c.copy(vis = v).setPos(c.pos)
+    case l: ValDecl       => l.copy(vis = v).setPos(l.pos)
+    case f: FuncDecl      => f.copy(vis = v).setPos(f.pos)
+    case t: TypeDecl      => t.copy(vis = v).setPos(t.pos)
+    case other            => other
 
   /** A dotted name — a module path. */
   protected lazy val dottedName: Parser[List[String]] = rep1sep(ident, op("."))

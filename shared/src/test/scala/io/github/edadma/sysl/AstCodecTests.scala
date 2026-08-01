@@ -122,6 +122,10 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
 
     check("a generic function with bounds", "f[T: Ord, U: Eq + Hash](a: T, b: U) -> T = a")
     check("a variadic extern under a link name", "extern \"snprintf\" fmt(f: *u8, ...) -> int")
+    // The two `extern` forms together, since the tag is what tells them apart and a codec that wrote
+    // one where the other belonged would still round-trip every field either of them has.
+    check("an extern variable, beside the function it is not",
+      "extern \"environ\" env: **u8\nprivate extern optind: i32\nextern abs(n: int) -> int")
     check("a struct with members, invariants and a private field",
       """struct Span
         |    private lo: int

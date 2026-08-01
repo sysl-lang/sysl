@@ -351,6 +351,15 @@ trait ExprAnalysis
                 case None =>
                   valKey(name) match
                     case Some(key) => TGlobal(key, valType(key))
+                    // An `extern` variable is storage too, so it becomes the same node — under the
+                    // **symbol** rather than the key, since what it names is what the linker
+                    // supplies, and writable, since the storage is not this program's to promise
+                    // anything about (`12 §1`).
+                    case None if externVarKey(name).isDefined =>
+                      val key = externVarKey(name).get
+
+                      externVarsUsed += key
+                      TGlobal(externVarDecls(key).symbol, externVarType(key), writable = true)
                     // A name the block binds further down is a different mistake from one that
                     // stands for nothing, and the difference is what the reader has to fix.
                     case None if blockDeclares(name) =>

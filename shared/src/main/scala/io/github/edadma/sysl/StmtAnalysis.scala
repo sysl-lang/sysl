@@ -413,7 +413,8 @@ trait StmtAnalysis extends TypeResolution {
         pendingNested = Nil
         lowerNestedGroup(group)
 
-    case _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl | _: TypeDecl =>
+    case _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
+        _: ExternVarDecl | _: TypeDecl =>
       err("structs, enums, traits, impls, externs, and types may only be declared at the top level")
 
     // The leading clauses of a function body are split off before the body is analyzed, so any

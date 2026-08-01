@@ -28,6 +28,7 @@ trait Hoisting extends HoistMembers {
   protected def valueNameHolder(key: String): Option[String] =
     if constDecls.contains(key) then Some("a constant")
     else if valDecls.contains(key) then Some("a 'val'")
+    else if externVarDecls.contains(key) then Some("an 'extern' variable")
     else if variantOwner.contains(key) then Some(s"enum '${qn(variantOwner(key))}'")
     else None
 
@@ -160,6 +161,28 @@ trait Hoisting extends HoistMembers {
       declScope(key) = currentScope
       recordAccess(key, v.vis)
 
+    // An `extern` variable is registered here rather than with the functions, because what it
+    // declares is a *value* a bare name reaches — the same namespace a `const` and a `val` are in,
+    // and the reason a clash with either is reported at whichever was written second. Its **symbol**
+    // is not qualified for the reason the `extern` function's is not: the linker knows nothing about
+    // sysl's modules, so the key carries the module and the symbol is what was written.
+    case e: ExternVarDecl =>
+      val key = Modules.qualify(currentModule, e.name)
+
+      if externVarDecls.contains(key) then err(s"'${e.name}' is already declared")
+      else for what <- valueNameHolder(key) do err(s"'${e.name}' is already used by $what")
+      externVarDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
+      declScope(key) = currentScope
+      recordAccess(key, e.vis)
+      if libraryOffers(e, currentModule) then libraryNames(e.name) = key
+      for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
+        err(s"'$s' is not a symbol a linker can resolve")
+      // The same rule the `extern` function is held to, and the same reason: this program defines
+      // `main`, so a declaration claiming the linker supplies it is a duplicate symbol at the link
+      // rather than anything the line it is written on could explain.
+      if e.symbol == "main" then
+        err("'main' is where the platform starts this program, so an 'extern' may not name that symbol")
+
     // The same rule, meeting a form that cannot satisfy it: a binding that names several things has
     // nowhere to write a type for any of them (`12 §5b`), so it can only ever be a local. Saying so
     // here is what stops one at the top of a file from quietly becoming a local of the entry point,
@@ -204,6 +227,8 @@ trait Hoisting extends HoistMembers {
       if funcDecls.contains(key) then err(s"function '${f.name}' is already declared")
       else if constDecls.contains(key) then err(s"'${f.name}' is already declared as a constant")
       else if valDecls.contains(key) then err(s"'${f.name}' is already declared as a 'val'")
+      else if externVarDecls.contains(key) then
+        err(s"'${f.name}' is already declared as an 'extern' variable")
       funcDecls(key) = f.copy(name = key).setPos(f.pos)
       declScope(key) = currentScope
       recordAccess(key, f.vis)
@@ -232,6 +257,8 @@ trait Hoisting extends HoistMembers {
       val key = Modules.qualify(currentModule, e.name)
 
       if funcDecls.contains(key) then err(s"function '${e.name}' is already declared")
+      else if externVarDecls.contains(key) then
+        err(s"'${e.name}' is already declared as an 'extern' variable")
       funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
       externDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
       declScope(key) = currentScope

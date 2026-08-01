@@ -573,6 +573,26 @@ case class ExternDecl(name: String, params: List[Param], retType: Option[TypeRef
   /** The symbol the linker resolves this to. */
   def symbol: String = link.getOrElse(name)
 
+/** `extern name: type` — storage this program does not lay down but may read and write, resolved by
+ * the linker exactly as an `extern` function is.
+ *
+ * It is the same seam as the declaration above, pointed at the other kind of thing a C library
+ * exports. `stdout` and `environ` are variables rather than functions, and a language whose only way
+ * out is a call cannot name either: `fputs(s, stdout)` needs the *variable*, and there is no getter
+ * to reach it through.
+ *
+ * The type is written and never inferred — there is no initializer to infer it from, and what the
+ * other side laid down is not something this compiler can see. Writing the wrong one is the same
+ * kind of promise a wrong parameter list to an `extern` function is (`12 §1`).
+ *
+ * `link` is the leading string of `extern "environ" env: **u8`, and means what it means for a
+ * function: the symbol the linker resolves, when that differs from what the program calls it by.
+ */
+case class ExternVarDecl(name: String, typ: TypeRef, link: Option[String] = None,
+                         vis: Visibility = Visibility.Public) extends Stmt:
+  /** The symbol the linker resolves this to. */
+  def symbol: String = link.getOrElse(name)
+
 /** `struct Name[T…]` with `name: type` fields and, intermixed, member declarations (methods,
  * properties, associated functions). Positional construction is `Name(a, b, …)`.
  *

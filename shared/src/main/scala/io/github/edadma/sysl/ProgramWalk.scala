@@ -183,6 +183,12 @@ trait ProgramWalk
 
     resetFunction()
     tsubst = Map.empty
+    // An `extern` variable's type is resolved here, before any body that might name one, and whether
+    // or not anything does: it is the declaration that is wrong, exactly as an unused `val`'s is.
+    // Nothing is built from it — the storage is somebody else's — so this is the check and no more.
+    for (key, decl) <- externVarDecls do
+      currentPos = decl.pos
+      recover(())(at(decl.pos)(checkExternVar(key)))
     for (key, decl) <- valDecls do
       currentPos = decl.pos
       tvals ++= recoverOpt(analyzeVal(key))
@@ -308,6 +314,7 @@ trait ProgramWalk
       // the runner could run, and listing it would put a name in the report that no dispatcher arm
       // matches — which reads as a test that vanished rather than as the error already printed.
       tests = tests.filter(t => allFuncs.exists(_.name == t.func)).toList,
+      externVars = externVarsUsed.toList.map(k => TExternVar(externVarDecls(k).symbol, externVarType(k))),
     )
   }
 
@@ -442,7 +449,7 @@ trait ProgramWalk
     // written at the top of a file never reach it.
     def executable(u: Program) = u.body.filter {
       case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-          _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl =>
+          _: ExternVarDecl | _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl =>
         false
       case _ => true
     }
@@ -503,6 +510,24 @@ trait ProgramWalk
       err(s"'${qn(key)}' cannot be a 'val': its type is ${show(ty)}, and a 'val' holds plain data " +
         "only — a reference, a pointer, a slice, or a string in storage that outlives every frame " +
         "would be neither released nor held to being read-only")
+
+  // --- `extern` variables ----------------------------------------------------------------
+
+  /** Holds one `extern` variable's declared type to being something a symbol could stand for.
+   *
+   * There is one rule and it is the `val`'s first one, for the same reason: a symbol is an address,
+   * and a value with no representation has nothing to put one at. The `val`'s *second* rule — plain
+   * data only — is deliberately not applied here. It exists to keep a `val` from owning a reference
+   * it can never release and from promising read-only through a pointer, and an `extern` variable
+   * owns nothing and promises nothing: `stdout` is a pointer, `environ` is a pointer to pointers,
+   * and refusing those would leave the declaration unable to name what it was added to reach.
+   */
+  private def checkExternVar(key: String): Unit =
+    val ty = externVarType(key)
+
+    if Type.zeroSized(ty) then
+      err(s"'${qn(key)}' cannot be an 'extern' variable: a ${show(ty)} value occupies nothing, so " +
+        "there is no storage for the linker to resolve the name to")
 
   private def plain(t: Type): Boolean = t match
     case _: Type.Ptr | _: Type.Ref | _: Type.View | _: Type.Trait => false

@@ -385,7 +385,9 @@ before they appear and may be mutually recursive).
 Textual LLVM IR with **opaque pointers** (`ptr`, never `i32*`), verified against Apple clang
 on arm64. Floats are emitted as **hex doubles** (`0x…`) so the textual round-trip loses no
 bits. An `extern` is declared under its **symbol** — its link name where it has one, its sysl name
-otherwise — and each symbol is declared once however many declarations name it. Value
+otherwise — and each symbol is declared once however many declarations name it; an `extern`
+*variable* is the same rule on one line of storage, `@sym = external global <ty>`, emitted after the
+type definitions so a named aggregate is not opaque where it is named. Value
 structs lower to named aggregates (`%struct.Name = type { … }`); construction is an
 `insertvalue` chain, and a field read is `extractvalue`. A **write** instead computes the
 place's address — a local's own slot, a loaded pointer value, or a `getelementptr` chain over

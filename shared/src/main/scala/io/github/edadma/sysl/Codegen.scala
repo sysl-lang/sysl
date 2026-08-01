@@ -131,10 +131,20 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     if boolStrs then
       out ++= "@.true = private constant [5 x i8] c\"true\\00\"\n"
       out ++= "@.false = private constant [6 x i8] c\"false\\00\"\n"
+    // Storage the linker supplies: the declaration line and nothing else, since this module lays none
+    // of it down. It goes here rather than up with the `extern` functions because a named aggregate
+    // type is opaque until its `= type` line, and an `external global` naming one has to come after.
+    // Two declarations may share one symbol, so the symbol is what is declared once.
+    val declaredGlobals = mutable.Set.empty[String]
+
+    for v <- program.externVars if declaredGlobals.add(v.symbol) do
+      out ++= s"@${v.symbol} = external global ${v.ty.llvm}\n"
     out ++= genVals(program.vals)
     out ++= globals.toString
     out ++= vtableText
-    if globals.nonEmpty || boolStrs || vtableText.nonEmpty || program.vals.nonEmpty then out ++= "\n"
+    if globals.nonEmpty || boolStrs || vtableText.nonEmpty || program.vals.nonEmpty ||
+      program.externVars.nonEmpty
+    then out ++= "\n"
 
     if charBuf then out ++= ScalarEmitter.utf8Encoder
     if heap then out ++= ArcEmitter.core

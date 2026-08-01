@@ -128,11 +128,17 @@ case class TResult(ty: Type) extends TExpr
  */
 case class TOld(index: Int, ty: Type) extends TExpr
 
-/** Names a module-level `val` — storage that exists for the whole run, under the key its module
- * gives it. It is a *place*, so indexing and iterating reach into it without copying the whole
- * thing out; what it is not is a writable one, which the analyzer enforces rather than the type.
+/** Names module-level storage — a `val`, under the key its module gives it, or an `extern` variable,
+ * under the symbol the linker resolves. Either way it exists for the whole run and it is a *place*,
+ * so indexing and iterating reach into it without copying the whole thing out.
+ *
+ * `writable` is what tells the two apart, and it is the only thing that does. A `val` is written
+ * once and the analyzer refuses both an assignment to one and a `*T` into it (`13 §7`); an `extern`
+ * variable is storage this program did not lay down, so there is no such promise to keep — `optind`
+ * and `optarg` are assigned by ordinary C and a declaration that could not would name half of what
+ * it was added to reach.
  */
-case class TGlobal(symbol: String, ty: Type) extends TExpr
+case class TGlobal(symbol: String, ty: Type, writable: Boolean = false) extends TExpr
 
 /** `*p` — reads through a pointer or reference. */
 case class TDeref(operand: TExpr, ty: Type) extends TExpr
@@ -557,6 +563,15 @@ case class TFunc(
 case class TExtern(name: String, symbol: String, params: List[Type], retTy: Type,
                    variadic: Boolean = false)
 
+/** Storage the linker supplies, which the module declares rather than lays down (`12 §1`).
+ *
+ * The same accounting the externs above get: only the ones something reads or writes reach here, and
+ * two declarations may share one symbol, so the module declares each *symbol* once. What it carries
+ * is the symbol and the type, because that is the whole of an `external global` line — there is no
+ * initializer, and nothing about the storage for this module to decide.
+ */
+case class TExternVar(symbol: String, ty: Type)
+
 /** One method table — the constant a trait object's first word points at, holding one function
  * pointer per method the trait declares, in declaration order.
  *
@@ -658,4 +673,9 @@ case class TProgram(
      * drops both this and the functions it names: `Tests.strip`.
      */
     tests: List[TTest] = Nil,
+    /** The `extern` variables the program reads or writes (`12 §1`). Declared beside the `val`s
+     * rather than up with the `extern` functions, because a named aggregate type has to be defined
+     * before anything names it — the same ordering the precompiled declarations need.
+     */
+    externVars: List[TExternVar] = Nil,
 )

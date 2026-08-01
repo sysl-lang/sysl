@@ -738,6 +738,15 @@ be written — a `string` is a view with an owner word, and a static one would n
 anything visible outside its file states its types, and a module member always could be. A local
 states nothing to anyone, so it infers exactly as a `var` does.
 
+**The one module-level storage these rules do not reach is an `extern` variable** (`12 §1`), and the
+reason is what the rules are about. Every paragraph above is a promise this program makes about
+storage it laid down: that it is written once, that it is read-only at every depth, that nothing
+counted sits in it unreleased. An `extern` variable is storage the *linker* supplies — `stdout`,
+`environ`, `optind` — and this program lays none of it down, so there is no such promise to keep and
+none of these refusals to carry over. It is a place, it may be written, and it holds whatever the
+other side put there. That is the foreign seam behaving like the foreign seam, and it is written
+down here so a reader who finds `optind = 1` compiling does not read it as a hole in this section.
+
 #### What order the initializers run in
 
 **An initializer may be computed**, and `guide/png`'s CRC table is what asked for it: 256 entries

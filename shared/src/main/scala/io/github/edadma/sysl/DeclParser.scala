@@ -31,8 +31,14 @@ trait DeclParser extends ExprParser {
     }
 
   /** `extern name(params) -> ret` — a header with no body at all, which is what tells it from a
-   * function declaration. The result is optional and absent means `unit`, exactly as for a
-   * function; `-> never` says the callee does not come back.
+   * function declaration — or `extern name: type`, the same seam pointed at a variable the other
+   * side exports rather than a function. The result is optional and absent means `unit`, exactly as
+   * for a function; `-> never` says the callee does not come back.
+   *
+   * What follows the name is what decides which of the two this is, so the name and its optional
+   * link name are read once and both forms continue from there. That is also what makes the refusal
+   * below able to name both: having got as far as an identifier, the declaration is an `extern`
+   * whatever comes next, and the only question left is which kind.
    *
    * A string before the name is the *symbol*, and the name after it is what the program calls it by:
    * `extern "snprintf" fmt(…)` resolves to libc's `snprintf` without spending the name `snprintf`.
@@ -40,10 +46,17 @@ trait DeclParser extends ExprParser {
    * costs no keyword. Haskell's `foreign import ccall "snprintf" c_snprintf` is the same shape.
    */
   protected lazy val externDecl: PackratParser[Stmt] =
-    op("extern") ~> opt(linkName) ~ ident ~ noTypeParams ~ (op("(") ~> paramList <~ op(")")) ~
-      opt(op("->") ~> typeRef) ^^ {
-        case link ~ name ~ _ ~ ((params, variadic)) ~ ret => ExternDecl(name, params, ret, variadic, link)
-      }
+    op("extern") ~> opt(linkName) ~ ident ~ noTypeParams >> { case link ~ name ~ _ =>
+      (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> typeRef) ^^ {
+        case ((params, variadic)) ~ ret => ExternDecl(name, params, ret, variadic, link)
+      } |
+        // The type is read *after* the colon has been consumed, so a mistake in it is reported as
+        // the mistake it is rather than as this rule failing back to the sentence below.
+        op(":") ~> (typeRef ^^ (t => ExternVarDecl(name, t, link)) |
+          err(s"an 'extern' variable states the type the other side laid down — 'extern $name: T'")) |
+        err(s"an 'extern' declares a function — '$name(params) -> result' — or a variable — " +
+          s"'$name: type' — so what follows the name is '(' or ':'")
+    }
 
   /** An `extern` may not declare type parameters. Monomorphization needs a body to specialize, and a
    * foreign symbol is one function at one signature however many sysl types would fit it — so the

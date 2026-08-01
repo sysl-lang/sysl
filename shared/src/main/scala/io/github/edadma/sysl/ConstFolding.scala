@@ -120,6 +120,21 @@ trait ConstFolding extends ImportResolution {
     inDecl(key)(decl.typ.map(resolveType(_, Map.empty)).getOrElse(Type.Unknown))
   })
 
+  // --- `extern` variables -----------------------------------------------------------------
+
+  /** The key a written **`extern` variable** name resolves to. */
+  protected def externVarKey(written: String): Option[String] =
+    resolveName(written)(externVarDecls.contains)
+
+  /** The type an `extern` variable was declared with. Written for the reason a `val`'s is and one
+   * more: there is no initializer to infer it from, because the storage was laid down elsewhere.
+   */
+  protected def externVarType(key: String): Type = externVarTypes.getOrElseUpdate(key, {
+    val decl = externVarDecls(key)
+
+    inDecl(key)(resolveType(decl.typ, Map.empty))
+  })
+
   /** Folds a constant expression to the literal it denotes, or `None` where it is not one.
    *
    * The set is deliberately small and closed: literals, other constants, conversions, and the
@@ -241,6 +256,7 @@ trait ConstFolding extends ImportResolution {
     case _    => None
 
   private val valTypes         = mutable.HashMap.empty[String, Type]
+  private val externVarTypes   = mutable.HashMap.empty[String, Type]
   private val constTypes       = mutable.HashMap.empty[String, Type]
   private val constLits        = mutable.HashMap.empty[String, Expr]
   private val constsInProgress = mutable.LinkedHashSet.empty[String]

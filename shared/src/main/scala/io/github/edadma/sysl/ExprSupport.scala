@@ -75,7 +75,9 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * and so is a field of a read-only struct.
    */
   protected def readOnly(t: TExpr): Boolean = t match
-    case _: TGlobal         => true
+    // An `extern` variable is the one global that is not one: the storage belongs to whoever laid it
+    // down, and reaching it is the foreign seam rather than a promise this program made (`12 §1`).
+    case g: TGlobal         => !g.writable
     case TLoad(name, _)     => readOnlyLocals(name)
     case TField(recv, _, _) => readOnly(recv)
     // Only where the elements are the receiver's own storage. A slice's are somebody else's, and
