@@ -182,6 +182,12 @@ trait Hoisting extends HoistMembers {
       // rather than anything the line it is written on could explain.
       if e.symbol == "main" then
         err("'main' is where the platform starts this program, so an 'extern' may not name that symbol")
+      // The `llvm.` namespace holds the back end's operations (`Intrinsics`), which are code and not
+      // storage. Left alone this would emit `@llvm.something = external global`, which is a module
+      // the verifier rejects for a reason no reader of this line would connect to it.
+      if Intrinsics.declared(e.symbol) then
+        err(s"'${e.symbol}' is in the namespace the back end's own operations live in, and those are " +
+          "code rather than storage — an 'extern' variable names a symbol the linker resolves")
 
     // The same rule, meeting a form that cannot satisfy it: a binding that names several things has
     // nowhere to write a type for any of them (`12 §5b`), so it can only ever be a local. Saying so
@@ -260,13 +266,30 @@ trait Hoisting extends HoistMembers {
       else if externVarDecls.contains(key) then
         duplicate(key, s"'${e.name}' is already declared as an 'extern' variable")
       funcDecls(key) = FuncDecl(key, Nil, e.params, e.retType, Nil, variadic = e.variadic).setPos(e.pos)
-      externDecls(key) = e.copy(name = key, link = Some(e.symbol)).setPos(e.pos)
       declScope(key) = currentScope
       recordAccess(key, e.vis)
       if libraryOffers(e, currentModule) then libraryNames(e.name) = key
-      funcInsts(key) =
+
+      val signature =
         (e.params.map(p => (p.name, foreignParam(recover(Type.Unknown)(resolveType(p.typ, Map.empty))))),
          e.retType.map(t => recover(Type.Unknown)(resolveReturn(t, Map.empty))).getOrElse(Type.Unit))
+
+      funcInsts(key) = signature
+
+      // An intrinsic's emitted name carries the width it was declared at (`Intrinsics`), so the
+      // symbol is settled here — where the signature has just been resolved — rather than being
+      // recomputed wherever it is wanted. Everything downstream reads `link` and needs to know
+      // nothing about which kind of `extern` this was.
+      val symbol =
+        if !Intrinsics.declared(e.symbol) then e.symbol
+        else
+          if e.variadic then
+            err("an intrinsic takes a fixed argument list, so it may not be declared with '...'")
+          Intrinsics.resolve(e.symbol, signature._1.map(_._2), signature._2) match
+            case Right(mangled) => mangled
+            case Left(why)      => err(why); e.symbol
+
+      externDecls(key) = e.copy(name = key, link = Some(symbol)).setPos(e.pos)
       checkSignatureRules(e.name, e.params, e.retType, e.variadic, foreign = true)
       for s <- e.link if !s.matches("[A-Za-z0-9_$.]+") do
         err(s"'$s' is not a symbol a linker can resolve")

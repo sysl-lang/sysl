@@ -202,6 +202,40 @@ name.
 name, unmangled, so a program that defines `abs` collides with libc's whatever else it declares.
 That is a question for the module system (`13`) rather than for this seam.
 
+**A link name in the `llvm.` namespace names an instruction rather than a symbol.**
+
+```
+private[sysl] extern "llvm.sqrt" sysl_sqrt(x: f64) -> f64
+private[sysl] extern "llvm.sqrt" sysl_sqrtf(x: f32) -> f32
+```
+
+The two kinds of `extern` differ only in who resolves them — the linker, or the back end — and this
+needs no keyword to say which, because **LLVM owns that namespace**: a module defining a symbol
+beginning `llvm.` is invalid IR, so no library can export one and a link name there cannot mean
+anything else. The compiler has always emitted intrinsics for its own needs (the bounds trap, the
+overflow-checked multiply, the varargs walk); this is the same emission with the library choosing.
+
+**The width is derived, not written.** LLVM overloads an intrinsic on its operand type and spells the
+choice in the name — `llvm.sqrt.f64`, `llvm.sqrt.f32` — so a declaration stating the whole thing
+would say the width twice and let the two disagree. What is written is the base; the suffix comes
+from the signature, which is why the pair above is one name at two widths.
+
+**The set is closed, and the reason is not caution about the feature.** An intrinsic's signature
+belongs to LLVM and moves between releases, and a declaration that disagrees is not a link error —
+it is a verifier failure at best and a miscompile at worst, reported against generated IR rather than
+against a line someone wrote. So the compiler holds the list it supports, checks each declaration
+against the shape that intrinsic takes, and refuses anything else by name. Rust draws the line in the
+same place: `core::intrinsics` is internal and `f64::sqrt` is the surface.
+
+**What it is for is not only speed.** An intrinsic that lowers to an instruction leaves no symbol
+behind, so the operation needs no library at the link — which is what lets `sysl.math`'s roots,
+magnitudes, sign transfers and roundings work on a **freestanding** target, where there is no libm to
+ask. Where the machine has no instruction there is nothing to gain: `llvm.sin` exists, and lowers to
+a call to the same `sin` an ordinary `extern` names, so the transcendentals stay linked.
+
+An intrinsic has no address (`§10`): there is no body for one to name, and a wrapper that calls it is
+what has one.
+
 ## 2. Parameters are by-value bindings
 
 Every parameter is an ordinary **value binding**: `a: int` names a copy of the argument, and

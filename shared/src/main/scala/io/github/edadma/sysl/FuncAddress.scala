@@ -46,6 +46,14 @@ trait FuncAddress extends CallCore {
       err(s"'$written' is a '#test' function, which 'sysl test' calls and nothing else does — every " +
         "other build leaves it out, so its address would be of a definition the program does not have")
 
+    // An intrinsic is a name the back end recognises and lowers, not a function that exists to be
+    // pointed at: there is no body anywhere for an address to name, and LLVM refuses a module that
+    // takes one. The wrapper the message asks for *is* a real function and does have an address.
+    if externDecls.get(key).exists(e => Intrinsics.declared(e.symbol)) then
+      err(s"'$written' is an intrinsic, which the back end lowers to an instruction rather than a " +
+        "function anything calls — there is no body for an address to name. A sysl function that " +
+        "calls it is what has one")
+
     val (params, ret) = funcInsts(key)
     val ptypes        = params.map(_._2)
 
