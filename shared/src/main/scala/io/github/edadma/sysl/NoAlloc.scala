@@ -76,27 +76,39 @@ trait NoAlloc extends AnalyzerBase {
      */
     private val direct: Set[String] = funcs.filter(f => firstAllocation(f.body).isDefined).map(_.name).toSet
 
-    /** An allocating function this tree can arrive at, if there is one. */
-    private def reached(x: Any): Option[String] =
-      Reachability.reachedFrom(List(x), funcs, vtables).calls.find(direct)
+    /** Every allocating function this tree can arrive at. */
+    private def reached(x: Any): Set[String] =
+      Reachability.reachedFrom(List(x), funcs, vtables).calls.filter(direct)
 
     /** Reports the **smallest** sub-tree that still reaches an allocator, which is as close to the
      * call as the tree can put the caret: a body reaches one through some statement, that statement
      * through some expression, and the descent stops where no part of the node answers on its own.
      *
-     * Descending rather than testing every node is what keeps this one reachability walk per level
-     * instead of one per node.
+     * **Every such sub-tree, not merely the first.** A body that calls two allocating functions has
+     * two things wrong with it and two places to change, and a reader told about one of them fixes it
+     * and is told about the next — which is a worse experience than the direct-allocation walk gives
+     * for the same mistake one step nearer. So where several children still reach, the descent
+     * branches into all of them rather than picking one.
+     *
+     * That is not the same as reporting every node: the descent still stops as soon as no part of a
+     * node answers on its own, which is what keeps `str(a) + str(b)` reaching one allocator from
+     * being a message per node on the way down.
      */
     def blame(x: Any): Unit =
-      for who <- reached(x) do
-        val site = narrow(x)
+      if reached(x).nonEmpty then
+        parts(x).filter(c => reached(c).nonEmpty) match
+          case Nil  => report(x)
+          case kids => kids.foreach(blame)
 
+    /** One site, naming the allocator it reaches. Where it reaches several, the name is the least of
+     * them rather than whichever the set happened to yield first — the site is what the reader has to
+     * change, and a diagnostic that varied between runs would be a poor thing to assert on.
+     */
+    private def report(site: Any): Unit =
+      for who <- reached(site).toList.sorted.headOption do
         recover(())(at(position(site))(err(s"this reaches '${Modules.show(who)}', which makes heap " +
           "storage, and this module declared 'no alloc' — an allocator-free module may only call " +
           "what is allocator-free itself")))
-
-    private def narrow(x: Any): Any =
-      parts(x).find(c => reached(c).isDefined).map(narrow).getOrElse(x)
 
     private def parts(x: Any): List[Any] = x match
       case _: Type         => Nil

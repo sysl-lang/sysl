@@ -356,6 +356,58 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       e should include("may only call what is allocator-free itself")
     }
 
+    /** **Every** call site that reaches an allocator, not merely the first. A body with two of them
+      * has two things wrong with it and two places to change, and reporting one at a time makes the
+      * reader fix, recompile, and be told about the next — which is worse than what the *direct*
+      * allocation walk gives for the same mistake one step nearer.
+      *
+      * The two statements below reach the same allocator by two different routes, so a walk that
+      * stopped at the first reaching child would say one thing and leave the second line standing.
+      */
+    "and every call that reaches one is named, not just the first" in {
+      val e = errOf(
+        "thing/a.sysl" ->
+          """module thing
+            |no alloc
+            |
+            |import sysl.io.line_text
+            |
+            |two(a: []const u8, b: []const u8) -> usize
+            |    var x = line_text(a)
+            |    var y = line_text(b)
+            |    x.len + y.len
+            |""".stripMargin,
+        "main.sysl" -> ("var bytes: [2]u8 = [104u8, 105u8]\n" +
+          "print(thing.two(bytes[0..<2], bytes[0..<2]))\n"),
+      )
+
+      // One diagnostic per site, each caret on its own call rather than twice on the body — which is
+      // what says the descent branched and then narrowed each branch to the smallest node.
+      e.linesIterator.count(_.contains("which makes heap storage")) shouldBe 2
+      e should include("thing/a.sysl:7:13")
+      e should include("thing/a.sysl:8:13")
+    }
+
+    // The counterpart, and the reason the branching descent is not simply "report every node": one
+    // call reached through a chain of nodes is still one thing to change, so the descent stops at the
+    // smallest sub-tree that answers rather than reporting each node on the way down to it.
+    "while one call reached through several nodes is still one diagnostic" in {
+      val e = errOf(
+        "thing/a.sysl" ->
+          """module thing
+            |no alloc
+            |
+            |import sysl.io.line_text
+            |
+            |one(a: []const u8) -> usize = line_text(a).len + 1
+            |""".stripMargin,
+        "main.sysl" -> ("var bytes: [2]u8 = [104u8, 105u8]\n" +
+          "print(thing.one(bytes[0..<2]))\n"),
+      )
+
+      e.linesIterator.count(_.contains("which makes heap storage")) shouldBe 1
+    }
+
     // The same rule the other way: printing is reached constantly from allocator-free code and does
     // not allocate, so it is not refused. A capability that refused `print` would be one no kernel
     // could carry.

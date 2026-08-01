@@ -379,14 +379,6 @@ class ExternVarTests
       run("extern optind: i32\nval start: i32 = optind\nprint(start)") shouldBe "1\n"
     }
 
-    /** `13 §2` says what is visible outside its file states types that are visible too, and
-      * `SignatureVisibility` holds structs, enums, traits and functions to it. It does **not** hold a
-      * `val` or a `const`, and so it does not hold this either — the same gap, not a new one.
-      *
-      * Pinned rather than closed, because closing it for one of the three would leave the other two
-      * saying the opposite, and which way all three should go is a question about `13 §2` rather than
-      * about this declaration.
-      */
     // `testing.md`: a test build drops the entry point and dispatches to the `#test` functions
     // instead, so what a test reaches is reached from a different root. An extern variable read only
     // from a test still has to be declared, and the storage read is still C's.
@@ -404,16 +396,30 @@ class ExternVarTests
       allPass(src)
     }
 
-    "a public one may still name a private type, where a public function may not" in {
+    /** `13 §2`: a declaration may not be more visible than the types it names. It reaches this one
+      * exactly as it reaches a function — a module that may write `os.there` would hold a `Hidden` it
+      * cannot write, which is the hole the rule exists to close and not a smaller one.
+      *
+      * `VisibilityTests` is where the rule itself lives, over every form a declaration takes. What is
+      * asked here is only that this declaration is among them.
+      */
+    "a public one may not name a private type, exactly as a public function may not" in {
       val hidden = "module os\n\nprivate struct Hidden\n    a: i32\n"
 
       errOf(
         "os/env.sysl" -> (hidden + "\nget() -> Hidden = Hidden(1)"),
         "main.sysl"   -> "print(1)",
-      ) should include("Hidden")
+      ) should include("'get' is public, but its result names 'os.Hidden'")
 
-      irOf(
+      errOf(
         "os/env.sysl" -> (hidden + "\nextern there: Hidden"),
+        "main.sysl"   -> "print(1)",
+      ) should include("'there' is public, but its type names 'os.Hidden'")
+
+      // The exemption both share: restricted to the file that declares the type, there is nobody who
+      // could hold the value and be unable to name it.
+      irOf(
+        "os/env.sysl" -> (hidden + "\nprivate extern there: Hidden"),
         "main.sysl"   -> "print(1)",
       ) should include("define")
     }
