@@ -581,6 +581,126 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     message should include("[]uint")
   }
 
+  "the edges of the rule" - {
+    // The second occurrence is the one an optimizer would have folded into the first, and the whole
+    // definition turns on it: two reads of one register are two reads.
+    "reading one register twice is two loads" in {
+      val body = defineOf(ir(uart + "two() -> u32 = regs.data + regs.data\nprint(two())"), "two")
+
+      body.linesIterator.count(_.contains("load volatile i32")) shouldBe 2
+    }
+
+    // A built value touches nothing until it lands, and where it lands is the device.
+    "building a block and storing it whole is one volatile aggregate store" in {
+      val body = defineOf(ir(uart + "go() = *regs = Uart(1u32, 2u32, 3u32)\ngo()"), "go")
+
+      body should include("insertvalue %struct.Uart")
+      body should include("store volatile %struct.Uart")
+    }
+
+    // A zero-sized field takes no slot, so the field written third lands second — and the marker has
+    // to follow the field rather than the slot.
+    "a field that occupies nothing does not shift the qualifier onto its neighbour" in {
+      val src =
+        """struct Pair
+          |    nothing: unit
+          |    reg:     volatile u32
+          |    plain:   u32
+          |val p: *Pair = ptr_cast(usize(4096))
+          |peek() -> u32 = p.reg
+          |poke() -> unit = p.plain = 1u32
+          |print(peek())
+          |poke()""".stripMargin
+
+      val out = ir(src)
+
+      defineOf(out, "peek") should include("i32 0, i32 0")
+      defineOf(out, "peek") should include("load volatile i32")
+      defineOf(out, "poke") should include("i32 0, i32 1")
+      defineOf(out, "poke") should not include "volatile"
+    }
+
+    // Two types that lay out identically and are reached by different instructions must never share
+    // an instantiated body, which is what mangling the qualifier is for.
+    "a generic instantiated at a qualified pointee is a different body from one at a plain pointee" in {
+      val src =
+        """id[T](x: T) -> T = x
+          |a(q: *volatile u32) -> *volatile u32 = id(q)
+          |b(q: *u32) -> *u32 = id(q)
+          |print(*a(ptr_cast(usize(16))), *b(ptr_cast(usize(16))))""".stripMargin
+
+      val out = ir(src)
+
+      out should include("@id.ptr.volatile.uint(")
+      out should include("@id.ptr.uint(")
+    }
+
+    // `ptr_cast` is how a device address is reached at all, so it is also the way between the two
+    // pointer types — there is no implicit conversion either way.
+    "'ptr_cast' is what goes between a '*T' and a '*volatile T'" in {
+      val src =
+        """to(p: *u32) -> *volatile u32 = ptr_cast(p)
+          |from(p: *volatile u32) -> *u32 = ptr_cast(p)
+          |print(*to(ptr_cast(usize(16))), *from(ptr_cast(usize(16))))""".stripMargin
+
+      ir(src) should include("define ptr @to(ptr %p.param)")
+    }
+
+    "and one is not the other without it" in {
+      err("f(p: *volatile u32) -> unit = ()\ng(q: *u32) -> unit = f(q)\ng(ptr_cast(usize(16)))") should
+        include("*volatile uint")
+    }
+
+    // A driver is exactly the code that runs where there is no allocator, so the capability clause
+    // has to admit one (`13 §4`).
+    "a driver module compiles under 'no alloc'" in {
+      irOf(
+        "dev.sysl" ->
+          """module dev
+            |no alloc
+            |struct Uart
+            |    status: volatile u32
+            |    data:   volatile u32
+            |val regs: *Uart = ptr_cast(usize(0x10000000))
+            |putc(c: u32) -> unit
+            |    while regs.status == 0u32 do ()
+            |    regs.data = c
+            |""".stripMargin,
+        "main.sysl" -> "import dev\ndev.putc(65u32)\n",
+      ) should include("store volatile i32")
+    }
+  }
+
+  "a register stands where an ordinary value does, and the accesses still happen" - {
+    "as the scrutinee of a match" in {
+      val src =
+        """extern malloc(n: usize) -> *u8
+          |go() -> unit
+          |    val p: *volatile u32 = ptr_cast(malloc(4))
+          |    *p = 2u32
+          |    val what = *p match
+          |        2u32 -> "two"
+          |        _ -> "other"
+          |    print(what)
+          |go()""".stripMargin
+
+      run(src) shouldBe "two\n"
+    }
+
+    "and compared against a null one" in {
+      val src =
+        """nul() -> *volatile u32 = null
+          |p() -> *volatile u32 = ptr_cast(usize(16))
+          |print(nul() == nul(), p() == nul())""".stripMargin
+
+      run(src) shouldBe "true false\n"
+    }
+
+    "while 'sizeof' answers for the pointer and for the block" in {
+      run(uart + "print(sizeof(*volatile u32), sizeof(Uart))") shouldBe "8 12\n"
+    }
+  }
+
   // A qualifier is about the instruction, never about the layout: a block of registers is laid out
   // exactly as the same fields unqualified would be, which is what lets a device header be
   // transcribed field for field.
