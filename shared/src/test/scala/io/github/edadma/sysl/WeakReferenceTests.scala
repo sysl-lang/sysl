@@ -56,6 +56,58 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
                    |print(ws[0].get().unwrap().value, ws[1].get().unwrap().value)
                    |""".stripMargin) shouldBe "1 2\n"
     }
+
+    // The chapter says a weak reference is written "in the same places" the other two modes are,
+    // which makes the positions above a sample and not the list. These are the rest of the places a
+    // '&T' reaches, kept because "the same places" is the kind of claim that stays true only while
+    // something asks: an array element, a tuple part, a generic argument, and the parameter of a
+    // callable type — the last being a separate mechanism from a bare arrow rather than a spelling
+    // of it, so passing there is no evidence about passing here.
+    "an array element, a tuple part, and a generic argument" in {
+      run(node + """var r: &Node = Node(1)
+                   |var s: &Node = Node(2)
+                   |var arr: [2]weak Node = [r, s]
+                   |var tu: (weak Node, int) = (r, 3)
+                   |var op: Option[weak Node] = Some(s)
+                   |print(arr[1].get().unwrap().value, tu.0.get().unwrap().value, tu.1)
+                   |print(op.unwrap().get().unwrap().value)
+                   |""".stripMargin) shouldBe "2 1 3\n2\n"
+    }
+
+    "the parameter of a callable type" in {
+      run(node + """peek(w: weak Node) -> int = w.get().unwrap().value
+                   |var r: &Node = Node(7)
+                   |var f: &Fn(weak Node) -> int = peek
+                   |print(f(r))
+                   |""".stripMargin) shouldBe "7\n"
+    }
+
+    // The one position a 'weak T' does NOT reach, and it is worth two tests because the reason is
+    // not a rule about weak references at all. A default is produced afresh at each call that omits
+    // it, in a scope holding no locals, so what it names has to outlive every frame — and the only
+    // two things that could hand it a 'weak Node' are both closed. A construction is refused for
+    // having nowhere to live (asserted below, under "and only a reference does"), which leaves a
+    // name, and neither kind of name works.
+    "but not a default parameter value, because nothing a default may name can produce one" - {
+
+      // A top-level 'var' is a local of the entry point, so a default reading one is reading the
+      // caller's locals — which is what the scope emptied for defaults is there to prevent.
+      "not a top-level 'var', which is a local of the caller however far above it is written" in {
+        err(node + """var fallback: &Node = Node(4)
+                     |peek(w: weak Node = fallback) -> int = w.get().unwrap().value
+                     |print(peek())
+                     |""".stripMargin) should include("undefined name 'fallback'")
+      }
+
+      // And the declaration that does outlive every frame cannot hold a reference in the first
+      // place, which closes the other half.
+      "and not a module-level 'val', which outlives every frame but holds plain data only" in {
+        err(node + """val fallback: &Node = Node(4)
+                     |peek(w: weak Node = fallback) -> int = w.get().unwrap().value
+                     |print(peek())
+                     |""".stripMargin) should include("a 'val' holds plain data only")
+      }
+    }
   }
 
   "and only a reference does" - {
