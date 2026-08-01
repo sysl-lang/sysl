@@ -40,7 +40,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       case Left(err) => fail(s"the core library did not build: $err")
 
   private lazy val read: (Core, Set[String]) =
-    Core.read("sysl.syslib", artifact._2) match
+    Core.read("sysl.syslib", artifact._2, Target.default) match
       case Right(r)  => r
       case Left(err) => fail(s"the core metadata did not read back: $err")
 
@@ -143,7 +143,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     // decodes and links perfectly — it is simply the wrong library, and nothing else would notice.
 
     "is refused, rather than compiled against" in {
-      Core.read("stale.syslib", drifted) match
+      Core.read("stale.syslib", drifted, Target.default) match
         case Left(err) => err should include("different standard module")
         case Right(_)  => fail("a core built from other source was accepted")
     }
@@ -151,7 +151,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     "while the one built from what the compiler carries is accepted" in {
       // Discriminating against the above: without this the refusal could be unconditional, which
       // would reject every artifact and look exactly as green.
-      Core.read("sysl.syslib", artifact._2) shouldBe a[Right[?, ?]]
+      Core.read("sysl.syslib", artifact._2, Target.default) shouldBe a[Right[?, ?]]
     }
 
     "and the fingerprint is what tells them apart" in {
@@ -369,7 +369,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
 
       fromDisk match
         case Right((_, meta)) =>
-          LibraryArtifact.read("disk.syslib", meta) match
+          LibraryArtifact.read("disk.syslib", meta, Target.default) match
             case Right((_, syms, _)) => syms shouldBe precompiled
             case Left(err)           => fail(err)
         case Left(err) => fail(s"the core library did not build from disk: $err")

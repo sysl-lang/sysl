@@ -64,7 +64,7 @@ object LibraryArtifact {
    * the tree encoding inside it change for different reasons, and either alone makes an artifact
    * unreadable, so each says so on its own.
    */
-  val Version: Int = 2
+  val Version: Int = 3
 
   /** The separator both byte formats here lean on: between the fields of a fingerprint, and around
    * the metadata marker.
@@ -189,7 +189,8 @@ object LibraryArtifact {
             // shims are as much its source as its modules are, and an artifact that did not change
             // when one of them was edited is a stale artifact nothing would notice was stale.
             Compiler.compileLibrary(units, target, building, core)
-              .map((ir, compiled) => (ir, metadata(units, compiled, fingerprint(sources ::: native))))
+              .map((ir, compiled) =>
+                (ir, metadata(units, compiled, fingerprint(sources ::: native), target)))
   }
 
   /** What one of a library's C files is called inside the archive.
@@ -251,13 +252,22 @@ object LibraryArtifact {
    */
   def core: Set[String] = Library.modules.toSet
 
-  /** The metadata blob: the source fingerprint, how many symbols the object half defines, those
-   * symbols, then the tree.
+  /** The metadata blob: the machine it was built for, the source fingerprint, how many symbols the
+   * object half defines, those symbols, then the tree.
+   *
+   * **The target is recorded because the tree half is now a per-target answer** (`Conditional`): a
+   * library may gate on the machine, so two artifacts built from one source are two different sets of
+   * declarations. Before that the trees were the same whatever the artifact was built for, and the
+   * only target-specific part was the object half — which a linker refuses on its own. A tree
+   * mismatch has nothing to refuse it, and would surface as a diagnostic about a missing name in
+   * somebody else's library.
    */
-  private def metadata(units: List[Program], compiled: Set[String], source: String): String = {
+  private def metadata(units: List[Program], compiled: Set[String], source: String,
+                       target: Target): String = {
     val names = compiled.toList.sorted
 
-    (source :: names.length.toString :: names).mkString("", "\n", "\n") + AstCodec.encode(units)
+    (target.name :: source :: names.length.toString :: names).mkString("", "\n", "\n") +
+      AstCodec.encode(units)
   }
 
   /** The byte string the metadata is found by, inside an object file nothing else can read.
@@ -384,18 +394,31 @@ object LibraryArtifact {
   /** The modules an artifact carries, the symbols its object half defines, and the fingerprint of
    * the source it was built from.
    *
-   * The fingerprint is handed back rather than checked here, because only the caller knows what it
-   * should be: a library's own source is not something the compiler has, while the standard
-   * module's is exactly what it carries. `Core.read` is where the comparison belongs.
+   * **An artifact built for another machine is refused here**, and refused rather than handed back
+   * for the caller to check, because every caller wants the same rule — the same reason
+   * `Target.named` refuses a target it cannot lower for. The tree half is a per-target answer since
+   * a library may gate on the machine (`Conditional`), and the wrong one decodes perfectly: it is
+   * simply a different set of declarations, which is the worst way for this to fail. The object half
+   * would be refused by the linker eventually, in a message about object formats that says nothing
+   * about which library or why.
+   *
+   * The fingerprint is handed back rather than checked, because only the caller knows what it should
+   * be: a library's own source is not something the compiler has, while the standard module's is
+   * exactly what it carries. `Core.read` is where that comparison belongs.
    */
-  def read(name: String, meta: String): Either[String, (List[Program], Set[String], String)] = {
-    val header  = meta.indexOf('\n')
-    val source  = Option.when(header > 0)(meta.take(header))
-    val rest    = meta.drop(header + 1)
+  def read(name: String, meta: String, target: Target)
+      : Either[String, (List[Program], Set[String], String)] = {
+    val lines = meta.linesWithSeparators
+    val built = if lines.hasNext then lines.next().stripLineEnd else ""
+    val rest0 = meta.drop(built.length).dropWhile(_ == '\n')
+
+    val header  = rest0.indexOf('\n')
+    val source  = Option.when(header > 0)(rest0.take(header))
+    val rest    = rest0.drop(header + 1)
     val newline = rest.indexOf('\n')
 
     (source, Option.when(newline >= 0)(rest.take(newline)).flatMap(_.trim.toIntOption).filter(_ >= 0)) match
-      case (Some(fingerprint), Some(count)) =>
+      case (Some(fingerprint), Some(count)) if built == target.name =>
         val body  = rest.drop(newline + 1)
         val lines = body.linesWithSeparators.take(count).toList
         val tree  = body.drop(lines.map(_.length).sum)
@@ -403,6 +426,10 @@ object LibraryArtifact {
         AstCodec.decode(tree).left
           .map(e => s"$name is not a readable sysl library: $e")
           .map((_, lines.map(_.stripLineEnd).toSet, fingerprint))
+
+      case (Some(_), Some(_)) =>
+        Left(s"$name was built for $built and this is a build for ${target.name} — " +
+          s"rebuild it with --target ${target.name}")
 
       case _ => Left(s"$name is not a readable sysl library: its metadata header is missing")
   }

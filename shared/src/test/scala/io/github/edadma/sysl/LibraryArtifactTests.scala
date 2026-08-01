@@ -41,7 +41,7 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
    * fingerprint of the source it was built from.
    */
   private def metadata: (List[Program], Set[String], String) =
-    LibraryArtifact.read("demo.syslib", built._2) match
+    LibraryArtifact.read("demo.syslib", built._2, Target.default) match
       case Right(r)  => r
       case Left(err) => fail(s"the metadata did not read back: $err")
 
@@ -248,7 +248,7 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       // emitting them would put a copy of the printing surface in every artifact.
       val (ir, meta) = printing("say", "hello")
 
-      LibraryArtifact.read("say.syslib", meta) match
+      LibraryArtifact.read("say.syslib", meta, Target.default) match
         case Right((_, syms, _)) => syms shouldBe Set("say$hello")
         case Left(err)           => fail(err)
 
@@ -272,7 +272,7 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
           case Right(_)  => obj
       }
       val trees = built.flatMap { (_, meta) =>
-        LibraryArtifact.read("x.syslib", meta) match
+        LibraryArtifact.read("x.syslib", meta, Target.default) match
           case Right((t, _, _)) => t
           case Left(err)        => fail(err)
       }

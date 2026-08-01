@@ -107,8 +107,8 @@ object Core {
    * this to fail. Refusing puts it on the path a corrupt one already takes: a warning, and the copy
    * the compiler carries.
    */
-  def read(name: String, metadata: String): Either[String, (Core, Set[String])] =
-    LibraryArtifact.read(name, metadata).flatMap((units, precompiled, source) =>
+  def read(name: String, metadata: String, target: Target): Either[String, (Core, Set[String])] =
+    LibraryArtifact.read(name, metadata, target).flatMap((units, precompiled, source) =>
       if source == Std.fingerprint then Right((new Core(units), precompiled))
       else
         Left(s"$name was built from a different standard module than this compiler carries — " +

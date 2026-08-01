@@ -227,7 +227,8 @@ private[sysl] def execute(cfg: Config): Int = {
     case Some(e) => return fail(e)
     case None    => ()
 
-  val decoded = artifacts.zip(unpacked).collect { case (p, Right(meta)) => LibraryArtifact.read(p, meta) }
+  val decoded =
+    artifacts.zip(unpacked).collect { case (p, Right(meta)) => LibraryArtifact.read(p, meta, target) }
 
   decoded.collectFirst { case Left(e) => e } match
     case Some(e) => return fail(e)
@@ -403,7 +404,7 @@ private def chooseCore(cfg: Config, target: Target): Either[String, (Core, Set[S
   if cfg.noCoreLib || cfg.core then Right((Core.embedded(target), Set.empty, None))
   else
     cfg.coreLib.orElse(Option.when(isFile(cfg.coreSearch))(cfg.coreSearch)) match
-      case Some(path) => loadCore(path)
+      case Some(path) => loadCore(path, target)
       case None =>
         Left(s"cannot find the standard module — build it with 'sysl build-lib lib --core', " +
           s"or pass --no-core-lib to compile against the copy built into the compiler")
@@ -417,13 +418,13 @@ private def chooseCore(cfg: Config, target: Target): Either[String, (Core, Set[S
  * kind as not finding it at all, and is reported rather than worked around. A standard module that
  * cannot be read is not a standard module.
  */
-private def loadCore(path: String): Either[String, (Core, Set[String], Option[String])] = {
+private def loadCore(path: String, target: Target): Either[String, (Core, Set[String], Option[String])] = {
   val bytes =
     try readBytes(path)
     catch case e: Exception => return Left(s"cannot read $path: ${e.getMessage}")
 
   LibraryArtifact.metadataOf(path, bytes).flatMap(meta =>
-    Core.read(path, meta).map((core, symbols) => (core, symbols, Some(path))))
+    Core.read(path, meta, target).map((core, symbols) => (core, symbols, Some(path))))
 }
 
 /** Which machine this invocation is for: the one it names, or this one. A machine sysl has no entry

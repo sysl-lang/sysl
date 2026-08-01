@@ -853,8 +853,13 @@ is which of those the consumer must declare rather than emit a second time.
 
 Five consequences worth stating, because each is a thing a reader would otherwise have to discover:
 
-- **An artifact is for one machine**, exactly as an `.rlib` is, because half of it is object code.
-  The tree half would travel anywhere; the object half is what pins it.
+- **An artifact is for one machine**, exactly as an `.rlib` is, and **both** halves pin it. The
+  object half obviously does. The tree half does since a library may gate on the machine it is built
+  for (`targets.md § Conditional compilation`), which makes two artifacts built from one source two
+  different sets of declarations. So an artifact records the target it was built for and is refused
+  by a build for another — refused rather than left to the linker, which would eventually complain
+  about object formats in a message saying nothing about which library or why, and which would not
+  fire at all for a mismatch that only reached the trees.
 - **A library carries no entry point.** A `main` of its own would collide with the one belonging to
   whatever links it.
 - **Nothing is pruned when a library is built.** A program is lowered from `main` outwards because

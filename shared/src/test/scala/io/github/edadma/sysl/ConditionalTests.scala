@@ -9,7 +9,8 @@ import org.scalatest.matchers.should.Matchers
  * what each of the ten machines in the registry sees, and reading the emitted text is the whole of
  * what a cross-target question needs.
  */
-class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport with RunSupport {
+class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport with RunSupport
+    with TestFrameworkSupport {
 
   private val linux   = Target.x86_64Linux
   private val macos   = Target.aarch64MacOS
@@ -548,6 +549,129 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
 
       irFor(macos, src.stripMargin) should include("1")
       irFor(linux, src.stripMargin) should include("1")
+    }
+  }
+
+  /** A one-module library whose `flavour` differs between machines, built for a target and read back
+   * through the same seam a consuming compilation reads it through.
+   */
+  private def built(target: Target): List[String] = {
+    val src = """module demo
+                |
+                |#if macos
+                |flavour() -> int = 31337
+                |#elif linux
+                |flavour() -> int = 42424
+                |#else
+                |flavour() -> int = 55555
+                |extra() -> int = 1
+                |#endif
+                |""".stripMargin
+
+    LibraryArtifact.build(List(Source("demo/lib.sysl", src, List("demo"))), target) match
+      case Left(err)     => fail(s"the library did not build: $err")
+      case Right((_, m)) =>
+        LibraryArtifact.read("demo.syslib", m, target) match
+          case Left(err)            => fail(err)
+          case Right((units, _, _)) => Library.names(units.flatMap(_.body)).toList.sorted
+  }
+
+  "a library gates like anything else" - {
+
+    "the artifact carries the declarations its target saw" in {
+      built(macos) shouldBe List("flavour")
+      built(linux) shouldBe List("flavour")
+      built(windows) shouldBe List("extra", "flavour")
+    }
+
+    "and an artifact built for another machine is refused rather than quietly used" in {
+      // The hazard this feature creates. Before it the tree half was the same whatever the artifact
+      // was built for, and only the object half was per-target — which a linker refuses on its own.
+      // A tree mismatch decodes perfectly and is simply a different set of declarations.
+      val src = "module demo\n\nf() -> int = 1\n"
+
+      LibraryArtifact.build(List(Source("demo/lib.sysl", src, List("demo"))), linux) match
+        case Left(err)     => fail(err)
+        case Right((_, m)) =>
+          LibraryArtifact.read("demo.syslib", m, macos) match
+            case Right(_)  => fail("an artifact built for another machine was accepted")
+            case Left(err) =>
+              err should include("was built for x86_64-linux")
+              err should include("--target aarch64-macos")
+    }
+  }
+
+  "a '#test' is gated like any other declaration" in {
+    // `#` opens both an attribute and a directive, and this is the one place the two meet in earnest:
+    // the test build has to discover the tests the target actually has.
+    discovered("""#test
+                 |everywhere()
+                 |    1
+                 |
+                 |#if windows
+                 |#test
+                 |only_on_windows()
+                 |    1
+                 |#endif
+                 |""".stripMargin) shouldBe List("everywhere")
+  }
+
+  "an inactive branch does not have to be sysl at all" - {
+
+    "it may not parse" in {
+      // The stated cost of gating text rather than trees, and the thing most worth pinning: a reader
+      // told the branch is never syntax-checked should be able to see that it is not.
+      run("""#if windows
+            |)( this is not sysl and never was ][
+            |#endif
+            |print(1)
+            |""".stripMargin) shouldBe "1\n"
+    }
+
+    "it may not even lex" in {
+      run("#if windows\nvar s = \"unterminated\nvar c = '\n#endif\nprint(2)\n") shouldBe "2\n"
+    }
+
+    "but a directive inside it is still read, because the group has to be closed" in {
+      err("#if windows\n#if linux\nnonsense ][\n#endif\nprint(1)\n") should include("never closed")
+    }
+  }
+
+  "the shape of the file survives" - {
+
+    "a file's directory is carried through the gate, so its module still checks out" in {
+      // A gated `Source` is a new object, and losing `dir` would make every module header in a
+      // project stop agreeing with the directory it sits in — a whole class of wrong diagnostics.
+      irIn(("demo", "a.sysl", "module demo\n\n#if macos\ntwo() -> int = 2\n#endif\n"),
+           ("", "main.sysl", "print(demo.two())\n")) should include("2")
+    }
+
+    "an empty file gates to an empty file" in {
+      Conditional.gate(Source("<input>", ""), macos).map(_.text) shouldBe Right("")
+    }
+
+    "a file of nothing but directives" in {
+      Conditional.gate(Source("<input>", "#if macos\n#endif\n"), macos).map(_.text) shouldBe Right("\n\n")
+    }
+
+    "CRLF line endings survive on the lines that are kept" in {
+      Conditional.gate(Source("<input>", "#if macos\r\nprint(1)\r\n#else\r\nprint(2)\r\n#endif\r\n"), macos)
+        .map(_.text) shouldBe Right("\nprint(1)\r\n\n\n\n")
+    }
+
+    "groups nest as deeply as they are written" in {
+      val depth = 12
+      val body  = List.fill(depth)("#if posix").mkString("\n") + "\n    31337\n" +
+        List.fill(depth)("#endif").mkString("\n")
+
+      sees(macos, body) shouldBe "31337"
+    }
+
+    "a gated 'module' header puts the file in the root module, and says so where that is wrong" in {
+      // Worth pinning because it is the one line whose absence changes what the whole file means
+      // rather than what it contains.
+      errIn(("demo", "a.sysl", "#if windows\nmodule demo\n#endif\n\ntwo() -> int = 2\n")) should
+        include("demo")
     }
   }
 

@@ -277,7 +277,7 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
     }
 
     def fingerprintOf(out: String): String =
-      LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _)) match
+      LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _, Target.default)) match
         case Right((_, _, fingerprint)) => fingerprint
         case Left(err)                  => fail(err)
 
@@ -904,7 +904,7 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
 
       cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
 
-      LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _)) match
+      LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _, Target.default)) match
         case Right((trees, syms, fingerprint)) =>
           // Every symbol is one of the library's own modules'. A library defines its own
           // declarations and nobody else's, and the core library is the one place that rule is under
