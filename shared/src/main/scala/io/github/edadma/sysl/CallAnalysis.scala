@@ -12,6 +12,42 @@ package io.github.edadma.sysl
  */
 trait CallAnalysis extends OperatorCalls {
 
+  /** The type a bare name stands for in call position where no *value* of that name is nearer and
+   * no declaration table claims it: a type parameter of whatever is being analyzed, which is the
+   * body's own `T` and the `Self` a member's is bound to, or a built-in.
+   *
+   * A struct, an enum and a constrained subtype are named through `typeKey` by the forms above,
+   * which have their own readings to offer — a construction, a variant, a cast. What is left is the
+   * two kinds a name in this position could only ever have meant as a type.
+   */
+  protected def typeNamed(written: String): Option[Type] =
+    tsubst.get(written).orElse(scalarType(written))
+
+  /** `T.f(…)` — an associated function reached through a **type** rather than through a value of one
+   * (`02 § Reaching a trait's members without a value`).
+   *
+   * The two cases are the two things a name in that position can stand for. A **parameter** reaches
+   * what its bounds promise, checked against the trait's signature exactly as a method call on a
+   * value of the parameter is — one walk standing in for every instantiation. Anything **concrete**
+   * reaches its own member table, which is the same lookup `Box.of(…)` makes, and arrives there by a
+   * different route only because a built-in's name is not one of the declaration tables.
+   */
+  protected def callTypeAssociated(
+      ty: Type,
+      mname: String,
+      args: List[Expr],
+      expected: Option[Type],
+  ): TExpr = ty match
+    case a: Type.Abstract => callBoundAssociated(a, mname, args)
+    case concrete =>
+      val key = memberKey(concrete, mname)._1
+
+      if !memberDecls.contains((key, mname)) then
+        err(s"${show(concrete)} has no associated function '$mname'" +
+          (if hasMember(concrete, mname) then s" — '$mname' is reached on a value of one" else ""))
+
+      callAssociated(key, mname, args, expected)
+
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
    * The positional constructor `Type(…)` is a different form and is handled elsewhere.
    *

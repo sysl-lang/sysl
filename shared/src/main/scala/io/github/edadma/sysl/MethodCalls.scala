@@ -402,6 +402,63 @@ trait MethodCalls extends FuncAddress {
           TCall(fname, recv :: (checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_))), rtype)
         }
 
+  /** `T.f(…)` where `T` is a type parameter and `f` is an associated function one of its bounds
+   * declares — what `callBoundMethod` is to a value, asked of the type itself.
+   *
+   * This is the whole of what a bound can say **about the type** rather than about a value of it.
+   * A parameter is not a name anything else can be written through, so without it every fact a
+   * generic body needs — a width, a zero, a table of constants — has to arrive as a member carrying
+   * a receiver nothing reads, which is the workaround `02` describes and this replaces.
+   *
+   * Checked against the trait's signature and discarded, exactly as a bound method call is: the name
+   * it carries is the trait's, and which implementation runs is settled once a concrete type is
+   * known. Static dispatch only — a trait declaring one has no object (`checkObjectSafe`), because
+   * there is no receiver for a table slot to be selected by.
+   */
+  protected def callBoundAssociated(a: Type.Abstract, mname: String, args: List[Expr]): TExpr =
+    boundMember(a, mname) match
+      case None => unlicensedAssociated(a, mname)
+      case Some((tr, self, m)) =>
+        reported {
+          val fname = s"${tr.name}.$mname"
+          if m.isProperty then
+            err(s"'$mname' is a property of '${tr.show}' — read it on a value, as 'value.$mname'")
+          if m.receiver.isDefined then
+            err(s"'$mname' is a method of '${tr.show}' — call it on a value of '${a.name}', not on " +
+              "the type itself")
+          val params = m.params.map(p => (p.name, resolveType(p.typ, self)))
+          val bound  = bindArgs(s"associated function '$fname'", Some(tr.name), m.params, args, m.variadic)
+
+          checkArity(s"associated function '$fname'", params.length, m.variadic, bound.length)
+          val (declared, tail) = bound.splitAt(params.length)
+          val ts    = declared.zip(params).map { case (arg, (_, pty)) => analyzeExpr(arg, Some(pty)) }
+          val rtype = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
+          TCall(fname, checkArgs(fname, params, declared, Some(ts)) ::: tail.map(variadicArg(_)), rtype)
+        }
+
+  /** The trait a bound reaches an associated function of that name through, where one does — asked
+   * by a *read* that has to decide between telling the reader to add the parentheses and reporting
+   * whatever else the name turned out to be.
+   */
+  protected def boundAssociated(a: Type.Abstract, mname: String): Option[String] =
+    boundMember(a, mname).filter(_._3.recvMode.isEmpty).map(_._1.show)
+
+  /** The diagnostic for `T.f(…)` that no bound licenses, which is the associated-function half of
+   * `unlicensed`: with a trait declaring one of that name the fix is the bound, and naming it is
+   * what checking at the definition is for.
+   */
+  private def unlicensedAssociated(a: Type.Abstract, mname: String): Nothing =
+    traitDecls.values
+      .filter(_.methods.exists(m => m.name == mname && m.recvMode.isEmpty))
+      .map(t => qn(t.name))
+      .toList match
+      case Nil =>
+        boundErr(s"'${a.name}' is a type parameter, and no trait declares an associated function " +
+          s"'$mname' that a bound could promise")
+      case one :: Nil => boundErr(s"'$mname' needs '${a.name}: $one'")
+      case many =>
+        boundErr(s"'$mname' needs a bound on '${a.name}' — it is declared by ${many.mkString("'", "', '", "'")}")
+
   /** The first member of that name one of a parameter's bounds declares, with the substitution its
    * signature is read under.
    *
