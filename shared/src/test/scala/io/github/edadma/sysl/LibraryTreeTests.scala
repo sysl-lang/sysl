@@ -445,7 +445,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // library does not carry it, and every module the library *does* carry is refused — which was
     // one rule about one name while `sysl` was alone and is now a rule about a set.
     "a program may not declare any module the library carries, not merely the standard one" in {
-      for carried <- List("sysl.buf", "sysl.text", "sysl.io", "sysl.sys", "sysl.args") do
+      for carried <- List("sysl.buf", "sysl.text", "sysl.io", "sysl.sys", "sysl.args", "sysl.math") do
         withClue(s"declaring $carried: ") {
           errOf("mine.sysl" -> s"module $carried\n\nflag(n: int) -> int = n") should
             include(s"'$carried' is the module every program is compiled against")

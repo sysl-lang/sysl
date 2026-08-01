@@ -1,0 +1,220 @@
+module sysl.math
+
+import sysl.sys.*
+
+// Mathematics on the floating-point types, offered as a trait rather than as two sets of functions.
+//
+// The shape is forced by a language decision and turns out to be the better one anyway. sysl has no
+// overloading (`12 §1`), so a module of free functions could not call the square root of a `real`
+// and the square root of an `f32` by one name -- it would need `sqrt` and `sqrtf` the way C does,
+// and every caller would have to keep track of which width it was holding. A trait resolves that on
+// the receiver: `x.sqrt()` is the same three words whichever width `x` is, and changing a
+// declaration from `f32` to `real` does not send anyone editing call sites. `02` allows an `impl`
+// for a built-in precisely so a library can do this.
+//
+// **What the trait requires and what it answers are two different lists, and the split is where the
+// mathematics is.** A method whose result C computes -- a range-reduced sine, a correctly rounded
+// root -- is required, and each width binds it to its own libm entry point. A method that is
+// arithmetic over the others is a default, written once and inherited by both. So `log` in an
+// arbitrary base exists in exactly one place, and adding a third floating-point width would be 31
+// bindings and no new mathematics.
+//
+// The required list also holds the handful of operations that need a *literal* of the implementing
+// type -- an absolute value needs a zero to compare against, a reciprocal needs a one, a conversion
+// to radians needs pi over 180. A default may assume of its receiver exactly what the trait declares
+// (`02`), and the trait declares no way to make a constant, so those are written per width even
+// though the body is the same shape both times.
+trait Float: Eq + Ord + Neg + Add + Sub + Mul + Div
+
+    // Roots. `sqrt` is the one every float program reaches for and the one hardware has an
+    // instruction for; `cbrt` is here because the alternative a program would otherwise write --
+    // raising to one third -- is wrong for negative operands.
+    sqrt(self) -> Self
+    cbrt(self) -> Self
+
+    // Exponentials and their inverses. `ln` is the natural logarithm and is spelled for what it is
+    // rather than as C's bare `log`, which reads as though it were the general one and is the single
+    // most common way to get a base wrong.
+    exp(self) -> Self
+    exp2(self) -> Self
+    ln(self) -> Self
+    log2(self) -> Self
+    log10(self) -> Self
+
+    // Raising to an arbitrary power, and the length of a two-dimensional vector. `hypot` is not
+    // `(x*x + y*y).sqrt()`: the squares of operands near the top of the range overflow to infinity
+    // when the answer itself is perfectly representable, and libm's does the scaling that avoids it.
+    pow(self, exponent: Self) -> Self
+    hypot(self, other: Self) -> Self
+
+    // Circular trigonometry, in radians. `atan2` takes the two coordinates rather than their ratio,
+    // which is what lets it tell the four quadrants apart -- and the receiver is the *vertical*
+    // coordinate, matching the argument order the name has had since Fortran.
+    sin(self) -> Self
+    cos(self) -> Self
+    tan(self) -> Self
+    asin(self) -> Self
+    acos(self) -> Self
+    atan(self) -> Self
+    atan2(self, x: Self) -> Self
+
+    // Hyperbolic trigonometry.
+    sinh(self) -> Self
+    cosh(self) -> Self
+    tanh(self) -> Self
+
+    // Rounding to an integral value. All four answer in the float's own type, because a `floor` that
+    // returned an integer would have no answer for the operands that do not fit one -- the caller who
+    // wants an integer is the caller who knows the range, and casts.
+    //
+    // `round` goes away from zero at a half, which is C's rule and not the banker's rounding a
+    // printed value gets; `trunc` goes towards zero, which is what a cast already does.
+    floor(self) -> Self
+    ceil(self) -> Self
+    round(self) -> Self
+    trunc(self) -> Self
+
+    // The remainder of a division that truncates, keeping the sign of the receiver. This is `%` on
+    // the integers and is *not* `%` here: `01` leaves `Rem` to the integer types, since a float
+    // remainder is a library operation rather than an instruction.
+    fmod(self, divisor: Self) -> Self
+
+    // Sign, taken three ways because the three answer differently at the edges. `abs` and `signum`
+    // are comparisons and see neither the sign of a zero nor a NaN; `copysign` reads the sign bit
+    // itself and carries both.
+    abs(self) -> Self
+    signum(self) -> Self
+    copysign(self, sign: Self) -> Self
+
+    // One over the receiver, which is worth a name because a loop that divides by the same value
+    // repeatedly should multiply by this instead.
+    recip(self) -> Self
+
+    // Whether the receiver is one of the two infinities. NaN is not, and answers `false` here as it
+    // does to every comparison.
+    is_infinite(self) -> bool
+
+    // Degrees are what a person writes down and radians are what the functions above take, so the
+    // conversion belongs beside them rather than in each program that reads an angle from a file.
+    to_radians(self) -> Self
+    to_degrees(self) -> Self
+
+    // --- What the trait answers for itself. ---
+
+    // The only value that is not equal to itself, which is both the definition and the test.
+    is_nan(self) -> bool = self != self
+
+    // Neither infinite nor NaN, and so a value the arithmetic below will keep meaning something for.
+    is_finite(self) -> bool = !self.is_nan() && !self.is_infinite()
+
+    // The receiver multiplied by itself, which is worth a name for the same reason `hypot` is: it
+    // says what was meant, and it evaluates the operand once where `x * x` written over a call
+    // evaluates it twice.
+    square(self) -> Self = self * self
+
+    // The logarithm in an arbitrary base. One place, one identity, and the two logarithms it is
+    // built from are the accurate ones -- which is why `log2` and `log10` are required separately
+    // rather than left to this: reading them back through a ratio loses digits that libm keeps.
+    log(self, base: Self) -> Self = self.ln() / base.ln()
+
+    // The point a fraction of the way from the receiver to another, which is the interpolation every
+    // program that animates or resamples writes for itself. Written as `a + (b - a) * t` rather than
+    // `a * (1 - t) + b * t`: the second form is the exact one at `t = 1` and this one is the exact
+    // one at `t = 0`, and starting where you said you would start is what a caller notices.
+    lerp(self, to: Self, t: Self) -> Self = self + (to - self) * t
+
+end Float
+
+// Binary64, which is what `real` names and what a float literal is unless it says otherwise.
+impl Float for real
+    sqrt(self) -> real = sysl_sqrt(self)
+    cbrt(self) -> real = sysl_cbrt(self)
+
+    exp(self) -> real = sysl_exp(self)
+    exp2(self) -> real = sysl_exp2(self)
+    ln(self) -> real = sysl_log(self)
+    log2(self) -> real = sysl_log2(self)
+    log10(self) -> real = sysl_log10(self)
+
+    pow(self, exponent: real) -> real = sysl_pow(self, exponent)
+    hypot(self, other: real) -> real = sysl_hypot(self, other)
+
+    sin(self) -> real = sysl_sin(self)
+    cos(self) -> real = sysl_cos(self)
+    tan(self) -> real = sysl_tan(self)
+    asin(self) -> real = sysl_asin(self)
+    acos(self) -> real = sysl_acos(self)
+    atan(self) -> real = sysl_atan(self)
+    atan2(self, x: real) -> real = sysl_atan2(self, x)
+
+    sinh(self) -> real = sysl_sinh(self)
+    cosh(self) -> real = sysl_cosh(self)
+    tanh(self) -> real = sysl_tanh(self)
+
+    floor(self) -> real = sysl_floor(self)
+    ceil(self) -> real = sysl_ceil(self)
+    round(self) -> real = sysl_round(self)
+    trunc(self) -> real = sysl_trunc(self)
+    fmod(self, divisor: real) -> real = sysl_fmod(self, divisor)
+
+    abs(self) -> real = if self < 0.0 then -self else self
+
+    // A NaN receiver satisfies neither comparison and leaves by the last arm holding itself, which
+    // is the answer wanted; so does a zero, which keeps its own sign rather than being told it is
+    // positive.
+    signum(self) -> real = if self > 0.0 then 1.0 else if self < 0.0 then -1.0 else self
+
+    copysign(self, sign: real) -> real = sysl_copysign(self, sign)
+    recip(self) -> real = 1.0 / self
+
+    // Larger in magnitude than the largest finite binary64 is a condition only the infinities meet,
+    // and a NaN fails it the way it fails every comparison.
+    is_infinite(self) -> bool = self.abs() > 1.7976931348623157e308
+
+    to_radians(self) -> real = self * 0.017453292519943295
+    to_degrees(self) -> real = self * 57.29577951308232
+end real
+
+// Binary32. Every body here is its binary64 counterpart with libm's `f`-suffixed entry point and a
+// literal of this width, which is the duplication the trait exists to keep out of programs.
+impl Float for f32
+    sqrt(self) -> f32 = sysl_sqrtf(self)
+    cbrt(self) -> f32 = sysl_cbrtf(self)
+
+    exp(self) -> f32 = sysl_expf(self)
+    exp2(self) -> f32 = sysl_exp2f(self)
+    ln(self) -> f32 = sysl_logf(self)
+    log2(self) -> f32 = sysl_log2f(self)
+    log10(self) -> f32 = sysl_log10f(self)
+
+    pow(self, exponent: f32) -> f32 = sysl_powf(self, exponent)
+    hypot(self, other: f32) -> f32 = sysl_hypotf(self, other)
+
+    sin(self) -> f32 = sysl_sinf(self)
+    cos(self) -> f32 = sysl_cosf(self)
+    tan(self) -> f32 = sysl_tanf(self)
+    asin(self) -> f32 = sysl_asinf(self)
+    acos(self) -> f32 = sysl_acosf(self)
+    atan(self) -> f32 = sysl_atanf(self)
+    atan2(self, x: f32) -> f32 = sysl_atan2f(self, x)
+
+    sinh(self) -> f32 = sysl_sinhf(self)
+    cosh(self) -> f32 = sysl_coshf(self)
+    tanh(self) -> f32 = sysl_tanhf(self)
+
+    floor(self) -> f32 = sysl_floorf(self)
+    ceil(self) -> f32 = sysl_ceilf(self)
+    round(self) -> f32 = sysl_roundf(self)
+    trunc(self) -> f32 = sysl_truncf(self)
+    fmod(self, divisor: f32) -> f32 = sysl_fmodf(self, divisor)
+
+    abs(self) -> f32 = if self < 0.0f32 then -self else self
+    signum(self) -> f32 = if self > 0.0f32 then 1.0f32 else if self < 0.0f32 then -1.0f32 else self
+    copysign(self, sign: f32) -> f32 = sysl_copysignf(self, sign)
+    recip(self) -> f32 = 1.0f32 / self
+
+    is_infinite(self) -> bool = self.abs() > 3.4028235e38f32
+
+    to_radians(self) -> f32 = self * 0.017453292f32
+    to_degrees(self) -> f32 = self * 57.295776f32
+end f32
