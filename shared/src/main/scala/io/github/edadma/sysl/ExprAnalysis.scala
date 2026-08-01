@@ -448,7 +448,8 @@ trait ExprAnalysis
     // A parameter's default, spliced in where the argument was not written (`12 §2a`). It is
     // analyzed in the declaration's own terms and with nothing local in scope, which is what makes
     // it mean the same thing from every module that calls the function.
-    case DefaultArg(owner, e) => at(e.pos)(inDefault(owner)(analyzeExpr(e, expected)))
+    case DefaultArg(owner, e) =>
+      at(e.pos)(filling(e.pos)(inDefault(owner)(analyzeExpr(e, expected))))
 
     // Argument binding replaces every one of these before a call's arguments are looked at, so one
     // arriving here was written where nothing is being called by name — in an array literal, on the

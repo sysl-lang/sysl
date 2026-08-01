@@ -271,6 +271,18 @@ same kind of promise, made in the same place, and read by the same callers.
 - **A closure takes none.** An arrow's parameters are matched through the `Fn` trait (§6), which
   carries types and no names; there is nothing at that call to read a default out of, which is the
   same absence that stops a closure being called by name.
+- **A `#test` function takes none, because it takes no parameters at all** (`testing.md`). A default
+  looks as though it should rescue that — every parameter would have a value, so the runner's call
+  could be written with none — and it does not, because that call is *emitted* rather than analyzed.
+  Nothing fills a default there, and a signature the runner cannot satisfy is refused whether or not
+  a value was written beside it.
+
+**And a default may not lead back to the argument it is filling.** `f(n: int = f())` asks for the
+default in order to produce the default, and each arrival is a call that left the argument out, so
+it would fill forever — the same refusal `10 §3` makes at the type level, made at the other argument
+list. It reaches through several declarations too: two functions defaulting to each other are one
+cycle written twice. What is refused is the *filling*, not the recursion, so an ordinary recursive
+function whose default is something else is untouched.
 
 ### Calling by name
 

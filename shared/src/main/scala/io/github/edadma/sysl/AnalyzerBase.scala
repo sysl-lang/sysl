@@ -454,6 +454,33 @@ trait AnalyzerBase {
     finally scopes = saved
   }
 
+  /** The defaults being filled right now, so one that leads back to itself is caught rather than
+   * recursed into — `10 §3`'s guard, at the other argument list.
+   *
+   * Keyed on **where the default was written** rather than on the declaration it belongs to. The
+   * declaration is too coarse: a member's default that calls a sibling member of the same type
+   * would look like a cycle when it is an ordinary call. A position is exactly one written default,
+   * and every copy of one — a trait's, carried onto each implementing type — shares it, which is
+   * the grouping this question wants.
+   */
+  private val fillingDefaults = mutable.Set.empty[Pos]
+
+  /** Runs `body`, refusing a default whose filling has led back to itself.
+   *
+   * The value-level form of the cycle is deferred where the type-level one is immediate: the
+   * expression is spliced at the call and analyzed later, so the guard belongs where it is analyzed
+   * rather than where it is placed.
+   */
+  protected def filling[T](where: Option[Pos])(body: => T): T = where match
+    case Some(p) if fillingDefaults(p) =>
+      err("filling this default calls something that asks for it again — a default cannot stand in " +
+        "for an argument that is still being worked out")
+    case Some(p) =>
+      fillingDefaults += p
+      try body
+      finally fillingDefaults -= p
+    case None => body
+
   /** Runs `body` in `module` with nothing imported — for the compiler's own declarations, which
    * name everything they use in full.
    */

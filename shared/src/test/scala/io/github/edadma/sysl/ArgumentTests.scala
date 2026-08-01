@@ -404,6 +404,233 @@ class ArgumentTests
     }
   }
 
+  /** Cases the chapter says nothing about, which is why they are the ones that break: a default that
+   * asks for itself, a name that arrives before inference has run, a list where both kinds of
+   * default meet.
+   */
+  "the corners" - {
+    // The one that can hang the compiler rather than refuse a program: filling a default calls the
+    // function, which fills the default again. `10 §3` guards the type-level form of this with a
+    // set of what is being filled; the value-level form needs the same guard or none at all.
+    "a default that calls its own declaration is refused rather than recursed into" in {
+      err("""|loop(n: int = loop()) -> int = n
+             |print(loop())
+             |""".stripMargin) should not be empty
+    }
+
+    "and one that reaches itself through a second declaration is too" in {
+      err("""|ping(n: int = pong()) -> int = n
+             |pong(n: int = ping()) -> int = n
+             |print(ping())
+             |""".stripMargin) should not be empty
+    }
+
+    // Names are placed before the generic solve reads the arguments, so inference sees them in
+    // declared order and not written order. Without that, `T` would be solved from whichever
+    // argument happened to be written first.
+    "a name reorders the arguments before inference reads them" in {
+      run("""|pair[T](first: T, second: T) -> T = first
+             |print(pair(second = 1, first = 2))
+             |print(pair(second = "b", first = "a"))
+             |""".stripMargin) shouldBe "2\na\n"
+    }
+
+    "a type parameter's default and a value parameter's meet without interfering" in {
+      run("""|struct Pair[A, B = A]
+             |    x: A
+             |    y: B
+             |
+             |first[A, B](p: Pair[A, B], fallback: A = 0) -> A = p.x
+             |
+             |var p: Pair[int] = Pair(y = 2, x = 1)
+             |print(first(p))
+             |""".stripMargin) shouldBe "1\n"
+    }
+
+    "a default may itself be a call written with a name" in {
+      run("""|span(lo: int, hi: int) -> int = hi - lo
+             |width(n: int = span(hi = 10, lo = 4)) -> int = n
+             |print(width())
+             |print(width(1))
+             |""".stripMargin) shouldBe "6\n1\n"
+    }
+
+    "a default may name a constant" in {
+      run("""|const limit: int = 9
+             |cap(n: int = limit) -> int = n
+             |print(cap())
+             |""".stripMargin) shouldBe "9\n"
+    }
+
+    "a declaration with no parameters says so when given a name" in {
+      err("""|f() -> int = 1
+             |print(f(a = 1))
+             |""".stripMargin) should include("declares no parameter named 'a'")
+    }
+
+    "a named argument takes a trailing comma like any other" in {
+      run("""|f(a: int, b: int) -> int = a * b
+             |print(f(b = 2, a = 3,))
+             |""".stripMargin) shouldBe "6\n"
+    }
+
+    "a nested function takes a name as well as a default" in {
+      run("""|work(base: int) -> int
+             |    step(n: int, by: int) -> int = n * 10 + by
+             |    step(by = 3, n = base)
+             |
+             |print(work(1))
+             |""".stripMargin) shouldBe "13\n"
+    }
+
+    // A zero-sized parameter is dropped from the emitted signature (`12 §1`), so a default for one
+    // has to be filled and then have nothing left of it — the case where "fill it in" and "emit
+    // nothing" have to agree.
+    "a default of a zero-sized type is filled and then emitted as nothing" in {
+      run("""|nothing() -> unit
+             |    var ignored = 1
+             |
+             |f(u: unit = nothing(), n: int = 4) -> int = n
+             |print(f())
+             |""".stripMargin) shouldBe "4\n"
+    }
+
+    // The two defaults are filled independently, so one that reads the other is the forward
+    // reference it looks like rather than something quietly ordered.
+    "one default may not name the parameter another fills" in {
+      err("""|f(a: int = 1, b: int = a) -> int = a + b
+             |print(f())
+             |""".stripMargin) should include("undefined name 'a'")
+    }
+
+    "a variadic method declares no default either, not only a free function" in {
+      err("""|struct Log
+             |    n: int
+             |
+             |    say(self, first: int, rest: int = 0, ...) -> int = first
+             |
+             |print(Log(1).say(2))
+             |""".stripMargin) should include("a parameter list with a tail declares no default")
+    }
+
+    // `13 §2` through a member rather than a free function: the same leak, one declaration form in.
+    "a member's default is held to the same reach its type is" in {
+      errOf(
+        "lib.sysl"  -> """|module lib
+                          |
+                          |private secret() -> int = 7
+                          |
+                          |struct Box
+                          |    n: int
+                          |
+                          |    grown(self, by: int = secret()) -> int = self.n + by
+                          |""".stripMargin,
+        "main.sysl" -> """|import lib.Box
+                          |
+                          |print(Box(1).grown())
+                          |""".stripMargin,
+      ) should include("does not reach as far as")
+    }
+  }
+
+  /** What the chapters around this one claim, asked of the two new doors into a call rather than
+   * assumed to be unaffected by them. A constructor that a name can now reach is a constructor two
+   * other rules already had something to say about.
+   */
+  "what the neighbouring rules say once a name reaches a constructor" - {
+    // `08 § Visibility`: the positional constructor writes every field, so a restricted one puts it
+    // out of reach. A name is a second way in, and the rule has to hold at both.
+    "a private field still puts the constructor out of reach" in {
+      errOf(
+        "lib.sysl"  -> """|module lib
+                          |
+                          |struct Point
+                          |    private x: int
+                          |    y: int
+                          |""".stripMargin,
+        "main.sysl" -> """|import lib.Point
+                          |
+                          |print(Point(y = 2, x = 1).y)
+                          |""".stripMargin,
+      ) should include("the constructor")
+    }
+
+    // `07`: a struct with `invariant` clauses is checked the moment it is built, and every
+    // construction site flows through one place. Reordering by name must not route around it.
+    "an invariant is still checked when the fields arrive out of order" in {
+      exits("""|struct Span
+               |    lo: int
+               |    hi: int
+               |    invariant lo <= hi
+               |
+               |var s = Span(hi = 1, lo = 9)
+               |print(s.lo)
+               |""".stripMargin)
+    }
+
+    "while the same fields in a satisfying order build" in {
+      run("""|struct Span
+             |    lo: int
+             |    hi: int
+             |    invariant lo <= hi
+             |
+             |var s = Span(hi = 9, lo = 1)
+             |print(s.hi - s.lo)
+             |""".stripMargin) shouldBe "8\n"
+    }
+
+    // `12 §9`: a variadic's tail stands at no parameter, so nothing in it has a name — and since a
+    // positional argument may not follow a named one, a call that names anything has no tail left.
+    "a variadic call may name its declared parameters only while it writes no tail" in {
+      run("""|first(a: int, ...) -> int = a
+             |print(first(a = 5))
+             |""".stripMargin) shouldBe "5\n"
+
+      err("""|first(a: int, ...) -> int = a
+             |print(first(a = 5, 6))
+             |""".stripMargin) should include("comes after one written by name")
+    }
+
+    // `13 §7`: a `val` is laid down before any body runs, in a state belonging to no function. A
+    // default filled there is analyzed in the callee's terms and not in that state's.
+    "a module-level 'val' may be built by a call that takes a default" in {
+      run("""|origin(x: int = 3, y: int = 4) -> int = x * 10 + y
+             |
+             |val here: int = origin(y = 9)
+             |print(here)
+             |""".stripMargin) shouldBe "39\n"
+    }
+
+    // `02 § Defaults`: a trait's default *body* is copied to each implementing type. A parameter
+    // default on that same member is a second thing being copied, and the two travel together.
+    "a trait's default body and its parameter default are copied together" in {
+      run("""|trait Step
+             |    size(self) -> int
+             |    walk(self, times: int = 2) -> int = self.size() * times
+             |
+             |struct Foot
+             |    n: int
+             |
+             |impl Step for Foot
+             |    size(self) -> int = self.n
+             |
+             |print(Foot(3).walk())
+             |print(Foot(3).walk(5))
+             |""".stripMargin) shouldBe "6\n15\n"
+    }
+
+    // `testing.md`: a `#test` function takes no parameters, because `sysl test` calls it with
+    // nothing. A default looks like it should rescue that — every parameter has a value, so the
+    // call could be written with none — and it does not, which is right: the runner's call is
+    // emitted rather than analyzed, so there is nothing there to fill it.
+    "a '#test' function's parameter is refused even carrying a default" in {
+      err("""|#test
+             |works(n: int = 7) -> unit
+             |    assert(n == 7, "n")
+             |""".stripMargin) should include("takes no parameters")
+    }
+  }
+
   "the shapes the parser reads" - {
     "a default is held on the parameter it was written after" in {
       prog("""|f(a: int, b: int = 2) -> int

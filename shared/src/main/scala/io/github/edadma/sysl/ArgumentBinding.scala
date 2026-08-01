@@ -85,7 +85,7 @@ trait ArgumentBinding extends TraitLookup {
 
     val filled = params.zipWithIndex.map { (p, i) =>
       if i < positional.length then Some(positional(i))
-      else written.get(p.name).orElse(p.default.map(d => DefaultArg(owner, d).setPos(d.pos)))
+      else written.get(p.name).orElse(p.default.map(scoped(owner, _)))
     }
 
     // Named all at once: a call that left out three parameters has one mistake, not three, and the
@@ -99,6 +99,17 @@ trait ArgumentBinding extends TraitLookup {
 
     filled.flatten ::: tail
   }
+
+  /** A default wrapped in the scope it is to be read in.
+   *
+   * One that already carries a scope keeps it and is not wrapped again: it is a **trait's** default,
+   * copied onto an implementing type's method, and the trait is where it was written however far
+   * from it the implementation sits. Wrapping twice would also make the same written default appear
+   * to be filled inside itself, which is precisely what the cycle guard exists to refuse.
+   */
+  private def scoped(owner: Option[String], d: Expr): Expr = d match
+    case already: DefaultArg => already
+    case _                   => DefaultArg(owner, d).setPos(d.pos)
 
   /** How many arguments a declaration takes, said in a phrase that accounts for its defaults — the
    * value-level twin of `arityPhrase`, and worded the same way for the same reason.
