@@ -107,6 +107,33 @@ class TraitScopeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |    sqrt(self) -> f64 = 0.0""".stripMargin) should include("unknown trait 'Float'")
   }
 
+  // The bound narrows an associated function, which is reached through the parameter's own name and
+  // so still has it to be asked about. A **method** is reached through a value, and at an
+  // instantiation that value's type is the concrete one — the parameter it came from is not
+  // recoverable from the analyzed receiver, which carries a codegen name rather than the one the
+  // source wrote. So a generic body calling a method that two traits declare is refused for an
+  // ambiguity its own signature settled, and only the associated-function spelling gets through.
+  "a method on a bounded parameter resolves through the bound too" ignore {
+    run(
+      """trait Zero
+        |    id(self) -> int
+        |
+        |trait Blank
+        |    id(self) -> int
+        |
+        |impl Zero for int
+        |    id(self) -> int = 1
+        |
+        |impl Blank for int
+        |    id(self) -> int = 2
+        |
+        |tell[T: Zero](x: T) -> int = x.id()
+        |
+        |main()
+        |    print(tell(7))
+        |""".stripMargin) shouldBe "1\n"
+  }
+
   "the type's own member still collides, because nothing scopes it" in {
     val e = err(
       """trait Zero
