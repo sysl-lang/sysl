@@ -263,6 +263,26 @@ case class TCStrLit(value: String) extends TExpr { def ty: Type = Type.Ptr(Type.
 /** A call to a user function. */
 case class TCall(name: String, args: List[TExpr], ty: Type, results: Boolean = false) extends TExpr
 
+/** `&f` — the address of a declared function, as the C convention would have somebody call it
+ * (`12 §6a`). `name` is the function this addresses; `entry` is the symbol the address is *of*,
+ * which is the function itself where sysl's own convention already agrees with C's and a generated
+ * adapter where it does not.
+ *
+ * The two are separate because the choice is the emitter's and the reachability walk's question is
+ * about the first: what keeps the definition in the program is that something took its address, and
+ * that stays true whichever symbol the address turns out to name.
+ */
+case class TFuncAddr(name: String, entry: String, ty: Type) extends TExpr
+
+/** A call through a `*extern` — a function pointer with no definition in sight (`12 §6a`).
+ *
+ * It carries the whole signature rather than looking one up, because there is nothing to look up:
+ * the callee is a value, and what is known about it is exactly what its type said. That is also why
+ * the arguments cross under the C convention — the type says the other end obeys it, and nothing
+ * here can check that it does.
+ */
+case class TCallPtr(callee: TExpr, args: List[TExpr], params: List[Type], ty: Type) extends TExpr
+
 /** Forgets a value's type, keeping what its trait says can still be done to it (`02`): the operand
  * goes on pointing where it pointed, and the method table for the type it is losing rides beside it.
  *

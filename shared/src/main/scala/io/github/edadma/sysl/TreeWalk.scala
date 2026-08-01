@@ -77,6 +77,9 @@ object TreeWalk {
     case TCompare(ops, _)           => ops
     case TSeq(exprs)                => exprs
     case TCall(_, args, _, _)       => args
+    // A function's address has no operand — the symbol is a constant, not something evaluated.
+    case TFuncAddr(_, _, _)         => Nil
+    case TCallPtr(callee, args, _, _) => callee :: args
     // Which function a trait object's call reaches is a run-time word, so there is no parameter
     // list to ask whether an argument is kept — a callee that might keep anything is exactly what
     // a name the summaries do not recognise already stands for.

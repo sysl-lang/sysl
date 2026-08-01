@@ -213,6 +213,8 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case Type.Weak(inner) => if inner.isInstanceOf[Type.Trait] then "zeroinitializer" else "null"
     case _: Type.Ptr      => "null"
     case _: Type.Ref      => "null"
+    // C's null callback, which is a value several of its interfaces read as "do the default".
+    case _: Type.CFn      => "null"
     case _: Type.Struct   => "zeroinitializer"
     case _: Type.Array    => "zeroinitializer"
     case _: Type.View     => "zeroinitializer"
@@ -638,6 +640,16 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
 
     case TSeq(exprs) =>
       exprs.foreach(genExpr); ""
+
+    // A function's address is the symbol it is defined under, which is a constant — there is nothing
+    // to compute and nothing to load, the way there is for the address of a variable.
+    case TFuncAddr(_, entry, _) => s"@${symbolOf(entry)}"
+
+    // A call through one goes out under C's convention, because that is what the type said was at
+    // the other end. It reuses the foreign path entire: what a `call` names in front of an indirect
+    // callee is the result type and then the value, exactly where a direct one names the symbol.
+    case TCallPtr(callee, args, _, ty) =>
+      genForeignCall(s"${foreignResultType(ty)} ${genExpr(callee)}", args, ty)
 
     // A call to a foreign function is lowered under the other side's convention rather than sysl's
     // own, which is a difference only an aggregate can see (`ForeignEmitter`).

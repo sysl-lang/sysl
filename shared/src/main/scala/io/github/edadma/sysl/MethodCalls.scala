@@ -12,7 +12,7 @@ package io.github.edadma.sysl
  * place. Once made, each route ends in the same free call `CallCore` already knows how to check —
  * the receiver passed in the mode its `self` sigil declared, and nothing else method-specific.
  */
-trait MethodCalls extends CallCore {
+trait MethodCalls extends FuncAddress {
 
   /** `value.method(args)` — resolves `method` as an inherent member of the receiver's type and
    * calls the function it lowered to, passing the receiver as the first argument in whatever

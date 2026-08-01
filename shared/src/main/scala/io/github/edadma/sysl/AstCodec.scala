@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 5
+  val Version: Int = 6
 
   private val Magic = "sysl-ast"
 
@@ -202,6 +202,7 @@ object AstCodec {
         case ArrayType(len, elem, ro) => tok("ta"); opt(len)(expr); typ(elem); bool(ro)
         case TupleType(ps, res)   => tok("tt"); list(ps)(typ); bool(res)
         case FnType(ps, ret, bar) => tok("tf"); list(ps)(typ); typ(ret); bool(bar)
+        case CFnType(ps, ret)     => tok("tc"); list(ps)(typ); typ(ret)
     }
 
     // ------------------------------------------------------------ patterns
@@ -541,6 +542,7 @@ object AstCodec {
         case "ta"  => ArrayType(opt(expr()), typ(), bool())
         case "tt"  => TupleType(list(typ()), bool())
         case "tf"  => FnType(list(typ()), typ(), bool())
+        case "tc"  => CFnType(list(typ()), typ())
         case other => fail(s"'$other' is not a type tag")
     }
 

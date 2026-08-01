@@ -277,6 +277,10 @@ trait ExprAnalysis
     case NullLit() =>
       expected match
         case Some(p: Type.Ptr) => TNullLit(p)
+        // The null callback, which several C interfaces read as "there is none, use the default" —
+        // `signal(SIG_DFL)`, an `atexit` slot never filled, a `*_set_callback(0)`. It is an address
+        // like any other and the same word says it is absent.
+        case Some(c: Type.CFn) => TNullLit(c)
         case Some(other)       => err(s"'null' is a raw pointer, and ${show(other)} was expected here")
         case None              => err("'null' takes its type from its context, and there is none here")
 
@@ -388,6 +392,19 @@ trait ExprAnalysis
     //
     // The one place it is refused is a place inside a struct whose invariant reads it: the pointer
     // would be typed below the promise, and `16 §6` is discharged by naming the struct.
+    // A function is not a place — nothing holds it, and there is no slot to point at — so its
+    // address is taken here rather than by the walk below, which asks for one (`12 §6a`). A local
+    // shadowing the name is an ordinary value and keeps the ordinary reading.
+    case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+      functionAddress(name, funcKey(name).get)
+
+    // A nested function's environment is the frame it was declared in (`12 §5a`), and an address is
+    // a way of carrying it out of that frame — the same reason the name is not a value either.
+    case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && (nestedFuncs.contains(name) || outerNested(name)) =>
+      err(s"'$name' is a nested function, so it has no address to take — what would have to travel " +
+        "beside the address is the frame it reads, and a '*extern' is one word. A top-level " +
+        "function is what has an address")
+
     case Unary("&", e) =>
       val place = analyzePlace(e, "'&'", writes = false)
       checkAddressable(place)
@@ -517,6 +534,12 @@ trait ExprAnalysis
     // whether it is a local, so a name that shadows a function with something uncallable still
     // reaches the function — which is what it did before there were closures, and no program that
     // relied on it is silently rerouted.
+    // A local holding C's function pointer, called through it. It comes before the callable one
+    // because a `*extern` implements no call trait: there is no receiver to pass and no table to
+    // read, only an address and the signature its type carried (`12 §6a`).
+    case Call(Ident(name), args) if lookupOpt(name).exists((_, t) => cfnOf(t).isDefined) =>
+      callThroughAddress(analyzeExpr(Ident(name).setPos(expr.pos)), args)
+
     case Call(Ident(name), args) if lookupOpt(name).exists((_, t) => callableOf(t).isDefined) =>
       callCallable(analyzeExpr(Ident(name).setPos(expr.pos)), args, expected)
 
@@ -617,6 +640,11 @@ trait ExprAnalysis
     // Anything that *is* a callable may be called, wherever it was read from — an element of an
     // array of them, a part of a tuple, a container's item (`12 §6`). The head of a call is looked
     // at rather than required to be a name, and only what turns out not to be callable is refused.
+    // A function pointer read from wherever one was kept — a struct's field, an element of a table
+    // of handlers, what another call handed back (`12 §6a`).
+    case Call(callee, args) if probe(analyzeExpr(callee)).exists(t => cfnOf(t.ty).isDefined) =>
+      callThroughAddress(analyzeExpr(callee), args)
+
     case Call(callee, args) if probe(analyzeExpr(callee)).exists(t => callableOf(t.ty).isDefined) =>
       callCallable(analyzeExpr(callee), args, expected)
 

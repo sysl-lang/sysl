@@ -111,7 +111,7 @@ trait ScalarEmitter extends StringEmitter {
    */
   protected def predicate(op: String, ty: Type): String = ty match
     // Equality only: a bool and an address have no ordering, so no signed/unsigned choice.
-    case Type.Bool | _: Type.Ptr | _: Type.Ref =>
+    case Type.Bool | _: Type.Ptr | _: Type.Ref | _: Type.CFn =>
       op match
         case "==" => "eq"; case "!=" => "ne"
         case _    => sys.error(s"unreachable compare '$op'")
@@ -180,6 +180,14 @@ trait ScalarEmitter extends StringEmitter {
     case (_: Type.Ptr, _: Type.Ptr)      => v
     case (a: Type.Ptr, b: Type.Integer)  => castOp("ptrtoint", a, b, v)
     case (a: Type.Integer, b: Type.Ptr)  => castOp("inttoptr", a, b, v)
+
+    // An address of code and an address of bytes are the same word, which is what makes `dlsym`
+    // usable in one direction and a `*u8` callback table usable in the other (`12 §6a`).
+    case (_: Type.Ptr, _: Type.CFn)      => v
+    case (_: Type.CFn, _: Type.Ptr)      => v
+    case (_: Type.CFn, _: Type.CFn)      => v
+    case (a: Type.CFn, b: Type.Integer)  => castOp("ptrtoint", a, b, v)
+    case (a: Type.Integer, b: Type.CFn)  => castOp("inttoptr", a, b, v)
 
     case _ => sys.error(s"unreachable conversion from ${from.llvm} to ${to.llvm}")
 

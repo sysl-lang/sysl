@@ -316,6 +316,16 @@ class SyslParser(val source: Source) extends DeclParser {
         // `() -> R` — a callable of no arguments. Empty parentheses are not a type, so this is the
         // one place they may be written, and the arrow is what says so.
         (op("(") ~> op(")") ~> op("->") ~> typeRef) ^^ (r => FnType(Nil, r, bare = true)) |
+        // `*extern(A) -> R`, C's function pointer (`12 §6a`). It comes before the general `*` so the
+        // `extern` is read as part of this spelling rather than as a type named `extern` — which it
+        // could not be anyway, the word being reserved, but the alternative below would reach the
+        // name production and complain about the wrong thing.
+        ((op("*") ~> op("extern") ~> op("(") ~> commaList(typeRef) <~ op(")")) ~ (op("->") ~> typeRef) ^^ {
+          case ps ~ r => CFnType(ps, r)
+        }) |
+        op("*") ~> op("extern") ~> err("'*extern' is a foreign function's address, so it is written " +
+          "with the signature that address is called at — '*extern(int) -> int', and '*extern() -> unit' " +
+          "for one that takes nothing and yields nothing") |
         op("*") ~> coreType ^^ PtrType.apply |
         op("&") ~> softSync ~> coreType ^^ (t => RefType(t, sync = true)) |
         op("&") ~> coreType ^^ (t => RefType(t, sync = false)) |

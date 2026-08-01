@@ -45,6 +45,9 @@ object Layout {
     // A weak reference is an address like the other two, and a weak trait object is the same pair
     // of words an erased `&T` is — the count it takes is the box's business, not the value's.
     case Type.Weak(inner)                => if inner.isInstanceOf[Type.Trait] then 16 else 8
+    // One word, and the reason it is one rather than the two a `*Fn` costs: there is no table beside
+    // it, because the signature is in the type rather than in the value.
+    case _: Type.CFn                     => 8
     case _: Type.View                    => 24
     case Type.Array(n, elem)             => n * size(elem)
     case s: Type.Struct                  => aggregate(s.stored.map(_._2))._1
@@ -62,6 +65,7 @@ object Layout {
     case Type.VaList                     => 8
     case _: Type.Ptr | _: Type.Ref       => 8
     case _: Type.Weak                    => 8
+    case _: Type.CFn                     => 8
     case _: Type.View                    => 8
     case Type.Array(_, elem)             => align(elem)
     case s: Type.Struct                  => aggregate(s.stored.map(_._2))._2

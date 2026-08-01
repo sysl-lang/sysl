@@ -236,6 +236,9 @@ trait SignatureVisibility extends TypeResolution {
     // A callable mentions the library's call trait, which is public and is nobody's to hide; what a
     // signature can expose through one is its parameters and its result, so those are what is walked.
     case f: FnType           => (f.params :+ f.ret).flatMap(namesIn(_, skip))
+    // A function pointer names no declaration of its own, so what a signature can expose through one
+    // is what it is called with — the same walk, for the same reason.
+    case CFnType(ps, r)      => (ps :+ r).flatMap(namesIn(_, skip))
 
   /** The declaration a name in a type position stands for: a struct, an enum, or — behind a memory
    * mode, where a trait object writes one — a trait.

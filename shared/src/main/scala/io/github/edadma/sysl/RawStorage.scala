@@ -67,6 +67,11 @@ trait RawStorage extends ExprSupport {
         "and the table of the type it was erased from, which an address alone does not say")
     case _: Type.Ptr => ()
 
+    // A function pointer is an address like any other, and this is how the one `dlsym` hands back
+    // becomes something callable — the direction that would otherwise stay shut, since nothing else
+    // produces a `*extern` out of a value C computed (`12 §6a`).
+    case _: Type.CFn => ()
+
     case _: Type.Ref =>
       err("'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an address " +
         "read out of bytes carries no count for anything to own — read it as a '*T'")
@@ -87,6 +92,9 @@ trait RawStorage extends ExprSupport {
       err("'ptr_cast' takes a plain pointer, and a pointer to a trait is two words — select the " +
         "address half by reading through it, rather than reinterpreting the pair")
     case _: Type.Ptr => ()
+    // The other direction of the same seam: an address of code, handed to something that reads it
+    // as an address of bytes — `dlclose`, a table of handlers stored as `*u8`, a hash of the value.
+    case _: Type.CFn => ()
 
     // An integer narrower than an address would be read as a pointer with its top bits invented,
     // which is the one mistake here that produces a wild pointer silently rather than a diagnostic.

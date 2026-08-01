@@ -112,6 +112,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case TupleType(parts, r)                => TupleType(parts.map(spellSelf(_, selfRef)), r)
     case f: FnType =>
       f.copy(params = f.params.map(spellSelf(_, selfRef)), ret = spellSelf(f.ret, selfRef))
+    case CFnType(params, ret) => CFnType(params.map(spellSelf(_, selfRef)), spellSelf(ret, selfRef))
 
   /** Whether a written type names any of the parameters being solved, and so is not yet a type.
    *
@@ -125,6 +126,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case ArrayType(_, elem, _) => mentions(elem, tps)
     case TupleType(parts, _) => parts.exists(mentions(_, tps))
     case f: FnType          => mentions(f.asTrait, tps)
+    case CFnType(params, ret) => params.exists(mentions(_, tps)) || mentions(ret, tps)
 
   /** Resolves one bound — a trait, with whatever arguments it was applied to — under the
    * substitution the declaration that wrote it is being read at.
@@ -306,6 +308,13 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     // A tuple holds its parts the way a struct holds its fields, so a part is resolved exactly as a
     // field is — a `unit` part included, which the layout skips and the parts after it shift past.
     case TupleType(parts, false) => tupleType(parts.map(resolveType(_, subst)))
+
+    // C's function pointer, which is a type wherever any other is: it is one word, it is copied by
+    // being copied, and nothing about it is counted. Its parts are held to exactly what an `extern`
+    // holds its own to, which is nothing — what crosses the boundary is the programmer's business
+    // (`12 §1`), and a signature written here is the same kind of promise the `*` already is.
+    case CFnType(params, ret) =>
+      Type.CFn(params.map(resolveType(_, subst)), resolveReturn(ret, subst))
 
     // A callable is not a type: it is a trait, and a trait stands where a type does only behind a
     // mode sigil. The bare arrow is the sugar a **parameter** may use, and it never reaches here —
@@ -566,6 +575,7 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case ArrayType(_, e, _)  => mentionsAny(e, names)
     case TupleType(parts, _) => parts.exists(mentionsAny(_, names))
     case f: FnType           => mentionsAny(f.asTrait, names)
+    case CFnType(ps, r)      => ps.exists(mentionsAny(_, names)) || mentionsAny(r, names)
 
   /** Which of a trait's own type parameters were given `Self` at this application — the parameters a
    * member may name and so mention the forgotten type without ever spelling it.

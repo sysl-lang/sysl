@@ -333,9 +333,14 @@ trait Closures extends CallAnalysis {
       expected: Option[Type],
   ): Option[TExpr] = rty match
     case s: Type.Struct =>
-      s.fieldType(name).filter(callableOf(_).isDefined).map { fty =>
+      s.fieldType(name).filter(t => callableOf(t).isDefined || cfnOf(t).isDefined).map { fty =>
         checkFieldVisible(s.base, name)
-        callCallable(TField(autoDeref(recv), s.slot(s.fieldIndex(name)), fty), args, expected)
+        val field = TField(autoDeref(recv), s.slot(s.fieldIndex(name)), fty)
+
+        // A field holding C's function pointer is called through in the same position and by the
+        // same spelling; what differs is only that there is no receiver to hand over (`12 §6a`).
+        if cfnOf(fty).isDefined then callThroughAddress(field, args)
+        else callCallable(field, args, expected)
       }
     case _ => None
 

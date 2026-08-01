@@ -199,6 +199,28 @@ object Type {
     def llvm: String = if inner.isInstanceOf[Trait] then fatPointer else "ptr"
   }
 
+  /** `*extern(A, B) -> R` — the address of a function that obeys the machine's C convention, which
+   * is the one word a C library means when it says function pointer (`12 §6a`).
+   *
+   * It is its own type rather than `Ptr` of something for the reason `03` gives `*T` its meaning: a
+   * raw pointer addresses a *value*, one that can be read through, written through, and measured.
+   * There is no value at the end of this one — code is not data the language offers a view of — so
+   * the operations `*T` carries would each need an exception. What it can do instead is the one
+   * thing an address of code is for: be called, and be handed to whoever asked for it.
+   *
+   * The signature is part of the type because it is the whole of what makes a call to one safe to
+   * emit. Nothing checks it against the function the address actually came from — that is the
+   * promise the `*` announces, the same one every raw pointer announces.
+   */
+  case class CFn(params: List[Type], ret: Type) extends Type {
+    def llvm: String = "ptr"
+
+    /** How the call is written at the machine level, which the emitter needs in front of an
+     * indirect callee exactly as it does in front of a variadic one.
+     */
+    override def toString: String = s"*extern(${params.mkString(", ")}) -> $ret"
+  }
+
   /** `&T` — a reference to a reference-counted heap object, and `&sync T` when its refcount is
    * atomic so the reference may cross a concurrency domain. The two are distinct types with no
    * conversion either way: atomicity is fixed when the object is allocated.
@@ -347,6 +369,7 @@ object Type {
     case Ptr(inner)               => s"*${show(inner)}"
     case Ref(inner, sync)         => s"&${if sync then "sync " else ""}${show(inner)}"
     case Weak(inner)              => s"weak ${show(inner)}"
+    case CFn(ps, r)               => s"*extern(${ps.map(show).mkString(", ")}) -> ${show(r)}"
     case Array(n, elem)           => s"[$n]${show(elem)}"
     case Slice(elem, ro)          => s"[]${if ro then "const " else ""}${show(elem)}"
     case Abstract(n, _)           => n
@@ -390,6 +413,7 @@ object Type {
     case Weak(inner)      => mentionsAbstract(inner)
     case Array(_, elem)   => mentionsAbstract(elem)
     case Slice(elem, _)   => mentionsAbstract(elem)
+    case CFn(ps, r)       => ps.exists(mentionsAbstract) || mentionsAbstract(r)
     case _                => false
 
   def isNumeric(t: Type): Boolean = underlying(t) match
@@ -410,9 +434,11 @@ object Type {
    * so what "equal" would mean is a question the trait has to answer, not the machine.
    */
   def isEquatable(t: Type): Boolean = t match
-    case _ if erased(t)         => false
-    case Bool | _: Ptr | _: Ref => true
-    case _                      => isOrdered(t)
+    case _ if erased(t)                  => false
+    // A function pointer is one word and compares by it, which is what makes "is a callback
+    // installed" answerable — the question every C interface with a null default asks.
+    case Bool | _: Ptr | _: Ref | _: CFn => true
+    case _                               => isOrdered(t)
 
   /** Whether a literal value is representable in an integer type. Out of range is an error
    * rather than a wrap: the width is the programmer's statement of intent.
@@ -675,6 +701,10 @@ object Type {
     case Slice(elem, false) => s"slice.${mangleOne(elem)}"
     case Slice(elem, true)  => s"constslice.${mangleOne(elem)}"
     case Trait(n, args)    => mangled(n, args)
+    // The signature is part of the name for the reason a generic's arguments are: two of these are
+    // the same type only where they are called the same way, and a mangled name that dropped the
+    // signature would let an instantiation at one share a body with an instantiation at another.
+    case CFn(ps, r)        => s"cfn${ps.length}.${(ps :+ r).map(mangleOne).mkString(".")}"
     // A transparent subtype shares its base's representation, so it mangles as the base; a derived
     // one is its own type and mangles under its name, keeping `Vec[Meters]` and `Vec[f64]` apart.
     case c: Constrained    => if c.derived then mangled(c.name, Nil) else mangleOne(c.base)

@@ -103,6 +103,11 @@ object Reachability {
       case g: TGlobal         => vals += g.symbol
       case d: TDispatch       => calls += d.name
       case c: TCall           => calls += c.name; c.args.foreach(scan)
+      // Taking a function's address is a use of it exactly as calling it is, and the only one whose
+      // caller is not in this program: what happens to the address afterwards is C's business, so
+      // there is nothing else that could keep the definition from being dropped.
+      case a: TFuncAddr       => calls += a.name
+      case p: TCallPtr        => scan(p.callee); p.args.foreach(scan)
       case s: TStructInvCheck => calls += s.invFn; scan(s.value)
       case r: TRecheck        => calls += r.invFn; scan(r.after); scan(r.recv)
       // A multi-assignment's arm carries its re-check as data rather than as a node, so the

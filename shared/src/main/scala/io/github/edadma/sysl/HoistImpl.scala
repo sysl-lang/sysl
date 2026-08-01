@@ -447,6 +447,8 @@ trait HoistImpl extends ImplConformance {
     case ArrayType(_, elem, _) => subjectHomes(elem)
     case TupleType(parts, _) => Set(None) ++ parts.flatMap(subjectHomes)
     case f: FnType           => subjectHomes(f.asTrait)
+    // A function pointer belongs to no module — its parts may, so they are what is asked.
+    case CFnType(ps, r)      => Set(None) ++ (ps :+ r).flatMap(subjectHomes)
 
   /** A resolution made only to ask where a name lives, which is not the place a name that resolves
    * to nothing is worth reporting from — a scalar and a block's own type parameter both answer

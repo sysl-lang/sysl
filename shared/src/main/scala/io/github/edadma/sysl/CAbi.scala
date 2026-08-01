@@ -325,8 +325,8 @@ object CAbi {
   private def floating(t: Type): Boolean = Type.underlying(t).isInstanceOf[Type.Floating]
 
   private def address(t: Type): Boolean = Type.underlying(t) match {
-    case _: Type.Ptr | _: Type.Ref | _: Type.Weak => true
-    case _                                        => false
+    case _: Type.Ptr | _: Type.Ref | _: Type.Weak | _: Type.CFn => true
+    case _                                                      => false
   }
 
   private def integral(t: Type): Boolean = Type.underlying(t) match {

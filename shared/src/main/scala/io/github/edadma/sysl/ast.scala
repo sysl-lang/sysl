@@ -175,6 +175,7 @@ sealed trait TypeRef extends Positioned {
     case FnType(List(one), ret, true)     => s"${one.show} -> ${ret.show}"
     case FnType(params, ret, true)        => s"(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
     case FnType(params, ret, false)       => s"Fn(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
+    case CFnType(params, ret)             => s"*extern(${params.map(_.show).mkString(", ")}) -> ${ret.show}"
 }
 
 /** A named type, optionally applied to type arguments: `int`, `Box[int]`,
@@ -231,6 +232,20 @@ case class FnType(params: List[TypeRef], ret: TypeRef, bare: Boolean) extends Ty
    */
   def asTrait: NamedType = NamedType(Type.Fn.base(params.length), params :+ ret).setPos(pos)
 }
+
+/** `*extern(A, B) -> R` — the address of a function compiled to the machine's C convention, which is
+ * the one word a C library means by a function pointer.
+ *
+ * It is written as one spelling rather than a mode applied to a callable's type, because it is not a
+ * pointer to any sysl value: there is nothing at the other end that a program could read, copy, or
+ * count, and `*T` promises all three (`03`). `*Fn(A) -> R` is already the *other* thing — an unowned
+ * trait object over a callable, two words, a table beside the value — so a shared spelling would put
+ * a fat pointer where C reads one word.
+ *
+ * The `extern` in it is the same word the declaration form uses and means the same thing: what is at
+ * the other end obeys a published convention rather than this compiler's.
+ */
+case class CFnType(params: List[TypeRef], ret: TypeRef) extends TypeRef
 
 /** A trait as a **bound** names it: `Show`, or `From[int]` where the trait takes parameters of its
  * own. It is not a `TypeRef` — a trait is not a type, and the one thing that may stand here is a

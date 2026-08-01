@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 import scala.collection.mutable
 
-import TreeWalk.{blocks, children, forEachStmt, ownBreakValues}
+import TreeWalk.{children, forEachStmt, ownBreakValues}
 
 /** Escape analysis for slices, as specified in `05-escape-analysis.md`.
  *
@@ -232,6 +232,7 @@ private class Escape(program: TProgram) {
       case TLoad(name, _)       => confined.getOrElse(name, View.none)
       case TCall(_, args, _, _)    => View.any(args.map(views))
       case TVCall(_, _, args, _, _) => View.any(args.map(views))
+      case TCallPtr(_, args, _, _)  => View.any(args.map(views))
       case TStructNew(_, args)  => View.any(args.map(views))
       case TStructInvCheck(v, _, _) => views(v)
       case TRecheck(after, _, _, _) => views(after)
@@ -384,6 +385,13 @@ private class Escape(program: TProgram) {
         case TVCall(recv, _, args, _, _) if !borrows(recv.ty) =>
           for a <- args do
             if viewsFrame(a) then gets_out(a, "is passed through a trait object, which may hold on to it")
+
+        // Nothing is known about what is at the other end of a function pointer — not even which
+        // program compiled it — so the worst is assumed of every argument, exactly as `12 §1` has
+        // this analysis assume it of an `extern`.
+        case TCallPtr(_, args, _, _) =>
+          for a <- args do
+            if viewsFrame(a) then gets_out(a, "is passed through a function pointer, which may hold on to it")
 
         case _ =>
 

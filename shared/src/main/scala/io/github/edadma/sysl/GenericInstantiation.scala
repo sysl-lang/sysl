@@ -178,6 +178,7 @@ trait GenericInstantiation extends ConstFolding {
         case Type.Weak(inner)     => Type.Weak(substParams(inner, subst))
         case Type.Array(n, elem)  => Type.Array(n, substParams(elem, subst))
         case Type.Slice(elem, ro) => Type.Slice(substParams(elem, subst), ro)
+        case Type.CFn(ps, r)      => Type.CFn(ps.map(substParams(_, subst)), substParams(r, subst))
         case other                => other
 
   /** Instantiates an enum for one set of type arguments. All-dataless variants make a *simple*
@@ -338,6 +339,14 @@ trait GenericInstantiation extends ConstFolding {
     // trait binds its arguments. A closure's own type is a struct that says nothing about either, so
     // what settles a *bare* arrow's parameters is the call's own inference and not this.
     case f: FnType => unify(f.asTrait, actual, tparams, sub)
+    // A function pointer's parts bind exactly as a tuple's do — position by position, and only
+    // against another one of the same width, since nothing else has parts to read.
+    case CFnType(ps, r) =>
+      actual match
+        case Type.CFn(as, ar) if as.length == ps.length =>
+          ps.zip(as).foreach((pr, a) => unify(pr, a, tparams, sub))
+          unify(r, ar, tparams, sub)
+        case _ => ()
     // A trait never binds a type parameter. `f[T](p: *T)` handed a `*Writer` would otherwise
     // instantiate at a type with no layout, and the body could then write `var v: T` for a value
     // that cannot exist; leaving it unsolved reports the inference failure instead.
