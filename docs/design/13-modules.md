@@ -1068,3 +1068,15 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   have to name, which is everything else. Whether a submodule can be marked private to its parent, so
   that the library can have workings that are not a public surface at all, is (c); `private[sysl]` on
   each declaration reaches the same place today, one declaration at a time.
+
+  **Five modules in, one boundary case decided the shape of the rule.** `sysl.sys`, `sysl.buf`,
+  `sysl.text`, `sysl.io` and `sysl.args` all fell out of "does the language reach it". The
+  `display_*` renderers do not: no desugaring names one, so the letter of the rule puts them in a
+  `sysl.fmt` — and the split was *tried*, works, and needs nothing else to move once the tuple rows
+  go with it, `13 §6` notwithstanding. They stay in `sysl` anyway, and the reason sharpens the rule
+  rather than excusing an exception. **A program writing `impl Display` is not reaching for a
+  library; it is implementing a language feature.** `print` is a keyword, `Display` is how a type
+  joins in, and the renderers are the vocabulary that contract is written in — a program that cannot
+  write its `display` body without an import has been asked to name part of the language. So the
+  test is not "does a desugaring name it" but **"can a program take part in the language without
+  it"**, which is the same question everywhere else and a different answer only here.

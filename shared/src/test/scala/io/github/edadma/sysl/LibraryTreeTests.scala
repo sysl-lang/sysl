@@ -397,9 +397,12 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     }
 
     // The sink could move because nothing the language does reaches it: a render lays out storage
-    // the compiler chose, not a `ByteSink`. So a program may still make itself printable — naming
-    // `Display`, `Writer`, `FormatSpec` and a renderer, all of them the standard module's — with
-    // no import written at all, which is the half of `04`'s line that did *not* move.
+    // the compiler chose, not a `ByteSink`. What did *not* move is everything an `impl Display`
+    // writes — `Display`, `Writer`, `FormatSpec` and the renderers — and this is what holds them
+    // there. A `sysl.fmt` holding the renderers compiles and closes no cycle, so nothing mechanical
+    // stops the split; what stops it is that a program implementing `Display` is taking part in
+    // `print` rather than reaching for a library, and should not have to name part of the language
+    // to do it (`13 § Open h`). Written as a whole program because that is the claim: no import.
     "while making a value printable still needs nothing named at all" in {
       irOf(
         "main.sysl" ->
@@ -408,6 +411,61 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
             "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"p\", out, fmt)\n\n" +
             "print(f\"[${P(1)}%4s]\")\n"),
       ) should include(s"@${Library.key("display_str")}(")
+    }
+  }
+
+  /** What five modules make askable that one could not. Each of these is a shape the library did not
+   * have while it was flat, and none of them is asserted anywhere above.
+   */
+  "the library being a tree of five" - {
+
+    // The ordinary case now, and it was not reachable at all before: a program that reads text out
+    // of a file names three of the library's modules and the standard one arrives underneath.
+    "a program reaches several submodules at once, and the free names underneath them" in {
+      irOf(
+        "main.sysl" ->
+          ("import sysl.buf.*\nimport sysl.io.*\nimport sysl.text.from_utf8\n\n" +
+            "var r = stdin()\nvar b: Buf[string] = buf()\n" +
+            "for line in lines(&r) do b.push(line)\n" +
+            "print(b.len(), from_utf8(\"x\".bytes).unwrap())\n"),
+      ) should include(s"@${Library.key("from_utf8")}({ ptr, ptr, i64 }")
+    }
+
+    // Two wildcards over two of the library's own modules. `13 §3` makes a name offered by two
+    // wildcards ambiguous, so this passing is the claim that the library's spellings do not
+    // collide across its modules — which `LibraryTests` holds them to, and this is that held at
+    // the seam a program actually writes.
+    "two wildcards over two of them offer no name twice" in {
+      irOf(
+        "main.sysl" -> "import sysl.buf.*\nimport sysl.text.*\n\nvar b = str_builder()\nb.push(\"x\")\nprint(b.finish(), byte_sink().text().len)",
+      ) should include(s"@${Library.key("str_builder")}()")
+    }
+
+    // The complement of the case above it: `sysl.other` is a name a program may declare because the
+    // library does not carry it, and every module the library *does* carry is refused — which was
+    // one rule about one name while `sysl` was alone and is now a rule about a set.
+    "a program may not declare any module the library carries, not merely the standard one" in {
+      for carried <- List("sysl.buf", "sysl.text", "sysl.io", "sysl.sys", "sysl.args") do
+        withClue(s"declaring $carried: ") {
+          errOf("mine.sysl" -> s"module $carried\n\nflag(n: int) -> int = n") should
+            include(s"'$carried' is the module every program is compiled against")
+        }
+    }
+
+    // And a path under a carried module is not itself carried, so it stays a program's to declare —
+    // the depth is not what decides it, the library's own headers are (`Library.modules`).
+    "while a module under one of them is still a program's own to declare" in {
+      irAgainstTree()( // no stand-in: this is the real library
+        "mine.sysl" -> "module sysl.buf.mine\n\nflag(n: int) -> int = n + 5",
+        "main.sysl" -> "sysl.buf.mine.flag(21)",
+      ) should include(s"call i32 @${Modules.qualify("sysl.buf.mine", "flag")}")
+    }
+
+    // An import of a module nothing declares is the ordinary undefined-module diagnostic, and it is
+    // worth pinning that a *plausible* submodule of the library is no different from any other
+    // unknown module — the library's name does not make `sysl.anything` resolvable.
+    "and an import of a submodule the library does not carry is refused" in {
+      errOf("main.sysl" -> "import sysl.collections.*\n\nprint(1)") should include("sysl.collections")
     }
   }
 }
