@@ -972,8 +972,8 @@ cores be handed to two compilations and compared — but the parameter has a def
 is found rather than named:
 
 ```
-sysl build-lib lib --core          # once, after a clone; writes .sysl/core.syslib
-sysl run prog.sysl                 # finds it there, with nothing to remember
+sysl run prog.sysl                 # builds .sysl/core.syslib if it is not there, then finds it
+sysl build-lib lib --core          # the same artifact, written on demand
 ```
 
 One path at both ends. `build-lib --core` with no `-o` writes to `.sysl/core.syslib`, and a
@@ -991,13 +991,26 @@ carries. Sorting by basename rather than by path is what lets the artifact built
 disk match the copy the compiler generated from the same files, which are named by where each was
 read.
 
-**A compilation that finds no standard module stops**, exactly as one handed a `--lib` it cannot read
-does. The reasoning is the same in both cases: the calls into that library have nothing to resolve
-them, and a compiler does not answer *I could not find the library you meant* by silently compiling
-against a different one. No C compiler that cannot find libc carries a spare, and none of them
-guesses. A missing artifact is therefore an error naming the command that builds it, and so is one
-that is corrupt, truncated, built by another sysl, or built from other sources than these — a
-standard module that cannot be read is not a standard module.
+**A compilation that finds no standard module at the default path builds one.** The artifact is a
+*derived* file — not committed, object code for one machine, and computed entirely from library
+source the compiler already carries — so the two states it is ever found in, absent after a clone or
+a fresh worktree and stale after a change to the tree encoding or the container, have one answer
+each, the same answer every time, and it takes well under a second to produce. Putting that to
+whoever ran the compiler buys nothing: there is no second option for them to choose.
+
+**This is not the silent substitution the rule above forbids, and the difference is exact.** What a
+compiler must never do is answer *I could not find the library you meant* by compiling against a
+different one — which is why no C compiler that cannot find libc carries a spare. A rebuild compiles
+against **this** library: the sources are the ones the compiler carries, the result is held to the
+same fingerprint on the way back in, and the program is compiled against precisely what it would have
+been had the artifact been there. Nothing is substituted, so there is nothing to be misled about. It
+is announced on stderr rather than done invisibly, because a first build that pauses to do work
+should say what the work was.
+
+**An artifact named with `--core-lib` is not rebuilt, and one that cannot be read stops the
+compilation** — corrupt, truncated, built by another sysl, or built from other sources than these.
+Someone who wrote down which standard module to compile against is owed the truth about that one
+rather than a different one built underneath them; it is the rule a named `--ar` already takes.
 
 **`--no-core-lib` is the one route to the copy the compiler carries.** That copy is there for the
 compiler's own unit tests, which have to run in a tree where nothing has been built — and, once, for

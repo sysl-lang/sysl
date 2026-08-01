@@ -796,24 +796,76 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
         notes should not include "warning"
       }
 
-      "while nothing there stops the compilation, and names the command that fixes it" in {
-        // A fresh clone has to build the library once. Saying so is the whole difference between a
-        // one-line fix and a user wondering why their program is slower than the one in the docs —
-        // and, more to the point, the compiler does not get to pick a different standard module.
-        val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
-          coreSearch = s"${createTempDirectory("sysl-cli-none-")}/core${LibraryArtifact.extension}"))
+      "while nothing there is built rather than reported, a fresh clone having one answer" in {
+        assume(Toolchain.clangAvailable, "clang not available")
+        assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
 
-        status should not be 0
-        notes should include("build-lib lib --core")
-        notes should include("--no-core-lib")
+        val where = s"${createTempDirectory("sysl-cli-none-")}/core${LibraryArtifact.extension}"
+
+        val (status, notes) =
+          diagnostics(Config(command = "emit-llvm", file = program("print(1)"), coreSearch = where))
+
+        status shouldBe 0
+        isFile(where) shouldBe true
+
+        // Announced rather than done invisibly: a first build that pauses to do work should say what
+        // the work was.
+        notes should include("building the standard module")
       }
 
-      "and something unreadable there stops it too, that being the shape a drifted one takes" in {
+      "and something unreadable there is replaced, the artifact being derived and not authored" in {
+        assume(Toolchain.clangAvailable, "clang not available")
+        assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
+
+        val where = corrupt("not a library\n".getBytes)
+
+        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), coreSearch = where))._1 shouldBe 0
+
+        // Replaced, not merely worked around: what is at the path afterwards is a standard module
+        // this compiler will read, which is the whole of what the rebuild is for.
+        LibraryArtifact.metadataOf(where, readBytes(where))
+          .flatMap(Core.read(where, _, Target.default)) shouldBe Symbol("right")
+      }
+
+      "and a stale one is replaced too, which is the state it is actually found in" in {
+        assume(Toolchain.clangAvailable, "clang not available")
+        assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
+
+        // The one a developer meets after a merge: an artifact whose container is a format behind.
+        // It is not corrupt and would decode as far as its own header — only the compiler has moved.
+        val where = corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)
+
+        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), coreSearch = where))._1 shouldBe 0
+      }
+
+      "and the program is compiled against the rebuilt one, not against the carried copy" in {
+        assume(Toolchain.clangAvailable, "clang not available")
+        assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
+
+        val where = s"${createTempDirectory("sysl-cli-rebuilt-")}/core${LibraryArtifact.extension}"
+        val src   = program("print(1)")
+
+        // The discriminating half. A rebuild that produced an artifact and then went on compiling
+        // against the copy the compiler carries would pass every assertion above, and the library's
+        // symbols are what tell the two apart: linked, they are declarations.
+        val rebuilt = emitted(Config(command = "emit-llvm", file = src, coreSearch = where))
+        val carried = emitted(Config(command = "emit-llvm", file = src, noCoreLib = true, coreSearch = where))
+
+        libraryOwn(rebuilt, "define") shouldBe empty
+        libraryOwn(rebuilt, "declare") should not be empty
+        libraryOwn(carried, "define") should not be empty
+      }
+
+      "but one named with --core-lib is not rebuilt, being the one that was asked for" in {
+        // The rule the rebuild does *not* reach, and the reason it does not: someone who wrote down
+        // which artifact to compile against is owed the truth about that one rather than a different
+        // one built underneath them.
         val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
-          coreSearch = corrupt("not a library\n".getBytes)))
+          coreLib = Some(corrupt("not a library\n".getBytes))))
 
         status should not be 0
-        notes should include("error")
+        notes should include("is not a sysl library")
+        notes should not include "building the standard module"
       }
 
       "and --core-lib is the one consulted, being the one someone actually asked for" in {
@@ -854,15 +906,17 @@ class LibraryCliTests extends AnyFreeSpec with Matchers {
       notes should not include "error"
     }
 
-    "and is what a tree with no artifact at all needs, there being no silent fallback" in {
-      // The flag's reason for existing. Without it this exact configuration — a fresh clone, nothing
-      // built — is an error, which is the whole point: the carried copy is reached deliberately or
-      // not at all.
+    "and compiles a tree with no artifact without making one, which the default path would" in {
+      // The flag's reason for existing, and what separates it from the rebuild. Both compile in a
+      // tree where nothing has been built; only one of them needs a toolchain to do it, which is why
+      // this is the path the compiler's own unit tests take and the bootstrap took.
       val nowhere = s"${createTempDirectory("sysl-cli-bare-")}/core${LibraryArtifact.extension}"
 
-      cli(Config(command = "emit-llvm", file = program("print(1)"), coreSearch = nowhere)) should not be 0
       cli(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
         coreSearch = nowhere)) shouldBe 0
+
+      // Nothing was written, where the same run without the flag would have built one there.
+      isFile(nowhere) shouldBe false
     }
 
     "and takes the built-in copy with a good artifact sitting right there" in {

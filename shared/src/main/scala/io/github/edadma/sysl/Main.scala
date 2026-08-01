@@ -36,14 +36,19 @@ import scopt.OParser
  * of the library the compiler carries: the signatures arrive decoded instead of parsed, and the half
  * that was already compiled is linked rather than emitted a second time into every program.
  *
- * **It need not be given.** `build-lib --core` with no `-o` writes to `LibraryArtifact.coreDefault`,
- * and a compilation with no `--core-lib` looks there — one path at both ends, so building the
- * artifact once after a clone is the whole of what anyone has to do.
+ * **It need not be given, and it need not already exist.** `build-lib --core` with no `-o` writes to
+ * `LibraryArtifact.coreDefault`, and a compilation with no `--core-lib` looks there — one path at both
+ * ends. Where nothing usable is at that path the compiler **builds one**, from the library source it
+ * carries, and says so on stderr. The artifact is derived rather than authored: not committed, object
+ * code for one machine, and computed entirely from sources the compiler already has, so being absent
+ * after a clone or stale after a format change has one answer and it is not a question for whoever
+ * ran the command.
  *
- * **And it has to be there.** A compilation that finds no standard module stops, the same as one
- * handed a `--lib` it cannot read: a compiler does not silently substitute a different library for
- * the one it was meant to use, and a C compiler that cannot find libc does not carry a spare. The
- * diagnostic names the command that builds it.
+ * **Which is not the same as substituting a library.** What a compiler must never do is answer *I
+ * could not find the library you meant* by quietly using a different one — and a rebuild uses **this**
+ * one, held to `Std.fingerprint` on the way back in. A `--core-lib` that was named and cannot be read
+ * still stops the compilation, because there the reader asked for a particular artifact and is owed
+ * the truth about it.
  *
  * **`--no-core-lib` is the one route to the copy the compiler carries**, ignoring whatever is on
  * disk. That copy is what makes bootstrap possible — there is no released sysl to build the first
@@ -142,7 +147,7 @@ case class Config(
       opt[String]("core-lib")
         .action((l, c) => c.copy(coreLib = Some(l)))
         .text("a prebuilt standard module to compile against, from 'build-lib --core'; " +
-          "one that cannot be read costs a warning, not the compilation"),
+          "one that cannot be read stops the compilation, being the one that was asked for"),
       opt[Unit]("no-core-lib")
         .action((_, c) => c.copy(noCoreLib = true))
         .text("compile against the copy of the standard module built into the compiler, " +
@@ -384,30 +389,106 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
 
 /** The standard module this compilation gets, or why it has none.
  *
- * Two places, in order: the one `--core-lib` names and the one sitting at the default path. **Neither
- * one being there is an error**, exactly as it is for every other library — a compiler that cannot
- * find its standard library does not quietly compile against something else, and clang without a
- * libc does not carry a spare. The message names the command that fixes it, because "build the
- * library once" is the whole of what a fresh clone has to do.
+ * Two places, and they are governed by different rules. **A named one is taken as it is**: someone
+ * who wrote `--core-lib` down is owed an error when what they named is not there or will not read,
+ * rather than a different standard module built underneath them. That is the rule `Toolchain.findAr`
+ * applies to a named archiver, and for the same reason.
  *
- * `--no-core-lib` is the one way to the copy the compiler carries. That copy exists for bootstrap —
- * there is no released sysl to build the first artifact with — and reaching it is therefore a
- * deliberate act rather than what happens when a lookup comes up empty. Which is what keeps it
- * honest: a fallback taken silently is a fallback taken *always*, since nobody would ever build the
- * artifact, and the path meant for the rarest of circumstances would become the only path anyone ran.
+ * **The one at the default path is a cache, and is rebuilt when it is not usable.** See `foundCore`.
+ *
+ * `--no-core-lib` is the one way to the copy the compiler carries *as source*. That copy exists for
+ * bootstrap — there is no released sysl to build the first artifact with — and for the compiler's own
+ * unit tests, which run in a tree where nothing has been built. Reaching it is a deliberate act, and
+ * that is worth keeping distinct from the rebuild below: this one compiles the library's source into
+ * the program, where the rebuild produces the artifact and links it.
  *
  * **`build-lib --core` is exempt, and has to be.** It is the command that produces the artifact, so
- * requiring one would be a deadlock with nothing to break it — the bootstrap case in its purest form,
- * and the reason the carried copy is kept at all.
+ * consulting one would be a deadlock with nothing to break it.
  */
 private def chooseCore(cfg: Config, target: Target): Either[String, (Core, Set[String], Option[String])] =
   if cfg.noCoreLib || cfg.core then Right((Core.embedded(target), Set.empty, None))
   else
-    cfg.coreLib.orElse(Option.when(isFile(cfg.coreSearch))(cfg.coreSearch)) match
-      case Some(path) => loadCore(path, target)
-      case None =>
-        Left(s"cannot find the standard module — build it with 'sysl build-lib lib --core', " +
-          s"or pass --no-core-lib to compile against the copy built into the compiler")
+    cfg.coreLib match
+      case Some(named) => loadCore(named, target)
+      case None        => foundCore(cfg.coreSearch, target)
+
+/** The standard module at the path both ends agree on, **built there when what is there is not one.**
+ *
+ * The artifact is a *derived* file: it is object code for one machine, it is not committed, and every
+ * byte of it is computed from the library source the compiler already carries. So the states it can
+ * be found in — absent after a clone or a fresh worktree, and stale after any change to the tree
+ * encoding or the container — are not questions to put to whoever ran the compiler. They have one
+ * answer, the compiler can produce it in well under a second, and it is the same answer every time.
+ *
+ * **This is not the silent fallback the design refuses**, and the distinction is the whole of why it
+ * is allowed. What is refused is compiling against a *different* standard module than the one asked
+ * for — answering "I could not find your library" by quietly using another. A rebuild answers with
+ * **this** library: the sources are the ones the compiler carries, `Core.read` holds the result to
+ * `Std.fingerprint` on the way back in, and a program compiled after it is compiled against exactly
+ * what it would have been compiled against had the artifact been there. Nothing is substituted, so
+ * there is nothing for a reader to be misled about.
+ *
+ * It says so on stderr rather than doing it invisibly. The work is a second of someone's time and the
+ * line is what makes a slow first build explicable instead of mysterious.
+ *
+ * **A rebuild that cannot happen reports the original problem, not its own.** Without a toolchain
+ * there is no artifact to make, and what the reader needs then is the sentence naming the command and
+ * the flag — the same one they would have got before — with the reason the compiler could not do it
+ * for them appended.
+ */
+private def foundCore(path: String, target: Target)
+    : Either[String, (Core, Set[String], Option[String])] = {
+  val found = if isFile(path) then loadCore(path, target) else Left(s"$path does not exist")
+
+  found match
+    case Right(got) => Right(got)
+    case Left(why)  =>
+      Console.err.println(s"building the standard module at $path ($why)")
+
+      writeCore(path, target) match
+        case Right(_) => loadCore(path, target)
+        case Left(err) =>
+          Left(s"cannot find or build the standard module — build it with " +
+            s"'sysl build-lib lib --core', or pass --no-core-lib to compile against the copy built " +
+            s"into the compiler ($err)")
+}
+
+/** The standard module compiled to an artifact at `out`, from the library source the compiler
+ * carries.
+ *
+ * The sources are `Std.sources` and not the `lib/` in some tree, which is what makes this usable at
+ * all: an installed compiler has no repository beside it, and `Core.read` checks a decoded artifact
+ * against `Std.fingerprint` — the fingerprint of exactly these files — so building from them is the
+ * one thing guaranteed to produce an artifact this compiler will accept.
+ *
+ * No C files are gathered, and none can be missed: `15 §7` lets a library carry `.c` beside its
+ * modules, and the standard module carries none. It could not — the fingerprint an artifact is held
+ * to covers a library's C sources with its sysl ones, while the one the compiler carries covers only
+ * what `CoreSource` embeds, so a `.c` under `lib/sysl` would make every artifact built from the tree
+ * fail the check it is read back through.
+ */
+private def writeCore(out: String, target: Target): Either[String, Unit] =
+  for
+    ar    <- Toolchain.findAr(None)
+    built <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.core, Some(Core.embedded(target)))
+    _     <- {
+               val staging  = createTempDirectory("sysl-core-")
+               val code     = s"$staging/${LibraryArtifact.codeMember}"
+               val metadata = s"$staging/${LibraryArtifact.metadataMember}"
+
+               parentOf(out).foreach(createDirectories)
+
+               val outcome =
+                 for
+                   _ <- Toolchain.compileObject(built._1, code, target)
+                   _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(built._2, target), metadata, target)
+                   _ <- Toolchain.archive(List(code, metadata), out, ar)
+                 yield ()
+
+               List(code, metadata, staging).foreach(discard)
+               outcome
+             }
+  yield ()
 
 /** A prebuilt standard module read back: the trees to compile against, the symbols its object half
  * already defines, and the archive to link that half from — which is the file itself, since it is

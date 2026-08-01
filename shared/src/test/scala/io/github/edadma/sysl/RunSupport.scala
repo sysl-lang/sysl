@@ -11,10 +11,26 @@ import org.scalatest.matchers.should.Matchers
  */
 trait RunSupport extends Matchers { this: Assertions =>
 
+  /** Every run-tier compilation, in one place, against the **prebuilt** standard module
+   * (`PrebuiltCore`) where the toolchain can build one.
+   *
+   * That is the compilation an ordinary `sysl build` performs: the library's determined half is
+   * linked from the artifact rather than emitted into this program and handed to clang again. Absent
+   * a toolchain there is no artifact and this is the compilation the suite has always done — which is
+   * the case the `assume` above each helper has already cancelled for.
+   */
+  private def compiled(sources: List[Source], args: List[String]): Either[String, (Int, String)] =
+    PrebuiltCore.forHost match {
+      case Some((core, precompiled, archive)) =>
+        Toolchain.compileAndRun(sources, Nil, args, Some(core), precompiled, List(archive))
+      case None =>
+        Toolchain.compileAndRun(sources, Nil, args, None, Set.empty, Nil)
+    }
+
   protected def run(src: String): String = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    Toolchain.compileAndRun(src) match {
+    compiled(List(Source("<input>", src)), Nil) match {
       case Right((0, out))    => out
       case Right((code, out)) => fail(s"program exited with $code:\n$out")
       case Left(err)          => fail(err)
@@ -28,7 +44,7 @@ trait RunSupport extends Matchers { this: Assertions =>
   protected def runWith(src: String, args: String*): String = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    Toolchain.compileAndRun(src, "<input>", args.toList) match {
+    compiled(List(Source("<input>", src)), args.toList) match {
       case Right((0, out))    => out
       case Right((code, out)) => fail(s"program exited with $code:\n$out")
       case Left(err)          => fail(err)
@@ -69,7 +85,7 @@ trait RunSupport extends Matchers { this: Assertions =>
   private def ran(sources: List[Source]): String = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    Toolchain.compileAndRun(sources) match {
+    compiled(sources, Nil) match {
       case Right((0, out))    => out
       case Right((code, out)) => fail(s"program exited with $code:\n$out")
       case Left(err)          => fail(err)
@@ -82,7 +98,7 @@ trait RunSupport extends Matchers { this: Assertions =>
   protected def exits(src: String): Unit = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    Toolchain.compileAndRun(src) match {
+    compiled(List(Source("<input>", src)), Nil) match {
       case Right((code, _)) => code should not be 0
       case Left(err)        => fail(err)
     }
@@ -94,7 +110,7 @@ trait RunSupport extends Matchers { this: Assertions =>
   protected def exitsWith(src: String, code: Int): Unit = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    Toolchain.compileAndRun(src) match {
+    compiled(List(Source("<input>", src)), Nil) match {
       case Right((c, _)) => c shouldBe code
       case Left(err)     => fail(err)
     }
@@ -107,7 +123,7 @@ trait RunSupport extends Matchers { this: Assertions =>
   protected def panics(src: String, message: String): Unit = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    Toolchain.compileAndRun(src) match {
+    compiled(List(Source("<input>", src)), Nil) match {
       case Right((0, out)) => fail(s"expected the program to stop, but it exited cleanly:\n$out")
       case Right((_, out)) => out should include(message)
       case Left(err)       => fail(err)
