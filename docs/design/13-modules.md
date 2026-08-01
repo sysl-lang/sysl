@@ -226,19 +226,31 @@ mean something a reader can rely on — a restricted type stays inside its regio
 in the safe direction: forbidding it now rules out nothing that a later rule would have had to keep
 allowing, while allowing it and tightening later would break programs.
 
-**Open: what an `impl` for a built-in reserves, in every program.** A type's members are one
-namespace whatever brought them (`08 § One name, one member`), and a member arrives with its type
-rather than with an import — which is the rule above, working. Together they mean that
-`sysl.math`'s `Float`, which the library ships, permanently claims each of its member names on
-`real` and on `f32` **for every program that compiles**, whether or not it ever mentions the module.
-`guide/fft` met this: it declares a `Zero` trait whose member is spelled `zero`, and cannot
-implement it for either float width, so its generic sum is demonstrated over `int` and over the
-program's own type instead.
+**A trait's member is reached where the trait is.** A type's members are one namespace whatever
+brought them (`08 § One name, one member`), and the members an `impl` block brings are in it — but
+which of them a use can *see* is a question about the **trait**, not about the type. A trait
+declared in this module, imported by name, offered by a wildcard, or carried by an auto-imported
+module is in scope; a library submodule's is not until a file asks for it, exactly as its values are
+not (`§3`).
 
-Nothing here is a defect — each rule is the one wanted — and the consequence is real and was not
-visible until a library implemented a wide trait for a built-in. What could answer it is a way for a
-member to be reached only where its trait is in scope, which is a different rule from the one above
-and is not designed here. Recorded with its customer.
+This is what keeps an `impl` for a built-in from spending names. `sysl.math`'s `Float` declares some
+forty-one members on `real` and `f32`, and a program that never imports the module may still declare
+a trait of its own with any of those names and implement it for either width. `guide/fft` does: its
+`Zero` is implemented for `real` alongside the library's, and the bound on `sum` says which one the
+body means.
+
+**Two traits may therefore give one type a member of one name, and three things tell them apart, in
+this order.** A **bound** answers first, because inside a generic body the signature already said
+which trait was being asked for — and at an instantiation the parameter has become an ordinary type
+whose table holds both. **Scope** answers next, and is the only thing that *can* answer for two
+members that take no arguments: `zero()` and `zero()` differ in nothing a call writes. The
+**arguments** answer last, which is `08`'s existing rule for two implementations of one trait, now
+reached only once the first two have narrowed the set. A use that still reaches two is reported
+where it is written, naming both traits.
+
+What does **not** get a scope to be told apart by is a member of the type's **own** body: it is
+reachable wherever the type is, so a trait may not give a type a name its own declaration already
+used, and that is refused at the `impl`.
 
 ### Anything visible outside its file states its types
 
