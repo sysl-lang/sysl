@@ -87,7 +87,7 @@ print(wide)
 ```
 
 ```error
-byte
+declared int but the value is byte
 ```
 
 The fix is to say so, and every conversion is written with call syntax:

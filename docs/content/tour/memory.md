@@ -250,5 +250,4 @@ language is built around.
 
 ---
 
-Next: [arrays, slices and strings](/tour/arrays/) — three types that lean on everything in this
-chapter.
+Next: [arrays and slices](/tour/arrays/) — two types that lean on everything in this chapter.

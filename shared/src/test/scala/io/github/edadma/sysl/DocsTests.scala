@@ -34,6 +34,8 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/tour/functions.md"                  -> (10, 0, 0),
     "docs/content/tour/structs.md"                    -> (5, 0, 0),
     "docs/content/tour/memory.md"                     -> (7, 0, 0),
+    "docs/content/tour/arrays.md"                     -> (9, 1, 0),
+    "docs/content/tour/strings.md"                    -> (10, 1, 0),
   )
 
   "every page on the site is accounted for" in {
