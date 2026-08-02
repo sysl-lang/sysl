@@ -68,6 +68,17 @@ explicitly, and an artifact you named is never rebuilt behind your back — if i
 compilation stops and says so. `--no-core-lib` compiles against the copy built into the compiler
 with no toolchain involved at all, which is the path the compiler's own test suite takes.
 
+## Optimization
+
+`-O` names the level handed to clang, spelled the way clang spells one — `-O2`, `-Os`, `-O0` — and
+it reaches every object a build produces rather than only the final link. It can also be written
+`--optimize 2`.
+
+The default is **`-O1`**, not off. That is worth knowing because it is unusual: `-O0` is a different
+instruction selector rather than merely a slower one, it is the mode a back end's own test suite
+covers least, and a real miscompile was found living there. If you drop to `-O0` to make something
+easier to debug and the behaviour changes, suspect that before your program.
+
 ## If something goes wrong
 
 **`clang: command not found`** — sysl got as far as emitting IR and had nothing to hand it to.

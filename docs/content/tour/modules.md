@@ -174,7 +174,7 @@ import anything to call `print`. Everything else is a submodule you ask for by n
 | `sysl.text` | `from_utf8`, `StrBuilder`, `Chars`, `CString` |
 | `sysl.io` | `Reader`, `stdin()`, `lines()` |
 | `sysl.fs` | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` |
-| `sysl.math` | `max`, `min`, `pi`, and the float functions |
+| `sysl.math` | `max`, `min`, `pi`, the float functions, and the integer traits `Signed` and `Bits` |
 | `sysl.args` | `args_of`, for reading a raw `argv` |
 | `sysl.sys` | the platform seam — what a freestanding target replaces |
 
