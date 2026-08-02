@@ -194,6 +194,43 @@ class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  // What the trait is *for*. A membership over an open family exists so that a body can be written
+  // once against the bound and instantiated at a width nobody listed — the counts and the rotations
+  // both have to survive the trip through `[T: Bits]`, not only a call on a concrete type.
+  "as a bound" - {
+
+    "a generic body may count the bits of whatever it was instantiated at" in {
+      run(importing +
+        """popcount[T: Bits](x: T) -> u32 = x.count_ones()
+          |
+          |main()
+          |    var a: u8 = 7
+          |    var b: u32 = 255
+          |    var c: u12 = 0b100000000001
+          |    print(popcount(a), popcount(b), popcount(c))
+          |""".stripMargin) shouldBe "3 8 2\n"
+    }
+
+    // The rotation is the harder half of the same question: its amount is a `u32` whatever `T` is,
+    // so the widening happens per instantiation and the literal `1` is not `T`'s.
+    "and may rotate one, at each instantiation's own width" in {
+      run(importing +
+        """spin[T: Bits](x: T, n: u32) -> T = x.rotate_left(n)
+          |
+          |main()
+          |    var a: u8 = 1
+          |    print(spin(a, 1), spin(0x12345678u32, 4))
+          |""".stripMargin) shouldBe "2 591751041\n"
+    }
+
+    // Every member answers something that mentions `Self` or is a count, so an erased value has
+    // forgotten what it would have to answer — which is object safety's ordinary rule reaching this
+    // trait rather than anything new about it.
+    "but there is no trait object over it, because Self is in the answers" in {
+      err(importing + "main()\n    var x: &Bits = null\n    print(1)") should include("Self")
+    }
+  }
+
   "what is refused" - {
 
     // Same rule as `Signed`: a compiler-provided membership says which types have the member, never
@@ -213,6 +250,12 @@ class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "a rotation takes exactly one" in {
       err(importing + "main()\n    print((1u8).rotate_left())") should include("rotate_left")
       err(importing + "main()\n    print((1u8).rotate_left(1, 2))") should include("rotate_left")
+    }
+
+    // The signature is the trait's own, so the amount is held to being a count: there is no
+    // rotation by a negative number, and the complaint is the ordinary one about a literal.
+    "and an amount that is not a count" in {
+      err(importing + "main()\n    print((1u8).rotate_left(-1))") should include("does not fit")
     }
 
     // Deliberately absent, and the absence is a design decision rather than an oversight: reversing
@@ -256,6 +299,27 @@ class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |    print(x.rotate_right(8) == x.rotate_right(n), x.rotate_right(8))
           |""".stripMargin) shouldBe "true 17222085231038278605\n"
     }
+  }
+
+  // The signature is read off the trait's declaration rather than restated in the compiler, so
+  // everything an ordinary call gets from a declaration works here: the parameter has the name the
+  // library gave it, and naming it reaches it.
+  "the amount may be passed by the name the trait gave it" in {
+    run(importing + "main()\n    print((1u8).rotate_left(n = 1))") shouldBe "2\n"
+  }
+
+  // A subtype narrows which values a type has and never which operations it has (`16 §3`), so the
+  // members reach one — at the base's bit pattern, which is the only thing a count could mean.
+  "a constrained subtype has them, at its base's bits" in {
+    run(
+      """import sysl.math.{Bits, Signed}
+        |
+        |type Temp = int within -50..50
+        |
+        |main()
+        |    var a: Temp = -7
+        |    print(a.abs(), a.count_ones())
+        |""".stripMargin) shouldBe "7 30\n"
   }
 
   // The declaration carries the width, so a program using one member at three widths gets three

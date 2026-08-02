@@ -528,18 +528,28 @@ These memberships change no codegen: a scalar operator still lowers to its nativ
 (`§3`). Their sole job is to make the type system agree that a scalar satisfies the bound a
 generic asks for, so `sum(3, 4)` and `sum(3.0, 4.0)` both instantiate `sum[T: Add]`.
 
-**A compiler-provided membership is not always an operator, and `sysl.math.Signed` is the case that
-shows why the mechanism is needed rather than convenient.** `abs` and `signum` are ordinary members
-with ordinary names, and the reason they cannot be a library `impl` is the one that put the
-memberships here in the first place: the `iN` / `uN` families are **open**, so `i5` and `i128` have
-no block anybody could have written. The floating-point half of the same module *is* a written
-trait with an `impl` per width, because there are two widths — which is the whole difference, and it
-is a fact about how many types there are rather than about what the members do.
+**A compiler-provided membership is not always an operator, and `sysl.math`'s integer half is the
+case that shows why the mechanism is needed rather than convenient.** `Signed`'s `abs` and `signum`,
+and `Bits`' population counts, runs, reversal and rotations, are ordinary members with ordinary
+names, and the reason they cannot be a library `impl` is the one that put the memberships here in
+the first place: the `iN` / `uN` families are **open**, so `i5` and `i128` have no block anybody
+could have written. The floating-point half of the same module *is* a written trait with an `impl`
+per width, because there are two widths — which is the whole difference, and it is a fact about how
+many types there are rather than about what the members do.
 
 Such a trait is declared in library source like any other, and what the compiler holds is the
-membership rule and the lowering. Both members read their operand more than once — a magnitude
-compares it and negates it — so they lower to a **select over one evaluation** rather than to the
-tree of operators they are equivalent to, and `f().abs()` calls `f` once.
+membership rule and the lowering. Every one of these members reads its operand more than once — a
+magnitude compares it and negates it, a rotation shifts it both ways — so each is **one node over
+one evaluation** rather than the tree of operators it is equivalent to, and `f().abs()` calls `f`
+once.
+
+**Every member of such a trait must be total over every type the membership covers**, and this is
+the constraint that shapes the surface rather than a remark about it. A `[T: Bits]` body is written
+once and instantiated later, so a member that answered at `u32` and not at `u24` would turn a bound
+that was supposed to have *proven* an operation into a failure at somebody else's instantiation —
+the same reason `Rem` is an integer membership and not a numeric one. `Bits` therefore has no
+`swap_bytes`: reversing byte order needs a whole number of bytes and at least two, and the open
+family has widths that are neither.
 
 **Membership does not put a member in scope.** `13 §2` decides which files may write a member and
 this section decides which types have one; they are different questions and both are asked. `Add`
@@ -553,11 +563,20 @@ floats have an `abs` already — `Float`'s, bound to libm's `fabs` so that it ca
 which is what makes `(-0.0).abs()` answer `0.0` where a comparison against zero cannot. Two members
 of one name that disagree about a zero would be worse than one of them not existing.
 
-**They are homogeneous**, which is `01`'s rule and not a limitation of the mechanism: an `int` is
-`Mul[int]` and no other `Mul`, because no scalar operator promotes. A scalar therefore keeps its
-instruction whatever an `impl` written elsewhere might say — `impl Mul[Complex] for f64` does not
-make `2.0 * c` mean anything, and `c * 2.0` is how a program writes it. A **transparent** subtype is
-its base's member the same way it is its base's operand, so an `Age` over `int` is `Mul[Age]`.
+**The operator memberships are homogeneous**, which is `01`'s rule and not a limitation of the
+mechanism: an `int` is `Mul[int]` and no other `Mul`, because no scalar operator promotes. A scalar
+therefore keeps its instruction whatever an `impl` written elsewhere might say — `impl Mul[Complex]
+for f64` does not make `2.0 * c` mean anything, and `c * 2.0` is how a program writes it. A
+**transparent** subtype is its base's member the same way it is its base's operand, so an `Age` over
+`int` is `Mul[Age]`.
+
+That is a rule about **operators**, and the members above are where the difference shows: `Bits`
+answers a count of bits as a `u32` whatever it counted, and takes a rotation amount as a `u32`
+whatever it rotates. Neither is a promotion — how far to rotate is a count of bit positions rather
+than a value of the type being rotated, and a `u8` that could only state amounts up to 255 would be
+the *narrow* case that homogeneity made awkward rather than the safe one. What the compiler reads is
+the trait's own declaration, so the signature is stated once, in the library source, where a reader
+can see it.
 
 Because these impls are compiler-provided, they raise no coherence question: the orphan rule of
 `02` asks that an `impl` live in the module declaring the trait or the one declaring the type, and
