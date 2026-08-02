@@ -18,6 +18,16 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
+  /** The register-block shape `03 § Device memory` is written against, shared by the probes below. */
+  private val uart =
+    """struct Uart
+      |    status: volatile u32
+      |    data:   volatile u32
+      |    baud:   u32
+      |const UART: usize = 0x10000000
+      |val regs: *Uart = ptr_cast(UART)
+      |""".stripMargin
+
   "what the chapter claims" - {
 
     // The headline: a write through the name lands in the storage the place found, not in a copy.
@@ -581,6 +591,127 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |print(now(() -> xs[1]))""".stripMargin
 
       run(src) shouldBe "42\n"
+    }
+  }
+
+  /** The chapters next door, probed because a ref is a place under a new name and every rule about
+    * places has to keep meaning what it did.
+    */
+  "the neighbouring chapters" - {
+
+    // `03 § Device memory` puts the qualifier on the **storage**, and a ref names storage — so an
+    // access through the name has to be the access the path would have been.
+    //
+    // This was a real defect, found by asking the question rather than by a failing program: a ref
+    // has no declaration to read a qualifier off, and the emitter read it off the node. A register
+    // written through a ref got an unmarked store, free to be reordered or dropped, where the direct
+    // path got `store volatile`.
+    "a ref to a register keeps the volatile qualifier on the store" in {
+      val out = defineOf(ir(uart + "poke()\n    ref s = regs.status\n    s = 7u32\npoke()"), "poke")
+
+      out should include("store volatile i32 7")
+    }
+
+    "and on the load" in {
+      val out = defineOf(ir(uart + "peek() -> u32\n    ref s = regs.status\n    s\nprint(peek())"), "peek")
+
+      out should include("load volatile i32")
+    }
+
+    // The disagreement half: a ref to the block's *shadow* field is ordinary memory and must not
+    // acquire a qualifier it never had.
+    "where a ref to an ordinary field of the same block does not" in {
+      val out = defineOf(ir(uart + "poke()\n    ref b = regs.baud\n    b = 7u32\npoke()"), "poke")
+
+      out should include("store i32 7")
+      out should not include "store volatile"
+    }
+
+    // `05` promotes an array whose view escapes the frame, and the pass finds *which* array by
+    // walking to the view's root. A ref is a name for storage, so the walk has to carry on through
+    // it — otherwise the array would be unnameable and the escape reported instead of promoted.
+    "an escape through a ref promotes the array the ref names" in {
+      val src =
+        """keep(v: []int) -> []int = v
+          |f() -> []int
+          |    var xs = [1, 2, 3]
+          |    ref r = xs
+          |    keep(r[..])
+          |print(f()[1])""".stripMargin
+
+      run(src) shouldBe "2\n"
+    }
+
+    // `16 §6`'s `SelfAlias`: a `*self` method may not let a pointer into its receiver outlive the
+    // call. A ref is a second name for the receiver's own storage, so taking its address is the same
+    // leak written one line longer — and has to be caught as one.
+    "a '*self' method may not return an address taken through a ref into its receiver" in {
+      val src =
+        """|struct Inner
+           |    n: int
+           |
+           |    leak(*self) -> *int
+           |        ref x = self.n
+           |        &x
+           |struct Outer
+           |    a: Inner
+           |    b: int
+           |    invariant a.n <= b
+           |""".stripMargin
+
+      err(src + "var o = Outer(Inner(1), 5)\nvar p = o.a.leak()") should include("outlive the call")
+    }
+
+    // `13 §2`: statements at the top of a file are the entry point's, not module members — so a ref
+    // written there is an ordinary local of `main` and needs no rule of its own. Probed because the
+    // opposite was assumed: `ref` is local-only, and the question was whether the top of a file
+    // counts as local. It does, and it does for a reason that predates this feature.
+    "a ref at the top of a file is a local of the entry point" in {
+      run("var xs = [1, 2, 3]\nref e = xs[1]\ne = 9\nprint(xs[1])") shouldBe "9\n"
+    }
+
+    // `09`: a ref to an enum is matched the way the place is, since what a match reads is the value.
+    "a ref to an enum is matched like the place it names" in {
+      val src =
+        """enum Colour
+          |    Red
+          |    Green
+          |    Blue
+          |end Colour
+          |var cs = [Red, Green, Blue]
+          |ref c = cs[1]
+          |c match
+          |    Red -> print("red")
+          |    Green -> print("green")
+          |    Blue -> print("blue")""".stripMargin
+
+      run(src) shouldBe "green\n"
+    }
+
+    // `03 § defer`: a deferred statement runs where the block is left, and a ref is still in scope
+    // there — the binding is a declaration of a name, not of storage that could have been released.
+    "a deferred statement may write through a ref" in {
+      val src =
+        """var xs = [1, 2, 3]
+          |if true
+          |    ref e = xs[0]
+          |    defer e = 9
+          |    print(xs[0])
+          |print(xs[0])""".stripMargin
+
+      run(src) shouldBe "1\n9\n"
+    }
+
+    // `00 §2`: a multi-assignment writes several places at once, and a ref is a place.
+    "a ref may be one place of a multi-assignment" in {
+      val src =
+        """var xs = [1, 2, 3]
+          |ref a = xs[0]
+          |ref b = xs[2]
+          |a, b = b, a
+          |print(xs[0], xs[1], xs[2])""".stripMargin
+
+      run(src) shouldBe "3 2 1\n"
     }
   }
 

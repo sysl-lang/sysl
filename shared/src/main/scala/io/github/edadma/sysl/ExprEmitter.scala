@@ -388,8 +388,12 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.
     case TLoad(_, ty) if Type.zeroSized(ty) => ""
 
+    // The qualifier comes off the value's type for an ordinary local, whose slot is its own, and off
+    // the recorded storage for a `ref`, whose slot is somebody else's and may be a register
+    // (`03 § ref`, `03 § Device memory`).
     case TLoad(name, ty) =>
-      val r = freshTemp(); emit(s"$r = load${qualifier(ty)} ${ty.llvm}, ptr %$name.addr"); r
+      val q = if refStorage.contains(name) then qualifier(refStorage(name)) else qualifier(ty)
+      val r = freshTemp(); emit(s"$r = load$q ${ty.llvm}, ptr %$name.addr"); r
 
     case TResult(_) =>
       resultSSA.getOrElse(sys.error("'result' lowered outside an ensure postcondition"))

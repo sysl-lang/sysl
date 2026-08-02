@@ -175,7 +175,32 @@ trait Emitter {
     scratch = mutable.HashMap.empty
     promoted = Set.empty
     promotedBoxes = mutable.HashMap.empty
+    refStorage = mutable.HashMap.empty
+    refPlaceOf = mutable.HashMap.empty
   }
+
+  /** The **storage** type each `ref` in this body names (`03 § ref`), which is not the same as the
+   * type of the values that come out of it.
+   *
+   * A qualifier lives on storage rather than on a value (`03 § Device memory`), and the ordinary way
+   * to read one is off the place — a field knows its own declaration. A ref's uses are all a plain
+   * name, which has no declaration to consult, so the qualifier it found at the binding is kept here
+   * and put back at each access. Without it a ref to a register would emit an unmarked load and
+   * store: the same access the direct path marks `volatile`, silently free to be reordered or
+   * dropped.
+   *
+   * Per function, like every other name-keyed table here, since a name is unique only within one.
+   */
+  protected var refStorage: mutable.HashMap[String, Type] = mutable.HashMap.empty
+
+  /** The place each `ref` in this body names, for the walks that have to reach past the name to the
+   * storage's **root** rather than to its address — which the address alone cannot tell them.
+   *
+   * `promotedOwner` is the one that needs it: a view records the box it borrows from, and a ref that
+   * names a promoted array has to hand over that array's box rather than the null a name with no
+   * declaration would otherwise give.
+   */
+  protected var refPlaceOf: mutable.HashMap[String, TExpr] = mutable.HashMap.empty
 
   /** The local arrays this body allocates on the heap rather than in its frame, decided by the
    * escape analysis (`05`), and the buffer each one ended up in.

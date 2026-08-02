@@ -383,6 +383,11 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // to release when the block ends, which is why `ownSlot` is absent where `TVarDecl` calls it.
     case TRefDecl(name, _, place) =>
       val base = address(place)
+
+      // The qualifier belongs to the storage, and the name that replaces the path has no declaration
+      // to read it off — so it is recorded here and put back at every access through the name.
+      if Type.volatileIn(place.placeTy) then refStorage(name) = place.placeTy
+      refPlaceOf(name) = place
       emit(s"%$name.addr = getelementptr i8, ptr $base, i64 0")
 
     case TExprStmt(expr) =>
