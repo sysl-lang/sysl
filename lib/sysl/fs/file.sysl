@@ -61,11 +61,17 @@ struct File
 
     closed(*self) -> bool = self.inner.shut
 
-    // Hands the buffered bytes to the operating system. A program that writes and then waits, or
-    // that shares the file with something else, needs this; one that writes and closes does not,
-    // since `close` flushes on its way out.
-    flush(*self) -> Result[unit, IoError] =
+    // **Every member below asks this first, and none of them may be dropped.** `fclose` releases the
+    // handle, so the pointer this struct holds afterwards names storage C has freed, and reaching it
+    // is a use-after-free rather than a call that fails. The flag is what stands between a program
+    // that closed a file too early and undefined behaviour, and the answer it produces instead is
+    // `NotOpen` -- which is `EBADF`, the code the operating system reports for the same mistake made
+    // one layer down.
+    flush(*self) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
         if c_fflush(self.inner.handle) != 0 then Err(why()) else Ok(())
+    end flush
 
     // Releases the handle, flushing what is still buffered.
     //
@@ -88,14 +94,19 @@ struct File
 
     // Where the next read or write will happen, in bytes from the start.
     tell(*self) -> Result[long, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
         var at = c_ftell(self.inner.handle)
 
         if at < 0i64 then Err(why()) else Ok(at)
     end tell
 
     // Moves to an absolute offset, which also clears the end-of-file mark.
-    seek(*self, to: long) -> Result[unit, IoError] =
+    seek(*self, to: long) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
         if c_fseek(self.inner.handle, to, seek_set()) != 0 then Err(why()) else Ok(())
+    end seek
 
     // How many bytes the file holds, leaving the position where it found it.
     //
@@ -104,6 +115,8 @@ struct File
     // transcribing it would be holding numbers nothing checks, while a seek is two calls whose
     // signatures are all there is to get right.
     size(*self) -> Result[long, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
         var here = c_ftell(self.inner.handle)
 
         if here < 0i64 then return Err(why())
@@ -120,7 +133,10 @@ struct File
     // Whether a read has already run off the end. It answers about reads that **happened**, so it is
     // false on a file just opened however empty that file is -- which is C's meaning, and the reason
     // a read loop tests what `read` handed back rather than testing this first.
-    at_end(*self) -> bool = c_feof(self.inner.handle) != 0
+    //
+    // A closed file answers `true`, since nothing more will arrive from it and a loop asking this
+    // should stop rather than spin.
+    at_end(*self) -> bool = self.inner.shut || c_feof(self.inner.handle) != 0
 end File
 
 // Whether anything has gone wrong on this file since it was opened. It latches, so it is worth
@@ -143,6 +159,13 @@ end File
 // should not have to ask -- the same split `FdReader` makes.
 impl Reader for File
     read(*self, into: []u8) -> []const u8
+        // Reading a closed file latches rather than answering quietly empty: an empty read means the
+        // end of the input, and a program told that would conclude it had read the whole file when
+        // what it had done was close it too early.
+        if self.inner.shut then
+            self.inner.bad = true
+            return into[0..<0usize]
+
         if into.len == 0usize then return into
 
         var got = c_fread(&into[0], 1usize, into.len, self.inner.handle)
@@ -160,7 +183,9 @@ end File
 // file. It latches rather than returning, which is what keeps `f.write(b)` a statement.
 impl Writer for File
     write(*self, bytes: []const u8)
-        if bytes.len > 0usize
+        if self.inner.shut
+            self.inner.bad = true
+        elif bytes.len > 0usize
             var put = c_fwrite(&bytes[0], 1usize, bytes.len, self.inner.handle)
 
             if put < bytes.len then self.inner.bad = true

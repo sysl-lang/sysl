@@ -13,7 +13,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * of its own as `args[1]` and builds its paths under it, so nothing here depends on the tree the
  * suite runs in or on two tests not colliding.
  */
-class FsTests extends AnyFreeSpec with RunSupport {
+class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   /** `sysl.fs` is a module of its own, so a program that touches a file says so. Written once and
    * prepended, since what each program below is about is the file and not the import.
@@ -134,6 +134,46 @@ class FsTests extends AnyFreeSpec with RunSupport {
           |    print("failed", f.failed())
           |    f.close().unwrap()""".stripMargin,
       ) shouldBe "[ one ]\n[ two ]\n[ three ]\nfailed false\n"
+    }
+
+    /* A file need not end in a newline, and the last line of one that does not is still a line. It
+     * is the case a program counting lines gets wrong, and the case a test written against a file
+     * the harness produced would miss, since text written as a block ends tidily. */
+    "a final line with no newline after it is still a line" in {
+      inDir(
+        """main(args: []string)
+          |    var p = args[1] + "/ragged"
+          |
+          |    write_text(p, "one\ntwo").unwrap()
+          |
+          |    var f = open(p).unwrap()
+          |    var n = 0
+          |
+          |    for line in lines(&f)
+          |        n += 1
+          |        print("[", line, "]")
+          |
+          |    print("lines", n)
+          |    f.close().unwrap()""".stripMargin,
+      ) shouldBe "[ one ]\n[ two ]\nlines 2\n"
+    }
+
+    "and a file of nothing but newlines is that many empty lines" in {
+      inDir(
+        """main(args: []string)
+          |    var p = args[1] + "/blank"
+          |
+          |    write_text(p, "\n\n\n").unwrap()
+          |
+          |    var f = open(p).unwrap()
+          |    var n = 0
+          |
+          |    for line in lines(&f)
+          |        n += 1
+          |        print(n, line.len)
+          |
+          |    f.close().unwrap()""".stripMargin,
+      ) shouldBe "1 0\n2 0\n3 0\n"
     }
 
     "a read hands back the prefix it filled, not the room it was offered" in {
@@ -525,6 +565,76 @@ class FsTests extends AnyFreeSpec with RunSupport {
       ) shouldBe "stopped at: no such file or directory\n"
     }
 
+    /** Everything below is about the same hazard: `fclose` frees the handle, so the pointer the
+     * struct goes on holding names storage C has released. Every member has to ask before it
+     * reaches, and each of these is one member asking.
+     */
+    "using a file after it is closed reports rather than reaching a freed handle" in {
+      inDir(
+        """main(args: []string)
+          |    var p = args[1] + "/shut"
+          |
+          |    write_text(p, "abcdef").unwrap()
+          |
+          |    var f = open(p).unwrap()
+          |
+          |    f.close().unwrap()
+          |    print(f.size().unwrap_err(), f.tell().unwrap_err())
+          |    print(f.seek(0i64).unwrap_err(), f.flush().unwrap_err())""".stripMargin,
+      ) shouldBe "the file is not open the file is not open\nthe file is not open the file is not open\n"
+    }
+
+    /* A closed file must not read as an *empty* one: empty means the end of the input, and a
+     * program told that would conclude it had read the whole file when what it had done was close
+     * it too early. So the read latches instead, and the latch is what `read_bytes` turns into an
+     * error. */
+    "a read after the close latches rather than answering quietly empty" in {
+      inDir(
+        """main(args: []string)
+          |    var p = args[1] + "/early"
+          |
+          |    write_text(p, "abcdef").unwrap()
+          |
+          |    var f = open(p).unwrap()
+          |    var room: [4]u8
+          |
+          |    f.close().unwrap()
+          |
+          |    var got = f.read(room[..])
+          |
+          |    print("got", got.len, "failed", f.failed(), "at_end", f.at_end())""".stripMargin,
+      ) shouldBe "got 0 failed true at_end true\n"
+    }
+
+    "and a write after it latches too" in {
+      inDir(
+        """main(args: []string)
+          |    var p = args[1] + "/late"
+          |    var f = create(p).unwrap()
+          |
+          |    f.write("in".bytes)
+          |    f.close().unwrap()
+          |    print("failed", f.failed())
+          |    f.write("out".bytes)
+          |    print("failed", f.failed())
+          |    print(read_text(p).unwrap())""".stripMargin,
+      ) shouldBe "failed false\nfailed true\nin\n"
+    }
+
+    "the closed handle's error is EBADF, which is what the platform reports for the same mistake" in {
+      inDir(
+        """main(args: []string)
+          |    var p = args[1] + "/bad"
+          |
+          |    write_text(p, "x").unwrap()
+          |
+          |    var f = open(p).unwrap()
+          |
+          |    f.close().unwrap()
+          |    print(f.size().unwrap_err().code())""".stripMargin,
+      ) shouldBe "9\n"
+    }
+
     "an error renders as its sentence and carries its number" in {
       inDir(
         """main(args: []string)
@@ -534,6 +644,112 @@ class FsTests extends AnyFreeSpec with RunSupport {
           |    print(e.message(), e.code())
           |    print(Other(99), Other(99).code())""".stripMargin,
       ) shouldBe "no such file or directory\nno such file or directory 2\nerror 99 99\n"
+    }
+  }
+
+  /** The two things in the module that differ between the platforms, built for the platform this is
+   * not.
+   *
+   * `Conditional` gates **text**, so the branch a build does not take is never lexed — which is C's
+   * cost too and the price of gating lines rather than trees. What closes it is compiling for the
+   * other machine, and that is a thing to run rather than a thing to design around. There is nothing
+   * here to execute the result on, so reading it is the whole of what these can do; it is enough,
+   * because what would rot in an untaken branch is a name or a signature, and both are settled
+   * before any instruction is chosen.
+   */
+  "the platform branches the module carries" - {
+
+    /* `errno` is a macro over a call on both platforms and the two libcs spell the function
+     * differently, so a build for the other machine is the only thing that would notice the Linux
+     * arm going stale. `mkdir`'s `mode_t` is the same shape of hazard one argument down. */
+    "compile for Linux as well as for the machine the suite runs on" in {
+      val src = "import sysl.fs.*\n\nprint(exists(\"/\"), is_dir(\"/\"))\n"
+
+      irFor(Target.x86_64Linux, src) should include("@main")
+      irFor(Target.aarch64Linux, src) should include("@main")
+    }
+
+    "and the whole surface does, not merely the two calls the gate is under" in {
+      val src =
+        """import sysl.fs.*
+          |
+          |main(args: []string)
+          |    write_text(args[1], "x").unwrap()
+          |    make_dir(args[1] + "/d").unwrap()
+          |    rename(args[1], args[1] + "/e").unwrap()
+          |    remove_file(args[1]).unwrap()
+          |    remove_dir(args[1]).unwrap()
+          |    print(read_text(args[1]).unwrap(), size_of(args[1]).unwrap())
+          |""".stripMargin
+
+      irFor(Target.x86_64Linux, src) should include("@main")
+    }
+  }
+
+  /** The claims the library's own shape rests on, checked as a program rather than read off the
+   * chapters — because what `sysl.fs` needed from the trait system is exactly what a program writing
+   * a two-way stream of its own will need, and neither of these was true of the library before.
+   */
+  "what a file needed from the trait system, asked of an ordinary program" - {
+
+    /* `02 §` — the diamond needs no rule of its own, the walk taking each trait the first time it
+     * reaches it. `Reader` and `Writer` both require `Fallible`, so a type that is both carries one
+     * `failed`, and it is the same answer through either trait object and through the value. Before
+     * the latch was shared this program could not be written at all. */
+    "a type may be a Reader and a Writer at once, and carries one 'failed' between them" in {
+      inDir(
+        """import sysl.io.Reader
+          |
+          |struct Both
+          |    n: usize
+          |    over: bool
+          |end Both
+          |
+          |impl Fallible for Both
+          |    failed(*self) -> bool = self.over
+          |
+          |impl Reader for Both
+          |    read(*self, into: []u8) -> []const u8 = into[0..<0usize]
+          |
+          |impl Writer for Both
+          |    write(*self, bytes: []const u8)
+          |        self.n += bytes.len
+          |        if self.n > 3usize then self.over = true
+          |
+          |main(args: []string)
+          |    var b = Both(0usize, false)
+          |    var w: *Writer = &b
+          |    var r: *Reader = &b
+          |
+          |    display_str("ab", w, FormatSpec(0, -1, false))
+          |    print(b.n, b.failed(), w.failed(), r.failed())
+          |    display_str("cd", w, FormatSpec(0, -1, false))
+          |    print(b.n, b.failed(), w.failed(), r.failed())""".stripMargin,
+      ) shouldBe "2 false false false\n4 true true true\n"
+    }
+
+    /* `02 §` — a trait whose every method has a default leaves nothing to write, so the block is
+     * optional and the `impl` line alone is a complete implementation. That claim is what keeps the
+     * shared latch from costing every sink a body it does not need, so it is worth a program rather
+     * than a reading. */
+    "a sink that cannot fail opts into the latch on one line, with no block at all" in {
+      inDir(
+        """struct Sink
+          |    n: usize
+          |end Sink
+          |
+          |impl Fallible for Sink
+          |
+          |impl Writer for Sink
+          |    write(*self, bytes: []const u8) = self.n += bytes.len
+          |
+          |main(args: []string)
+          |    var s = Sink(0usize)
+          |    var w: *Writer = &s
+          |
+          |    display_str("abc", w, FormatSpec(0, -1, false))
+          |    print(s.n, w.failed(), s.failed())""".stripMargin,
+      ) shouldBe "3 false false\n"
     }
   }
 }
