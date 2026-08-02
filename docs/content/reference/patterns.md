@@ -274,8 +274,64 @@ show()
 ### Only an irrefutable pattern may stand there
 
 A binding has **no other arm to take**. So the patterns allowed at one are exactly those that cannot
-fail — a tuple pattern, a name, a wildcard, and those nested inside one another — and everything in
-the table above that is a *test* is refused by name.
+fail — a tuple pattern, **either struct form**, a name, a wildcard, and those nested inside one
+another — and everything in the table above that is a *test* is refused by name.
+
+A struct qualifies because it has exactly one shape, which is the same property that makes a tuple
+pattern irrefutable, and both spellings of it stand here:
+
+```sysl
+struct Point
+    x: int
+    y: int
+end Point
+
+struct Pair
+    both: (int, int)
+end Pair
+
+show()
+    val Point{y, x} = Point(3, 4)
+    val Point(a, b) = Point(5, 6)
+    val (Point{x: px}, k) = (Point(7, 8), 9)
+    val Pair((lo, hi)) = Pair((10, 11))
+
+    print(x, y, a, b, px, k, lo, hi)
+
+show()
+```
+
+```output
+3 4 5 6 7 9 10 11
+```
+
+**The two forms differ in what they must account for, and it is the difference they have in a
+`match`.** The named form may leave fields out, and an unlisted one simply binds nothing — there is
+no exhaustiveness to discharge at a binding, so nothing has to stand in for it. The positional form
+names every field, so a struct that grows one turns each positional binding into a checked to-do
+rather than a binding that quietly goes on binding the same names:
+
+```sysl
+struct Point
+    x: int
+    y: int
+    z: int
+end Point
+
+show()
+    val Point(x, y) = Point(1, 2, 3)
+
+    print(x)
+
+show()
+```
+
+```error
+has 3 fields, but 2 sub-patterns were given
+```
+
+That `Name(…)` is a struct pattern here at all is the ordinary resolution rule: the spelling reads as
+a variant pattern until the value's type settles it, exactly as it does in an arm.
 
 A literal is a test:
 

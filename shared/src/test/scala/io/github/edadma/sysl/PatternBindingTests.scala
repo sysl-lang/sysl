@@ -253,6 +253,130 @@ class PatternBindingTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     }
   }
 
+  // `Name(…)` reads as a variant pattern until the value's type says otherwise, which is the rule an
+  // arm already applies. Against a struct it is one shape, so it is irrefutable for the reason the
+  // named form is — and it names every field, which is what turns adding one to the struct into a
+  // checked to-do rather than a binding that quietly went on binding fewer.
+  "a struct, taken apart by position" - {
+    "every field, in declaration order" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val Point(x, y) = Point(3, 4)
+          |    print(x, y)
+          |
+          |show()""".stripMargin
+      ) shouldBe "3 4\n"
+    }
+
+    "nested in a tuple, and with a tuple nested in it" in {
+      run(
+        """struct Pair
+          |    both: (int, int)
+          |
+          |struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val (Point(x, y), n) = (Point(1, 2), 3)
+          |    val Pair((a, b)) = Pair((4, 5))
+          |    print(x, y, n, a, b)
+          |
+          |show()""".stripMargin
+      ) shouldBe "1 2 3 4 5\n"
+    }
+
+    "a wildcard skips a field it does not want" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |    z: int
+          |
+          |show() =
+          |    val Point(_, y, _) = Point(1, 2, 3)
+          |    print(y)
+          |
+          |show()""".stripMargin
+      ) shouldBe "2\n"
+    }
+
+    "var makes the bound fields assignable" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    var Point(x, y) = Point(3, 4)
+          |    x = x + 10
+          |    print(x, y)
+          |
+          |show()""".stripMargin
+      ) shouldBe "13 4\n"
+    }
+
+    // The value is read once, as it is for every other pattern at a binding: two names out of one
+    // struct must not mean two calls.
+    "the value is evaluated exactly once" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |made(n: *int) -> Point =
+          |    *n = *n + 1
+          |    Point(1, 2)
+          |
+          |show() =
+          |    var calls = 0
+          |    val Point(x, y) = made(&calls)
+          |    print(x, y, calls)
+          |
+          |show()""".stripMargin
+      ) shouldBe "1 2 1\n"
+    }
+
+    // Unlike the named form, this one has to account for every field — so a struct that grew one
+    // reports the pattern that stopped covering it instead of binding the same names as before.
+    "a sub-pattern per field, and not fewer" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |    z: int
+          |
+          |show() =
+          |    val Point(x, y) = Point(1, 2, 3)
+          |    print(x)
+          |
+          |show()""".stripMargin
+      ) should include("has 3 fields")
+    }
+
+    "a struct name that is not the value's" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |struct Size
+          |    w: int
+          |    h: int
+          |
+          |show() =
+          |    val Size(w, h) = Point(3, 4)
+          |    print(w)
+          |
+          |show()""".stripMargin
+      ) should include("does not match")
+    }
+  }
+
   "what a struct binding will not accept" - {
     "a field the struct does not have" in {
       err(

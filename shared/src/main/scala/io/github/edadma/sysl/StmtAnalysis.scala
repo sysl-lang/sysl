@@ -442,6 +442,28 @@ trait StmtAnalysis extends TypeResolution {
           err(s"'$name{…}' matches a struct, but the value is ${show(other)}")
           Nil
 
+    // `Name(…)` is a variant pattern or the positional form of a struct pattern, told apart by what
+    // the value's type turns out to be — the same rule an arm applies. Against a struct it is one
+    // shape and belongs here for the reason `Name{…}` does; the positional form additionally names
+    // every field, which is what makes adding one to the struct a checked to-do rather than a
+    // silently shorter binding.
+    case VariantPattern(written, args) if Type.underlying(subject.ty).isInstanceOf[Type.Struct] =>
+      val s = Type.underlying(subject.ty).asInstanceOf[Type.Struct]
+
+      if !typeKey(written).contains(s.base) then
+        err(s"'$written(…)' does not match a ${show(s)} value")
+        Nil
+      else if args.length != s.fields.length then
+        err(s"struct '${qn(s.base)}' has ${quantity(s.fields.length, "field")}, " +
+          s"but ${supplied(args.length, "sub-pattern")}")
+        Nil
+      else
+        checkEveryFieldVisible(s.base, s.fields.map(_._1), "this pattern",
+          "take apart the fields it does offer by name, as 'Name{…}'")
+
+        (for (sub, i) <- args.zipWithIndex
+         yield bindPattern(sub, TField(subject, i, s.fields(i)._2), mutable)).flatten
+
     // Everything `09 §5` admits in an arm and a binding cannot use. Named individually, because the
     // reason differs: a literal or a range is a *test*, and a variant is a choice among several.
     case _: LitPattern | _: RangePattern =>
