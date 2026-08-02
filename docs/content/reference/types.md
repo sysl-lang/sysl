@@ -79,13 +79,41 @@ sixteen. This is LLVM's rule, and it matters anywhere a width is stated rather t
 
 ### Where the width stops
 
-Up to 64 bits everything is a machine instruction. From 65 to 128 the arithmetic is still native but a
-division becomes a runtime call, and decimal rendering becomes the language's own job — C's `printf`
-has no length modifier that wide, so a value past 64 bits renders through a digit loop and is refused
-a `%d`. Past 128 there is neither a division routine nor a renderer, and a wider width is a diagnostic
-naming the limit.
+Up to 64 bits everything is a machine instruction. Past that the arithmetic is still native — the
+back end expands a wide multiply or divide inline, with no runtime routine behind it — and decimal
+rendering becomes the language's own job, since C's `printf` has no length modifier that wide. So a
+value past 64 bits renders through a digit loop and is refused a `%d`.
 
-That ceiling is a statement about the toolchain, not about the design.
+The ceiling is LLVM's own **2²³ − 1**, and a wider width is a diagnostic naming it. That is a
+statement about the toolchain, not about the design.
+
+```sysl
+var wide: u256 = 1
+var i = 0
+
+while i < 200 do
+    wide = wide * 2u256
+    i = i + 1
+
+print(wide)
+```
+
+```output
+1606938044258990275541962092341162602522202993782792835301376
+```
+
+Two costs are worth knowing before reaching for an extreme width, because neither is guarded against:
+the digit buffer is stack space proportional to the width, so a width near the ceiling overflows the
+frame, and sizing it evaluates 2^N at compile time. Nothing reaches either without asking for it by
+name.
+
+### The narrowest widths
+
+`N ≥ 1` has no exception at its low end. `u1` is a single binary digit. `i1` holds `{-1, 0}` — one bit
+of two's complement, where the only bit *is* the sign bit. It is degenerate but entirely consistent,
+and nothing special-cases it: `abs` at `i1` answers `-1` because `-1` is that width's most negative
+value, exactly as `abs` at any width answers its own minimum, and `signum` never returns `+1` because
+no value of the type is positive. If you want a bit, write `u1` or `bool`.
 
 ## Floating point is a closed set
 

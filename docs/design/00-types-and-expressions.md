@@ -332,14 +332,26 @@ Semantics generalize the existing integer rules with no special cases:
 - **Wrapping** is at the declared width: `i5` arithmetic wraps mod `2^5`, matching "integer
   arithmetic wraps at the declared type width" already in force for `i8`…`i64`.
 
-**Where the back end currently stops is 128 bits**, and that is a statement about the toolchain
-rather than about the family. Up to 64 bits everything is a machine instruction; from 65 to 128 the
-arithmetic is still LLVM's own but a division becomes a compiler-rt call, and the decimal rendering
-becomes the language's own job — C's `printf` has no length modifier for an argument that wide, so a
-value past 64 bits renders through the digit loop sysl emits and is refused a `%d` (the diagnostic
-says so and names `str`). Past 128 there is neither a division routine nor a renderer, so a wider
-width is a diagnostic naming the limit. What the *maximum permitted* `N` should be is still open
-below; 128 is where the tools stop, not where the language was decided to.
+**Where the back end stops is LLVM's own `2^23 - 1`**, and that is a statement about the toolchain
+rather than about the family. Up to 64 bits everything is a machine instruction; past that the
+arithmetic is still LLVM's own, and the decimal rendering becomes the language's own job — C's
+`printf` has no length modifier for an argument that wide, so a value past 64 bits renders through
+the digit loop sysl emits and is refused a `%d` (the diagnostic says so and names `str`). What the
+*maximum permitted* `N` should be is still open below; `2^23 - 1` is where the tools stop, not where
+the language was decided to.
+
+**This stopped at 128 for two reasons and neither was true**, which is worth recording because both
+sounded plausible and both were repeated in three places. A wide division was said to need a
+compiler-rt routine: it needs none, and `udiv i256`, `udiv i1024` and `mul i8192` all compile with no
+undefined symbol behind them, the back end expanding them inline. The renderer was said to be written
+once at the widest width: it is generated per width on demand, sized from the width itself. Raising
+the ceiling took the check, one clamp in the emitter that would otherwise have printed a truncated
+value, and the constant-fold's shift distance.
+
+**Two costs are real at the extreme and are accepted rather than guarded.** The renderer's digit
+buffer is a stack `alloca` proportional to the width — about `0.302 × N` bytes — so a width near the
+ceiling overflows the frame; and sizing it evaluates `2^N` as a bignum at compile time. Neither is
+reachable without writing the width out deliberately.
 
 Two consequences worth stating, because both are places a width that is not a whole number of bytes
 could go wrong quietly:
@@ -352,7 +364,15 @@ could go wrong quietly:
   stores into, and nothing downstream can notice.
 - **Equal values must still hash equal.** A value too wide for the 64-bit mixer is mixed in halves
   rather than truncated. Truncating would keep the law and throw away every bit above the 64th, which
-  puts every 128-bit identifier differing only in its high half into one bucket.
+  puts every 128-bit identifier differing only in its high half into one bucket. **Above 128 bits the
+  value *is* truncated to 128 before mixing**, which keeps the law and costs only collision
+  resistance among values agreeing in their low 128 bits — a hash owes equal-implies-equal and
+  nothing more. Mixing in 128-bit chunks is the answer if anything ever keys a table on values that
+  wide.
+- **`N ≥ 1` has no exception at either end.** `u1` is a single binary digit; `i1` holds `{-1, 0}`,
+  the one bit being the sign bit. Degenerate and entirely consistent — `abs` at `i1` answers `-1`
+  because that is the width's most negative value, and `signum` never produces `+1` because the type
+  has no positive value to produce it for. Nothing special-cases it.
 
 Several details that arbitrary width raises are not yet settled — see below.
 

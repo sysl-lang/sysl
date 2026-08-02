@@ -44,7 +44,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/tour/capstone.md"                   -> (1, 0, 1),
     "docs/content/reference/_index.md"                -> (0, 0, 0),
     "docs/content/reference/lexical.md"               -> (6, 0, 0),
-    "docs/content/reference/types.md"                 -> (8, 0, 0),
+    "docs/content/reference/types.md"                 -> (9, 0, 0),
     "docs/content/reference/expressions.md"           -> (16, 3, 0),
     "docs/content/reference/statements.md"            -> (13, 1, 1),
     "docs/content/reference/declarations.md"          -> (13, 2, 0),

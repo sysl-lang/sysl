@@ -22,8 +22,77 @@ class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run("var a: u128 = 7\nvar b: u96 = 8\nvar c: i65 = 9\nprint(a, b, c)") shouldBe "7 8 9\n"
     }
 
-    "a width the back end will not lower is still a diagnostic, and names the limit" in {
-      err("var x: i129 = 1") should include("128")
+    // Past 128 is now ordinary. What made 128 the ceiling was two claims about the toolchain, and
+    // neither held: a wide division needs no compiler-rt routine (the back end expands it inline),
+    // and the decimal renderer is generated per width rather than written once.
+    "a width past the old 128-bit ceiling is an ordinary type" in {
+      run("var a: u256 = 7\nvar b: i256 = -9\nvar c: u512 = 11\nprint(a, b, c)") shouldBe "7 -9 11\n"
+    }
+
+    // The value that proves the renderer is generated at the value's own width rather than clamped
+    // to 128: every digit here lives above the 128th bit, so a clamped renderer prints zero.
+    "a value living entirely above 128 bits prints its real digits" in {
+      run(
+        """var x: u256 = 1
+          |var i = 0
+          |
+          |while i < 200 do
+          |    x = x * 2u256
+          |    i = i + 1
+          |
+          |print(x)""".stripMargin
+      ) shouldBe s"${BigInt(2).pow(200)}\n"
+    }
+
+    "arithmetic above 128 bits carries, rather than wrapping at 128" in {
+      run(
+        s"""var a: u256 = ${BigInt(2).pow(128)}
+           |var b: u256 = ${BigInt(2).pow(128)}
+           |print(a + b)""".stripMargin
+      ) shouldBe s"${BigInt(2).pow(129)}\n"
+    }
+
+    "the ceiling is the back end's own, and the diagnostic names it" in {
+      err("var x: i8388608 = 1") should include("8388607")
+    }
+  }
+
+  /** `N ≥ 1` has no exception at its low end either, and `i1` is the degenerate case worth pinning:
+   * one bit of two's complement is the sign bit, so the type holds `{-1, 0}`.
+   *
+   * Nothing about it is special-cased, which is the assertion — `abs` answers `-1` because `-1` is
+   * this width's most negative value, exactly as `abs` at every width answers its own minimum, and
+   * `signum` never has to produce `+1` because no value of the type is positive.
+   */
+  "the narrowest widths" - {
+    "u1 is a single binary digit" in {
+      run("var a: u1 = 1\nvar b: u1 = 0\nprint(a, b, a + a)") shouldBe "1 0 0\n"
+    }
+
+    "i1 holds minus one and zero, the sign bit being the only bit" in {
+      run("var a: i1 = 0\nvar b: i1 = -1\nprint(a, b, a + b, b + b)") shouldBe "0 -1 -1 0\n"
+    }
+
+    "i1's abs and signum follow the general rule with no carve-out" in {
+      run(
+        """import sysl.math.*
+          |
+          |var a: i1 = 0
+          |var b: i1 = -1
+          |
+          |print(b.abs(), b.signum(), a.signum())""".stripMargin
+      ) shouldBe "-1 -1 0\n"
+    }
+
+    "and the bit surface counts against a width of one" in {
+      run(
+        """import sysl.math.*
+          |
+          |var a: i1 = -1
+          |var b: u1 = 0
+          |
+          |print(a.count_ones(), b.count_zeros(), a.leading_zeros())""".stripMargin
+      ) shouldBe "1 1 0\n"
     }
   }
 

@@ -374,9 +374,14 @@ public, which is what lets a `Hash` written for a struct mix its own fields:
 | mixer | for | what it is |
 |---|---|---|
 | `hash_u64` | every integer up to 64 bits | splitmix64's finalizer |
-| `hash_u128` | `i128`, `u128` | the two halves mixed separately, then combined |
+| `hash_u128` | every integer above 64 bits | the two halves mixed separately, then combined |
 | `hash_bool` | `bool` | `hash_u64` of 1 or 0 |
 | `hash_str` | `string` | FNV-1a over the bytes |
+
+**A value wider than 128 bits is truncated to 128 before it reaches `hash_u128`.** That keeps the law
+a hash owes — equal values hash equal — and gives up only collision resistance among values that
+agree in their low 128 bits. If something ever keys a table on values that wide, mixing in 128-bit
+chunks is the fix.
 
 **`hash_u64` is a finalizer and not the identity for a reason.** Consecutive integers are the input a
 hash table actually meets — loop counters, row ids, sizes — and an identity hash makes them collide

@@ -255,8 +255,16 @@ trait ConstFolding extends ImportResolution {
         case _    => None
     case _ => None
 
+  /** A constant shift distance, as a number the fold can actually shift by.
+   *
+   * The ceiling is the widest integer the back end lowers rather than 64, because a shift past 64
+   * is meaningful the moment a type is wider than that: `1 << 200` is an ordinary constant at
+   * `u256`, and refusing it here would have made the fold narrower than the types it folds for. A
+   * distance beyond every possible width is still refused — it cannot be a shift of anything, and
+   * the `BigInt` it would produce is unbounded.
+   */
   private def shiftBy(n: BigInt): Int =
-    if n < 0 || n > 64 then err(s"a constant shifted by $n places") else n.toInt
+    if n < 0 || n > Type.MaxIntegerBits then err(s"a constant shifted by $n places") else n.toInt
 
   private def compare(op: String, sign: Int): Option[Expr] = op match
     case "==" => Some(BoolLit(sign == 0))

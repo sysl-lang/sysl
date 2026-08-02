@@ -265,10 +265,19 @@ object StringEmitter {
    * large unsigned value that happens to have its top bit set.
    *
    * It is written once for every width because C's own formatting stops before the widest sysl
-   * integer does: `printf` has no length modifier for a 128-bit argument, so a value that needs one
-   * has to be rendered by the language rather than borrowed from libc. Divide and remainder at 128
-   * bits become compiler-rt calls, which is the whole cost of the width and is paid by the
-   * arithmetic in the program besides.
+   * integer does: `printf` has no length modifier past `long long`, so a value wider than that has
+   * to be rendered by the language rather than borrowed from libc.
+   *
+   * **The wide division this loop runs is expanded by the back end, not called out to.** An earlier
+   * note here said divide and remainder became compiler-rt calls; they do not — `udiv i256`,
+   * `udiv i1024` and `mul i8192` all compile with no undefined symbol behind them.
+   *
+   * **The buffer is the width's real cost, and it is a stack `alloca`.** `digitCapacity` grows with
+   * the number of decimal digits the width can produce — about `bits * 0.302` of them — so a
+   * renderer near `Type.MaxIntegerBits` allocates megabytes of stack in one frame and will overflow
+   * it. Nothing reaches that by accident, and a program printing an integer that wide has stranger
+   * problems than this one, so the size is left as the honest consequence of the width rather than
+   * being capped into a wrong answer.
    */
   def int(bits: Int): String = {
     val ty  = s"i$bits"

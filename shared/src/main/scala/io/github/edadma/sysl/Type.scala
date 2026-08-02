@@ -21,6 +21,14 @@ object Type {
    */
   val pointerBits: Int = 64
 
+  /** The widest integer the back end lowers, which is LLVM's own `iN` maximum.
+   *
+   * It is the back end's number rather than one this language chose: LLVM expands arithmetic at any
+   * width up to it, division included and with no runtime routine behind it. What a *program*
+   * should want is a separate question, and a narrower one.
+   */
+  val MaxIntegerBits: Int = (1 << 23) - 1
+
   /** An integer type of any width. Arithmetic wraps at `bits` and never promotes, so the
    * width is part of the type rather than a property of the operation.
    *

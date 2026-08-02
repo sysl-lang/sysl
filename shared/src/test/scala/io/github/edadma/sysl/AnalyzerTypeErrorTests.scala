@@ -37,9 +37,18 @@ class AnalyzerTypeErrorTests extends AnyFreeSpec with CodegenSupport {
     // `i128` is lowered — see `WideIntegerTests` — so what is left here is the integer width past
     // where the back end stops and the float width the chapters promise and this compiler has not
     // built. The two say different things, and neither should read like the other.
+    //
+    // The integer ceiling is LLVM's own `2^23 - 1`, so what is refused is a width past *that*, not
+    // the 128 this once stopped at.
     "an unsupported width is named as such" in {
-      err("var x: i129 = 1") should include("wider than the 128 bits")
+      err("var x: i8388608 = 1") should include("wider than the 8388607 bits")
       err("var x: f128 = 1.0") should include("'f128' is not lowered yet")
+    }
+
+    // A width so large it is not a number the compiler can hold at all, which is a different
+    // complaint from one it can hold and will not lower.
+    "a width beyond counting is its own complaint" in {
+      err("var x: i99999999999999999999 = 1") should include("far wider than anything can hold")
     }
 
     "char has no arithmetic" in {

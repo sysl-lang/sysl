@@ -44,11 +44,25 @@ trait GenericInstantiation extends ConstFolding {
    * so it is recognised by shape rather than listed; a width the back end cannot lower is a
    * diagnostic, not an unknown name.
    *
-   * The integer limit is 128 rather than LLVM's own `2^23 - 1` because 128 is where the *rest* of
-   * the toolchain stops agreeing: a division at a wider width has no compiler-rt routine behind it,
-   * and the decimal rendering is written once at the widest width there is. It is a statement about
-   * what the back end lowers, not about what `00 §5` permits — the maximum the language allows is
-   * still that chapter's open question.
+   * **The integer limit is LLVM's own, `2^23 - 1`**, because the two reasons this once stopped at
+   * 128 were both checked and neither survived:
+   *
+   *   - *"a division at a wider width has no compiler-rt routine behind it"* — it needs none.
+   *     `udiv i256`, `udiv i1024` and `mul i8192` all compile with **no undefined symbols at all**;
+   *     the back end expands a wide division inline rather than calling out to one.
+   *   - *"the decimal rendering is written once at the widest width there is"* — it is written
+   *     **per width**, on demand: `ScalarEmitter` asks `StringEmitter.intName(bits)` for a renderer
+   *     and gets one generated at that width, with its buffer sized from the width itself.
+   *
+   * So the ceiling is the back end's and nothing else's. It is still not a statement about what
+   * `00 §5` permits — the maximum the *language* allows is that chapter's open question, and a
+   * width this large is a thing the machine can hold rather than a thing a program should want.
+   *
+   * **Two known costs at the extreme, accepted deliberately rather than guarded against.** A width
+   * near the ceiling makes `digitCapacity` evaluate `2^bits` as a `BigInt` and take its decimal
+   * length — millions of digits, at compile time, once per width a program actually renders. And a
+   * value that wide is a megabyte travelling by value. Neither is reachable by accident: nothing
+   * writes `i8388607` without meaning to.
    */
   protected def widthType(name: String): Option[Type] = {
     val digits = name.drop(1)
@@ -62,8 +76,9 @@ trait GenericInstantiation extends ConstFolding {
         if bits == 16 || bits == 32 || bits == 64 then Some(Type.Floating(bits))
         else if bits == 128 then err("'f128' is not lowered yet — the widest float is 'f64'")
         else err(s"'$name' is not an IEEE floating-point width; they are f16, f32, and f64")
-      else if bits >= 1 && bits <= 128 then Some(Type.Integer(bits, signed = name.head == 'i'))
-      else err(s"'$name' is wider than the 128 bits the back end lowers")
+      else if bits >= 1 && bits <= Type.MaxIntegerBits then
+        Some(Type.Integer(bits, signed = name.head == 'i'))
+      else err(s"'$name' is wider than the ${Type.MaxIntegerBits} bits the back end lowers")
   }
 
   protected def plain(name: String, targs: List[Type], ty: Type): Type =

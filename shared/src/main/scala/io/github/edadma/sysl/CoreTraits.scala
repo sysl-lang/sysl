@@ -234,6 +234,13 @@ object CoreTraits {
     // equal values would still hash equal — and throw away every bit above the 64th, so a table keyed
     // on values that differ only in their high half would put all of them in one bucket. That is the
     // shape of a 128-bit identifier, which is the reason to have the width at all.
+    //
+    // **Past 128 bits this does truncate, and that is a choice rather than an oversight.** Widths
+    // now run to `Type.MaxIntegerBits`, so an `i256` reaching here is cast down to `u128` and its
+    // top half is dropped. The hash *law* is untouched — equal values still hash equal, which is all
+    // a hash owes — and what is lost is only collision resistance among values agreeing in their low
+    // 128 bits. Mixing every width in 128-bit chunks is the answer whenever something is keying a
+    // table on values that wide; nothing is, so the mixer that exists is the one that runs.
     case i: Type.Integer if i.bits > 64 => Some(("hash_u128", Type.Integer(128, signed = false)))
     case _: Type.Integer | Type.Char => Some(("hash_u64", Type.Integer(64, signed = false)))
     // A `bool` is one bit, and one bit does not widen to a number in this language — the same

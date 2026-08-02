@@ -22,7 +22,7 @@ are for aarch64 (LP64, little-endian, 64-bit pointers).
 | `u16` | `ushort` | 2 | unsigned 16-bit |
 | `u32` | `uint` | 4 | unsigned 32-bit |
 | `u64` | `ulong` | 8 | unsigned 64-bit |
-| `iN` / `uN` | — | see below | arbitrary width, any `N ≥ 1` (`i5`, `u12`, `i128`, …); the back end lowers up to 128 |
+| `iN` / `uN` | — | see below | arbitrary width, any `N ≥ 1` (`i5`, `u12`, `i128`, …); the back end lowers up to `2^23 - 1` |
 | `isize` | — | 8 (pointer width) | signed pointer-width; **distinct type**, not an alias |
 | `usize` | — | 8 (pointer width) | unsigned pointer-width; **distinct type**, not an alias |
 
@@ -30,6 +30,11 @@ are for aarch64 (LP64, little-endian, 64-bit pointers).
 - `iN` / `uN` is an open family (`00` §5); the fixed-width aliases are common-width names over
   it. On the LP64 ABI each alias matches its C namesake's width; `isize` / `usize` match
   `size_t` / `ptrdiff_t` on *every* target.
+- **`N ≥ 1` has no exception at `N = 1`.** `u1` holds `{0, 1}` and `i1` holds `{-1, 0}`, the single
+  bit being the sign bit — degenerate, entirely consistent, and special-cased nowhere. `abs` at `i1`
+  answers `-1` because `-1` *is* that width's most negative value, and `signum` never has to produce
+  `+1` because no value of the type is positive. A program that wants a bit wants `u1` or `bool`;
+  the family is not narrowed to say so.
 - **A width is stored the way the target stores it**, which for a width that is not a whole number of
   bytes is not `⌈N/8⌉`: the alignment rounds up to that of the smallest width the data layout names,
   and the stride rounds up to that alignment. So `u8`→1, `u12`→2 aligned 2, `u20`→4 aligned 4,

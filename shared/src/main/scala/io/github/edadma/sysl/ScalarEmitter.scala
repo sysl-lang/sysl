@@ -278,13 +278,19 @@ trait ScalarEmitter extends StringEmitter {
       emit(s"$r = call ${Type.Str.llvm} @$fn(i32 $cp)")
       r
 
-    // Rendered at whichever of the two widths holds the value: everything up to 64 bits goes
-    // through the renderer every program has always used, and only a value that cannot fit there
-    // pulls in the 128-bit one and the compiler-rt division behind it.
+    // Rendered at a width that holds the value, which for anything past 64 bits is **the value's
+    // own**. Up to 64 it goes through the renderer every program has always used — one instance,
+    // shared, and the overwhelmingly common case.
+    //
+    // **Beyond that the width may not be clamped**, which is what this did while 128 was the
+    // ceiling and every wider value was unreachable. Rendering an `i256` through a 128-bit renderer
+    // would not be a lossy answer, it would be the wrong number: the conversion below narrows first
+    // and the digits printed are of the truncated value. A renderer is generated per width instead,
+    // and `StringEmitter.intName` gives each its own symbol.
     case i: Type.Integer =>
       heap = true
       request("sysl.str.from_bytes")(StringEmitter.fromBytes)
-      val bits   = if i.bits > 64 then 128 else 64
+      val bits   = if i.bits > 64 then i.bits else 64
       val fn     = request(StringEmitter.intName(bits))(StringEmitter.int(bits))
       val wide   = convert(i, Type.Integer(bits, i.signed), genExpr(arg))
       val signed = if i.signed then "1" else "0"
