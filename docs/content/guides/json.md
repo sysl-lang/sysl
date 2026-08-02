@@ -61,10 +61,10 @@ recursive renderers.
 
 ## Worth noticing
 
-The depth limit is a `const`, and it is a `const` rather than a `val` because it is an **array
-bound** — the case that motivated adding the form at all. That is the difference between the two
-spelled out in [declarations](/reference/declarations/): a `const` has no storage and no address, and
-being usable where a constant is demanded is exactly what it buys.
+The depth limit is `private const max_depth: int = 64`, and the finding above is why it can be. What
+a nullary function could never be is an **array bound**, which is the case that motivated the form:
+as [declarations](/reference/declarations/) puts it, a `const` is folded into every use and has no
+address, and being usable where a constant is *demanded* is exactly what that buys.
 
 ---
 

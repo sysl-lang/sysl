@@ -167,9 +167,10 @@ You have seen the whole language. What is left is depth:
   [modules](/tour/modules/) named, one page each, down to what a `no alloc` program may reach.
 - **The design chapters** in `docs/design/` are the specification — every rule in this tour is stated
   there with the argument for it, including the alternatives that were rejected and why.
-- **The `guide/` programs** in the repository are complete, working programs at the size where the
-  choices start to matter: a JSON parser, a scheduler, a SHA-2 implementation, a slab allocator, a
-  ring buffer, a datetime library.
+- **The [guide programs](/guides/)** are thirteen complete programs at the size where the choices
+  start to matter — a JSON parser, a scheduler, SHA-2, a slab allocator, a ring buffer, a datetime
+  library — each written to force a language decision rather than to demonstrate a finished one. The
+  pages say what each found, which is most of the reason the language is shaped the way it is.
 - **The standard library's own source** is the best worked example there is. `Buf`, `StrBuilder` and
   the `Reader` above are ordinary sysl over the same features this tour covered — there is no
   privileged layer underneath them.
