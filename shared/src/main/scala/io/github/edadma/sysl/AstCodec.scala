@@ -487,7 +487,12 @@ object AstCodec {
         val body  = strings(parts(1).toInt)
         val dir   = if parts(2) == "1" then Some(parts.drop(4).toList.map(x => strings(x.toInt))) else None
 
-        sources(k) = known.getOrElse(name, new Source(name, body, dir))
+        // What was stored is the text the *positions* were recorded against, which for a literate
+        // file is its program with the left margin already gone (`Literate`). The margin is how far
+        // a reported column has to move to name the file again, and it is read back off the name for
+        // the same reason it is read off the name anywhere else — nothing inside the text says.
+        sources(k) =
+          known.getOrElse(name, new Source(name, body, dir, if Literate.named(name) then Literate.Indent else 0))
 
       val count = line().toIntOption.getOrElse(fail("the program count is not a number"))
       val b     = List.newBuilder[Program]

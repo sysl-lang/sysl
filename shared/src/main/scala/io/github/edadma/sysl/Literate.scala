@@ -37,6 +37,11 @@ package io.github.edadma.sysl
  * fenced. The two are never the same block, which is what lets a chapter show a wrong version beside
  * the right one.
  *
+ * **What is under a bullet is prose.** An indented block inside a list item is part of that item —
+ * the example the bullet is about — and the program is the blocks at the **top level** only. A list
+ * runs until prose comes back to the margin, which a following paragraph or heading already does, so
+ * an executable block never sits directly under a list without a line of prose between them.
+ *
  * **A tab is refused.** The indent is measured in columns, and a tab has no width until something
  * decides what a tab stop is — so a file that mixes them means one thing to the compiler and another
  * in the reader's editor. Refusing is the only answer that cannot be quietly wrong.
@@ -81,6 +86,7 @@ object Literate {
       val lines = source.lines
       val out   = lines.toArray
       var fence = Option.empty[(String, Int)]
+      var list  = -1
       var i     = 0
 
       while (i < lines.length) {
@@ -108,11 +114,26 @@ object Literate {
                 "a tab in the indentation of a literate file — what makes a line program text is " +
                   "four columns of indent, and a tab is as wide as whatever happens to be " +
                   "displaying it, so this line is code in one editor and prose in another"))
-            else if opensFence(bare) && margin.length < Indent then
-              out(i) = ""
-              fence = Some((bare.takeWhile(_ == bare.head), i + 1))
-            else if margin.length >= Indent then out(i) = text.drop(Indent)
-            else out(i) = ""
+            else {
+              // An open list item ends at the first line with content that is no further in than the
+              // marker was. A blank line does not end one — a list may be written with air between
+              // its items — so what closes a list is prose returning to the margin, which is what a
+              // paragraph or a heading after a list already is.
+              if list >= 0 && bare.nonEmpty && margin.length <= list then list = -1
+
+              if list >= 0 then out(i) = ""
+              else if opensFence(bare) && margin.length < Indent then
+                out(i) = ""
+                fence = Some((bare.takeWhile(_ == bare.head), i + 1))
+              else if margin.length >= Indent then out(i) = text.drop(Indent)
+              else {
+                // Only asked where the line is too shallow to be program text, which is why a `-` or
+                // a `*` opening a sysl line can never be read as a bullet: at four columns in, the
+                // line was code before this was consulted.
+                if marker(bare) then list = margin.length
+                out(i) = ""
+              }
+            }
         }
 
         i += 1
@@ -133,6 +154,19 @@ object Literate {
 
   private def opensFence(bare: String): Boolean =
     bare.startsWith("```") || bare.startsWith("~~~")
+
+  /** Whether a line begins a list item: a bullet, or a number and its punctuation, followed by a
+   * space. What follows one is prose however far it is indented, so this is the question that keeps
+   * an example written under a bullet out of the program.
+   */
+  private def marker(bare: String): Boolean = {
+    val bullet  = bare.length > 1 && "-*+".contains(bare.head) && bare(1) == ' '
+    val digits  = bare.takeWhile(_.isDigit)
+    val ordered = digits.nonEmpty && bare.length > digits.length + 1 &&
+      ".)".contains(bare(digits.length)) && bare(digits.length + 1) == ' '
+
+    bullet || ordered
+  }
 
   /** Whether a line closes the fence `open` opened: the same character, at least as many of them,
    * and nothing else on the line. Trailing spaces are allowed, since they are invisible and a file

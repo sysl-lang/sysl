@@ -80,6 +80,55 @@ class LiterateTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  "what is under a bullet is prose" - {
+    "an indented block inside a list item is the example the bullet is about" in {
+      // It would not compile if it were compiled, which is the discriminating part: a test whose
+      // list held valid sysl would pass whether or not the rule existed.
+      runOf("bullets.lsysl" ->
+        """Two things worth knowing
+          |
+          |- The first, whose example is written out here:
+          |
+          |      this is not sysl at all
+          |
+          |- The second.
+          |
+          |Which is the end of the list, and this is the program.
+          |
+          |    print(5)
+          |""".stripMargin) shouldBe "5\n"
+    }
+
+    "an ordered list does the same" in {
+      runOf("ordered.lsysl" ->
+        """Steps
+          |
+          |1. First, which is illustrated by
+          |
+          |       nonsense goes here
+          |
+          |2. Second.
+          |
+          |Then the program.
+          |
+          |    print(6)
+          |""".stripMargin) shouldBe "6\n"
+    }
+
+    "a bullet opens nothing when it is already inside program text" in {
+      // At four columns in, the line was code before anything asked whether it looked like a bullet —
+      // so a sysl line starting with `-` or `*` cannot be mistaken for one.
+      runOf("minus.lsysl" ->
+        """Arithmetic across a line break
+          |
+          |    var n = (10
+          |        - 4)
+          |
+          |    print(n)
+          |""".stripMargin) shouldBe "6\n"
+    }
+  }
+
   "a fence that is never closed is refused" - {
     "because everything below it would be silently not compiled" in {
       // Markdown would let it run to the end of the document, which for a document is harmless. Here

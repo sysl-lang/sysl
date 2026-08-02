@@ -59,10 +59,17 @@ The rest of the set, and the coverage map that justifies each entry, is recorded
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is
 a variation, and belongs in the test suite instead.
 
+**`slab` is written as a literate file** (`15 §11`), and it is the one program here that is. Its
+findings ran to sixty lines of header comment before anything executable appeared, which is the
+length at which a comment stops being one — so `slab.lsysl` is a document with the program indented
+inside it, and the essay that was fighting the `//` is prose. Nothing about the program changed; the
+directory holds a `.lsysl` beside `.sysl` files and `Project.collect` reads both.
+
 ## What each program found
 
-Findings go in the program's own header comment, where the code that provoked them is. They are the
-output of the exercise; the program passing is only the evidence that the finding is real.
+Findings go in the program's own header comment, where the code that provoked them is — or in its
+prose, where the program is literate. They are the output of the exercise; the program passing is
+only the evidence that the finding is real.
 
 **A finding must be discharged before the next program is written.** Every language or compiler
 issue one of these raises is either fixed, or investigated and decided — and "deferred, for this
