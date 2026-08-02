@@ -1354,4 +1354,4 @@ slice it was given — neither of which is expressible if ownership stops at the
 
 ---
 
-Next: [traits](/reference/traits/).
+Next: [arrays and slices](/reference/arrays/) — the two sequence types, and what a view keeps alive.
