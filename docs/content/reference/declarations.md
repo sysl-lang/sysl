@@ -427,7 +427,7 @@ See [errors and contracts](/reference/errors/) for what a bound costs and when i
 ## Traits, impls, and externs
 
 `trait Name` declares a set of requirements; `impl Trait for Type` supplies them. Both are covered on
-[generics and traits](/reference/generics/).
+[traits](/reference/traits/).
 
 `extern` declares a function or a variable the other side of the link owns, and is covered on
 [the foreign interface](/reference/ffi/).

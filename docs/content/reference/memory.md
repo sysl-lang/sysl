@@ -1354,4 +1354,4 @@ slice it was given — neither of which is expressible if ownership stops at the
 
 ---
 
-Next: [generics and traits](/reference/generics/).
+Next: [traits](/reference/traits/).
