@@ -103,6 +103,39 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
     (status, captured.toString)
   }
 
+  /** A driver run with the program's own output captured — `run` prints what the child wrote, so
+   * this is what lets a test assert the answer a library computed rather than only that the link
+   * held.
+   *
+   * Both streams are captured and **both are quoted when the run fails**, because the two ways it
+   * fails are invisible in different places: a compilation that was refused says so on stderr and
+   * prints nothing, while a program that ran and panicked says so on stdout and exits non-zero. A
+   * bare status assertion would report neither, and the failure a library test is most likely to
+   * produce is exactly one of those two.
+   */
+  protected def ran(cfg: Config): String = {
+    val out    = new java.io.ByteArrayOutputStream
+    val notes  = new java.io.ByteArrayOutputStream
+    val status = Console.withOut(out)(Console.withErr(notes)(cli(cfg)))
+
+    if status != 0 then fail(s"the driver exited with $status:\n${out.toString}${notes.toString}")
+
+    out.toString
+  }
+
+  /** A library tree on disk carrying C source beside its sysl (`15 §7`), which is what a binding to
+   * a real library is: the module in a directory under the root, and the shims beside it.
+   */
+  protected def rootWithC(module: String, sysl: String, cFiles: (String, String)*): String = {
+    val root = createTempDirectory("sysl-cli-clib-")
+    val dir  = s"$root/$module"
+
+    createDirectory(dir)
+    writeFile(s"$dir/lib.sysl", sysl)
+    cFiles.foreach((name, text) => writeFile(s"$dir/$name", text))
+    root
+  }
+
   /** A driver run with its emitted module captured. `emit-llvm` prints, so this is what lets a test
    * see *which* standard module a compilation was given rather than only that it succeeded: the
    * library arriving prebuilt is a declaration where the built-in copy is a definition.

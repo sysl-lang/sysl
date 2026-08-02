@@ -111,26 +111,6 @@ class LibraryBuildCliTests extends LibraryCliSupport {
         |seven_times(n: int) -> int = c_seven() * n
         |""".stripMargin
 
-    def rootWithC(module: String, sysl: String, cFiles: (String, String)*): String = {
-      val root = createTempDirectory("sysl-cli-clib-")
-      val dir  = s"$root/$module"
-
-      createDirectory(dir)
-      writeFile(s"$dir/lib.sysl", sysl)
-      cFiles.foreach((name, text) => writeFile(s"$dir/$name", text))
-      root
-    }
-
-    /** A driver run with the program's own output captured — `run` prints what the child wrote, so
-     * this is what lets a test assert the answer C computed rather than only that the link held.
-     */
-    def ran(cfg: Config): String = {
-      val captured = new java.io.ByteArrayOutputStream
-
-      Console.withOut(captured)(cli(cfg)) shouldBe 0
-      captured.toString
-    }
-
     def fingerprintOf(out: String): String =
       LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _, Target.default)) match
         case Right((_, _, fingerprint)) => fingerprint

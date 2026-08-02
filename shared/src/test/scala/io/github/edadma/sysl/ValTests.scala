@@ -89,6 +89,30 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       run("val k: [n]int = [4; n]\nconst n: usize = 3\nprint(str(k.len))\nprint(str(k[2]))") shouldBe "3\n4\n"
     }
 
+    // The other half of order-freedom, and the sharp one: where the initializer *does* have to run,
+    // it runs with the module's other initializers and not in the place it was written. So a `val`
+    // sitting between two statements of a script is **not** evaluated between them — it is already
+    // bound by the time the first of them runs.
+    //
+    // Written down because the shape it bites is an ordinary one: a script that opens a resource in
+    // a `val`, sets it up with a statement, and binds something derived from it in a second `val`.
+    // The second `val` runs before the setup and fails, with nothing in the source suggesting an
+    // order was involved. A sequence that has to be a sequence belongs in a function.
+    "runs its initializer ahead of the script, wherever it was written" in {
+      run(
+        """print("script")
+          |
+          |val n: int = noisy()
+          |
+          |print(str(n))
+          |
+          |noisy() -> int
+          |    print("initializer")
+          |    7
+          |end noisy""".stripMargin,
+      ) shouldBe "initializer\nscript\n7\n"
+    }
+
     "is reached from another module, fully qualified" in {
       runIn(
         ("tables", "t.sysl", "module tables\nval k: [2]int = [5, 6]"),
