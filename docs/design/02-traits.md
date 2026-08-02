@@ -150,11 +150,15 @@ would have broken every `impl` — and the library now uses a default itself, fo
 which `Writer` and `Reader` both require (most sinks and most sources cannot fail, and one that cannot
 should not have to say so).
 
-**That the latch is one trait rather than two defaults is what the coherence rule above forced.** It
-was written twice, once on each of the two traits, until the first type that was both a source and a
-sink — an open file — could not exist: a trait's members become the implementing type's, so two
-`failed` declarations are two members of one name. Sharing one required trait is the fix, and it is
-the diamond the rule below says needs no rule of its own. What it costs is one line per
+**That the latch is one trait rather than two defaults is the first thing a two-way stream asked
+for.** It was written twice, once on each of the two traits, until an open file had to be both a
+source and a sink at once. Two traits may each declare a member of one name for one type — that is
+settled below, and a call says which by naming the trait — so what the library ran into was not a
+refusal but something worse to live with: `failed()` takes no arguments, and a program that reads and
+writes a file has *both* traits in scope by definition, so neither the arguments nor the scope can
+say which was meant and the call is refused at the use rather than at the declaration. **Permitted is
+not the same as answerable.** One required trait makes the question disappear instead of moving it,
+and it is the diamond the rule below says needs no rule of its own. What it costs is one line per
 implementation, `impl Fallible for MySink` with no block, which is the opt-in this section is about.
 
 **A default may assume of its receiver exactly what its own trait declares.** That is not a

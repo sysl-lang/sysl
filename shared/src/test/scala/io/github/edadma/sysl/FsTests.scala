@@ -17,8 +17,13 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   /** `sysl.fs` is a module of its own, so a program that touches a file says so. Written once and
    * prepended, since what each program below is about is the file and not the import.
+   *
+   * `Reader` is named as well as `lines`, because `read` is the trait's member and a trait's members
+   * are reachable where the trait is (`13 §2`) — a program reading a file by the byte has to be able
+   * to write down what makes it readable.
    */
-  private val importing = "import sysl.fs.*\nimport sysl.io.lines\nimport sysl.text.from_utf8\n\n"
+  private val importing =
+    "import sysl.fs.*\nimport sysl.io.{lines, Reader}\nimport sysl.text.from_utf8\n\n"
 
   /** A program run with a directory of its own. It is not removed afterwards: the harness's
    * temporary directories are the operating system's to reclaim, and a test that failed is worth
@@ -698,9 +703,7 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
      * the latch was shared this program could not be written at all. */
     "a type may be a Reader and a Writer at once, and carries one 'failed' between them" in {
       inDir(
-        """import sysl.io.Reader
-          |
-          |struct Both
+        """struct Both
           |    n: usize
           |    over: bool
           |end Both
@@ -726,6 +729,35 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |    display_str("cd", w, FormatSpec(0, -1, false))
           |    print(b.n, b.failed(), w.failed(), r.failed())""".stripMargin,
       ) shouldBe "2 false false false\n4 true true true\n"
+    }
+
+    /* And the reason it is one trait rather than two members of one name, now that `02 §` permits
+     * the latter: two nullary members differ in no argument a call could write, and a program that
+     * uses a file has both traits in scope by definition, so scope cannot tell them apart either.
+     * Permitted is not the same as answerable. */
+    "two unrelated traits may each declare 'failed', and then a call cannot say which was meant" in {
+      val e = err(
+        """trait Src
+          |    failed(*self) -> bool = false
+          |
+          |trait Snk
+          |    failed(*self) -> bool = false
+          |
+          |struct Two
+          |    n: int
+          |end Two
+          |
+          |impl Src for Two
+          |
+          |impl Snk for Two
+          |
+          |var t = Two(0)
+          |print(t.failed())
+          |""".stripMargin,
+      )
+
+      e should include("'failed' on Two comes from Src and Snk, and each is in scope here")
+      e should include("nothing in the call says which was meant")
     }
 
     /* `02 §` — a trait whose every method has a default leaves nothing to write, so the block is
