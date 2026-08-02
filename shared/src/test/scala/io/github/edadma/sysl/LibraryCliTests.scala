@@ -420,4 +420,105 @@ class LibraryCliTests extends LibraryCliSupport {
         .should(not be 0)
     }
   }
+
+  /** What an artifact may advertise is what a linker can resolve, and a `private` declaration is not
+   * that: its symbol is emitted `internal` (`13 §2`), which says every caller is inside the module
+   * that defines it.
+   *
+   * A library used to advertise one anyway — the precompiled half was every function of the
+   * library's own modules, read off the key — and the program that reached it did the reasonable
+   * thing with what it was told: declared the symbol, called it, and found nothing at the link.
+   * The trait default is how a program comes to reach one at all, since the hoisted copy is
+   * materialized in the program and its body names whatever the default named.
+   *
+   * Left out of the advertisement, the program compiles a copy of its own from the tree the artifact
+   * carries — the same answer a generic gets, and `internal` is exactly the licence to have two.
+   *
+   * Found while writing `sysl.text`'s `Search` trait, whose cutset trims called a private membership
+   * helper.
+   */
+  "a private helper reached only from a trait default" - {
+
+    val withDefault =
+      """module demo
+        |
+        |trait Widen
+        |    base(self) -> int
+        |
+        |    scaled(self) -> int = tripled(self.base())
+        |
+        |impl Widen for int
+        |    base(self) -> int = self
+        |
+        |private tripled(n: int) -> int = n * 3
+        |""".stripMargin
+
+    "survives into the artifact, so a program instantiating the default links" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = artifactOf(rootOf("demo", withDefault))
+      val prog = program("import demo.*\n\nvar x = 7\nprint(x.scaled())")
+
+      cli(Config(command = "run", file = prog, libs = List(lib))) shouldBe 0
+    }
+
+    // The neighbouring determinism, which is the weaker half of `CoreArtifactTests`' "one library
+    // built two ways": the same files read the same way twice say the same thing. What that one adds
+    // is the case only the core can pose — the same files arriving as the `Source` objects the
+    // compiler embeds rather than as a second read of them.
+    "and the same library built twice from disk agrees with itself" in {
+      val root = rootOf("demo", withDefault.replace("private tripled", "tripled"))
+
+      def symbols(): Set[String] =
+        LibraryArtifact.build(Project.collect(root), Target.default, LibraryArtifact.core) match
+          case Right((_, meta)) =>
+            LibraryArtifact.read("twice.syslib", meta, Target.default) match
+              case Right((_, syms, _)) => syms
+              case Left(err)           => fail(err)
+          case Left(err) => fail(err)
+
+      val first  = symbols()
+      val second = symbols()
+
+      second shouldBe first
+    }
+
+    // The same library with the helper public links too, which is what says the fault was the
+    // linkage and not the trait default on its own.
+    "and does so when the helper is public" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = artifactOf(rootOf("demo", withDefault.replace("private tripled", "tripled")))
+      val prog = program("import demo.*\n\nvar x = 7\nprint(x.scaled())")
+
+      cli(Config(command = "run", file = prog, libs = List(lib))) shouldBe 0
+    }
+
+    // The other direction through the same seam: the library calls its *own* default, and the
+    // program only calls the function that does. A member of a builtin type is keyed under the type,
+    // which has no module — so nothing about the key says whose it is, and what decides has to be
+    // the file it was written in.
+    "and a library that calls its own default on a builtin type links too" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val callsItsOwn =
+        """module demo
+          |
+          |trait Widen
+          |    base(self) -> int
+          |
+          |    scaled(self) -> int = self.base() * 3
+          |
+          |impl Widen for int
+          |    base(self) -> int = self
+          |
+          |thrice(n: int) -> int = n.scaled()
+          |""".stripMargin
+
+      val lib  = artifactOf(rootOf("demo", callsItsOwn))
+      val prog = program("import demo.*\n\nprint(thrice(7))")
+
+      ran(Config(command = "run", file = prog, libs = List(lib))) shouldBe "21\n"
+    }
+  }
 }

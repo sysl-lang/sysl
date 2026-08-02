@@ -22,13 +22,22 @@ A string is therefore no longer always traceable to a literal; a program can bui
 by rendering, by gathering, or by validating bytes, and can walk what it built at either
 granularity.
 
+Above that sits what a program *does* with text, all of it ordinary sysl in `sysl.text`: the
+**`Ascii`** trait, which asks a byte or a character what kind of thing it is; the **`parse_*`**
+family, which reads a value back out of text and is the direction `str` does not go; and the
+cursor's **`offset`**, **`peek`**, **`count`** and **`char_indices`**, which are what a program
+walking text by hand needs beyond "the next one".
+
 **Where these live: everything the compiler writes for itself is `sysl` and everything a program
 writes by name is `sysl.text`.** A literal, `+`, `str(x)`, an interpolation and `s.chars` are all
 desugarings, so they cost no import — even `s.chars`, whose cursor is `sysl.text`'s, because the
 compiler names `chars_of` by key rather than by resolving the word (`13 §8`). Named at the call
-site, and so imported: `from_utf8`, `from_cstring`, `char_from_u32`, `str_builder`, `cstring`, and
-the types `Utf8Error`, `Chars`, `StrBuilder` and `CString`. The split is the one `13 § Open h`
-describes — what a program cannot avoid needing is free, and what it has to ask for it asks for.
+site, and so imported: `from_utf8`, `from_cstring`, `char_from_u32`, `str_builder`,
+`str_builder_with_capacity`, `cstring`, `char_indices`, `is_char_boundary`, the `parse_*` family,
+the text operations `split`, `fields`, `join`, `repeat`, `replace_all`, `to_upper` and
+`to_lower`, the `Search` and `Ascii` traits, and the types `Utf8Error`, `ParseError`, `Chars`,
+`CharIndices`, `StrBuilder` and `CString`. The split is the one `13 § Open h` describes — what a
+program cannot avoid needing is free, and what it has to ask for it asks for.
 
 ## The decision in one paragraph
 
@@ -120,8 +129,8 @@ Construction:
 | From | Spelling | Behaviour |
 |---|---|---|
 | literal | `"héllo"` | validated at compile time |
-| bytes | `from_utf8(b: []u8) -> Result[string, Utf8Error]` | validates; the error names the offending byte offset |
-| bytes, trusted | `from_utf8_unchecked(b: []u8) -> string` | **unsafe** — the long name is the point: it stays greppable |
+| bytes | `from_utf8(b: []const u8) -> Result[string, Utf8Error]` | validates; the error names the offending byte offset |
+| bytes, trusted | `from_utf8_unchecked(b: []const u8) -> string` | **unsafe** — the long name is the point: it stays greppable |
 | a `char` | `string(c)` | encodes one scalar value |
 
 `from_utf8_unchecked` is in the `*T` category deliberately: breaking the UTF-8 invariant
@@ -183,7 +192,7 @@ choice is right for a systems language; Swift's is right for an application lang
 | byte length | `s.len` | O(1) |
 | byte at an index | `s[i] -> u8` | O(1), bounds-checked |
 | substring | `s[a..b] -> string` | O(1), shares; bounds-checked **and** boundary-checked |
-| bytes | `s.bytes -> []u8` | O(1) view |
+| bytes | `s.bytes -> []const u8` | O(1) view |
 | scalar values | `s.chars` | O(1) per step, total — no replacement characters |
 | copy out | `s.copy() -> string` | O(n), allocates; releases the parent |
 | concatenation | `a + b` | O(n), allocates |
@@ -208,12 +217,62 @@ decodes as itself — and never a read past the end: every byte the decoder take
 slice's own bounds check, so a truncated sequence traps like any other overrun. That is the same
 runtime-safety category `char(u)` and a mid-codepoint slice are in.
 
+**What a cursor answers besides "the next one".** A `for` walks a *copy* of a cursor, so a loop over
+`s.chars` cannot be asked afterwards where it got to — and a program that needs to know drives the
+cursor itself. That shape is a lexer's, and it was underserved: the guide's JSON reader and its
+bytecode lexer both index bytes by hand and decode a second time, because there was no form giving
+them a character and its position together. So a `Chars` also offers `offset`, the byte position it
+has reached; `peek`, the next character without moving to it; and `count`, how many remain — all
+three by value, so asking consumes nothing.
+
+**`char_indices(b)` is the paired walk**, yielding `(usize, char)` — Rust's name, for Rust's reason.
+The offset is each character's **first** byte, which is what makes it directly usable: a slice built
+from two reported offsets lands on boundaries by construction, and since `s[a..b]` traps on a
+mid-codepoint bound, that is a guarantee rather than a convention. It wraps a `Chars` rather than
+decoding for itself, so there is one decoder and the two cursors cannot come to disagree about a
+width.
+
+**`is_char_boundary(b)`** is the same question about a single byte — one mask and one comparison,
+since the continuation byte is the only one matching `10xxxxxx`. It is what a program walking
+backwards, or snapping an arbitrary offset onto a boundary, would otherwise write inline.
+
 **Slicing is boundary-checked.** `s[a..b]` must land on scalar-value boundaries; landing
 mid-codepoint traps, in the same runtime-safety category as a bounds check and `char(u)`. Go
 permits the mid-codepoint slice and lets you build an invalid string with it — that option is
 closed here by the validity guarantee. This holds for a string that arrived through `from_utf8`
 exactly as it does for a literal, which is the point of validating at the door: nothing downstream
 may undo it.
+
+### Classification is ASCII, and is named for it
+
+Asking what kind of thing a byte or a character is — a digit, a letter, whitespace — is the `Ascii`
+trait in `sysl.text`. **It answers over the ASCII range and nothing else, and the name is the
+promise:** a value at or above 128 answers `false` to every question rather than being guessed at,
+and `is_ascii` is how a caller distinguishes "not a letter" from "not a letter I can see". Real
+Unicode classification needs property tables, which is the same argument that puts grapheme
+clusters in a library above this one: they must not be in a kernel.
+
+The older sysl called the equivalent module `unicode` and classified nothing above 127, so every
+caller read a promise the code did not keep. That is the mistake this name exists to avoid.
+
+**It is a trait rather than two sets of functions**, for exactly the reason `sysl.math.Float` is
+one: sysl has no overloading, so free functions would need `is_digit` for a `u8` and some suffixed
+twin for a `char`, and every caller would have to track which it was holding. `b.is_digit()` is the
+same three words either way. The pair is *closed*, which is what makes an `impl` the right mechanism
+here and the wrong one for the integers — `sysl.math.Signed` cannot be written this way because
+`iN` is an open family and a finite set of blocks would leave widths out, while a byte and a
+character are the only two types this question is ever asked of.
+
+Each implementation supplies three things — `code`, `to_upper`, `to_lower` — and every classifier is
+a default written once over `code()`. The two conversions stay per type only because each must
+answer in its own type; the arithmetic is the same, and both are **total**, leaving anything that is
+not a letter of the other case exactly as they found it. That is what makes mapping one over
+arbitrary text safe rather than merely defined.
+
+`digit_value(base)` is here rather than in `sysl.strconv` because it is a question about a
+character, and because parsing wants exactly this and nothing else from a digit — the two would
+otherwise be the same test written twice. A base outside 2..36 answers `None` rather than trapping,
+so the caller that passed it is the one that gets to report it.
 
 ### Comparison is by bytes
 
@@ -225,6 +284,70 @@ composed `"é"` equals a decomposed one — correct for user-facing text, surpri
 expensive in systems code, where a string is usually a path, a device name, or a protocol
 token that must compare as the bytes it is. Normalization and collation are library
 operations, applied where they are wanted and visible when they cost something.
+
+## Operations
+
+Searching, trimming, splitting and joining — what a program actually does with text once it has
+some. All of it is `sysl.text` and all of it is ordinary sysl.
+
+**The searching and trimming half is a trait, written once.** `Search` requires two members — `view`,
+the bytes to look at, and `slice`, how to cut a piece of itself out — and every operation is a
+default written against those two. There are two implementations, `string` and `[]const u8`, so
+`s.starts_with("//")` and `b.starts_with(prefix)` are the same code and an operation added is added
+to both.
+
+That is the one place this library most deliberately departs from the older sysl, which wrote the
+whole surface **twice** — `std.strings` over `string` and `std.bytes` over `[]byte`, 1,630 lines of
+near-identical code — because it had no way to say "either of these". The trait is that way, and it
+is the same mechanism `sysl.math.Float` and `Ascii` use. There is deliberately no `len` member:
+both implementations already have one the compiler provides, and a trait member of that name would
+hide it rather than agree with it.
+
+| | |
+|---|---|
+| ends | `starts_with`, `ends_with` |
+| finding | `index_of`, `last_index_of`, `index_of_byte`, `last_index_of_byte`, `contains`, `count_of` |
+| trimming | `trim`, `trim_start`, `trim_end`, and the `_matches` three taking a cutset |
+| and | `is_empty` |
+
+**A byte-level search over UTF-8 is correct, not a shortcut.** UTF-8 is self-synchronizing: a
+continuation byte is distinguishable from a lead byte, so a well-formed needle cannot match starting
+anywhere but at a character boundary. So these ignore encoding entirely, and an offset one of them
+returns is always safe to slice at — which matters, since `s[a..b]` traps on a mid-codepoint bound.
+Trimming whitespace is safe for the same reason from the other side: every whitespace byte is ASCII,
+so every byte removed is a whole character.
+
+A cutset is a set of **bytes**, and that is the one caveat in the group: a non-ASCII character in one
+is its bytes and not itself, so such a cutset can cut a character in half — a trap rather than a
+wrong answer. `index_of` returns an `Option` rather than the older sysl's `-1`, because a sentinel is
+a value the type calls ordinary and every caller has to remember to check. Counting is
+non-overlapping and left to right, the same rule `replace_all` substitutes by, so the two always
+agree: in `"aaa"` there is one `"aa"`.
+
+**The other half makes new bytes, and is free functions over `string`:** `split`, `fields`, `join`,
+`repeat`, `replace_all`, `to_upper`, `to_lower`. They are not trait defaults because a default cannot
+write them — it would have to build a `Self` out of new bytes, and no trait can say how. **That
+boundary is exactly the allocator's**, which is why the two halves are separate files: a program that
+only searches never links an allocator on account of a `join` it does not call.
+
+**What splitting hands back are views.** A piece shares the bytes of the string it came from and
+costs a retain, so `split` allocates the vector and not the text — where the older sysl copied every
+piece, for want of an O(1) substring to hand out. This is where the representation `04` chose pays
+off most visibly.
+
+`fields` is not `split` on a space: a run of whitespace separates two fields rather than producing
+empty ones between them, which is what reading a line of columns wants. `split` itself drops nothing
+— adjacent separators and separators at the ends produce the empty pieces they imply. An empty
+separator yields the whole string as one piece, and an empty pattern in `replace_all` matches
+nowhere, both for the same reason: the byte-level reading would cut multi-byte characters apart, and
+the character-level reading is what `s.chars` already is.
+
+`to_upper` and `to_lower` are ASCII, like the trait they are written on, and they walk **characters**
+rather than bytes. A byte map would be the faster loop and would need a way to put a raw byte into a
+builder — the one thing the builder deliberately does not offer. Going through `push_char` means
+every way in still carries the UTF-8 guarantee and no unchecked primitive is named; it works because
+`Ascii for char` is total, so a character outside the range is re-encoded as exactly the bytes it
+arrived as.
 
 ## Concatenation
 
@@ -263,13 +386,32 @@ b.push(str(n))
 var line = b.finish()
 ```
 
-**The two ways in are the two that carry the guarantee.** A `push` takes a `string` and a
-`push_char` takes a `char`, and UTF-8 is closed under appending either — so `finish` hands back a
-plain `string` rather than something a caller has to validate. That is why a builder is **not** a
-`Writer`: a public `write` taking a `[]u8` would be `from_utf8_unchecked` with a longer name and
-none of its greppability. A value of some other type is pushed as `push(str(x))`, which spends the
-one allocation `str` was always going to spend, and still saves the quadratic copying that made a
-builder worth having.
+**Every way in carries the guarantee.** A `push` takes a `string`, a `push_char` takes a `char`, and
+the four renderers below take a number or a `bool` — UTF-8 is closed under appending any of them, so
+`finish` hands back a plain `string` rather than something a caller has to validate. That is why a
+builder is **not** a `Writer`: a public `write` taking a `[]u8` would be `from_utf8_unchecked` with
+a longer name and none of its greppability.
+
+**`push_int`, `push_uint`, `push_real` and `push_bool` exist so that gathering a number costs no
+allocation.** The spelling without them is `push(str(n))`, which builds a whole reference-counted
+`string` — a heap object with a refcount and a deallocation hook — copies its bytes out, and drops
+it, for a value whose text is a couple of dozen bytes and is wanted only inside this buffer. A stack
+array and one `snprintf` is the same rendering with none of that, and it is what `display_int`
+already does for the sink path. They agree with `str` to the byte, which is the property that makes
+the cheap path a substitute rather than a second rendering: a program that builds half a line with a
+builder and half with an interpolation must not be able to tell which half a number came through.
+
+They take `long` and `ulong` rather than one member per width, which is the bargain the `print*`
+family makes for the same reason. The difference is that `print` has the compiler widening its
+arguments and a member cannot, so a narrower value is written `b.push_int(long(n))` — and a caller
+who would rather not write that is describing `push(str(n))`, which still works and still saves the
+quadratic copying that made a builder worth having. A value of any *other* type is pushed that way
+too.
+
+**A builder can be started with room.** `str_builder_with_capacity(n)` skips the
+reallocate-and-copy at each doubling on the way up to `n`, for a caller who knows roughly how long
+the text will be. It is a guess and nothing depends on it: too small and the buffer grows the way it
+always does, too large and the slack goes with the rest.
 
 **`finish` copies rather than lending.** What comes out is an independent string, so a builder may
 go on being appended to and the string already taken out of it does not change. The alternative —
@@ -313,6 +455,53 @@ array remain errors, since none of them can carry an `impl` yet.
 A value of any other type is not silently rendered across `+` or in a `print`; the conversion is
 always written, at the point it happens. That is the same no-implicit-coercion stance the numeric
 operators take, and it is what keeps a string's contents something a reader can see the source of.
+
+## Reading a value
+
+The direction `str` does not go. `sysl.text` reads text back into a value: `parse_int`,
+`parse_long`, `parse_uint`, `parse_ulong`, each with a `_base` variant, plus `parse_bool` and
+`parse_real`. Every one returns `Result[T, ParseError]`.
+
+**The library rendered and did not read, and that is a gap a program feels immediately** — an
+argument, a configuration field, and a number in a file are all text. `guide/json` wrote the loop
+itself, and its loop has no overflow check at all, which is the ordinary outcome: the digits are
+easy and the edges are not.
+
+The edges are what the library is for:
+
+- **The most negative value.** The signed range is asymmetric, so a parser that builds a magnitude
+  and negates at the end cannot represent `MIN` at any point. These accumulate on the **negative**
+  side, which covers the whole range with one path and leaves only a *positive* result of `MIN`'s
+  magnitude to refuse, just before the final negation.
+- **Overflow is caught before the arithmetic that would overflow.** Integer arithmetic wraps (`01`),
+  so a product that has already wrapped tells a later comparison nothing.
+- **Trailing garbage is refused.** `"12abc"` is not `12`, and `"1.5x"` is not `1.5` — which for the
+  float means checking C's end pointer, since `strtod` on its own stops where it likes and reports
+  success.
+- **The unsigned range is not the signed one with the sign removed.** `"ffffffffffffffff"` is an
+  ordinary 64-bit mask that overflows every signed parse there is, so a systems language needs the
+  unsigned direction to read back what its own literals are written in. No sign is accepted there,
+  not even `+`: a leading `-` on an unsigned value is a question with no good answer.
+
+`ParseError` names four cases — `Empty`, `BadDigit(at)`, `Overflow`, `BadBase(base)` — separated by
+what a caller would *do* about them rather than by taxonomy. An empty field is often a default, a
+bad digit is a message to a user, an overflow is a wider type or a refusal, and a bad base is the
+program's own mistake rather than the input's. `BadDigit` carries the byte offset for the reason
+`Utf8Error` does: a message naming where is worth writing and cannot be reconstructed afterwards.
+
+`parse_bool` accepts exactly the two spellings `str` produces. `"True"`, `"yes"` and `"1"` are each
+somebody's convention and none is this library's; a program wanting one writes three lines that read
+as the policy they are.
+
+**`parse_real` goes to `strtod`** for the reason the float half of `str` goes to `snprintf`:
+correctly rounded decimal-to-binary conversion is hard to get right, easy to get subtly wrong, and
+the two directions must agree or a value will not survive being written and read back. It costs one
+allocation, since C reads a NUL-terminated pointer and a `string` carries a length instead.
+
+These live in `sysl.text` rather than a module of their own because they are the same shape as
+`from_utf8` — fallible, text in, value out, `Result` — and because they are built on
+`Ascii.digit_value`, which is there already. A parse and a digit test are otherwise one question
+asked twice.
 
 ## Printing
 

@@ -241,6 +241,100 @@ class StringSurfaceTests extends AnyFreeSpec with CodegenSupport with RunSupport
     }
   }
 
+  /** The numbers a builder takes without a `str` in front of them, and the capacity it can be
+   * started with.
+   *
+   * These are about cost, so what the tests can check is that the rendering agrees exactly with the
+   * one the allocating path would have produced — `push_int(long(n))` and `push(str(n))` must be
+   * indistinguishable in the output or the cheaper one is not a substitute for the other.
+   */
+  "a builder renders numbers straight into its buffer" - {
+
+    // The parameter is a `long`, so a literal argument takes that width from the context and needs
+    // no suffix of its own.
+    "an integer reads the same as 'str' would have rendered it" in {
+      run("""var b = str_builder()
+            |b.push_int(0)
+            |b.push_char(' ')
+            |b.push_int(-42)
+            |b.push_char(' ')
+            |b.push_int(9223372036854775807)
+            |print(b.finish())
+            |""".stripMargin) shouldBe "0 -42 9223372036854775807\n"
+    }
+
+    // The most negative value, whose magnitude does not fit the width it is held in — the case a
+    // hand-rolled digit loop gets wrong by negating first. It is built by subtracting from the
+    // maximum rather than written down, since the magnitude has no literal that fits.
+    "including the value whose magnitude will not fit" in {
+      run("""var m: long = -9223372036854775807 - 1
+            |var b = str_builder()
+            |b.push_int(m)
+            |print(b.finish(), b.finish() == str(m))
+            |""".stripMargin) shouldBe "-9223372036854775808 true\n"
+    }
+
+    // The discriminating pair: an unsigned value past the signed maximum renders as itself through
+    // `push_uint` and would render negative through `push_int`.
+    "an unsigned value reads at its own width, not as a signed one" in {
+      run("""var b = str_builder()
+            |b.push_uint(18446744073709551615)
+            |print(b.finish())
+            |""".stripMargin) shouldBe "18446744073709551615\n"
+    }
+
+    "a float agrees with what 'str' and 'print' give the same value" in {
+      run("""var b = str_builder()
+            |b.push_real(2.5)
+            |print(b.finish(), b.finish() == str(2.5))
+            |""".stripMargin) shouldBe "2.5 true\n"
+    }
+
+    "a bool is the same two words 'str' renders" in {
+      run("""var b = str_builder()
+            |b.push_bool(true)
+            |b.push_char(' ')
+            |b.push_bool(false)
+            |print(b.finish(), b.finish() == str(true) + " " + str(false))
+            |""".stripMargin) shouldBe "true false true\n"
+    }
+
+    // What the cheap path has to be equal to: the same values gathered the allocating way.
+    "the whole set agrees with the same values pushed through 'str'" in {
+      run("""var n: long = -7
+            |var cheap = str_builder()
+            |cheap.push_int(n)
+            |cheap.push_real(0.5)
+            |cheap.push_bool(true)
+            |var dear = str_builder()
+            |dear.push(str(n))
+            |dear.push(str(0.5))
+            |dear.push(str(true))
+            |print(cheap.finish() == dear.finish(), cheap.finish())
+            |""".stripMargin) shouldBe "true -70.5true\n"
+    }
+
+    "a builder started with room behaves like any other" in {
+      run("""var b = str_builder_with_capacity(64usize)
+            |print(b.len, b.is_empty)
+            |b.push("hello")
+            |b.push_int(1)
+            |print(b.finish(), b.len)
+            |""".stripMargin) shouldBe "0 true\nhello1 6\n"
+    }
+
+    // Too small a guess is a guess and nothing more: the buffer grows the way it always does.
+    "and a capacity smaller than the text is not a limit" in {
+      run("""var b = str_builder_with_capacity(2usize)
+            |var k = 0
+            |while k < 100
+            |    b.push("xy")
+            |    k += 1
+            |print(b.len, b.finish().len)
+            |""".stripMargin) shouldBe "200 200\n"
+    }
+  }
+
   /** `cstring(s)` is `04 § C interop`'s general direction — the one for a string that is not a
    * literal, where `c"…"` cannot apply because there is no constant to take the address of.
    */

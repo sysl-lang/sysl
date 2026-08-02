@@ -187,8 +187,15 @@ object Compiler {
       // initialized by the entry point, and a library has none. Such a function is compiled in the
       // program instead, where the initialization it depends on actually happens. Everything else —
       // which is most of a library — is compiled once, here.
+      //
+      // **What is advertised is what the linker can reach**, so a file-private declaration is left
+      // out however ordinary it looks here. Its symbol is emitted `internal` (`13 §2`), which is a
+      // promise that every caller is in this module — and a program told the artifact holds it would
+      // declare it, call it, and find nothing at the link. Left out, the program compiles a copy of
+      // its own from the tree the artifact carries, which is what it does with a generic.
       val determined =
-        own.filter(f => Reachability.reachedFrom(List(f), typed.funcs, typed.vtables).vals.isEmpty)
+        own.filter(f => !f.internal)
+          .filter(f => Reachability.reachedFrom(List(f), typed.funcs, typed.vtables).vals.isEmpty)
 
       (ir, determined.map(_.name).toSet)
 

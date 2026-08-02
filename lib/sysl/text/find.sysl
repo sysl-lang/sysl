@@ -1,0 +1,286 @@
+module sysl.text
+
+// Searching text and trimming it -- the half of the operations that makes no new bytes.
+//
+// **Everything here is allocation-free, and that is what the file boundary is drawn on.** A search
+// answers with an offset or a `bool`, and a trim answers with a *view* of what it was given, so
+// nothing in this file needs an allocator and all of it is reachable under `no alloc`. What makes
+// new text -- joining, replacing, changing case -- is in `edit.sysl` beside it, and needs one.
+//
+// **It is written once, over `[]const u8`, and that is the whole design.** The older sysl wrote this
+// surface twice: `std.strings` over `string` and `std.bytes` over `[]byte`, 1,630 lines of
+// near-identical code, because it had no way to say "either of these". A trait says it: each
+// implementation supplies two members -- the bytes to look at, and how to cut a piece of itself out
+// -- and every operation below is a default written against those two. So `s.starts_with("//")` and
+// `b.starts_with(prefix)` are the same code, and adding an operation adds it to both.
+//
+// **A byte-level search over UTF-8 is not a shortcut, it is correct.** UTF-8 is self-synchronizing:
+// a continuation byte is distinguishable from a lead byte, so a well-formed needle cannot match
+// starting anywhere but at a character boundary. That is why these can ignore encoding entirely,
+// and why an offset one of them returns is always safe to slice at -- which matters, since
+// `s[a..b]` traps on a mid-codepoint bound.
+//
+// The searches are the naive O(n*m) scan. A sub-linear one may replace them without anything
+// observable changing, which is the reason to say so here rather than in each body.
+trait Search
+
+    // The bytes to look at. This is the whole of what a `string` and a `[]const u8` disagree about.
+    view(self) -> []const u8
+
+    // A piece of the receiver, as the receiver's own type -- what lets a trim answer with a view
+    // rather than a copy, and what a default cannot do for itself because it does not know how to
+    // build a `Self`.
+    slice(self, lo: usize, hi: usize) -> Self
+
+    // --- What the trait answers for itself. ---
+
+    // There is deliberately no `len` here: both implementations already have one the compiler
+    // provides, and a trait member of that name would hide it rather than agree with it.
+    is_empty(self) -> bool = self.view().len == 0usize
+
+    // The empty prefix is a prefix of everything, which falls out of the loop rather than being
+    // said: there is nothing to disagree about.
+    starts_with(self, prefix: Self) -> bool
+        var h = self.view()
+        var n = prefix.view()
+
+        if n.len > h.len then return false
+
+        for i in 0usize..<n.len
+            if h[i] != n[i] then return false
+
+        true
+    end starts_with
+
+    ends_with(self, suffix: Self) -> bool
+        var h = self.view()
+        var n = suffix.view()
+
+        if n.len > h.len then return false
+
+        var base = h.len - n.len
+
+        for i in 0usize..<n.len
+            if h[base + i] != n[i] then return false
+
+        true
+    end ends_with
+
+    // Where the first occurrence starts, or `None`.
+    //
+    // An `Option` rather than old sysl's `-1`, because a sentinel is a value the type says is
+    // ordinary and every caller has to remember to check. The empty needle is found at 0, which is
+    // the convention every library shares and the one that makes `split` on an empty separator
+    // terminate.
+    index_of(self, needle: Self) -> Option[usize]
+        var h = self.view()
+        var n = needle.view()
+
+        if n.len == 0usize then return Some(0usize)
+        if n.len > h.len then return None
+
+        var last = h.len - n.len
+        var i = 0usize
+
+        while i <= last
+            var matched = true
+            var j = 0usize
+
+            while j < n.len
+                if h[i + j] != n[j]
+                    matched = false
+                    break
+                j += 1usize
+
+            if matched then return Some(i)
+            i += 1usize
+
+        None
+    end index_of
+
+    // The empty needle is found at the end here rather than at 0, which is the same convention read
+    // from the other side: the last place it occurs.
+    last_index_of(self, needle: Self) -> Option[usize]
+        var h = self.view()
+        var n = needle.view()
+
+        if n.len == 0usize then return Some(h.len)
+        if n.len > h.len then return None
+
+        var i = h.len - n.len
+
+        while true
+            var matched = true
+            var j = 0usize
+
+            while j < n.len
+                if h[i + j] != n[j]
+                    matched = false
+                    break
+                j += 1usize
+
+            if matched then return Some(i)
+            if i == 0usize then break
+            i -= 1usize
+
+        None
+    end last_index_of
+
+    index_of_byte(self, b: u8) -> Option[usize]
+        var h = self.view()
+
+        for i in 0usize..<h.len
+            if h[i] == b then return Some(i)
+
+        None
+    end index_of_byte
+
+    last_index_of_byte(self, b: u8) -> Option[usize]
+        var h = self.view()
+        var i = h.len
+
+        while i > 0usize
+            i -= 1usize
+            if h[i] == b then return Some(i)
+
+        None
+    end last_index_of_byte
+
+    contains(self, needle: Self) -> bool = self.index_of(needle).is_some()
+
+    // Whether one byte occurs anywhere. It is written as its own loop rather than as
+    // `index_of_byte(b).is_some()` because the answer is a `bool` and going through the `Option`
+    // asks for a position nobody wants -- which is also what a cutset trim needs, since it asks
+    // this once per byte trimmed.
+    has_byte(self, b: u8) -> bool
+        for x in self.view()
+            if x == b then return true
+
+        false
+    end has_byte
+
+    // How many non-overlapping occurrences there are, counted the way a `replace_all` would find
+    // them -- so `count_of` and the number of replacements `replace_all` makes always agree. In
+    // `"aaa"` there is one `"aa"`, not two.
+    count_of(self, needle: Self) -> usize
+        var h = self.view()
+        var n = needle.view()
+
+        if n.len == 0usize then return 0usize
+        if n.len > h.len then return 0usize
+
+        var found = 0usize
+        var i = 0usize
+        var last = h.len - n.len
+
+        while i <= last
+            var matched = true
+            var j = 0usize
+
+            while j < n.len
+                if h[i + j] != n[j]
+                    matched = false
+                    break
+                j += 1usize
+
+            if matched
+                found += 1usize
+                i += n.len
+            else
+                i += 1usize
+
+        found
+    end count_of
+
+    // --- Trimming, which answers with a view of the receiver rather than a copy. ---
+
+    // ASCII whitespace off the front, the back, or both.
+    //
+    // **Trimming a `string` cannot land mid-character**, which is what makes it safe to answer with
+    // a slice: every whitespace byte is ASCII, so every byte removed is a whole character and every
+    // bound left behind is one the receiver already had.
+    trim_start(self) -> Self
+        var h = self.view()
+        var i = 0usize
+
+        while i < h.len && h[i].is_space()
+            i += 1usize
+
+        self.slice(i, h.len)
+    end trim_start
+
+    trim_end(self) -> Self
+        var h = self.view()
+        var n = h.len
+
+        while n > 0usize && h[n - 1usize].is_space()
+            n -= 1usize
+
+        self.slice(0usize, n)
+    end trim_end
+
+    trim(self) -> Self
+        var h = self.view()
+        var i = 0usize
+        var n = h.len
+
+        while i < n && h[i].is_space()
+            i += 1usize
+
+        while n > i && h[n - 1usize].is_space()
+            n -= 1usize
+
+        self.slice(i, n)
+    end trim
+
+    // The same three against a set of bytes the caller names, which is what strips quotes, slashes
+    // or padding rather than whitespace.
+    //
+    // **The cutset is a set of BYTES**, so a non-ASCII character in one is its bytes and not itself
+    // -- and trimming with such a cutset can cut a character in half, which for a `string` is a
+    // trap rather than a wrong answer. That is the honest behaviour for a byte-level operation and
+    // the reason the whitespace trims above are the ones without a caveat.
+    // Membership in the cutset is `has_byte` asked of the cutset, which is why there is no helper
+    // beside these: the question "is this byte one of those" is one the trait already answers, and
+    // asking it of the cutset rather than of the receiver is the whole difference.
+    trim_start_matches(self, cutset: Self) -> Self
+        var h = self.view()
+        var i = 0usize
+
+        while i < h.len && cutset.has_byte(h[i])
+            i += 1usize
+
+        self.slice(i, h.len)
+    end trim_start_matches
+
+    trim_end_matches(self, cutset: Self) -> Self
+        var h = self.view()
+        var n = h.len
+
+        while n > 0usize && cutset.has_byte(h[n - 1usize])
+            n -= 1usize
+
+        self.slice(0usize, n)
+    end trim_end_matches
+
+    trim_matches(self, cutset: Self) -> Self = self.trim_start_matches(cutset).trim_end_matches(cutset)
+
+end Search
+
+// Text, which is the receiver these are nearly always written on. `slice` goes through the
+// language's own boundary-checked subscript, so a piece cut out of a string is a string with the
+// same guarantee -- and the bounds every operation above hands it are ones the search or the trim
+// already knows are boundaries.
+impl Search for string
+    view(self) -> []const u8 = self.bytes
+
+    slice(self, lo: usize, hi: usize) -> string = self[lo..<hi]
+end string
+
+// Bytes that are not text, or not yet: what a program reads off a socket or a file before it knows
+// whether it is UTF-8. The same operations answer the same way, which is the point of the trait --
+// and here there is no encoding to be careful of, since there is no guarantee to keep.
+impl Search for []const u8
+    view(self) -> []const u8 = self
+
+    slice(self, lo: usize, hi: usize) -> []const u8 = self[lo..<hi]
