@@ -31,3 +31,60 @@ trait Signed
     // The result is `Self` rather than a fixed width so that it can be multiplied back into a value
     // of the same type, which is what a signum is usually for.
     signum(self) -> Self
+
+// A value's bits, asked the questions the machine can answer in one instruction.
+//
+// Every one of these is a shift-and-mask loop a program would otherwise write, and every one of
+// them is a single instruction on the machines sysl targets -- which is the case for a member
+// rather than a comment recommending a loop. `count_ones` is `popcnt`, `leading_zeros` is `lzcnt`
+// or `clz`, and the rotations are `rol` and `ror`.
+//
+// The membership is the compiler's for the reason `Signed`'s is: the integers are an open family,
+// so there is no finite list of widths to write an `impl` for. Unlike `Signed`, this covers the
+// **unsigned** widths too -- a bit pattern is a bit pattern, and `01` already gives `&`, `|`, `^`,
+// `~` and the shifts to every integer at either signedness.
+//
+// **What is deliberately not here is `swap_bytes`.** Reversing the byte order needs a whole number
+// of bytes and at least two, so a `u24` has no answer to it and a `u4` has none either. Every
+// member of this trait is total over every integer type, because a `[T: Bits]` body is written once
+// and instantiated later: a member that worked at `u32` and not at `u24` would turn a bound that
+// was supposed to have proven an operation into a failure at somebody else's instantiation. A
+// program that means to reorder bytes has the shifts, and knows its own width while writing them.
+trait Bits
+
+    // How many bits are set, and how many are clear. The two sum to the width, which is what makes
+    // the second worth having rather than left to a subtraction the caller writes: the width is the
+    // fact the caller would have to know, and this is the member that already knows it.
+    count_ones(self) -> u32
+    count_zeros(self) -> u32
+
+    // How many bits above the highest one, and below the lowest one.
+    //
+    // **Zero answers the width**, at both ends, rather than being undefined the way the bare machine
+    // instruction is on some targets. That is the answer that makes `leading_zeros` usable as
+    // "how far left is the top bit" without a special case in front of it, and it is what makes the
+    // same program print the same number on every machine.
+    leading_zeros(self) -> u32
+    trailing_zeros(self) -> u32
+
+    // The same two counted over set bits instead, so that `-1` answers the width and `0` answers
+    // nothing -- the mirror of the pair above, and what a run of ones at either end is measured by.
+    leading_ones(self) -> u32
+    trailing_ones(self) -> u32
+
+    // The bits in the opposite order: the lowest becomes the highest. The width is the receiver's,
+    // so this is a different function at every type and none of them is a byte order.
+    reverse_bits(self) -> Self
+
+    // Rotate: the bits shifted off one end arrive at the other.
+    //
+    // **The amount is taken modulo the width**, so every amount is meaningful and none of it is
+    // undefined -- which is the whole reason to call this rather than write
+    // `(x << n) | (x >> (w - n))`, an expression that shifts by the width when `n` is zero and is
+    // undefined when it does.
+    //
+    // The amount is a `u32` and not `Self`, because how far to rotate is a count of bit positions
+    // rather than a value of the type being rotated, and a narrow receiver would otherwise be
+    // unable to state an amount its own width cannot hold.
+    rotate_left(self, n: u32) -> Self
+    rotate_right(self, n: u32) -> Self

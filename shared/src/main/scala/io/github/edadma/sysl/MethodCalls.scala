@@ -410,14 +410,21 @@ trait MethodCalls extends FuncAddress {
     }
 
   /** A member of a trait the compiler supplies membership for, but which is not an operator —
-   * `n.abs()` and `n.signum()` (`14 §5`, `CoreTraits.numeric`).
+   * `n.abs()`, `n.count_ones()`, `n.rotate_left(3)` (`14 §5`, `CoreTraits.numeric`).
    *
    * **Gated on the trait being in scope**, which is what keeps a compiler-provided membership from
    * being a way around `13 §2`. The two questions are different and both have to be answered: a
    * membership settles which *types* have the member, and scope settles which *files* may write it.
    * `Add` and `Display` are unaffected because they are in the standard module, which every file
-   * auto-imports; `Signed` is in `sysl.math`, so a program asks for it exactly as it asks for
-   * `Float`.
+   * auto-imports; `Signed` and `Bits` are in `sysl.math`, so a program asks for one exactly as it
+   * asks for `Float`.
+   *
+   * **Every signature is read off the trait's own declaration**, the way `builtinMethod` reads
+   * `Add`'s, rather than being restated here. That is what makes `rotate_left`'s amount, and the
+   * `u32` a count answers, facts stated once — in the library source a reader can see — instead of
+   * twice in places that could disagree. `Self` binds to the receiver's **underlying** type, so the
+   * magnitude of a constrained subtype is an ordinary integer: a range is a promise about the values
+   * that were put in, and nothing says a range that holds `-128` also holds `128`.
    */
   private def builtinNumeric(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
     for
@@ -426,14 +433,29 @@ trait MethodCalls extends FuncAddress {
       key = Library.key(trName)
       if traitInScope(key)
       decl <- traitDecls.get(key)
-      if decl.methods.exists(_.name == mname)
+      m    <- decl.methods.find(_.name == mname)
+      // Every one of these answers something, and the answer is where the result type comes from. A
+      // declaration that stated none would leave nothing to build the node's type out of, so it is
+      // matched here rather than assumed: the member then simply does not resolve, which reports
+      // the ordinary missing-method complaint instead of failing inside the compiler.
+      declared <- m.retType
     yield {
-      if args.nonEmpty then
-        err(s"method '$trName.$mname' takes no arguments, but ${supplied(args.length, "argument")}")
+      val width = Type.underlying(rty)
+      val self  = selfBinding(width)
+      val (params, ret) = inDecl(decl.name) {
+        (m.params.map(p => (p.name, resolveType(p.typ, self))), resolveType(declared, self))
+      }
 
-      // The result is `Self`, which for a built-in's membership is the receiver's own type — the
-      // same homogeneity `builtinMethod` reads off `Add`.
-      TIntOp(mname, buildReceiver(RecvMode.ByValue, recv), Type.underlying(rty))
+      val bound = bindArgs(s"method '$trName.$mname'", Some(decl.name), m.params, args)
+
+      if bound.length != params.length then
+        err(s"method '$trName.$mname' takes ${quantity(params.length, "argument")}, " +
+          s"but ${supplied(bound.length, "argument")}")
+
+      val recvd = buildReceiver(RecvMode.ByValue, recv)
+      val ts    = checkArgs(s"$trName.$mname", params, bound, None)
+
+      TIntOp(mname, recvd, ts.headOption, width, ret)
     }
 
   /** `w.get()` — the one thing a `weak T` can be asked (`03`).

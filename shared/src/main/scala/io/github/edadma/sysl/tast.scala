@@ -197,8 +197,13 @@ case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExp
  * A node of its own rather than a tree of the operators it is equivalent to, because every one of
  * these reads its operand more than once — a magnitude compares it and negates it — and a tree would
  * evaluate the receiver expression once per mention. `f().abs()` must call `f` once.
+ *
+ * `width` is the integer type the instruction runs at, which is the receiver's own type with any
+ * constrained subtype resolved away; `ty` is what the member answers, and the two differ wherever
+ * the answer is a **count** of bits rather than a value of the receiver's type. `amount` is the
+ * rotations' second operand and nothing else's.
  */
-case class TIntOp(op: String, operand: TExpr, ty: Type) extends TExpr
+case class TIntOp(op: String, operand: TExpr, amount: Option[TExpr], width: Type, ty: Type) extends TExpr
 
 /** `&&` / `||` — short-circuit, always boolean. */
 case class TLogical(op: String, left: TExpr, right: TExpr) extends TExpr { def ty: Type = Type.Bool }

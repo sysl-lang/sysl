@@ -181,7 +181,7 @@ object Library {
       // The traits whose members a built-in has by rule rather than by an `impl` (`14 §5`).
       "Display", "Hash",
       // The same, for the members that are not operators and whose trait is in a submodule.
-      "Signed",
+      "Signed", "Bits",
       // The sink every rendering goes through, and the one function its standard-output table ends
       // at — whose *table* codegen lays out by hand, which is why the shape is checked rather than
       // read (`SpecialForms.checkWriterShape`, `WriterEmitter`).

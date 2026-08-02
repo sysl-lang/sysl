@@ -77,6 +77,22 @@ object CoreTraits {
   val numeric: Map[String, String] = Map(
     "abs"    -> "Signed",
     "signum" -> "Signed",
+
+    // The bit surface. Each is one machine instruction on the targets sysl serves, reached through
+    // the LLVM intrinsic that is the portable spelling of it — which is why they are worth a member
+    // rather than being left to the shifts and masks a program would otherwise write, and why
+    // `rotate_left` is here at all when `(x << n) | (x >> (w - n))` looks like it says the same
+    // thing. It does not: that expression shifts by `w` when `n` is zero, and a shift by the width
+    // is undefined.
+    "count_ones"     -> "Bits",
+    "count_zeros"    -> "Bits",
+    "leading_zeros"  -> "Bits",
+    "leading_ones"   -> "Bits",
+    "trailing_zeros" -> "Bits",
+    "trailing_ones"  -> "Bits",
+    "reverse_bits"   -> "Bits",
+    "rotate_left"    -> "Bits",
+    "rotate_right"   -> "Bits",
   )
 
   /** Each infix operator token, and the trait its operands must satisfy (`§3`). The four derived
@@ -171,6 +187,18 @@ object CoreTraits {
       t match
         case i: Type.Integer => i.signed
         case _               => false
+
+    // The bit surface is every integer, signed and unsigned, which is the domain `01` already gives
+    // `&`, `|`, `^`, `~` and the shifts — a signed value has a bit pattern like any other, and a
+    // population count of one is the same question at either signedness.
+    //
+    // **Every member here is total over that domain, and that is what decided the surface.** A
+    // membership the compiler cannot lower at some width would promise a `[T: Bits]` body an
+    // operation that fails at an instantiation the bound was supposed to have proven — so
+    // `swap_bytes` is deliberately absent, `llvm.bswap` being defined only at widths that are a
+    // multiple of 16. A member that exists at `u32` and not at `u24` is worse than one that exists
+    // nowhere, because only the second is visible when the generic is written.
+    case "Bits" => t.isInstanceOf[Type.Integer]
 
     // A hash only means anything beside an equality it agrees with — `a == b` must imply that the
     // two hash alike — so membership here is `Eq`'s, minus the two places that law is not free.
