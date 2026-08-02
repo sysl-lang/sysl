@@ -133,6 +133,32 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "and yielding answers that the system took the hint" in {
       run("print(yield_now())") shouldBe "true\n"
     }
+
+    // A thread starts threads of its own, which nothing in the module treats as a special case —
+    // `pthread_create` does not care which thread called it, and the reaper's worklist being per
+    // thread is what keeps the inner one from finding the outer one's list.
+    "a thread may start threads of its own" in {
+      run(
+        """struct Tree
+          |    depth: Atomic[int]
+          |
+          |leaf(t: *Tree)
+          |    t.depth.add(1)
+          |
+          |branch(t: *Tree)
+          |    var a = spawn(&leaf, t).unwrap()
+          |    var b = spawn(&leaf, t).unwrap()
+          |
+          |    a.join()
+          |    b.join()
+          |    t.depth.add(10)
+          |
+          |var t = Tree(Atomic(0))
+          |
+          |spawn(&branch, &t).unwrap().join()
+          |print(t.depth.load())""".stripMargin
+      ) shouldBe "12\n"
+    }
   }
 
   "the lock that owns what it protects" - {
@@ -204,6 +230,77 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |
           |print(*m.lock())""".stripMargin
       ) shouldBe "3\n"
+    }
+
+    // What it holds is a whole value rather than a word, which is the case the type exists for: a
+    // struct is what a lock guards and an `Atomic[T]` cannot.
+    "holds an aggregate, which is what a lock is for and an atomic is not" in {
+      run(
+        """struct Ledger
+          |    hits: int
+          |    last: int
+          |
+          |var m = Mutex.new(Ledger(0, 0))
+          |var p = m.lock()
+          |
+          |p.hits = p.hits + 1
+          |p.last = 9
+          |m.unlock()
+          |
+          |var q = m.lock()
+          |
+          |print(q.hits, q.last)""".stripMargin
+      ) shouldBe "1 9\n"
+    }
+
+    /** `&sync Mutex[T]` is the shape `06` calls the ordinary answer: the lock is in the counted
+     * object rather than beside it, so the object's own atomic count is what keeps it alive while
+     * two threads hold it. The receiver reaches through the reference, which is what makes it
+     * usable at all — a `*self` method wants a place, and a counted reference is one.
+     */
+    "and works through the counted reference the chapter reaches it by" in {
+      run(
+        """var m: &sync Mutex[int] = Mutex.new(4)
+          |var p = m.lock()
+          |
+          |*p = *p * 10
+          |m.unlock()
+          |print(*m.lock())""".stripMargin
+      ) shouldBe "40\n"
+    }
+
+    /** Eight threads on a machine with fewer processors is the case the yield exists for: a waiter
+     * cannot make progress by spinning, because the holder is not running. A `SpinLock` here would
+     * burn a quantum per waiter per round; this gives the processor up and the total still comes
+     * out exact.
+     */
+    "more threads than the machine has processors still finish, since a waiter yields" in {
+      run(
+        """struct Job
+          |    m: Mutex[int]
+          |    rounds: int
+          |
+          |bump(j: *Job)
+          |    var i = 0
+          |
+          |    while i < j.rounds
+          |        var p = j.m.lock()
+          |
+          |        defer j.m.unlock()
+          |        *p = *p + 1
+          |        i = i + 1
+          |
+          |var j = Job(Mutex.new(0), 5000)
+          |var ts = [spawn(&bump, &j).unwrap(), spawn(&bump, &j).unwrap(),
+          |          spawn(&bump, &j).unwrap(), spawn(&bump, &j).unwrap(),
+          |          spawn(&bump, &j).unwrap(), spawn(&bump, &j).unwrap(),
+          |          spawn(&bump, &j).unwrap(), spawn(&bump, &j).unwrap()]
+          |
+          |for t in ts
+          |    t.join()
+          |
+          |print(*j.m.lock())""".stripMargin
+      ) shouldBe "40000\n"
     }
 
     /** An ordering is a keyword in the emitted instruction and this machine would compute the right
@@ -377,6 +474,24 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "reading what it protects without taking it" in {
       err("var m = Mutex.new(5)\nprint(m.value)") should include("'value'")
+    }
+
+    /** The `&sync` rule reaches through the new type without knowing anything about it: what a
+     * shared object may hold is decided from its fields, and a `Mutex[&Cell]` has a plain counted
+     * reference among them however deep. The lock protects the *field*, and the field's own count
+     * is what two threads would race on — which is the race one level down that `06` names.
+     */
+    "and sharing one that guards a non-atomically counted reference" in {
+      val out = err(
+        """struct Cell
+          |    v: int
+          |
+          |var m: &sync Mutex[&Cell] = Mutex.new(Cell(1))
+          |
+          |print(*m.lock())""".stripMargin
+      )
+
+      out should include("&sync")
     }
 
     /** A thread body is C's shape and a callable is not (`12 §6a`): the address is what pthreads

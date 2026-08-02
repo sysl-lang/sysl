@@ -1039,7 +1039,7 @@ model, and propagation through imports — is specified in **`capabilities.md`**
 | null dereference | non-null references; nullable is `Option` |
 | out-of-bounds | length-carrying arrays/slices, checked everywhere |
 | slice outliving its buffer | the slice's `owner` word retains it; escaping locals are promoted |
-| refcount race across threads | `&T` cannot cross a domain; `&sync T` is atomic (`06`) |
+| refcount race across threads | `&sync T` is atomic; `&T` may not cross a domain — *specified, and unchecked until the channel is written* (`06`) |
 | dangling / wild pointer | impossible without `*T` |
 
 Only `*T` opts out — visibly.
