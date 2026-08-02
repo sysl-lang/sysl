@@ -20,6 +20,7 @@ trait ProgramWalk
     with ModuleGraph
     with Capabilities
     with NoAlloc
+    with GatedModules
     with InitOrder
     with DefaultParams {
 
@@ -275,6 +276,10 @@ trait ProgramWalk
     // Every reference the program makes has been resolved, so which module depends on which is
     // finally settled and the graph can be held to being acyclic (`13 §6`).
     checkModuleGraph()
+
+    // And which module a reference lands in is what decides whether a module that gave up an
+    // environment capability was allowed to make it, so this asks the same settled graph (`13 §4`).
+    checkGatedModules()
 
     // Which structs can lie inside one that carries invariant clauses is likewise only settled now,
     // so the rule about what a `*self` method may let out of the call is asked here (`16 §6`).
@@ -827,6 +832,13 @@ trait ProgramWalk
     // A member's body sees `Self` alongside whatever type parameters it was instantiated with, so
     // the one substitution answers both questions and nothing downstream has to know the difference.
     tsubst = subst ++ memberSelf.getOrElse(name, Map.empty)
+    // What the signature asked of those parameters, kept beside what they became: an instantiated
+    // body still has to say which trait's member a name on a type parameter meant.
+    tbounds = f.bounds
+    // And which of the body's own names hold one of them, for the members reached through a value
+    // rather than through the parameter's name. Only a parameter written as the bare type parameter
+    // qualifies: a `Box[T]` is a `Box`, and what its members mean is the `Box`'s question.
+    pbounds = f.params.collect { case p @ Param(n, NamedType(w, Nil), _, _) if f.bounds.contains(w) => n -> w }.toMap
 
     // A result list is the signature's, and the body produces the tuple its parts lay out as — so
     // the body is analyzed against that tuple, with the list itself recorded beside it as the one

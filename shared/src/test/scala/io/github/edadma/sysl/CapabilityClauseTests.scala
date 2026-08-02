@@ -58,11 +58,15 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       e should include("'alloc', 'os', 'posix', 'threads'")
     }
 
-    "narrowing away a capability that gates modules nobody has written" in {
-      val e = err("no posix\n\nf() -> int = 1\n")
+    /* `threads` is the last of the four with nothing to gate. `os` and `posix` left this list the
+     * day a module requiring one existed, which is the shape the refusal always had: a narrowing is
+     * refused while it would enforce nothing, and allowed once it would. */
+    "narrowing away a capability that gates something nobody has written" in {
+      val e = err("no threads\n\nf() -> int = 1\n")
 
-      e should include("'no posix' is not enforced yet")
-      e should include("'no alloc' is the narrowing that means something today")
+      e should include("'no threads' is not enforced yet")
+      e should include("gates thread creation and the growable channel, and neither is built")
+      e should include("'no alloc', 'no os' and 'no posix' are the narrowings that mean something today")
     }
 
     "the same capability declared twice" in {
@@ -446,5 +450,69 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
   "a module with no clause is unaffected" in {
     runOf("thing/a.sysl" -> "module thing\n\nf() -> int = 1\n", "main.sysl" -> "print(thing.f())") shouldBe "1\n"
+  }
+
+  /** `no os` and `no posix`, which gate **which modules exist** rather than what the language allows
+   * — so they are asked of the module graph where `no alloc` is asked of each construction.
+   *
+   * `sysl.fs` is what makes any of this checkable: it is the first module in the library to declare
+   * `requires os`, and until it existed the narrowing was refused because it would have enforced
+   * nothing.
+   */
+  "'no os' gives up the modules an operating system gates" - {
+
+    "a module that gave it up may not reach one that requires it" in {
+      val e = err("no os\n\nimport sysl.fs.exists\n\nprint(exists(\"x\"))\n")
+
+      e should include("which requires 'os'")
+      e should include("this module declared 'no os'")
+      e should include("a module that gave one up may not reach one that needs it")
+    }
+
+    // A qualified path needs no import (`13 §3`), so a rule stated over imports would have missed
+    // this entirely — which is why the graph is the reference graph and not the import graph.
+    "nor by a qualified path, which needs no import at all" in {
+      err("no os\n\nprint(sysl.fs.exists(\"x\"))\n") should include("which requires 'os'")
+    }
+
+    "the import alone is enough, before anything is named through it" in {
+      err("no os\n\nimport sysl.fs.*\n\nprint(1)\n") should include("'sysl.fs', which requires 'os'")
+    }
+
+    "a named module is named in the message rather than called 'this module'" in {
+      errOf(
+        "thing/a.sysl" -> "module thing\nno os\n\nf() -> bool = sysl.fs.exists(\"x\")\n",
+        "main.sysl"    -> "print(thing.f())",
+      ) should include("'thing' declared 'no os'")
+    }
+
+    // Giving up `os` gives up `posix` with it, since POSIX needs an operating system under it — the
+    // implication runs the opposite way from the one `requires` follows.
+    "and 'no posix' does not, since posix is what needs an os rather than the other way round" in {
+      runOf("thing/a.sysl" -> "module thing\nno posix\n\nf() -> int = 1\n",
+        "main.sysl" -> "print(thing.f())") shouldBe "1\n"
+    }
+
+    "a module that said nothing reaches it freely" in {
+      run("import sysl.fs.exists\n\nprint(exists(\"/\"))\n") shouldBe "true\n"
+    }
+
+    /* The requirement is transitive: what a module reaches through a third is still what it
+     * reaches. A rule stated only over direct edges would let a `no os` module get at the whole of
+     * `sysl.fs` by writing one function in between. */
+    "and may not reach one through a module that says nothing itself" in {
+      val e = errOf(
+        "helper/a.sysl" -> "module helper\n\nthere(p: string) -> bool = sysl.fs.exists(p)\n",
+        "main.sysl"     -> "no os\n\nprint(helper.there(\"x\"))\n",
+      )
+
+      e should include("'helper'")
+      e should include("this module declared 'no os'")
+    }
+
+    "the clause and the requirement may be written on the same module without contradiction" in {
+      irOf("thing/a.sysl" -> "module thing\nrequires os\n\nf() -> int = 1\n",
+        "main.sysl" -> "print(thing.f())") should include("define")
+    }
   }
 }

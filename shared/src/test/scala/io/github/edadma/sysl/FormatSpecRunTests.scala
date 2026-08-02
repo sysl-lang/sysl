@@ -140,6 +140,8 @@ class FormatSpecRunTests extends AnyFreeSpec with RunSupport {
     "reaches a writer the program wrote itself" in {
       run("""struct Counter
             |    n: usize
+            |impl Fallible for Counter
+            |
             |impl Writer for Counter
             |    write(*self, bytes: []const u8)
             |        self.n += bytes.len

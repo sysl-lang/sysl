@@ -226,19 +226,40 @@ mean something a reader can rely on — a restricted type stays inside its regio
 in the safe direction: forbidding it now rules out nothing that a later rule would have had to keep
 allowing, while allowing it and tightening later would break programs.
 
-**Open: what an `impl` for a built-in reserves, in every program.** A type's members are one
-namespace whatever brought them (`08 § One name, one member`), and a member arrives with its type
-rather than with an import — which is the rule above, working. Together they mean that
-`sysl.math`'s `Float`, which the library ships, permanently claims each of its member names on
-`real` and on `f32` **for every program that compiles**, whether or not it ever mentions the module.
-`guide/fft` met this: it declares a `Zero` trait whose member is spelled `zero`, and cannot
-implement it for either float width, so its generic sum is demonstrated over `int` and over the
-program's own type instead.
+**A trait's member is reached where the trait is.** A type's members are one namespace whatever
+brought them (`08 § One name, one member`), and the members an `impl` block brings are in it — but
+which of them a use can *see* is a question about the **trait**, not about the type. A trait
+declared in this module, imported by name, offered by a wildcard, or carried by an auto-imported
+module is in scope; a library submodule's is not until a file asks for it, exactly as its values are
+not (`§3`).
 
-Nothing here is a defect — each rule is the one wanted — and the consequence is real and was not
-visible until a library implemented a wide trait for a built-in. What could answer it is a way for a
-member to be reached only where its trait is in scope, which is a different rule from the one above
-and is not designed here. Recorded with its customer.
+**This holds whether or not anything else declares the name.** A member is not reachable because
+there is nothing it might be confused with — a file that never named `sysl.math.Float` may not call
+`x.sqrt()`, and the diagnostic is the import, because an import is the whole of what it was missing.
+That makes a submodule cost a program exactly what it asked for in both halves: `pi` and `sqrt` are
+one rule, not a name rule and a member exception to it. The alternative was tried and is worse than
+it looks — if a lone member arrived unasked, then *adding* a trait of your own with that name would
+silently change which implementation an existing call meant, since your trait is in scope and the
+library's is not.
+
+This is what keeps an `impl` for a built-in from spending names. `sysl.math`'s `Float` declares some
+forty-one members on `real` and `f32`, and a program that never imports the module may still declare
+a trait of its own with any of those names and implement it for either width. `guide/fft` does: its
+`Zero` is implemented for `real` alongside the library's, and the bound on `sum` says which one the
+body means.
+
+**Two traits may therefore give one type a member of one name, and three things tell them apart, in
+this order.** A **bound** answers first, because inside a generic body the signature already said
+which trait was being asked for — and at an instantiation the parameter has become an ordinary type
+whose table holds both. **Scope** answers next, and is the only thing that *can* answer for two
+members that take no arguments: `zero()` and `zero()` differ in nothing a call writes. The
+**arguments** answer last, which is `08`'s existing rule for two implementations of one trait, now
+reached only once the first two have narrowed the set. A use that still reaches two is reported
+where it is written, naming both traits.
+
+What does **not** get a scope to be told apart by is a member of the type's **own** body: it is
+reachable wherever the type is, so a trait may not give a type a name its own declaration already
+used, and that is refused at the `impl`.
 
 ### Anything visible outside its file states its types
 
@@ -448,6 +469,14 @@ no alloc                        no alloc            // same clause, enforced ide
   the inferred half is asked of **what a module calls** rather than of which modules it depends on.
   `capabilities.md § Propagation` carries the argument; what belongs here is that this does not
   weaken §6, which is still what makes a *declared* requirement answerable in one sweep.
+- **For `os` and `posix`, the check is exactly the declaration, and it is asked of the graph this
+  chapter is about.** These gate which modules *exist* rather than what the language allows, so
+  there is nothing finer than a module to ask about: every declaration of `sysl.fs` is equally out
+  of reach of a module that wrote `no os`. The edge the rule is stated over is the **reference**
+  graph of §6 rather than the import graph, and that is load-bearing — a qualified path reaches
+  another module with no import at all (§3), so a rule about imports would have missed the shorter
+  of the two ways to write the mistake. The diagnostic lands at the reference for the same reason
+  `alloc`'s lands at the call: that is the line a reader has to change.
 
 ## 5. Platform selection rides the same name
 
@@ -507,8 +536,17 @@ the graph and not by which one is tidiest to move.
 
 The library's tree as it stands, read as edges: `sysl.sys` needs nothing; `sysl` reaches `sysl.sys`;
 `sysl.buf` reaches `sysl`; `sysl.text` reaches `sysl` and `sysl.buf`; `sysl.io` reaches all four;
-`sysl.args` reaches `sysl`, `sysl.buf` and `sysl.text`. Every edge runs away from the standard module
-and none runs back, which is what makes any of them removable from a program that never asks.
+`sysl.args` reaches `sysl`, `sysl.buf` and `sysl.text`; `sysl.fs` reaches `sysl`, `sysl.buf`,
+`sysl.text` and `sysl.io`. Every edge runs away from the standard module and none runs back, which is
+what makes any of them removable from a program that never asks.
+
+**`sysl.fs` is where the forward rule paid for itself a second time.** It holds the externs it needs
+rather than putting them in `sysl.sys`, which the "every declaration that is not sysl" convention
+would have suggested — because they are the only ones in the library that need an *operating system*
+under them rather than merely a C library, and `sysl.sys` carrying them would have meant either
+`sysl.sys requires os`, dragging printing and reading in behind it, or a module whose header says
+less than its contents do. A capability clause is a property of the module (§4), so what a module may
+truthfully claim is part of what decides where a declaration lives.
 
 Three things follow from acyclicity:
 
@@ -1164,13 +1202,14 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   what the library asks of its host, so the surface a freestanding target would have to supply is one
   file.
 
-  **It also shows what an import does and does not gate, which is not one answer.** A *name* in a
-  submodule has to be asked for — `pi`, `min` and `nan` all need the import, which is §1's rule and
-  the reason `sysl.math` is a submodule. A **member** does not: §2 puts an `impl` outside the
-  visibility rule in both directions, so implementing the trait for `real` files those methods under
-  `real`'s owner key and a program reaches them wherever it holds a float. Adding a submodule of
-  methods on a built-in therefore widens what every program can call without any program importing
-  anything, and whether that is the wanted answer is (b)'s question asked from the other side.
+  **It also shows what an import gates, which turned out to be one answer.** A *name* in a submodule
+  has to be asked for — `pi`, `min` and `nan` all need the import, which is §1's rule and the reason
+  `sysl.math` is a submodule. A **member** is asked for the same way, and §2 is where that is
+  written: it is reachable where its **trait** is, so implementing `Float` for `real` reaches the
+  files that named `Float` and no others. This was the other answer once, and the asymmetry is what
+  made the question worth asking — a submodule of methods on a built-in would otherwise widen what
+  every program can call without any program importing anything, and claim those member names from
+  every program that would ever compile. Both halves of that went away with the one rule.
 
   What was wrong with growing a *prelude* instead is worth keeping, because it is the constraint on
   the answer: a prelude declaration is one every program carries a **layout** for whether or not it is
@@ -1189,8 +1228,9 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   that the library can have workings that are not a public surface at all, is (c); `private[sysl]` on
   each declaration reaches the same place today, one declaration at a time.
 
-  **Six modules in, one boundary case decided the shape of the rule.** `sysl.sys`, `sysl.buf`,
-  `sysl.text`, `sysl.io`, `sysl.args` and `sysl.math` all fell out of "does the language reach it". The
+  **Seven modules in, one boundary case decided the shape of the rule.** `sysl.sys`, `sysl.buf`,
+  `sysl.text`, `sysl.io`, `sysl.args`, `sysl.math` and `sysl.fs` all fell out of "does the language
+  reach it". The
   `display_*` renderers do not: no desugaring names one, so the letter of the rule puts them in a
   `sysl.fmt` — and the split was *tried*, works, and needs nothing else to move once the tuple rows
   go with it, `13 §6` notwithstanding. They stay in `sysl` anyway, and the reason sharpens the rule

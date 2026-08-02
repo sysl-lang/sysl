@@ -543,21 +543,35 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "the error path" - {
-    // What the import does and does not gate, which is not the same answer for the two halves of the
-    // module. A *name* — `pi`, `min`, `nan` — lives in a submodule and has to be asked for, which is
-    // `13 §1`'s rule and the reason `sysl.math` is a submodule at all. A **member** does not: an
-    // `impl` block is outside the visibility rule in both directions (`13 §2`), so implementing
-    // `Float` for `real` files `sqrt` under `real`'s owner key and it is reached wherever a `real`
-    // is. Pinned here in both directions because the asymmetry is easy to change by accident.
+    // What the import gates, which is now one answer for both halves of the module. A *name* — `pi`,
+    // `min`, `nan` — lives in a submodule and has to be asked for, which is `13 §1`'s rule and the
+    // reason `sysl.math` is a submodule at all. A **member** is asked for the same way: it is
+    // reachable where its **trait** is (`13 §2`), so `Float` giving `real` a `sqrt` reaches only the
+    // files that named `Float`. Pinned in both directions because the symmetry is what a reader is
+    // owed — a submodule costs a program nothing it did not ask for, names and members alike.
     "a name from the module has to be asked for" in {
       err("print(pi)") should include("pi")
       err("print(min(1, 2))") should include("min")
       err("print(nan())") should include("nan")
     }
 
-    "a member arrives with the type it was implemented for" in {
+    "and so does a member, which is the same rule and not an exception to it" in {
+      // This suite's own `run` prepends the wildcard import, so this is the reachable direction.
       run("print((2.0).sqrt() > 1.414)") shouldBe "true\n"
-      super.run("print((144.0).sqrt(), (8.0).cbrt())") shouldBe "12 2\n"
+
+      // Without the import the member is not reachable, and the message is the import — there is
+      // nothing else a file in this position could have been missing.
+      val e = err("print((144.0).sqrt())")
+
+      e should include("'sqrt'")
+      e should include("sysl.math.Float")
+      e should include("not in scope")
+    }
+
+    // Naming the trait by hand reaches it exactly as a wildcard does, which is what makes the rule
+    // about the trait rather than about the module: `cbrt` comes with `Float` and not with `tau`.
+    "naming the trait alone is enough to reach its members" in {
+      super.run("import sysl.math.Float\nprint((144.0).sqrt(), (8.0).cbrt())") shouldBe "12 2\n"
     }
 
     "a width the trait was not implemented for" in {
@@ -585,21 +599,45 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err("import sysl.math.*\nprint(sysl_sqrt(2.0))") should include("sysl_sqrt")
     }
 
-    // The price of the members arriving with the type: the trait's names are now `real`'s and
-    // `f32`'s names, so a program cannot give either width a member of its own by one of them. The
-    // import makes no difference — this is refused with or without it. It is refused rather than
-    // shadowed, which is the answer that matters: two traits offering `sqrt` for one type would
-    // leave a call with no way to say which was meant.
-    "a program may not give a float a member the trait already names" in {
-      val clash =
+    // The library claims no names. A trait's members are reachable where the **trait** is in scope
+    // (`13 §2`), so `Float` giving `real` a `sqrt` leaves the name free for anyone else's trait to
+    // give it another — which is what keeps a shipped library implementing a wide trait for a
+    // built-in from spending those names on every program that will ever compile.
+    // `super.run`, because this suite's own `run` prepends the import and the point here is a file
+    // that did not write one.
+    "a program may give a float a member the trait already names" in {
+      val mine =
         """trait Mine
           |    sqrt(self) -> real
           |
           |impl Mine for real
-          |    sqrt(self) -> real = 42.0""".stripMargin
+          |    sqrt(self) -> real = 42.0
+          |
+          |main()
+          |    var x: real = 9.0
+          |    print(x.sqrt())""".stripMargin
 
-      err(clash) should include("type 'real' already has a member named 'sqrt'")
-      err(importing + clash) should include("type 'real' already has a member named 'sqrt'")
+      super.run(mine) shouldBe "42\n"
+    }
+
+    // And with both in scope the call is the thing that cannot be resolved — reported where it
+    // happens, naming both traits, rather than one of them silently winning.
+    "a call reaching both traits' member is refused, not silently resolved" in {
+      val both =
+        """import sysl.math.*
+          |
+          |trait Mine
+          |    sqrt(self) -> real
+          |
+          |impl Mine for real
+          |    sqrt(self) -> real = 42.0
+          |
+          |main()
+          |    var x: real = 9.0
+          |    print(x.sqrt())""".stripMargin
+
+      err(both) should include("'sqrt'")
+      err(both) should include("which was meant")
     }
 
     // `real` and `f64` are one type under one owner key (`02`), so the library's implementation is

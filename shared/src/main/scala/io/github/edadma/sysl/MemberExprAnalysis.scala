@@ -82,6 +82,9 @@ trait MemberExprAnalysis extends ExprSupport {
     case Field(receiver, f) =>
       val outer = analyzeExpr(receiver)
       val tr    = autoDeref(outer)
+      // A property is a method with the parentheses dropped, so it is reached through a value and
+      // needs the same question put to the source that a call does.
+      val via   = receiverBound(receiver)
       tr.ty match
         // A trait object has no fields: the layout is exactly what it forgot. What it still has is
         // whatever the trait declares, and a property is declared to be read exactly like this.
@@ -97,7 +100,7 @@ trait MemberExprAnalysis extends ExprSupport {
           else if f.forall(_.isDigit) then
             err(s"${show(t)} has ${quantity(t.fields.length, "part")}, so there is no '.$f' — " +
               s"the parts are numbered from 0")
-          else readProperty(tr, t, f)
+          else readProperty(tr, t, f, via)
 
         case s: Type.Struct =>
           val idx = s.fieldIndex(f)
@@ -106,10 +109,10 @@ trait MemberExprAnalysis extends ExprSupport {
             // Whatever qualifier the field was declared with stays in the struct's field list and
             // comes off here: reading a register yields an ordinary value (`03 § Device memory`).
             TField(tr, idx, Type.unqualified(s.fields(idx)._2))
-          else readProperty(tr, s, f)
+          else readProperty(tr, s, f, via)
 
         // An enum has no fields to shadow a member, so every name read off one is a property.
-        case e: Type.Enum => readProperty(tr, e, f)
+        case e: Type.Enum => readProperty(tr, e, f, via)
 
         // A bound promises behaviour, and a property is behaviour spelled like a field — so this is
         // a bound's to license after all, and it is checked at the definition like every other use
@@ -142,7 +145,7 @@ trait MemberExprAnalysis extends ExprSupport {
         // Any other type reaches its own members too, since an `impl` may be written for one and a
         // trait may ask for a property. A name none of them supplies is the older complaint, which
         // is the better one there: nothing about `x.foo` on an `int` says a property was meant.
-        case other if hasMember(other, f) => readProperty(tr, other, f)
+        case other if hasMember(other, f) => readProperty(tr, other, f, via)
 
         // Still a mode after the one automatic dereference, so the receiver carries more
         // indirection than selection reaches through (`03 § Places`). Falling through to the line
@@ -299,11 +302,11 @@ trait MemberExprAnalysis extends ExprSupport {
    * The absent-member wording is the one difference between the kinds: a struct's `x` could have
    * been either a field or a property, while an enum and a built-in have no fields to have meant.
    */
-  protected def readProperty(tr: TExpr, ty: Type, f: String): TExpr = {
+  protected def readProperty(tr: TExpr, ty: Type, f: String, via: Set[String] = Set.empty): TExpr = {
     val (base, _) = memberKey(ty, f)
     // A property takes no arguments, so where two implementations of one trait both supply one there
     // is nothing to say which is meant — which `pickOverload` reports as the call it is.
-    val chosen = pickOverload(ty, base, f, Nil)
+    val chosen = pickOverload(ty, base, f, Nil, via)
 
     memberDecls.get((base, chosen)) match
       case Some(m) if m.isProperty =>

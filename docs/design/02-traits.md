@@ -146,9 +146,20 @@ open. What it buys beyond convenience is that **a trait can grow**: adding a met
 does not break the implementations that already exist, which is the difference between a trait a
 library can evolve and one frozen at its first release. `14 §8 d` had to design around not having
 this — `FormatSpec` went into `Display`'s signature early precisely because adding a parameter later
-would have broken every `impl` — and the library now uses a default itself, for `Writer.failed` and
-`Reader.failed` alike (most sinks and most sources cannot fail, and one that cannot should not have to
-say so).
+would have broken every `impl` — and the library now uses a default itself, for `Fallible.failed`,
+which `Writer` and `Reader` both require (most sinks and most sources cannot fail, and one that cannot
+should not have to say so).
+
+**That the latch is one trait rather than two defaults is the first thing a two-way stream asked
+for.** It was written twice, once on each of the two traits, until an open file had to be both a
+source and a sink at once. Two traits may each declare a member of one name for one type — that is
+settled below, and a call says which by naming the trait — so what the library ran into was not a
+refusal but something worse to live with: `failed()` takes no arguments, and a program that reads and
+writes a file has *both* traits in scope by definition, so neither the arguments nor the scope can
+say which was meant and the call is refused at the use rather than at the declaration. **Permitted is
+not the same as answerable.** One required trait makes the question disappear instead of moving it,
+and it is the diamond the rule below says needs no rule of its own. What it costs is one line per
+implementation, `impl Fallible for MySink` with no block, which is the opt-in this section is about.
 
 **A default may assume of its receiver exactly what its own trait declares.** That is not a
 restriction bolted on; it is what a default *is*, since the body must serve every implementing type
@@ -352,11 +363,12 @@ there is no specialization rule and deliberately no place to add one — so **wh
 second is refused**, and the diagnostic names the one already there. The choice is between saying
 how every slice behaves and saying it slice type by slice type; not both.
 
-The same rule reaches member *names*, because a type's members are one namespace whatever trait
-brought them (`08`). A shape may not give a member a name that some slice written out in full
-already has, and vice versa — otherwise one name on one type would mean two different members
-depending on which table was asked, and a trait object's slot would be filled from the wrong one.
-Two traits with distinct member names are unaffected, exactly as they are for a struct.
+The same rule reaches member *names*, and the reason is the boundary rather than the namespace. A
+shape may not give a member a name that some slice written out in full already has, and vice versa —
+otherwise one name on one type would mean two different members depending on which table was asked,
+and a trait object's slot would be filled from the wrong one. **Two traits declaring one name are a
+different case and are allowed**, because a use of one of them says which by naming the trait
+(`13 §2`); what has no such answer is two *tables* that a lookup picks between without being told.
 
 This is also the boundary a **second implementation of one trait** does not cross. A type may
 implement a parameterized trait at more than one argument list (below), and what makes that work is
@@ -666,8 +678,11 @@ it appended *after* the slots, so no index moves.
 
 The diamond needs no rule of its own. `D: A + C` with both `A: B` and `C: B` carries `B`'s members
 once, because the walk takes each trait the first time it reaches it. What *is* refused is two traits
-in one closure declaring a member of the same name: a trait's members become the implementing type's
-and a type's members are one namespace, so this is the coherence rule one level up.
+in one closure declaring a member of the same name — and the reason is the **table**, not the
+namespace. Two unrelated traits may each name a member of one type, because a call says which by
+naming the trait (`13 §2`); two traits inside one requirement closure are laid out as one table,
+and a call through a `&Sub` has already forgotten everything that could have said which slot it
+meant.
 
 ```
 'R' and 'L' both declare 'len', and a trait's members become the implementing type's — so
@@ -768,10 +783,12 @@ type-argument entry already records.
   for — `Sink[T]`, `Into[T]` — with the difference that an argument is written by everything that
   names the trait rather than chosen once by the implementation. Which of the two a language wants,
   and whether it wants both, is a real question and is not answered here.
-- **Choosing between implementations of one trait for one type.** Refused above, because a type's
-  members are one namespace. Allowing `From[int]` and `From[real]` on one type needs a way for a use
-  to say which it means; that is what `11 § Open a`'s `?`-conversion is waiting on, not on generic
-  traits themselves.
+- **Choosing between implementations of one trait for one type.** ~~Refused above, because a type's
+  members are one namespace.~~ **Answered.** `From[int]` and `From[real]` may both be implemented for
+  one type: the members are filed under names that differ, and a use says which it means by the
+  arguments it wrote — which is the last of the three steps `13 §2` lays out, the other two being
+  the bound and the trait's scope. What `11 § Open a`'s `?`-conversion was waiting on is therefore
+  no longer this.
 - **A trait method with type parameters of its own.** An inherent member may declare them (`08`,
   `10 §4`); a trait's may not, and so neither may an `impl`'s, which must match what the trait
   declares. The refusal is a **decision**, and the diagnostic says so — it names the table slot that

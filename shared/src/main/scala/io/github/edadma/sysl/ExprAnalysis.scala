@@ -685,7 +685,7 @@ trait ExprAnalysis
     case Call(Field(Ident(written), mname), args)
         if lookupOpt(written).isEmpty && typeKey(written).isEmpty && traitKey(written).isEmpty &&
           typeNamed(written).isDefined =>
-      callTypeAssociated(typeNamed(written).get, mname, args, expected)
+      callTypeAssociated(typeNamed(written).get, written, mname, args, expected)
 
     case Call(Field(recv, mname), args) =>
       callMethod(recv, mname, args, expected)

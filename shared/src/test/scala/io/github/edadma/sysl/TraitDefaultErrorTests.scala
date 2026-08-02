@@ -133,10 +133,11 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("but trait 'Greet' declares")
     }
 
-    // Two defaults of one name are two bodies for one member, and nothing at the call site would
-    // say which — the same collision an inherent member of that name makes.
-    "two traits whose defaults share a name cannot both be implemented for one type" in {
-      err(
+    // Two defaults of one name are two bodies, and a default is filed exactly as a written method
+    // is — so this is `13 §2`'s case and not a collision: both blocks stand, and it is a *use*
+    // reaching both that has nothing to say which was meant.
+    "two traits whose defaults share a name may both be implemented for one type" in {
+      val both =
         """trait A
           |    tag(self) -> int = 1
           |trait B
@@ -144,8 +145,11 @@ class TraitDefaultErrorTests extends AnyFreeSpec with CodegenSupport {
           |struct C
           |    n: int
           |impl A for C
-          |impl B for C""".stripMargin
-      ) should include("already has a member named 'tag'")
+          |impl B for C
+          |""".stripMargin
+
+      ir(both + "main()\n    print(1)") should include("define")
+      err(both + "main()\n    print(C(1).tag())") should include("which was meant")
     }
 
     "an inherited default may not collide with a member the type already has" in {

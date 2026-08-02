@@ -573,8 +573,11 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "a type is callable at one arity, since its members are one namespace" in {
       // `Fn(int) -> int` and `Fn(int, int) -> int` are two traits, and each would give the type a
-      // member named `call` — which `08`'s one-name-one-member rule refuses. sysl has no
-      // overloading, so this falls out rather than being a rule of its own.
+      // member named `call`. Two traits naming one member is ordinarily allowed, told apart by
+      // which of them a file can name (`13 §2`) — but `call` is reached through the **call syntax**,
+      // which names no trait, so nothing a program could write would say which arity it meant.
+      // `callableOf` answers with the first it finds, which makes the second one silent rather than
+      // ambiguous, and that is what is refused here.
       err("""struct Twin
             |    k: int
             |
@@ -583,6 +586,24 @@ class ClosureEdgeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |
             |impl Fn(int, int) -> int for Twin
             |    call(*self, a: int, b: int) -> int = a + b
+            |""".stripMargin) should include("already has a member named 'call'")
+    }
+
+    // The same rule from the other side: a trait of the program's own may not take the name either,
+    // however ordinary that trait is. Two traits sharing a name are told apart by which is in scope,
+    // and the call syntax is exactly the use that has no trait in it to be told by.
+    "nor may a trait of the program's own take the name a call trait holds" in {
+      err("""struct Twin
+            |    k: int
+            |
+            |trait Mine
+            |    call(*self, a: int) -> int
+            |
+            |impl Fn(int) -> int for Twin
+            |    call(*self, a: int) -> int = a
+            |
+            |impl Mine for Twin
+            |    call(*self, a: int) -> int = a + 1
             |""".stripMargin) should include("already has a member named 'call'")
     }
 
