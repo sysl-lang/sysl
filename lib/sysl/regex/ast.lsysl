@@ -1,0 +1,258 @@
+sysl.regex — what a pattern parses to
+=====================================
+
+    module sysl.regex
+
+    import sysl.buf.{Buf, buf}
+    import sysl.text.Ascii
+
+A regular expression is a tree, and this file is the tree plus the two things hanging off it: the
+set a bracket expression stands for, and the ways a pattern can refuse to parse.
+
+The engine matches **characters**, not bytes. A `string` in sysl is UTF-8 by construction (`04`),
+so a `.` standing for one byte would be a promise the type does not make — it would match half of a
+two-byte character and hand back a span that `s[a..<b]` then refuses to cut. Every position the
+engine reports is a **byte offset at a character boundary**, which is exactly what a slice takes.
+
+
+The tree
+--------
+
+The AST is a recursive enum, reaching itself through `&Node`. That edge is what makes the cycle
+finite (`03 § Recursive types`), and it is the whole reason this reads as a tree at all: the same
+engine in the older sysl had no recursive types, so its AST was a flat array of five-field structs
+addressed by integer index, with `-1` standing for "no child" and bracket expressions kept in a
+side array reached by a second index. Every walk over it was an index lookup the type system could
+not check, and a node holding a child index into the wrong array was a wrong answer rather than a
+compile error.
+
+`Empty` is a node rather than an absence for the same reason. `a|` is a legal pattern whose second
+branch matches the empty string, and the older engine said so by returning `-1` from the branch
+parser — which is also what it returned for a parse failure, so the two could not be told apart.
+
+    enum Node
+        Empty
+        Lit(ch: char)
+        AnyChar
+        AtStart
+        AtEnd
+        InSet(of: CharClass)
+        Seq(left: &Node, right: &Node)
+        Alt(left: &Node, right: &Node)
+        Star(inner: &Node)
+        Plus(inner: &Node)
+        Quest(inner: &Node)
+        Group(inner: &Node, index: int)
+    end Node
+
+A pattern does not reach through a reference the way a field selection does, so every walk below
+starts by taking the reference apart with `*n match`. The compiler says so precisely when that is
+forgotten, which is how it was learned here rather than guessed.
+
+
+The named classes
+-----------------
+
+`[[:alpha:]]` and its eleven siblings are the one part of a bracket expression that is not a range.
+They are kept as what they are rather than expanded into ranges, so that each one is answered by
+the classifier that already exists for it in `sysl.text.Ascii` — `[[:punct:]]` is `is_punct`, not
+four hand-typed runs of the ASCII table that a reader has to check against it.
+
+Each is ASCII-only, which is what POSIX means by them in the C locale, and a character above 127
+answers `false` to every one. That is the trait's own guarantee rather than something restated here.
+
+    enum NamedClass
+        Alpha
+        Digit
+        Alnum
+        Upper
+        Lower
+        Space
+        Blank
+        Print
+        Graph
+        Cntrl
+        Punct
+        XDigit
+    end NamedClass
+
+    private admits_named(n: NamedClass, c: char) -> bool = n match
+        Alpha -> c.is_alpha()
+        Digit -> c.is_digit()
+        Alnum -> c.is_alnum()
+        Upper -> c.is_upper()
+        Lower -> c.is_lower()
+        Space -> c.is_space()
+        Blank -> c.is_blank()
+        Print -> c.is_print()
+        Graph -> c.is_graph()
+        Cntrl -> c.is_control()
+        Punct -> c.is_punct()
+        XDigit -> c.is_hex_digit()
+    end admits_named
+
+    private named_spelling(n: NamedClass) -> string = n match
+        Alpha -> "alpha"
+        Digit -> "digit"
+        Alnum -> "alnum"
+        Upper -> "upper"
+        Lower -> "lower"
+        Space -> "space"
+        Blank -> "blank"
+        Print -> "print"
+        Graph -> "graph"
+        Cntrl -> "cntrl"
+        Punct -> "punct"
+        XDigit -> "xdigit"
+    end named_spelling
+
+    named_class(name: string) -> Option[NamedClass] = name match
+        "alpha" -> Some(Alpha)
+        "digit" -> Some(Digit)
+        "alnum" -> Some(Alnum)
+        "upper" -> Some(Upper)
+        "lower" -> Some(Lower)
+        "space" -> Some(Space)
+        "blank" -> Some(Blank)
+        "print" -> Some(Print)
+        "graph" -> Some(Graph)
+        "cntrl" -> Some(Cntrl)
+        "punct" -> Some(Punct)
+        "xdigit" -> Some(XDigit)
+        else None
+    end named_class
+
+
+What a bracket expression stands for
+------------------------------------
+
+`[a-z0-9_[:space:]]` is a union of inclusive ranges and named classes, and `[^...]` is its
+complement. Both are one shape: ask whether the character falls in any member, then flip the answer
+if the class was negated.
+
+Ranges are over `u32` code points rather than over `char` so that the comparison is ordinary
+integer arithmetic on the value a character already carries.
+
+    struct CharRange
+        lo: u32
+        hi: u32
+    end CharRange
+
+    struct CharClass
+        ranges: &Buf[CharRange]
+        names: &Buf[NamedClass]
+        negated: bool
+
+        // Whether the class admits this character. The members are walked rather than looked up: a
+        // bracket expression holds a handful of them, and a bitmap would be both bigger and wrong
+        // for the characters above ASCII that `[^a]` has to admit.
+        admits(self, c: char) -> bool
+            var hit = false
+            var v = u32(c)
+
+            for i in 0usize..<self.ranges.len()
+                var r = self.ranges.at(i)
+
+                if v >= r.lo && v <= r.hi
+                    hit = true
+                    break
+
+            if !hit
+                for i in 0usize..<self.names.len()
+                    if admits_named(self.names.at(i), c)
+                        hit = true
+                        break
+
+            if self.negated then !hit else hit
+        end admits
+    end CharClass
+
+    char_class() -> CharClass = CharClass(buf(), buf(), false)
+
+
+Why a pattern was refused
+-------------------------
+
+Every case carries the offset in the *pattern* where the trouble is, which is what a caller needs
+to point at the character the author got wrong. The older engine carried a `string` message beside
+a `bool` flag; an enum is matched exhaustively instead, so a caller that wants to treat one case
+differently — an unknown class name is a typo, an unterminated group is a missing character — can,
+and adding a case makes every such caller say what it does about it.
+
+    enum RegexError
+        TrailingBackslash(at: usize)
+        UnterminatedClass(at: usize)
+        UnterminatedClassName(at: usize)
+        UnknownClassName(at: usize, name: string)
+        UnterminatedGroup(at: usize)
+        UnmatchedParen(at: usize)
+        UnterminatedInterval(at: usize)
+        MissingIntervalCount(at: usize)
+        BackwardsInterval(at: usize)
+        BackwardsRange(at: usize)
+        NothingToRepeat(at: usize)
+    end RegexError
+
+    describe(e: RegexError) -> string = e match
+        TrailingBackslash(at) -> s"a backslash ends the pattern, at $at"
+        UnterminatedClass(at) -> s"a bracket expression is never closed, opened at $at"
+        UnterminatedClassName(at) -> s"a [:name:] is never closed, opened at $at"
+        UnknownClassName(at, name) -> s"there is no character class named '$name', at $at"
+        UnterminatedGroup(at) -> s"a group is never closed, opened at $at"
+        UnmatchedParen(at) -> s"a ')' closes a group that was never opened, at $at"
+        UnterminatedInterval(at) -> s"an interval is never closed, opened at $at"
+        MissingIntervalCount(at) -> s"an interval needs a count, at $at"
+        BackwardsInterval(at) -> s"an interval counts down rather than up, at $at"
+        BackwardsRange(at) -> s"a range runs from high to low, at $at"
+        NothingToRepeat(at) -> s"a repetition has nothing before it to repeat, at $at"
+    end describe
+
+
+Reading a tree back
+-------------------
+
+`show` renders a node as a parenthesised term, which is what the parser is checked against. It is
+public rather than a test fixture because it is also the answer to "what did my pattern actually
+parse to", and a caller debugging a bracket expression that admits one character too many wants to
+see it — Go exposes its regex AST for the same reason.
+
+The form is deliberately not the pattern it came from. Round-tripping to pattern text would hide
+exactly the precedence mistakes the parser can make, because `a|bc` and `(a|b)c` differ only in
+where the parentheses go and both are legal patterns.
+
+    show(n: &Node) -> string = *n match
+        Empty -> "empty"
+        Lit(c) -> s"lit($c)"
+        AnyChar -> "any"
+        AtStart -> "start"
+        AtEnd -> "end"
+        InSet(cls) -> show_set(cls)
+        Seq(l, r) -> s"seq(${show(l)}, ${show(r)})"
+        Alt(l, r) -> s"alt(${show(l)}, ${show(r)})"
+        Star(i) -> s"star(${show(i)})"
+        Plus(i) -> s"plus(${show(i)})"
+        Quest(i) -> s"quest(${show(i)})"
+        Group(i, k) -> s"group$k(${show(i)})"
+    end show
+
+A range whose ends are equal came from a single character and is shown as one, so `[abc]` reads as
+`set(a,b,c)` rather than as three ranges that happen to be degenerate.
+
+    private show_set(cls: CharClass) -> string
+        var out = if cls.negated then "notset(" else "set("
+        var wrote = false
+
+        for i in 0usize..<cls.ranges.len()
+            var r = cls.ranges.at(i)
+
+            if wrote then out += ","
+            out += if r.lo == r.hi then str(char(r.lo)) else s"${char(r.lo)}-${char(r.hi)}"
+            wrote = true
+
+        for i in 0usize..<cls.names.len()
+            if wrote then out += ","
+            out += s"[:${named_spelling(cls.names.at(i))}:]"
+            wrote = true
+
+        out + ")"
+    end show_set
