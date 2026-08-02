@@ -329,7 +329,7 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   /** A transparent subtype shares its base's *representation*, which is what makes `Vec[Meters]` and
-   * `Vec[f64]` one instantiation. It does not share its base's **members**: the two are different
+   * `Vec[f64]` one emitted layout. It does not share its base's **members**: the two are different
    * implementations of one trait, and naming both after the base gave one symbol two definitions —
    * which the back end rejected outright rather than miscompiling, but only at the point where the
    * program was already built.

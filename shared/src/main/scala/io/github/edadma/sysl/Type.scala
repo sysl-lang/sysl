@@ -736,7 +736,10 @@ object Type {
    * one.
    *
    * A transparent constrained subtype mangles as its base, deliberately: sharing a representation
-   * is what makes `Vec[Meters]` and `Vec[f64]` one instantiation rather than two identical ones.
+   * is what makes `Vec[Meters]` and `Vec[f64]` one *emitted layout* rather than two identical ones.
+   * They remain two instantiations to the analyzer, and have to — only one of them checks what is
+   * written into it — so what the shared name obliges is that the layout be defined once, which is
+   * `Codegen`'s business rather than this function's.
    * Members are the place that rule must not reach — `Age`'s and `int`'s are different bodies, and
    * naming both `int.describe` gives one symbol two definitions. So a member of a constrained type
    * is prefixed with the type's own name whichever kind it is, which is also the key its members
