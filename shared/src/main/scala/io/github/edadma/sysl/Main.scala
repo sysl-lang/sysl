@@ -167,20 +167,42 @@ private[sysl] val parser = {
       opt[String]("ar")
         .action((a, c) => c.copy(ar = Some(a)))
         .text("the llvm-ar to build a library with; defaults to searching for one"),
-      opt[String]("optimize")
+      opt[String]('O', "optimize")
         .action((o, c) => c.copy(optimize = o))
         .text(s"the optimization level to hand clang, as it spells one after the '-O': " +
           s"defaults to ${Toolchain.defaultOptimization}, and '0' is the mode a miscompile was " +
-          s"once found in"),
+          s"once found in. '-O2' is written the way clang writes it"),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
 }
 
+/** `-O2` split into `-O` and `2`, which is the one place sysl's spelling of an option and the
+ * parser's disagree.
+ *
+ * A short option takes its value as the next argument, and clang's optimization flag is written
+ * **joined** — `-O2`, `-Os` — because that is how it has been written since cc. A short form that
+ * only worked detached would look like clang's flag without being it, which is a worse thing to
+ * offer than no short form at all, so the argument is rewritten rather than the spelling given up.
+ *
+ * Only that one letter, and only where something follows it: a bare `-O` still takes the next
+ * argument, and `--optimize` is untouched because it does not begin `-O`. Nothing here can reach a
+ * program's own arguments, which the caller has already split off at the `--`.
+ */
+private def splitJoinedLevel(args: Seq[String]): Seq[String] =
+  args.flatMap(a => if a.startsWith("-O") && a.length > 2 then Seq("-O", a.drop(2)) else Seq(a))
+
+/** sysl's own arguments, parsed. Held apart from the entry point so that a test asks the question a
+ * user's shell asks, rather than building a `Config` by hand and never finding out whether a flag is
+ * spelled the way it has to be typed.
+ */
+private[sysl] def parseArgs(own: Seq[String]): Option[Config] =
+  OParser.parse(parser, splitJoinedLevel(own), Config())
+
 @main def sysl(args: String*): Unit = {
   val (own, forwarded) = processArgs(args).span(_ != "--")
 
-  OParser.parse(parser, own, Config()) match
+  parseArgs(own) match
     case Some(cfg) => processExit(execute(cfg.copy(programArgs = forwarded.drop(1).toList)))
     case None      => processExit(2)
 }
