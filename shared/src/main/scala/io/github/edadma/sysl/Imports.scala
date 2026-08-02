@@ -82,11 +82,11 @@ object AutoImport {
 
   /** Runs `body` with `module` auto-imported as well — **for tests only**.
    *
-   * `devlib/demo` is what proved this mechanism on a library nothing depends on, before the standard
-   * module was asked to rely on it, and it goes on holding that proof. Reaching it needs a second
-   * auto-imported module, which is also the only thing that says two of them leave each other alone
-   * — but a development library has no business in a shipped compiler's list, so it is scoped to the
-   * test that wants it instead of living in the constant.
+   * `DevLibraryTests`' `demo` is what proved this mechanism on a library nothing depends on, before
+   * the standard module was asked to rely on it, and it goes on holding that proof. Reaching it needs
+   * a second auto-imported module, which is also the only thing that says two of them leave each
+   * other alone — but a development library has no business in a shipped compiler's list, so it is
+   * scoped to the test that wants it instead of living in the constant.
    *
    * **This is process-global, and suites run in parallel.** A module named here is therefore visible
    * to whatever else is compiling at the time. That is inert for almost everything, because

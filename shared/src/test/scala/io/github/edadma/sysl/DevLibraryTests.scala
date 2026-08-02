@@ -12,16 +12,16 @@ import org.scalatest.matchers.should.Matchers
  * bisect. It goes on earning its place for the same reason in reverse — these tests fail alone,
  * where the same defect reached through `sysl` fails everything.
  *
- * The library is `devlib/demo`, kept deliberately useless. What it is not useless *about* is shape
- * coverage: a generic is the reason a library ships bodies rather than signatures (it is
- * monomorphized in the program that calls it), and a trait with an `impl` is the reason the orphan
- * rule has to know whose rows those are.
+ * The library is the module `demo` below, written out in this file and kept deliberately useless.
+ * What it is not useless *about* is shape coverage: a generic is the reason a library ships bodies
+ * rather than signatures (it is monomorphized in the program that calls it), and a trait with an
+ * `impl` is the reason the orphan rule has to know whose rows those are.
  */
 class DevLibraryTests extends AnyFreeSpec with Matchers with RunSupport {
 
   /** The demo library as the driver would have read it off disk: one module, two files, each
-   * carrying the directory it was found under. Kept in step with `devlib/demo` by the test at the
-   * bottom, which reads the real files and compares.
+   * carrying the directory it was found under. Written here rather than on disk so the suite needs
+   * no filesystem and every platform's test run can read it.
    */
   private val numbers =
     """module demo
@@ -254,21 +254,7 @@ class DevLibraryTests extends AnyFreeSpec with Matchers with RunSupport {
     }
   }
 
-  "the checked-in library" - {
-
-    "is what these tests describe" in {
-      // The fixtures above are in-memory so the suite needs no filesystem, which means they could
-      // drift from `devlib/demo`. This is the guard: the real files are read and compared.
-      val root = DevLib.root
-
-      assume(root.isDefined, "devlib/demo not found from the test working directory")
-
-      val onDisk = Project.collect(root.get).map(s => s.name.split('/').last -> s.text).toMap
-
-      onDisk.keySet shouldBe Set("numbers.sysl", "pair.sysl")
-      onDisk("numbers.sysl") shouldBe numbers
-      onDisk("pair.sysl") shouldBe pair
-    }
+  "the library read as source" - {
 
     "compiles and links from source, exactly as the artifact does" in {
       assume(Toolchain.clangAvailable, "clang not available")
