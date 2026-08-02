@@ -71,7 +71,7 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     }
 
     // The C runtime is linked unasked everywhere it exists, so naming it is legal and costs nothing.
-    // `15 § Open c` opened with "-lc and friends", so it has to be writable.
+    // `15 §8` opened with "-lc and friends", so it has to be writable.
     "asks for libc nowhere, because every target that has one links it already" in {
       for t <- Target.all do
         withClue(t.name) { Toolchain.libraryFlags(List("c"), t) shouldBe empty }

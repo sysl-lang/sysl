@@ -231,6 +231,25 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
       back.links.head.pos.map(_.line) shouldBe parsed.links.head.pos.map(_.line)
     }
 
+    // The codec is what carries it, but a `.syslib` is what ships — so the assertion is made once
+    // through the container a consumer actually reads, and not only through the encoding inside it.
+    "a real artifact carries it to the program that links against it" in {
+      val lib = List(Source("demo/net.sysl",
+        "module demo\nlink \"z\"\n\nzipped(n: int) -> int = n + 1\n", List("demo")))
+
+      val meta = LibraryArtifact.build(lib) match
+        case Right((_, m)) => m
+        case Left(err)     => fail(s"the library did not build: $err")
+
+      val trees = LibraryArtifact.read("demo.syslib", meta, Target.default) match
+        case Right((units, _, _)) => units
+        case Left(err)            => fail(s"the metadata did not read back: $err")
+
+      Compiler.compiledWith(files("main.sysl" -> "print(demo.zipped(1))"), trees) match
+        case Right(built) => built.links should contain("z")
+        case Left(e)      => fail(s"did not compile against the artifact:\n$e")
+    }
+
     "and a library decoded from one still asks for it" in {
       val lib = SyslParser.parse("module thing\nlink \"z\"\n\nf() -> int = 1\n", "a.sysl") match
         case Right(p)  => p
