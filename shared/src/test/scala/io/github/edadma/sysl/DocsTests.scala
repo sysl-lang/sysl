@@ -49,6 +49,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/reference/statements.md"            -> (13, 1, 1),
     "docs/content/reference/declarations.md"          -> (10, 2, 0),
     "docs/content/reference/patterns.md"              -> (6, 4, 0),
+    "docs/content/reference/memory.md"                -> (21, 15, 0),
   )
 
   "every page on the site is accounted for" in {
