@@ -23,26 +23,33 @@ somebody already wrote for you, and where it will not be there.
 `sysl` is one module with submodules under it, and each is a directory. A program reaches the core
 without asking; everything below it is [imported](/reference/modules/) by name.
 
-| module | holds |
-|---|---|
-| `sysl` | the core — `Option`, `Result`, `Display`, the operator traits, `print`, `assert` |
-| `sysl.buf` | `Buf[T]`, the growable sequence, and `ByteSink` |
-| `sysl.text` | the whole text surface — validation, the character cursors, `Ascii` and `Search`, splitting and joining, `StrBuilder`, the parsers, `CString` |
-| `sysl.io` | `Reader`, `stdin()`, `lines()` |
-| `sysl.fs` | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` |
-| `sysl.math` | `max`, `min`, `pi`, the float functions, the integer traits `Signed` and `Bits`, and the integer arithmetic above them — `pow`, `gcd`, `lcm`, `divmod`, `is_power_of_two`, `next_power_of_two` |
-| `sysl.sync` | `Atomic[T]`, `SpinLock`, and the five memory orderings |
-| `sysl.thread` | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` |
-| `sysl.args` | `args_of`, for reading a raw `argv` |
-| `sysl.sys` | the platform seam — what a freestanding target replaces |
+| module | holds | requires |
+|---|---|---|
+| [`sysl`](/library/core/) | the core — `Option`, `Result`, `Display`, the operator traits, `print`, `assert` | — |
+| [`sysl.text`](/library/text/) | the whole text surface — validation, the character cursors, `Ascii` and `Search`, splitting and joining, `StrBuilder`, the parsers, `CString` | — |
+| [`sysl.buf`](/library/buf/) | `Buf[T]`, the growable sequence, and `ByteSink` | — |
+| [`sysl.io`](/library/io/) | `Reader`, `stdin()`, `lines()` | — |
+| [`sysl.fs`](/library/fs/) | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` | `os` |
+| [`sysl.math`](/library/math/) | `max`, `min`, `pi`, the float functions, the integer traits `Signed` and `Bits`, and the integer arithmetic above them — `pow`, `gcd`, `lcm`, `divmod`, `is_power_of_two`, `next_power_of_two` | — |
+| [`sysl.sync`](/library/sync/) | `Atomic[T]`, `SpinLock`, and the five memory orderings | — |
+| [`sysl.thread`](/library/thread/) | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` | `threads`, `posix` |
+| [`sysl.args`](/library/args/) | `args_of`, for reading a raw `argv` | — |
+| [`sysl.sys`](/library/sys/) | the platform seam — what a freestanding target replaces | — |
 
 **The split is by capability, not by taste.** `sysl.fs` is `requires os`, because a filesystem is
-something the environment either has or does not; `sysl.thread` is `requires threads`. That is why
-the atomics live apart from the threads: `sysl.sync` requires **nothing**, so a kernel can have a
-spinlock without acquiring a scheduler along with it.
-
-A module a target cannot support is therefore not a module that fails to link — it is one a
+something the environment either has or does not; `sysl.thread` is `requires threads` and `posix`,
+because pthreads is what it is built on. Those two are the whole of the column, and a module a target
+cannot support is therefore not one that fails to link — it is one a
 [capability clause](/reference/modules/) will not let that program import in the first place.
+
+That is why the atomics live apart from the threads: `sysl.sync` requires **nothing**, so a kernel
+can have a spinlock without acquiring a scheduler along with it.
+
+**`alloc` is not in that column, and the omission is the point.** No module requires it, because
+allocation is refused at the **call** rather than at the import — so a program under `no alloc` still
+imports `sysl.text` and still gets `from_utf8`, the cursors, and `Search`, and is refused only where
+it reaches for `join` or a `StrBuilder`. A capability that gated whole modules would have cost the
+allocator-free subset most of the library it can actually use.
 
 ## Where some of this already is
 
