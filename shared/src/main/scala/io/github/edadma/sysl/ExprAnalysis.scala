@@ -347,12 +347,23 @@ trait ExprAnalysis
     // A declared function named where nothing wants a callable. The name is not undefined — the
     // declaration is right above — and saying so sends the reader hunting for a typo instead of at
     // what is really missing: a context that says which call trait to build the function into
-    // (`§5`, `§6`). A function has no address of its own to fall back on, which is the other thing
-    // a reader arriving here may have been reaching for, so the message rules it out by name.
+    // (`§5`, `§6`).
+    //
+    // **The other thing it may be is an address**, and the two are deliberately different spellings:
+    // a bare name is the capture-free closure and `&name` is the address of code compiled to C's
+    // convention (`§6a`). Where the context asks for one of those outright — a `pthread_create`, a
+    // `qsort`, any interface that calls back — the missing `&` is the whole of the mistake, so the
+    // message names it rather than the two callable forms the reader did not want.
     case Ident(name) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
-      err(s"'$name' is a function, and a function becomes a value only where a callable is wanted — " +
-        "a bare-arrow parameter, or a '&Fn' where a concrete type is required. Nothing here asks " +
-        "for one, and a function has no address of its own to take instead")
+      err(
+        if expected.exists(t => cfnOf(t).isDefined) then
+          s"'$name' is a function, and what is wanted here is the address of one — write '&$name'. A " +
+            "bare name is the capture-free closure, which has no address a C interface could call"
+        else
+          s"'$name' is a function, and a function becomes a value only where a callable is wanted — " +
+            "a bare-arrow parameter, or a '&Fn' where a concrete type is required. Nothing here asks " +
+            s"for one; where the address of code is what is wanted, that is written '&$name'",
+      )
 
     case Ident(name) =>
       lookupOpt(name) match
