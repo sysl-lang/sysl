@@ -9,8 +9,10 @@ package io.github.edadma.sysl
  * growable byte buffer is `07`'s *Not yet*. What a program writes for itself is an ordinary
  * `impl Writer for MyThing`, and that is the case the trait exists for.
  *
- * Each table is laid out by hand in the order `Writer` declares its methods, which the analyzer
- * checks before it emits a node that reaches one.
+ * Each table is laid out by hand in the order `Writer` **offers** its methods — which is not the
+ * order it declares them, because a trait offers what it requires first: `Writer: Fallible` puts
+ * `failed` in slot 0 and `write` in slot 1. The analyzer checks that order against the flattened
+ * list every call site indexes into, before it emits a node that reaches one of these.
  */
 trait WriterEmitter extends Emitter {
 
@@ -27,6 +29,21 @@ trait WriterEmitter extends Emitter {
 }
 
 object WriterEmitter {
+
+  /** The order `Writer` offers its members in — which is **not** the order it declares them, since a
+   * trait offers what it requires first and `Writer: Fallible`.
+   *
+   * It is written down once because three things depend on it and none of them can see the other
+   * two: the two tables below are laid out by hand in this order, `Escape` reaches into a program's
+   * own `Writer` tables by slot, and every call through a `*Writer` indexes by whatever the analyzer
+   * computed. `SpecialForms.checkWriterShape` compares this list against the flattened member list
+   * the analyzer builds, so a library edit that reorders them fails the build here rather than
+   * calling the wrong function with the right arguments.
+   */
+  val members: List[String] = List("failed", "write")
+
+  /** Which slot of a `Writer`'s table holds the writing. */
+  val writeSlot: Int = members.indexOf("write")
 
   /** Writing to standard output. It goes through the library's own `putbytes` rather than straight
    * to the byte loop, so the one function a freestanding target replaces is still that one — the
@@ -47,7 +64,7 @@ object WriterEmitter {
       |  ret i1 false
       |}
       |
-      |@sysl.vt.out = private constant [2 x ptr] [ptr @sysl.w.out.write, ptr @sysl.w.out.failed]
+      |@sysl.vt.out = private constant [2 x ptr] [ptr @sysl.w.out.failed, ptr @sysl.w.out.write]
       |""".stripMargin
 
   /** Writing into a growable buffer, and finishing with one.
@@ -146,6 +163,6 @@ object WriterEmitter {
       |  ret { ptr, ptr, i64 } %s
       |}
       |
-      |@sysl.vt.buf = private constant [2 x ptr] [ptr @sysl.w.buf.write, ptr @sysl.w.buf.failed]
+      |@sysl.vt.buf = private constant [2 x ptr] [ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write]
       |""".stripMargin
 }

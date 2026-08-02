@@ -129,10 +129,11 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
     "may not keep the bytes it is written" in {
       err("""struct Bad
             |    held: []const u8
+            |impl Fallible for Bad
+            |
             |impl Writer for Bad
             |    write(*self, bytes: []const u8)
             |        self.held = bytes
-            |    failed(*self) -> bool = false
             |var b: Bad
             |var w: *Writer = &b
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
@@ -142,10 +143,11 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
     "may keep what it copies out of them" in {
       ir("""struct Ok
             |    n: usize
+            |impl Fallible for Ok
+            |
             |impl Writer for Ok
             |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
-            |    failed(*self) -> bool = false
             |var o: Ok
             |var w: *Writer = &o
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include("@main")
@@ -154,10 +156,11 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
     "is refused as a counted object where a raw one is asked for" in {
       err("""struct S
             |    n: usize
+            |impl Fallible for S
+            |
             |impl Writer for S
             |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
-            |    failed(*self) -> bool = false
             |var w: &Writer = S(0usize)
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
         s"'out' of '${Modules.show(Library.key("display_int"))}' is *sysl.Writer, " +
@@ -171,6 +174,8 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
     "and a member at the wrong signature is reported rather than crashing the table builder" in {
       val e = err("""struct Counter
                     |    n: usize
+                    |impl Fallible for Counter
+                    |
                     |impl Writer for Counter
                     |    write(*self, bytes: []u8)
                     |        self.n += bytes.len

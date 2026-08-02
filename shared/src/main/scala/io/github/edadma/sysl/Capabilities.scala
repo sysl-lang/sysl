@@ -24,6 +24,24 @@ object Capability {
   /** The core set, in the order a diagnostic lists them. */
   val core: List[String] = List(Alloc, Os, Posix, Threads)
 
+  /** The capabilities that gate **which standard-library modules exist**, as against `alloc`, which
+   * changes what the language allows (`capabilities.md § Two kinds of capability`).
+   *
+   * The distinction is what decides where each is enforced. `alloc` is asked of every construction
+   * that makes heap storage and of every call that reaches one, because the standard module is one
+   * module and half of it allocates. These are asked of the module **graph**, because what they gate
+   * is a whole module: a program either may name `sysl.fs` or may not.
+   */
+  val environment: Set[String] = Set(Os, Posix, Threads)
+
+  /** The ones a module may give up today.
+   *
+   * `threads` is absent because nothing gates thread creation yet, and a clause that compiled and
+   * enforced nothing would read in a source file as a guarantee the compiler never made. `os` and
+   * `posix` earned their place when the first module requiring one was written.
+   */
+  val narrowable: Set[String] = Set(Alloc, Os, Posix)
+
   /** `cap` together with everything it implies. */
   def closure(cap: String): Set[String] = implies.getOrElse(cap, Set.empty) + cap
 }
@@ -57,21 +75,38 @@ trait Capabilities extends AnalyzerBase {
 
     for (module, files) <- units.groupBy(declaredModule) do
       checkAgreement(module, files)
+      record(module, files.head)
 
-      // Only the clauses that survived are kept, so a module that wrote something the compiler
-      // refused is left with the set it would have had without it — which is what makes one mistake
-      // report once rather than again at every use of what the bad clause was about.
-      val kept                = files.head.capabilities.filter(enforceable)
-      val (narrows, requires) = kept.partition(_.direction == CapabilityDirection.Narrows)
+    // The library's own headers, read but **not checked**. They were checked when the library was
+    // built — and where this compilation is the one building it, those files are in `units` above
+    // and `contributed` leaves them out — so a complaint here would point at a file the program's
+    // author did not write and could not change.
+    //
+    // Reading them is what makes an environment capability answerable at all: `no os` is refused
+    // where it reaches `sysl.fs`, and there is no such thing as reaching `sysl.fs` unless
+    // `sysl.fs`'s own `requires os` has been read off the library this compilation was handed.
+    for (module, files) <- core.contributed(building).groupBy(declaredModule) do
+      record(module, files.head)
+  }
 
-      if narrows.nonEmpty then moduleNarrows(module) = spread(narrows)
-      if requires.nonEmpty then moduleRequires(module) = spread(requires)
+  /** What a module's clauses leave behind, which is the whole output of this pass.
+   *
+   * Only the clauses that survived `checkClause` are kept, so a module that wrote something the
+   * compiler refused is left with the set it would have had without it — which is what makes one
+   * mistake report once rather than again at every use of what the bad clause was about.
+   */
+  private def record(module: String, first: Program): Unit = {
+    val kept                = first.capabilities.filter(enforceable)
+    val (narrows, requires) = kept.partition(_.direction == CapabilityDirection.Narrows)
+
+    if narrows.nonEmpty then moduleNarrows(module) = spread(narrows)
+    if requires.nonEmpty then moduleRequires(module) = spread(requires)
   }
 
   /** Whether a clause is one `checkClause` let through. */
   private def enforceable(c: CapabilityClause): Boolean =
     Capability.implies.contains(c.name) &&
-      (c.direction == CapabilityDirection.Requires || c.name == Capability.Alloc)
+      (c.direction == CapabilityDirection.Requires || Capability.narrowable(c.name))
 
   /** Refuses a file that says the same thing about one capability twice, and one that says both
    * things about it.
@@ -115,20 +150,21 @@ trait Capabilities extends AnalyzerBase {
 
   /** Refuses a clause that names nothing, or that narrows away a capability nothing yet gates.
    *
-   * The second is the honest half. `no alloc` is checked at every construction that makes heap
-   * storage, so it means what it says; the other three gate **which standard-library modules
-   * exist**, and the modules they would gate are not written. A clause that compiled and enforced
-   * nothing would be worse than one that is refused, because it would read in a source file as a
-   * guarantee the compiler never made.
+   * The second is the honest half, and it is now down to one. `no alloc` is checked at every
+   * construction that makes heap storage; `no os` and `no posix` are checked against the module
+   * graph, which they could not be until a module requiring one existed (`sysl.fs` is the first).
+   * `threads` gates thread creation and the growable channel, and neither is built — a clause that
+   * compiled and enforced nothing would be worse than one that is refused, because it would read in
+   * a source file as a guarantee the compiler never made.
    */
   private def checkClause(c: CapabilityClause): Unit = {
     if !Capability.implies.contains(c.name) then
       err(s"no capability is called '${c.name}' — the set is ${Capability.core.map(n => s"'$n'").mkString(", ")}")
 
-    if c.direction == CapabilityDirection.Narrows && c.name != Capability.Alloc then
+    if c.direction == CapabilityDirection.Narrows && !Capability.narrowable(c.name) then
       err(s"'no ${c.name}' is not enforced yet, and would say something the compiler does not check: " +
-        s"'${c.name}' gates which standard-library modules exist, and those modules are not written. " +
-        "'no alloc' is the narrowing that means something today")
+        s"'${c.name}' gates thread creation and the growable channel, and neither is built. " +
+        "'no alloc', 'no os' and 'no posix' are the narrowings that mean something today")
   }
 
   /** Holds the files of one module to declaring the same clauses (`13 §4`).

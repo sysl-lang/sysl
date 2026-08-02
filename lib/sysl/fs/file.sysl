@@ -1,0 +1,197 @@
+module sysl.fs
+requires os
+
+import sysl.io.Reader
+import sysl.text.cstring
+
+// An open file, and the two directions it can be read and written in.
+//
+// **It is bound to C's buffered `FILE *` rather than to a file descriptor**, and that is the load-
+// bearing choice in this file. A descriptor would mean `open(2)`, and `open(2)` means `O_CREAT`,
+// `O_TRUNC` and `O_APPEND` -- three constants whose values differ between the two platforms this
+// builds for and which nothing in the program could check. `fopen` takes a *mode string*, which C
+// standardises, so the same three intentions cross the boundary as text that is right everywhere.
+// The buffering comes with it, which is the second reason: a `Writer` that reached the operating
+// system once per `write` would make rendering into a file cost a system call per fragment, and
+// `14 §2`'s rendering surface writes in fragments.
+//
+// What is given up is the descriptor itself. A program that needs one -- to poll it, to pass it to a
+// child -- is not served here and should say `open(2)` for itself, which is what `sysl.io`'s
+// `FdReader` is already shaped for. The two live side by side on purpose: `Reader` is about bytes
+// arriving, not about where a program got its handle.
+
+private[sysl] extern "fopen" c_fopen(path: *u8, mode: *u8) -> *u8
+private[sysl] extern "fclose" c_fclose(f: *u8) -> int
+private[sysl] extern "fread" c_fread(p: *u8, size: usize, n: usize, f: *u8) -> usize
+private[sysl] extern "fwrite" c_fwrite(p: *u8, size: usize, n: usize, f: *u8) -> usize
+private[sysl] extern "fflush" c_fflush(f: *u8) -> int
+private[sysl] extern "fseek" c_fseek(f: *u8, off: long, whence: int) -> int
+private[sysl] extern "ftell" c_ftell(f: *u8) -> long
+private[sysl] extern "ferror" c_ferror(f: *u8) -> int
+private[sysl] extern "feof" c_feof(f: *u8) -> int
+
+// Where a seek counts from. C standardises the three names and every platform has agreed on the
+// three values since V7, but the *names* are what the calls below read, so a reader never has to
+// know which is which.
+private seek_set() -> int = 0
+private seek_end() -> int = 2
+
+// The handle itself, and the two things that are true of it beyond the pointer.
+//
+// It is a struct of its own -- rather than the three fields sitting directly in `File` -- because of
+// what `File` has to survive being copied. A struct is a value here, so a `File` handed to a
+// function is a second `File`, and if it held the pointer directly then closing either would leave
+// the other holding a handle C has freed. Every copy sharing **one** `FileState` is what makes
+// `close` answerable at all: it is written once, and every copy sees it.
+struct FileState
+    handle: *u8
+    bad: bool
+    shut: bool
+end FileState
+
+// A file that is open, or that was.
+//
+// **Closing is the program's to do**, and `defer f.close()` is how it is written -- the language has
+// no destructor, so nothing runs at the end of a scope that the scope did not say. What the shared
+// state above buys is that saying it *twice* is harmless rather than a use-after-free, which is the
+// mistake a value type would otherwise make easy. Dropping a `File` without closing it leaks the
+// handle until the program exits, the same as in C.
+struct File
+    inner: &FileState
+
+    closed(*self) -> bool = self.inner.shut
+
+    // Hands the buffered bytes to the operating system. A program that writes and then waits, or
+    // that shares the file with something else, needs this; one that writes and closes does not,
+    // since `close` flushes on its way out.
+    flush(*self) -> Result[unit, IoError] =
+        if c_fflush(self.inner.handle) != 0 then Err(why()) else Ok(())
+
+    // Releases the handle, flushing what is still buffered.
+    //
+    // **It is idempotent**, and the second call is not merely tolerated -- it is the case `defer`
+    // creates. A function that closes on one path and defers the close for the others reaches the
+    // end having done both, and the alternative would be for every such function to carry a flag
+    // this can carry once.
+    //
+    // A failure here is a real one: the flush it performs is where a full disk finally reports, so a
+    // program that cares about its output checks this and not only the writes.
+    close(*self) -> Result[unit, IoError]
+        if self.inner.shut then return Ok(())
+
+        // Set before the call, not after: a failed `fclose` has released the handle all the same,
+        // so a retry would be the use-after-free this flag exists to prevent.
+        self.inner.shut = true
+
+        if c_fclose(self.inner.handle) != 0 then Err(why()) else Ok(())
+    end close
+
+    // Where the next read or write will happen, in bytes from the start.
+    tell(*self) -> Result[long, IoError]
+        var at = c_ftell(self.inner.handle)
+
+        if at < 0i64 then Err(why()) else Ok(at)
+    end tell
+
+    // Moves to an absolute offset, which also clears the end-of-file mark.
+    seek(*self, to: long) -> Result[unit, IoError] =
+        if c_fseek(self.inner.handle, to, seek_set()) != 0 then Err(why()) else Ok(())
+
+    // How many bytes the file holds, leaving the position where it found it.
+    //
+    // It is a seek to the end and back rather than a `stat`, and that is the same decision the
+    // header makes: `struct stat` is laid out differently by each platform's headers and a program
+    // transcribing it would be holding numbers nothing checks, while a seek is two calls whose
+    // signatures are all there is to get right.
+    size(*self) -> Result[long, IoError]
+        var here = c_ftell(self.inner.handle)
+
+        if here < 0i64 then return Err(why())
+        if c_fseek(self.inner.handle, 0i64, seek_end()) != 0 then return Err(why())
+
+        var n = c_ftell(self.inner.handle)
+
+        if n < 0i64 then return Err(why())
+        if c_fseek(self.inner.handle, here, seek_set()) != 0 then return Err(why())
+
+        Ok(n)
+    end size
+
+    // Whether a read has already run off the end. It answers about reads that **happened**, so it is
+    // false on a file just opened however empty that file is -- which is C's meaning, and the reason
+    // a read loop tests what `read` handed back rather than testing this first.
+    at_end(*self) -> bool = c_feof(self.inner.handle) != 0
+end File
+
+// Whether anything has gone wrong on this file since it was opened. It latches, so it is worth
+// asking once after a run of writes rather than after each -- which is the whole reason the surface
+// reports this way (`14 §6`).
+//
+// **It is written once, here, and that is what makes the two `impl` blocks below both possible.** A
+// trait's members become the implementing type's, so a `failed` declared by `Reader` and another
+// declared by `Writer` would be two members of one name on one type; both requiring `Fallible`
+// instead leaves this the single answer each of them reaches.
+impl Fallible for File
+    failed(*self) -> bool = self.inner.bad
+end File
+
+// Reading bytes out of a file is the `Reader` of `sysl.io`, whole and unmodified, which is what lets
+// `lines(&f)` work over a file with nothing here knowing about lines.
+//
+// An empty answer means the end of the input and nothing more. Whether the input ended *badly* is
+// what `failed` reports, and the two are separate questions because a caller that does not care
+// should not have to ask -- the same split `FdReader` makes.
+impl Reader for File
+    read(*self, into: []u8) -> []const u8
+        if into.len == 0usize then return into
+
+        var got = c_fread(&into[0], 1usize, into.len, self.inner.handle)
+
+        // `fread` reports a short count for the end of the file and for a failure alike, so the
+        // error flag is the only thing that tells them apart, and it is asked only when nothing
+        // arrived -- a partial read that hit the end is not a failure.
+        if got == 0usize && c_ferror(self.inner.handle) != 0 then self.inner.bad = true
+
+        into[0..<got]
+    end read
+end File
+
+// And writing them is the `Writer` of `14 §2`, so everything that renders into a sink renders into a
+// file. It latches rather than returning, which is what keeps `f.write(b)` a statement.
+impl Writer for File
+    write(*self, bytes: []const u8)
+        if bytes.len > 0usize
+            var put = c_fwrite(&bytes[0], 1usize, bytes.len, self.inner.handle)
+
+            if put < bytes.len then self.inner.bad = true
+    end write
+end File
+
+// The three ways a program opens a file, named for what it means rather than for the mode string it
+// becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
+// `append` writes at the end of whatever is there, making the file if it is not.
+open(path: string) -> Result[File, IoError] = opened(path, c"rb")
+
+create(path: string) -> Result[File, IoError] = opened(path, c"wb")
+
+append(path: string) -> Result[File, IoError] = opened(path, c"ab")
+
+// A file opened for reading **and** writing, which the three above cannot express between them: each
+// of C's update modes is a different answer to "and what about what is already there", and naming
+// them apart is what keeps a caller from having to know that `"r+"` fails on a missing file while
+// `"w+"` empties one that exists.
+open_update(path: string) -> Result[File, IoError] = opened(path, c"r+b")
+
+create_update(path: string) -> Result[File, IoError] = opened(path, c"w+b")
+
+// The mode string is a literal at every call above, so it costs no allocation and there is no
+// direction from a `string` into one -- which is also why this is private. A program wanting a mode
+// the four names do not cover is asking for C's spelling, and that is a good thing to have to say
+// out loud with an `extern` of its own.
+private opened(path: string, mode: *u8) -> Result[File, IoError]
+    var h = c_fopen(cstring(path).ptr, mode)
+
+    if h == null then return Err(why())
+
+    Ok(File(FileState(h, false, false)))
+end opened

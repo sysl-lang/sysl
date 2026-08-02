@@ -116,10 +116,14 @@ private class Escape(program: TProgram) {
   private def borrowed: List[String] = {
     // Both flavours of a type's table name the same implementation, so the offender is named once
     // however many ways the program erased it.
+    // The writing is **not** the first slot: `Writer: Fallible`, and a trait offers what it requires
+    // before what it declares. Reaching for the head would ask this question of `failed`, which
+    // keeps nothing, and would quietly stop refusing the implementations this check exists for —
+    // so the slot is read from the one place the layout is written down.
     val offenders =
       for
         vt   <- program.vtables if vt.traitName == Library.key("Writer")
-        slot <- vt.slots.headOption.toList if keeps((slot.target, 1))
+        slot <- vt.slots.lift(WriterEmitter.writeSlot).toList if keeps((slot.target, 1))
       yield slot.target
 
     offenders.distinct.map { name =>

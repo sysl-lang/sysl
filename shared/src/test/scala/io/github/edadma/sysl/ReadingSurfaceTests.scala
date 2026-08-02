@@ -60,6 +60,8 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
       |
       |bytes_reader(b: []const u8) -> Bytes = Bytes(b, 0usize)
       |
+      |impl Fallible for Bytes
+      |
       |impl Reader for Bytes
       |    read(*self, into: []u8) -> []const u8
       |        var n = 0usize
@@ -198,6 +200,8 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
         """struct Empty
           |    unused: int
           |end Empty
+          |
+          |impl Fallible for Empty
           |
           |impl Reader for Empty
           |    read(*self, into: []u8) -> []const u8 = into[0..<0usize]
@@ -577,6 +581,8 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
            |    inner: &Bytes
            |end Trickle
            |
+           |impl Fallible for Trickle
+           |
            |impl Reader for Trickle
            |    read(*self, into: []u8) -> []const u8
            |        if into.len == 0usize then return into
@@ -602,6 +608,8 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
           |    at: usize
           |end Canned
           |
+          |impl Fallible for Canned
+          |
           |impl Reader for Canned
           |    read(*self, into: []u8) -> []const u8
           |        if self.at > 0usize then return self.text[0..<0usize]
@@ -625,6 +633,8 @@ class ReadingSurfaceTests extends AnyFreeSpec with RunSupport {
         """struct Stutter
           |    step: int
           |end Stutter
+          |
+          |impl Fallible for Stutter
           |
           |impl Reader for Stutter
           |    read(*self, into: []u8) -> []const u8

@@ -146,9 +146,16 @@ open. What it buys beyond convenience is that **a trait can grow**: adding a met
 does not break the implementations that already exist, which is the difference between a trait a
 library can evolve and one frozen at its first release. `14 §8 d` had to design around not having
 this — `FormatSpec` went into `Display`'s signature early precisely because adding a parameter later
-would have broken every `impl` — and the library now uses a default itself, for `Writer.failed` and
-`Reader.failed` alike (most sinks and most sources cannot fail, and one that cannot should not have to
-say so).
+would have broken every `impl` — and the library now uses a default itself, for `Fallible.failed`,
+which `Writer` and `Reader` both require (most sinks and most sources cannot fail, and one that cannot
+should not have to say so).
+
+**That the latch is one trait rather than two defaults is what the coherence rule above forced.** It
+was written twice, once on each of the two traits, until the first type that was both a source and a
+sink — an open file — could not exist: a trait's members become the implementing type's, so two
+`failed` declarations are two members of one name. Sharing one required trait is the fix, and it is
+the diamond the rule below says needs no rule of its own. What it costs is one line per
+implementation, `impl Fallible for MySink` with no block, which is the opt-in this section is about.
 
 **A default may assume of its receiver exactly what its own trait declares.** That is not a
 restriction bolted on; it is what a default *is*, since the body must serve every implementing type

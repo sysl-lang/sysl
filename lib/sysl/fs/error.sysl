@@ -1,0 +1,131 @@
+module sysl.fs
+requires os
+
+// What a filesystem call reports when it does not succeed, and the one number it comes from.
+//
+// `11 §` puts this class of failure — something outside the program, a file or a user or a device —
+// on `Result` rather than on a trap, and this is the error half of every `Result` the module hands
+// back. It is an enum rather than a bare `int` for the reason `Result` carries its error as a type
+// parameter at all: a caller that wants to act on *why* wants to match, and a match over named
+// cases is exhaustive where a comparison against a number is a guess that compiled.
+//
+// The cases are the ones a program branches on. Everything else arrives as `Other`, carrying the
+// number, because a library that mapped every `errno` to a name of its own would be a table nobody
+// could keep current and a program could not extend -- and the number is what a reader looks up
+// anyway.
+//
+// **The module requires `os`.** Nothing here is language, and nothing here can be given a body on a
+// target with no filesystem under it: a freestanding image has no `fopen` to call and no `errno` to
+// read. `capabilities.md` reserves `os` for exactly this and the clause is what says so in the one
+// place a reader of the file will see it.
+
+// `errno` is a **function** on both platforms this builds for, not a variable -- C spells it as a
+// macro expanding to a dereference so that a threaded program gets its own -- so the binding is to
+// whatever that macro expands to rather than to a symbol called `errno`, which does not exist.
+//
+// The `#else` is Linux's spelling rather than a refusal, and deliberately: an `extern` costs nothing
+// until something links it, so a target that has neither still *compiles* this module and fails at
+// the link with the name it could not find. The alternative -- no declaration at all -- would fail
+// in the compiler, on a file the program never called into.
+#if macos
+private[sysl] extern "__error" errno_location() -> *i32
+#else
+private[sysl] extern "__errno_location" errno_location() -> *i32
+#endif
+
+// The number the last failed call left behind. Only meaningful straight after one that failed: a
+// call that succeeds may leave it at anything, which is why nothing here reads it unless a return
+// value already said something went wrong.
+private[sysl] last_errno() -> int = errno_location()[0usize]
+
+// A directory that still has something in it. The one code in this set whose value differs between
+// the two platforms -- the rest are V7 Unix's, and have been the same numbers everywhere since.
+#if macos
+private[sysl] not_empty() -> int = 66
+#else
+private[sysl] not_empty() -> int = 39
+#endif
+
+// Why a filesystem operation did not happen.
+enum IoError
+    NotFound
+    PermissionDenied
+    AlreadyExists
+    NotADirectory
+    IsADirectory
+    DirectoryNotEmpty
+    TooManyOpenFiles
+    NoSpaceLeft
+    Interrupted
+    Other(code: int)
+
+    // The number this came from, so a program can report or compare one the set does not name.
+    // `Other` carries its own; the named cases hand back the code they were recognised from, which
+    // is what keeps `e.code()` answerable without a second table.
+    code(self) -> int = self match
+        NotFound         -> 2
+        PermissionDenied -> 13
+        AlreadyExists    -> 17
+        NotADirectory    -> 20
+        IsADirectory     -> 21
+        DirectoryNotEmpty -> not_empty()
+        TooManyOpenFiles -> 24
+        NoSpaceLeft      -> 28
+        Interrupted      -> 4
+        Other(c)         -> c
+
+    // A sentence, in the terms the operation was asked in rather than in C's.
+    message(self) -> string = self match
+        NotFound          -> "no such file or directory"
+        PermissionDenied  -> "permission denied"
+        AlreadyExists     -> "already exists"
+        NotADirectory     -> "not a directory"
+        IsADirectory      -> "is a directory"
+        DirectoryNotEmpty -> "directory not empty"
+        TooManyOpenFiles  -> "too many open files"
+        NoSpaceLeft       -> "no space left on the device"
+        Interrupted       -> "interrupted"
+        Other(c)          -> f"error $c%d"
+end IoError
+
+// So that `print(e)` and `f"$e%s"` say the sentence rather than the shape of the value.
+impl Display for IoError
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+end IoError
+
+// A number from the platform as the case it stands for.
+//
+// The chain is over `errno` values rather than over a name per platform because these are the codes
+// that have been stable since V7 -- `ENOENT` has been 2 on every Unix anyone has shipped -- and the
+// one that is not is `not_empty` above, which is why it is a call rather than a literal here.
+private[sysl] from_errno(code: int) -> IoError
+    if code == 2 then
+        NotFound
+    elif code == 13 || code == 1 then     // EACCES, and EPERM which a caller cannot tell apart
+        PermissionDenied
+    elif code == 17 then
+        AlreadyExists
+    elif code == 20 then
+        NotADirectory
+    elif code == 21 then
+        IsADirectory
+    elif code == not_empty() then
+        DirectoryNotEmpty
+    elif code == 24 then
+        TooManyOpenFiles
+    elif code == 28 then
+        NoSpaceLeft
+    elif code == 4 then
+        Interrupted
+    else
+        Other(code)
+end from_errno
+
+// What every call in this module reports with when it has just been told something failed. It reads
+// `errno` itself rather than taking one, so the reading happens at the failure instead of wherever
+// the caller got round to it -- there is nothing between the two that could overwrite it.
+//
+// It answers the **error**, not a `Result` around it, so that the call site writes `Err(why())` and
+// the type of the result comes from what receives it. A generic `failure[T]()` would have had to be
+// given its type argument at the call, which is not something a call may say (`10 §`).
+private[sysl] why() -> IoError = from_errno(last_errno())

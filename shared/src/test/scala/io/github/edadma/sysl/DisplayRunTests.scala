@@ -166,10 +166,11 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
     "receives the bytes of everything rendered into it" in {
       run("""struct Counter
             |    n: usize
+            |impl Fallible for Counter
+            |
             |impl Writer for Counter
             |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
-            |    failed(*self) -> bool = false
             |var c: Counter
             |var w: *Writer = &c
             |display_int(12345, w, FormatSpec(0, -1, false))
@@ -182,6 +183,8 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
     "may leave out 'failed', which the trait defaults to false" in {
       run("""struct Counter
             |    n: usize
+            |impl Fallible for Counter
+            |
             |impl Writer for Counter
             |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
@@ -191,17 +194,20 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
             |print(c.n, w.failed())""".stripMargin) shouldBe "3 false\n"
     }
 
-    // The latch: a write that overruns sets a flag the trait's other method reports, and nothing in
-    // between had to return or check anything.
+    // The latch: a write that overruns sets a flag the *required* trait reports, and nothing in
+    // between had to return or check anything. A sink that can fail is where the two blocks earn
+    // their separation — `Fallible` carries the answer and `Writer` carries the writing.
     "latches a failure the writes themselves do not report" in {
       run("""struct Cap
             |    n: usize
             |    over: bool
+            |impl Fallible for Cap
+            |    failed(*self) -> bool = self.over
+            |
             |impl Writer for Cap
             |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
             |        if self.n > 4usize then self.over = true
-            |    failed(*self) -> bool = self.over
             |var c: Cap
             |var w: *Writer = &c
             |display_str("abc", w, FormatSpec(0, -1, false))
@@ -214,10 +220,11 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
       run(point +
         """struct Counter
           |    n: usize
+          |impl Fallible for Counter
+          |
           |impl Writer for Counter
           |    write(*self, bytes: []const u8)
           |        self.n += bytes.len
-          |    failed(*self) -> bool = false
           |var c: Counter
           |var w: *Writer = &c
           |Point(10, 20).display(w, FormatSpec(0, -1, false))

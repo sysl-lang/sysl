@@ -316,11 +316,16 @@ trait SpecialForms extends Closures {
    * edit to the library into a failed build instead of a call through the wrong slot.
    */
   private def checkWriterShape(): Unit = {
-    val declared = traitDecls.get(Library.key("Writer")).map(_.methods.map(_.name)).getOrElse(Nil)
+    // The **flattened** list, which is what a table is and what every call site indexes into: a
+    // trait offers what it requires before what it declares, so `Writer: Fallible` puts `failed`
+    // in the first slot and `write` in the second. Reading the declaration alone would have missed
+    // exactly the change that moved them.
+    val offered = traitMembers(Type.Bound(Library.key("Writer"), Nil)).map(_._2.name)
 
-    if declared != List("write", "failed") then
-      sys.error(s"the compiler's own writers assume 'Writer' declares 'write' then 'failed', " +
-        s"but the library declares ${declared.mkString("'", "', '", "'")}")
+    if offered != WriterEmitter.members then
+      sys.error(s"the compiler's own writers are laid out as " +
+        s"${WriterEmitter.members.mkString("'", "', '", "'")}, " +
+        s"but 'Writer' offers ${offered.mkString("'", "', '", "'")}")
   }
 
   /** Standard output as a sink. Recording `putbytes` is what brings it into the program: the table
