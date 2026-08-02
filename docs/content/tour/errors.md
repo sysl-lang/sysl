@@ -208,6 +208,87 @@ Two things make that ordinary code. A diverging arm has a type — `never` — s
 `Some(v) -> v` and the `match` still has the payload's type rather than a conflict. And the departure
 itself is an `extern`: the library declares `exit(code: int) -> never`, so stopping is a call.
 
+## `defer` — releasing what ARC does not
+
+`?` has a consequence worth facing directly: it makes leaving early the **normal** way out of a
+function. That is fine for everything ARC owns — a `&T`, a string, a slice's backing all go back on
+their own — and it is a problem for everything else. A file descriptor from `open`, a block from
+`malloc`, a lock taken from a mutex: those are released by hand, and a function with four exits has
+four places to remember.
+
+`defer <statement>` runs that statement on the way out of the block containing it, so the release is
+written **beside the call that took the resource**, once:
+
+```sysl
+acquire(n: int) -> Result[int, string]
+    if n > 0 then Ok(n)
+    else Err("cannot acquire")
+
+step(n: int) -> Result[int, string]
+    if n % 2 == 0 then Ok(n * 10)
+    else Err("odd step")
+
+run(n: int) -> Result[int, string]
+    var h = acquire(n)?
+
+    defer print("released", h)
+
+    var v = step(h)?
+
+    print("finished with", v)
+
+    Ok(v)
+
+print(run(4).is_ok())
+print(run(3).is_ok())
+```
+
+```output
+finished with 40
+released 4
+true
+released 3
+false
+```
+
+Both exits ran it. `run(4)` fell off the end and `run(3)` left through the `?` in the middle, and
+neither one had to say so — which is the entire point, because the second exit is the one a program
+forgets.
+
+Two rules make it predictable. **Several in one block run last-registered-first**, so they undo in
+the reverse of the order they were set up. And **a `defer` runs only if control reached it**: it is a
+statement, not a declaration, so one below an early return never registered at all. In the program
+above, a failure from `acquire` returns before the `defer` line, and nothing is released — correctly,
+since nothing was acquired.
+
+The scope is the **block**, not the function, and a loop is where that shows:
+
+```sysl
+for i in 0..<2
+    defer print("close", i)
+
+    print("open", i)
+
+print("done")
+```
+
+```output
+open 0
+close 0
+open 1
+close 1
+done
+```
+
+Go runs its `defer` at function exit, so the same loop would hold two resources to the end and
+release both at once — which is how a loop over ten thousand files runs out of descriptors. Here each
+iteration is a block and each closes its own.
+
+One thing `defer` is not: a `finally`. **A trap runs nothing.** A broken invariant means the
+program's model of itself is already wrong, and cleanup run against that state is how a corrupt
+program writes its corruption out. `defer` releases a resource; it does not rescue a bug — which is
+the subject of the rest of this page.
+
 ## Traps
 
 The other channel. A trap is the runtime response to a broken invariant, and what it does is settled:
