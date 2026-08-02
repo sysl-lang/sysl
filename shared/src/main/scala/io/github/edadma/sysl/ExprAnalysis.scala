@@ -901,12 +901,8 @@ trait ExprAnalysis
       case TIndex(recv, _, _) if recv.ty == Type.Str =>
         err("a string is immutable, so its bytes have no address to write through")
 
-      // `s.bytes` reinterprets the same three words as a `[]u8` (`04`), so its elements are the
-      // string's own storage and assigning to one is the line above by another route — with a
-      // literal's bytes in read-only memory, a segfault out of a program containing no `*T` at all.
-      //
-      // `s.bytes` reinterprets the same three words as a `[]u8` (`04`), so its elements are the
-      // string's own storage and assigning to one is the line above by another route — with a
+      // `s.bytes` reinterprets the same three words as a `[]const u8` (`04`), so its elements are
+      // the string's own storage and assigning to one is the line above by another route — with a
       // literal's bytes in read-only memory, a segfault out of a program containing no `*T` at all.
       case TIndex(_: TBytes, _, _) if writes =>
         err("a string is immutable, and 'bytes' views the string's own storage rather than a copy " +

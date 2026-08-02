@@ -27,8 +27,9 @@ writes by name is `sysl.text`.** A literal, `+`, `str(x)`, an interpolation and 
 desugarings, so they cost no import — even `s.chars`, whose cursor is `sysl.text`'s, because the
 compiler names `chars_of` by key rather than by resolving the word (`13 §8`). Named at the call
 site, and so imported: `from_utf8`, `from_cstring`, `char_from_u32`, `str_builder`, `cstring`, and
-the types `Utf8Error`, `Chars`, `StrBuilder` and `CString`. The split is the one `13 § Open h`
-describes — what a program cannot avoid needing is free, and what it has to ask for it asks for.
+the types `Utf8Error`, `Chars`, `StrBuilder`, `CString` and the `Ascii` trait. The split is the one
+`13 § Open h` describes — what a program cannot avoid needing is free, and what it has to ask for it
+asks for.
 
 ## The decision in one paragraph
 
@@ -120,8 +121,8 @@ Construction:
 | From | Spelling | Behaviour |
 |---|---|---|
 | literal | `"héllo"` | validated at compile time |
-| bytes | `from_utf8(b: []u8) -> Result[string, Utf8Error]` | validates; the error names the offending byte offset |
-| bytes, trusted | `from_utf8_unchecked(b: []u8) -> string` | **unsafe** — the long name is the point: it stays greppable |
+| bytes | `from_utf8(b: []const u8) -> Result[string, Utf8Error]` | validates; the error names the offending byte offset |
+| bytes, trusted | `from_utf8_unchecked(b: []const u8) -> string` | **unsafe** — the long name is the point: it stays greppable |
 | a `char` | `string(c)` | encodes one scalar value |
 
 `from_utf8_unchecked` is in the `*T` category deliberately: breaking the UTF-8 invariant
@@ -183,7 +184,7 @@ choice is right for a systems language; Swift's is right for an application lang
 | byte length | `s.len` | O(1) |
 | byte at an index | `s[i] -> u8` | O(1), bounds-checked |
 | substring | `s[a..b] -> string` | O(1), shares; bounds-checked **and** boundary-checked |
-| bytes | `s.bytes -> []u8` | O(1) view |
+| bytes | `s.bytes -> []const u8` | O(1) view |
 | scalar values | `s.chars` | O(1) per step, total — no replacement characters |
 | copy out | `s.copy() -> string` | O(n), allocates; releases the parent |
 | concatenation | `a + b` | O(n), allocates |
@@ -214,6 +215,37 @@ permits the mid-codepoint slice and lets you build an invalid string with it —
 closed here by the validity guarantee. This holds for a string that arrived through `from_utf8`
 exactly as it does for a literal, which is the point of validating at the door: nothing downstream
 may undo it.
+
+### Classification is ASCII, and is named for it
+
+Asking what kind of thing a byte or a character is — a digit, a letter, whitespace — is the `Ascii`
+trait in `sysl.text`. **It answers over the ASCII range and nothing else, and the name is the
+promise:** a value at or above 128 answers `false` to every question rather than being guessed at,
+and `is_ascii` is how a caller distinguishes "not a letter" from "not a letter I can see". Real
+Unicode classification needs property tables, which is the same argument that puts grapheme
+clusters in a library above this one: they must not be in a kernel.
+
+The older sysl called the equivalent module `unicode` and classified nothing above 127, so every
+caller read a promise the code did not keep. That is the mistake this name exists to avoid.
+
+**It is a trait rather than two sets of functions**, for exactly the reason `sysl.math.Float` is
+one: sysl has no overloading, so free functions would need `is_digit` for a `u8` and some suffixed
+twin for a `char`, and every caller would have to track which it was holding. `b.is_digit()` is the
+same three words either way. The pair is *closed*, which is what makes an `impl` the right mechanism
+here and the wrong one for the integers — `sysl.math.Signed` cannot be written this way because
+`iN` is an open family and a finite set of blocks would leave widths out, while a byte and a
+character are the only two types this question is ever asked of.
+
+Each implementation supplies three things — `code`, `to_upper`, `to_lower` — and every classifier is
+a default written once over `code()`. The two conversions stay per type only because each must
+answer in its own type; the arithmetic is the same, and both are **total**, leaving anything that is
+not a letter of the other case exactly as they found it. That is what makes mapping one over
+arbitrary text safe rather than merely defined.
+
+`digit_value(base)` is here rather than in `sysl.strconv` because it is a question about a
+character, and because parsing wants exactly this and nothing else from a digit — the two would
+otherwise be the same test written twice. A base outside 2..36 answers `None` rather than trapping,
+so the caller that passed it is the one that gets to report it.
 
 ### Comparison is by bytes
 
