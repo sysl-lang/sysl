@@ -38,6 +38,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/tour/strings.md"                    -> (10, 1, 0),
     "docs/content/tour/enums.md"                      -> (10, 2, 0),
     "docs/content/tour/errors.md"                     -> (6, 1, 2),
+    "docs/content/tour/traits.md"                     -> (7, 1, 0),
   )
 
   "every page on the site is accounted for" in {
