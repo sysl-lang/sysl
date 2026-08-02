@@ -22,15 +22,21 @@ A string is therefore no longer always traceable to a literal; a program can bui
 by rendering, by gathering, or by validating bytes, and can walk what it built at either
 granularity.
 
+Above that sits what a program *does* with text, all of it ordinary sysl in `sysl.text`: the
+**`Ascii`** trait, which asks a byte or a character what kind of thing it is; the **`parse_*`**
+family, which reads a value back out of text and is the direction `str` does not go; and the
+cursor's **`offset`**, **`peek`**, **`count`** and **`char_indices`**, which are what a program
+walking text by hand needs beyond "the next one".
+
 **Where these live: everything the compiler writes for itself is `sysl` and everything a program
 writes by name is `sysl.text`.** A literal, `+`, `str(x)`, an interpolation and `s.chars` are all
 desugarings, so they cost no import — even `s.chars`, whose cursor is `sysl.text`'s, because the
 compiler names `chars_of` by key rather than by resolving the word (`13 §8`). Named at the call
 site, and so imported: `from_utf8`, `from_cstring`, `char_from_u32`, `str_builder`,
-`str_builder_with_capacity`, `cstring`, `char_indices`, `is_char_boundary`, and the types
-`Utf8Error`, `Chars`,
-`CharIndices`, `StrBuilder`, `CString` and the `Ascii` trait. The split is the one `13 § Open h`
-describes — what a program cannot avoid needing is free, and what it has to ask for it asks for.
+`str_builder_with_capacity`, `cstring`, `char_indices`, `is_char_boundary`, the `parse_*` family,
+and the types `Utf8Error`, `ParseError`, `Chars`, `CharIndices`, `StrBuilder`, `CString` and the
+`Ascii` trait. The split is the one `13 § Open h` describes — what a program cannot avoid needing is
+free, and what it has to ask for it asks for.
 
 ## The decision in one paragraph
 
@@ -384,6 +390,53 @@ array remain errors, since none of them can carry an `impl` yet.
 A value of any other type is not silently rendered across `+` or in a `print`; the conversion is
 always written, at the point it happens. That is the same no-implicit-coercion stance the numeric
 operators take, and it is what keeps a string's contents something a reader can see the source of.
+
+## Reading a value
+
+The direction `str` does not go. `sysl.text` reads text back into a value: `parse_int`,
+`parse_long`, `parse_uint`, `parse_ulong`, each with a `_base` variant, plus `parse_bool` and
+`parse_real`. Every one returns `Result[T, ParseError]`.
+
+**The library rendered and did not read, and that is a gap a program feels immediately** — an
+argument, a configuration field, and a number in a file are all text. `guide/json` wrote the loop
+itself, and its loop has no overflow check at all, which is the ordinary outcome: the digits are
+easy and the edges are not.
+
+The edges are what the library is for:
+
+- **The most negative value.** The signed range is asymmetric, so a parser that builds a magnitude
+  and negates at the end cannot represent `MIN` at any point. These accumulate on the **negative**
+  side, which covers the whole range with one path and leaves only a *positive* result of `MIN`'s
+  magnitude to refuse, just before the final negation.
+- **Overflow is caught before the arithmetic that would overflow.** Integer arithmetic wraps (`01`),
+  so a product that has already wrapped tells a later comparison nothing.
+- **Trailing garbage is refused.** `"12abc"` is not `12`, and `"1.5x"` is not `1.5` — which for the
+  float means checking C's end pointer, since `strtod` on its own stops where it likes and reports
+  success.
+- **The unsigned range is not the signed one with the sign removed.** `"ffffffffffffffff"` is an
+  ordinary 64-bit mask that overflows every signed parse there is, so a systems language needs the
+  unsigned direction to read back what its own literals are written in. No sign is accepted there,
+  not even `+`: a leading `-` on an unsigned value is a question with no good answer.
+
+`ParseError` names four cases — `Empty`, `BadDigit(at)`, `Overflow`, `BadBase(base)` — separated by
+what a caller would *do* about them rather than by taxonomy. An empty field is often a default, a
+bad digit is a message to a user, an overflow is a wider type or a refusal, and a bad base is the
+program's own mistake rather than the input's. `BadDigit` carries the byte offset for the reason
+`Utf8Error` does: a message naming where is worth writing and cannot be reconstructed afterwards.
+
+`parse_bool` accepts exactly the two spellings `str` produces. `"True"`, `"yes"` and `"1"` are each
+somebody's convention and none is this library's; a program wanting one writes three lines that read
+as the policy they are.
+
+**`parse_real` goes to `strtod`** for the reason the float half of `str` goes to `snprintf`:
+correctly rounded decimal-to-binary conversion is hard to get right, easy to get subtly wrong, and
+the two directions must agree or a value will not survive being written and read back. It costs one
+allocation, since C reads a NUL-terminated pointer and a `string` carries a length instead.
+
+These live in `sysl.text` rather than a module of their own because they are the same shape as
+`from_utf8` — fallible, text in, value out, `Result` — and because they are built on
+`Ascii.digit_value`, which is there already. A parse and a digit test are otherwise one question
+asked twice.
 
 ## Printing
 

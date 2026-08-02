@@ -1,0 +1,199 @@
+module sysl.text
+
+import sysl.sys.sysl_strtod
+
+// Reading a value back out of text -- the direction `str(x)` does not go.
+//
+// **The library rendered and did not read.** `str`, `Display`, the format specifiers and the whole
+// of `04 § Rendering a value` turn a value into text, and nothing turned text into a value, so a
+// program handed `"42"` by an argument vector or a configuration file had to write the loop itself.
+// `guide/json` did exactly that and its loop has no overflow check at all, which is the ordinary
+// outcome: the digits are easy and the edges are not.
+//
+// **Every edge is here rather than in each caller.** The most negative value, whose magnitude does
+// not fit the width holding it. The overflow that has to be caught *before* it happens, because
+// integer arithmetic wraps (`01`) and a check afterwards is reading a number that already lied. The
+// empty string, the lone sign, the trailing garbage that makes `"12abc"` not a number.
+//
+// It is in `sysl.text` rather than a module of its own because it is the same shape as `from_utf8`
+// -- fallible, text in, value out, `Result` -- and because it is built on `Ascii.digit_value`,
+// which is here already. A parse and a digit test are one question asked twice otherwise.
+
+// Why a parse refused, at the granularity a caller can act on.
+//
+// `BadDigit` carries the byte offset for the same reason `Utf8Error` does: a message naming where
+// is worth writing and cannot be reconstructed afterwards. The four are separated by what a caller
+// would *do* about them and not by taxonomy -- an empty field is often a default, a bad digit is a
+// message to a user, an overflow is a wider type or a refusal, and a bad base is the program's own
+// mistake rather than the input's.
+enum ParseError
+    Empty
+    BadDigit(at: usize)
+    Overflow
+    BadBase(base: int)
+
+// The rendering, so that a refusal can be printed without matching on it.
+impl Display for ParseError
+    display(self, out: *Writer, fmt: FormatSpec)
+        var text = self match
+            Empty -> "no digits to read"
+            BadDigit(at) -> s"not a digit at byte $at"
+            Overflow -> "value too large for its type"
+            BadBase(b) -> s"$b is not a base between 2 and 36"
+
+        display_str(text, out, fmt)
+    end display
+
+// `"true"` or `"false"`, and nothing else.
+//
+// Exactly the two spellings `str(b)` produces, so the pair round-trips and neither direction has an
+// opinion the other lacks. `"True"`, `"yes"` and `"1"` are refused deliberately: each is somebody's
+// convention, none is this library's, and a program wanting one can say so in three lines that read
+// as the policy they are.
+parse_bool(s: string) -> Result[bool, ParseError]
+    if s == "true" then
+        Ok(true)
+    elif s == "false" then
+        Ok(false)
+    elif s.len == 0usize then
+        Err(Empty)
+    else
+        Err(BadDigit(0usize))
+end parse_bool
+
+// The whole signed range in the given base, `MIN` included.
+//
+// **The accumulation runs negative, and that is the whole trick.** The signed range is asymmetric
+// -- the magnitude of the most negative value is one larger than the largest positive one -- so a
+// parser building the magnitude and negating at the end cannot represent `MIN` at any point and has
+// to special-case it. Building on the negative side covers the entire range with one path, and the
+// only value needing a word of its own is a *positive* result of `MIN`'s magnitude, refused just
+// before the final negation.
+//
+// **The overflow test happens before the arithmetic that would overflow**, because integer
+// arithmetic wraps rather than trapping (`01`): a product that has already wrapped is not a number
+// a later comparison can learn anything from. `limit` is the largest magnitude surviving a multiply
+// by the base, and `cutoff` is the largest digit that may still be subtracted once the accumulator
+// is exactly there.
+parse_long_base(s: string, base: int) -> Result[long, ParseError]
+    if base < 2 || base > 36 then return Err(BadBase(base))
+
+    var min: long = -9223372036854775807 - 1
+    var b = s.bytes
+    var i = 0usize
+    var neg = false
+
+    if b.len > 0usize && (b[0] == u8('+') || b[0] == u8('-'))
+        neg = b[0] == u8('-')
+        i = 1usize
+
+    if i >= b.len then return Err(Empty)
+
+    var limit = min / long(base)
+    var cutoff = -(min - limit * long(base))
+    var acc: long = 0
+
+    while i < b.len
+        var d = b[i].digit_value(base) match
+            Some(v) -> long(v)
+            None -> return Err(BadDigit(i))
+
+        if acc < limit then return Err(Overflow)
+        if acc == limit && d > cutoff then return Err(Overflow)
+
+        acc = acc * long(base) - d
+        i += 1usize
+
+    if neg then return Ok(acc)
+
+    // The one value the negative side can hold that the positive side cannot.
+    if acc < -9223372036854775807 then return Err(Overflow)
+
+    Ok(-acc)
+end parse_long_base
+
+parse_long(s: string) -> Result[long, ParseError] = parse_long_base(s, 10)
+
+// The same, narrowed to `int`. A value that is a perfectly good `long` and does not fit here is an
+// `Overflow`, since what the caller asked for is an `int` and there is no honest `int` to hand back.
+parse_int_base(s: string, base: int) -> Result[int, ParseError]
+    var v = parse_long_base(s, base)?
+
+    if v > 2147483647 || v < -2147483648 then return Err(Overflow)
+
+    Ok(int(v))
+end parse_int_base
+
+parse_int(s: string) -> Result[int, ParseError] = parse_int_base(s, 10)
+
+// The unsigned range, which is not the signed one with the sign removed: `"ffffffffffffffff"` is a
+// perfectly ordinary 64-bit mask and overflows every signed parse there is. A systems language that
+// could not read one back would be missing the case its own literals are written in.
+//
+// No sign is accepted, not even `+`. A leading `-` on an unsigned value is a question with no good
+// answer -- wrap, clamp or refuse -- and refusing at the first byte is the one that cannot surprise.
+parse_ulong_base(s: string, base: int) -> Result[ulong, ParseError]
+    if base < 2 || base > 36 then return Err(BadBase(base))
+
+    var max: ulong = 18446744073709551615
+    var b = s.bytes
+
+    if b.len == 0usize then return Err(Empty)
+
+    var limit = max / ulong(base)
+    var cutoff = max - limit * ulong(base)
+    var acc: ulong = 0
+    var i = 0usize
+
+    while i < b.len
+        var d = b[i].digit_value(base) match
+            Some(v) -> ulong(v)
+            None -> return Err(BadDigit(i))
+
+        if acc > limit then return Err(Overflow)
+        if acc == limit && d > cutoff then return Err(Overflow)
+
+        acc = acc * ulong(base) + d
+        i += 1usize
+
+    Ok(acc)
+end parse_ulong_base
+
+parse_ulong(s: string) -> Result[ulong, ParseError] = parse_ulong_base(s, 10)
+
+parse_uint(s: string) -> Result[uint, ParseError]
+    var v = parse_ulong(s)?
+
+    if v > 4294967295 then return Err(Overflow)
+
+    Ok(uint(v))
+end parse_uint
+
+// A floating-point value, through the C library.
+//
+// It goes to `strtod` for the reason the float half of `str` goes to `snprintf`: correctly rounded
+// decimal-to-binary conversion is a hard algorithm to get right and an easy one to get subtly
+// wrong, and the two directions must agree or a value will not survive being written and read back.
+// Writing it in sysl waits for a target with no C library, which is the same condition `04
+// § Printing` puts on the rendering half.
+//
+// **It costs one allocation**, because `strtod` reads a NUL-terminated pointer and a `string`
+// carries a length instead. That is `cstring`'s copy, and it is the same trade every C boundary in
+// the language makes.
+//
+// The end pointer is what turns C's lenient parse into this library's strict one: `strtod` stops at
+// the first byte it cannot use and reports where, so anything left over is trailing garbage and
+// `"1.5x"` is refused rather than read as `1.5`.
+parse_real(s: string) -> Result[real, ParseError]
+    if s.len == 0usize then return Err(Empty)
+
+    var cs = cstring(s)
+    var end: *u8 = null
+    var v = sysl_strtod(cs.ptr, &end)
+    var used = usize(end) - usize(cs.ptr)
+
+    if used == 0usize then return Err(BadDigit(0usize))
+    if used < s.len then return Err(BadDigit(used))
+
+    Ok(v)
+end parse_real
