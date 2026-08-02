@@ -384,6 +384,93 @@ class BufTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** `extend` and `buf_with_capacity` — appending a run at once, and starting with room for one.
+   *
+   * Both are about the cost rather than the result, so the tests are written to pin the *result*
+   * exactly and to catch the ways a bulk copy can go wrong that a loop of `push` cannot: an
+   * off-by-one at the join between what was there and what arrives, a growth that fits the new run
+   * but forgets the old elements, and the empty run that has no first element to seed storage with.
+   */
+  "extending by a whole slice" - {
+
+    "appends every element after the ones already there" in {
+      run("""var b: &Buf[int] = buf()
+            |b.push(1)
+            |b.push(2)
+            |b.extend([3, 4, 5])
+            |print(b.len(), b.at(0), b.at(2), b.at(4))""".stripMargin) shouldBe "5 1 3 5\n"
+    }
+
+    // The discriminating case for the growth: the run is longer than one doubling would give, so an
+    // implementation that grew once by a factor of two and then copied would write past the end.
+    "grows enough for a run far longer than the current capacity" in {
+      run("""var b: &Buf[int] = buf()
+            |b.push(7)
+            |var xs: [40]int
+            |for i in 0..<40 do xs[i] = i
+            |b.extend(xs[..])
+            |print(b.len(), b.at(0), b.at(1), b.at(40))""".stripMargin) shouldBe "41 7 0 39\n"
+    }
+
+    // An empty run has no first element to repeat into new storage, which is the one case the
+    // implementation has to leave early for rather than merely handle.
+    "an empty run is a no-op rather than a trap" in {
+      run("""var b: &Buf[int] = buf()
+            |b.push(1)
+            |var none: []int = []
+            |b.extend(none)
+            |print(b.len(), b.at(0))""".stripMargin) shouldBe "1 1\n"
+    }
+
+    "extending an empty buffer works the same as filling one" in {
+      run("""var b: &Buf[int] = buf()
+            |b.extend([9, 8])
+            |print(b.len(), b.at(0), b.at(1))""".stripMargin) shouldBe "2 9 8\n"
+    }
+
+    // Repeated extends have to keep the geometric growth, or a loop of them is quadratic. What is
+    // observable from sysl is that the result is right after many of them; the capacity check
+    // below is what says the growth was not exact-fit.
+    "many extends in a row keep every element in order" in {
+      run("""var b: &Buf[int] = buf()
+            |for i in 0..<20 do b.extend([i, i])
+            |print(b.len(), b.at(0), b.at(1), b.at(38), b.at(39))""".stripMargin) shouldBe
+        "40 0 0 19 19\n"
+    }
+  }
+
+  "starting with room" - {
+
+    "a buffer with capacity is still empty" in {
+      run("""var b: &Buf[int] = buf_with_capacity(32usize, 0)
+            |print(b.len(), b.is_empty(), b.cap())""".stripMargin) shouldBe "0 true 32\n"
+    }
+
+    // The point of the capacity: pushing up to it does not reallocate, so the capacity is the one
+    // it was given rather than a power of two arrived at by doubling from eight.
+    "filling up to the capacity does not grow it" in {
+      run("""var b: &Buf[int] = buf_with_capacity(32usize, 0)
+            |for i in 0..<32 do b.push(i)
+            |print(b.len(), b.cap(), b.at(31))""".stripMargin) shouldBe "32 32 31\n"
+    }
+
+    "and going past it grows the way any other buffer does" in {
+      run("""var b: &Buf[int] = buf_with_capacity(4usize, 0)
+            |for i in 0..<5 do b.push(i)
+            |print(b.len(), b.cap(), b.at(4))""".stripMargin) shouldBe "5 8 4\n"
+    }
+
+    // The fill is a parameter because a generic `T` has no zero, and none of those slots is ever
+    // read — `count` is what says which elements are real, so `at` refuses them all.
+    "the fill is never visible, since the count starts at zero" in {
+      panics(
+        """var b: &Buf[int] = buf_with_capacity(8usize, 99)
+          |print(b.at(0))""".stripMargin,
+        "past the 0 elements",
+      )
+    }
+  }
+
   "what stops the program" - {
     // Reading past the end is a panic rather than a trap, because a `Buf` is written in sysl and
     // what sysl has to stop with is the library's own `exit` — so it can say what went wrong.

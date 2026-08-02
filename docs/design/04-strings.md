@@ -295,13 +295,32 @@ b.push(str(n))
 var line = b.finish()
 ```
 
-**The two ways in are the two that carry the guarantee.** A `push` takes a `string` and a
-`push_char` takes a `char`, and UTF-8 is closed under appending either — so `finish` hands back a
-plain `string` rather than something a caller has to validate. That is why a builder is **not** a
-`Writer`: a public `write` taking a `[]u8` would be `from_utf8_unchecked` with a longer name and
-none of its greppability. A value of some other type is pushed as `push(str(x))`, which spends the
-one allocation `str` was always going to spend, and still saves the quadratic copying that made a
-builder worth having.
+**Every way in carries the guarantee.** A `push` takes a `string`, a `push_char` takes a `char`, and
+the four renderers below take a number or a `bool` — UTF-8 is closed under appending any of them, so
+`finish` hands back a plain `string` rather than something a caller has to validate. That is why a
+builder is **not** a `Writer`: a public `write` taking a `[]u8` would be `from_utf8_unchecked` with
+a longer name and none of its greppability.
+
+**`push_int`, `push_uint`, `push_real` and `push_bool` exist so that gathering a number costs no
+allocation.** The spelling without them is `push(str(n))`, which builds a whole reference-counted
+`string` — a heap object with a refcount and a deallocation hook — copies its bytes out, and drops
+it, for a value whose text is a couple of dozen bytes and is wanted only inside this buffer. A stack
+array and one `snprintf` is the same rendering with none of that, and it is what `display_int`
+already does for the sink path. They agree with `str` to the byte, which is the property that makes
+the cheap path a substitute rather than a second rendering: a program that builds half a line with a
+builder and half with an interpolation must not be able to tell which half a number came through.
+
+They take `long` and `ulong` rather than one member per width, which is the bargain the `print*`
+family makes for the same reason. The difference is that `print` has the compiler widening its
+arguments and a member cannot, so a narrower value is written `b.push_int(long(n))` — and a caller
+who would rather not write that is describing `push(str(n))`, which still works and still saves the
+quadratic copying that made a builder worth having. A value of any *other* type is pushed that way
+too.
+
+**A builder can be started with room.** `str_builder_with_capacity(n)` skips the
+reallocate-and-copy at each doubling on the way up to `n`, for a caller who knows roughly how long
+the text will be. It is a guess and nothing depends on it: too small and the buffer grows the way it
+always does, too large and the slack goes with the rest.
 
 **`finish` copies rather than lending.** What comes out is an independent string, so a builder may
 go on being appended to and the string already taken out of it does not change. The alternative —
