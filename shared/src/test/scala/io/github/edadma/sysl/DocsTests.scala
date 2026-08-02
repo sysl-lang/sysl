@@ -39,7 +39,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/tour/enums.md"                      -> (10, 2, 0),
     "docs/content/tour/errors.md"                     -> (6, 1, 2),
     "docs/content/tour/traits.md"                     -> (8, 1, 0),
-    "docs/content/tour/modules.md"                    -> (3, 0, 5),
+    "docs/content/tour/modules.md"                    -> (4, 0, 7),
     "docs/content/tour/contracts.md"                  -> (6, 2, 0),
     "docs/content/tour/capstone.md"                   -> (1, 0, 1),
   )

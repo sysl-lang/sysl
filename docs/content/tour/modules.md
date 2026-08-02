@@ -94,6 +94,61 @@ than a bare `private`. The alternative spends a whole keyword to save a bracket.
 **A restriction is about naming, not existence.** A file-private declaration still belongs to its
 module and still spends its name there, so a sibling file cannot declare something else of that name.
 
+### Hiding the shape is a different axis
+
+Visibility decides who may say a **name**. It does nothing about a type's **layout**: a `private`
+field still occupies its place, counts toward the size, shifts the fields after it, and takes part in
+the ABI. Anyone who can name the type can still be built against its shape.
+
+`opaque` is the other axis. Inside the declaring module the struct is ordinary:
+
+```sysl
+opaque struct Conn
+    fd: int
+    live: bool
+end Conn
+
+open(n: int) -> Conn = Conn(n, true)
+
+describe(c: *Conn) -> string = "fd " + str(c.fd)
+
+var c = open(7)
+
+print(describe(&c), c.live)
+```
+
+```output
+fd 7 true
+```
+
+Outside it, the type is **incomplete** — the same thing C's `struct foo;` is — and the only thing
+anyone may say about it is `*Conn`:
+
+```sysl
+import net.Conn
+
+var c: Conn        // refused: no size out here
+var p: *Conn       // fine — a pointer needs no shape
+```
+
+Everything refused outside is refused for one reason: constructing, reading a field, taking an
+element, a by-value parameter or result, `sizeof`, `alignof`, a by-value `self` method. Each needs a
+size or an offset, and the size is exactly what is being withheld — so it is one rule rather than
+fourteen.
+
+The by-value `self` method is the case worth pointing at, because it looks like an ordinary call and
+is not. The *function* was compiled by the library, but what crosses the boundary is the **caller's
+copy**, laid out as the fields stood when that caller was built — so adding a field would break it
+silently, which is the failure the modifier exists to prevent. `*self` and `&self` need no shape, and
+are what an opaque type's methods use.
+
+A struct may also be opaque with **no body at all**, which is how a C handle is bound: nothing in
+sysl lays a `Dir` out, and the storage is libc's.
+
+The payoff is that a field may move with nothing downstream recompiled. The reach is the declaring
+module exactly — not a subtree, the way `private[M]` widens — because the files of a module already
+share one scope and are already the unit that recompiles together.
+
 ## Imports
 
 A public member is **always** reachable fully-qualified — `sysl.math.max(2, 7)` needs no import at
@@ -173,6 +228,32 @@ importing it is told so at the import.
 Propagation is over the module graph, which is acyclic — so a module's effective requirement is
 computed in a single sweep rather than an iterated fixpoint, and a `no alloc` module importing one
 that requires an allocator is an error **at the import**, not deep in code generation.
+
+## Naming a library the linker needs
+
+The header has one other inhabitant. An `extern` says which symbol it wants and never where that
+symbol lives, so a module binding a C library says it with `link`:
+
+```sysl
+module image.png
+link "png"
+link "z"
+
+extern "png_create_read_struct" create(ver: *u8, err: *u8, fn: *u8) -> *u8
+```
+
+**A directive names a library, never a flag**, and that is the whole design. Where a library lives is
+a property of the machine being built for: the mathematics is a separate file on Linux, part of
+`libSystem` on macOS, inside the CRT on Windows, and absent entirely from a freestanding target that
+has no libc to hold it. A directive spelling `-lm` would be right on one of those and wrong on three,
+and the author could not be told so by any compiler running on the machine that wrote it — the link
+that fails is somewhere else. So the file names `m` and the driver decides what that becomes,
+including deciding it becomes nothing.
+
+Unlike a capability, `link` is **not** required to agree across a module's files, because it
+describes something narrower: a capability is a property of the whole module, while a link
+requirement belongs to the `extern`s in one file — and a module that keeps its foreign declarations
+together has nothing for its other files to repeat.
 
 ## The standard library
 
