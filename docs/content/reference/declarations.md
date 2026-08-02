@@ -27,9 +27,21 @@ value it was given, and a `val` with no value is not a declaration of anything.
 ### A module member states its type
 
 Where a binding is a **member of a module** rather than a local, the annotation stops being optional
-even on a `val`. A reader of a module's interface should not have to run the inference to see what it
-exports. That is a rule about *where* the binding was written, so the grammar accepts either form and
-the analyzer applies the rule.
+even on a `val`. That is a rule about *where* the binding was written, so the grammar accepts either
+form and the analyzer applies the rule.
+
+It is worth reading as one rule rather than two, because it is one: **anything visible outside its
+file states its types**, and a module member always could be, while a local states nothing to anyone
+and so infers exactly as a `var` does. Most of it the syntax already enforced — a parameter type and
+a field type are mandatory, and an absent return type *means* `unit` rather than being inferred — so
+a module-level binding is simply the last declaration the rule had left to reach.
+
+**The payoff is that interface extraction is parse-only.** A file's exported surface can be read off
+its syntax tree without resolving a name, checking a body, or having compiled anything the file
+imports, which is what lets the collect pass depend on nothing but parsing — and that is what a fast,
+parallel, eventually incremental build rests on. Scala infers types for public members and pays for
+it with a far heavier extraction step; this is a deliberate divergence, and a cheap one here because
+sysl's signatures were already explicit for other reasons.
 
 ```sysl
 const Limit: int = 3
@@ -51,12 +63,13 @@ show()
 1 6 sysl 3
 ```
 
-The two `val`s in that program are the same keyword under two rules: the one at file scope is a
-member and says `: int`, and the one inside `show` is a local and does not have to.
+The two `val`s in that program are one keyword doing one thing: the one at file scope is visible
+outside it and says `: int`, and the one inside `show` is visible to nobody and does not have to.
 
-**A module-level `val` holds no counted type.** Static storage exists for the whole run and is never
-let go of, so a reference, a weak reference, a slice, or a `string` there would be a count with
-nowhere to write the release:
+**A module-level `val` holds no counted type.** A `&T`, a `weak T`, a slice and a `string` are each
+refused, for the one thing that is true of module storage and of no other storage: it exists for the
+whole run and is therefore never let go of, so a count taken in one is a count with no line to write
+the release on.
 
 ```sysl
 val name: string = "sysl"
@@ -68,9 +81,23 @@ print(name)
 storage that exists for the whole run is never let go of
 ```
 
-A raw `*T` may be held, because it counts nothing. The same value as a **local** is ordinary — which
-is what the program above does with its `val name` — and a module that wants one at file scope
-builds it where it is used instead.
+The same value as a **local** is ordinary — which is what the program above does with its
+`val name` — and a module that wants one at file scope builds it where it is used instead.
+
+**A raw pointer may be held**, because it counts nothing and so there is no release to write. What a
+`val` promises is that its *own* storage is written once and never again, and holding an address
+keeps that promise exactly as holding a number does. This is the shape that has no substitute — a
+device register block named at file scope, reached by every function in the driver rather than
+re-materialised in each:
+
+```
+const UART: usize = 0x1000_0000
+val regs: *Uart = ptr_cast(UART)
+```
+
+An address that is a constant is laid into the object file rather than stored by a prologue, so a
+`val` at pointer type needs nothing ordered and is readable before the first initializer runs — which
+is what a freestanding program starting at a reset vector requires.
 
 Writing to a `val` twice is refused:
 
@@ -88,6 +115,20 @@ show()
 ```error
 a 'val' is written once, so assignment has nothing to write through
 ```
+
+**Read-only means read-only at every depth.** `k = …`, `k[0] = …`, `k[0] += 1` and `k[0]++` are all
+refused on a module-level `val`, and so is `&k[0]` — a `*T` is a licence to write, and handing one
+out would move the mistake one step away from where it could still be reported.
+
+**Slicing is allowed, and yields a `[]const T`.** That is what lets a table be *read and passed*
+rather than only read: the read-only property travels with the view, through a name, through a call,
+and through a second subscript, so every write above is refused through it too. `&v[0]` on such a
+view is a `*T`, the tier the memory model excludes on purpose, and is how the view reaches C.
+
+**The one module-level storage none of this reaches is an `extern` variable.** Every rule above is a
+promise this program makes about storage it laid down; an `extern` variable is storage the *linker*
+supplies — `stdout`, `environ`, `optind` — so there is no such promise to keep. It is a place, it may
+be written, and it holds whatever the other side put there.
 
 ### Several at once
 
