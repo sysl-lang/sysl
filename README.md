@@ -6,7 +6,7 @@ A modern, ref-counted, general-purpose systems language — easier than Rust.
 > language — not a port of the earlier prototype, which survives only as a source of lessons. The
 > compiler is built up deliberately behind a written design, one feature at a time, and it compiles
 > programs to native binaries through LLVM today: see [`guide/`](guide/) for complete ones, and the
-> [tour](https://edadma.github.io/sysl/tour/) to learn the language.
+> [tour](https://sysl.sh/tour/) to learn the language.
 
 ## What sysl is
 
@@ -18,7 +18,7 @@ a local binding that gives a second name to storage something else already owns.
 
 ## Documentation
 
-- **[The tour](https://edadma.github.io/sysl/tour/)** — the language and its standard library in one
+- **[The tour](https://sysl.sh/tour/)** — the language and its standard library in one
   pass, from `print` to a program that reads its input. Every program on those pages is compiled and
   run by the test suite, so a page that has drifted from the compiler fails the build.
 - **[`docs/design/`](docs/design/)** — the numbered specification. The language is designed in
