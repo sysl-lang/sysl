@@ -841,4 +841,4 @@ at all — a `string` is already a validated `[]u8`, so there is nothing to chec
 
 ---
 
-Next: [`sysl.buf`](/library/buf/) — the growable sequence everything here builds on.
+Next: [`sysl.regex`](/library/regex/) — a pattern over that same text, matched without backtracking.

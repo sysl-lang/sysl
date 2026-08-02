@@ -59,6 +59,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/library/_index.md"                   -> (0, 0, 0),
     "docs/content/library/core.md"                     -> (13, 4, 8),
     "docs/content/library/text.md"                      -> (15, 6, 4),
+    "docs/content/library/regex.md"                      -> (16, 0, 0),
     "docs/content/library/buf.md"                       -> (8, 6, 3),
     "docs/content/library/io.md"                        -> (4, 3, 2),
     "docs/content/library/fs.md"                        -> (6, 5, 3),

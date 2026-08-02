@@ -27,6 +27,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 |---|---|---|
 | [`sysl`](/library/core/) | the core — `Option`, `Result`, `Display`, the operator traits, `print`, `assert` | — |
 | [`sysl.text`](/library/text/) | the whole text surface — validation, the character cursors, `Ascii` and `Search`, splitting and joining, `StrBuilder`, the parsers, `CString` | — |
+| [`sysl.regex`](/library/regex/) | POSIX Extended Regular Expressions — `regex`, `Regex`, `Match` | — |
 | [`sysl.buf`](/library/buf/) | `Buf[T]`, the growable sequence, and `ByteSink` | — |
 | [`sysl.io`](/library/io/) | `Reader`, `stdin()`, `lines()` | — |
 | [`sysl.fs`](/library/fs/) | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` | `os` |
