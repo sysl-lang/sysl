@@ -206,7 +206,7 @@ val table: []int = squares(4)
 ```
 
 ```error
-cannot be a 'val': its type is []int
+'table' cannot be a 'val': its type is []int, and storage that exists for the whole run is never let go of — a reference, a weak reference, a slice, or a string in one would be a count with nowhere to write the release. A raw pointer may be held: it counts nothing
 ```
 
 The diagnostic names the whole family — a reference, a weak reference, a slice, or a string — and

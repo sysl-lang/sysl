@@ -859,7 +859,7 @@ print(1)
 ```
 
 ```error
-contains itself, so it has no finite size
+type 'Node' contains itself, so it has no finite size
 ```
 
 The rule is **per cycle rather than per field**: a cycle is legal as soon as one edge on it is a `*T`
@@ -1006,7 +1006,7 @@ print(first_two([1, 2, 3, 4]).len)
 ```
 
 ```error
-the storage is not this body's to move
+a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — it is a field of a value, or an array a caller passed by value. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
 ```
 
 **Without an allocator it is always a compile error.** Under `no alloc` there is nothing to promote
@@ -1105,7 +1105,7 @@ print(n.value)
 ```
 
 ```error
-'ptr_cast' never produces a reference
+'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an address read out of bytes carries no count for anything to own — read it as a '*T'
 ```
 
 A `weak T` is refused for the same reason, and the fat types — a slice, a `string` — for that reason
@@ -1312,7 +1312,7 @@ print(send(c))
 ```
 
 ```error
-neither converts to the other
+'&Cell' and '&sync Cell' are distinct types, and neither converts to the other: a count is atomic or it is not from the moment the object is allocated, and a conversion would put an ordinary retain beside an atomic one. Allocate Cell as a '&sync Cell' where it is constructed
 ```
 
 A conversion would put an ordinary retain beside an atomic one, so the count is atomic or it is not

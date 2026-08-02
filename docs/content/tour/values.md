@@ -93,7 +93,7 @@ print(wide)
 ```
 
 ```error
-declared int but the value is byte
+cannot initialize 'wide': declared int but the value is byte
 ```
 
 The fix is to say so, and every conversion is written with call syntax:
