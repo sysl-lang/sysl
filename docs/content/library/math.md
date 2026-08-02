@@ -1,13 +1,14 @@
 ---
 title: The math module
-summary: "`sysl.math` — the `Float` trait over both widths, `Signed` and `Bits` over the open integer family, the constants, and `min`/`max`/`clamp` over anything ordered."
+summary: "`sysl.math` — the `Float` trait over both widths, `Signed` and `Bits` over the open integer family, the constants, `min`/`max`/`clamp` over anything ordered, and the integer arithmetic above the operators."
 weight: 60
 ---
 
 `sysl.math` is four files and three traits, and the interesting thing about it is that **the three
 traits are written three different ways** — because the types they cover are three different shapes.
-It requires no capability at all: every name here is reachable under `no alloc` and on a target with
-no operating system.
+Above them sit the free functions, which are not members of anything and say in a bound what they
+need. It requires no capability at all: every name here is reachable under `no alloc` and on a target
+with no operating system.
 
 ```sysl
 no alloc
@@ -499,6 +500,266 @@ it and a `u4` has none either. **Every member of `Bits` is total over every inte
 else's instantiation.
 
 A program that means to reorder bytes has the shifts, and knows its own width while writing them.
+
+## The arithmetic above the operators
+
+Six free functions sit above `Signed` and `Bits`, and they are what the operators do not give you:
+
+```
+pow(base, exponent)          gcd(a, b)                lcm(a, b)
+divmod(a, b) -> T, T         is_power_of_two(x)       next_power_of_two(x) -> Option[T]
+```
+
+```sysl
+no alloc
+no os
+
+import sysl.math.{pow, gcd, lcm, is_power_of_two, next_power_of_two}
+
+print(pow(2, 10), pow(3, 0u32))
+print(gcd(12, 18), lcm(4, 6), lcm(21, 6))
+print(is_power_of_two(8), is_power_of_two(0))
+print(next_power_of_two(17).unwrap_or(-1))
+```
+
+```output
+1024 1
+6 12 42
+true false
+32
+```
+
+### Free functions, and the bound is the specification
+
+**None of these is a trait member**, and the reason is the one this page already gave for `min`. A
+member has to belong to a trait, and the trait is what decides which types have it — but nothing here
+is a question about a *bit pattern*, which is what `Bits` collects, nor about having a sign, which is
+what `Signed` collects.
+
+What each one actually needs is written in its own bound instead:
+
+| function | bound |
+|---|---|
+| `pow` | `Mul + Ord` |
+| `gcd` | `Rem + Eq + Ord + Sub` |
+| `lcm` | `Rem + Eq + Ord + Sub + Div + Mul` |
+| `divmod` | `Div + Rem` |
+| `is_power_of_two` | `Bits + Ord` |
+| `next_power_of_two` | `Bits + Ord + Shl + Sub` |
+
+Read `gcd`'s: `Rem` because Euclid's algorithm is a remainder loop, `Sub` and `Ord` because it has to
+answer a magnitude — and **deliberately not `Signed`**, which would have shut the unsigned widths out
+of a function that serves them perfectly well.
+
+That is also the thing a trait member could not have offered. The memberships of `Bits` and `Signed`
+are the compiler's, and **no program can join them** — so a member would have been closed to a
+program's own numeric type forever, where a bound is satisfied by whoever satisfies it.
+
+When one is not, the bound is what says so, by name:
+
+```sysl
+import sysl.math.is_power_of_two
+
+print(is_power_of_two(8.0))
+```
+
+```error
+'sysl.math.is_power_of_two' requires its type parameter 'T' to implement 'sysl.math.Bits', but real does not
+```
+
+And these are ordinary names in the module, so they are reached the way `pi` is — by importing them,
+not by importing the module:
+
+```sysl
+import sysl.math.pi
+
+print(gcd(12, 18), pi)
+```
+
+```error
+undefined function 'gcd'
+```
+
+### `pow`
+
+```sysl
+no alloc
+no os
+
+import sysl.math.pow
+
+print(pow(2, 10), pow(-3, 3u32))
+print(pow(2, 64u32), pow(2u8, 9u32))
+```
+
+```output
+1024 -27
+0 0
+```
+
+**The exponent is a `u32` and not a `T`**, because how many times to multiply is a *count* rather
+than a value of the type being multiplied — the same reason `rotate_left` takes one. A negative
+exponent has no answer among the integers, and saying so in the type is better than a trap:
+
+```sysl
+import sysl.math.pow
+
+print(pow(2, -1))
+```
+
+```error
+the literal -1 does not fit uint
+```
+
+**An overflowing power wraps**, as every other integer operation in the language does. `pow(2, 64)`
+at `int` is `0` and `pow(2u8, 9)` is `0`, both arrived at honestly — the doubling that overflows is a
+`*` like any other. A program that needs to know writes the check it needs.
+
+The implementation is repeated squaring, so the exponent costs a logarithmic number of multiplies
+rather than a linear one.
+
+**This one is the integers'.** Its bound admits a `real`, and the body does not:
+
+```sysl
+import sysl.math.pow
+
+print(pow(2.0, 10u32))
+```
+
+```error
+cannot initialize 'acc': declared real but the value is int
+```
+
+A float raises through [`Float`](#float)'s own member — `2.0.pow(10.0)` — which takes its exponent as
+a `Self` rather than a count, because a float exponent is a meaningful thing to have and an integer
+one is not the same operation.
+
+### `gcd` and `lcm`
+
+```sysl
+no alloc
+no os
+
+import sysl.math.{gcd, lcm}
+
+print(gcd(12, 18), gcd(-12, 18), gcd(12, -18), gcd(-12, -18))
+print(gcd(7, 0), gcd(0, 7), gcd(12u8, 18u8))
+print(lcm(4, 6), lcm(0, 5), lcm(21, 6))
+```
+
+```output
+6 6 6 6
+7 7 6
+12 0 42
+```
+
+**Neither ever answers a negative**, and how `gcd` gets there is worth reading. The magnitude is
+taken at the **end** rather than at the start: `%` truncates, so Euclid's loop over negative operands
+arrives at the right divisor already, carrying the wrong sign, and one comparison at the end fixes
+it. Doing it at the start would have meant negating both operands first — two operations instead of
+one, and a signed-only one at that.
+
+Because the negation is written `zero - x` rather than `-x`. Unary minus requires `Neg`, which the
+language gives to the **signed** integers alone, while `Sub` is every integer's — so that one
+spelling is what keeps `gcd(12u8, 18u8)` on the third value of the second line.
+
+`gcd(x, 0)` is `x`, which is both the identity the loop already produces and the answer number theory
+gives: everything divides zero, so the largest divisor the pair has in common is `x`'s own.
+
+**`lcm` divides before multiplying** — `a / gcd(a, b) * b` and not `a * b / gcd(a, b)` — because the
+product of the operands overflows at half the width where the answer itself would fit, and the
+quotient is exact by construction, `gcd` being a divisor of `a`. That is the same reason `hypot` is
+not `sqrt(x*x + y*y)`. A zero operand answers zero rather than dividing by one, since `gcd(0, 0)` is
+zero and reaching the division would be a division by it.
+
+### `divmod`
+
+```sysl
+no alloc
+no os
+
+import sysl.math.divmod
+
+show()
+    val q, r = divmod(17, 5)
+    val nq, nr = divmod(-17, 5)
+
+    print(q, r)
+    print(nq, nr)
+
+show()
+```
+
+```output
+3 2
+-3 -2
+```
+
+Both are the operators' own, so both truncate toward zero and the remainder takes the sign of the
+**dividend**. The reason to call this rather than write the two operators is that it says once what a
+reader would otherwise have to check twice: that the same two operands feed both.
+
+It answers a [result list](/reference/declarations/) and not a tuple, because the pair travels from
+callee to caller and nothing afterwards needs to hold the two together. A caller that *does* need to
+hold them writes the tuple itself.
+
+That is also why the program above puts the call inside a function. A binding naming several things
+is a **local** form — its parts have nowhere to write a type — so one at the top of a file is
+refused rather than becoming a quiet local of the entry point:
+
+```sysl
+import sysl.math.divmod
+
+val q, r = divmod(17, 5)
+
+print(q, r)
+```
+
+```error
+a module-level 'val' states its type, and a binding that names several things has nowhere to write one — declare 'q' and 'r' separately
+```
+
+### `is_power_of_two` and `next_power_of_two`
+
+```sysl
+no alloc
+no os
+
+import sysl.math.{is_power_of_two, next_power_of_two}
+
+print(is_power_of_two(8), is_power_of_two(0), is_power_of_two(-8), is_power_of_two(1))
+print(is_power_of_two(-128i8), is_power_of_two(128u8))
+print(next_power_of_two(17).unwrap_or(-1), next_power_of_two(16).unwrap_or(-1))
+print(next_power_of_two(0).unwrap_or(-1), next_power_of_two(-5).unwrap_or(-1))
+print(next_power_of_two(200u8).is_some(), next_power_of_two(128u8).unwrap_or(0u8))
+print(next_power_of_two(100i8).is_some(), next_power_of_two(60i8).unwrap_or(0i8))
+```
+
+```output
+true false false true
+false true
+32 16
+1 1
+false 128
+false 64
+```
+
+**`is_power_of_two` is one set bit *and* a comparison against zero**, and the second line is why the
+comparison is there. `-128i8` has exactly one bit set — `count_ones` answers `1` — and it is
+emphatically not a power of two. A comparison costs nothing and is the whole of the difference.
+
+**`next_power_of_two` answers an `Option`, and that is what totality costs here.** `200u8`'s next
+power is `256`, which no `u8` holds. Wrapping to zero would be silently wrong, and a trap would make
+a library function rule that a caller's arithmetic is a bug — so the absence goes in the **type**,
+where a caller has to look at it. Values at or below one answer `1`, negatives included: one is the
+smallest power of two and every negative is below it.
+
+**The last two lines are the same width answering differently**, and they are the reason the
+implementation works at all. `128` fits a `u8` and does not fit an `i8`, because the top bit of a
+signed byte is the sign — so `next_power_of_two(100i8)` is none while `next_power_of_two(128u8)` is
+`128`. The body does not ask which `T` it has, which is a question a generic body has no way to put:
+it performs the shift and compares the result against zero, since **a signed shift that has reached
+the sign bit comes back negative** and an unsigned one never does.
 
 ---
 

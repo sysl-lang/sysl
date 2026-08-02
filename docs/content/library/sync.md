@@ -537,3 +537,7 @@ reached.
 values may cross a domain boundary is meant to be enforced — is not written. Until it is, that rule
 is specification with nothing asking the question, which the [`sysl.thread`](/library/thread/) page
 says more about, since that is where it becomes visible rather than theoretical.
+
+---
+
+Next: [`sysl.thread`](/library/thread/) — spawning, joining, and the mutex above the spinlock.

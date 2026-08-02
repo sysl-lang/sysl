@@ -208,6 +208,164 @@ discharges its column for exhaustiveness exactly as a struct pattern does.
 Both forms compose with everything else: a struct pattern nests inside a variant pattern and vice
 versa, and each bound sub-pattern is itself any pattern in this table.
 
+## A pattern at a binding
+
+`match` is not the only place a pattern stands. A `val` or `var`
+[binding](/reference/declarations/#by-pattern-when-the-shape-matters) takes one too:
+
+```sysl
+struct Counter
+    n: int
+end Counter
+
+pair(c: *Counter) -> (int, int)
+    c.n = c.n + 1
+    (1, 2)
+
+once()
+    var c = Counter(0)
+
+    val ((p, q), r) = (pair(&c), 3)
+
+    print(p, q, r, c.n)
+
+shape()
+    val ((x, y), _) = ((3, 4), 5)
+    var (lo, hi) = (0, 10)
+
+    hi += 1
+
+    print(x, y, lo, hi)
+
+once()
+shape()
+```
+
+```output
+1 2 3 1
+3 4 0 11
+```
+
+**The value is evaluated exactly once**, which is the same guarantee a scrutinee gets and for the
+same reason: it is analyzed into a temporary no program can name, and every part is a field read of
+that. `pair()` runs one time above however many names come out of it — the `1` on the end of the
+first line is the count.
+
+A `var` pattern makes every name it binds assignable and a `val` pattern makes each write-once,
+exactly as the single-name forms do. A `_` binds nothing and skips its part.
+
+That once-only rule is also what makes the obvious swap correct, since both parts of the right-hand
+side are read before either name is bound:
+
+```sysl
+show()
+    var (a, b) = (1, 2)
+    val (c, d) = (b, a)
+
+    print(a, b, c, d)
+
+show()
+```
+
+```output
+1 2 2 1
+```
+
+### Only an irrefutable pattern may stand there
+
+A binding has **no other arm to take**. So the patterns allowed at one are exactly those that cannot
+fail — a tuple pattern, a name, a wildcard, and those nested inside one another — and everything in
+the table above that is a *test* is refused by name.
+
+A literal is a test:
+
+```sysl
+show()
+    val (1, b) = (1, 2)
+
+    print(b)
+
+show()
+```
+
+```error
+a binding cannot test a value — this pattern matches only some values, and a binding has no other arm to take when it does not match
+```
+
+So is a range, and the diagnostic is the same one, because it is the same objection.
+
+A variant is a **choice among shapes**, which is a different objection and gets its own words:
+
+```sysl
+enum Shape
+    Circle(r: int)
+    Square(s: int)
+end Shape
+
+show()
+    val (Circle(r), b) = (Circle(1), 2)
+
+    print(r, b)
+
+show()
+```
+
+```error
+a binding cannot choose among variants — this pattern matches one of several shapes, and a binding has no other arm to take when the value has another
+```
+
+Each of those belongs in a `match`, where the arm that does not match has somewhere to fall through
+to.
+
+### The shape has to line up
+
+A tuple pattern is irrefutable *for the tuple it describes*, so the arity is checked where it is
+written rather than at run time:
+
+```sysl
+show()
+    val (a, b, c) = (1, 2)
+
+    print(a)
+
+show()
+```
+
+```error
+this pattern takes 3 parts, and a (int, int) has 2 parts to give it
+```
+
+Taking apart something that is not a tuple at all is refused in its own words, because the mistake is
+a different one — there is no shape to disagree about:
+
+```sysl
+show()
+    val (a, b) = 5
+
+    print(a)
+
+show()
+```
+
+```error
+one int is not something to take apart — only a tuple is
+```
+
+And a name may appear once:
+
+```sysl
+show()
+    val (a, a) = (1, 2)
+
+    print(a)
+
+show()
+```
+
+```error
+'a' is named twice in one binding
+```
+
 ## Guards
 
 An arm may carry an `if` guard, evaluated **after** its pattern matches.

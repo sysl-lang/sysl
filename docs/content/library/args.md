@@ -222,3 +222,7 @@ nothing**, which is what a platform module should be.
 That second reason is worth sitting with, because it is a general shape rather than an accident of
 this module. A conversion that reports its failure in words is not a leaf, because reporting is
 itself a dependency. Splitting it out is what let the thing underneath stay one.
+
+---
+
+Next: [`sysl.sys`](/library/sys/) — the platform seam, and the leaf it was split out to protect.

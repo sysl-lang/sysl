@@ -456,3 +456,7 @@ of which are greppable and neither of which is what an ordinary value is. What y
 *stopped* from doing is pointing one of them at something whose count is not atomic — and the race
 you can write by putting a mutable field in a `&sync T` is permanent, because it is the cost of not
 having a borrow checker.
+
+---
+
+Next: [`sysl.args`](/library/args/) — how `argc` and `argv` become a `[]string`.

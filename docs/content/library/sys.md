@@ -245,3 +245,8 @@ it lives in [`sysl.args`](/library/args/) instead, and what is left here is a le
 
 **A declaration that reports its own failure in words is not a leaf**, because reporting is itself a
 dependency. That is the shape to look for when deciding whether something belongs at the seam.
+
+---
+
+That is the last module. Back to the [section index](/library/) for the tree, or to the
+[language reference](/reference/) for what the compiler itself accepts.
