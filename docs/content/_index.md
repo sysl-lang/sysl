@@ -15,8 +15,8 @@ learn — instead of a borrow checker, it counts references.
 
 ```sysl
 var here: Point         // T   — a value. It lives in this frame.
-var shared: &Point      // &T  — a reference. Counted, freed when the last one goes.
 var raw: *Point         // *T  — a raw pointer. C's pointer, spelled so you can grep for it.
+var shared: &Point      // &T  — a reference. Counted, freed when the last one goes.
 ref slot = grid[i]      // ref — a second name for storage that already exists.
 ```
 
