@@ -119,10 +119,40 @@ count(n: int) -> int
 '?' may only be used in a function returning sysl.Result, not int
 ```
 
-The error types must match exactly, too. A function whose own error type differs from a callee's has
-to convert at the call site; there is no implicit widening. That is a real ergonomic cost and it is
-the shipping behaviour rather than the end state — a `From`-style conversion is designed and waiting
-on a way for a type to implement one trait more than once.
+The error types must match **exactly**, too. There is no implicit widening, so a function whose own
+error type differs from a callee's converts at the call site:
+
+```sysl
+struct IoError
+    code: int
+end IoError
+
+struct AppError
+    why: string
+end AppError
+
+read_it(n: int) -> Result[int, IoError]
+    if n > 0 then Ok(n)
+    else Err(IoError(5))
+
+run(n: int) -> Result[int, AppError]
+    var v = read_it(n)?
+
+    Ok(v)
+
+print(run(1).is_ok())
+```
+
+```error
+'?' propagates a IoError error, but this function returns AppError
+```
+
+That is a real ergonomic cost, and it is the shipping behaviour rather than the end state: the
+intended answer is a `From`-style conversion, where `?` converts the callee's error to the caller's
+whenever a conversion trait connects the two, as Rust's `?` calls `From::from`. Writing that trait is
+possible today — `impl From[IoError] for AppError` and `impl From[ParseError] for AppError` are two
+different argument lists, and a type may implement a parameterized trait once at each of them (see
+the [reference](/reference/traits/)). What is left is teaching `?` to look for one.
 
 ## The combinators
 
