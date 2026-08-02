@@ -27,7 +27,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 |---|---|
 | `sysl` | the core — `Option`, `Result`, `Display`, the operator traits, `print`, `assert` |
 | `sysl.buf` | `Buf[T]`, the growable sequence, and `ByteSink` |
-| `sysl.text` | `from_utf8`, `StrBuilder`, `Chars`, `CString` |
+| `sysl.text` | the whole text surface — validation, the character cursors, `Ascii` and `Search`, splitting and joining, `StrBuilder`, the parsers, `CString` |
 | `sysl.io` | `Reader`, `stdin()`, `lines()` |
 | `sysl.fs` | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` |
 | `sysl.math` | `max`, `min`, `pi`, the float functions, and the integer traits `Signed` and `Bits` |
