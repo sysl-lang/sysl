@@ -151,13 +151,24 @@ trait HoistImpl extends ImplConformance {
     // what lets a program declare its own `Zero` for a float width the library has already given a
     // `zero`. A name held by the type's **own** body is a real collision and is reported per member,
     // so the search stops at one rather than stepping over it.
+    //
+    // A **call** trait's member is the other thing that has no scope to be told apart by, and for
+    // the same reason an inherent member has none: `t(1)` reaches it through the call syntax, which
+    // names no trait for a file to have imported or left out. Its members are therefore recorded
+    // with no provenance, which keeps them reachable wherever a value is and makes a second call
+    // trait for one type the collision it has to be — `callableOf` answers with the first arity it
+    // finds, so two would be a silent choice rather than an ambiguity anything could speak to.
+    val callTrait = (0 to Type.Fn.maxArity).exists(n => traitKey(Type.Fn.base(n)).contains(impl.traitName))
+
     val floor = if already.isEmpty then 1 else already.length + 1
 
     def heldByAnother(a: String) =
-      tr.methods.exists(tm => memberTrait.get((outer.key, tm.name + a)).exists(_ != impl.traitName))
+      !callTrait && tr.methods.exists(tm =>
+        memberTrait.get((outer.key, tm.name + a)).exists(_ != impl.traitName))
 
-    val nth  = LazyList.from(floor).find(i => !heldByAnother(if i == 1 then "" else s".$i")).get
-    val home = outer.copy(alt = if nth == 1 then "" else s".$nth", fromTrait = Some(impl.traitName))
+    val nth = LazyList.from(floor).find(i => !heldByAnother(if i == 1 then "" else s".$i")).get
+    val home =
+      outer.copy(alt = if nth == 1 then "" else s".$nth", fromTrait = Option.unless(callTrait)(impl.traitName))
 
     traitImpls((impl.traitName, home.key)) =
       already :+ TraitImpl(impl, written, wkey, home.alt, home.tparams,

@@ -222,7 +222,9 @@ class ModuleGraphTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // second dependency running the other way.
     "a trait whose default is copied into another module's type" in {
       runIn(
-        ("", "main.sysl", "print(b.P(1).twice())"),
+        // The trait is imported and the struct is not: `twice` comes with `a.Show` (`13 §2`), while
+        // `b.P` is named where it is used.
+        ("", "main.sysl", "import a.Show\nprint(b.P(1).twice())"),
         ("a", "a.sysl", "module a\ntrait Show\n    n(self) -> int\n    twice(self) -> int = self.n() * 2"),
         ("b", "b.sysl", "module b\nstruct P[T]\n    v: T\nimpl[T] a.Show for P[T]\n    n(self) -> int = 21"),
       ) shouldBe "42\n"
