@@ -684,6 +684,11 @@ case class ExternVarDecl(name: String, typ: TypeRef, link: Option[String] = None
  * parameter name, with an unbounded one simply absent. Every application of the type is held to
  * them, and its members may assume them: they are what makes a member checkable at its definition
  * rather than once per instantiation (`10 §5`).
+ *
+ * `opaque` withholds the **layout** from every module but the one declaring it (`15 §9`): outside,
+ * the type may be named only as the pointee of a `*`. It is not a `vis`, and the two are orthogonal —
+ * `vis` decides who may say the *name*, `opaque` decides who may know the *shape*, and a type whose
+ * name nobody could say would have nothing to be opaque to.
  */
 case class StructDecl(
     name: String,
@@ -694,6 +699,7 @@ case class StructDecl(
     invariants: List[Expr] = Nil,
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
+    opaque: Boolean = false,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)

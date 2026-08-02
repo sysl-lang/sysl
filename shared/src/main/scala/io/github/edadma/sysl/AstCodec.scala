@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 13
+  val Version: Int = 14
 
   private val Magic = "sysl-ast"
 
@@ -299,9 +299,9 @@ object AstCodec {
         case ExternVarDecl(n, t, lk, vs) =>
           tok("extv"); sref(n); typ(t); opt(lk)(sref); vis(vs)
 
-        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds) =>
+        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op) =>
           tok("sd"); sref(n); list(tps)(sref); list(fs)(param); list(ms)(method)
-          bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds)
+          bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds); bool(op)
 
         case EnumDecl(n, tps, und, vars, ms, bs, vs, tds) =>
           tok("ed"); sref(n); list(tps)(sref); opt(und)(typ); list(vars)(variant); list(ms)(method)
@@ -645,7 +645,7 @@ object AstCodec {
           ExternVarDecl(sref(), typ(), opt(sref()), vis())
         case "sd" =>
           StructDecl(sref(), list(sref()), list(param()), list(method()),
-            bounds(), list(expr()), vis(), tdefaults())
+            bounds(), list(expr()), vis(), tdefaults(), bool())
         case "ed" =>
           EnumDecl(sref(), list(sref()), opt(typ()), list(variant()), list(method()),
             bounds(), vis(), tdefaults())
