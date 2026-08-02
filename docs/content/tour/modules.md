@@ -167,8 +167,15 @@ Because the module is the directory, the clause is a property of the directory �
 is the point: you can never open a file in a `no alloc` module and fail to see that it is.
 
 The other direction is `requires`, and the standard library uses it: `sysl.fs` is `requires os`,
-because a filesystem is something the environment either has or does not. A freestanding target
-importing it is told so at the import.
+because a filesystem is something the environment either has or does not, and `sysl.thread` is
+`requires threads` and `requires posix`, because creating a thread needs a scheduler underneath it. A
+freestanding target importing either is told so at the import.
+
+That is also why the atomics live apart from the threads. `sysl.sync` requires **nothing**, so a
+module that has given up both its allocator and its operating system can still import it — which is
+the point, since a spinlock and an atomic counter are what a kernel has before it has anything else.
+A module's requirement is module-wide, so one type in there needing a scheduler would have taken the
+whole module out of the kernel's reach.
 
 Propagation is over the module graph, which is acyclic — so a module's effective requirement is
 computed in a single sweep rather than an iterated fixpoint, and a `no alloc` module importing one
@@ -187,6 +194,8 @@ import anything to call `print`. Everything else is a submodule you ask for by n
 | `sysl.io` | `Reader`, `stdin()`, `lines()` |
 | `sysl.fs` | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` |
 | `sysl.math` | `max`, `min`, `pi`, the float functions, and the integer traits `Signed` and `Bits` |
+| `sysl.sync` | `Atomic[T]`, `SpinLock`, and the five memory orderings — requires nothing |
+| `sysl.thread` | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` |
 | `sysl.args` | `args_of`, for reading a raw `argv` |
 | `sysl.sys` | the platform seam — what a freestanding target replaces |
 

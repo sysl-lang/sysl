@@ -182,6 +182,9 @@ object Library {
       "Display", "Hash",
       // The same, for the members that are not operators and whose trait is in a submodule.
       "Signed", "Bits",
+      // The orderings the atomic forms require written at the call, whose variant names become
+      // keywords in the emitted instruction (`06 § The kernel tier`, `Atomics`).
+      "Ordering",
       // The sink every rendering goes through, and the one function its standard-output table ends
       // at — whose *table* codegen lays out by hand, which is why the shape is checked rather than
       // read (`SpecialForms.checkWriterShape`, `WriterEmitter`).

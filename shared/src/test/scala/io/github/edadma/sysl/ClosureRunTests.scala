@@ -239,8 +239,29 @@ class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         val e = err(src)
 
         e should include("'twice' is a function")
-        e should include("no address of its own")
+        e should include("becomes a value only where a callable is wanted")
+        e should include("that is written '&twice'")
         e should not include "undefined name"
+    }
+
+    /** The address is the **other** thing a bare name may have been reaching for, and where the
+      * context asks for one outright the missing `&` is the whole of the mistake — so the message
+      * drops the two callable forms the reader did not want and names it (`12 §6a`).
+      */
+    "while a context that wants C's function pointer names the '&' rather than the callable forms" in {
+      val e = err(
+        """extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+          |
+          |compare(a: *u8, b: *u8) -> i32 = 0i32
+          |
+          |var xs = [30i32, 10i32]
+          |
+          |qsort(ptr_cast(&xs[0]), 2usize, 4usize, compare)""".stripMargin
+      )
+
+      e should include("what is wanted here is the address of one — write '&compare'")
+      e should include("capture-free closure")
+      e should not include "'&Fn'"
     }
   }
 

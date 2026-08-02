@@ -1,0 +1,99 @@
+module sysl.thread
+requires threads
+requires posix
+
+// Threads of execution, and the two things a program does with one: start it, and wait for it.
+//
+// **This module requires a capability and `sysl.sync` does not**, which is the whole reason the two
+// are apart. `Atomic[T]` and `SpinLock` are reachable from a module that has given up its allocator
+// and its operating system, because a word the processor touches indivisibly is something a bare
+// machine has. A *thread* is not: creating one needs a scheduler underneath, so `06 § Threads are a
+// capability` makes it an environment capability, and a module's requirement is module-wide -- one
+// type in here needing `threads` would have taken `Atomic[T]` out of the kernel's reach.
+//
+// **`posix` is required beside `threads` because pthreads is what this is built on**, and the two do
+// not imply each other in either direction. A bare-metal target with a scheduler of its own has
+// threads and no POSIX; the implication list says so deliberately (`Capability.implies`), so both are
+// written here.
+//
+// A **domain** is a thread (`06 § Domains`), so everything this module starts is a new one, and what
+// may cross the boundary between two is the subject of that chapter. Nothing here copies anything:
+// `spawn` hands the new thread an **address**, which is the raw tier's way of sharing and is on the
+// crossable list precisely because it carries no refcount to make atomic. What is at that address is
+// then shared by two threads and needs a `Mutex[T]` beside this file, or an `Atomic[T]` below it.
+
+// pthreads, by symbol.
+//
+// **A `pthread_t` is one word on both platforms this builds for** -- a pointer on Darwin, an
+// `unsigned long` under glibc -- and `usize` is the spelling that is both. That is a transcription,
+// which `15 §7` warns is silently wrong when what is transcribed is a *layout*; a scalar handle is
+// the case where it is not, and it is also the only case here, since nothing below passes an opaque
+// C struct by value or allocates storage for one. The mutex beside this file is built on the atomic
+// tier rather than on `pthread_mutex_t` for exactly that reason.
+private[sysl] extern "pthread_create" c_pthread_create(
+    t: *usize,
+    attr: *u8,
+    body: *extern(*u8) -> *u8,
+    arg: *u8,
+) -> int
+private[sysl] extern "pthread_join" c_pthread_join(t: usize, result: **u8) -> int
+private[sysl] extern "pthread_self" c_pthread_self() -> usize
+private[sysl] extern "sched_yield" c_sched_yield() -> int
+
+// A thread that has been started, and may be waited for.
+//
+// It is a handle rather than the thread: copying one copies the handle, and joining either copy
+// joins the one thread. Joining **twice** is undefined in POSIX and is not checked here, for the
+// reason `SpinLock.unlock` gives about the releasing thread -- the word it would take to notice is
+// paid by every correct program.
+struct Thread
+
+    // The `pthread_t` itself. Not hidden, because a program that wants to hand it to a POSIX call
+    // this module does not wrap -- `pthread_detach`, `pthread_kill`, a scheduling parameter -- has
+    // nothing else to give it, and the alternative is a wrapper per call.
+    id: usize
+
+    // Waits for the thread to finish, and answers whether it was waited for.
+    //
+    // The value the body returned is **not** carried back, and the omission is the crossing rule
+    // rather than an oversight: a result coming out of another domain is a value crossing a boundary
+    // (`06 § Crossing copies`), which is what a channel is for and what this branch of the library
+    // does not have. A body that has something to say writes it through the address it was given.
+    join(self) -> bool = c_pthread_join(self.id, null) == 0
+
+end Thread
+
+// Starts `body` on a new thread, with `arg` as the address it is handed.
+//
+// **The body is a `*extern`, not a callable** (`12 §6a`). A closure would have to be boxed for the
+// new thread to reach it, which needs an allocator this module could otherwise do without, and its
+// captures would be values crossing a domain boundary with nothing yet checking that they may. The
+// address of a named function is what C's own interface takes, so it is what this takes.
+//
+// **`T` is inferred from the body**, so `spawn(&work, &state)` is the whole of the call. An address
+// is always written, `null` included -- and `null` is the one thing that cannot be, since it takes
+// its type from its context and the context here is the `T` being inferred. A body with nothing of
+// its own to read is handed the address of whatever it reads instead, which every body has.
+//
+// The pointer is the sharing: two threads reading and writing what is at that address is a race
+// unless something orders them, which is what `Mutex[T]` and `Atomic[T]` are for.
+//
+// A body declared `-> unit` is called by pthreads as though it returned a `void *`, and the value it
+// leaves in the return register is whatever was there. Nothing reads it -- `join` above passes no
+// place to put it -- so the mismatch costs the thread's exit value, which this module does not offer.
+spawn[T](body: *extern(*T) -> unit, arg: *T) -> Option[Thread]
+    var id: usize = 0usize
+    var started = c_pthread_create(&id, null, ptr_cast(body), ptr_cast(arg))
+
+    if started == 0 then Some(Thread(id)) else None
+
+// Offers the processor to whatever else is ready to run, and answers whether the system took it.
+//
+// This is a **hint**, not a wait: a thread that yields is still runnable and may be given the
+// processor straight back. What it is for is the spin in `Mutex.lock`, where the thread holding the
+// lock may not be running at all and nothing else will make it so.
+yield_now() -> bool = c_sched_yield() == 0
+
+// The calling thread's own handle, which is what a body compares against to learn it is not the
+// thread that spawned it.
+current() -> Thread = Thread(c_pthread_self())

@@ -147,7 +147,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     then out ++= "\n"
 
     if charBuf then out ++= ScalarEmitter.utf8Encoder
-    if heap then out ++= ArcEmitter.core
+    if heap then out ++= ArcEmitter.core(target)
     if syncHeap then out ++= ArcEmitter.atomic
     if maybeHeap then out ++= ArcEmitter.maybe
     if weakHeap then out ++= ArcEmitter.weak

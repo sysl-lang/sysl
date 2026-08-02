@@ -49,6 +49,29 @@ class RecursiveTeardownRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "199999\n"
   }
 
+  // The same chain through the atomic release path, which is the one the per-thread worklist exists
+  // for. Storage class is a claim a text assertion cannot finish: `thread_local` is not an ordinary
+  // symbol — Darwin places it in `__thread_vars` and reaches it through `tlv_get_addr`, ELF puts it
+  // in `.tbss` behind a relocation the linker relaxes — so "the IR says thread_local" and "it links,
+  // and a drain still finds its list" are two things, and this is the second.
+  "a long atomic chain drains through the worklist the reaper keeps per thread" in {
+    val src =
+      """struct Node
+        |    value: int
+        |    next: Option[&sync Node]
+        |build(n: int) -> &sync Node
+        |    var head: &sync Node = Node(0, None)
+        |    var i = 1
+        |    while i < n
+        |        head = Node(i, Some(head))
+        |        i++
+        |    head
+        |var list = build(200000)
+        |print(list.value)""".stripMargin
+
+    run(src) shouldBe "199999\n"
+  }
+
   // A monomorphized generic recursive type tears down through the same iterative reaper — its
   // drop hook is generated per instantiation, so this checks Stack[int]'s hook releases the
   // `rest: Option[&Stack[int]]` field iteratively too.

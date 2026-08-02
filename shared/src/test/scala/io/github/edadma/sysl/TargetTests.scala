@@ -59,6 +59,14 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
       Target.all.filterNot(_.hardFloat).map(_.name) shouldBe List("riscv64-freestanding")
     }
 
+    // Whether a thread's storage is laid down before `main` is a fact about the system and not about
+    // the processor, and it is the OS that records it: a hosted system starts a thread by giving it
+    // storage, and a bare one has no loader, no libc, and nothing that writes the thread pointer.
+    "records which targets have thread-local storage set up before main" in {
+      Target.all.filterNot(_.hasThreadLocalStorage).map(_.name) shouldBe
+        List("aarch64-freestanding", "x86_64-freestanding", "riscv64-freestanding")
+    }
+
     // Two machines differing only in their OS are two targets, which is the point of recording the
     // OS at all: the processor does not settle the C ABI on its own.
     "tells one processor's systems apart" in {

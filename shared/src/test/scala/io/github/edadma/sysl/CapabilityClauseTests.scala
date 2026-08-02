@@ -58,17 +58,6 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       e should include("'alloc', 'os', 'posix', 'threads'")
     }
 
-    /* `threads` is the last of the four with nothing to gate. `os` and `posix` left this list the
-     * day a module requiring one existed, which is the shape the refusal always had: a narrowing is
-     * refused while it would enforce nothing, and allowed once it would. */
-    "narrowing away a capability that gates something nobody has written" in {
-      val e = err("no threads\n\nf() -> int = 1\n")
-
-      e should include("'no threads' is not enforced yet")
-      e should include("gates thread creation and the growable channel, and neither is built")
-      e should include("'no alloc', 'no os' and 'no posix' are the narrowings that mean something today")
-    }
-
     "the same capability declared twice" in {
       err("no alloc\nno alloc\n\nf() -> int = 1\n") should include("'alloc' is declared twice")
     }
@@ -76,6 +65,15 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     "and a capability both given up and required" in {
       err("no alloc\nrequires alloc\n\nf() -> int = 1\n") should
         include("'alloc' is both given up and required here")
+    }
+
+    /* The refusal that used to sit here refuses nothing now, and that is the state it was built to
+     * reach: a narrowing is refused while it would enforce nothing, and allowed once it would. `os`
+     * and `posix` left the list the day a module requiring one existed, and `threads` left it the
+     * day `sysl.thread` did — so all four are narrowings today. What each of them then *means* is
+     * checked against the module graph, in `ThreadTests` and `FsTests`. */
+    "while every capability there is may now be given up, since each of them gates something" in {
+      run("no alloc\nno os\nno posix\nno threads\n\nprint(1 + 1)\n") shouldBe "2\n"
     }
   }
 
