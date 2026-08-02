@@ -280,11 +280,11 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       val emitted =
         Compiler.compiledWith(List(Source("<input>", "say.hello(1)\nshout.loud(3)\nprint(2)")),
           trees, Target.default, syms) match
-          case Right((out, _)) => out
-          case Left(err)       => fail(err)
+          case Right(built) => built
+          case Left(err)    => fail(err)
 
       val exe = createTempFile("sysl-test-", "")
-      val ran = Toolchain.build(emitted, exe, Target.default, objects).map { _ =>
+      val ran = Toolchain.build(emitted.ir, exe, Target.default, objects, links = emitted.links).map { _ =>
         val r = exec(List(exe))
 
         (r.exitCode, r.stdout)
@@ -325,19 +325,19 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       case Right(_)  => ()
 
     val emitted = Compiler.compiledWith(List(Source("<input>", program)), trees, Target.default, syms) match
-      case Right((out, _)) => out
-      case Left(err)       => fail(err)
+      case Right(built) => built
+      case Left(err)    => fail(err)
 
     val exe = createTempFile("sysl-test-", "")
     val ran =
-      Toolchain.build(emitted, exe, Target.default, List(obj)).map { _ =>
+      Toolchain.build(emitted.ir, exe, Target.default, List(obj), links = emitted.links).map { _ =>
         val r = exec(List(exe))
         (r.exitCode, r.stdout)
       }
 
     deleteFile(obj)
     deleteFile(exe)
-    (emitted, ran)
+    (emitted.ir, ran)
   }
 
   "a program linked against the artifact" - {

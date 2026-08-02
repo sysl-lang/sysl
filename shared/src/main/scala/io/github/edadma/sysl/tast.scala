@@ -630,6 +630,7 @@ case class TFunc(
     ensures: List[(TExpr, Option[String])] = Nil,
     olds: List[TExpr] = Nil,
     internal: Boolean = false,
+    conv: Option[CallConv] = None,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones

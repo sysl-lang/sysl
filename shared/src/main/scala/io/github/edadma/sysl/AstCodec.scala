@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 12
+  val Version: Int = 15
 
   private val Magic = "sysl-ast"
 
@@ -130,6 +130,10 @@ object AstCodec {
       int(src(p.source))
       opt(p.module)(m => { pos(m); list(m.parts)(sref) })
       list(p.capabilities)(c => { pos(c); tok(if c.direction == CapabilityDirection.Narrows then "no" else "req"); sref(c.name) })
+      // A library's link directives travel with it. Without this a binding works from source and
+      // stops working the moment it ships as an artifact — which is the worst shape the bug could
+      // take, since the build that breaks is the one nobody ran.
+      list(p.links)(l => { pos(l); sref(l.name) })
       list(p.body)(stmt)
       body.append('\n')
     }
@@ -285,9 +289,10 @@ object AstCodec {
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); opt(t)(testAttr)
+          opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) })
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -295,9 +300,9 @@ object AstCodec {
         case ExternVarDecl(n, t, lk, vs) =>
           tok("extv"); sref(n); typ(t); opt(lk)(sref); vis(vs)
 
-        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds) =>
+        case StructDecl(n, tps, fs, ms, bs, invs, vs, tds, op) =>
           tok("sd"); sref(n); list(tps)(sref); list(fs)(param); list(ms)(method)
-          bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds)
+          bounds(bs); list(invs)(expr); vis(vs); tdefaults(tds); bool(op)
 
         case EnumDecl(n, tps, und, vars, ms, bs, vs, tds) =>
           tok("ed"); sref(n); list(tps)(sref); opt(und)(typ); list(vars)(variant); list(ms)(method)
@@ -502,8 +507,9 @@ object AstCodec {
         case "no"  => CapabilityClause(CapabilityDirection.Narrows, sref())
         case "req" => CapabilityClause(CapabilityDirection.Requires, sref())
         case t     => fail(s"'$t' is not a capability clause's direction")))
+      val links = list(at(LinkClause(sref())))
 
-      Program(list(stmt()), module, caps, sources(s))
+      Program(list(stmt()), module, caps, links, sources(s))
     }
 
     // -------------------------------------------------------------- pieces
@@ -633,14 +639,15 @@ object AstCodec {
         case "ens"  => Ensure(expr(), opt(sref()))
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
-            bounds(), bool(), vis(), tdefaults(), opt(testAttr()))
+            bounds(), bool(), vis(), tdefaults(), opt(testAttr()),
+            opt(at(CallConv(sref(), opt(sref())))))
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "extv" =>
           ExternVarDecl(sref(), typ(), opt(sref()), vis())
         case "sd" =>
           StructDecl(sref(), list(sref()), list(param()), list(method()),
-            bounds(), list(expr()), vis(), tdefaults())
+            bounds(), list(expr()), vis(), tdefaults(), bool())
         case "ed" =>
           EnumDecl(sref(), list(sref()), opt(typ()), list(variant()), list(method()),
             bounds(), vis(), tdefaults())

@@ -55,8 +55,8 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
    */
   private def against(core: Core, program: String, linked: Set[String] = Set.empty): String =
     Compiler.compiledWith(List(Source("<input>", program)), Nil, Target.default, linked, Some(core)) match
-      case Right((ir, _)) => ir
-      case Left(err)      => fail(s"the program did not compile:\n$err")
+      case Right(built) => built.ir
+      case Left(err)    => fail(s"the program did not compile:\n$err")
 
   private def sameBothWays(program: String): Unit =
     against(decoded, program) shouldBe against(Library.carried, program)

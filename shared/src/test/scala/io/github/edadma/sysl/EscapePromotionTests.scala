@@ -365,8 +365,8 @@ class EscapePromotionTests extends AnyFreeSpec with RunSupport with CodegenSuppo
   "every promotion can be asked about" - {
     def explain(src: String): List[String] =
       Compiler.compiled(List(Source("t.sysl", src))) match
-        case Right((_, notes)) => notes
-        case Left(err)         => fail(s"did not compile:\n$err")
+        case Right(built) => built.notes
+        case Left(err)    => fail(s"did not compile:\n$err")
 
     "the array is named, with the view that forced it" in {
       val notes = explain("""first() -> []u8

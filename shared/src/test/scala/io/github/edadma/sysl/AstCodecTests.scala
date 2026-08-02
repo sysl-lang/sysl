@@ -284,10 +284,10 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
 
     "keep their own module headers, sources and directories" in {
       val a = Program(parsed("module geom\nf() -> int = 1").body,
-        Some(ModuleName(List("geom"))), Nil,
+        Some(ModuleName(List("geom"))), Nil, Nil,
         new Source("a.sysl", "module geom\nf() -> int = 1", Some(List("geom"))))
       val b = Program(parsed("module geom.shape\ng() -> int = 2").body,
-        Some(ModuleName(List("geom", "shape"))), Nil,
+        Some(ModuleName(List("geom", "shape"))), Nil, Nil,
         new Source("b.sysl", "module geom.shape\ng() -> int = 2", Some(List("geom", "shape"))))
 
       val back = roundTrip(List(a, b))

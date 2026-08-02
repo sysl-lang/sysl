@@ -43,8 +43,17 @@ object Reachability {
    * what this pass is about; both are their own question.
    */
   def prune(program: TProgram): TProgram = {
-    val roots = List(program.main, program.vals, program.vtables, program.entry)
-    val live  = reachedFrom(roots, program.funcs, program.vtables).calls
+    // **An interrupt handler is a root**, and it is the one kind of function that can never be
+    // anything else: no program calls it — `15 §10` refuses that outright — so a walk starting from
+    // what the program *runs* cannot reach it. Dropping one would leave the vector table pointing at
+    // nothing, which is a fault at the worst available moment. It is entered by the processor, and
+    // that is exactly what an entry point is.
+    //
+    // Its **body** is walked with the others, so whatever a handler calls survives because the
+    // handler does. Only its own name has to be added by hand, since nothing names it.
+    val handlers = program.funcs.filter(_.conv.isDefined)
+    val roots    = List(program.main, program.vals, program.vtables, program.entry, handlers)
+    val live     = reachedFrom(roots, program.funcs, program.vtables).calls ++ handlers.map(_.name)
 
     program.copy(
       externs = program.externs.filter(e => live(e.name)),

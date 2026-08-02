@@ -453,6 +453,12 @@ no alloc                        no alloc            // same clause, enforced ide
 
 - **`requires alloc`** (and the other direction) is likewise a module-header clause, documenting
   and early-diagnosing a hard dependency, per `capabilities.md`.
+- **The header has one other inhabitant, and it is deliberately not held to agreeing.** `link "z"`
+  (`15 §8`) names a library the file's `extern`s need, and the files of a module may each name their
+  own. The rule differs because what is being described does: a capability is a property of the whole
+  module, so files that disagreed would describe different modules, while a link requirement is a
+  property of the `extern`s in *one* file — and a module whose foreign declarations all sit together
+  has nothing for its other files to repeat.
 - **Propagation is over the module graph.** A module's effective requirement is its own uses plus
   the requirements of every module it imports, transitively, and the whole graph must fit the
   target (`capabilities.md`). A `no alloc` module importing a `requires alloc` module is an error

@@ -38,12 +38,27 @@ trait DeclParser extends ExprParser {
    * statement; a bare call `foo(1)` fails here (its arguments are not `name: type` bindings,
    * and nothing follows to open a body) and falls through to `exprStmt`.
    */
+  /** A calling convention written before a definition: `interrupt handler()`, or with the privilege
+   * mode a processor distinguishes, `interrupt(supervisor) handler()` (`15 §10`).
+   *
+   * `interrupt` is a soft keyword, and the trailing `guard(ident)` is the whole of what keeps it one.
+   * Three things start with that word and only the first is a convention: `interrupt timer()`
+   * declares a handler, `interrupt(n: int) -> int` declares a *function called* `interrupt`, and
+   * `interrupt(4)` calls one. Requiring a name after the modifier tells them apart with no
+   * backtracking a reader could feel — and consuming nothing when it fails is what lets the other
+   * two go on to parse as themselves.
+   */
+  protected lazy val callConv: Parser[CallConv] =
+    at((softWord("interrupt") ~> opt(op("(") ~> ident <~ op(")")) <~ guard(ident))
+      ^^ (CallConv("interrupt", _)))
+
   protected lazy val funcDecl: PackratParser[Stmt] =
-    ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
+    opt(callConv) ~ ident ~ opt(boundedTypeParams) >> { case conv ~ name ~ tps =>
       val tp = tps.getOrElse(TypeParams.none)
       (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
         case ((params, variadic)) ~ ret ~ body =>
-          FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults)
+          FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults,
+                   conv = conv)
       }
     }
 
@@ -114,16 +129,45 @@ trait DeclParser extends ExprParser {
     case Mem(m: MethodDecl)
     case Inv(e: Expr)
 
-  protected lazy val structDecl: PackratParser[Stmt] =
-    op("struct") ~> ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
-      val tp = tps.getOrElse(TypeParams.none)
+  /** `opaque`, the modifier that withholds a struct's layout from every module but the one declaring
+   * it (`15 §9`). A soft keyword: `opaque` is an ordinary word — an alpha channel's fully-`opaque`
+   * end is the obvious field to want it for — and a language that spent it would be taking a name
+   * away to save itself a lookahead.
+   */
+  protected lazy val opaqueKw: Parser[Unit] = softWord("opaque")
 
-      (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~ endName(name) ^^ {
-        items =>
-          val fields     = items.collect { case StructPart.Fld(f)  => f }
-          val members    = items.collect { case StructPart.Mem(m)  => m }
-          val invariants = items.collect { case StructPart.Inv(e)  => e }
-          StructDecl(name, tp.names, fields, members, tp.bounds, invariants, tdefaults = tp.defaults)
+  protected lazy val structDecl: PackratParser[Stmt] =
+    opt(opaqueKw) ~ (op("struct") ~> ident) ~ opt(boundedTypeParams) >> { case hidden ~ name ~ tps =>
+      val tp     = tps.getOrElse(TypeParams.none)
+      val opaque = hidden.isDefined
+
+      // Whether there is an indented block **decides** which of the two this is, so it is settled by
+      // lookahead and committed to with `>>`. Written as an alternation it would not work: a body
+      // whose first line is bad fails deep inside the file, and a combinator choice keeps whichever
+      // alternative reached furthest — so the sentence below, raised back at the declaration, would
+      // lose to it and a struct with a mistake in its body would be reported as having no body.
+      opt(guard(newline ~ indent)) >> {
+        case Some(_) =>
+          (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~
+            endName(name) ^^ { items =>
+              val fields     = items.collect { case StructPart.Fld(f)  => f }
+              val members    = items.collect { case StructPart.Mem(m)  => m }
+              val invariants = items.collect { case StructPart.Inv(e)  => e }
+              StructDecl(name, tp.names, fields, members, tp.bounds, invariants,
+                         tdefaults = tp.defaults, opaque = opaque)
+            }
+
+        // A struct with **no body at all**, which only an `opaque` one may be: it is C's incomplete
+        // type, `struct sqlite3;`, and it is what a handle from a C library should be declared as.
+        // Nothing in sysl lays one out — the storage belongs to whoever allocated it — so the
+        // declaration exists to give `*sqlite3` a type of its own that a `*u8` cannot be mistaken for.
+        case None if opaque =>
+          success(StructDecl(name, tp.names, Nil, Nil, tp.bounds, Nil,
+                             tdefaults = tp.defaults, opaque = true))
+
+        case None =>
+          err(s"'struct $name' declares no fields — a struct's body is indented under it, and a " +
+            s"type with no layout of its own is written 'opaque struct $name'")
       }
     }
 

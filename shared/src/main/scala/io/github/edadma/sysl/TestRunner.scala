@@ -46,7 +46,7 @@ object TestRunner {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
-    val (ir, tests) = Compiler.compileTests(sources, libraries, target, precompiled, Some(core)) match
+    val (built, tests) = Compiler.compileTests(sources, libraries, target, precompiled, Some(core)) match
       case Left(err)     => return report(err)
       case Right(result) => result
 
@@ -66,7 +66,7 @@ object TestRunner {
 
     val exe = createTempFile("sysl-test-", "")
 
-    Toolchain.build(ir, exe, target, archives, cfg.optimize) match
+    Toolchain.build(built.ir, exe, target, archives, cfg.optimize, built.links) match
       case Left(err) => discard(exe); fail(err)
       case Right(_) =>
         val outcomes = execute(exe, selected, opts)

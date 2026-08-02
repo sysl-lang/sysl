@@ -19,8 +19,8 @@ class EscapeClaimTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   /** The promotion notes, which are what `--explain-escapes` prints. */
   private def promotions(src: String): List[String] =
     Compiler.compiled(List(Source("t.sysl", src))) match
-      case Right((_, notes)) => notes
-      case Left(err)         => fail(s"did not compile:\n$err")
+      case Right(built) => built.notes
+      case Left(err)    => fail(s"did not compile:\n$err")
 
   "a view rides out in whatever carries it, not only in the three the chapter listed" - {
 

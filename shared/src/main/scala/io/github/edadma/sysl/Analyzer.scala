@@ -34,6 +34,7 @@ class Analyzer private (
     protected val units: List[Program],
     protected val building: Set[String],
     protected val core: Core,
+    protected val target: Target,
 ) extends ProgramWalk with ExprAnalysis {
 
   /** Every error the walk found, rendered and in source order. */
@@ -57,10 +58,15 @@ object Analyzer {
    * out of hoisting, since the pass that registers every signature already runs over the whole set
    * before any body is checked.
    */
+  /** `target` is here for the reason it is a parameter everywhere else: a few rules are the
+   * *machine's* rather than the language's, and a diagnostic about one has to be raised where
+   * diagnostics are raised. `15 §10`'s calling conventions are the case — whether `interrupt` exists
+   * at all, and what signature it demands, differ per processor.
+   */
   def analyze(units: List[Program], building: Set[String] = Set.empty,
-              core: Core = Core.embedded(Target.default))
+              core: Core = Core.embedded(Target.default), target: Target = Target.default)
       : Either[String, TProgram] = {
-    val analyzer = new Analyzer(units, building, core)
+    val analyzer = new Analyzer(units, building, core, target)
 
     val outcome =
       try Right(analyzer.analyze())

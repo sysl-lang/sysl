@@ -194,6 +194,17 @@ trait CallCore extends Literals with TraitObjects with ArgumentBinding {
         "every other build leaves it out, so this call would have no definition to reach. " +
         "Work two tests share belongs in an ordinary function they both call")
 
+    // An interrupt handler has one caller and it is the processor (`15 §10`). It is entered on an
+    // asynchronous event with a frame the hardware pushed, and it leaves through a
+    // return-from-interrupt that restores the interrupted context — so a call written here would set
+    // up an ordinary frame and then execute an instruction that unwinds something that never
+    // happened. Its address is still worth taking, which is what a vector table is built from.
+    if f.conv.isDefined then
+      err(s"'$shown' is an interrupt handler, which the processor enters and no program calls — " +
+        "it leaves through a return-from-interrupt, which would unwind a frame this call never " +
+        s"pushed. Take its address for the vector table with '&$shown', and put whatever the two " +
+        "share in an ordinary function they both call")
+
     checkArity(s"function '$shown'", f.params.length, variadic, args.length)
 
     // An extern is declared in the output only if something reaches it, which is what keeps an

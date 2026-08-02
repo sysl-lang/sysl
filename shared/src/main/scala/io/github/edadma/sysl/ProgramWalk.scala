@@ -19,6 +19,8 @@ trait ProgramWalk
     with SignatureVisibility
     with ModuleGraph
     with Capabilities
+    with LinkRequirements
+    with ConventionCheck
     with NoAlloc
     with GatedModules
     with InitOrder
@@ -44,6 +46,7 @@ trait ProgramWalk
     // What a module may do is settled before anything in it is read, because the first construction
     // the walk reaches is already a question about it.
     readCapabilities()
+    readLinkDirectives()
     moduleNames ++= units.map(moduleOf)
     // The library's own modules are modules like any other, and are known for the same reason a
     // file's header is: what they are called is settled before a single name is resolved. They are
@@ -211,6 +214,10 @@ trait ProgramWalk
     // The hoisted declarations are what is walked, rather than the source statements, because
     // hoisting is where each one was renamed to the key its module gives it — an `extern` is left
     // out by the table that says which names have no body rather than by its declaration form.
+    // Read off the declarations rather than the bodies, so that a handler nothing instantiates and
+    // nothing reaches is judged exactly as one that does (`15 §10`).
+    checkConventions()
+
     val (fromLibrary, ours) = funcDecls.values.toList
       .filter(f => f.tparams.isEmpty && !externDecls.contains(f.name))
       .partition(f => suppliedByLibrary(f, f.name))
@@ -882,7 +889,7 @@ trait ProgramWalk
     // function, and only the second answers for an instantiation; a symbol is file-private if either
     // says so, since both name the one declaration.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
-      fileLocal(name) || fileLocal(f.name))
+      fileLocal(name) || fileLocal(f.name), f.conv)
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`
