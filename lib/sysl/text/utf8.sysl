@@ -89,13 +89,15 @@ end from_utf8
 // or storage the caller is about to free. A `string` outlives the call that produced it, so it
 // cannot be a view onto either.
 //
+// **But it is one copy, and it is `from_utf8`'s.** Slicing a `*u8` names the bytes where C left them
+// without taking any hold on them -- a `*T` promises nothing about how long they stay -- and
+// validation is what turns that borrowed run into a `string` owning its own. Gathering them into a
+// `[]u8` first, as this once did, is a second buffer for the same bytes that is freed on the next
+// line.
+//
 // Fallible for the same reason `from_utf8` is, and it goes through it rather than around it: nothing
 // about a `char *` promises well-formed UTF-8, and a C library reporting in a non-UTF-8 locale is
 // the ordinary case rather than a corrupt one.
-// The copy is `from_utf8`'s, and it is the only one. Slicing a `*u8` names the bytes where C left
-// them without taking a hold on them -- a `*T` promises nothing about how long they stay -- and
-// validation is what turns that borrowed run into a `string` that owns its own. Gathering them into
-// a `[]u8` first would be a second buffer for the same bytes, freed on the next line.
 from_cstring(p: *u8) -> Result[string, Utf8Error]
     var n = 0usize
 
@@ -105,40 +107,131 @@ from_cstring(p: *u8) -> Result[string, Utf8Error]
     from_utf8(p[0..<n])
 end from_cstring
 
+// Whether a byte begins a character rather than continuing one. A continuation byte is the only
+// one matching `10xxxxxx`, so this is one mask and one comparison -- and it is what a program
+// walking backwards through text, or snapping an arbitrary offset onto a boundary, needs and would
+// otherwise write inline. `04 § Granularity` calls the same property "boundary-checked" where the
+// compiler enforces it on `s[a..b]`; this is how a program asks the question for itself.
+is_char_boundary(b: u8) -> bool = (b & 192u8) != 128u8
+
+// How many bytes the character starting with this lead byte occupies. The width is written into the
+// lead byte, which is the property that makes UTF-8 walkable forwards without decoding anything.
+private char_width(lead: u8) -> usize
+    if lead >= 240u8 then
+        4usize
+    elif lead >= 224u8 then
+        3usize
+    elif lead >= 192u8 then
+        2usize
+    else
+        1usize
+end char_width
+
+// One character read out of a run of bytes.
+//
+// It is a function rather than a body inside `next` because looking without advancing needs the
+// same decode, and a decoder written twice is two chances for the two to disagree. Counting needs
+// neither of them -- `char_width` is enough -- which is why the width is not returned alongside:
+// the caller that has to move already knows how far.
+//
+// The decode is a plain shift-and-accumulate with no validation, which is sound only because there
+// is no way to reach it with bytes that were not validated first: a `string` is UTF-8 by
+// construction, so the lead byte's width is the width that is there.
+private decode_at(b: []const u8, i: usize) -> char
+    var lead = b[i]
+    var need = char_width(lead)
+    var v = u32(lead)
+
+    if need == 4usize then
+        v = u32(lead & 7u8)
+    elif need == 3usize then
+        v = u32(lead & 15u8)
+    elif need == 2usize then
+        v = u32(lead & 31u8)
+
+    for k in 1usize..<need
+        v = (v << 6u32) | u32(b[i + k] & 63u8)
+
+    char(v)
+end decode_at
+
 // A cursor over the characters of a run of bytes, which is what `s.chars` reaches -- the compiler
 // names `chars_of` for itself, so this is a declaration the language depends on by name rather than
 // one a program has to find.
 struct Chars
     rest: []const u8
     at: usize
+
+    // Where the cursor is, in bytes from the start of the run it was made over.
+    //
+    // **It is here because a `for` walks a copy** (`sysl.iter`), so a loop over `s.chars` cannot
+    // ask the cursor anything afterwards -- and a program that needs to know where it is drives the
+    // cursor by hand with `next` instead. That is the shape a lexer wants, and without an offset it
+    // has to index bytes itself and decode a second time.
+    offset -> usize = self.at
+
+    // The next character without moving to it. The receiver is taken by value, so what is peeked at
+    // is a copy's business and the cursor is left where it was.
+    peek(self) -> Option[char]
+        if self.at >= self.rest.len then return None
+
+        Some(decode_at(self.rest, self.at))
+    end peek
+
+    // How many characters are left, which costs a walk of the remaining bytes -- there is nothing
+    // in the representation that knows it, since the whole point of UTF-8 is that the count and the
+    // byte length are different numbers. By value again, so counting does not consume.
+    //
+    // It reads each lead byte's width and skips, decoding nothing: what a count needs to know is
+    // where the characters start, not what they are.
+    count(self) -> usize
+        var n = 0usize
+        var i = self.at
+
+        while i < self.rest.len
+            i += char_width(self.rest[i])
+            n += 1usize
+
+        n
+    end count
 end Chars
 
 chars_of(b: []const u8) -> Chars = Chars(b, 0usize)
 
-// The decode is a plain shift-and-accumulate with no validation, which is sound only because there
-// is no way to reach it with bytes that were not validated first: a `string` is UTF-8 by
-// construction, so the lead byte's width is the width that is there.
 impl Iterate[char] for Chars
     next(*self) -> Option[char]
         if self.at >= self.rest.len then return None
 
-        var lead = self.rest[self.at]
-        var need = 1usize
-        var v = u32(lead)
+        var c = decode_at(self.rest, self.at)
 
-        if lead >= 240u8
-            need = 4usize
-            v = u32(lead & 7u8)
-        elif lead >= 224u8
-            need = 3usize
-            v = u32(lead & 15u8)
-        elif lead >= 192u8
-            need = 2usize
-            v = u32(lead & 31u8)
+        self.at += char_width(self.rest[self.at])
+        Some(c)
+    end next
 
-        for k in 1usize..<need
-            v = (v << 6u32) | u32(self.rest[self.at + k] & 63u8)
+// The same walk, reporting where each character started as well as what it was.
+//
+// This is the cursor a lexer actually wants, and its absence is why the guide's JSON reader and its
+// bytecode lexer both index bytes by hand: a `for` walks a *copy* of a cursor, so `for c in s.chars`
+// cannot be asked afterwards where it got to, and a program needing both the character and its
+// offset had no form that gave it both. Rust calls this `char_indices` and it is here for the same
+// reason.
+//
+// The offset is the character's **first** byte, so it is directly what `s[a..b]` takes -- a slice
+// from a reported offset lands on a boundary by construction.
+//
+// It wraps a `Chars` rather than decoding for itself, so there is one decoder and the two cursors
+// cannot come to disagree about a width.
+struct CharIndices
+    inner: Chars
+end CharIndices
 
-        self.at += need
-        Some(char(v))
+char_indices(b: []const u8) -> CharIndices = CharIndices(chars_of(b))
+
+impl Iterate[(usize, char)] for CharIndices
+    next(*self) -> Option[(usize, char)]
+        var start = self.inner.at
+
+        self.inner.next() match
+            Some(c) -> Some((start, c))
+            None -> None
     end next

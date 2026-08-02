@@ -26,10 +26,11 @@ granularity.
 writes by name is `sysl.text`.** A literal, `+`, `str(x)`, an interpolation and `s.chars` are all
 desugarings, so they cost no import — even `s.chars`, whose cursor is `sysl.text`'s, because the
 compiler names `chars_of` by key rather than by resolving the word (`13 §8`). Named at the call
-site, and so imported: `from_utf8`, `from_cstring`, `char_from_u32`, `str_builder`, `cstring`, and
-the types `Utf8Error`, `Chars`, `StrBuilder`, `CString` and the `Ascii` trait. The split is the one
-`13 § Open h` describes — what a program cannot avoid needing is free, and what it has to ask for it
-asks for.
+site, and so imported: `from_utf8`, `from_cstring`, `char_from_u32`, `str_builder`,
+`str_builder_with_capacity`, `cstring`, `char_indices`, `is_char_boundary`, and the types
+`Utf8Error`, `Chars`,
+`CharIndices`, `StrBuilder`, `CString` and the `Ascii` trait. The split is the one `13 § Open h`
+describes — what a program cannot avoid needing is free, and what it has to ask for it asks for.
 
 ## The decision in one paragraph
 
@@ -208,6 +209,25 @@ do. What it gets is the ordinary garbage-in answer — a lead byte that is reall
 decodes as itself — and never a read past the end: every byte the decoder takes goes through the
 slice's own bounds check, so a truncated sequence traps like any other overrun. That is the same
 runtime-safety category `char(u)` and a mid-codepoint slice are in.
+
+**What a cursor answers besides "the next one".** A `for` walks a *copy* of a cursor, so a loop over
+`s.chars` cannot be asked afterwards where it got to — and a program that needs to know drives the
+cursor itself. That shape is a lexer's, and it was underserved: the guide's JSON reader and its
+bytecode lexer both index bytes by hand and decode a second time, because there was no form giving
+them a character and its position together. So a `Chars` also offers `offset`, the byte position it
+has reached; `peek`, the next character without moving to it; and `count`, how many remain — all
+three by value, so asking consumes nothing.
+
+**`char_indices(b)` is the paired walk**, yielding `(usize, char)` — Rust's name, for Rust's reason.
+The offset is each character's **first** byte, which is what makes it directly usable: a slice built
+from two reported offsets lands on boundaries by construction, and since `s[a..b]` traps on a
+mid-codepoint bound, that is a guarantee rather than a convention. It wraps a `Chars` rather than
+decoding for itself, so there is one decoder and the two cursors cannot come to disagree about a
+width.
+
+**`is_char_boundary(b)`** is the same question about a single byte — one mask and one comparison,
+since the continuation byte is the only one matching `10xxxxxx`. It is what a program walking
+backwards, or snapping an arbitrary offset onto a boundary, would otherwise write inline.
 
 **Slicing is boundary-checked.** `s[a..b]` must land on scalar-value boundaries; landing
 mid-codepoint traps, in the same runtime-safety category as a bounds check and `char(u)`. Go
