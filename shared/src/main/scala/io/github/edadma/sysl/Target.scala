@@ -41,6 +41,26 @@ case class Target(
    */
   def hardFloat: Boolean = !softFloat
 
+  /** Whether a `thread_local` global on this target reaches storage something has actually set up.
+   *
+   * Every target LLVM knows will *accept* the keyword, so this is not a question about the backend —
+   * it is a question about what runs before `main`. A hosted system lays down a thread's storage as
+   * part of starting it, and a bare one has nothing that would: there is no loader, no libc, and
+   * nothing that writes the thread pointer.
+   *
+   * The reason it has to be asked rather than left to the backend is that the failure is silent.
+   * Asked for a freestanding ELF target, LLVM upgrades an internal thread-local to the **local-exec**
+   * model — a `:tprel_hi12:` offset from `TPIDR_EL0` on AArch64 — which links clean and reads
+   * whatever the register happened to hold. A kernel that never set one up would get a wild address
+   * out of the arc runtime rather than a diagnostic out of the linker.
+   *
+   * Nothing is lost by answering `false` there, because nothing on a bare target can spawn: the
+   * threads a program gets from sysl come from `sysl.thread`, which is `requires posix`. A kernel
+   * that implements threads of its own and shares a reference across them is outside what the
+   * compiler can see either way — it does not know that scheduler exists.
+   */
+  def hasThreadLocalStorage: Boolean = os != Os.Freestanding
+
   /** Whether the compiler can lower for this target at all. A target it knows and cannot lower for
    * is worth naming: the diagnostic then says what is missing instead of leaving the name unknown,
    * which reads as a typo.

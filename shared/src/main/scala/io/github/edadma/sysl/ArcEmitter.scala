@@ -465,9 +465,18 @@ object ArcEmitter {
    * stack frame per node and overflow the stack on a long one. Instead, when a count reaches zero
    * the object is pushed onto a worklist (reusing its now-dead count slot as the link) and the
    * *first* release to hit zero drains the list in a loop: each destructor it runs pushes more
-   * work rather than recursing, so teardown depth is O(1) regardless of structure depth. The
-   * worklist is a plain global, which is correct while drops are single-threaded; concurrent drops
-   * of `&sync` structures across threads will need it thread-local.
+   * work rather than recursing, so teardown depth is O(1) regardless of structure depth.
+   *
+   * **The worklist is per thread, because it is scratch space and not shared state.** Two threads
+   * releasing the last reference to two unrelated `&sync` structures at the same moment both reach
+   * `arc.reap`, and one list between them would have each overwrite the other's head — a queued
+   * object dropped on the floor, or drained twice. Neither is a race the counts could prevent: the
+   * counts are what got both threads here correctly. So the list is `thread_local` and each thread
+   * drains its own, which is also what makes the `arc.draining` flag mean what it says, since it
+   * asks whether *this* thread is already inside a drain further up its own stack.
+   *
+   * A target with no thread-local storage keeps the plain global (`Target.hasThreadLocalStorage`),
+   * which is exactly as correct there as it was everywhere before: nothing on a bare target spawns.
    *
    * **The storage outlives the object when something weak still asks about it.** The strong count
    * reaching zero destroys the object — the payload's references are given back — but the bytes
@@ -481,11 +490,13 @@ object ArcEmitter {
    * gives it back, after the hook has run and the link is no longer needed. The slot is put back
    * to zero before the hook runs, so nothing ever reads a link where a count should be.
    */
-  val core: String =
-    """%arc.header = type { i64, ptr, i64 }
+  def core(target: Target): String = {
+    val tls = if target.hasThreadLocalStorage then "thread_local " else ""
+
+    s"""%arc.header = type { i64, ptr, i64 }
       |
-      |@arc.worklist = internal global ptr null
-      |@arc.draining = internal global i1 false
+      |@arc.worklist = internal ${tls}global ptr null
+      |@arc.draining = internal ${tls}global i1 false
       |
       |define private void @arc.retain(ptr %p) {
       |entry:
@@ -566,6 +577,7 @@ object ArcEmitter {
       |}
       |
       |""".stripMargin
+  }
 
   /** The three functions a `weak T` needs, emitted only into a module that holds one.
    *

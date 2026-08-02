@@ -151,6 +151,13 @@ and nothing here will tell you. Shared *mutable* state goes through the library:
 That is Rust's `Arc<Mutex<T>>` with one less layer of spelling, and it is a convention rather
 than a checked rule — see "How strong this is."
 
+**Letting go of the last one is the place where an atomic count is not the whole answer.** A zero
+hands the object to the iterative reaper, and the worklist that reaper drains is **per thread**
+(`03 § Teardown is iterative`) — otherwise two threads dropping two unrelated shared objects at the
+same moment would each overwrite the other's list. The counts cannot help with that: they are what
+got both threads to the reaper correctly, each having genuinely released the last reference to a
+different object.
+
 ## Channels
 
 Domains talk by **channel**, one type with two implementations underneath:
@@ -249,11 +256,6 @@ to do it.
   one is a compare-and-swap loop against a strong count another thread may be driving to zero, and
   nothing can race with it until this chapter is. It is refused where it is written, naming this
   document. Whatever lands here has to say what an upgrade racing a release means.
-
-- **The teardown worklist is a plain global.** `arc.reap` drains a list threaded through the dead
-  objects' own count slots, which is correct while drops are single-threaded and is not once two
-  domains can drop `&sync` structures at the same time. It has to become thread-local before the
-  first thread is spawned; the comment on `ArcEmitter.core` says so where the code is.
 
 - **A view that records something about its storage.** Shared above, with `07 § Not yet` — the same
   missing type is what an immortal string and a `&sync` buffer's slice both want.

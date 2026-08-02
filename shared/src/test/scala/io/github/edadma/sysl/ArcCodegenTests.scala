@@ -10,6 +10,10 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
   private val point = "struct Point\n    x: int\n    y: int\n"
 
+  // A payload the reaper's tests can hang a `&sync` off, kept apart from `point` so that changing
+  // either one does not silently change what the other's assertions are counting.
+  private val chain = "struct Node\n    v: int\n"
+
   // A monomorphized name carries its generic's **key**, so the library's `Option` appears here as
   // `sysl$Option` — and inside a regex the `$` has to be escaped, since it would otherwise read as
   // an end-of-input anchor and match nothing at all.
@@ -177,5 +181,57 @@ class ArcCodegenTests extends AnyFreeSpec with CodegenSupport {
 
     out should not include "call ptr @malloc"
     out should not include "@arc.copy"
+  }
+
+  /** The reaper's worklist, which is scratch space a thread uses while it drains and not state two
+   * threads share. Its being per-thread is what keeps a concurrent `&sync` drop from having one
+   * thread overwrite the other's list head — and it is invisible from a program's output, so the
+   * storage class is asserted in the text.
+   */
+  "the reaper's worklist" - {
+    "is thread-local, and so is the flag saying a drain is already running" in {
+      val out = ir(chain + "var p: &sync Node = Node(1)")
+
+      out should include("@arc.worklist = internal thread_local global ptr null")
+      out should include("@arc.draining = internal thread_local global i1 false")
+    }
+
+    // The reaper is unchanged by the storage class: it still threads the list through the dead count
+    // slot and still drains in a loop rather than recursing.
+    "and the reaper reads and writes it exactly as it did" in {
+      val out = ir(chain + "var p: &sync Node = Node(1)")
+
+      out should include regex raw"%w = load ptr, ptr @arc\.worklist\n  store ptr %w, ptr %p"
+      out should include("store ptr %p, ptr @arc.worklist")
+      out should include regex raw"drain:\n  store i1 true, ptr @arc\.draining"
+    }
+
+    /** A bare target keeps the plain global, and the reason is not that threads are unlikely there:
+     * asked for a thread-local, LLVM gives a freestanding ELF target the **local-exec** model, whose
+     * `:tprel_hi12:` offset is read from a thread pointer register nothing on a bare machine has
+     * written. That links clean and reads a wild address, which is the one outcome worse than the
+     * single-threaded list — and nothing the compiler provides can spawn there anyway, since the
+     * threads a program gets come from a module that is `requires posix`.
+     */
+    "is a plain global where nothing has set thread-local storage up" in {
+      val out = irFor(Target.aarch64Freestanding, chain + "var p: &sync Node = Node(1)")
+
+      out should include("@arc.worklist = internal global ptr null")
+      out should include("@arc.draining = internal global i1 false")
+      out should not include "thread_local"
+    }
+
+    // Stated over the whole registry rather than for the two targets above, so that a target added
+    // later cannot get one storage class while `Target` says the other.
+    "and every target gets whichever one it says it has" in {
+      for t <- Target.all if t.supported do
+        withClue(t.name) {
+          val out = irFor(t, chain + "var p: &sync Node = Node(1)")
+          val tls = if t.hasThreadLocalStorage then "thread_local " else ""
+
+          out should include(s"@arc.worklist = internal ${tls}global ptr null")
+          out should include(s"@arc.draining = internal ${tls}global i1 false")
+        }
+    }
   }
 }
