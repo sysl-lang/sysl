@@ -22,6 +22,35 @@ object Toolchain {
   lazy val clangAvailable: Boolean =
     exec(Seq("clang", "--version")).exitCode == 0
 
+  /** What optimization a build asks for when nothing named one — the level, as clang spells it after
+   * the `-O`.
+   *
+   * **Nothing was passed here at all until a program miscompiled.** `guide/sha2` handed a 184-byte
+   * struct to a function **by value** and the callee received zeros, from correct IR, on a build
+   * that differed from a working one by a single `zext` feeding an `llvm.fshr`. `-O0` was where it
+   * lived: the same module at `-O1` ran correctly, and the case reduced to a hand-edited `.ll` with
+   * none of sysl's own code in the edit. The shape of it is a FastISel fallback losing a live value
+   * — a path that exists only because `-O0` selects instructions the fast way and falls back to the
+   * full selector for whatever it cannot handle.
+   *
+   * **So the default is not a workaround for that one bug.** It is the decision to stop building on
+   * the least-exercised path in the back end. `-O0` is the mode a compiler's own suite covers least
+   * and the one where instruction selection is a different algorithm; a language whose programs were
+   * correct only at `-O0` would have the problem the wrong way round.
+   *
+   * `1` rather than `2` because what is wanted is the ordinary pipeline and not the aggressive one.
+   * `-O1` is where the standard selector and the everyday simplifications are, which is the whole of
+   * what this is for; it is also where a debugger still finds its footing and where compile time is
+   * not something a program has to be big before noticing. `--optimize` names another.
+   */
+  val defaultOptimization = "1"
+
+  /** The flag a level is passed as. A level is whatever was written — `0`, `2`, `s`, `z`, `fast` are
+   * all clang's — and one clang does not have is clang's to complain about, since it is the
+   * authority on its own levels and would say so better than a list here could.
+   */
+  private def flag(level: String) = s"-O$level"
+
   /** Where an `llvm-ar` is looked for, in order, when none was named.
    *
    * The PATH first, since a toolchain installed to be used is on it. Then the places a package
@@ -93,11 +122,11 @@ object Toolchain {
    * With `--target` passed, the only override that can still happen is that refinement.
    */
   def build(ir: String, exe: String, target: Target = Target.default,
-            archives: List[String] = Nil): Either[String, Unit] = {
+            archives: List[String] = Nil, level: String = defaultOptimization): Either[String, Unit] = {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    val result = exec(linkCommand(ll, archives, exe, target))
+    val result = exec(linkCommand(ll, archives, exe, target, level))
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())
@@ -113,9 +142,9 @@ object Toolchain {
    * nothing. The system libraries go after both for exactly the same reason, since the library's own
    * object is one of the things that calls them.
    */
-  private[sysl] def linkCommand(ll: String, archives: List[String], exe: String,
-                                target: Target): List[String] =
-    List("clang", s"--target=${target.triple}", "-Wno-override-module") ::: deadStrip(target) :::
+  private[sysl] def linkCommand(ll: String, archives: List[String], exe: String, target: Target,
+                                level: String = defaultOptimization): List[String] =
+    List("clang", s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: deadStrip(target) :::
       List(ll) ::: archives ::: systemLibraries(target) ::: List("-o", exe)
 
   /** The system libraries a program is linked against beyond the ones the driver passes itself.
@@ -172,11 +201,12 @@ object Toolchain {
    * wrong — atoms are already per-definition there. Passed unconditionally so that an artifact built
    * on one host still strips when linked for another.
    */
-  def compileObject(ir: String, obj: String, target: Target = Target.default): Either[String, Unit] = {
+  def compileObject(ir: String, obj: String, target: Target = Target.default,
+                    level: String = defaultOptimization): Either[String, Unit] = {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    val result = exec(Seq("clang", s"--target=${target.triple}", "-Wno-override-module",
+    val result = exec(Seq("clang", s"--target=${target.triple}", "-Wno-override-module", flag(level),
       "-ffunction-sections", "-fdata-sections", "-c", ll, "-o", obj))
     deleteFile(ll)
 
@@ -202,8 +232,9 @@ object Toolchain {
    * driver then refines, and a `.c` has no module statement to override — passing it here would be
    * suppressing a warning that cannot arise.
    */
-  def compileC(source: String, obj: String, target: Target = Target.default): Either[String, Unit] = {
-    val result = exec(Seq("clang", s"--target=${target.triple}",
+  def compileC(source: String, obj: String, target: Target = Target.default,
+               level: String = defaultOptimization): Either[String, Unit] = {
+    val result = exec(Seq("clang", s"--target=${target.triple}", flag(level),
       "-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj))
 
     if result.exitCode == 0 then Right(())

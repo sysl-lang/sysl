@@ -33,6 +33,20 @@ object SelfAlias {
     /** The locals that may hold such a pointer. `self` seeds it: the receiver is one. */
     var confined = Set("self")
 
+    /** The place each `ref` in this body names (`03 § ref`).
+     *
+     * A ref is a second name for storage, so `&r` is `&<the place r names>` — and the question this
+     * pass asks of an address is *structural*, "is this a chain of steps from `*self`", which a bare
+     * name cannot answer for itself. Without the map the leak is simply invisible: the same pointer,
+     * out of the same method, written one line longer.
+     */
+    val refOf = {
+      val found = scala.collection.mutable.Map.empty[String, TExpr]
+
+      TreeWalk.forEachStmt(f.body.stmts) { case TRefDecl(n, _, place) => found(n) = place }
+      found.toMap
+    }
+
     /** Whether a value carries a pointer into the receiver's inline storage — directly, or inside
      * something built around one. A struct made of it, a branch that yields it and a box holding it
      * are all the same pointer with a wrapper on.
@@ -73,6 +87,7 @@ object SelfAlias {
       case TDeref(ptr, _)  => carries(ptr)
       case TField(r, _, _) => stepsInto(r)
       case TIndex(r, _, _) => stepsInto(r)
+      case TLoad(n, _) if refOf.contains(n) => ownStorage(refOf(n))
       case _               => false
 
     /** Whether stepping *through* this receiver stays in the same object. A reference, a view or a
@@ -96,6 +111,10 @@ object SelfAlias {
 
       TreeWalk.forEachStmt(f.body.stmts) {
         case TVarDecl(n, _, init)                  => bind(n, init)
+        // A `ref` into the receiver carries the receiver's storage under a new name, so the name
+        // has to be tracked as one that does — otherwise `&r` would be the leak this pass exists to
+        // catch, written one line longer and unseen.
+        case TRefDecl(n, _, place)                 => bind(n, place)
         case TExprStmt(TStore(TLoad(n, _), v, _))  => bind(n, v)
         case TMultiAssign(writes) =>
           for w <- writes do
@@ -135,6 +154,7 @@ object SelfAlias {
       case TReturn(Some(v))  => gotOut(v, "is returned"); written(v)
       case TExprStmt(e)      => written(e)
       case TVarDecl(_, _, e) => written(e)
+      case TRefDecl(_, _, e) => written(e)
       case TBreak(Some(v), _) => written(v)
       case TMultiAssign(writes) =>
         for w <- writes do

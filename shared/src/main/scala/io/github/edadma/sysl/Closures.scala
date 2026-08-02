@@ -118,6 +118,9 @@ trait Closures extends CallAnalysis {
       pos: Option[Pos],
   ): TExpr = {
     val captured = captures(body, names.toSet)
+
+    refuseRefCaptures(captured)
+
     val fields   = captured.map(n => (n, lookupOpt(n).get._2))
 
     val struct = Type.Struct(Closures.base(closureCount), Nil)
@@ -176,6 +179,8 @@ trait Closures extends CallAnalysis {
     // group are bound here and are not free in each other's bodies.
     val bound    = names.toSet
     val captured = group.flatMap(f => captures(f.body, bound ++ f.params.map(_.name))).distinct
+
+    refuseRefCaptures(captured)
 
     // The field holds the **address** of the enclosing variable, not a copy of it — see
     // `Environment`. That is what makes a nested function assigning to one of the block's locals
@@ -242,6 +247,29 @@ trait Closures extends CallAnalysis {
    */
   private def fixed(captured: List[String]): Set[String] =
     captured.filter(n => lookupOpt(n).exists((u, _) => readOnlyLocals(u))).toSet
+
+  /** Refuses a capture of a `ref`, which is the one construct that would carry one out of its block
+   * (`03 § ref`).
+   *
+   * A ref is a **declaration and never a type**, and the whole of what that buys is that the compiler
+   * still holds the place the name stands for, in the body that wrote it. A capture is exactly the
+   * thing that breaks it: the name would be read from an environment, in a body that has no place to
+   * walk outward through, and an escaping closure would carry the address past the block whose
+   * storage it names — the dangle the binding rule spends its effort preventing at the other end.
+   *
+   * It is refused rather than made to work by capturing the place instead, because that would be a
+   * second, hidden meaning for one word: `ref e = xs[i]` inside the closure would re-walk the path at
+   * whatever `i` had become, which is the call-by-name reading the chapter rejects.
+   */
+  protected def refuseRefCaptures(captured: List[String]): Unit =
+    for
+      n         <- captured
+      (unique, _) <- lookupOpt(n)
+      if refPlaces.contains(unique)
+    do
+      err(s"'$n' is a 'ref', which names storage for as long as its own block and no longer — so it " +
+        "cannot be captured, since a closure may outlive that block. Capture the place it names, or " +
+        "read the value into a 'val' and capture that")
 
   /** `inner(a)` — a call to a nested function, which is a call to its lowered name with the shared
    * environment in front of the arguments it was written with.
@@ -398,6 +426,7 @@ trait Closures extends CallAnalysis {
       // the initializer is still read outside it — `var n = n` captures the outer `n`.
       case VarDecl(n, _, init)   => init.foreach(walk(_, bound)); bound + n
       case ValDecl(n, _, v, _)   => walk(v, bound); bound + n
+      case RefDecl(n, p)         => walk(p, bound); bound + n
       case ConstDecl(n, _, v, _) => walk(v, bound); bound + n
       case f: FuncDecl => scoped(f.body, bound ++ f.params.map(_.name)); bound
       // A closure inside this one captures from further out through this one, so what it reads is

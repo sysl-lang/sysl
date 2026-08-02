@@ -239,6 +239,67 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // A trait is only ever the pointee of a `*Trait` / `&Trait`, both handled above; resolving a
     // bare trait name is a diagnostic, so nothing of this type is ever laid out.
     case _: Type.Trait    => sys.error("unreachable zero of a trait")
+
+  /** A call to an LLVM intrinsic overloaded on one integer width, declared on first use.
+   *
+   * These are the compiler's own reach for an instruction, not the library's — `Intrinsics` is the
+   * table an `extern "llvm.…"` is checked against, and nothing in `sysl.math` could have declared
+   * these: `Bits`' membership covers an open family of widths, so there is no finite set of
+   * `extern`s to write. What the two mechanisms share is the reason the name carries the width,
+   * which is that LLVM overloads on the operand type and spells the choice in the name.
+   *
+   * `zeroFlag` is the extra `i1` that `ctlz` and `cttz` take and no other intrinsic here does. It
+   * is always `false`, meaning a zero operand is defined rather than poison — see the call sites.
+   */
+  private def intrinsic(base: String, ll: String, args: List[String], zeroFlag: Boolean = false): String = {
+    val name   = s"llvm.$base.$ll"
+    val params = List.fill(args.length)(ll) ++ Option.when(zeroFlag)("i1")
+    satDecls += s"declare $ll @$name(${params.mkString(", ")})"
+
+    val ops = args.map(a => s"$ll $a") ++ Option.when(zeroFlag)("i1 false")
+    val r   = freshTemp()
+    emit(s"$r = call $ll @$name(${ops.mkString(", ")})")
+    r
+  }
+
+  /** An integer value moved between two widths, unsigned. Nothing is emitted where they agree,
+   * which is the usual case and keeps the IR of a 32-bit count readable.
+   */
+  private def resize(v: String, from: Type, to: Type): String = {
+    val (a, b) = (from.asInstanceOf[Type.Integer].bits, to.asInstanceOf[Type.Integer].bits)
+
+    // A non-negative immediate is its own value at every width it fits in, so **widening** one is a
+    // `zext` of a constant that says nothing. The optimizer folds it either way; what this is for is
+    // `emit-llvm`, where a rotation by a literal should read as the constant funnel shift it is
+    // rather than as a register one whose register is a constant. Narrowing still goes through the
+    // instruction, since an immediate too wide for the type it is written at is not IR at all.
+    if a == b || (a < b && !v.startsWith("%") && !v.startsWith("-")) then v
+    else
+      val r = freshTemp()
+      emit(s"$r = ${if a < b then "zext" else "trunc"} ${from.llvm} $v to ${to.llvm}")
+      r
+  }
+
+  /** A rotation amount, brought from the `u32` it is written as to the width being rotated.
+   *
+   * The funnel-shift intrinsics already take their amount modulo the width, so most of the time
+   * this is the resize alone. The exception is a width that is **not a power of two**, where
+   * narrowing to it first would take the amount modulo `2^w` and the two reductions do not compose:
+   * an `i5` asked to rotate by 33 would answer as though asked for 1, because 33 survives the
+   * narrowing to 1 and 5 does not divide 32. So a width like that reduces first, at the amount's
+   * own width, where the answer is still the one the program asked for.
+   */
+  private def rotateBy(v: String, from: Type, bits: Int): String = {
+    val reduced =
+      if (bits & (bits - 1)) == 0 || from.asInstanceOf[Type.Integer].bits <= bits then v
+      else
+        val r = freshTemp()
+        emit(s"$r = urem ${from.llvm} $v, $bits")
+        r
+
+    resize(reduced, from, Type.Integer(bits, signed = false))
+  }
+
   // --- expressions ---------------------------------------------------------------------
 
   /** Lowers an expression, returning the register or immediate holding its value (empty for a
@@ -388,8 +449,12 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.
     case TLoad(_, ty) if Type.zeroSized(ty) => ""
 
+    // The qualifier comes off the value's type for an ordinary local, whose slot is its own, and off
+    // the recorded storage for a `ref`, whose slot is somebody else's and may be a register
+    // (`03 § ref`, `03 § Device memory`).
     case TLoad(name, ty) =>
-      val r = freshTemp(); emit(s"$r = load${qualifier(ty)} ${ty.llvm}, ptr %$name.addr"); r
+      val q = if refStorage.contains(name) then qualifier(refStorage(name)) else qualifier(ty)
+      val r = freshTemp(); emit(s"$r = load$q ${ty.llvm}, ptr %$name.addr"); r
 
     case TResult(_) =>
       resultSSA.getOrElse(sys.error("'result' lowered outside an ensure postcondition"))
@@ -567,6 +632,63 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val v = genExpr(operand); val r = freshTemp(); emit(s"$r = xor ${ty.llvm} $v, -1"); r
     case TUnary(op, _, _) =>
       sys.error(s"unreachable unary '$op'")
+
+    // The operand is read into a register once and the comparisons index off that, which is the
+    // whole reason these are a node rather than a tree of the operators they mean (`14 §5`).
+    case TIntOp(op, operand, amount, width, ty) =>
+      val v    = genExpr(operand)
+      val n    = amount.map(genExpr)
+      val bits = width.asInstanceOf[Type.Integer].bits
+      val ll   = width.llvm
+
+      // The bits counted at the operand's own width, then resized to the `u32` the count is
+      // answered in. A count is at most the width, so narrowing one from a type wider than 32 bits
+      // cannot lose anything.
+      def counted(base: String, of: String, zeroFlag: Boolean = false) =
+        resize(intrinsic(base, ll, List(of), zeroFlag), width, ty)
+
+      // `~x`, which is what turns a count of zeroes into a count of ones. The trait has both pairs
+      // because the complement is the caller's to get wrong, not because the machine has four
+      // instructions.
+      def complement = { val r = freshTemp(); emit(s"$r = xor $ll $v, -1"); r }
+
+      op match
+        // `x < 0 ? -x : x`, and the negation is the wrapping one the language's own `-` is — so at
+        // the most negative value both answer that value, rather than the member disagreeing with
+        // the operator beside it.
+        case "abs" =>
+          val neg = freshTemp(); emit(s"$neg = sub $ll 0, $v")
+          val lt  = freshTemp(); emit(s"$lt = icmp slt $ll $v, 0")
+          val r   = freshTemp(); emit(s"$r = select i1 $lt, $ll $neg, $ll $v")
+          r
+        // Two comparisons rather than a subtraction of them, because `(x > 0) - (x < 0)` would have
+        // to widen both booleans to the operand's width first and says less about what it computes.
+        case "signum" =>
+          val pos = freshTemp(); emit(s"$pos = icmp sgt $ll $v, 0")
+          val neg = freshTemp(); emit(s"$neg = icmp slt $ll $v, 0")
+          val hi  = freshTemp(); emit(s"$hi = select i1 $pos, $ll 1, $ll 0")
+          val r   = freshTemp(); emit(s"$r = select i1 $neg, $ll -1, $ll $hi")
+          r
+
+        case "count_ones"  => counted("ctpop", v)
+        case "count_zeros" => counted("ctpop", complement)
+
+        // The `i1` the two counting intrinsics take says whether a zero operand is **poison**.
+        // `false` is what makes zero answer the width instead, which is the answer the trait
+        // documents and the only one that is the same number on every target.
+        case "leading_zeros"  => counted("ctlz", v, zeroFlag = true)
+        case "trailing_zeros" => counted("cttz", v, zeroFlag = true)
+        case "leading_ones"   => counted("ctlz", complement, zeroFlag = true)
+        case "trailing_ones"  => counted("cttz", complement, zeroFlag = true)
+
+        case "reverse_bits" => intrinsic("bitreverse", ll, List(v))
+
+        // A rotation is a funnel shift of the value with itself, which is how LLVM spells one: the
+        // two halves are the same register, so the bits leaving the top arrive at the bottom.
+        case "rotate_left"  => intrinsic("fshl", ll, List(v, v, rotateBy(n.get, amount.get.ty, bits)))
+        case "rotate_right" => intrinsic("fshr", ll, List(v, v, rotateBy(n.get, amount.get.ty, bits)))
+
+        case _ => sys.error(s"unreachable integer operation '$op'")
 
     // Short-circuit: `&&` evaluates its right side only when the left is true, `||` only when the
     // left is false — so a guard like `p != null && *p > 0` never runs the unsafe right side. The

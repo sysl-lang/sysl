@@ -20,7 +20,11 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * `regs.status` has type `u32` and sits in storage of type `volatile u32`, and the difference
    * between those two is exactly this word.
    */
-  protected def vol(place: TExpr): String = qualifier(place.placeTy)
+  protected def vol(place: TExpr): String = place match
+    // A `ref` name carries no declaration of its own, so the qualifier comes from what the binding
+    // found rather than from the node (`03 § ref`).
+    case TLoad(name, _) if refStorage.contains(name) => qualifier(refStorage(name))
+    case _                                           => qualifier(place.placeTy)
 
   /** The same marker read off a type directly, for the paths that have the storage's type and not
    * the node it came from.
@@ -273,9 +277,15 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * parameter is the caller's layout, so neither is this body's to have moved.
    */
   protected def promotedOwner(base: TExpr): String = base match
-    case TLoad(name, _)  => promotedBoxes.getOrElse(name, "null")
-    case TIndex(r, _, _) => promotedOwner(r)
-    case _               => "null"
+    case TLoad(name, _) if promotedBoxes.contains(name) => promotedBoxes(name)
+    // A `ref` names storage it did not declare, so the box belongs to whatever its place was rooted
+    // at (`03 § ref`). Without this step a view taken through a ref would own nothing, and the buffer
+    // the array was promoted into would be released while the view still pointed into it — a
+    // promotion that silently undid itself.
+    case TLoad(name, _) if refPlaceOf.contains(name)    => promotedOwner(refPlaceOf(name))
+    case _: TLoad                                       => "null"
+    case TIndex(r, _, _)                                => promotedOwner(r)
+    case _                                              => "null"
 
   /** The dereference a place walk bottoms out at, following **receivers only**.
    *

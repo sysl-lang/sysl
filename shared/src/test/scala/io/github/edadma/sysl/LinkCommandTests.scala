@@ -78,6 +78,36 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  // A build asks for an optimization level, and `-O0` is deliberately not what it asks for: the fast
+  // instruction selector is a different algorithm from the one everything else in the ecosystem
+  // ships through, and a miscompile was found living there (`Toolchain.defaultOptimization`).
+  "the optimization level" - {
+
+    "is asked for, and defaults to something other than none at all" in {
+      commandFor(Target.aarch64MacOS) should contain(s"-O${Toolchain.defaultOptimization}")
+      Toolchain.defaultOptimization should not be "0"
+    }
+
+    // Whatever was written, spelled after the `-O` — so `s`, `z` and `fast` reach clang as readily
+    // as a digit does, and a level clang has no answer for is clang's to complain about.
+    "is whatever was named, and only that" in {
+      for level <- List("0", "2", "3", "s", "fast") do
+        val cmd = Toolchain.linkCommand("prog.ll", Nil, "prog", Target.aarch64MacOS, level)
+
+        withClue(level) {
+          cmd should contain(s"-O$level")
+          cmd.count(_.startsWith("-O")) shouldBe 1
+        }
+    }
+
+    // It goes in front of the inputs, where a driver flag belongs, rather than after the output.
+    "is stated before the module it applies to" in {
+      val cmd = commandFor(Target.x86_64Linux)
+
+      cmd.indexOf(s"-O${Toolchain.defaultOptimization}") should be < cmd.indexOf("prog.ll")
+    }
+  }
+
   // A program with no library to link against still gets the system libraries: they resolve what the
   // *program's own* externs name, not only what the standard module's do.
   "a link with no archives still asks for the mathematics on Linux" in {

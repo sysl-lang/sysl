@@ -914,6 +914,11 @@ trait ExprAnalysis
         // from where it was written.
         if readOnly(t) then err(s"a 'val' is written once, so $what has nothing to write through")
 
+    // A live `ref` stands on storage, and an assignment that would release it leaves the name aimed
+    // at freed memory (`03 § ref`). Only a write is asked about: `&` produces a pointer and takes
+    // nothing away, so the storage a ref found is exactly where it was.
+    if writes then checkRefGuards(t)
+
     t
   }
 

@@ -20,7 +20,7 @@ import scala.collection.mutable
  * Nothing here costs a program that declares no invariants anything: every entry point answers
  * `Nil` or `false` before it looks at a clause.
  */
-trait Aliasing extends AnalyzerBase {
+trait Aliasing extends RefBindings {
 
   /** Whether a struct type carries clauses this machinery has to honour. A generic one is refused
    * where it is declared, so it never reaches a check that would have to be instantiated first.
@@ -44,7 +44,11 @@ trait Aliasing extends AnalyzerBase {
     place match
       case TField(recv, _, _) => owed(recv) ++ invCheckFor(recv)
       case TIndex(recv, _, _) => invCheckFor(recv)
-      case _                  => Nil
+      // A `ref` name is a place written shorter (`03 § ref`), so the walk carries on through what it
+      // stands for. This is the whole of why a ref keeps the checking a `*T` would have severed:
+      // there is still a place here to walk outward through, and it is the one the program wrote.
+      case TLoad(n, _) if refPlaces.contains(n) => invCheckFor(refPlaces(n))
+      case _                                    => Nil
 
   /** The same walk asked the other question: which enclosing structs an alias of this place would be
    * typed **below**, each with the field path from that struct down to the place.
@@ -66,7 +70,10 @@ trait Aliasing extends AnalyzerBase {
             (if carriesInvariants(s) then List((s, path)) else Nil) ::: walk(recv, path)
           case _ => Nil
       case TIndex(recv, _, _) => walk(recv, below)
-      case _                  => Nil
+      // As in `invCheckFor`: a ref is a shorter spelling of the place it stands for, and the path a
+      // clause would be told about is the one through that place.
+      case TLoad(n, _) if refPlaces.contains(n) => walk(refPlaces(n), below)
+      case _                                    => Nil
 
     walk(place, Nil)
   }

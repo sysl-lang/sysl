@@ -40,6 +40,18 @@
 //     above survives it in the narrowed form it now has, and the difference is worth being exact
 //     about: `[None; n]` works whatever `K` and `V` are because `None` is a value that needs nothing
 //     of them, while a `[16]K` needs a value *of* `K` and so needs a bound that supplies one.
+//   * **A bucket is named rather than re-indexed, and this is where that rule has something to
+//     say.** `ref bucket = self.cell[self.index(k)]` (`03 § ref`) names the slot, so `put` and
+//     `remove` each hash once and walk the table once instead of writing the path out at the read
+//     and again at the write. What makes it worth recording is the *other* half: `cell` is a `[]T`,
+//     which owns the buffer it views, so a ref standing in it holds that buffer still — and
+//     `self.grow()`, which replaces it, may not be called while one is live. That is not a
+//     limitation the code had to be bent around. `put` already grows *before* it decides where the
+//     entry goes, because a table that is about to double has no useful answer to "which bucket" —
+//     so the ordering the rule requires is the ordering the algorithm already had. `guide/kernel`
+//     next door pays nothing for the same feature, its tables being fixed arrays, and the difference
+//     between the two programs is exactly the difference between storage that can move and storage
+//     that cannot.
 //   * **A bound is repeated at every declaration that needs it.** `[K: Hash + Eq, V]` is written
 //     on the type and again on each free function over it; there is no `where` clause (`10 § Open
 //     c`) and no name for a set of bounds.
@@ -116,18 +128,18 @@ struct Map[K: Hash + Eq, V]
             None ->
                 if self.count * 4 >= self.buckets() * 3 then self.grow()
 
-                var i = self.index(k)
-                var e: &Entry[K, V] = Entry(k, v, self.cell[i])
+                ref bucket = self.cell[self.index(k)]
+                var e: &Entry[K, V] = Entry(k, v, bucket)
 
-                self.cell[i] = Some(e)
+                bucket = Some(e)
                 self.count += 1usize
     end put
 
     // Unlinking is the one walk that needs to remember where it came from, since the entry before
     // the one being removed is what has to be made to point past it.
     remove(*self, k: K) -> bool
-        var i = self.index(k)
-        var at = self.cell[i]
+        ref bucket = self.cell[self.index(k)]
+        var at = bucket
         var prev: Option[&Entry[K, V]] = None
 
         loop
@@ -136,7 +148,7 @@ struct Map[K: Hash + Eq, V]
                 Some(e) ->
                     if e.key == k
                         prev match
-                            None -> self.cell[i] = e.next
+                            None -> bucket = e.next
                             Some(p) -> p.next = e.next
                         self.count -= 1usize
                         break true

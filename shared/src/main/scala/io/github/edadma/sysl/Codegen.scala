@@ -371,6 +371,25 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       emit(s"store ${ty.llvm} $v, ptr %$name.addr")
       ownSlot(name, ty)
 
+    // `ref name = place` (`03 § ref`). The walk to the place is made **once**, here, and its result
+    // becomes the name's address — so every later read and write is the one instruction it would
+    // have been, and the bounds check an element owed is paid at this line rather than at each use.
+    //
+    // The zero-offset `getelementptr` is there to give the address a name of its own: `address` may
+    // hand back an existing slot or a global, and a register cannot simply be renamed.
+    //
+    // Nothing is retained and nothing is owned. A ref names a slot rather than taking a share of what
+    // is in it, so binding one to a `&T` field takes no count — and there is correspondingly nothing
+    // to release when the block ends, which is why `ownSlot` is absent where `TVarDecl` calls it.
+    case TRefDecl(name, _, place) =>
+      val base = address(place)
+
+      // The qualifier belongs to the storage, and the name that replaces the path has no declaration
+      // to read it off — so it is recorded here and put back at every access through the name.
+      if Type.volatileIn(place.placeTy) then refStorage(name) = place.placeTy
+      refPlaceOf(name) = place
+      emit(s"%$name.addr = getelementptr i8, ptr $base, i64 0")
+
     case TExprStmt(expr) =>
       genExpr(expr)
 

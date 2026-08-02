@@ -191,6 +191,20 @@ case class TIncDec(place: TExpr, op: String, pre: Boolean, ty: Type, check: Opti
 case class TBinary(op: String, left: TExpr, right: TExpr, ty: Type) extends TExpr
 case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExpr
 
+/** A member a built-in has by rule rather than by an `impl`, and which lowers to instructions rather
+ * than to a call (`14 §5`, `CoreTraits.numeric`).
+ *
+ * A node of its own rather than a tree of the operators it is equivalent to, because every one of
+ * these reads its operand more than once — a magnitude compares it and negates it — and a tree would
+ * evaluate the receiver expression once per mention. `f().abs()` must call `f` once.
+ *
+ * `width` is the integer type the instruction runs at, which is the receiver's own type with any
+ * constrained subtype resolved away; `ty` is what the member answers, and the two differ wherever
+ * the answer is a **count** of bits rather than a value of the receiver's type. `amount` is the
+ * rotations' second operand and nothing else's.
+ */
+case class TIntOp(op: String, operand: TExpr, amount: Option[TExpr], width: Type, ty: Type) extends TExpr
+
 /** `&&` / `||` — short-circuit, always boolean. */
 case class TLogical(op: String, left: TExpr, right: TExpr) extends TExpr { def ty: Type = Type.Bool }
 
@@ -497,6 +511,21 @@ sealed trait TStmt
 
 case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
+
+/** `ref name = place` (`03 § ref`) — a name bound to the storage `place` found, rather than to a
+ * copy of what was in it.
+ *
+ * It declares **no slot**. Where a `TVarDecl` allocates storage and stores into it, this binds the
+ * name's address to the address the place already has, so the walk that reaches an element is made
+ * once and every later use is the load or store it would have been anyway. That is also why nothing
+ * releases it at scope end: the ref took no count, and the storage belongs to whatever the place was
+ * rooted at.
+ *
+ * The place is kept in the node as well as consumed by codegen because the analyzer's own record of
+ * it (`Scoping.refPlaces`) does not survive into the tree, and a later pass reading this statement
+ * should see the same place the binding was made from.
+ */
+case class TRefDecl(name: String, ty: Type, place: TExpr) extends TStmt
 
 /** One write of a multi-assignment: the place, the operator that was written, the value, the trait
  * method a compound operator lowers to when it is not an instruction (`14 §3`), and the `invariant`

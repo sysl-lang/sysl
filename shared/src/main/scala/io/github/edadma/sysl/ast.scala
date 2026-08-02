@@ -486,6 +486,21 @@ case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = 
 case class ValDecl(name: String, typ: Option[TypeRef], value: Expr, vis: Visibility = Visibility.Public)
     extends Stmt
 
+/** `ref name = place` — a name for a place rather than for a value (`03 § ref`).
+ *
+ * The place is evaluated once, where this is written, and the name means the storage that was found
+ * afterwards. So it neither copies what it names nor re-walks the path at each use, which are the
+ * only two things a `var` and a re-written path respectively could offer.
+ *
+ * It carries no type annotation and no visibility, and both absences are the same fact: this is a
+ * **local declaration and never a type**, so there is nothing for a reader elsewhere to be told. A
+ * ref cannot be a field, a parameter, a return type, or a type argument, which is what keeps the
+ * analyzer holding the place expression for as long as the name exists — and that, rather than the
+ * address it lowers to, is what lets a write through the name re-check the invariants of every
+ * struct the place lies inside.
+ */
+case class RefDecl(name: String, place: Expr) extends Stmt
+
 /** `a, b = b, a` — several places written from several values in one step (`00 §2`).
  *
  * It is a statement rather than an expression, and that is what keeps it small: a single assignment
