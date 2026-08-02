@@ -268,6 +268,46 @@ That second rule excludes **every trait in the operator catalogue** — `add(sel
 first among them — and that is the right answer rather than a limitation. An operator over two values
 of one type is a question about types known while compiling, so those traits are for bounds.
 
+## A trait may require another
+
+`trait Reader: Fallible` says that implementing `Reader` obliges implementing `Fallible` too. The
+requirement is checked **at the `impl`**, not at the bound — so `[T: Reader]` gets both traits'
+members without having to name both, and a type that forgot one is told at its own declaration rather
+than at somebody's call.
+
+Where the required trait's members all have defaults, satisfying it is one line with no block under
+it:
+
+```sysl
+trait Fallible
+    failed(*self) -> bool = false
+
+trait Source: Fallible
+    take(*self) -> int
+
+struct Counter
+    n: int
+
+impl Fallible for Counter
+
+impl Source for Counter
+    take(*self) -> int
+        self.n += 1
+        self.n
+
+var c = Counter(0)
+
+print(c.take(), c.take(), c.failed())
+```
+
+```output
+1 2 false
+```
+
+That is the shape the standard library's byte surface uses: `Reader` and `Writer` each require
+`Fallible`, so a type that is **both** carries one `failed` rather than two that nothing at a call
+site could tell apart.
+
 ## Implementing `Display`
 
 The trait worth writing first, because it is what `print` and `str` reach:

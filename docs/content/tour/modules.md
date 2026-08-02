@@ -154,6 +154,10 @@ Because the module is the directory, the clause is a property of the directory �
 **every** file of the module, and the compiler rejects a module whose files disagree. The redundancy
 is the point: you can never open a file in a `no alloc` module and fail to see that it is.
 
+The other direction is `requires`, and the standard library uses it: `sysl.fs` is `requires os`,
+because a filesystem is something the environment either has or does not. A freestanding target
+importing it is told so at the import.
+
 Propagation is over the module graph, which is acyclic — so a module's effective requirement is
 computed in a single sweep rather than an iterated fixpoint, and a `no alloc` module importing one
 that requires an allocator is an error **at the import**, not deep in code generation.
@@ -169,6 +173,7 @@ import anything to call `print`. Everything else is a submodule you ask for by n
 | `sysl.buf` | `Buf[T]`, the growable sequence, and `ByteSink` |
 | `sysl.text` | `from_utf8`, `StrBuilder`, `Chars`, `CString` |
 | `sysl.io` | `Reader`, `stdin()`, `lines()` |
+| `sysl.fs` | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` |
 | `sysl.math` | `max`, `min`, `pi`, and the float functions |
 | `sysl.args` | `args_of`, for reading a raw `argv` |
 | `sysl.sys` | the platform seam — what a freestanding target replaces |

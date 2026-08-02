@@ -15,6 +15,10 @@ struct SliceReader
     src: []const u8
     at: usize
 
+// `Reader` requires `Fallible`, whose one member has a default — so this line
+// is the whole of the implementation, and it says "reading this cannot fail".
+impl Fallible for SliceReader
+
 impl Reader for SliceReader
     read(*self, into: []u8) -> []const u8
         var left = self.src.len - self.at
@@ -91,6 +95,12 @@ ended.
 
 `into[0..<n]` is a `[]u8` flowing into a `[]const u8` return type, which is the widening the arrays
 chapter described — giving up the ability to write is a promise the callee can always make.
+
+The bare `impl Fallible for SliceReader` line is a **required trait** at work. `Reader` requires
+`Fallible`, so implementing one obliges the other; and because `Fallible`'s single member has a
+default, there is nothing left to write and the block is empty. Whether a stream *ended* and whether
+it ended *badly* are separate questions — the first is answered by an empty result, the second by
+`failed`, and a source that cannot go wrong should not have to write down that it cannot.
 
 ## The tally takes a trait object
 
