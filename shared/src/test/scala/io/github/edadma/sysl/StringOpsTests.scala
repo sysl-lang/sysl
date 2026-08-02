@@ -138,6 +138,25 @@ class StringOpsTests extends AnyFreeSpec with RunSupport {
       run("""var b = "  hi  ".bytes
             |print(b.trim().len, b.len)""".stripMargin) shouldBe "2 6\n"
     }
+
+    // `s.bytes` is already read-only, which is why every case above resolved without anything being
+    // widened. A buffer a program is still filling is a *writable* `[]u8`, and that is the receiver
+    // the second implementation exists for — bytes off a socket or a file, before anyone knows
+    // whether they are UTF-8. `07 § Read-only views` says a `[]T` is accepted wherever a
+    // `[]const T` is wanted, and a receiver is such a place; the lookup used to file the two under
+    // the names a diagnostic gives them and deny the member outright.
+    "a writable byte view reaches them too, since it is the same type with a bit" in {
+      run("""var raw = [104u8, 105u8, 33u8]
+            |var needle = [105u8, 33u8]
+            |print(raw[..].contains(needle[..]), raw[..].index_of(needle[..]).unwrap())
+            |print(raw[..].starts_with([104u8][..]), raw[..].is_empty())""".stripMargin) shouldBe
+        "true 1\ntrue false\n"
+    }
+
+    "and a trim of one still answers, through the same widening" in {
+      run("""var raw = [32u8, 104u8, 105u8, 32u8]
+            |print(raw[..].trim().len, raw[..].len)""".stripMargin) shouldBe "2 4\n"
+    }
   }
 
   "splitting" - {
