@@ -1,0 +1,56 @@
+// Counting what is in a file, which is `wc` with the flags left out.
+//
+// It is the shortest program that needs both halves of `sysl.fs`. The *handle* half, because
+// counting lines means reading them one at a time rather than holding the file in memory — and the
+// line cursor it goes through is `sysl.io`'s, written long before a file existed to point it at,
+// which works because a `File` is a `Reader` like any other. And the *path* half, because a file
+// that is not there should say which file and why, rather than counting zero of everything.
+//
+//     ./run-example.sh examples/wc.sysl -- README.md
+//
+// The close is deferred rather than written at the end. sysl has no destructor, so nothing releases
+// a handle that the scope did not say to release — and a `defer` says it once, for the failing paths
+// as well as the one that reaches the bottom.
+
+import sysl.fs.open
+import sysl.io.lines
+
+main(args: []string)
+    if args.len < 2usize
+        print("usage: wc <file>")
+        exit(1)
+
+    var path  = args[1]
+    var asked = open(path)
+
+    if asked.is_err()
+        print(f"wc: $path%s: ${asked.unwrap_err()}%s")
+        exit(1)
+
+    var f = asked.unwrap()
+
+    defer f.close()
+
+    var lines_seen = 0
+    var words      = 0
+    var bytes      = 0
+
+    for line in lines(&f)
+        lines_seen += 1
+        // The newline the cursor took off is still a byte of the file, so it is counted back on.
+        bytes += int(line.len) + 1
+
+        var inside = false
+
+        for b in line.bytes
+            if b == 32u8 || b == 9u8
+                inside = false
+            elif !inside
+                inside = true
+                words += 1
+
+    if f.failed()
+        print(f"wc: $path%s: reading stopped early")
+        exit(1)
+
+    print(f"$lines_seen%8d $words%8d $bytes%8d $path%s")

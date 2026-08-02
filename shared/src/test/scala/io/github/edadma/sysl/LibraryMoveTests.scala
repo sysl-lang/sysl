@@ -167,6 +167,8 @@ class LibraryMoveTests extends LibrarySeamSupport {
           |struct S
           |    n: int
           |
+          |impl Fallible for S
+          |
           |impl Writer for S
           |    log(self) -> int = self.n
           |
@@ -248,10 +250,11 @@ class LibraryMoveTests extends LibrarySeamSupport {
           |struct S
           |    n: usize
           |
+          |impl Fallible for S
+          |
           |impl Writer for S
           |    write(*self, bytes: []const u8)
           |        self.n += bytes.len
-          |    failed(*self) -> bool = false
           |
           |var w: &Writer = S(0usize)
           |sysl.display_int(1, w, FormatSpec(0, -1, false))
@@ -272,12 +275,16 @@ class LibraryMoveTests extends LibrarySeamSupport {
           |struct Tick
           |    n: int
           |
+          |impl Fallible for Tick
+          |
           |impl Reader for Tick
           |    poll(self) -> int = self.n
           |
           |struct Bytes
           |    src: []const u8
           |    at: usize
+          |
+          |impl sysl.Fallible for Bytes
           |
           |impl sysl.io.Reader for Bytes
           |    read(*self, into: []u8) -> []const u8
@@ -300,6 +307,8 @@ class LibraryMoveTests extends LibrarySeamSupport {
           |
           |struct Tick
           |    n: int
+          |
+          |impl Fallible for Tick
           |
           |impl Reader for Tick
           |    poll(self) -> int = self.n
@@ -384,6 +393,8 @@ class LibraryMoveTests extends LibrarySeamSupport {
           |struct Bytes
           |    src: []const u8
           |    at: usize
+          |
+          |impl sysl.Fallible for Bytes
           |
           |impl sysl.io.Reader for Bytes
           |    read(*self, into: []u8) -> []const u8

@@ -89,15 +89,18 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "the writers' tables" - {
-    // The compiler lays these out by hand, so the order is the contract: slot 0 is `write` and slot
-    // 1 is `failed`, which is what a call through the object indexes by.
-    "hold write first and failed second" in {
+    // The compiler lays these out by hand, so the order is the contract, and the order is the one a
+    // trait *offers* rather than the one `Writer` declares: `Writer: Fallible` puts the required
+    // trait's members first, so slot 0 is `failed` and slot 1 is `write`. That is what a call
+    // through the object indexes by, and getting it backwards would call the wrong function with
+    // the right arguments — which is why `SpecialForms.checkWriterShape` asks as well.
+    "hold failed first and write second, the order the trait offers them" in {
       val out = ir(point + "print(Point(1, 2))\nprint(str(Point(3, 4)))")
 
       out should include("@sysl.vt.out = private constant [2 x ptr] " +
-        "[ptr @sysl.w.out.write, ptr @sysl.w.out.failed]")
+        "[ptr @sysl.w.out.failed, ptr @sysl.w.out.write]")
       out should include("@sysl.vt.buf = private constant [2 x ptr] " +
-        "[ptr @sysl.w.buf.write, ptr @sysl.w.buf.failed]")
+        "[ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write]")
     }
 
     "are emitted once however many values render" in {
@@ -151,16 +154,20 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     "puts its own implementation straight into the table" in {
       ir("""struct C
             |    n: usize
+            |impl Fallible for C
+            |
             |impl Writer for C
             |    write(*self, bytes: []const u8)
             |        self.n += bytes.len
-            |    failed(*self) -> bool = false
             |var c: C
             |var w: *Writer = &c
             |display_int(1, w, FormatSpec(0, -1, false))""".stripMargin) should include(
         // The table's symbol carries the trait's **key**, as every emitted name does, so it is read
         // off the seam rather than spelled — and goes on saying the same thing after a move.
-        s"@vt.${Library.key("Writer")}.C = private constant [2 x ptr] [ptr @C.write, ptr @C.failed]")
+        // The required trait's slot comes first, and `C.failed` is the **default** `Fallible`
+        // supplied — an implementation that writes nothing still fills the slot, which is what makes
+        // the block optional rather than merely short.
+        s"@vt.${Library.key("Writer")}.C = private constant [2 x ptr] [ptr @C.failed, ptr @C.write]")
     }
   }
 }

@@ -90,10 +90,28 @@ class ExampleTests extends AnyFreeSpec with Matchers {
     example("args.sysl") should endWith("0 argument(s) given\n")
   }
 
+  /** `wc` has to be given something to count, and a temporary file is the only input an assertion can
+   * be sure of — counting a file of the repository would pin this test to whatever that file happens
+   * to say today, which is the kind of expectation that gets deleted rather than fixed.
+   *
+   * Only the counting is asserted. Both of the ways this example stops early exit non-zero, and
+   * `example` fails on that before there is any output to read, so what it says about a file it
+   * cannot open belongs to `FsTests` — where the same failure is reached through the library rather
+   * than through a program.
+   */
+  "wc — counting the lines, words and bytes of a file" in {
+    val path = createTempFile("sysl-wc-", ".txt")
+
+    writeFile(path, "one two three\nfour five\n\nsix\n")
+
+    try example("wc.sysl", path) shouldBe f"${4}%8d ${6}%8d ${29}%8d $path%s\n"
+    finally deleteFile(path)
+  }
+
   "every example in the tree has an expectation above" in {
     assume(isDirectory(dir), s"$dir is not reachable from the working directory")
 
     listFiles(dir).filter(_.endsWith(".sysl")).map(Project.basename).toList.sorted shouldBe
-      List("args.sysl", "hello.sysl")
+      List("args.sysl", "hello.sysl", "wc.sysl")
   }
 }

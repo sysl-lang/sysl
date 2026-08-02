@@ -4,10 +4,16 @@
 are read from a file's header, the files of a module are held to agreeing, and `no alloc` is
 enforced both against the module's own constructions and against what its calls arrive at. The
 **target half is not**: nothing declares what a target offers, so a module's effective set is
-everything it did not narrow away, and `requires` is documentation until there is a target that
-could fail to satisfy it. Only `alloc` narrows — the other three gate standard-library modules that
-are not written, and a clause enforcing nothing would read in a source file as a guarantee the
-compiler never made, so `no os` is refused with that as the reason.
+everything it did not narrow away, and `requires` against a *target* is documentation until there is
+one that could fail to satisfy it.
+
+**`no os` and `no posix` are enforced too, and against the module graph rather than against a
+target.** They became checkable the day the library grew a module that declares `requires os` —
+`sysl.fs` — because what an environment capability gates is a whole module, so the rule is that a
+module which gave one up may not *reach* one that needs it, directly or through anything in between.
+`threads` is the last of the four still refused as a narrowing: it gates thread creation and the
+growable channel, neither of which is built, and a clause enforcing nothing would read in a source
+file as a guarantee the compiler never made.
 
 Capabilities govern the allocator / OS / POSIX boundary
 that lets one language span safe application code and allocator-free kernel/driver code. The
@@ -33,8 +39,10 @@ parts of the compiler:
   hook (`03`). The **type-checker** enforces this — it is what makes "the kernel allocates
   nothing" a checked guarantee rather than a convention.
 - **`os` / `posix` — *environment* capabilities.** They do not change the language; they gate
-  which **standard-library modules exist**. `import std.fs` requires `os`; the POSIX
-  compatibility layer requires `posix`. Enforced by **module resolution**, not the type-checker.
+  which **standard-library modules exist**. `sysl.fs` requires `os`; the POSIX compatibility layer
+  would require `posix`. Enforced against the **module graph**, not by the type-checker: the unit is
+  the reference from one module to another, and the diagnostic lands at the reference rather than at
+  the clause, because that is the line a reader has to change.
 
 `alloc` is the load-bearing one for the memory model. `os` / `posix` layer on the same
 two-level machinery but act at the import boundary.
@@ -95,7 +103,11 @@ fit within the target's capabilities.
 - A `no alloc` module can only import and call things that are themselves no-alloc-compatible.
   Importing `std.heap` (which `requires alloc`) from a `no alloc` module is an error — cleanly,
   at the import, not deep in codegen.
-- On a no-`os` target, importing any module that requires `os` fails at resolution.
+- A `no os` module may not reach any module that requires `os`. **This is built**, and the graph it
+  is asked of is the **reference** graph rather than the import graph: a qualified path reaches
+  another module's declarations with no import at all (`13 §3`), so a rule stated over imports would
+  have missed the case a program is most likely to write. The requirement is transitive — reaching
+  `sysl.fs` through a module that says nothing itself is still reaching it.
 
 **Where the `alloc` diagnostic actually lands, and why it is the call rather than the import.** The
 rule above is stated over modules, and the standard library is why the check cannot be: `sysl` is
@@ -143,7 +155,7 @@ promote the array to the heap, and there is nothing to promote into (`05`).
 
 | | Hosted app | Kernel (alloc, no os) | Cortex-M (no alloc) |
 |---|---|---|---|
-| ordinary module | everything | `&T` ok; no `import std.fs` | no-alloc subset only |
+| ordinary module | everything | `&T` ok; no `sysl.fs` | no-alloc subset only |
 | `no alloc` module | no-alloc subset, enforced | no-alloc subset, enforced | compiles unchanged |
 
 A `no alloc` module is portable across every target — write the arch layer once, guaranteed
@@ -151,8 +163,10 @@ allocator-free everywhere.
 
 ## Open sub-questions
 
-- **Per-module `os` / `posix` restriction** — allow a module to assert `no posix` for symmetry
-  with `no alloc`? Probably yes; secondary to `alloc`.
+- ~~**Per-module `os` / `posix` restriction**~~ — **done.** A module may assert `no os` or
+  `no posix`, and the assertion is enforced against the module graph. What settled it was not a
+  decision but an arrival: the question was academic while nothing required `os`, and `sysl.fs` is
+  what gave the clause something to refuse.
 - **Config / module-resolution details** — the HOCON `sysl.conf` schema, per-target capability
   sets, and filename-axis platform selection are still to be written. **The target registry
   itself is done (`targets.md`)**: a target is a value with a name, a triple, and the ABI facts
@@ -179,10 +193,9 @@ allocator-free everywhere.
   rather than creating one. `guide/kernel` cannot carry it at all, because its machine and its checks
   are one module. Nothing here is wrong; what it says is that **a module is a coarse unit for this
   question**, and it is the same observation the granularity bullet above makes from the other end.
-- **Narrowing is enforced for `alloc` alone.** `os`, `posix` and `threads` are read and refused with
-  the reason: each gates which standard-library modules exist, and those modules are not written.
-  They become narrowings the day there is something for them to gate, and the grammar already
-  carries them.
+- **Narrowing is enforced for everything but `threads`.** `os` and `posix` became narrowings the day
+  there was something for them to gate, exactly as this bullet predicted; `threads` is still read and
+  refused with the reason, since thread creation and the growable channel are not built.
 - **The clause spends two ordinary words, and one of them is wanted.** `no alloc` and `requires
   alloc` are read by the lexer, so `no`, `alloc` and `requires` are all reserved and none of them may
   name anything. `guide/slab` ran into it immediately: an allocator's central function is called

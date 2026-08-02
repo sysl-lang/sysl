@@ -1,0 +1,104 @@
+module sysl.fs
+requires os
+
+import sysl.buf.{Buf, buf}
+import sysl.io.Reader
+import sysl.text.from_utf8
+
+// A whole file in one call, which is what most programs that touch a file want and all of what some
+// of them want.
+//
+// It sits above `File` rather than inside it because the two tiers cost different things. Opening
+// and reading in chunks needs a buffer the caller already has, and works in a module that may not
+// allocate; reading a whole file *is* asking for storage the size of the file, so these allocate by
+// their nature and could not be written any other way. Keeping them apart is what lets the tier
+// below stay honest about it.
+//
+// Each of these opens, does the one thing, and closes -- and closes through `defer`, so the handle
+// is released down the failing paths too. That is the idiom the module is written to demonstrate:
+// the language has no destructor, so a scope releases what the scope said it would.
+//
+// `Reader` is imported although nothing here names it: `read` is *its* member and a trait's members
+// are reachable where the trait is (`13 §2`), so a file reading a file has to be able to write the
+// trait's name down even when it only ever writes the member's.
+
+// Every byte of the file.
+//
+// It reads in chunks and grows rather than sizing the buffer from `size` first, which costs a little
+// copying and buys the case that matters: a file being written while this reads it, and anything
+// whose length is not a fact until the read ends. The loop stops on the first empty read, and asks
+// afterwards whether the reading *ended* badly -- the two are separate questions, which is the split
+// `Reader` was built around.
+read_bytes(path: string) -> Result[[]u8, IoError]
+    var f = open(path)?
+
+    defer f.close()
+
+    var out: Buf[u8] = buf()
+    var chunk: []u8  = [0u8; 8192usize]
+
+    loop
+        var got = f.read(chunk)
+
+        if got.len == 0usize
+            break
+
+        for b in got do out.push(b)
+
+    if f.failed() then return Err(why())
+
+    Ok(out.view())
+end read_bytes
+
+// The file as text.
+//
+// **Bytes that are not UTF-8 stop the program**, the way an ill-formed command-line argument does,
+// and for the reason `sysl.io`'s `line_text` gives: the layer underneath is public, so a caller who
+// would rather inspect than trap reads `read_bytes` and validates it. Answering with an error
+// instead would put a case in `IoError` that no filesystem ever reports, and would make every
+// program that reads its own configuration handle a failure that means its build is broken.
+read_text(path: string) -> Result[string, IoError]
+    var b = read_bytes(path)?
+
+    from_utf8(b) match
+        Ok(s) -> Ok(s)
+        Err(e) ->
+            print("panic:", path, "is not UTF-8 at byte", e.offset, "of the file")
+            exit(1)
+end read_text
+
+// Writes the bytes, replacing whatever was there and making the file if it was not.
+write_bytes(path: string, bytes: []const u8) -> Result[unit, IoError] = put(create(path)?, bytes)
+
+write_text(path: string, text: string) -> Result[unit, IoError] = write_bytes(path, text.bytes)
+
+// Writes the bytes at the end of the file, making it if it is not there. Each call lands after
+// whatever the file already held, including anything another program appended in between.
+append_bytes(path: string, bytes: []const u8) -> Result[unit, IoError] = put(append(path)?, bytes)
+
+append_text(path: string, text: string) -> Result[unit, IoError] = append_bytes(path, text.bytes)
+
+// The shared tail of the three above: write everything, then close, and report the first thing that
+// went wrong rather than the last.
+//
+// **The failure is read before the close, and that is the point of the local.** A `Writer` latches
+// rather than returning, so what went wrong is `errno` at the moment it did -- and `fclose` is a
+// call like any other, which sets `errno` to whatever *it* thought. Asking afterwards would report
+// the wrong failure for the right file.
+//
+// It takes the file by value and copies it into a local it can write through, which is safe for the
+// reason `File` exists in two pieces: the copy shares the one `FileState`, so the close below is the
+// close of the file the caller opened.
+private put(f: File, bytes: []const u8) -> Result[unit, IoError]
+    var out = f
+
+    out.write(bytes)
+
+    if out.failed()
+        var stopped: Result[unit, IoError] = Err(why())
+
+        out.close()
+        return stopped
+
+    out.close()
+end put

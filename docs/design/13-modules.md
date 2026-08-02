@@ -469,6 +469,14 @@ no alloc                        no alloc            // same clause, enforced ide
   the inferred half is asked of **what a module calls** rather than of which modules it depends on.
   `capabilities.md § Propagation` carries the argument; what belongs here is that this does not
   weaken §6, which is still what makes a *declared* requirement answerable in one sweep.
+- **For `os` and `posix`, the check is exactly the declaration, and it is asked of the graph this
+  chapter is about.** These gate which modules *exist* rather than what the language allows, so
+  there is nothing finer than a module to ask about: every declaration of `sysl.fs` is equally out
+  of reach of a module that wrote `no os`. The edge the rule is stated over is the **reference**
+  graph of §6 rather than the import graph, and that is load-bearing — a qualified path reaches
+  another module with no import at all (§3), so a rule about imports would have missed the shorter
+  of the two ways to write the mistake. The diagnostic lands at the reference for the same reason
+  `alloc`'s lands at the call: that is the line a reader has to change.
 
 ## 5. Platform selection rides the same name
 
@@ -528,8 +536,17 @@ the graph and not by which one is tidiest to move.
 
 The library's tree as it stands, read as edges: `sysl.sys` needs nothing; `sysl` reaches `sysl.sys`;
 `sysl.buf` reaches `sysl`; `sysl.text` reaches `sysl` and `sysl.buf`; `sysl.io` reaches all four;
-`sysl.args` reaches `sysl`, `sysl.buf` and `sysl.text`. Every edge runs away from the standard module
-and none runs back, which is what makes any of them removable from a program that never asks.
+`sysl.args` reaches `sysl`, `sysl.buf` and `sysl.text`; `sysl.fs` reaches `sysl`, `sysl.buf`,
+`sysl.text` and `sysl.io`. Every edge runs away from the standard module and none runs back, which is
+what makes any of them removable from a program that never asks.
+
+**`sysl.fs` is where the forward rule paid for itself a second time.** It holds the externs it needs
+rather than putting them in `sysl.sys`, which the "every declaration that is not sysl" convention
+would have suggested — because they are the only ones in the library that need an *operating system*
+under them rather than merely a C library, and `sysl.sys` carrying them would have meant either
+`sysl.sys requires os`, dragging printing and reading in behind it, or a module whose header says
+less than its contents do. A capability clause is a property of the module (§4), so what a module may
+truthfully claim is part of what decides where a declaration lives.
 
 Three things follow from acyclicity:
 
@@ -1211,8 +1228,9 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   that the library can have workings that are not a public surface at all, is (c); `private[sysl]` on
   each declaration reaches the same place today, one declaration at a time.
 
-  **Six modules in, one boundary case decided the shape of the rule.** `sysl.sys`, `sysl.buf`,
-  `sysl.text`, `sysl.io`, `sysl.args` and `sysl.math` all fell out of "does the language reach it". The
+  **Seven modules in, one boundary case decided the shape of the rule.** `sysl.sys`, `sysl.buf`,
+  `sysl.text`, `sysl.io`, `sysl.args`, `sysl.math` and `sysl.fs` all fell out of "does the language
+  reach it". The
   `display_*` renderers do not: no desugaring names one, so the letter of the rule puts them in a
   `sysl.fmt` — and the split was *tried*, works, and needs nothing else to move once the tuple rows
   go with it, `13 §6` notwithstanding. They stay in `sysl` anyway, and the reason sharpens the rule

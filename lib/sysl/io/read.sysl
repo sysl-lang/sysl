@@ -13,17 +13,21 @@ import sysl.text.from_utf8
 //
 // `Reader` is here for the same reason `Writer` is: a program that reads has to name what it reads
 // from, and naming it once is what keeps two mechanisms -- and so two buffers, and bytes arriving in
-// the wrong order -- from growing. It is `Writer` turned around, down to the `failed` latch and its
-// `false` default, so a source that cannot fail says nothing about failing.
+// the wrong order -- from growing. It is `Writer` turned around, down to the `Fallible` latch both
+// require, so a source that cannot fail says nothing about failing.
+//
+// **The latch is required rather than declared**, and that is what lets one type be a reader and a
+// writer at once: a trait's members become the implementing type's, so two traits each declaring a
+// `failed` could not both be implemented for one file. Sharing `Fallible` is what makes an open
+// file writable at all (`sysl.fs`).
 //
 // `read` hands back **the prefix of `into` that was filled** rather than a count, because a slice
 // already *is* a count and a pointer: the length is `got.len` and there is no way to be handed one
 // and forget to apply it to the other. Returning empty says end of input and nothing more -- whether
 // input *ended badly* is what `failed` is for, and the two questions are separate because a caller
 // that does not care should not have to ask.
-trait Reader
+trait Reader: Fallible
     read(*self, into: []u8) -> []const u8
-    failed(*self) -> bool = false
 
 // A line is found with `memchr` rather than a byte loop because libc's reads a word at a time and
 // sysl's could not. This is the whole of what pointer difference is for: `memchr` answers *where*
@@ -58,7 +62,9 @@ impl Reader for FdReader
 
         into[0..<usize(k)]
     end read
+end FdReader
 
+impl Fallible for FdReader
     failed(*self) -> bool = self.bad
 
 // Bytes to text at the boundary they arrive at, which is where `04` puts the check. Ill-formed input

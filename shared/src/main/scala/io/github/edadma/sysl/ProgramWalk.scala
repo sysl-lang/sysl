@@ -20,6 +20,7 @@ trait ProgramWalk
     with ModuleGraph
     with Capabilities
     with NoAlloc
+    with GatedModules
     with InitOrder
     with DefaultParams {
 
@@ -275,6 +276,10 @@ trait ProgramWalk
     // Every reference the program makes has been resolved, so which module depends on which is
     // finally settled and the graph can be held to being acyclic (`13 §6`).
     checkModuleGraph()
+
+    // And which module a reference lands in is what decides whether a module that gave up an
+    // environment capability was allowed to make it, so this asks the same settled graph (`13 §4`).
+    checkGatedModules()
 
     // Which structs can lie inside one that carries invariant clauses is likewise only settled now,
     // so the rule about what a `*self` method may let out of the call is asked here (`16 §6`).
