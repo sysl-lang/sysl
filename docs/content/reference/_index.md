@@ -1,5 +1,5 @@
 ---
-title: Reference
+title: Language Reference
 summary: The language in full, organized for looking things up rather than for reading through.
 weight: 30
 ---
