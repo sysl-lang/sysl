@@ -1,0 +1,224 @@
+sysl.regex — a tree becomes a program
+=====================================
+
+    module sysl.regex
+
+    import sysl.buf.{Buf, buf}
+
+Every regular expression construct is a small fixed arrangement of five instructions, and that is
+the whole of this file. The tree is walked once, each node emits its arrangement, and what comes out
+is a flat program the matcher runs.
+
+
+The instruction set
+-------------------
+
+Nine instructions, of which only three look at the input. The other six move the program counter or
+write down a position, which is what makes the matcher's inner loop small: a step either consumes a
+character or it does not, and everything that does not is resolved before the character is read.
+
+The three operands that were `arg1` and `arg2` in the engine this is modelled on are named here
+instead, because they meant different things per opcode — a target, a slot, a class index — and a
+reader had to know which. A bracket expression rides on the instruction rather than in a side array
+addressed by index, so the side array and the second kind of index are both gone.
+
+    enum Inst
+        MatchChar(ch: char)
+        MatchAny
+        MatchSet(of: CharClass)
+        Accept
+        Jump(to: usize)
+        Split(first: usize, second: usize)
+        Save(slot: usize)
+        AssertStart
+        AssertEnd
+    end Inst
+
+`Split` is the whole of the nondeterminism. It says "both of these are live", and the matcher
+follows each — which is why a pattern that would send a backtracking engine exponential costs this
+one nothing: the two branches are two threads at two program counters, not two searches.
+
+
+What the compiler produces
+--------------------------
+
+A program plus the number of capture groups it writes. Group `k` owns slots `2k` and `2k+1`, and
+group 0 is the whole match — so a pattern with two groups needs six slots.
+
+    struct Program
+        code: &Buf[Inst]
+        groups: int
+
+        len(self) -> usize = self.code.len()
+
+        at(self, pc: usize) -> Inst = self.code.at(pc)
+
+        // How many capture positions a run of this program has to carry.
+        slots(self) -> usize = usize(self.groups + 1) * 2usize
+
+        // Append an instruction and answer where it landed, which is what every jump target below
+        // is derived from.
+        emit(*self, i: Inst) -> usize
+            var pc = self.code.len()
+
+            self.code.push(i)
+            pc
+        end emit
+
+        // Overwrite an instruction already emitted. A forward branch is emitted before its target
+        // exists, so it goes out with placeholder operands and is corrected once the code it jumps
+        // over has been laid down.
+        patch(*self, pc: usize, i: Inst)
+            self.code.set(pc, i)
+
+
+The arrangements
+----------------
+
+Each is written as a listing with the labels the code below computes, so that the two can be read
+against one another.
+
+A literal, a dot, an anchor or a bracket expression is one instruction. Concatenation is the two
+sides in order and no instruction of its own. The rest:
+
+```
+e*          L1: split L2, L3        e+      L1: e
+            L2: e                           L2: split L1, L3
+                jump L1                 L3:
+            L3:
+
+e?              split L1, L2        a|b         split L1, L2
+            L1: e                           L1: a
+            L2:                                 jump L3
+                                            L2: b
+                                            L3:
+
+(e) as group k  save 2k
+                e
+                save 2k+1
+```
+
+`e*` prefers the branch that matches, and `e?` prefers the branch that takes `e` — the greedy
+reading in both cases. Preference decides nothing on its own here, because the matcher runs every
+branch; it decides which thread is already at a program counter when a second one arrives there,
+which is what makes the answer the longest one rather than merely a matching one.
+
+        private walk(*self, n: &Node)
+            *n match
+                Empty ->
+                    return
+                Lit(c) ->
+                    self.emit(MatchChar(c))
+                AnyChar ->
+                    self.emit(MatchAny)
+                AtStart ->
+                    self.emit(AssertStart)
+                AtEnd ->
+                    self.emit(AssertEnd)
+                InSet(cls) ->
+                    self.emit(MatchSet(cls))
+                Seq(l, r) ->
+                    self.walk(l)
+                    self.walk(r)
+                Star(inner) ->
+                    var l1 = self.emit(Split(0usize, 0usize))
+
+                    self.walk(inner)
+                    self.emit(Jump(l1))
+
+                    var l3 = self.len()
+
+                    self.patch(l1, Split(l1 + 1usize, l3))
+                Plus(inner) ->
+                    var l1 = self.len()
+
+                    self.walk(inner)
+
+                    var l3 = self.len() + 1usize
+
+                    self.emit(Split(l1, l3))
+                Quest(inner) ->
+                    var split = self.emit(Split(0usize, 0usize))
+
+                    self.walk(inner)
+
+                    var l2 = self.len()
+
+                    self.patch(split, Split(split + 1usize, l2))
+                Alt(l, r) ->
+                    var split = self.emit(Split(0usize, 0usize))
+
+                    self.walk(l)
+
+                    var jmp = self.emit(Jump(0usize))
+                    var l2 = self.len()
+
+                    self.walk(r)
+
+                    var l3 = self.len()
+
+                    self.patch(split, Split(split + 1usize, l2))
+                    self.patch(jmp, Jump(l3))
+                Group(inner, k) ->
+                    var slot = usize(k) * 2usize
+
+                    self.emit(Save(slot))
+                    self.walk(inner)
+                    self.emit(Save(slot + 1usize))
+        end walk
+    end Program
+
+The whole pattern is wrapped in group 0's pair of `Save`s, so the matcher needs no separate notion
+of where the match began and ended: the span of the whole match is the span of a capture group like
+any other, and reporting it is reading slots 0 and 1.
+
+    compile(root: &Node, groups: int) -> Program
+        var p = Program(buf(), groups)
+
+        p.emit(Save(0usize))
+        p.walk(root)
+        p.emit(Save(1usize))
+        p.emit(Accept)
+        p
+    end compile
+
+    compile_pattern(pattern: string) -> Result[Program, RegexError]
+        var t = parse_counted(pattern)?
+
+        Ok(compile(t.0, t.1))
+    end compile_pattern
+
+
+Reading a program back
+----------------------
+
+The listing, one instruction to a line with its program counter. It exists for the same reason
+`show` does — a caller asking what their pattern actually became — and it is what the compiler is
+checked against, because a mis-computed jump target is invisible in the answers a small pattern
+gives and obvious here.
+
+    dump(p: Program) -> string
+        var out = ""
+
+        for pc in 0usize..<p.len()
+            out += s"$pc: ${show_inst(p.at(pc))}\n"
+
+        out
+    end dump
+
+A bracket expression is rendered by handing it back to `show` as the node it came from, rather than
+by a renderer of its own here. That is not only shorter: it is what makes the listing and the tree
+agree about a class by construction, so a reader comparing the two is reading one piece of code
+twice.
+
+    private show_inst(i: Inst) -> string = i match
+        MatchChar(c) -> s"char $c"
+        MatchAny -> "any"
+        MatchSet(cls) -> show(InSet(cls))
+        Accept -> "accept"
+        Jump(to) -> s"jump $to"
+        Split(a, b) -> s"split $a, $b"
+        Save(slot) -> s"save $slot"
+        AssertStart -> "start"
+        AssertEnd -> "end"
+    end show_inst
