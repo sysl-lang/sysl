@@ -29,12 +29,23 @@
 //     table as a parameter, and the reason is not that it wants to look at the tasks — it is that
 //     the queue's own links live inside them. A data structure that owns no storage cannot be
 //     asked a question on its own.
-//   * **There is no local name for the task being worked on.** `var t = self.tasks[i]` binds a
-//     *copy*, so every read and every write repeats the path from the table: thirteen occurrences
-//     of `self.tasks[i]` in `advance` alone, where the scheduler next door wrote `t` once.
-//     `&self.tasks[i]` would give the name back as a `*Task` — which is the mode this program
-//     exists to do without, and which would give up the checking that made the indices worth
-//     having.
+//   * **There was no local name for the task being worked on, and this program is what asked for
+//     one.** `var t = self.tasks[i]` binds a *copy*, so every read and every write repeated the path
+//     from the table: thirteen occurrences of `self.tasks[i]` in `advance` alone, where the
+//     scheduler next door wrote `t` once. `&self.tasks[i]` would have given the name back as a
+//     `*Task` — the mode this program exists to do without, and one that drops the bounds and
+//     `within` checking that made the indices worth having in the first place.
+//
+//     Answered: `ref t = self.tasks[i]` (`03 § ref`) names the place rather than copying it, and the
+//     eighty-three paths through the two tables are forty-three. The walk is made once, so the
+//     subscript is bounds-checked at the binding instead of at each use, and the name stays inside
+//     every check a written-out path gets — which is the half a pointer could not have.
+//
+//     What it costs here is nothing at all, and that is a property of this program rather than of
+//     the feature: the rule holding storage still while a ref stands on it asks only about steps that
+//     **own** what they point at, and a fixed table reached through a `*Kernel` receiver has none. A
+//     `[]T` field would have made `self.grow()` under a live ref a refusal, which is exactly what
+//     `guide/hashmap` runs into next door.
 //   * **A subtype bounds the slot but cannot spell "no slot".** `TaskId` is `u8 within 0..<200`,
 //     so a number that is not a task cannot be made into one and every table index is in range by
 //     construction. What it cannot do is carry the sentinel a kernel would have used — 255 is not
@@ -223,13 +234,16 @@ struct Kernel
         var i = usize(id)
 
         self.tasks[i] = blank_task()
-        self.tasks[i].mark = mark
-        self.tasks[i].base = prio
-        self.tasks[i].prio = prio
-        self.tasks[i].arrive = arrive
-        self.tasks[i].nsteps = u8(steps.len)
 
-        for k in 0..<steps.len do self.tasks[i].steps[k] = steps[k]
+        ref t = self.tasks[i]
+
+        t.mark = mark
+        t.base = prio
+        t.prio = prio
+        t.arrive = arrive
+        t.nsteps = u8(steps.len)
+
+        for k in 0..<steps.len do t.steps[k] = steps[k]
 
         self.ntasks += 1u8
         Some(id)
@@ -241,7 +255,9 @@ struct Kernel
         var m = LockId(self.nlocks)
 
         self.locks[usize(m)] = blank_mutex()
-        self.locks[usize(m)].mark = mark
+        ref k = self.locks[usize(m)]
+
+        k.mark = mark
         self.nlocks += 1u8
         Some(m)
     end declare
@@ -250,13 +266,19 @@ struct Kernel
     // numbers — the level's list is already in that order — but a wait list still does, and that
     // is the one place left where two ready moments have to be told apart.
     make_ready(*self, id: TaskId)
-        self.tasks[usize(id)].state = Ready
+        ref t = self.tasks[usize(id)]
+
+        t.state = Ready
         self.seq += 1
-        self.tasks[usize(id)].seq = self.seq
+        t.seq = self.seq
         self.ready.push(self.tasks[..], id)
     end make_ready
 
-    key(*self, id: TaskId) -> Urgency = Urgency(self.tasks[usize(id)].prio, self.tasks[usize(id)].seq)
+    key(*self, id: TaskId) -> Urgency
+        ref t = self.tasks[usize(id)]
+
+        Urgency(t.prio, t.seq)
+    end key
 
     before(*self, a: TaskId, b: TaskId) -> bool = self.key(a) < self.key(b)
 
@@ -264,21 +286,22 @@ struct Kernel
     // more urgent is waiting for. Two nested walks of intrusive lists where the scheduler next
     // door wrote two `for` loops over `Buf`s — the same shape, spelled through links.
     urgency(*self, id: TaskId) -> int
-        var p = self.tasks[usize(id)].base
-        var m = self.tasks[usize(id)].holds
+        ref t = self.tasks[usize(id)]
+        var p = t.base
+        var m = t.holds
 
         while m.is_some()
-            var j = usize(m.unwrap())
-            var w = self.locks[j].waiters
+            ref k = self.locks[usize(m.unwrap())]
+            var w = k.waiters
 
             while w.is_some()
-                var k = usize(w.unwrap())
+                ref waiter = self.tasks[usize(w.unwrap())]
 
-                if self.tasks[k].prio < p then p = self.tasks[k].prio
+                if waiter.prio < p then p = waiter.prio
 
-                w = self.tasks[k].next_wait
+                w = waiter.next_wait
 
-            m = self.locks[j].next_held
+            m = k.next_held
 
         p
     end urgency
@@ -315,8 +338,9 @@ struct Kernel
 
     // Unlink a lock from its owner's chain of held locks.
     unhold(*self, id: TaskId, m: LockId)
-        var i = usize(id)
-        var cur = self.tasks[i].holds
+        ref t = self.tasks[usize(id)]
+        ref k = self.locks[usize(m)]
+        var cur = t.holds
         var prev: Option[LockId] = None
 
         while cur.is_some() && cur.unwrap() != m
@@ -325,19 +349,20 @@ struct Kernel
 
         if cur.is_none() then return
 
-        var nxt = self.locks[usize(m)].next_held
+        var nxt = k.next_held
 
         prev match
-            None -> self.tasks[i].holds = nxt
+            None -> t.holds = nxt
             Some(p) -> self.locks[usize(p)].next_held = nxt
 
-        self.locks[usize(m)].next_held = None
+        k.next_held = None
     end unhold
 
     // Unlink a task from a lock's wait list.
     unwait(*self, m: LockId, id: TaskId)
-        var j = usize(m)
-        var cur = self.locks[j].waiters
+        ref k = self.locks[usize(m)]
+        ref t = self.tasks[usize(id)]
+        var cur = k.waiters
         var prev: Option[TaskId] = None
 
         while cur.is_some() && cur.unwrap() != id
@@ -346,13 +371,13 @@ struct Kernel
 
         if cur.is_none() then return
 
-        var nxt = self.tasks[usize(id)].next_wait
+        var nxt = t.next_wait
 
         prev match
-            None -> self.locks[j].waiters = nxt
+            None -> k.waiters = nxt
             Some(q) -> self.tasks[usize(q)].next_wait = nxt
 
-        self.tasks[usize(id)].next_wait = None
+        t.next_wait = None
     end unwait
 
     // Taking a lock. Free, and it is yours; held by somebody else, and you join its wait list and
@@ -362,30 +387,30 @@ struct Kernel
     // reason worth stating: `seq` is stamped afresh on every entry to the ready queue, so no two
     // waiters ever share a key and the search below has a single answer whatever order it walks.
     acquire(*self, id: TaskId, m: LockId) -> bool
-        var i = usize(id)
-        var j = usize(m)
+        ref t = self.tasks[usize(id)]
+        ref k = self.locks[usize(m)]
 
-        var held = self.locks[j].owner match
+        var held = k.owner match
             Some(o) -> true
             None -> false
 
         if !held
-            self.locks[j].owner = Some(id)
-            self.locks[j].next_held = self.tasks[i].holds
-            self.tasks[i].holds = Some(m)
+            k.owner = Some(id)
+            k.next_held = t.holds
+            t.holds = Some(m)
             return true
 
-        var o = self.locks[j].owner.unwrap()
+        var o = k.owner.unwrap()
 
         if o == id
-            self.tasks[i].fault = Some(AlreadyHeld(self.locks[j].mark))
-            self.tasks[i].state = Faulted
+            t.fault = Some(AlreadyHeld(k.mark))
+            t.state = Faulted
             return false
 
-        self.tasks[i].state = Blocked
-        self.tasks[i].blocked_on = Some(m)
-        self.tasks[i].next_wait = self.locks[j].waiters
-        self.locks[j].waiters = Some(id)
+        t.state = Blocked
+        t.blocked_on = Some(m)
+        t.next_wait = k.waiters
+        k.waiters = Some(id)
         self.reprice(o)
         false
     end acquire
@@ -394,33 +419,35 @@ struct Kernel
     // for whoever runs next, and that waiter's program counter moves past the `Lock` step it
     // blocked on — it did not take the lock, it was given it.
     release(*self, id: TaskId, m: LockId) -> bool
-        var i = usize(id)
-        var j = usize(m)
+        ref t = self.tasks[usize(id)]
+        ref k = self.locks[usize(m)]
 
-        var mine = self.locks[j].owner match
+        var mine = k.owner match
             Some(o) -> o == id
             None -> false
 
         if !mine
-            self.tasks[i].fault = Some(NotHeld(self.locks[j].mark))
-            self.tasks[i].state = Faulted
+            t.fault = Some(NotHeld(k.mark))
+            t.state = Faulted
             return false
 
         self.unhold(id, m)
-        self.locks[j].owner = None
+        k.owner = None
 
         var next = self.most_urgent(m)
 
         if next.is_some()
             var w = next.unwrap()
-            var k = usize(w)
 
             self.unwait(m, w)
-            self.tasks[k].blocked_on = None
-            self.tasks[k].pc += 1u8
-            self.locks[j].owner = Some(w)
-            self.locks[j].next_held = self.tasks[k].holds
-            self.tasks[k].holds = Some(m)
+
+            ref heir = self.tasks[usize(w)]
+
+            heir.blocked_on = None
+            heir.pc += 1u8
+            k.owner = Some(w)
+            k.next_held = heir.holds
+            heir.holds = Some(m)
             self.make_ready(w)
             self.reprice(w)
 
@@ -431,33 +458,33 @@ struct Kernel
     // Run the task's program until it is sitting on a step that costs time, or until it can go no
     // further. The answer is whether it can spend the tick it was picked for.
     advance(*self, id: TaskId) -> bool
-        var i = usize(id)
+        ref t = self.tasks[usize(id)]
 
         loop
-            if self.tasks[i].pc >= self.tasks[i].nsteps
-                self.tasks[i].state = Done
+            if t.pc >= t.nsteps
+                t.state = Done
                 return false
 
-            self.tasks[i].steps[usize(self.tasks[i].pc)] match
+            t.steps[usize(t.pc)] match
                 Work(n) ->
-                    if self.tasks[i].did < n then return true
+                    if t.did < n then return true
 
-                    self.tasks[i].did = 0
-                    self.tasks[i].pc += 1u8
+                    t.did = 0
+                    t.pc += 1u8
                 Sleep(n) ->
-                    self.tasks[i].pc += 1u8
-                    self.tasks[i].state = Sleeping
-                    self.tasks[i].wake = self.now + n
+                    t.pc += 1u8
+                    t.state = Sleeping
+                    t.wake = self.now + n
                     self.sleep(id)
                     return false
                 Lock(m) ->
                     if !self.acquire(id, m) then return false
 
-                    self.tasks[i].pc += 1u8
+                    t.pc += 1u8
                 Unlock(m) ->
                     if !self.release(id, m) then return false
 
-                    self.tasks[i].pc += 1u8
+                    t.pc += 1u8
     end advance
 
     // Join the sleeper list at its tail, so the clock reaches sleepers in the order they lay down.
@@ -489,12 +516,12 @@ struct Kernel
 
         while cur.is_some()
             var id = cur.unwrap()
-            var k = usize(id)
-            var nxt = self.tasks[k].next_sleep
+            ref t = self.tasks[usize(id)]
+            var nxt = t.next_sleep
 
-            self.tasks[k].next_sleep = None
+            t.next_sleep = None
 
-            if self.tasks[k].wake <= self.now then self.make_ready(id)
+            if t.wake <= self.now then self.make_ready(id)
             else
                 tail match
                     None -> head = Some(id)

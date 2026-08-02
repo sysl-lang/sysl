@@ -86,18 +86,19 @@ struct RunQueue
     // next door got the same behaviour from a sequence number stamped on every entry, which it
     // then had to compare; here the order is the list.
     push(*self, ts: []Task, id: TaskId)
-        var i = usize(id)
-        var lv = level(ts[i].prio)
+        ref t = ts[usize(id)]
+        var lv = level(t.prio)
         var p = usize(lv)
+        ref tail = self.tail[p]
 
-        ts[i].next_ready = None
-        ts[i].qlevel = Some(lv)
+        t.next_ready = None
+        t.qlevel = Some(lv)
 
-        self.tail[p] match
+        tail match
             None -> self.head[p] = Some(id)
             Some(last) -> ts[usize(last)].next_ready = Some(id)
 
-        self.tail[p] = Some(id)
+        tail = Some(id)
         self.bits |= 1u64 << u64(p)
         self.n += 1usize
     end push
@@ -106,17 +107,18 @@ struct RunQueue
         if self.bits == 0u64 then return None
 
         var p = usize(lowest_bit(self.bits))
-        var id = self.head[p].unwrap()
-        var i = usize(id)
+        ref head = self.head[p]
+        var id = head.unwrap()
+        ref t = ts[usize(id)]
 
-        self.head[p] = ts[i].next_ready
+        head = t.next_ready
 
-        if self.head[p].is_none()
+        if head.is_none()
             self.tail[p] = None
             self.bits &= ~(1u64 << u64(p))
 
-        ts[i].next_ready = None
-        ts[i].qlevel = None
+        t.next_ready = None
+        t.qlevel = None
         self.n -= 1usize
         Some(id)
     end pop
@@ -126,12 +128,14 @@ struct RunQueue
     // heap paid a swap. A task that is in no queue is not an error: a running task is out of the
     // queue by definition.
     remove(*self, ts: []Task, id: TaskId)
-        var i = usize(id)
+        ref t = ts[usize(id)]
 
-        if ts[i].qlevel.is_none() then return
+        if t.qlevel.is_none() then return
 
-        var p = usize(ts[i].qlevel.unwrap())
-        var cur = self.head[p]
+        var p = usize(t.qlevel.unwrap())
+        ref head = self.head[p]
+        ref tail = self.tail[p]
+        var cur = head
         var prev: Option[TaskId] = None
 
         while cur.is_some() && cur.unwrap() != id
@@ -140,17 +144,17 @@ struct RunQueue
 
         if cur.is_none() then return
 
-        var nxt = ts[i].next_ready
+        var nxt = t.next_ready
 
         prev match
-            None -> self.head[p] = nxt
+            None -> head = nxt
             Some(q) -> ts[usize(q)].next_ready = nxt
 
-        if self.tail[p].unwrap_or(id) == id && self.tail[p].is_some() then self.tail[p] = prev
-        if self.head[p].is_none() then self.bits &= ~(1u64 << u64(p))
+        if tail.unwrap_or(id) == id && tail.is_some() then tail = prev
+        if head.is_none() then self.bits &= ~(1u64 << u64(p))
 
-        ts[i].next_ready = None
-        ts[i].qlevel = None
+        t.next_ready = None
+        t.qlevel = None
         self.n -= 1usize
     end remove
 
