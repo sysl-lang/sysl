@@ -498,6 +498,21 @@ sealed trait TStmt
 case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
 
+/** `ref name = place` (`03 § ref`) — a name bound to the storage `place` found, rather than to a
+ * copy of what was in it.
+ *
+ * It declares **no slot**. Where a `TVarDecl` allocates storage and stores into it, this binds the
+ * name's address to the address the place already has, so the walk that reaches an element is made
+ * once and every later use is the load or store it would have been anyway. That is also why nothing
+ * releases it at scope end: the ref took no count, and the storage belongs to whatever the place was
+ * rooted at.
+ *
+ * The place is kept in the node as well as consumed by codegen because the analyzer's own record of
+ * it (`Scoping.refPlaces`) does not survive into the tree, and a later pass reading this statement
+ * should see the same place the binding was made from.
+ */
+case class TRefDecl(name: String, ty: Type, place: TExpr) extends TStmt
+
 /** One write of a multi-assignment: the place, the operator that was written, the value, the trait
  * method a compound operator lowers to when it is not an instruction (`14 §3`), and the `invariant`
  * re-check the receiver needs once the write lands (`05`).

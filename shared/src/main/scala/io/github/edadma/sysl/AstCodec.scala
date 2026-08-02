@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 11
+  val Version: Int = 12
 
   private val Magic = "sysl-ast"
 
@@ -274,6 +274,7 @@ object AstCodec {
         case VarDecl(n, t, i)             => tok("var"); sref(n); opt(t)(typ); opt(i)(expr)
         case ConstDecl(n, t, v, vs)       => tok("cst"); sref(n); typ(t); expr(v); vis(vs)
         case ValDecl(n, t, v, vs)         => tok("val"); sref(n); opt(t)(typ); expr(v); vis(vs)
+        case RefDecl(n, p)                => tok("ref"); sref(n); expr(p)
         case MultiAssign(op, ts, vs)      => tok("masg"); sref(op); list(ts)(expr); list(vs)(expr)
         case MultiDecl(ns, mut, vs)       => tok("mdcl"); list(ns)(sref); bool(mut); list(vs)(expr)
         case ExprStmt(x)                  => tok("es"); expr(x)
@@ -620,6 +621,7 @@ object AstCodec {
         case "var"  => VarDecl(sref(), opt(typ()), opt(expr()))
         case "cst"  => ConstDecl(sref(), typ(), expr(), vis())
         case "val"  => ValDecl(sref(), opt(typ()), expr(), vis())
+        case "ref"  => RefDecl(sref(), expr())
         case "masg" => MultiAssign(sref(), list(expr()), list(expr()))
         case "mdcl" => MultiDecl(list(sref()), bool(), list(expr()))
         case "es"   => ExprStmt(expr())

@@ -42,6 +42,7 @@ trait StmtAnalysis extends TypeResolution {
     blockDeclares = savedDeclares ++ stmts.collect {
       case VarDecl(n, _, _)      => List(n)
       case ValDecl(n, _, _, _)   => List(n)
+      case RefDecl(n, _)         => List(n)
       case MultiDecl(ns, _, _)   => ns
       case ConstDecl(n, _, _, _) => List(n)
     }.flatten
@@ -186,6 +187,10 @@ trait StmtAnalysis extends TypeResolution {
   private def bindFailed(stmt: Stmt): Unit = stmt match
     case VarDecl(name, _, _)    => declare(name, Type.Unknown)
     case ValDecl(name, _, _, _) => declareReadOnly(name, Type.Unknown)
+    // A ref whose place did not analyze binds the name at `Type.Unknown` like the other two, and
+    // records no place: there is nothing to walk outward through, and a guard built from a poisoned
+    // node would refuse assignments for a reason the program never gave.
+    case RefDecl(name, _)       => declare(name, Type.Unknown)
     case MultiDecl(names, mutable, _) =>
       for n <- names do if mutable then declare(n, Type.Unknown) else declareReadOnly(n, Type.Unknown)
     case _                      =>
@@ -378,6 +383,22 @@ trait StmtAnalysis extends TypeResolution {
       if declared.isDefined && disagree(ti.ty, declTy) then
         err(s"cannot initialize '$name': declared ${show(declTy)} but the value is ${show(ti.ty)}")
       List(TVarDecl(declareReadOnly(name, declTy), declTy, ti))
+
+    // `ref name = place` (`03 § ref`). The place is analyzed once, here, and what the name means
+    // afterwards is the storage it found — so neither the path nor the checks along it are repeated,
+    // and neither is the copy a `var` would have made.
+    case RefDecl(name, placeExpr) =>
+      val tp = analyzeExpr(placeExpr)
+
+      // Rule one, and the message says what a place is rather than that this is not one: the mistake
+      // is nearly always a call, and "it has no address" is the fact that explains every case at once.
+      if !isPlace(tp) then
+        err(s"'ref' names a place — a local, a field, an element, or a dereference — and this " +
+          s"expression has no address for '$name' to name. Bind it with 'val' to hold the value it " +
+          s"produces")
+      if tp.ty == Type.Never then err(s"cannot bind '$name' to an expression that never returns")
+
+      List(TRefDecl(declareRef(name, tp, refHazards(tp)), tp.ty, tp))
 
     case VarDecl(name, typOpt, None) =>
       val ty = typOpt.map(rt).getOrElse(err(s"'$name' needs either a type or an initial value"))

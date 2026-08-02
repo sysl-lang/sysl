@@ -78,7 +78,10 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
     // An `extern` variable is the one global that is not one: the storage belongs to whoever laid it
     // down, and reaching it is the foreign seam rather than a promise this program made (`12 §1`).
     case g: TGlobal         => !g.writable
-    case TLoad(name, _)     => readOnlyLocals(name)
+    // A `ref` is read-only exactly when the storage it found is (`03 § ref`), which is what lets the
+    // property survive being given a shorter name: reaching into a `val` keeps it, and a ref is a
+    // way of reaching in.
+    case TLoad(name, _)     => readOnlyLocals(name) || refPlaces.get(name).exists(readOnly)
     case TField(recv, _, _) => readOnly(recv)
     // Only where the elements are the receiver's own storage. A slice's are somebody else's, and
     // whose they are is exactly what a slice does not record.

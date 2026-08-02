@@ -53,7 +53,7 @@ class SyslParser(val source: Source) extends DeclParser {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      misplacedCapability | importDecl | implDecl | declaration | varDecl | returnStmt |
+      misplacedCapability | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
         breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign |
         resultListStmt | exprStmt,
     )
@@ -67,7 +67,7 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val inlineStatement: PackratParser[Stmt] =
     at(
-      importDecl | implDecl | declaration | varDecl | returnStmt |
+      importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
         breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign | exprStmt,
     )
 
@@ -435,6 +435,21 @@ class SyslParser(val source: Source) extends DeclParser {
       op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
         case n ~ t ~ e => VarDecl(n, t, e.map(Placeholders.lift))
       }
+
+  /** `ref name = place` (`03 § ref`).
+   *
+   * Neither half of what `var` and `val` accept is offered here, and each absence is a rule rather
+   * than an omission. There is **no type annotation**, because a ref is a local declaration and never
+   * a type, so it states nothing to a reader elsewhere and its type is the place's by construction.
+   * There is **no multiple form**, because the comma family binds several names to several *values*
+   * (`00 §2`) and a place list is what a multi-assignment already is.
+   *
+   * The initializer is parsed as any expression and held to being a place by the analyzer, which is
+   * where the question can be answered at all — `f()[i]` and `xs[i]` are the same shape until
+   * something knows what `f` and `xs` are.
+   */
+  protected lazy val refDecl: PackratParser[Stmt] =
+    op("ref") ~> ident ~ (op("=") ~> expression) ^^ { case n ~ p => RefDecl(n, Placeholders.lift(p)) }
 
   /** `val a, b = …` / `var a, b = …` — a binding that names several things (`00 §2`).
    *

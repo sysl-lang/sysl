@@ -497,6 +497,27 @@ trait Scoping extends DeclTables {
    */
   protected val readOnlyLocals = mutable.HashSet.empty[String]
 
+  /** The place each `ref` name stands for (`03 § ref`), under the unique name codegen uses.
+   *
+   * This is the compile-time half of the binding, and the half that earns the feature. Codegen needs
+   * only an address, which it takes once; every *check* needs the place, because a promise is
+   * discharged by walking outward through one — so a write through a ref re-runs the invariants of
+   * the structs it lies inside, and a ref into read-only storage is read-only, both by the ordinary
+   * walks consulting this map when they reach the name.
+   *
+   * It is a map of unique names for the same reason `readOnlyLocals` is a set of them: the walks run
+   * on already-analyzed nodes, which carry the unique name and not the one the program wrote.
+   */
+  protected val refPlaces = mutable.HashMap.empty[String, TExpr]
+
+  /** What a live `ref` forbids while it is in scope (`03 § ref`): the places whose reassignment could
+   * free the storage the ref found. `depth` is the scope nesting it was declared at, which is what
+   * takes it out of consideration again when that block closes.
+   */
+  protected case class RefGuard(name: String, hazards: Set[String], depth: Int)
+
+  protected var refGuards: List[RefGuard] = Nil
+
   // An import inside a block lasts exactly as long as the block's bindings do, so the two stacks
   // are pushed and popped together — including by the unwinding a failed statement does.
   protected def pushScope(): Unit = {
@@ -507,6 +528,9 @@ trait Scoping extends DeclTables {
   protected def popScope(): Unit = {
     scopes = scopes.tail
     importStack = importStack.tail
+    // A ref's restriction lasts exactly as long as its name does, so closing the block that declared
+    // it is what lifts it — the storage it found is nobody's concern once nothing can reach it.
+    refGuards = refGuards.filter(_.depth <= scopes.length)
   }
 
   /** Adds what an `import` inside a block brings in to the innermost open block. */
@@ -519,6 +543,8 @@ trait Scoping extends DeclTables {
   protected def resetLocals(): Unit = {
     used.clear()
     readOnlyLocals.clear()
+    refPlaces.clear()
+    refGuards = Nil
     scopes = List(mutable.LinkedHashMap.empty[String, (String, Type)])
     importStack = List(Imports.empty)
   }
@@ -543,6 +569,19 @@ trait Scoping extends DeclTables {
   protected def declareReadOnly(name: String, ty: Type): String = {
     val unique = declare(name, ty)
     readOnlyLocals += unique
+    unique
+  }
+
+  /** Binds a name to a **place** rather than to a value — what `ref` declares (`03 § ref`).
+   *
+   * The type is the place's, since a ref states nothing of its own, and the guard is what holds the
+   * storage still for as long as the name can reach it.
+   */
+  protected def declareRef(name: String, place: TExpr, hazards: Set[String]): String = {
+    val unique = declare(name, place.ty)
+
+    refPlaces(unique) = place
+    refGuards = RefGuard(unique, hazards, scopes.length) :: refGuards
     unique
   }
 

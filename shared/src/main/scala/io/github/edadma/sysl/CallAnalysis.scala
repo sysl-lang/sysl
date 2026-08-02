@@ -167,6 +167,10 @@ trait CallAnalysis extends OperatorCalls {
             case _           => tr
           if !isPlace(place) then
             err("'*self' needs a variable, field, or dereference to point at — this receiver has no address")
+          // A `*self` method is handed somewhere to write, so it is the one call that could move
+          // storage a live `ref` is standing on (`03 § ref`). It is asked here because this is where
+          // the receiver becomes a place the caller can be told about.
+          checkRefCall(place)
           TAddrOf(place, Type.Ptr(place.ty))
 
     case RecvMode.ByRef(_) =>

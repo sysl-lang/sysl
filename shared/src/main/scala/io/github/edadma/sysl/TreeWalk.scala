@@ -20,6 +20,9 @@ object TreeWalk {
       s match
         case TExprStmt(e)      => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TVarDecl(_, _, e) => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
+        // A ref's place is an expression like any other — its index may be a branch, and a branch is
+        // a block. The walk goes through it for the same reason it goes through an initializer.
+        case TRefDecl(_, _, e) => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TReturn(Some(e))  => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TBreak(Some(e), _) => blocks(e).foreach(b => forEachStmt(b.stmts)(f))
         case TMultiAssign(writes) =>
@@ -39,6 +42,7 @@ object TreeWalk {
     case TBreak(Some(v), _) => List(v)
     case TExprStmt(e)       => ownBreaksInExpr(e)
     case TVarDecl(_, _, e)  => ownBreaksInExpr(e)
+    case TRefDecl(_, _, e)  => ownBreaksInExpr(e)
     case TReturn(Some(e))   => ownBreaksInExpr(e)
     case TMultiAssign(writes) => writes.flatMap(w => ownBreaksInExpr(w.place) ::: ownBreaksInExpr(w.value))
     case _                  => Nil

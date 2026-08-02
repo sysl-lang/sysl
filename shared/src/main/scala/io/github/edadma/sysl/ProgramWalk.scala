@@ -724,6 +724,8 @@ trait ProgramWalk
     val savedScopes   = scopes
     val savedUsed     = used.toSet
     val savedReadOnly = readOnlyLocals.toSet
+    val savedRefs     = refPlaces.toMap
+    val savedGuards   = refGuards
     val savedImports  = importStack
     val savedLoops    = loops
     val savedEnsure   = ensureResultTy
@@ -802,6 +804,8 @@ trait ProgramWalk
       scopes = savedScopes
       used.clear(); used ++= savedUsed
       readOnlyLocals.clear(); readOnlyLocals ++= savedReadOnly
+      refPlaces.clear(); refPlaces ++= savedRefs
+      refGuards = savedGuards
       importStack = savedImports
       loops = savedLoops
       ensureResultTy = savedEnsure

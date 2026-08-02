@@ -87,7 +87,7 @@ private class Escape(program: TProgram) {
 
     val walks =
       bodies.map { (who, stmts, result) =>
-        val walk = new Walk(Map.empty, returningEscapes = true, localArrays(stmts))
+        val walk = new Walk(Map.empty, returningEscapes = true, localArrays(stmts), refBindings(stmts))
         walk.seed(stmts, result)
         (who, walk)
       }
@@ -187,7 +187,12 @@ private class Escape(program: TProgram) {
   /** One function's worth of tracking: which of its locals may hold a view that dies with the
    * frame, which arrays those views root at, and the first escape that has nowhere to be promoted.
    */
-  private class Walk(seeds: Map[String, View], returningEscapes: Boolean, locals: Set[String] = Set.empty) {
+  private class Walk(
+      seeds: Map[String, View],
+      returningEscapes: Boolean,
+      locals: Set[String] = Set.empty,
+      refOf: Map[String, TExpr] = Map.empty,
+  ) {
 
     private var confined       = seeds
     var escape: Option[String] = None
@@ -279,6 +284,11 @@ private class Escape(program: TProgram) {
      */
     private def arrayRoot(base: TExpr): View = base match
       case TLoad(name, _) if locals(name) => View.of(name)
+      // A `ref` declares no storage, so it is never itself a root — the array it names is whatever
+      // its place was rooted at. Without this step the name would answer `unnamed`, and an escape
+      // through it would be reported as one with nowhere to promote to rather than moving the array
+      // it actually views.
+      case TLoad(name, _) if refOf.contains(name) => arrayRoot(refOf(name))
       case TIndex(r, _, _)                => arrayRoot(r)
       case _                              => View.unnamed
 
@@ -329,6 +339,10 @@ private class Escape(program: TProgram) {
 
         forEachStmt(stmts) {
           case TVarDecl(name, _, init)                  => bind(name, views(init))
+          // A `ref` name reaches the storage its place reached (`03 § ref`), so it views whatever
+          // that place views. Without this the name would view nothing, and a slice taken through it
+          // would look like a view of storage the frame does not own.
+          case TRefDecl(name, _, place)                 => bind(name, views(place))
           case TExprStmt(TStore(TLoad(name, _), v, _))  => bind(name, views(v))
           // A multi-assignment's arms are stores, and one landing in a plain local binds that local
           // to what it was given for the same reason a single one does.
@@ -347,6 +361,7 @@ private class Escape(program: TProgram) {
     private def check(stmts: List[TStmt]): Unit = forEachStmt(stmts) {
       case TReturn(Some(v))  => returned(v)
       case TVarDecl(_, _, e) => escaping(e)
+      case TRefDecl(_, _, e) => escaping(e)
       case TExprStmt(e)      => escaping(e)
       // Each arm is a store, so each is walked as one: a view that lands anywhere but a plain local
       // of this body has left it, exactly as it would after a single `=`.
@@ -467,6 +482,17 @@ private class Escape(program: TProgram) {
 
     forEachStmt(stmts) { case TVarDecl(name, _: Type.Array, _) => found += name }
     found.toSet
+  }
+
+  /** The place each `ref` in a body stands for, so a walk that reaches one of those names can carry
+   * on to the storage it really names (`03 § ref`). A ref declares nothing, which is why it is
+   * gathered separately from the arrays above rather than counted among them.
+   */
+  private def refBindings(stmts: List[TStmt]): Map[String, TExpr] = {
+    val found = mutable.Map.empty[String, TExpr]
+
+    forEachStmt(stmts) { case TRefDecl(name, _, place) => found(name) = place }
+    found.toMap
   }
 
 }

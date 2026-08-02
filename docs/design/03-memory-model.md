@@ -236,8 +236,10 @@ expression that found it. So a later `i += 1` leaves `t` naming the element it a
 
 This is the whole of why it can exist in a language with no borrow checker. `ref` may be written
 only as a local declaration. There is no `ref` type, so a ref cannot be a field, a parameter, a
-return type, an element, or a type argument; it cannot be assigned to another ref, and it does not
-outlive the block that declares it.
+return type, an element, or a type argument; it cannot be re-pointed at a second place once bound
+(C# spells that `t = ref other`, and it is not offered here); and it does not outlive the block that
+declares it. A ref *of* a ref — `ref b = a` — is not a re-pointing and is ordinary: it is one more
+name for the place `a` already stands for, and the walks follow it through.
 
 That restriction is what keeps the compiler's knowledge complete. A `*T` is a type, so the moment
 one exists it can be carried somewhere the compiler has lost the path it came from — which is
@@ -290,12 +292,50 @@ assigned, and no mutating method may be called on a prefix of one.** The check i
 from types alone, and never asks where the ref is *used* — which is the question that would need
 lifetimes.
 
-Which steps those are falls out of the model rather than being a list:
+Two words carry it, and between them they make the set small. A step is held still when it is an
+**owning** step that the path goes **through**.
 
-- a **view, reference, or pointer** step can be made to name somewhere else, so it is a hazard, and
-  so is every prefix of one;
-- a **field, a fixed array, or an element of one** cannot: that storage *is* the enclosing object's
-  bytes, and assigning to it overwrites the bytes rather than moving them.
+*Owning*, because an assignment can only strand a ref by freeing the storage the ref stands in, and
+only a `&T` or a view releases anything when it is overwritten:
+
+- a **`&T`** step and a **view** step are hazards. Overwriting either releases what it held, and that
+  release may be the last;
+- a **`*T`** step is **not** one. A raw pointer owns nothing, so `p = q` frees nothing and the
+  storage a ref found through `p` stays exactly as alive as it was. Whether it was alive to begin
+  with is the raw tier's ordinary bargain, and no rule here changes it;
+- a **field, a fixed array, or an element of one** is not one either: that storage *is* the enclosing
+  object's bytes, and assigning to it overwrites the bytes rather than moving them.
+
+*Through*, because what an assignment frees is whatever that step pointed **at** — so it takes the
+ref's storage with it only when the path carried on past it. The consequence is the one that keeps
+the rule from swallowing the feature: **the place itself is never in the set.** An assignment to it
+is what writing through the ref *is*. `ref r = h.node` names the slot, so `r = other` and
+`h.node = other` are one statement written two ways, and neither is refused — while `h = other`,
+where `h` is a `&Holder`, is.
+
+The `*T` exclusion is not a concession, it is what makes the feature usable where it is most wanted.
+`guide/kernel` reaches every table through a `*Kernel` receiver, so a rule that counted pointer steps
+would refuse every `self.…()` call in the program for a hazard that cannot happen.
+
+### A closure may not capture one
+
+The block is the whole of a ref's life, and a capture is the one construct that carries a name out of
+its block: the name would be read from an environment, in a body with no place to walk outward
+through, and an escaping closure would carry the address past the storage it names. So capturing a
+ref is refused, and the message points at the two things that work — capture the place it names,
+which is ordinary, or read the value into a `val`.
+
+Making it work by capturing the *place* instead was considered and not taken. It would give one word
+two meanings: re-walking `xs[i]` inside the closure would use whatever `i` had become by then, which
+is exactly the by-name reading rejected below.
+
+### What a ref does not reach
+
+A container's subscript is a call through `Index` (`14 §7`), not a place — so `ref e = b[0]` on a
+`Buf` is refused, and refused by the ordinary rule rather than by one of its own. This is the first
+thing a reader will try, and the answer is `07`'s: `b[0]` produces a value, and there is no address
+anywhere for a name to mean. A ref reaches the built-in subscript, which is the one that indexes
+storage.
 
 A chain with no indirection step in it therefore has nothing to refuse at all. `guide/kernel`'s
 tables are fixed arrays in a struct the kernel owns, so every ref in it is unconditional, and the
