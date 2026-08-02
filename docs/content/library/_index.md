@@ -31,6 +31,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | `sysl.io` | `Reader`, `stdin()`, `lines()` |
 | `sysl.fs` | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` |
 | `sysl.math` | `max`, `min`, `pi`, the float functions, and the integer traits `Signed` and `Bits` |
+| `sysl.regex` | POSIX Extended Regular Expressions — `regex`, `Regex`, `Match` |
 | `sysl.sync` | `Atomic[T]`, `SpinLock`, and the five memory orderings |
 | `sysl.thread` | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` |
 | `sysl.args` | `args_of`, for reading a raw `argv` |
