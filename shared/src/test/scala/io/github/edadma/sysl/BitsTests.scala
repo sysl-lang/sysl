@@ -322,6 +322,30 @@ class BitsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         |""".stripMargin) shouldBe "7 30\n"
   }
 
+  // Every `llvm.` name this trait reaches, with the signature it is declared under.
+  //
+  // The compiler builds these signatures rather than reading them off anything a program wrote, so
+  // `Intrinsics` — which exists to hold an `extern`'s declaration to LLVM's — has no say over them.
+  // What catches a wrong one is the verifier, on every test above that links and runs. This pins the
+  // spelling as well, so that the six names sysl emits for `Bits` are written down in one place.
+  "the six intrinsics, each under the signature it is called with" in {
+    val decls = ir(importing +
+      """main()
+        |    var x: u32 = 0b10110000
+        |    print(x.count_ones(), x.leading_zeros(), x.trailing_zeros())
+        |    print(x.reverse_bits(), x.rotate_left(1), x.rotate_right(1))
+        |""".stripMargin).linesIterator.filter(_.startsWith("declare")).toSet
+
+    decls should contain allOf (
+      "declare i32 @llvm.ctpop.i32(i32)",
+      "declare i32 @llvm.ctlz.i32(i32, i1)",
+      "declare i32 @llvm.cttz.i32(i32, i1)",
+      "declare i32 @llvm.bitreverse.i32(i32)",
+      "declare i32 @llvm.fshl.i32(i32, i32, i32)",
+      "declare i32 @llvm.fshr.i32(i32, i32, i32)",
+    )
+  }
+
   // The declaration carries the width, so a program using one member at three widths gets three
   // `declare` lines and no more — which is what makes `satDecls` a set.
   "each intrinsic is declared once, under the width it was reached at" in {

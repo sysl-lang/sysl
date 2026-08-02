@@ -68,6 +68,12 @@ import scopt.OParser
  * `--target` names the machine to build for (`targets.md`). Given none, a build is for the machine
  * it is running on — and if that is one sysl has no entry for, it says so and stops rather than
  * guessing, because a wrong guess produces a module that looks right and is not.
+ *
+ * `--optimize` names the level handed to clang, spelled as clang spells one after the `-O`, and it
+ * reaches every object a build produces rather than only the link. The default is `1` rather than
+ * nothing at all, which is what it used to be: `-O0` is a different instruction selector, it is the
+ * mode a back end's own suite covers least, and a miscompile was found living there
+ * (`Toolchain.defaultOptimization` has the case). A level clang does not have is clang's to report.
  */
 case class Config(
     command: String = "",
@@ -84,11 +90,17 @@ case class Config(
     programArgs: List[String] = Nil,
     filter: Option[String] = None,
     failFast: Boolean = false,
+    optimize: String = Toolchain.defaultOptimization,
 )
 
-@main def sysl(args: String*): Unit = {
+/** The option grammar, held apart from the entry point so that a test can ask what an argument list
+ * parses to. The alternative is a suite that builds a `Config` by hand and so never finds out
+ * whether the flag it is about is spelled the way the user has to spell it.
+ */
+private[sysl] val parser = {
   val builder = OParser.builder[Config]
-  val parser = {
+
+  {
     import builder.*
     OParser.sequence(
       programName("sysl"),
@@ -155,10 +167,17 @@ case class Config(
       opt[String]("ar")
         .action((a, c) => c.copy(ar = Some(a)))
         .text("the llvm-ar to build a library with; defaults to searching for one"),
+      opt[String]("optimize")
+        .action((o, c) => c.copy(optimize = o))
+        .text(s"the optimization level to hand clang, as it spells one after the '-O': " +
+          s"defaults to ${Toolchain.defaultOptimization}, and '0' is the mode a miscompile was " +
+          s"once found in"),
       checkConfig(c => if c.command.isEmpty then failure("a subcommand is required") else success),
     )
   }
+}
 
+@main def sysl(args: String*): Unit = {
   val (own, forwarded) = processArgs(args).span(_ != "--")
 
   OParser.parse(parser, own, Config()) match
@@ -286,14 +305,14 @@ private[sysl] def execute(cfg: Config): Int = {
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
 
-      Toolchain.build(compiled, exe, target, archives) match
+      Toolchain.build(compiled, exe, target, archives, cfg.optimize) match
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
       val exe = createTempFile("sysl-", "")
 
-      Toolchain.build(compiled, exe, target, archives) match
+      Toolchain.build(compiled, exe, target, archives, cfg.optimize) match
         case Left(err) => discard(exe); fail(err)
         case Right(_) =>
           val result = exec(exe :: cfg.programArgs)
@@ -371,12 +390,12 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
 
       val outcome =
         for
-          _ <- Toolchain.compileObject(ir, code, target)
-          _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(meta, target), metadata, target)
+          _ <- Toolchain.compileObject(ir, code, target, cfg.optimize)
+          _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(meta, target), metadata, target, cfg.optimize)
           // Each C file becomes its own member, so the linker pulls in a shim the same way it pulls
           // in anything else: because something left its symbol undefined.
           _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
-                 so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target)))
+                 so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize)))
           _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), out, ar)
         yield ()
 

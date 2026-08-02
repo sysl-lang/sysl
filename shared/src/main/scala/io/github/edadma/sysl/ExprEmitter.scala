@@ -269,10 +269,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     val (a, b) = (from.asInstanceOf[Type.Integer].bits, to.asInstanceOf[Type.Integer].bits)
 
     // A non-negative immediate is its own value at every width it fits in, so **widening** one is a
-    // `zext` of a constant that says nothing. It matters beyond tidiness: a rotation by a literal is
-    // then a *constant* funnel shift, which the back end turns into one instruction, where the same
-    // rotation through a register is a sequence. Narrowing still goes through the instruction, since
-    // an immediate too wide for the type it is written at is not IR at all.
+    // `zext` of a constant that says nothing. The optimizer folds it either way; what this is for is
+    // `emit-llvm`, where a rotation by a literal should read as the constant funnel shift it is
+    // rather than as a register one whose register is a constant. Narrowing still goes through the
+    // instruction, since an immediate too wide for the type it is written at is not IR at all.
     if a == b || (a < b && !v.startsWith("%") && !v.startsWith("-")) then v
     else
       val r = freshTemp()

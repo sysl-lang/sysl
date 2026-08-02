@@ -34,10 +34,23 @@ object Intrinsics {
   /** What an intrinsic takes: `arity` value parameters, all of one floating type, returning that
    * same type.
    *
-   * Every entry today has that shape, which is why it is the only one modelled. The integer
-   * operations that will want this next are not all so tidy — `llvm.ctlz` takes a second argument
-   * that must be a constant, and `llvm.fshl` takes three — so this is expected to grow a case rather
-   * than to have been general enough already.
+   * Every entry has that shape, which is why it is the only one modelled — and this used to predict
+   * that the integer operations would make it grow a case, naming `llvm.ctlz` and `llvm.fshl`. They
+   * arrived, in `sysl.math`'s `Bits`, and they did **not** come through here.
+   *
+   * The reason is the one this whole file is organised around, and it is worth stating rather than
+   * leaving as an absence. What is validated here is a signature **somebody wrote** — an `extern` in
+   * library source, which can disagree with LLVM's and has to be held to it before the verifier is
+   * reached. `Bits` has no such declaration to check: its memberships cover an open family of
+   * widths, so there was never a finite set of `extern`s, and the calls are built by the compiler
+   * from the receiver's own type (`ExprEmitter.intrinsic`). A signature the compiler constructs is
+   * checked by every build that runs one, which is a stronger guarantee than a table could give and
+   * the same one the checked arithmetic and the saturating casts already rely on.
+   *
+   * So this stays float-shaped, and stays about the library. **What no single place holds is the
+   * list of `llvm.` names sysl itself emits** — they are here, in `Codegen`'s module header, in
+   * `ScalarEmitter`, and in `ExprEmitter`. That is a real gap, and it is not this table's to close
+   * while this table is about what a program may name.
    */
   private case class Shape(arity: Int)
 
