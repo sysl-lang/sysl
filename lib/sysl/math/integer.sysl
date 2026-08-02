@@ -16,6 +16,10 @@ module sysl.math
 // what a compiler-provided membership does *not* change: it settles which types have the member,
 // not which files may name it. So a program reaches `abs` by importing `sysl.math`, and a program
 // that would rather define its own `abs` for its own purposes may still do so.
+//
+// **Below the two traits are the free functions**, which are here rather than in a file of their own
+// because they are about the same types -- and which are free functions rather than members for a
+// reason stated where they begin.
 trait Signed
 
     // The magnitude, with the sign discarded.
@@ -88,3 +92,143 @@ trait Bits
     // unable to state an amount its own width cannot hold.
     rotate_left(self, n: u32) -> Self
     rotate_right(self, n: u32) -> Self
+
+// The arithmetic above the operators: raising to a power, the two divisors, and the two questions
+// about powers of two.
+//
+// **These are free functions rather than members, and the reason is the one `compare.sysl` gives for
+// `min`.** A member has to belong to a trait, and the trait is what decides which types have it;
+// nothing here is a question about a *bit pattern*, which is what `Bits` collects, nor about having
+// a sign, which is what `Signed` collects. What each one actually needs is spelled in its own bound,
+// and a program with a type of its own satisfying that bound gets these for free -- which is the
+// thing a trait member could not have offered, since the memberships of `Bits` and `Signed` are the
+// compiler's and no program can join them.
+//
+// **The bounds are also the specification.** `gcd` asks for `Rem` because Euclid's algorithm is a
+// remainder loop, and for `Sub` and `Ord` because it has to answer a magnitude; it does *not* ask
+// for `Signed`, and that is deliberate -- `Signed` is the signed integers alone, so requiring it
+// would have shut the unsigned widths out of a function that works perfectly well over them. The
+// zero and the one each body needs are written as literals of `T`, which `10 §4` already supplies:
+// a literal has no type of its own to offer and takes the one the position wants.
+
+// A value raised to a whole power, by repeated squaring: `pow(2, 10)` is `1024`.
+//
+// **The exponent is a `u32` and not a `T`**, because how many times to multiply is a count rather
+// than a value of the type being multiplied -- the same reason `rotate_left` takes one. A negative
+// exponent has no answer among the integers, and saying so in the type is better than a trap.
+//
+// **An overflowing power wraps**, as every other integer operation in the language does (`01`).
+// `pow(2, 64)` at `int` is `0`, arrived at honestly: the doubling that overflows is a `*` like any
+// other. A program that needs to know writes the check it needs.
+pow[T: Mul + Ord](base: T, exponent: u32) -> T =
+    var acc: T = 1
+    var b = base
+    var e = exponent
+
+    while e > 0u32 do
+        if e % 2u32 == 1u32 then acc = acc * b
+
+        b = b * b
+        e = e / 2u32
+
+    acc
+
+// The largest value dividing both, and never a negative one.
+//
+// **The magnitude is taken at the end rather than at the start**, which is what lets one body serve
+// both signednesses: `%` truncates (`01`), so Euclid's loop over negative operands arrives at the
+// right divisor carrying the wrong sign, and one comparison at the end fixes it. Negating through
+// `zero - x` rather than `-x` is what keeps the unsigned widths in: unary `-` requires `Neg`, which
+// `01` gives to the signed integers only, while `Sub` is every integer's.
+//
+// `gcd(x, 0)` is `x`, which is the identity the loop already produces and the answer number theory
+// gives: everything divides zero, so the largest divisor the pair has in common is `x`'s own.
+gcd[T: Rem + Eq + Ord + Sub](a: T, b: T) -> T =
+    val zero: T = 0
+    var x = a
+    var y = b
+
+    while y != zero do
+        val t = x % y
+
+        x = y
+        y = t
+
+    if x < zero then zero - x else x
+
+// The smallest value both divide, and never a negative one.
+//
+// **Divided before multiplied** -- `a / gcd(a, b) * b` and not `a * b / gcd(a, b)` -- because the
+// product of the operands overflows at half the width where the answer itself would fit, and the
+// quotient is exact by construction, `gcd` being a divisor of `a`. This is the same reason `hypot`
+// is not `sqrt(x*x + y*y)` in `float.sysl`.
+//
+// **A zero operand answers zero** rather than dividing by one: zero has no multiple that anything
+// else also divides, and reaching `gcd(0, 0)`, which is zero, would otherwise be a division by it.
+lcm[T: Rem + Eq + Ord + Sub + Div + Mul](a: T, b: T) -> T =
+    val zero: T = 0
+
+    if a == zero || b == zero then
+        zero
+    else
+        val m = a / gcd(a, b) * b
+
+        if m < zero then zero - m else m
+
+// The quotient and the remainder together, as a result list (`12 §5b`): `val q, r = divmod(17, 5)`
+// binds `3` and `2`.
+//
+// This is a **result list and not a tuple** by `00 §13`'s discriminator: the pair travels from
+// callee to caller and there is nothing afterwards, so nothing needs to hold the two together. A
+// caller that does need to hold them writes the tuple itself.
+//
+// Both are the operators' own, so both truncate toward zero and the remainder takes the sign of the
+// dividend (`01`) -- `divmod(-17, 5)` is `-3` and `-2`. The reason to call this rather than write
+// the two operators is that it says once what a reader would otherwise check twice: that the same
+// two operands feed both.
+divmod[T: Div + Rem](a: T, b: T) -> T, T = a / b, a % b
+
+// Whether the value is a power of two -- which is to say, whether exactly one bit is set.
+//
+// **Zero and the negatives are not**, and the `> zero` in front is what says so. A negative value
+// has a bit pattern with one bit set only at the most negative value of its width, where
+// `count_ones` answers one and the number is emphatically not a power of two; a comparison against
+// zero costs nothing and is the whole of the difference.
+is_power_of_two[T: Bits + Ord](x: T) -> bool =
+    val zero: T = 0
+
+    x > zero && x.count_ones() == 1u32
+
+// The smallest power of two at or above the value, or `none` when that power does not fit in `T`.
+//
+// **The `Option` is what totality costs here, and it is worth it.** `next_power_of_two(200u8)` would
+// be `256`, which no `u8` holds; wrapping to zero would be a silently wrong answer, and a trap would
+// make a library function decide that a caller's arithmetic is a bug. So the answer's absence is in
+// the type, where a caller has to look at it. Values at or below one answer `some(1)`, negatives
+// included -- one is the smallest power of two, and every negative is below it.
+//
+// **Signedness is read off the result rather than the type**, which is what lets one body serve
+// both. At an unsigned width the answer stops fitting when it needs the whole width; at a signed one
+// it stops a bit earlier, because the top bit is the sign. Rather than ask which `T` is -- a
+// question a generic body has no way to put -- the shift is performed and the result compared
+// against zero: a signed shift that has reached the sign bit comes back negative, and an unsigned
+// one never does.
+next_power_of_two[T: Bits + Ord + Shl + Sub](x: T) -> Option[T] =
+    val zero: T = 0
+    val one: T = 1
+
+    if x <= one then
+        Some(one)
+    else
+        // The width, from the pair that sums to it, and then how many bits `x - 1` occupies. The
+        // answer is one shifted that far -- for `17`, `x - 1` is `16`, which occupies five bits, and
+        // `1 << 5` is `32`.
+        val width: u32 = x.count_ones() + x.count_zeros()
+        val needed: u32 = width - (x - one).leading_zeros()
+
+        if needed >= width then
+            None
+        else
+            val p: T = one << T(needed)
+
+            if p <= zero then None else Some(p)

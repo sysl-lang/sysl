@@ -197,6 +197,13 @@ trait Hoisting extends HoistMembers {
       at(m.pos)(err("a module-level 'val' states its type, and a binding that names several things " +
         s"has nowhere to write one — declare ${m.names.map(n => s"'$n'").mkString(" and ")} separately"))
 
+    // A pattern binding is the same case: its parts have nowhere to carry a type either, so one at
+    // the top of a file would silently become a local of the entry point.
+    case d: PatternDecl if !d.mutable =>
+      at(d.pos)(err("a module-level 'val' states its type, and a binding written as a pattern has " +
+        "nowhere to write one — take the value apart inside a function, or declare the parts " +
+        "separately"))
+
     // The type an `impl` names may be declared further down the file, so it cannot be resolved here
     // — the duplicate check goes with the resolution, in `hoistImpl`. The module it was written in
     // travels with it, since that is what the trait it names and the type it is for resolve under.
