@@ -490,9 +490,10 @@ trait ProgramWalk
    * The initializer is read at the declared type, so an element written `0x428a2f98` in a `[64]u32`
    * needs no suffix — the same courtesy a `const` gets from writing its type, for the same reason.
    *
-   * What the initializer *is* decides only how the storage gets filled: a constant tree is written
-   * into the object file, and anything else becomes code that runs once before the program's own
-   * statements. What is checked here is the **type**, which is the same either way.
+   * What the initializer *is* decides how the storage gets filled: a constant tree is written into
+   * the object file, and anything else becomes code that runs once before the program's own
+   * statements. It also decides one of the two things checked here, since whether a counted type
+   * may be held at all is a question about the value rather than about the type.
    */
   private def analyzeVal(key: String): TVal = inDecl(key)(at(valDecls(key).pos) {
     val decl = valDecls(key)
@@ -501,17 +502,29 @@ trait ProgramWalk
 
     if disagree(init.ty, ty) then
       err(s"cannot initialize '${qn(key)}': declared ${show(ty)} but the value is ${show(init.ty)}")
-    checkValType(ty, key)
-    TVal(key, ty, init, !isStatic(init))
+
+    val static = isStatic(init)
+
+    checkVal(ty, static, key)
+    TVal(key, ty, init, !static)
   })
 
-  /** Holds a module-level `val` to a value that **counts nothing** (`13 §7`).
+  /** Holds a module-level `val` to a value that **owes no release** (`13 §7`).
    *
    * There is one reason and it is about lifetime, not about depth. A module `val` exists for the
-   * whole run and is therefore never let go of, so a counted value in one is a leak with no line to
-   * write the release on — which reaches a `&T`, a `weak T`, a slice, and a `string`, each of which
-   * owes a box or an owner a release. It does not reach a raw pointer, which owns nothing and
-   * releases nothing, or the address of a function, which is the same.
+   * whole run and is therefore never let go of, so a value that owes a release in one is a leak with
+   * no line to write the release on.
+   *
+   * The question is asked of the **value**, not of the type, and the difference is the whole point.
+   * A `&T`, a `weak T`, a slice, and a `string` each owe a box or an owner a release *when one is
+   * built* — but a value the object file carries as it stands was never built, and a literal string
+   * in particular has a null owner word, which both retain and release test for and do nothing
+   * about (`04`). So a counted type is admissible exactly when its initializer is a constant tree:
+   * `val greeting: string = "hello"` is storage in read-only data with no count anywhere in it,
+   * while `val greeting: string = str(n)` is a count with nowhere to write the release.
+   *
+   * A raw pointer and the address of a function are outside the question entirely: they own nothing
+   * at the far end, so they owe nothing however they were arrived at.
    *
    * Read-only *at every depth* is deliberately **not** what this checks, though it once was. That
    * promise is about the storage the declaration lays down, and it is kept where it is made: `k[0] =
@@ -521,7 +534,7 @@ trait ProgramWalk
    * not be written`). Refusing a `val` at pointer type declined one route to what another route
    * grants.
    */
-  private def checkValType(ty: Type, key: String): Unit =
+  private def checkVal(ty: Type, static: Boolean, key: String): Unit =
     // The whole difference between a `val` and a `const` is that a `val` has an address (`13 §7`),
     // and a value with no representation has nothing to put one on. The initializer would still run,
     // which is the only thing such a declaration could have been for — and a statement says that
@@ -529,11 +542,11 @@ trait ProgramWalk
     if Type.zeroSized(ty) then
       err(s"'${qn(key)}' cannot be a 'val': a ${show(ty)} value occupies nothing, so there is no " +
         "storage for the name to stand for — write the call as a statement instead")
-    else if !uncounted(ty) then
-      err(s"'${qn(key)}' cannot be a 'val': its type is ${show(ty)}, and storage that exists for the " +
-        "whole run is never let go of — a reference, a weak reference, a slice, or a string in one " +
-        "would be a count with nowhere to write the release. A raw pointer may be held: it counts " +
-        "nothing")
+    else if !uncounted(ty) && !static then
+      err(s"'${qn(key)}' cannot be a 'val': storage that exists for the whole run is never let go " +
+        s"of, so a count taken in one is a count with nowhere to write the release — and this " +
+        s"${show(ty)} is built while the program runs. One the object file can carry as it stands " +
+        "may be held: a string literal owns nothing, and neither does a table of them")
 
   // --- `extern` variables ----------------------------------------------------------------
 
@@ -571,14 +584,29 @@ trait ProgramWalk
     case Type.Volatile(inner) => uncounted(inner)
     case _                    => true
 
-  /** Whether an initializer is a value the object file can carry as it stands: numbers, and the
-   * arrays built from them. Everything else is code, which is what `13 §7`'s initialization order is
-   * about — this is the test that decides which of the two a declaration is.
+  /** Whether an initializer is a value the object file can carry as it stands: numbers, string
+   * literals, and the arrays and structs built from them. Everything else is code, which is what
+   * `13 §7`'s initialization order is about — this is the test that decides which of the two a
+   * declaration is. It is also what `checkVal` asks to decide whether a counted type may be held,
+   * since a value that was never built owes no release.
    */
   private def isStatic(t: TExpr): Boolean = t match
     case _: TIntLit | _: TFloatLit | _: TBoolLit => true
-    case TArrayLit(elems, _)                     => elems.forall(isStatic)
-    case TArrayFill(value, _)                    => isStatic(value)
+
+    // A literal's bytes are already in the object file and its owner word is null, so the three
+    // words a `string` is are complete before anything runs (`04`). Nothing is allocated to make
+    // one, which is why a module with no allocator may hold a table of them.
+    case _: TStrLit => true
+
+    case TArrayLit(elems, _)  => elems.forall(isStatic)
+    case TArrayFill(value, _) => isStatic(value)
+
+    // Fields laid side by side are a constant tree exactly when the fields are — the same rule the
+    // array above follows, and the reason a table of `{name, code}` pairs lands in read-only data
+    // rather than being filled in by stores. A struct whose `invariant` has to run is wrapped in a
+    // `TStructInvCheck` and never reaches this, which is `13 §7`'s rule that a value having to be
+    // checked is code however it looks.
+    case TStructNew(_, args) => args.forall(isStatic)
 
     // An address the datasheet gives as a number is a constant like any other, so `ptr_cast` over one
     // stays in this category rather than becoming code. It matters where it is used: a register block

@@ -801,12 +801,40 @@ refused, because that is where the promise was made and where it can still be ke
 view of it is a `*T`, the tier `03` excludes on purpose, and is how the view reaches C. Slicing is
 the step between the two, and it is written down.
 
-**A module-level `val` may not hold a counted value.** A `&T`, a `weak T`, a slice, and a `string`
-are each refused, and the reason is the one thing that is true of module storage and of no other
-storage: it exists for the whole run and is therefore never let go of, so a count taken in one is a
-count with no line to write the release on. The cost this carries today is that
-`val greeting: string = "hello"` cannot be written — a `string` is a view with an owner word, and a
-static one would need that word to mean "nobody", which is `04`'s decision rather than this one.
+**A module-level `val` may not hold a value that owes a release.** The reason is the one thing that
+is true of module storage and of no other storage: it exists for the whole run and is therefore never
+let go of, so a count taken in one is a count with no line to write the release on. A `&T`, a
+`weak T`, a slice and a built `string` are each refused for it.
+
+**The question is asked of the value, not of the type**, and the difference is the whole of what the
+rule is worth. A value the object file carries as it stands was never built and takes no count, so a
+counted *type* is admissible exactly when its initializer is a constant tree by the rule below. A
+string literal is the case this exists for: `04` decided that a literal's owner word is null and that
+both retain and release test for it, so `val greeting: string = "hello"` is three words in read-only
+data with no count anywhere in them, while `val greeting: string = str(n)` is a count with nowhere to
+write the release. The two are told apart by the same test that decides whether any `val` is laid
+into the object file, which is why this is one rule and not two.
+
+```
+val messages: [3]string = ["out of range", "not permitted", "no such device"]
+```
+
+That shape is what asked for the relaxation. A module with `no alloc` (§4) can hold, index, slice and
+compare literals but cannot make bytes, so a table of messages was the one thing it could name only
+by reaching for a `const` — which is folded into its uses and has no address, so it cannot be indexed
+at a position computed while running. That is the whole difference between the two declarations, and
+a message table needs the half a `const` does not have.
+
+**A struct is admitted by the same recursion**, so a table of `{name, code}` pairs is one declaration
+rather than two parallel arrays. It follows that a struct carrying an `invariant` may **not** hold a
+literal string: a value that has to be checked is code by the rule below, and code takes a count. That
+is the specification reading consistently rather than a hole in it, but it is the corner worth knowing
+about before writing a device table with a constraint on it.
+
+**A joined string is refused, however constant its parts look.** `"a" + "b"` allocates, and folding it
+into one literal is separate work; admitting it on the strength of how it reads would be admitting a
+leak. The same holds for `str(x)` and, for now, for a slice of a literal — `"hello"[1..]` genuinely is
+immortal, but seeing that requires folding the slice arithmetic.
 
 **A raw pointer may be held, and so may the address of a function.**
 
@@ -861,9 +889,14 @@ private val crc_table: [256]u32 = build_crc_table()
 ```
 
 The two forms are told apart by what the initializer *is*, not by how it is written. A constant tree
-— a number, an array of them, a repeat `[v; n]` (`07`), `null`, and a `ptr_cast` of any of those — is
-laid straight into the object file, runs nothing, and needs nothing ordered. Anything else is code,
-and code runs somewhere.
+— a number, a string literal, a struct or tuple built from constant trees, an array of them, a repeat
+`[v; n]` (`07`), `null`, and a `ptr_cast` of any of those — is laid straight into the object file,
+runs nothing, and needs nothing ordered. Anything else is code, and code runs somewhere.
+
+A **text block** is a string literal by the time this rule sees it — the lexer joins one into a single
+constant (`04 § Text blocks`) — so it needs no clause of its own. This is also the test the paragraph
+above asks: a counted type is admissible in a module `val` exactly when its initializer is one of
+these, since a value that was never built owes no release.
 
 **A value that has to be *checked* is code, whatever it looks like.** A `val` at a constrained type
 (`16`) is written as a plain number and would otherwise be laid down by the rule above — which would

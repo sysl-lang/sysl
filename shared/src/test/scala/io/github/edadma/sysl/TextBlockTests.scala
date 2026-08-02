@@ -269,17 +269,17 @@ class TextBlockTests extends AnyFreeSpec with Matchers with RunSupport with Code
              |print(S.len)""".stripMargin) shouldBe "3\n"
     }
 
-    // …and a `val` still refuses a string, block or not. The refusal is `07 § Not yet`'s and is
-    // about strings rather than about how one was written — pinned so the two stay the same case.
-    "a val refuses a block exactly as it refuses a one-line string" in {
-      val one = err("""val S: string = "ab"
-                      |print(S.len)""".stripMargin)
+    // …and a `val` takes a block exactly as it takes a one-line string, since a block *is* a string
+    // literal by the time the analyzer sees it (`13 §7`). Pinned so the two stay the same case: the
+    // rule is about a value the object file can carry, not about how the value was written.
+    "a val takes a block exactly as it takes a one-line string" in {
+      run("""val S: string = "ab"
+            |print(S.len)""".stripMargin) shouldBe "2\n"
 
-      one should include("a count with nowhere to write the release")
-      err(s"""val S: string = $Q
+      run(s"""val S: string = $Q
              |    ab
              |    $Q
-             |print(S.len)""".stripMargin) should include("a count with nowhere to write the release")
+             |print(S.len)""".stripMargin) shouldBe "3\n"
     }
 
     // `04` — a string literal is a `match` pattern, and a block is a string literal. The arm's

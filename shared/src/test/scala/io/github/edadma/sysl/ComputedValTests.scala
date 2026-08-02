@@ -107,8 +107,9 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err("me() -> int = n\nval n: int = me()") should include("cannot be initialized")
     }
 
-    // A `val` counts nothing whatever fills it, which is the one rule that did not change: the
-    // constant form could not have expressed a reference and the computed form must not either.
+    // A **computed** `val` counts nothing, which is where the rule bites now that a constant one may
+    // hold a literal string: the two forms are told apart by the initializer, and the release a
+    // computed value owes is exactly the one there is no line to write.
     "a reference cannot be held in one" in {
       val e = err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nval p: &P = mk()")
 
@@ -116,8 +117,10 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       e should include("a count with nowhere to write the release")
     }
 
-    "nor a string, which is a view with an owner" in {
-      err("val s: string = \"hi\"") should include("a count with nowhere to write the release")
+    "nor a string a function returned, where the constant form may hold a literal" in {
+      err("val s: string = str(1)") should include("a count with nowhere to write the release")
+
+      run("val s: string = \"hi\"\nprint(s)") shouldBe "hi\n"
     }
 
     "nor a slice" in {

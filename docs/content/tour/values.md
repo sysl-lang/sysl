@@ -34,10 +34,11 @@ so its type is stated rather than inferred from whatever happens to be on the ri
 `val limit = 10` inside a function infers happily, because a local is nobody else's business.
 
 There is a second thing a module-level `val` will not do, and it is worth knowing before you go
-looking for it: it may not hold a **string, a reference, or a slice**. Storage that exists for the
-whole run is never let go of, so a count in one would be a count with nowhere to write the release.
-Numbers, characters, booleans and tables of them are what a module-level `val` is for; text that a
-program builds or reads is a `var` at the top of the file, which is a local of the entry point.
+looking for it: it may not hold a value the program had to **build** — a reference, a slice, or a
+string put together while running. Storage that exists for the whole run is never let go of, so a
+count in one would be a count with nowhere to write the release. Numbers, characters, booleans,
+string *literals*, and tables of any of them are what a module-level `val` is for; text a program
+builds or reads is a `var` at the top of the file, which is a local of the entry point.
 
 `print` takes any number of arguments, renders each one, and puts a space between them. It comes
 from the prelude, which is the part of the standard library a program gets without asking.

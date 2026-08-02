@@ -10,7 +10,7 @@ package io.github.edadma.sysl
  * set of trees that can be lowered this way (`ProgramWalk.isStatic`), which is what lets this fail
  * loudly on anything else instead of guessing.
  */
-trait StaticEmitter extends Emitter {
+trait StaticEmitter extends StringEmitter {
 
   /** One declaration line per `val`.
    *
@@ -41,6 +41,23 @@ trait StaticEmitter extends Emitter {
       val elem = arrayTy.elem.llvm
       val v    = constantValue(value)
       s"[${List.fill(arrayTy.length)(s"$elem $v").mkString(", ")}]"
+
+    // Three words naming bytes that are never freed. The owner is null, which is what makes the
+    // whole value a constant expression rather than something a prologue has to build — and what
+    // lets a `string` sit in storage that is never let go of at all (`13 §7`).
+    case TStrLit(s) => stringValue(s)
+
+    // A struct constant lists its fields in the order the type declares them, and skips the ones
+    // that occupy nothing exactly as the `insertvalue` chain in the ordinary path does — the
+    // initializer has to match the type this module emitted, which is built from `stored`.
+    case TStructNew(struct, args) =>
+      val fields =
+        args.zipWithIndex.collect {
+          case (a, i) if !Type.zeroSized(struct.fields(i)._2) =>
+            s"${struct.fields(i)._2.llvm} ${constantValue(a)}"
+        }
+
+      s"{ ${fields.mkString(", ")} }"
 
     // A device address written as a number: `inttoptr` is a constant expression, so the pointer is
     // in the object file rather than stored into it by a prologue. Only an *integer* read as an
