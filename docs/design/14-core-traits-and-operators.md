@@ -528,6 +528,31 @@ These memberships change no codegen: a scalar operator still lowers to its nativ
 (`§3`). Their sole job is to make the type system agree that a scalar satisfies the bound a
 generic asks for, so `sum(3, 4)` and `sum(3.0, 4.0)` both instantiate `sum[T: Add]`.
 
+**A compiler-provided membership is not always an operator, and `sysl.math.Signed` is the case that
+shows why the mechanism is needed rather than convenient.** `abs` and `signum` are ordinary members
+with ordinary names, and the reason they cannot be a library `impl` is the one that put the
+memberships here in the first place: the `iN` / `uN` families are **open**, so `i5` and `i128` have
+no block anybody could have written. The floating-point half of the same module *is* a written
+trait with an `impl` per width, because there are two widths — which is the whole difference, and it
+is a fact about how many types there are rather than about what the members do.
+
+Such a trait is declared in library source like any other, and what the compiler holds is the
+membership rule and the lowering. Both members read their operand more than once — a magnitude
+compares it and negates it — so they lower to a **select over one evaluation** rather than to the
+tree of operators they are equivalent to, and `f().abs()` calls `f` once.
+
+**Membership does not put a member in scope.** `13 §2` decides which files may write a member and
+this section decides which types have one; they are different questions and both are asked. `Add`
+and `Display` reach everywhere because they are declared in the standard module, which every file
+auto-imports — not because the compiler supplies their memberships. `Signed` is in `sysl.math`, so a
+program imports it exactly as it imports `Float`, and a program that would rather define an `abs` of
+its own still may.
+
+**A member the compiler supplies is not written twice.** `Signed` is the signed integers only. The
+floats have an `abs` already — `Float`'s, bound to libm's `fabs` so that it can see the sign bit,
+which is what makes `(-0.0).abs()` answer `0.0` where a comparison against zero cannot. Two members
+of one name that disagree about a zero would be worse than one of them not existing.
+
 **They are homogeneous**, which is `01`'s rule and not a limitation of the mechanism: an `int` is
 `Mul[int]` and no other `Mul`, because no scalar operator promotes. A scalar therefore keeps its
 instruction whatever an `impl` written elsewhere might say — `impl Mul[Complex] for f64` does not

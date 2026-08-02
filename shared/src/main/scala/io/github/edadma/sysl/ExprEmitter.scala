@@ -568,6 +568,31 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case TUnary(op, _, _) =>
       sys.error(s"unreachable unary '$op'")
 
+    // The operand is read into a register once and the comparisons index off that, which is the
+    // whole reason these are a node rather than a tree of the operators they mean (`14 §5`).
+    case TIntOp(op, operand, ty) =>
+      val v  = genExpr(operand)
+      val ll = ty.llvm
+
+      op match
+        // `x < 0 ? -x : x`, and the negation is the wrapping one the language's own `-` is — so at
+        // the most negative value both answer that value, rather than the member disagreeing with
+        // the operator beside it.
+        case "abs" =>
+          val neg = freshTemp(); emit(s"$neg = sub $ll 0, $v")
+          val lt  = freshTemp(); emit(s"$lt = icmp slt $ll $v, 0")
+          val r   = freshTemp(); emit(s"$r = select i1 $lt, $ll $neg, $ll $v")
+          r
+        // Two comparisons rather than a subtraction of them, because `(x > 0) - (x < 0)` would have
+        // to widen both booleans to the operand's width first and says less about what it computes.
+        case "signum" =>
+          val pos = freshTemp(); emit(s"$pos = icmp sgt $ll $v, 0")
+          val neg = freshTemp(); emit(s"$neg = icmp slt $ll $v, 0")
+          val hi  = freshTemp(); emit(s"$hi = select i1 $pos, $ll 1, $ll 0")
+          val r   = freshTemp(); emit(s"$r = select i1 $neg, $ll -1, $ll $hi")
+          r
+        case _ => sys.error(s"unreachable integer operation '$op'")
+
     // Short-circuit: `&&` evaluates its right side only when the left is true, `||` only when the
     // left is false — so a guard like `p != null && *p > 0` never runs the unsafe right side. The
     // result defaults to the left value and is overwritten by the right only when it is reached.

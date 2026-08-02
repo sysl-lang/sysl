@@ -87,6 +87,7 @@ object TreeWalk {
     case TIncDec(p, _, _, _, _)     => List(p)
     case TBinary(_, l, r, _)        => List(l, r)
     case TUnary(_, v, _)            => List(v)
+    case TIntOp(_, v, _)            => List(v)
     case TLogical(_, l, r)          => List(l, r)
     case TCompare(ops, _)           => ops
     case TSeq(exprs)                => exprs

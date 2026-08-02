@@ -101,6 +101,7 @@ trait MethodCalls extends FuncAddress {
           case Some(_) => err(s"'$mname' is an associated function of '$base' — call it with '$base.$mname(…)'")
           case None =>
             builtinMethod(rty, mname, tr, args)
+              .orElse(builtinNumeric(rty, mname, tr, args))
               .orElse(builtinDisplay(rty, mname, tr, args))
               .orElse(builtinHash(rty, mname, tr, args))
               .orElse(callableField(rty, mname, tr, args, expected))
@@ -406,6 +407,33 @@ trait MethodCalls extends FuncAddress {
 
       funcsUsed += key
       TCall(key, List(self), Type.Integer(64, signed = false))
+    }
+
+  /** A member of a trait the compiler supplies membership for, but which is not an operator —
+   * `n.abs()` and `n.signum()` (`14 §5`, `CoreTraits.numeric`).
+   *
+   * **Gated on the trait being in scope**, which is what keeps a compiler-provided membership from
+   * being a way around `13 §2`. The two questions are different and both have to be answered: a
+   * membership settles which *types* have the member, and scope settles which *files* may write it.
+   * `Add` and `Display` are unaffected because they are in the standard module, which every file
+   * auto-imports; `Signed` is in `sysl.math`, so a program asks for it exactly as it asks for
+   * `Float`.
+   */
+  private def builtinNumeric(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
+    for
+      trName <- CoreTraits.numeric.get(mname)
+      if CoreTraits.builtin(trName, rty)
+      key = Library.key(trName)
+      if traitInScope(key)
+      decl <- traitDecls.get(key)
+      if decl.methods.exists(_.name == mname)
+    yield {
+      if args.nonEmpty then
+        err(s"method '$trName.$mname' takes no arguments, but ${supplied(args.length, "argument")}")
+
+      // The result is `Self`, which for a built-in's membership is the receiver's own type — the
+      // same homogeneity `builtinMethod` reads off `Add`.
+      TIntOp(mname, buildReceiver(RecvMode.ByValue, recv), Type.underlying(rty))
     }
 
   /** `w.get()` — the one thing a `weak T` can be asked (`03`).

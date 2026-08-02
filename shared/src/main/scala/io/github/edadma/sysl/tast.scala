@@ -191,6 +191,15 @@ case class TIncDec(place: TExpr, op: String, pre: Boolean, ty: Type, check: Opti
 case class TBinary(op: String, left: TExpr, right: TExpr, ty: Type) extends TExpr
 case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExpr
 
+/** A member a built-in has by rule rather than by an `impl`, and which lowers to instructions rather
+ * than to a call (`14 §5`, `CoreTraits.numeric`).
+ *
+ * A node of its own rather than a tree of the operators it is equivalent to, because every one of
+ * these reads its operand more than once — a magnitude compares it and negates it — and a tree would
+ * evaluate the receiver expression once per mention. `f().abs()` must call `f` once.
+ */
+case class TIntOp(op: String, operand: TExpr, ty: Type) extends TExpr
+
 /** `&&` / `||` — short-circuit, always boolean. */
 case class TLogical(op: String, left: TExpr, right: TExpr) extends TExpr { def ty: Type = Type.Bool }
 
