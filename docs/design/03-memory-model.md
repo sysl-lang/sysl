@@ -710,9 +710,9 @@ The one layout still genuinely in motion is the **data-enum tag**, which `09 § 
 narrow. Exposing `sizeof` does not decide that: the tag's width is a layout change like any other,
 and `15 §1` already made every layout change an interface change. What it does is make the change
 visible to a program that asked, which is an argument for taking `09 § Open a` sooner and not for
-withholding the operator. The future carve-out already has its home: an `opaque` struct (`15 § Open
-a`) withholds its layout entirely, and *no `sizeof`* is on the list of what that costs — the type
-opts out, rather than `sizeof` opting in.
+withholding the operator. The carve-out has its home and is built: an `opaque` struct (`15 §9`)
+withholds its layout entirely, and *no `sizeof`* is on the list of what that costs — the type opts
+out, rather than `sizeof` opting in.
 
 ## Device memory
 
