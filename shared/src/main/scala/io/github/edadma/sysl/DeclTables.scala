@@ -36,6 +36,12 @@ trait DeclTables extends Reporting {
    */
   protected def core: Core
 
+  /** The machine this compilation is **for**. A handful of rules are the processor's rather than the
+   * language's — `15 §10`'s calling conventions are the case — and asking here is what lets those be
+   * ordinary diagnostics instead of something codegen discovers with nowhere to report it.
+   */
+  protected def target: Target
+
   /** Whether a declaration written in `module` is one the **library** supplies.
    *
    * Normally that is a question about which file it came from and nothing else (`Core.owns`), and

@@ -602,6 +602,23 @@ case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
  * the same rules for what the tail may hold. The body reads it through `va_start`/`va_arg`/`va_end`
  * (`12-functions-and-closures.md` §9).
  */
+/** The calling convention a definition is entered under, where that is not the ordinary one
+ * (`15 §10`).
+ *
+ * **A name and an optional argument, rather than an LLVM convention spelled through.** What
+ * `interrupt` *is* differs by processor — a calling convention on x86-64, a function attribute on
+ * RISC-V, and nothing at all on AArch64 — so the source names the concept and the back end decides
+ * what that becomes. A pass-through would put an LLVM spelling in a source file and be wrong for
+ * every other machine the file is built for.
+ *
+ * `arg` is the parenthesised word: RISC-V's privilege mode, `interrupt(supervisor)`. It is optional
+ * because most conventions have nothing to say and because the common mode has a default.
+ *
+ * One convention is known today and the shape carries a name anyway, so that the second one is an
+ * analyzer change rather than a change to every tree that holds a function.
+ */
+case class CallConv(name: String, arg: Option[String] = None) extends Positioned
+
 case class FuncDecl(
     name: String,
     tparams: List[String],
@@ -613,6 +630,7 @@ case class FuncDecl(
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
     test: Option[TestAttr] = None,
+    conv: Option[CallConv] = None,
 ) extends Stmt
 
 /** What `#test` says about the function it is written above (`testing.md`).

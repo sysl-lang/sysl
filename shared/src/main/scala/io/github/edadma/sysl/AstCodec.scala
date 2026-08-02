@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 14
+  val Version: Int = 15
 
   private val Magic = "sysl-ast"
 
@@ -289,9 +289,10 @@ object AstCodec {
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); opt(t)(testAttr)
+          opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) })
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -638,7 +639,8 @@ object AstCodec {
         case "ens"  => Ensure(expr(), opt(sref()))
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
-            bounds(), bool(), vis(), tdefaults(), opt(testAttr()))
+            bounds(), bool(), vis(), tdefaults(), opt(testAttr()),
+            opt(at(CallConv(sref(), opt(sref())))))
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "extv" =>

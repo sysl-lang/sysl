@@ -38,12 +38,27 @@ trait DeclParser extends ExprParser {
    * statement; a bare call `foo(1)` fails here (its arguments are not `name: type` bindings,
    * and nothing follows to open a body) and falls through to `exprStmt`.
    */
+  /** A calling convention written before a definition: `interrupt handler()`, or with the privilege
+   * mode a processor distinguishes, `interrupt(supervisor) handler()` (`15 §10`).
+   *
+   * `interrupt` is a soft keyword, and the trailing `guard(ident)` is the whole of what keeps it one.
+   * Three things start with that word and only the first is a convention: `interrupt timer()`
+   * declares a handler, `interrupt(n: int) -> int` declares a *function called* `interrupt`, and
+   * `interrupt(4)` calls one. Requiring a name after the modifier tells them apart with no
+   * backtracking a reader could feel — and consuming nothing when it fails is what lets the other
+   * two go on to parse as themselves.
+   */
+  protected lazy val callConv: Parser[CallConv] =
+    at((softWord("interrupt") ~> opt(op("(") ~> ident <~ op(")")) <~ guard(ident))
+      ^^ (CallConv("interrupt", _)))
+
   protected lazy val funcDecl: PackratParser[Stmt] =
-    ident ~ opt(boundedTypeParams) >> { case name ~ tps =>
+    opt(callConv) ~ ident ~ opt(boundedTypeParams) >> { case conv ~ name ~ tps =>
       val tp = tps.getOrElse(TypeParams.none)
       (op("(") ~> paramList <~ op(")")) ~ opt(op("->") ~> resultRef) ~ funcBody <~ endName(name) ^^ {
         case ((params, variadic)) ~ ret ~ body =>
-          FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults)
+          FuncDecl(name, tp.names, params, ret, body, tp.bounds, variadic, tdefaults = tp.defaults,
+                   conv = conv)
       }
     }
 

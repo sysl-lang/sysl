@@ -122,7 +122,7 @@ object Compiler {
         val whole = carried(core, target)
 
         for
-          typed    <- Analyzer.analyze(units, core = whole)
+          typed    <- Analyzer.analyze(units, core = whole, target = target)
           promoted <- Escape.check(typed)
         yield
           val kept = Tests.only(typed)
@@ -169,7 +169,7 @@ object Compiler {
   def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
                      core: Option[Core] = None): Either[String, (String, Set[String])] =
     for
-      analysed <- Analyzer.analyze(units, building, carried(core, target))
+      analysed <- Analyzer.analyze(units, building, carried(core, target), target)
       // A library ships no tests. They are the library author's, they run against the sources rather
       // than against the artifact, and emitting them would put a function nothing can call into every
       // program that links it — with the helpers only it reaches dragged in behind.
@@ -205,7 +205,7 @@ object Compiler {
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
                        core: Core): Either[String, Compiled] =
     for
-      typed    <- Analyzer.analyze(units, core = core)
+      typed    <- Analyzer.analyze(units, core = core, target = target)
       promoted <- Escape.check(typed)
     yield
       // Pruning still runs, and still from `main`: a library function this program never calls is
