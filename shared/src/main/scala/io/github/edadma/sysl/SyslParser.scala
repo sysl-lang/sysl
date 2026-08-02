@@ -53,7 +53,7 @@ class SyslParser(val source: Source) extends DeclParser {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      misplacedCapability | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
+      misplacedCapability | misplacedLink | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
         breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign |
         resultListStmt | exprStmt,
     )
@@ -249,6 +249,39 @@ class SyslParser(val source: Source) extends DeclParser {
     capabilityClause ~> err(
       "a capability clause belongs in the file's header, on the lines directly after 'module' and " +
         "before everything else — it is a property of the whole module, not of the statements below it")
+
+  /** A link directive: `link "z"`, naming a library the linker must be given for this file's
+   * `extern`s to resolve (`15 §8`).
+   *
+   * **`link` is a soft keyword and cannot be anything else.** `guide/slab` declares a function called
+   * `link` — the pointer into a free block — and reserving the word would break it, which is exactly
+   * the kind of name a systems language must not spend. Nothing is lost by it: a directive is `link`
+   * followed by a *string*, and no statement has that shape, so the grammar tells them apart with no
+   * lookahead.
+   *
+   * The library is named by a string rather than by an identifier because it is a name from outside
+   * sysl, exactly as an `extern`'s symbol is — and because plenty of real ones are not identifiers at
+   * all. `stdc++` is the everyday example.
+   */
+  protected lazy val linkClause: Parser[LinkClause] = at(softWord("link") ~> linkName ^^ LinkClause.apply)
+
+  /** One line of a file's header: either kind of clause, read in whatever order they were written.
+   *
+   * They interleave freely because they are about different things — what the module may do, and what
+   * its `extern`s need — and demanding one group before the other would be a rule with nothing behind
+   * it that every author would have to remember.
+   */
+  private lazy val headerClause: Parser[CapabilityClause | LinkClause] = capabilityClause | linkClause
+
+  /** A link directive written where a statement goes, refused for the reason `misplacedCapability`
+   * is: the clause has a place, and a reader who wrote it in the wrong one should be told which place
+   * that is rather than answered with "newline expected".
+   */
+  protected lazy val misplacedLink: Parser[Nothing] =
+    linkClause ~> err(
+      "a link directive belongs in the file's header, on the lines directly after 'module' and " +
+        "before everything else — the linker is given its libraries once for the whole build, not " +
+        "at the point in the file where the directive is written")
 
   /** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — the Scala forms (`13 §3`).
    *
@@ -706,9 +739,9 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val statements: PackratParser[List[Stmt]] =
     opt(newlines) ~> repsep(statement, newlines) <~ opt(newlines)
 
-  /** A file: an optional module header, the capability clauses that go with it, then its
-   * statements. A file with no header contributes to the anonymous root module, which is what lets
-   * a one-file program be written with no ceremony — and it may still narrow itself, since the root
+  /** A file: an optional module header, the clauses that go with it, then its statements. A file
+   * with no header contributes to the anonymous root module, which is what lets a one-file program
+   * be written with no ceremony — and it may still narrow itself or name a library, since the root
    * module is a module like any other.
    */
   protected lazy val program: PackratParser[Program] =
@@ -717,10 +750,17 @@ class SyslParser(val source: Source) extends DeclParser {
       // and what keeps `module m no alloc requires os` from being a line anyone has to read. The
       // exception is a file that declares no module: the root module is a module like any other, and
       // there is no header for its clause to sit below, so there the clause may open the file.
-      val lead = if m.isDefined then success(List.empty[CapabilityClause]) else opt(capabilityClause) ^^ (_.toList)
+      val lead = if m.isDefined then success(List.empty[CapabilityClause | LinkClause])
+                 else opt(headerClause) ^^ (_.toList)
 
-      lead ~ rep(newlines ~> capabilityClause) ~ statements ^^ {
-        case first ~ rest ~ body => Program(body, m, first ::: rest, source)
+      lead ~ rep(newlines ~> headerClause) ~ statements ^^ {
+        case first ~ rest ~ body =>
+          val clauses = first ::: rest
+
+          Program(body, m,
+                  clauses.collect { case c: CapabilityClause => c },
+                  clauses.collect { case l: LinkClause => l },
+                  source)
       }
     }
 

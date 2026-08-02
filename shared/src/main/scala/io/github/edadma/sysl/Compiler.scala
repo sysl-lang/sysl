@@ -9,6 +9,17 @@ package io.github.edadma.sysl
  * the machine the compiler is running on reaches this only as the default `Target.default` picks,
  * and a caller that names one is building for it whether or not it could run the result.
  */
+/** What one compilation produced: the module, whatever the driver may want to tell the user about
+ * it, and what the result has to be linked against.
+ *
+ * `links` is here rather than inside the IR because it is not a property of the code — it is a
+ * property of the *build*, and the only pass that can answer it is the one holding every unit that
+ * went in, the standard module and any decoded library included. A driver that had the IR alone
+ * could not work it out by reading it: an `extern` says which symbol it wants and never which
+ * library has it, which is the whole reason `15 §8` exists.
+ */
+case class Compiled(ir: String, notes: List[String], links: List[String])
+
 object Compiler {
 
   /** Compiles source text to an LLVM IR module, or to the first error as a rendered diagnostic.
@@ -25,7 +36,7 @@ object Compiler {
    * over in decides nothing but which one a diagnostic is reported against first.
    */
   def compile(sources: List[Source], target: Target = Target.default): Either[String, String] =
-    compiled(sources, target).map(_._1)
+    compiled(sources, target).map(_.ir)
 
   /** The same compilation, starting from trees that are **already parsed**.
    *
@@ -49,7 +60,7 @@ object Compiler {
    */
   def compileWith(sources: List[Source], libraries: List[Program],
                   target: Target = Target.default): Either[String, String] =
-    compiledWith(sources, libraries, target).map(_._1)
+    compiledWith(sources, libraries, target).map(_.ir)
 
   /** The same compilation against a library, keeping the notes the driver may want to show. This is
    * the one the CLI takes, so that a program linked against a library reports its heap promotions
@@ -57,7 +68,7 @@ object Compiler {
    */
   def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, core: Option[Core] = None)
-      : Either[String, (String, List[String])] = {
+      : Either[String, Compiled] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
@@ -81,7 +92,7 @@ object Compiler {
    * has nothing extra to ignore.
    */
   def compiled(sources: List[Source], target: Target = Target.default)
-      : Either[String, (String, List[String])] = {
+      : Either[String, Compiled] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     // Every file is parsed before any is rejected, so a syntax error in one does not hide the
@@ -101,21 +112,29 @@ object Compiler {
    */
   def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, core: Option[Core] = None)
-      : Either[String, (String, List[TTest])] = {
+      : Either[String, (Compiled, List[TTest])] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case errs if errs.nonEmpty => Left(errs.mkString("\n"))
       case _ =>
         val units = libraries ::: parsed.collect { case Right(p) => p }
+        val whole = carried(core, target)
 
         for
-          typed    <- Analyzer.analyze(units, core = carried(core, target))
+          typed    <- Analyzer.analyze(units, core = whole)
           promoted <- Escape.check(typed)
         yield
           val kept = Tests.only(typed)
 
-          (Codegen.generate(kept.copy(precompiled = precompiled), promoted, target), kept.tests)
+          // A test binary is linked like any other, so it needs the same libraries. It is a
+          // different compilation from the one above rather than a variant of it, which is why the
+          // collection is repeated here instead of shared: what the two keep differs, and only what
+          // they link is the same.
+          (Compiled(Codegen.generate(kept.copy(precompiled = precompiled), promoted, target),
+                    promoted.explanations,
+                    LinkDirectives.required(units ::: whole.units)),
+           kept.tests)
   }
 
   /** A **library** lowered on its own: the IR for everything in it that could be compiled ahead of
@@ -184,7 +203,7 @@ object Compiler {
    * the only thing between the checks and the lowering.
    */
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
-                       core: Core): Either[String, (String, List[String])] =
+                       core: Core): Either[String, Compiled] =
     for
       typed    <- Analyzer.analyze(units, core = core)
       promoted <- Escape.check(typed)
@@ -199,5 +218,10 @@ object Compiler {
       // what makes it safe to leave one beside the code it tests (`Tests`).
       val pruned = Reachability.prune(Tests.strip(typed))
 
-      (Codegen.generate(pruned.copy(precompiled = precompiled), promoted, target), promoted.explanations)
+      // The core's units are asked as well as the program's, and this is what makes an artifact's
+      // directives mean anything: the standard module arrives as `Core` rather than in `units`, so a
+      // collection that read only the latter would drop every directive the library ships with.
+      Compiled(Codegen.generate(pruned.copy(precompiled = precompiled), promoted, target),
+               promoted.explanations,
+               LinkDirectives.required(units ::: core.units))
 }

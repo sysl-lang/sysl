@@ -19,6 +19,7 @@ trait ProgramWalk
     with SignatureVisibility
     with ModuleGraph
     with Capabilities
+    with LinkRequirements
     with NoAlloc
     with GatedModules
     with InitOrder
@@ -44,6 +45,7 @@ trait ProgramWalk
     // What a module may do is settled before anything in it is read, because the first construction
     // the walk reaches is already a question about it.
     readCapabilities()
+    readLinkDirectives()
     moduleNames ++= units.map(moduleOf)
     // The library's own modules are modules like any other, and are known for the same reason a
     // file's header is: what they are called is settled before a single name is resolved. They are

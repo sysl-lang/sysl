@@ -841,8 +841,18 @@ enum CapabilityDirection:
  */
 case class CapabilityClause(direction: CapabilityDirection, name: String) extends Positioned
 
-/** One file's parse: the module it contributes to, the capabilities its header declares, its
- * statements, and the source it came from.
+/** `link "z"` — a library the linker must be given for this file's `extern`s to resolve (`15 §8`).
+ *
+ * The name is the library's, not a flag: `m` rather than `-lm`. What that becomes on a command line
+ * is the target's answer and not the author's, because where a library lives is a property of the
+ * machine — libm is a file of its own on ELF, part of `libSystem` on Darwin, and absent altogether
+ * from a freestanding target. A directive that spelled the flag would be right on one platform and
+ * wrong everywhere else, which is the mistake `Toolchain.libraryFlags` exists to make impossible.
+ */
+case class LinkClause(name: String) extends Positioned
+
+/** One file's parse: the module it contributes to, the capabilities and link requirements its header
+ * declares, its statements, and the source it came from.
  *
  * `module` is absent for a file that declares no header, which puts it in the **anonymous root
  * module** — the module whose name is the empty path. A single-file program is exactly that case,
@@ -851,6 +861,12 @@ case class CapabilityClause(direction: CapabilityDirection, name: String) extend
  * `capabilities` is a property of the *module* written on each of its files, so it is read per file
  * and held to agreeing across them (`13 §4`).
  *
+ * `links` is **not** held to agreeing, and that is the one place these two headers differ. A
+ * capability describes what the whole module may do, so files that disagree describe different
+ * modules; a link requirement describes what one file's `extern`s need, so a module whose externs
+ * all sit in one file has nothing to say in the other four. The module's requirement is the union of
+ * its files' (`15 §8`).
+ *
  * `source` is carried because a file is the unit several module rules are stated over, and a
  * diagnostic about one has to name it even where the file holds nothing to point at.
  */
@@ -858,5 +874,6 @@ case class Program(
     body: List[Stmt],
     module: Option[ModuleName],
     capabilities: List[CapabilityClause],
+    links: List[LinkClause],
     source: Source,
 )

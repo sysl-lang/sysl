@@ -47,7 +47,7 @@ object AstCodec {
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
    */
-  val Version: Int = 12
+  val Version: Int = 13
 
   private val Magic = "sysl-ast"
 
@@ -130,6 +130,10 @@ object AstCodec {
       int(src(p.source))
       opt(p.module)(m => { pos(m); list(m.parts)(sref) })
       list(p.capabilities)(c => { pos(c); tok(if c.direction == CapabilityDirection.Narrows then "no" else "req"); sref(c.name) })
+      // A library's link directives travel with it. Without this a binding works from source and
+      // stops working the moment it ships as an artifact — which is the worst shape the bug could
+      // take, since the build that breaks is the one nobody ran.
+      list(p.links)(l => { pos(l); sref(l.name) })
       list(p.body)(stmt)
       body.append('\n')
     }
@@ -502,8 +506,9 @@ object AstCodec {
         case "no"  => CapabilityClause(CapabilityDirection.Narrows, sref())
         case "req" => CapabilityClause(CapabilityDirection.Requires, sref())
         case t     => fail(s"'$t' is not a capability clause's direction")))
+      val links = list(at(LinkClause(sref())))
 
-      Program(list(stmt()), module, caps, sources(s))
+      Program(list(stmt()), module, caps, links, sources(s))
     }
 
     // -------------------------------------------------------------- pieces
