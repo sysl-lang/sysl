@@ -29,6 +29,9 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/getting-started/installation.md"    -> (0, 0, 0),
     "docs/content/getting-started/first-program.md"   -> (1, 0, 1),
     "docs/content/tour/_index.md"                     -> (0, 0, 0),
+    "docs/content/tour/values.md"                     -> (6, 1, 0),
+    "docs/content/tour/control-flow.md"               -> (9, 0, 0),
+    "docs/content/tour/functions.md"                  -> (10, 0, 0),
   )
 
   "every page on the site is accounted for" in {
