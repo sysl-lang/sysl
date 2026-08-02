@@ -47,6 +47,40 @@ class DeclarationParserTests extends AnyFreeSpec with ParseSupport {
     "a bare call is not a declaration" in {
       prog("foo(1)") shouldBe List(ExprStmt(Call(Ident("foo"), List(i(1)))))
     }
+
+    // A file is a script *and* a set of declarations, so the two forms sit beside each other and
+    // the same name appears in both roles. What tells them apart is the block, and nothing else: no
+    // keyword, no forward declaration, and no rule about which comes first.
+    "the same name is a call above and a declaration below, told apart by the block" in {
+      prog("start()\n\nstart()\n    print(1)") shouldBe List(
+        callStmt("start"),
+        FuncDecl("start", Nil, Nil, None, List(printStmt(i(1)))),
+      )
+    }
+
+    "a declaration below the script takes its parameters as any other does" in {
+      prog("insert(db: int, name: string)\n    print(name)") shouldBe List(
+        FuncDecl(
+          "insert",
+          Nil,
+          List(Param("db", NamedType("int")), Param("name", NamedType("string"))),
+          None,
+          List(printStmt(Ident("name"))),
+        )
+      )
+    }
+
+    // An expression body ends at its line, so what follows is at the top level again — including
+    // the comments, which are not part of either declaration and must not attach the second to the
+    // first.
+    "an expression-bodied declaration, a comment, and then a block-bodied one" in {
+      prog("f(n: int) -> int = n + 1\n\n// a note\n\ng(n: int) -> int\n    n * 2") shouldBe List(
+        FuncDecl("f", Nil, List(Param("n", NamedType("int"))), Some(NamedType("int")),
+          List(ExprStmt(Binary("+", Ident("n"), i(1))))),
+        FuncDecl("g", Nil, List(Param("n", NamedType("int"))), Some(NamedType("int")),
+          List(ExprStmt(Binary("*", Ident("n"), i(2))))),
+      )
+    }
   }
 
   "structs" - {

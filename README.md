@@ -51,6 +51,19 @@ reads — the same convention `sysl run <path> -- <args>` follows.
 
 That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with clang.
 
+`bindings/` holds bindings to real C libraries. Each is a library rather than a single file — its
+sysl and the `.c` shims that read whatever only a header knows — so it takes two commands, because a
+program compiles against the built artifact rather than against the tree:
+
+```bash
+sbt "syslJVM/run build-lib bindings/regex/lib -o /tmp/rx.syslib"
+sbt "syslJVM/run run bindings/regex/match.sysl --lib /tmp/rx.syslib"
+```
+
+`bindings/regex` binds POSIX regular expressions and needs nothing installed, since they are part of
+libc. `bindings/sqlite3` binds SQLite and needs its header and library; the program says nothing
+about linking, because `link "sqlite3"` is written once in the binding and travels in the artifact.
+
 A program's own unit tests are `#test` functions written beside what they test, and `sysl test` is
 what runs them (`docs/design/testing.md`):
 
