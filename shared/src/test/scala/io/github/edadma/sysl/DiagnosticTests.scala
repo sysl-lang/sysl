@@ -126,6 +126,35 @@ class DiagnosticTests extends AnyFreeSpec with Matchers {
       out should include("--> t.sysl:2:9")
     }
 
+    "on the '=' of a binding whose value was left on the next line" in {
+      // A binding's value goes on its own line or on a continuation of it, and this is where the
+      // refusal points when the binding is at the top of a file: at the `=` that has nothing after
+      // it, which is the character the writer has to change.
+      diag("var x =\n    1 + 2\nprint(str(x))\n") should include("--> t.sysl:1:7")
+    }
+
+    // The same mistake, one indent deeper. A function's body is parsed as part of the declaration,
+    // so a body that will not parse makes the *declaration* fail — and the position that survives is
+    // the one where the declaration was reconsidered as something else, which is its first line.
+    //
+    // The invariant this asserts is the one every other test in this section asserts: a diagnostic
+    // points at the construct that is wrong. Here it points several lines above it, at a line that
+    // is correct, and a reader is sent looking at the signature.
+    "on the binding inside a body, and not on the declaration the body belongs to" ignore {
+      val src =
+        """f(a: int) -> int
+          |    val b =
+          |        a + 1
+          |
+          |    b
+          |end f
+          |
+          |print(str(f(1)))
+          |""".stripMargin
+
+      diag(src) should include("--> t.sysl:2:")
+    }
+
     "on the declaration that redeclares a name" in {
       val src =
         """f() -> int = 1

@@ -1,0 +1,109 @@
+// A program using the `sqlite` library, which is bound to SQLite through the C beside it.
+//
+// Like the regex example this one needs a library, so it takes two commands rather than one:
+//
+//     sbt "syslJVM/run build-lib bindings/sqlite3/lib -o /tmp/sqlite.syslib"
+//     sbt "syslJVM/run run bindings/sqlite3/demo.sysl --lib /tmp/sqlite.syslib"
+//
+// `build-lib` finds `consts.c` because it is in the library's tree, compiles it for the same target
+// as the sysl, and archives both into `sqlite.syslib`. Nothing on this side knows C is involved, and
+// nothing here says `-lsqlite3` either -- the `link` directive travelled in the artifact.
+
+import sqlite.*
+
+// An in-memory database, so the program leaves nothing behind and needs no writable directory. The
+// name is SQLite's own: it is not a path.
+open(":memory:") match
+    Ok(db) ->
+        run(db)
+        db.close()
+
+    Err(why) -> print(f"cannot open the database: ${why}")
+
+run(db: Db)
+    setup(db) match
+        Err(why) -> print(f"setup failed: ${why}")
+        Ok(_) ->
+            insert(db, "Ada Lovelace", 1815)
+            insert(db, "Alan Turing", 1912)
+            insert(db, "Grace Hopper", 1906)
+
+            report(db)
+            missing(db)
+end run
+
+setup(db: Db) -> Result[bool, string] = db.exec("create table people (name text, born integer, note text)")
+
+// One prepared statement, bound and run once. `bind_*` numbers parameters from 1, which is SQLite's
+// numbering rather than this binding's -- the first `?` is 1.
+insert(db: Db, name: string, born: int)
+    db.prepare("insert into people (name, born) values (?, ?)") match
+        Err(why) -> print(f"cannot prepare the insert: ${why}")
+        Ok(q) ->
+            bind_both(q, name, born) match
+                Err(why) -> print(f"cannot bind: ${why}")
+                Ok(_) ->
+                    q.step() match
+                        Err(why) -> print(f"cannot insert ${name}: ${why}")
+                        Ok(_)    -> ()
+
+            q.finalize()
+end insert
+
+// Both parameters, or the first failure. Each `bind_*` answers the statement back, so they chain.
+bind_both(q: Query, name: string, born: int) -> Result[Query, string]
+    q.bind_text(1, name) match
+        Err(why) -> Err(why)
+        Ok(_)    -> q.bind_int(2, born)
+end bind_both
+
+// Read the rows back. `step` answers `true` while there is a row, so the loop ends on `false` -- and
+// an error ends it too, rather than being retried forever.
+report(db: Db)
+    db.prepare("select name, born from people order by born") match
+        Err(why) -> print(f"cannot prepare the query: ${why}")
+        Ok(q) ->
+            val first  = q.name_at(0).unwrap_or("?")
+            val second = q.name_at(1).unwrap_or("?")
+
+            print(f"${q.columns()} columns: ${first}, ${second}")
+
+            var going = true
+
+            while going
+                q.step() match
+                    Err(why) ->
+                        print(f"the query stopped: ${why}")
+                        going = false
+
+                    Ok(false) -> going = false
+                    Ok(true) ->
+                        val born = q.int_at(1)
+
+                        q.text_at(0) match
+                            Ok(Some(name)) -> print(f"  ${name}%-14s ${born}")
+                            Ok(None)       -> print(f"  (no name)      ${born}")
+                            Err(why)       -> print(f"  unreadable: ${why}")
+
+            q.finalize()
+end report
+
+// The NULL path, which is the one a binding has to have an answer for: `note` was never written, so
+// every row has SQL NULL there. `Ok(None)` is that, and it is not the same answer as a decode
+// failure -- reading it must not touch the null pointer SQLite returns.
+missing(db: Db)
+    db.prepare("select note from people limit 1") match
+        Err(why) -> print(f"cannot prepare the null query: ${why}")
+        Ok(q) ->
+            q.step() match
+                Ok(true) ->
+                    q.text_at(0) match
+                        Ok(None)    -> print("note is NULL, read without dereferencing it")
+                        Ok(Some(s)) -> print(f"note unexpectedly held ${s}")
+                        Err(why)    -> print(f"note did not decode: ${why}")
+
+                Ok(false) -> print("no rows to read a NULL from")
+                Err(why)  -> print(f"the null query stopped: ${why}")
+
+            q.finalize()
+end missing

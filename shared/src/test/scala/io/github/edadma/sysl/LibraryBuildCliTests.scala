@@ -111,26 +111,6 @@ class LibraryBuildCliTests extends LibraryCliSupport {
         |seven_times(n: int) -> int = c_seven() * n
         |""".stripMargin
 
-    def rootWithC(module: String, sysl: String, cFiles: (String, String)*): String = {
-      val root = createTempDirectory("sysl-cli-clib-")
-      val dir  = s"$root/$module"
-
-      createDirectory(dir)
-      writeFile(s"$dir/lib.sysl", sysl)
-      cFiles.foreach((name, text) => writeFile(s"$dir/$name", text))
-      root
-    }
-
-    /** A driver run with the program's own output captured — `run` prints what the child wrote, so
-     * this is what lets a test assert the answer C computed rather than only that the link held.
-     */
-    def ran(cfg: Config): String = {
-      val captured = new java.io.ByteArrayOutputStream
-
-      Console.withOut(captured)(cli(cfg)) shouldBe 0
-      captured.toString
-    }
-
     def fingerprintOf(out: String): String =
       LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _, Target.default)) match
         case Right((_, _, fingerprint)) => fingerprint
@@ -210,6 +190,30 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       ran(Config(command = "run", file = program(prog),
         libs = List(artifactOf(rootWithC("rx", binding, "regex.c" -> regexShim))))) shouldBe
         "true\ntrue\nfalse\n"
+    }
+
+    "is found at the root of the tree as well as beside a module" in {
+      // `15 §7` says *anywhere* in the tree, and the root is the one place that is not a module's
+      // directory — nothing there declares a module, so a walk that gathered C only where it had
+      // found sysl would skip it. The member takes the bare name, there being no directory to carry.
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = rootWithC("demo", """module demo
+                                     |
+                                     |extern "demo_root" c_root() -> int
+                                     |
+                                     |from_root() -> int = c_root()
+                                     |""".stripMargin)
+
+      writeFile(s"$root/shared.c", "int demo_root(void) { return 13; }\n")
+
+      val out = artifactOf(root)
+
+      Ar.members(readBytes(out)) match
+        case Right(members) => members.map(_.name) should contain("shared.o")
+        case Left(why)      => fail(why)
+
+      ran(Config(command = "run", file = program("print(demo.from_root())"), libs = List(out))) shouldBe "13\n"
     }
 
     "and two modules may each hold a file of the same name" in {
