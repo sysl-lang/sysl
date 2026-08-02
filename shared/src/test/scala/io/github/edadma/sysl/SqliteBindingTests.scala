@@ -234,6 +234,67 @@ class SqliteBindingTests extends BindingSupport {
           |""".stripMargin).trim should include("no such table: nosuchtable")
     }
 
+    "refuse SQL that holds no statement, rather than answering a handle that is not one" in {
+      // The sharp one, because SQLite calls it success. `sqlite3_prepare_v2` returns `SQLITE_OK`
+      // for text with no statement in it and writes a **null** handle — it compiled everything
+      // there was to compile. A binding that looked only at the return code would answer `Ok` with
+      // a `Query` whose every method is a call through a null pointer.
+      //
+      // All three spellings of nothing, since a check written against the empty string alone would
+      // pass the first and let the other two through.
+      out(
+        """import sqlite.*
+          |
+          |go()
+          |
+          |go()
+          |    val db = open(":memory:").expect("open")
+          |
+          |    db.prepare("-- nothing here") match
+          |        Ok(_)    -> print("prepared a comment")
+          |        Err(why) -> print(why)
+          |
+          |    db.prepare("") match
+          |        Ok(_)    -> print("prepared an empty string")
+          |        Err(why) -> print(why)
+          |
+          |    db.exec("   ") match
+          |        Ok(_)    -> print("ran blank SQL")
+          |        Err(why) -> print(why)
+          |
+          |    db.close()
+          |end go
+          |""".stripMargin) shouldBe
+        "the SQL holds no statement\nthe SQL holds no statement\nthe SQL holds no statement\n"
+    }
+
+    "report a parameter index the statement does not have" in {
+      // SQLite numbers parameters from 1 and the binding keeps that numbering rather than
+      // correcting it, so an index off the end is a mistake a caller can make and the message has
+      // to be SQLite's own rather than a code.
+      out(
+        """import sqlite.*
+          |
+          |go()
+          |
+          |go()
+          |    val db = open(":memory:").expect("open")
+          |    val q  = db.prepare("select ?, ?").expect("prepare")
+          |
+          |    q.bind_int(9, 1) match
+          |        Ok(_)    -> print("bound an index that is not a parameter")
+          |        Err(why) -> print(why)
+          |
+          |    q.bind_text(9, "x") match
+          |        Ok(_)    -> print("bound text at an index that is not a parameter")
+          |        Err(why) -> print(why)
+          |
+          |    q.finalize()
+          |    db.close()
+          |end go
+          |""".stripMargin) shouldBe "column index out of range\ncolumn index out of range\n"
+    }
+
     "refuse a path there is no database to make, and read the message off the handle anyway" in {
       // SQLite hands back a usable connection even when the open failed — which is why `open` can
       // answer a sentence at all — and the binding closes it rather than leaking it. Nothing here

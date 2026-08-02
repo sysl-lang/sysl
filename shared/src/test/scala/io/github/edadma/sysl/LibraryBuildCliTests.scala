@@ -192,6 +192,30 @@ class LibraryBuildCliTests extends LibraryCliSupport {
         "true\ntrue\nfalse\n"
     }
 
+    "is found at the root of the tree as well as beside a module" in {
+      // `15 §7` says *anywhere* in the tree, and the root is the one place that is not a module's
+      // directory — nothing there declares a module, so a walk that gathered C only where it had
+      // found sysl would skip it. The member takes the bare name, there being no directory to carry.
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val root = rootWithC("demo", """module demo
+                                     |
+                                     |extern "demo_root" c_root() -> int
+                                     |
+                                     |from_root() -> int = c_root()
+                                     |""".stripMargin)
+
+      writeFile(s"$root/shared.c", "int demo_root(void) { return 13; }\n")
+
+      val out = artifactOf(root)
+
+      Ar.members(readBytes(out)) match
+        case Right(members) => members.map(_.name) should contain("shared.o")
+        case Left(why)      => fail(why)
+
+      ran(Config(command = "run", file = program("print(demo.from_root())"), libs = List(out))) shouldBe "13\n"
+    }
+
     "and two modules may each hold a file of the same name" in {
       // `ar r` replaces by name, so a member name built from the basename alone would have the
       // second of these silently evict the first — and the library would ship missing whatever only

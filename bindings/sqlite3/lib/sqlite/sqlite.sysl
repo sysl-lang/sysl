@@ -151,15 +151,23 @@ struct Db
     //
     // The trailing-text out-parameter is passed as null: this binding compiles one statement, and a
     // caller with several has a loop rather than a pointer to the rest.
+    //
+    // **A successful call is not enough to have a statement.** SQL that holds no statement -- an
+    // empty string, or nothing but a comment -- is not an error to SQLite: it succeeds and writes a
+    // null handle, meaning "there was nothing here to compile". Answering `Ok` with that would hand
+    // back a `Query` whose every method is a call on a null pointer, and the caller asked for a
+    // statement, so the honest answer is that there is not one.
     prepare(self, sql: string) -> Result[Query, string]
         val text = cstring(sql)
 
         var stmt: *Stmt
 
-        if c_prepare(self.handle, text.ptr, -1, &stmt, null) == c_ok() then
-            Ok(Query(stmt, self.handle))
-        else
+        if c_prepare(self.handle, text.ptr, -1, &stmt, null) != c_ok() then
             Err(message(self.handle))
+        else if stmt == null then
+            Err("the SQL holds no statement")
+        else
+            Ok(Query(stmt, self.handle))
     end prepare
 
     // Compile and run a statement that returns no rows -- a `CREATE TABLE`, an `INSERT`, a `PRAGMA`.
