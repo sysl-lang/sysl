@@ -238,10 +238,9 @@ enum Shape
     Circle(r: real)
     Rect(w: real, h: real)
 
-area(s: Shape) -> real
-    s match
-        Circle(r)  -> 3.14159 * r * r
-        Rect(w, h) -> w * h
+area(s: Shape) -> real = s match
+    Circle(r)  -> 3.14159 * r * r
+    Rect(w, h) -> w * h
 
 print(int(Green), area(Circle(1.0)), area(Rect(2.0, 3.0)))
 ```
