@@ -41,6 +41,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/tour/traits.md"                     -> (7, 1, 0),
     "docs/content/tour/modules.md"                    -> (3, 0, 5),
     "docs/content/tour/contracts.md"                  -> (6, 2, 0),
+    "docs/content/tour/capstone.md"                   -> (1, 0, 1),
   )
 
   "every page on the site is accounted for" in {

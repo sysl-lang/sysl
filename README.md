@@ -2,10 +2,11 @@
 
 A modern, ref-counted, OS-level systems language — easier than Rust.
 
-> **Status: fresh restart (design-first).** This repository is a clean reimplementation of the sysl
-> language. It is not a port of the earlier prototype — the old tree survives only as a source of
-> lessons. Expect the compiler to be built up deliberately behind a written design, one feature at a
-> time. There is no usable compiler here yet.
+> **Status: design-first, and it runs.** This repository is a clean reimplementation of the sysl
+> language — not a port of the earlier prototype, which survives only as a source of lessons. The
+> compiler is built up deliberately behind a written design, one feature at a time, and it compiles
+> programs to native binaries through LLVM today: see [`guide/`](guide/) for complete ones, and the
+> [tour](https://edadma.github.io/sysl/tour/) to learn the language.
 
 ## What sysl is
 
@@ -15,8 +16,17 @@ memory is managed through three explicit modes — `T` (value/stack), `&T` (ARC 
 heap), and `*T` (raw pointer) — with no garbage collector. Its intended showcase is an operating
 system written in sysl and readable end to end.
 
-The language is designed in writing before it is implemented. The numbered specification lives in
-[`docs/design/`](docs/design/) — start there for what sysl is and why it is shaped the way it is.
+## Documentation
+
+- **[The tour](https://edadma.github.io/sysl/tour/)** — the language and its standard library in one
+  pass, from `print` to a program that reads its input. Every program on those pages is compiled and
+  run by the test suite, so a page that has drifted from the compiler fails the build.
+- **[`docs/design/`](docs/design/)** — the numbered specification. The language is designed in
+  writing before it is implemented, and each chapter carries the argument for its rules along with
+  the alternatives that were rejected.
+- **[`guide/`](guide/)** — complete working programs at the size where the choices start to matter.
+
+The site source is `docs/`, built with [juicer](https://juicer.build/) and deployed from `dev`.
 
 ## Building
 
