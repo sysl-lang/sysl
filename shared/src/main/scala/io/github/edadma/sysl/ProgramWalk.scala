@@ -11,7 +11,8 @@ import scala.collection.mutable
  * parameters opaque. Function bodies close it out, since running one is what the driver is draining
  * towards.
  *
- * `units` is supplied by the class: the files being analyzed together.
+ * `units` — the files being analyzed together — is supplied by the class and declared alongside the
+ * other things a walk is told about its compilation (`DeclTables`).
  */
 trait ProgramWalk
     extends Hoisting
@@ -25,8 +26,6 @@ trait ProgramWalk
     with GatedModules
     with InitOrder
     with DefaultParams {
-
-  protected def units: List[Program]
 
   // --- program -------------------------------------------------------------------------
 
@@ -220,7 +219,7 @@ trait ProgramWalk
 
     val (fromLibrary, ours) = funcDecls.values.toList
       .filter(f => f.tparams.isEmpty && !externDecls.contains(f.name))
-      .partition(f => suppliedByLibrary(f, f.name))
+      .partition(suppliedByLibrary)
 
     for f <- ours do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
@@ -232,7 +231,7 @@ trait ProgramWalk
     // queue rather than from here.
     val (libraryMembers, ourMembers) = members.toList
       .filter(f => !defaultOrigin.get(f.name).exists(brokenDefaults))
-      .partition(f => f.tparams.isEmpty && suppliedByLibrary(f, f.name))
+      .partition(f => f.tparams.isEmpty && suppliedByLibrary(f))
 
     for f <- ourMembers do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))

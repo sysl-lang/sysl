@@ -346,8 +346,18 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     }
 
     "a generic is not, because there is nothing to compile until a caller fixes its arguments" in {
-      // `Option`'s own members travel as trees and are built in whatever program instantiates them.
-      precompiled.filter(_.startsWith(Library.key("Option"))) shouldBe empty
+      // `Option`'s own members travel as trees and are built in whatever program fixes their
+      // arguments, so the generic itself is never in the object half however much of it is used.
+      //
+      // An **instantiation** may be, where the library itself asked for one: the text surface's
+      // `contains` is an `index_of` and an `is_some` at `usize`, and that one has a compiled form
+      // like any other function. It is the same statement `Buf.push.byte` makes further down rather
+      // than an exception to this one — what a library can precompile is the arguments it fixed.
+      val option = Library.key("Option")
+
+      precompiled should not contain s"$option.is_some"
+      precompiled should not contain s"$option.unwrap"
+      precompiled should contain(s"$option.is_some.usize")
     }
 
     "and the library carries no entry point of its own to collide with a program's" in {

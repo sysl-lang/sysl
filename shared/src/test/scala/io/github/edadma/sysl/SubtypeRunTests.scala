@@ -7,7 +7,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * Each passing case is paired with the adjacent violation that must stop the program, so a check
  * that is too tight (fails the valid case) or too loose (lets the invalid case run) is caught.
  */
-class SubtypeRunTests extends AnyFreeSpec with RunSupport {
+class SubtypeRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   private val Age    = "type Age = int within 0..150\n"
   private val Prob   = "type Prob = f64 within 0.0..<1.0\n"
@@ -383,6 +383,64 @@ class SubtypeRunTests extends AnyFreeSpec with RunSupport {
           |
           |main()
           |    print(Stamp(1i64).describe(), (1i64).describe())""".stripMargin) shouldBe "a stamp an i64\n"
+    }
+  }
+
+  /** The other side of the same sharing. A transparent subtype mangles as its base, so `Box[Age]`
+   * and `Box[int]` name **one** emitted layout — while the analyzer keeps two instantiations, because
+   * only one of them checks what is written into it. Two typed instantiations behind one emitted name
+   * is therefore the ordinary case rather than a mistake, and what follows from it is that the name is
+   * defined once: a definition per instantiation is a redefinition, and the back end rejects it after
+   * the program has already been built.
+   */
+  "a generic instantiated at a subtype and at its base defines its layout once" - {
+    val Box = "struct Box[T]\n    value: T\nend Box\n"
+
+    "a struct at both is one type, and each keeps the checking its own arguments asked for" in {
+      run(Age + Box + "var a: Box[Age] = Box(30)\nvar b: Box[int] = Box(300)\nprint(a.value, b.value)")
+        .shouldBe("30 300\n")
+      exits(Age + Box + "var a: Box[Age] = Box(200)\nprint(a.value)")
+    }
+
+    "and the layout it shares is defined once" in {
+      val out = ir(Age + Box + "var a: Box[Age] = Box(30)\nvar b: Box[int] = Box(300)\nprint(a.value, b.value)")
+
+      out.linesIterator.count(_.startsWith("%struct.Box.int = type")) shouldBe 1
+    }
+
+    // The case that found this: a payload region and a variant aggregate are two more definitions
+    // under the shared name, and `Option` is reached at a subtype by anything that reports a position.
+    "an enum at both defines its payload aggregate once" in {
+      val src =
+        Age +
+          """var a: Option[Age] = Some(30)
+            |var b: Option[int] = Some(300)
+            |var x = a match
+            |    Some(v) -> int(v)
+            |    None -> -1
+            |var y = b match
+            |    Some(v) -> v
+            |    None -> -1
+            |print(x, y)
+            |""".stripMargin
+
+      run(src) shouldBe "30 300\n"
+      ir(src).linesIterator.count(_.startsWith(s"%${Library.key("Option")}.int.Some = type")) shouldBe 1
+    }
+
+    "the enum instantiated at the subtype still checks its payload" in {
+      exits(Age + "var a: Option[Age] = Some(200)\nvar b: Option[int] = Some(300)\nprint(1)")
+    }
+
+    // A derived subtype is nominally its own type and mangles under its own name, so these are two
+    // layouts rather than one — which is what says the emission is keyed on the name and not on some
+    // blanket collapse of a subtype into its base.
+    "a derived subtype gets a layout of its own" in {
+      val out = ir("type Stamp = new i64\n" + Box +
+        "var a: Box[Stamp] = Box(Stamp(1i64))\nvar b: Box[i64] = Box(2i64)\nprint(i64(a.value), b.value)")
+
+      out.linesIterator.count(_.startsWith("%struct.Box.Stamp = type")) shouldBe 1
+      out.linesIterator.count(_.startsWith("%struct.Box.long = type")) shouldBe 1
     }
   }
 }

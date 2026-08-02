@@ -93,19 +93,33 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     // A zero-sized field is skipped: the aggregate is what occupies storage, and `Type.slot` is what
     // keeps every index that reaches into it agreeing with what was laid down here.
-    for s <- program.structs do
+    //
+    // **One name, one definition.** Two instantiations may share an emitted name, because a
+    // transparent subtype mangles as its base: `Box[Age]` and `Box[int]` are two types to the
+    // analyzer — only one of them checks what is written into it — and one layout here, which is
+    // exactly what sharing a representation means. Emitting per instantiation would define the name
+    // twice, and the back end rejects that rather than choosing. The layouts agree wherever the names
+    // do, since the only thing mangling collapses is a subtype into the base it is stored as.
+    val structs = program.structs.distinctBy(_.llvm)
+
+    for s <- structs do
       out ++= s"${s.llvm} = type { ${s.stored.map(_._2.llvm).mkString(", ")} }\n"
-    if program.structs.nonEmpty then out ++= "\n"
+    if structs.nonEmpty then out ++= "\n"
 
     // A data enum is the tag and **one** payload region, wide enough and aligned for whichever
     // variant needs the most (`09 §3`). Each variant's own payload keeps its named aggregate type,
     // which is what a construction stores into that region and what a match reads back out of it.
-    for e <- program.enums do
+    // Deduplicated for the reason the structs above are, and it is the same rule reaching two more
+    // definitions apiece: a variant's payload aggregate is named from the enum's mangling too, so
+    // `Option[Age]` beside `Option[int]` would define `%…Option.int.Some` twice as well.
+    val enums = program.enums.distinctBy(_.llvm)
+
+    for e <- enums do
       for v <- e.variants if v.carries do
         out ++= s"${e.payloadLlvm(v)} = type { ${v.stored.map(_._2.llvm).mkString(", ")} }\n"
       val (unit, count) = Layout.payloadArea(e)
       out ++= s"${e.llvm} = type { i32, [$count x $unit] }\n"
-    if program.enums.nonEmpty then out ++= "\n"
+    if enums.nonEmpty then out ++= "\n"
 
     // A box is the strong count, the function that destroys it, the weak count, and the payload —
     // so ARC works the same everywhere, and an object frees itself into whichever heap made it.

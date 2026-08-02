@@ -29,6 +29,16 @@ trait DeclTables extends Reporting {
    */
   protected def building: Set[String]
 
+  /** The files this compilation was handed to compile. */
+  protected def units: List[Program]
+
+  /** Whether a declaration came from one of *those* files — asked by identity, for the reason
+   * `Core.owns` is: a copy of a library file, however faithful, is not that file.
+   */
+  protected def producedHere(d: Positioned): Boolean = d.pos.exists(p => producing(p.source))
+
+  private lazy val producing: Set[Source] = units.map(_.source).toSet
+
   /** The standard module this compilation is compiled against, and where its trees came from
    * (`Core`). It is carried rather than looked up because a compilation may be handed a library
    * artifact instead of the copy the compiler embeds, and every question about *which* declarations
@@ -71,25 +81,35 @@ trait DeclTables extends Reporting {
   protected def libraryOffers(d: Positioned, module: String): Boolean =
     libraryOwns(d, module) && (Library.autoImported.contains(module) || !core.carries(module))
 
-  /** Whether a declaration keyed `key` was **supplied** to this compilation by the library, rather
+  /** Whether a declaration was **supplied** to this compilation by the library, rather
    * than being one this compilation is producing. It is what decides whether a body is analyzed only
    * once something reaches it, so that a program that never prints carries no printing surface.
    *
-   * The `building` half is not a detail. `core.owns` asks which `Source` a declaration came from,
-   * and a compilation *building* the library can be handed the very `Source` objects the compiler
-   * embeds — the sbt task that builds the core artifact has them in memory and no reason to go to
-   * disk for a second copy. Asking ownership alone there holds back every function in the library,
-   * nothing reaches any of them, and the artifact comes out with an **empty object half**: it still
-   * carries every tree, so every program that used it would compile and run, and the whole point of
+   * The second half is not a detail. `core.owns` asks which `Source` a declaration came from, and a
+   * compilation *building* the library can be handed the very `Source` objects the compiler embeds —
+   * the sbt task that builds the core artifact has them in memory and no reason to go to disk for a
+   * second copy. Asking ownership alone there holds back every function in the library, nothing
+   * reaches any of them, and the artifact comes out with an **empty object half**: it still carries
+   * every tree, so every program that used it would compile and run, and the whole point of
    * precompiling would be silently gone. Read off disk the same source answers the other way, so the
    * two builds of one library would disagree with nothing failing.
+   *
+   * **What is being produced is a question about the file, and only the file answers it.** Asking it
+   * of the *key* — is the module this declaration is filed under one of the modules being built —
+   * looks equivalent and is not: a member of a builtin type is keyed under the type, which has no
+   * module at all, so `string.contains` and `real.sqrt` are filed under the root however far inside
+   * the library they were written. Those came back as supplied, were held back, and were compiled
+   * only if something in the library itself happened to call them — while the same library read off
+   * disk compiled them all. The difference reached the object half one instantiation at a time: a
+   * default body that was never analyzed never asked for `Option.is_some` at `usize`, so one build
+   * shipped it and the other did not.
    *
    * This is the reverse of `libraryOwns`, which asks whether a declaration counts as the library's
    * for *scope* — and there a library being built has to count, or the rest of it could not name what
    * it declares.
    */
-  protected def suppliedByLibrary(d: Positioned, key: String): Boolean =
-    core.owns(d) && !building(Modules.moduleOf(key))
+  protected def suppliedByLibrary(d: Positioned): Boolean =
+    core.owns(d) && !producedHere(d)
 
   // --- what the sources declared ---------------------------------------------------------
 
