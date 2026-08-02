@@ -90,9 +90,10 @@ right rather than something that falls out of a general `within`-constraint.
 - **`u32` → `char`** is **partial**, and this is the only subtle direction. It has two
   spellings, chosen by how trustworthy the value is:
   1. **`char(u)`** — a **checked cast that traps** on an invalid scalar value, in the same
-     runtime-safety category as array-bounds and overflow checks (and strippable the same
-     way with `--no-contracts`-style removal). This is the fast path for a value already
-     known to be valid.
+     runtime-safety category as an array-bounds check (and strippable the same way with
+     `--no-contracts`-style removal). This is the fast path for a value already known to be
+     valid. Note that arithmetic overflow is *not* in that category: it wraps at the declared
+     width (§5) rather than trapping, so there is no overflow check to sit beside this one.
   2. **`char_from_u32(u) -> Option[char]`** — a **fallible constructor** returning `None`
      for an invalid scalar value. This is the required path for untrusted input (decoding
      bytes off a wire, parsing). The caller must handle the `None`.
@@ -447,8 +448,8 @@ fine.)
 **Type context wins.** An unsuffixed literal adopts the expected type from its context —
 assignment target, parameter, etc. — provided the value fits: `var x: u8 = 42` makes `42` a
 `u8`. Out of range is a compile error (`var x: u8 = 300`). This is not implicit integer
-promotion: the literal simply *is* that type. The no-promotion rule (§Integer Overflow)
-governs runtime *values*, not literal typing.
+promotion: the literal simply *is* that type. The no-promotion rule (§5, and `01`) governs
+runtime *values*, not literal typing.
 
 **Signed-minimum literals.** A decimal literal immediately following a unary minus may reach
 the signed type's minimum magnitude, so `-128i8` and `-2_147_483_648` are legal even though
