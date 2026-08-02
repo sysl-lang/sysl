@@ -66,6 +66,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/library/sync.md"                       -> (9, 7, 2),
     "docs/content/library/thread.md"                     -> (6, 6, 2),
     "docs/content/library/args.md"                        -> (4, 4, 1),
+    "docs/content/library/sys.md"                          -> (4, 3, 1),
   )
 
   "every page on the site is accounted for" in {
