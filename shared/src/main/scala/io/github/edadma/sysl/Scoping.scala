@@ -336,6 +336,33 @@ trait Scoping extends DeclTables {
   /** The key a written **trait** name resolves to. */
   protected def traitKey(written: String): Option[String] = resolveName(written)(traitDecls.contains)
 
+  /** Whether a trait can be **named** from where the walk currently is, which is what its members'
+   * reachability is measured by (`13 §2`).
+   *
+   * A trait declared in this module, one this file or an open block imported by name, one a
+   * wildcard offers, and one an auto-imported module carries are in scope; a sibling module's and a
+   * library submodule's are not. That last case is the point — a library's trait claims its member
+   * names only where a file asked for the trait.
+   *
+   * **Asked of the imports directly rather than through `resolveName`.** The general resolver is
+   * built to produce good diagnostics as well as answers: where a name is declared but out of
+   * reach it reports the restriction rather than answering, which is right for a name a file wrote
+   * and wrong for a question about whether the file *could* have written one. This has no name in
+   * hand to report about — it is deciding which of several members a use meant — so it asks the one
+   * thing it needs and cannot fail.
+   */
+  protected def traitInScope(key: String): Boolean = {
+    val (module, name) = Modules.split(key)
+
+    // An auto-imported module needs no case of its own: `ProgramWalk` starts every file's imports
+    // with a wildcard over each one, so the standard module's traits are reached by the same clause
+    // a written `import sysl.math.*` is.
+    module == currentModule || currentModule.startsWith(s"$module.") ||
+    searchImports { imports =>
+      Option.when(imports.names.get(name).contains(key) || imports.wildcards.contains(module))(true)
+    }.nonEmpty
+  }
+
   /** The key a written **function** name resolves to. */
   protected def funcKey(written: String): Option[String] = resolveName(written)(funcDecls.contains)
 

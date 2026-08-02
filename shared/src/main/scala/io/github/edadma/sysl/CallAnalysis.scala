@@ -34,6 +34,7 @@ trait CallAnalysis extends OperatorCalls {
    */
   protected def callTypeAssociated(
       ty: Type,
+      written: String,
       mname: String,
       args: List[Expr],
       expected: Option[Type],
@@ -46,7 +47,14 @@ trait CallAnalysis extends OperatorCalls {
         err(s"${show(concrete)} has no associated function '$mname'" +
           (if hasMember(concrete, mname) then s" — '$mname' is reached on a value of one" else ""))
 
-      callAssociated(key, mname, args, expected)
+      callAssociated(key, mname, args, expected, boundTraits(written))
+
+  /** The traits a **type parameter** was bounded by, as keys, and nothing for a name that is not one.
+   *
+   * This is what an instantiated generic body reaches a member through: `T` has become `int` by the
+   * time the call is analyzed, and the bound is the only record of which of `int`'s members under
+   * that name the body was promised.
+   */
 
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
    * The positional constructor `Type(…)` is a different form and is handled elsewhere.
@@ -55,8 +63,14 @@ trait CallAnalysis extends OperatorCalls {
    * the way a generic free function's are: from the arguments, and from the type the context expects
    * where the arguments do not determine them.
    */
-  protected def callAssociated(tname: String, mname: String, written: List[Expr], expected: Option[Type]): TExpr =
-    val chosen = pickAssociated(tname, mname, written)
+  protected def callAssociated(
+      tname: String,
+      mname: String,
+      written: List[Expr],
+      expected: Option[Type],
+      via: Set[String] = Set.empty,
+  ): TExpr =
+    val chosen = pickAssociated(tname, mname, written, via)
 
     memberDecls.get((tname, chosen)) match
       case Some(m) if m.receiver.isEmpty && !m.isProperty =>

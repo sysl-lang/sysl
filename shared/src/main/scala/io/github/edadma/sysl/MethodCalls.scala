@@ -25,13 +25,29 @@ trait MethodCalls extends FuncAddress {
    * `callGenericMethod` is where the rest of the answer comes from.
    */
   protected def callMethod(recv: Expr, mname: String, args: List[Expr], expected: Option[Type]): TExpr =
-    callMethodOn(analyzeExpr(recv), mname, args, expected)
+    callMethodOn(analyzeExpr(recv), mname, args, expected, receiverBound(recv))
+
+  /** The traits the receiver's own **bound** promised, read off the expression as written.
+   *
+   * This is the one thing the analyzed receiver cannot be asked for. `x` of a `[T: Zero]` body has
+   * become an `int` by the time an instantiation looks at it, so the question has to be put to the
+   * source — where the name is still `x`, and `pbounds` still knows `x` was written as a `T`.
+   */
+  protected def receiverBound(recv: Expr): Set[String] = recv match
+    case Ident(n) => pbounds.get(n).map(boundTraits).getOrElse(Set.empty)
+    case _        => Set.empty
 
   /** The same, for a receiver already analyzed — what a form that had to look at the receiver's type
    * to know it was a method call uses, so the receiver is analyzed once and the analysis that
    * decided is the one that runs.
    */
-  protected def callMethodOn(tr: TExpr, mname: String, args: List[Expr], expected: Option[Type]): TExpr = {
+  protected def callMethodOn(
+      tr: TExpr,
+      mname: String,
+      args: List[Expr],
+      expected: Option[Type],
+      via: Set[String] = Set.empty,
+  ): TExpr = {
     receiverType(tr.ty) match
       case a: Type.Abstract => callBoundMethod(a, tr, mname, args)
       case t: Type.Trait    => callTraitObject(tr, t, mname, args)
@@ -47,7 +63,7 @@ trait MethodCalls extends FuncAddress {
 
       case rty =>
         val (base, _) = memberKey(rty, mname)
-        val chosen    = pickOverload(rty, base, mname, args)
+        val chosen    = pickOverload(rty, base, mname, args, via)
         val targs     = memberKey(rty, chosen)._2
 
         memberDecls.get((base, chosen)) match
@@ -128,12 +144,50 @@ trait MethodCalls extends FuncAddress {
    * own to be matched by, so `c.mul(2)` where the candidates take a `Complex` and a `real` is one of
    * the calls that determines nothing (`08 § One name, one member`).
    */
-  protected def pickOverload(owner: String, mname: String, args: List[Expr], subject: String)(
+  protected def pickOverload(
+      owner: String,
+      mname: String,
+      args: List[Expr],
+      subject: String,
+      via: Set[String] = Set.empty,
+  )(
       params: String => Option[List[Type]],
   ): String =
     memberAlts.get((owner, mname)) match
-      case None => mname
-      case Some(cands) =>
+      // One member of the name is still a member of *some* trait, and the rule is about the trait
+      // rather than about there being a choice: a name a file cannot reach is not answered by there
+      // being nothing else it might have meant.
+      case None =>
+        if reachable(owner, mname, via) then mname else outOfScope(owner, mname, List(mname), subject)
+      case Some(everything) =>
+        // **A bound answers ahead of everything else.** Inside a generic body `T.zero()` means the
+        // `zero` the bound promised, and at an instantiation the parameter has become an ordinary
+        // type whose table may hold several — so the traits the parameter was bounded by are what
+        // the candidates are narrowed to first. Without this a body is refused for an ambiguity its
+        // own signature already settled, and which the caller has no way to speak to.
+        val all =
+          if via.isEmpty then everything
+          else
+            val named = everything.filter(c => memberTrait.get((owner, c)).exists(via))
+
+            if named.isEmpty then everything else named
+
+        // **Scope decides before the arguments do**, because the two axes answer different
+        // questions and only this one can answer its own. Two implementations of one trait differ
+        // in their argument lists and are told apart by a call's values; two *different traits*
+        // may declare the same name with the same parameters — `zero()` and `zero()` — and nothing
+        // in the call could ever tell those apart. What tells them apart is that a trait's member
+        // is reachable only where the trait can be named (`13 §2`), so a file reaching one of them
+        // has said which by what it imported.
+        val cands = all.filter(reachable(owner, _, via))
+
+        if cands.isEmpty then outOfScope(owner, mname, all, subject)
+
+        // One survivor is the whole answer, and it is the ordinary case once two libraries have each
+        // implemented something for a built-in: the arguments are never consulted, which is what
+        // makes a nullary `zero()` resolvable at all.
+        if cands.length == 1 then return cands.head
+
         val supplied = args.map(probeType)
         val from = s"'$mname' comes from ${quantity(cands.length, "implementation")} of one trait on $subject"
 
@@ -159,12 +213,48 @@ trait MethodCalls extends FuncAddress {
           }
         }
 
-        fits match
-          case one :: Nil => one
-          case Nil =>
-            err(s"$from, and none of them takes (${supplied.map(_.fold("?")(show)).mkString(", ")}) — " +
-              "write the argument at the type of the implementation that was meant")
-          case _ => err(s"$from, and the arguments do not say which was meant")
+        if fits.length == 1 then return fits.head
+
+        // Nothing has settled it. Which complaint that is depends on what is left standing: several
+        // **traits** is a use that reached more than one of them, and no argument could have told
+        // those apart — a `zero()` and a `zero()` take the same nothing. Several implementations of
+        // one trait is the older situation, where the arguments were the question and did not
+        // answer it. The set to describe is what the arguments left, or all of them where they left
+        // none, since that is the set the reader has to choose from either way.
+        val left   = if fits.isEmpty then cands else fits
+        val traits = left.flatMap(c => memberTrait.get((owner, c))).distinct
+
+        if traits.length > 1 then
+          err(s"'$mname' on $subject comes from ${conjoin(traits.map(qn))}, and each is in scope " +
+            "here — nothing in the call says which was meant")
+
+        if fits.isEmpty then
+          err(s"$from, and none of them takes (${supplied.map(_.fold("?")(show)).mkString(", ")}) — " +
+            "write the argument at the type of the implementation that was meant")
+
+        err(s"$from, and the arguments do not say which was meant")
+
+  /** Whether a use site here can reach this member at all (`13 §2`).
+   *
+   * Three ways it can, and the first is why the table records provenance at all. A member the type's
+   * **own** body declared has no trait to be gated by and is reachable wherever the type is. One an
+   * `impl` brought is reachable where its trait can be **named** — and also wherever a **bound**
+   * asked for that trait, since a signature naming a trait has said so at least as plainly as an
+   * import would.
+   */
+  protected def reachable(owner: String, cand: String, via: Set[String]): Boolean =
+    memberTrait.get((owner, cand)).forall(tr => via(tr) || traitInScope(tr))
+
+  /** What to say where a type has the member under every spelling and the file may reach none of
+   * them — which is the whole of what an import would have changed, so the message is the import.
+   */
+  protected def outOfScope(owner: String, mname: String, cands: List[String], subject: String): Nothing = {
+    val traits = cands.flatMap(c => memberTrait.get((owner, c))).distinct.map(qn)
+
+    err(s"$subject has '$mname' from ${conjoin(traits)}, and " +
+      (if traits.length == 1 then s"that trait is not in scope here — import it to reach the member"
+       else "none of those traits is in scope here — import the one that was meant"))
+  }
 
   /** Whether one of a type's members takes a `...`, asked of the member table rather than of the
    * lowered signature — a tail is not something a parameter list records.
@@ -181,12 +271,19 @@ trait MethodCalls extends FuncAddress {
     memberDecls.get((owner, mname)).fold(declared)(m => m.params.count(_.default.isEmpty))
 
   /** `value.m(…)`, where the receiver's type names each candidate's instantiation. */
-  protected def pickOverload(rty: Type, base: String, mname: String, args: List[Expr]): String =
-    pickOverload(base, mname, args, show(rty))(c => probe(funcInsts(memberFuncName(rty, c))._1.tail.map(_._2)))
+  protected def pickOverload(
+      rty: Type,
+      base: String,
+      mname: String,
+      args: List[Expr],
+      via: Set[String],
+  ): String =
+    pickOverload(base, mname, args, show(rty), via)(c =>
+      probe(funcInsts(memberFuncName(rty, c))._1.tail.map(_._2)))
 
   /** `Type.f(…)` — an associated function, which has no receiver to drop off the front. */
-  protected def pickAssociated(tname: String, mname: String, args: List[Expr]): String =
-    pickOverload(tname, mname, args, qn(tname))(c => funcInsts.get(s"$tname.$c").map(_._1.map(_._2)))
+  protected def pickAssociated(tname: String, mname: String, args: List[Expr], via: Set[String] = Set.empty): String =
+    pickOverload(tname, mname, args, qn(tname), via)(c => funcInsts.get(s"$tname.$c").map(_._1.map(_._2)))
 
   /** The type an argument already has, with nothing expected of it and nothing said about whatever
    * goes wrong — the ordinary analysis that follows reports that, in the place it belongs.

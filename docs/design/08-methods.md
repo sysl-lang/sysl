@@ -372,11 +372,17 @@ declared as `impl Trait for Type`, never an inherent method with an operator nam
 
 ### One name, one member — and what a second implementation does to that
 
-A type's members are one namespace: two traits declaring a `show` cannot both be implemented for one
-type, and a member may not take a struct field's name. That is what makes `p.show()` a lookup, and
-it is the rule the whole of `02`'s coherence rests on.
+A type's members are one namespace: a member may not take a struct field's name, and a type's own
+body may not declare a name one of its `impl` blocks brings. That is what makes `p.show()` a lookup,
+and it is the rule the whole of `02`'s coherence rests on.
 
-There is exactly one qualification, and a **parameterized** trait is the whole of it. A type may
+Two **traits** declaring a `show` may both be implemented for one type, and that is not an exception
+to the namespace so much as a statement of how wide it is. A trait's members are reached where the
+trait is (`13 §2`), so the two are told apart by what the using file asked for — which is what lets a
+library implement a wide trait for a built-in without claiming those names from every program that
+will ever compile. A use that reaches both is reported where it is written.
+
+There is one further qualification, and a **parameterized** trait is the whole of it. A type may
 implement such a trait at more than one argument list (`02 § One implementation per argument list`),
 and each implementation brings the trait's members under the name the trait declared — so a
 `Complex` that is both `Mul[Complex]` and `Mul[real]` has two members called `mul`. What resolves
@@ -384,8 +390,10 @@ the name is the **argument list**, which every use already carries: an operator 
 operands, a bound names the arguments, a trait object was formed at written ones, and a call passes
 values whose types are the arguments.
 
-Resolution is by exact parameter types and is **determined, not preferred**. Exactly one candidate
-accepting the arguments is the answer; none and more than one are both reported. In particular a
+Resolution is by exact parameter types and is **determined, not preferred**, and it is the last of
+three steps rather than the only one: a **bound** narrows first where the use is in a generic body,
+then **scope**, and the arguments settle whatever is left. Exactly one candidate accepting the
+arguments is the answer; none and more than one are both reported. In particular a
 literal has no type of its own to be matched by, so `c.mul(2)` against candidates taking a `Complex`
 and a `real` is refused rather than rounded to the nearest — choosing there would be a specialization
 rule, which `02` deliberately does not have. A **property** takes no arguments and so cannot be

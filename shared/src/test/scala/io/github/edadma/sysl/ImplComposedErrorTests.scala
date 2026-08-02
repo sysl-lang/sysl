@@ -169,19 +169,36 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
     }
   }
 
+  private val twoTraits =
+    """trait A
+      |    go(self) -> int
+      |trait B
+      |    go(self) -> int
+      |impl A for []int
+      |    go(self) -> int = 1
+      |impl B for []int
+      |    go(self) -> int = 2
+      |""".stripMargin
+
   "two impls for one composed type share its member table" - {
 
-    "so a name in both collides" in {
-      err(
-        """trait A
-          |    go(self) -> int
-          |trait B
-          |    go(self) -> int
-          |impl A for []int
-          |    go(self) -> int = 1
-          |impl B for []int
-          |    go(self) -> int = 2""".stripMargin,
-      ) should include("type '[]int' already has a member named 'go'")
+    // A composed type's members are one namespace like any other type's, and like any other type's
+    // that namespace is **per trait** (`13 §2`): both blocks are accepted, because which `go` a use
+    // means is a question about what the file can name rather than about the slice.
+    "so both are filed, and the declarations stand" in {
+      run(twoTraits +
+        """main()
+          |    print("ok")""".stripMargin) shouldBe "ok\n"
+    }
+
+    // What used to be reported at the second `impl` is reported at the use that reaches both — the
+    // later point, and the only one that knows a program actually wrote something ambiguous.
+    "and a call reaching both is what is refused" in {
+      err(twoTraits +
+        """main()
+          |    var a = [1, 2]
+          |    print(a[0..].go())""".stripMargin,
+      ) should include("which was meant")
     }
   }
 

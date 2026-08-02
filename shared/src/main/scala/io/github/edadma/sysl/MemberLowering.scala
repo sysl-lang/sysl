@@ -64,6 +64,9 @@ trait MemberLowering extends TypeResolution {
    *   - `alt` distinguishes the members of a second implementation of one trait from the first's.
    *     It is empty everywhere else, so a type's own body and its first `impl` file their members
    *     under exactly the names they were written with.
+   *   - `fromTrait` is the trait an `impl` block is keeping, and `None` for a type's own body. It is
+   *     what a use site's scope is asked about, since a trait's member is reachable only where the
+   *     trait can be named.
    */
   protected case class MemberHome(
       key: String,
@@ -78,6 +81,7 @@ trait MemberLowering extends TypeResolution {
       self: Map[String, Type],
       outer: Map[String, Type] = Map.empty,
       alt: String = "",
+      fromTrait: Option[String] = None,
   ) {
 
     /** Everything a member's signature resolves against that a call does not supply: the trait's
@@ -196,6 +200,12 @@ trait MemberLowering extends TypeResolution {
       // but a second implementation of one trait, whose members would otherwise collide with the
       // first's — and the collisions asked about below are still asked about the *written* name,
       // since that is the one a program spells.
+      //
+      // A name some **other trait** already gave the type is not a collision, and the block was
+      // given a suffix of its own above so that it is not one here either: the two members are told
+      // apart by which trait is in scope at the use (`13 §2`). What still collides is a name the
+      // type's **own** body has, which is reachable wherever the type is and so has no scope to be
+      // told apart by.
       val filed = m.name + home.alt
 
       if memberDecls.contains((home.key, filed)) then
@@ -242,10 +252,26 @@ trait MemberLowering extends TypeResolution {
 
       memberDecls((home.key, filed)) = m
 
+      // Which trait this member arrived with, for the members an `impl` brought. A type's own body
+      // records nothing, and that absence is what makes its members reachable wherever the type is.
+      for tr <- home.fromTrait do memberTrait((home.key, filed)) = tr
+
       // A name a program spells that now reaches more than one member is recorded as reaching all of
-      // them, first one included, so a call has the whole set to answer from.
-      if home.alt.nonEmpty then
-        memberAlts((home.key, m.name)) = memberAlts.getOrElse((home.key, m.name), List(m.name)) :+ filed
+      // them, so a call has the whole set to answer from. Both reasons a member is filed under
+      // something other than its written name come through here — a second implementation of one
+      // trait, and a second trait declaring a name the first already used.
+      //
+      // The bare name joins the set only if something was actually **filed** under it. A suffix is
+      // taken by the whole block, so a member the suffixed block alone declares — a default the
+      // trait supplied and the first trait never had — has no bare-named sibling, and listing one
+      // would put a name in the set that nothing can be looked up under.
+      if filed != m.name then
+        val prior = memberAlts.getOrElse(
+          (home.key, m.name),
+          if memberDecls.contains((home.key, m.name)) then List(m.name) else Nil,
+        )
+
+        memberAlts((home.key, m.name)) = prior :+ filed
 
       val fd = synthesize(home, m)
 
