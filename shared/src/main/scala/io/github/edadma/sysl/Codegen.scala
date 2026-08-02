@@ -323,15 +323,52 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       case None =>
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
-    val declared = Type.stored(f.params).map { case (name, ty) => s"${ty.llvm} %$name.param" }
+    val stored   = Type.stored(f.params)
+    val declared = stored.map { case (name, ty) => s"${ty.llvm}${frameOf(f, ty, name)} %$name.param" }
     val params   = (declared ++ Option.when(f.variadic)("...")).mkString(", ")
     // A file-private declaration has every caller in the module that defines it (`13 §2`), so its
     // symbol is `internal`: nothing outside may resolve it, and the linker is free to discard it
     // when nothing inside calls it either — which is what an exported helper in a library artifact
     // costs today.
     val linkage = if f.internal then "internal " else ""
-    finishFunction(s"define $linkage${f.retTy.llvm} @${symbolOf(f.name)}($params)")
+
+    finishFunction(
+      s"define $linkage${convention(f)}${f.retTy.llvm} @${symbolOf(f.name)}($params)${attribute(f)}")
   }
+
+  /** What a calling convention becomes on the `define` line for **this** machine (`15 §10`).
+   *
+   * Two of these because LLVM spells the one concept two ways: x86-64's interrupt handler is a
+   * *calling convention* written before the result type, and RISC-V's is a *function attribute*
+   * written after the signature. The analyzer has already refused the combinations that do not
+   * exist, so what is left here is the spelling.
+   */
+  private def convention(f: TFunc): String =
+    f.conv.flatMap(_ => Conventions.interruptForm(target.cpu)) match
+      case Some(Conventions.Form.Convention(llvm)) => s"$llvm "
+      case _                                       => ""
+
+  private def attribute(f: TFunc): String =
+    f.conv.zip(Conventions.interruptForm(target.cpu)) match
+      case Some((c, Conventions.Form.Attribute(key))) =>
+        s""" "$key"="${c.arg.getOrElse(Conventions.defaultRiscvMode)}""""
+      case _ => ""
+
+  /** `byval` on an x86-64 interrupt handler's frame parameter, which the ABI requires and which is
+   * the one place sysl emits a parameter attribute.
+   *
+   * The processor pushes the frame and the handler is handed its address; LLVM models exactly that
+   * as a `byval` pointer, so the pointee's type has to be named on the parameter. Only the *first*
+   * parameter is the frame — a second one, where a vector pushes an error code, is an ordinary
+   * integer passed as itself.
+   */
+  private def frameOf(f: TFunc, ty: Type, name: String): String =
+    f.conv.flatMap(_ => Conventions.interruptForm(target.cpu)) match
+      case Some(Conventions.Form.Convention(_)) if f.params.headOption.exists(_._1 == name) =>
+        ty match
+          case Type.Ptr(inner) => s" byval(${inner.llvm})"
+          case _               => ""
+      case _ => ""
 
   // --- statements ----------------------------------------------------------------------
 

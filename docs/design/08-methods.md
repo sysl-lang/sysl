@@ -454,6 +454,13 @@ Rust answers this the same way and for the same reason. The alternative — exem
 — leaves `private` on a field meaning only "you may not read it back", and nothing useful rests on
 that.
 
+**A visibility modifier hides a field; it does not hide the layout.** Every row of that table is
+about *naming* something, and a private field still occupies its place in the type — it is counted in
+the size, it shifts the fields after it, and it takes part in the ABI (`15 §1`). A type that wants
+its shape withheld as well says so with `opaque` (`15 §9`), which is the other axis and takes every
+row of the table with it: outside the declaring module none of those four forms is open, because
+there are no offsets out there to read one with.
+
 ### A member a trait declares carries no modifier
 
 A `trait`'s members and an `impl` block's have no visibility of their own, and a modifier written on

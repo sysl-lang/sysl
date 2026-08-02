@@ -1,6 +1,6 @@
 ---
 title: Modules and the library
-summary: A module is a directory, imports are Scala's, and the standard library is a tree of six.
+summary: A module is a directory, an import only shortens a name you could always write in full, and the standard library is a tree of six.
 weight: 110
 ---
 
@@ -114,19 +114,31 @@ print(sysl.math.max(1, 4))
 4
 ```
 
-The forms are Scala 3's, unchanged:
+An import is a dotted path through the module tree, and **how the path ends decides what you get**:
 
 ```sysl
 import sysl.math.max              // max(a, b)      — one member, unqualified
 import sysl.math.{max, min}       // several
 import sysl.math.*                // every public member
-import sysl.math.{max as bigger}  // renamed
 import sysl.math                  // math.max(a, b) — the module itself
+import sysl.math.{max as bigger}  // a member, renamed
 import sysl.math as m             // m.max(a, b)    — the module, renamed
 ```
 
-Bringing in the module *name* is the self-documenting middle ground: `math.max` says at the call site
-where the name came from, without listing members. The wildcard is the terse opposite.
+Ending the path at a **member** binds that member under its own name, so calls to it lose their
+qualifier entirely. The braces do that for several members at once, and `*` for every public member
+of the module.
+
+Ending it at the **module** binds the module's last name segment instead — so `sysl.math` becomes
+`math`, and calls keep exactly one level of qualification. That is the self-documenting middle
+ground: `math.max` says at the call site where the name came from without listing members up top,
+where the wildcard says nothing and the explicit list has to be maintained.
+
+`as` renames whatever the path ended at, member or module. It is what you reach for when two modules
+offer the same name, and the only way to resolve that collision without writing the full path at
+every use.
+
+If you happen to know Scala 3, these are its import forms unchanged — including `as` and `*`.
 
 Imports usually sit just below the header, but one may also appear **inside a block**, scoped to it,
 for a name wanted in one function only.

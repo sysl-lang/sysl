@@ -122,11 +122,12 @@ object Toolchain {
    * With `--target` passed, the only override that can still happen is that refinement.
    */
   def build(ir: String, exe: String, target: Target = Target.default,
-            archives: List[String] = Nil, level: String = defaultOptimization): Either[String, Unit] = {
+            archives: List[String] = Nil, level: String = defaultOptimization,
+            links: List[String] = Nil): Either[String, Unit] = {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    val result = exec(linkCommand(ll, archives, exe, target, level))
+    val result = exec(linkCommand(ll, archives, exe, target, level, links))
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())
@@ -143,32 +144,58 @@ object Toolchain {
    * object is one of the things that calls them.
    */
   private[sysl] def linkCommand(ll: String, archives: List[String], exe: String, target: Target,
-                                level: String = defaultOptimization): List[String] =
+                                level: String = defaultOptimization,
+                                links: List[String] = Nil): List[String] =
     List("clang", s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: deadStrip(target) :::
-      List(ll) ::: archives ::: systemLibraries(target) ::: List("-o", exe)
+      List(ll) ::: archives ::: libraryFlags(links, target) ::: List("-o", exe)
 
-  /** The system libraries a program is linked against beyond the ones the driver passes itself.
+  /** What a build's link directives (`15 §8`) become on **this** target's command line.
    *
-   * There is one, and it is the mathematics: `sysl.math` binds libm, and **where libm lives is a
-   * property of the host rather than of the library**. A Darwin program gets it from `libSystem`,
-   * which the driver already links, and a Windows one from the CRT; a program hosted on ELF has to
-   * say `-lm`, and until it did, every float program built for Linux failed at the link naming
-   * `sqrt` — while the same program built on a Mac linked and ran. That is the worst shape a
-   * portability bug can have, because the machine that finds it is not the machine that is being
-   * developed on.
+   * A directive names a library and never a flag, so this is the whole of the translation, and it is
+   * a decision per operating system written out per case rather than a default that some target
+   * falls into. Three things can happen to a name, and only two of them look alike from outside:
    *
-   * Freestanding gets nothing, and that is the case the `Os` match is written for rather than a
-   * default falling out of it: there is no libc on a bare target, so `-lm` there would fail the link
-   * of a kernel that never asked for mathematics.
+   *   - **The target has it, separately.** `-lm` on ELF. The ordinary case, and the one every name
+   *     the compiler has never heard of takes.
+   *   - **The target already links what holds it.** Darwin keeps libc and libm in `libSystem` and
+   *     Windows keeps them in the CRT, both of which the driver passes unasked, so naming either
+   *     adds nothing. `-lm` on a Mac is not merely redundant — there is no `libm.dylib` to find.
+   *   - **The target does not have it at all.** A freestanding build has no libc, so nothing can be
+   *     passed for one. A program that then calls `sqrt` fails at the link naming `sqrt`, which is
+   *     the honest report: the missing thing is the function, and no `-l` would have supplied it.
    *
-   * **This is the fixed part of a question `15 § Open c` answers in general.** A module of externs
-   * should be able to say which library resolves them, and when it can, this becomes what the
-   * standard module's own directive says rather than a list the driver carries.
+   * The last two both emit nothing and are written apart anyway, because they are different facts
+   * and a target added to the registry has to answer them separately. `hosted` is what tells them
+   * apart: it is the C runtime's own family that a freestanding target is missing, and a directive
+   * naming anything else — a driver's own archive, say — is passed through on every target.
+   *
+   * **This replaced a list the driver carried.** Until `15 §8` existed, `-lm` was appended to every
+   * ELF link whether or not the program touched mathematics, because the compiler had no way to be
+   * told and `sysl.math` had no way to say. It says so itself now, in `lib/sysl/sys/math.sysl`, and
+   * the decision left here is the only part that was ever the driver's: where a named library lives
+   * on the machine being built for.
    */
-  private[sysl] def systemLibraries(target: Target): List[String] =
-    target.os match
-      case Os.Linux                                  => List("-lm")
-      case Os.MacOS | Os.Windows | Os.Freestanding   => Nil
+  private[sysl] def libraryFlags(links: List[String], target: Target): List[String] =
+    links.filter(name => !provided(target.os).contains(name)).map(name => s"-l$name")
+
+  /** The libraries a target needs no flag for — because something the driver already links holds
+   * them, or because the target has none of them to link.
+   *
+   * The set is deliberately small: it holds what the compiler can *defend* rather than every library
+   * a platform might bundle. `c` and `m` are here because the standard module itself needs them and
+   * because their placement genuinely differs across the four. Guessing about `pthread` or `dl` would
+   * mean guessing wrong for some platform nobody here has, and the cost of being wrong is a link that
+   * fails on a machine the author cannot reach — so an unknown name is passed through, where a wrong
+   * `-l` at least names itself in the error.
+   */
+  private def provided(os: Os): Set[String] =
+    os match
+      // libSystem and the CRT carry both, and the driver links them without being asked.
+      case Os.MacOS | Os.Windows => Set("c", "m")
+      // clang links libc itself; the mathematics is a file of its own.
+      case Os.Linux => Set("c")
+      // No libc exists here, so there is nothing to pass for one.
+      case Os.Freestanding => Set("c", "m")
 
   /** Ask the linker to drop what nothing reaches.
    *
@@ -249,17 +276,17 @@ object Toolchain {
    */
   def compileAndRun(source: String, name: String = "<input>",
                     args: List[String] = Nil): Either[String, (Int, String)] =
-    runIr(Compiler.compileToLlvm(source, name), args)
+    runIr(Compiler.compiled(List(Source(name, source))), args)
 
   /** The same, for the files of one program. */
   def compileAndRun(sources: List[Source]): Either[String, (Int, String)] =
-    runIr(Compiler.compile(sources), Nil)
+    runIr(Compiler.compiled(sources), Nil)
 
   /** The same, for a program compiled **against a library** whose modules arrive as trees rather
    * than as source — an `AstCodec` artifact, decoded (`Compiler.compileWith`).
    */
   def compileAndRun(sources: List[Source], libraries: List[Program]): Either[String, (Int, String)] =
-    runIr(Compiler.compileWith(sources, libraries), Nil)
+    runIr(Compiler.compiledWith(sources, libraries), Nil)
 
   /** The same, compiled against a **prebuilt standard module** rather than the copy the compiler
    * carries: the trees arrive decoded, the symbols its object half already defines are declared
@@ -272,19 +299,22 @@ object Toolchain {
   def compileAndRun(sources: List[Source], libraries: List[Program], args: List[String],
                     core: Option[Core], precompiled: Set[String], archives: List[String])
       : Either[String, (Int, String)] =
-    runIr(Compiler.compiledWith(sources, libraries, Target.default, precompiled, core).map(_._1),
-          args, archives)
+    runIr(Compiler.compiledWith(sources, libraries, Target.default, precompiled, core), args, archives)
 
   /** `args` are the words the program is started with, which reach it exactly as they would from a
    * shell: the executable's own path arrives ahead of them as the zeroth, since that is what the
    * platform passes and not something this could withhold.
+   *
+   * The whole `Compiled` is taken rather than the IR alone because what a program links against
+   * comes back beside its module and nowhere else (`15 §8`). Taking the IR was enough only while the
+   * driver carried one hardcoded library for every build.
    */
-  private def runIr(compiled: Either[String, String], args: List[String],
+  private def runIr(compiled: Either[String, Compiled], args: List[String],
                     archives: List[String] = Nil): Either[String, (Int, String)] =
-    compiled.flatMap { ir =>
+    compiled.flatMap { c =>
       val exe = createTempFile("sysl-", "")
 
-      build(ir, exe, Target.default, archives).map { _ =>
+      build(c.ir, exe, Target.default, archives, defaultOptimization, c.links).map { _ =>
         val result = exec(exe :: args)
         deleteFile(exe)
         (result.exitCode, result.stdout)

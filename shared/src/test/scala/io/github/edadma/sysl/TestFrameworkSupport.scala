@@ -18,7 +18,7 @@ trait TestFrameworkSupport extends Matchers { this: Assertions =>
   protected def outcomes(src: String, opts: TestRunner.Options = TestRunner.Options()): List[TestRunner.Outcome] = {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    val (ir, tests) = Compiler.compileTests(List(Source("<input>", src)), Nil) match {
+    val (built, tests) = Compiler.compileTests(List(Source("<input>", src)), Nil) match {
       case Right(result) => result
       case Left(e)       => fail(e)
     }
@@ -26,7 +26,7 @@ trait TestFrameworkSupport extends Matchers { this: Assertions =>
     val exe = createTempFile("sysl-test-", "")
 
     try
-      Toolchain.build(ir, exe) match {
+      Toolchain.build(built.ir, exe, links = built.links) match {
         case Left(e)  => fail(e)
         case Right(_) => TestRunner.execute(exe, tests.filter(TestRunner.matches(_, opts.filter)), opts)
       }
@@ -51,8 +51,8 @@ trait TestFrameworkSupport extends Matchers { this: Assertions =>
   /** The IR of a **test build**, for asserting on the dispatcher without running it. */
   protected def testIr(src: String): String =
     Compiler.compileTests(List(Source("<input>", src)), Nil) match {
-      case Right((out, _)) => out
-      case Left(e)         => fail(e)
+      case Right((built, _)) => built.ir
+      case Left(e)           => fail(e)
     }
 
   /** Asserts that every test in a source passed, and says which did not when one did.

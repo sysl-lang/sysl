@@ -166,11 +166,10 @@ checks that make the safe subset segfault-proof (`03`), and like the bounds chec
 **strippable** for a release build that accepts the risk (a `--no-contracts`-style removal), on
 the same footing as C's `assert` compiled out by `NDEBUG`.
 
-> **Cross-doc note.** Whether *integer overflow* is a trap source or defined wrapping is a
-> scalar-types decision (`00 §5` currently specifies wrapping at the declared width), not an
-> error-handling one. This chapter lists the checks that trap today; the overflow question is
-> settled in `01`, and the README's "integer-overflow safety" wording should be reconciled with
-> it there.
+> **Cross-doc note.** *Integer overflow is deliberately not on that list.* Arithmetic wraps at
+> the declared width (`00 §5`, `01`), so overflow is defined behaviour rather than a broken
+> invariant, and there is nothing for a trap to report. That is a scalar-types decision, not an
+> error-handling one — this chapter only lists the checks that trap.
 
 ## 7. What is deliberately absent
 

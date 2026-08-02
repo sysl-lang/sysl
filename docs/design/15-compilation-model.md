@@ -32,16 +32,18 @@ Two consequences pay for it immediately:
 - **Layout is deterministic from the declaration alone**, which is what lets an importing module
   compute a generic instantiation's layout for itself (§4) instead of asking the defining module.
 
-**Layout is part of a module's public interface.** A caller needs size, alignment, and field
-offsets to stack-allocate a `T`, embed one, index one, or pass one by value. This is not an
-artifact of any caching design — it is what by-value semantics mean, and C has the same property.
+**Layout is part of a module's public interface** — unless the type opts out (§9). A caller needs
+size, alignment, and field offsets to stack-allocate a `T`, embed one, index one, or pass one by
+value. This is not an artifact of any caching design — it is what by-value semantics mean, and C has
+the same property. An `opaque` struct is the one type that publishes no layout, and it pays for that
+in the only currency available: none of those operations is open to a caller either.
 
 **Private fields still participate in layout, and in the ABI.** Platform ABI classification
 recurses into field *types* to choose register versus memory passing — under SysV x86-64 an
 8-byte struct of two `f32` is passed in an SSE register, two `i32` in an integer register — so a
 by-value call needs the complete ordered field type list, private fields included. Field
 visibility and layout visibility are independent axes: a private field is not *nameable*
-downstream, and it is still *there*.
+downstream, and it is still *there*. §9 is that second axis given a name of its own.
 
 **The cost, stated plainly:** a careless field order silently wastes memory, and nothing packs it
 back. The mitigation is a lint that reports a struct's padding and suggests an ordering — the
@@ -72,7 +74,7 @@ Three rules follow:
 
 Deeply nested instantiations produce very long symbols — a standing C++ complaint. Truncating past
 a threshold and appending a hash of the full name, as Rust and Swift do, is cheaper to build in now
-than to retrofit when a linker chokes (§Open e).
+than to retrofit when a linker chokes (§Open b).
 
 ## 3. Visibility chooses linkage
 
@@ -166,7 +168,8 @@ Nothing in this section is an independent decision; it is what §1–§4 and `13
 6. **Emit.** One object file per source file, plus the instantiations of §4.
 7. **Link.** Objects, then the archives that resolve them, then the system libraries the target needs
    — left to right, because that is the order the scan pulls archive members in. Which system
-   libraries those are is the driver's answer today and §Open c's in general.
+   libraries those are is §8's answer: each module names the ones its own `extern`s need, and the
+   target decides what a name becomes on the command line.
 
 Step 4 never needs a dependency to have been **compiled** — only parsed. That is `13` §2's
 parse-only interface extraction doing the work it was chosen for, and it is what makes steps 4–6
@@ -250,43 +253,219 @@ object. The standard module under `lib/sysl` includes no headers and reaches lib
 it goes on building for any target the toolchain can lower for; that is worth keeping, and it is a
 property of what that library happens to need rather than a rule about where C may live.
 
+## 8. A module says which library resolves its externs
+
+**`link "z"` in a file's header names a library the linker must be given**, and it sits beside the
+`extern`s it supports because that is the only place that knows. An `extern` states the symbol it
+wants and never where the symbol lives; a binding to `libpng` is written by whoever writes the
+module, and the driver cannot carry a list of libraries it has never heard of.
+
+```
+module image.png
+link "png"
+link "z"
+
+extern "png_create_read_struct" create(ver: *u8, err: *u8, fn: *u8) -> *u8
+```
+
+**A directive names a library, and never a flag.** That is the whole of the design, and everything
+else follows from it. Where a library *lives* is a property of the machine being built for: the
+mathematics is a file of its own on ELF, part of `libSystem` on Darwin, inside the CRT on Windows,
+and absent from a freestanding target that has no libc for it to be in. A directive that spelled
+`-lm` would be right on one of those and wrong on the other three — and the author could not be told
+so by any compiler running on the machine that wrote it, because the link that fails is somewhere
+else. So the file names `m`, and the driver decides what that becomes:
+
+| the target | what a name becomes | why |
+|---|---|---|
+| has the library separately | `-lname` | the ordinary case, and what every unrecognized name gets |
+| already links what holds it | nothing | Darwin's `libSystem`, Windows' CRT — the driver passes those unasked |
+| does not have it at all | nothing | a freestanding build has no libc, so nothing can be passed for one |
+
+The last two both put nothing on the command line and are still written apart, because they are
+different facts and a target added to the registry has to answer them separately. A freestanding
+program that then calls `sqrt` fails at the link naming `sqrt`, which is the honest report: what is
+missing is the function, and no `-l` would have supplied it.
+
+**The set the compiler knows is deliberately small** — the C runtime and the mathematics, which are
+the two whose placement actually differs across the four. An unrecognized name is passed straight
+through rather than guessed about. Being wrong in that direction produces a link error naming the
+library; being wrong in the other produces a link error naming a *function*, on a platform the
+author does not have.
+
+**The requirement travels in the artifact.** The clauses are part of the tree a `.syslib` carries, so
+a program depending on a prebuilt library learns to pass `-lz` without reading that library's source.
+Leaving them out would mean a binding that works from source and stops working the moment it ships —
+the worst available shape, since the build that breaks is one its author never ran.
+
+**A module's requirement is the union of its files', and its files are not held to agreeing.** This
+is the one place the directive differs from the capability clause of `13 §4`, which it is otherwise
+shaped like, and the difference is in what each describes. A capability describes what the whole
+module may do, so files that disagreed would be describing different modules. A link requirement
+describes what one file's `extern`s need — and a module whose foreign declarations all sit in one
+file has nothing for its other four to repeat.
+
+**Order is kept rather than sorted.** A static archive is scanned once, left to right, and a member
+is pulled in only to resolve a symbol already undefined, so a library that calls into another has to
+come first: `-lpng -lz`, never the reverse. That ordering is the author's to state and the compiler's
+to preserve. Sorting would decide it by spelling, which is right by accident for those two and wrong
+for the next pair. Two libraries that call into *each other* are not expressible today; `--start-group`
+is what would express them, and nothing has needed it yet.
+
+**`link` is a soft keyword** — special only in a header, an ordinary identifier everywhere else.
+`guide/slab` declares a function called `link`, the pointer threading a free block, and a systems
+language cannot afford to spend that name. Nothing is lost by it: a directive is `link` followed by a
+*string*, and no statement has that shape.
+
+**It cannot be tested by linking**, which decides how it is tested. A program that calls `sqrt` links
+on a Mac whether or not `-lm` was passed, so the machine that finds a missing directive is never the
+machine the compiler was developed on. The assertion is therefore about the *command line*, and
+`LinkCommandTests` is that — one test aside, which hands a real linker a library that does not exist
+and requires the error to name it back.
+
+**This replaced a list the driver carried.** Before it, `-lm` went onto every ELF link whether or not
+the program computed anything, because `sysl.math` had no way to say so and the compiler had no way
+to be told. That stopgap was bounded to the standard module because the standard module is the one
+the compiler ships; every other module needed this built. It says so itself now, in
+`lib/sysl/sys/math.sysl`.
+
+## 9. `opaque` withholds a layout
+
+**`opaque struct Name` is known by shape only inside the module that declares it.** Everywhere else
+the type is **incomplete** — exactly what C's `struct foo;` is — and the only thing that may be said
+about it is `*Name`.
+
+```
+module net
+
+opaque struct Conn
+    fd: int
+    live: bool
+end Conn
+
+open() -> *Conn
+close(c: *Conn)
+```
+
+**One rule, because two different wants meet in it.** A library stabilizing its surface wants to add
+and reorder fields with nothing downstream recompiled. A binding wants `*sqlite3` to be a type that a
+`*u8` cannot be mistaken for, where nobody in sysl knows the layout at all. Both are "the shape is
+not yours to know", and both are served by making the type incomplete outside its module.
+
+So an opaque struct may declare **no body at all**:
+
+```
+opaque struct Dir
+
+private[sysl] extern "opendir" c_opendir(path: *u8) -> *Dir
+private[sysl] extern "closedir" c_closedir(d: *Dir) -> int
+```
+
+That is the C-handle case, and `lib/sysl/fs` is its first user — it previously bound `DIR *` as
+`*u8`, which the linker accepts and which is interchangeable with the `*u8` *paths* declared on the
+lines above it. Nothing in sysl lays a `Dir` out; the storage is libc's. An ordinary struct with no
+body stays an error, and says which word to add.
+
+**What is refused outside, and why it is one list.** A binding, a field of another type, an element,
+an array, a slice, a `&`, a type argument, a by-value parameter or result, construction, reading or
+writing a field, a pattern naming the fields, a dereference, `sizeof`, `alignof`, and a by-value
+`self` method. Every one of them needs a size or an offset, which is the single fact being withheld,
+so they are one diagnostic rather than fourteen.
+
+**The by-value `self` method is the case worth stating outright**, because it looks like a call and
+is not. The *function* was compiled by the library; what crosses the boundary is the **caller's
+copy**, laid out to the fields as they stood when that caller was built. Adding a field would then
+break it silently — precisely the failure the modifier exists to prevent. `*self` and `&self` need no
+shape and stay reachable, which is what makes them the forms an opaque type's methods take.
+
+**The reach is the declaring module exactly**, not a subtree the way `private[M]` widens (`13 §2`).
+What `opaque` buys is that a field may move with nothing downstream recompiled, and the set of files
+that must recompile together is the module — its files share one scope (`13 §1`), so they are already
+one unit for this, and a submodule is already not.
+
+**It is not a visibility, and the two are independent.** `vis` decides who may say the *name*;
+`opaque` decides who may know the *shape*. A public type may be opaque, which is the whole point of
+one; a `private` type may be opaque too, and simply has nobody left to be opaque to.
+
+**Rejected: Swift-style resilient value types**, which compute layout at runtime from metadata. Every
+field access becomes an indirect load, which is why Swift itself added `@frozen` to opt back out. The
+cost here is an indirection at the *interface* — a pointer the caller already holds — rather than at
+every access forever.
+
+Codegen needs nothing for it. Pointers lower to `ptr` (`codegen.md`), so a `*Opaque` downstream never
+asks for the aggregate, and the check is entirely a front-end rule.
+
+## 10. A definition may name the convention it is entered under
+
+**`interrupt` before a definition says the processor enters it, not a caller.** It is written where a
+visibility modifier is, on the declaration rather than folded into `extern`, because it is about a
+*definition* — the handler is code this program supplies.
+
+```
+interrupt timer()               // RISC-V: takes nothing
+interrupt(supervisor) trap()    // ...at a named privilege level
+
+interrupt fault(f: *Frame)      // x86-64: the ABI requires the frame
+```
+
+**One concept, three answers, and every one of them was read off clang rather than out of a
+document.** This is the fact the whole design turns on:
+
+| processor | what `interrupt` is | the signature it demands |
+|---|---|---|
+| **x86-64** | an LLVM calling convention, `x86_intrcc` | a pointer to the frame the hardware pushed, optionally then an integer error code |
+| **RISC-V** | a function *attribute*, `"interrupt"="machine"` | nothing at all |
+| **AArch64** | it does not exist | — |
+
+So the annotation names the **concept** and the back end decides what that becomes. A directive that
+spelled `x86_intrcc` would put one machine's answer in a source file and be wrong on the other two —
+and the author could not be told, because the build that breaks is elsewhere. This is the same shape
+as §8's rule that a link directive names a library rather than a flag, and it is the same reason.
+
+**On a processor without it, the annotation is refused rather than ignored.** Clang answers
+`__attribute__((interrupt))` on AArch64 with "unknown attribute ignored" and compiles an ordinary
+function. That is defensible for C, where an attribute is advisory by tradition. It is not defensible
+here: the handler then returns with `ret` where the machine needs `eret`, having saved none of the
+registers an asynchronous entry clobbers, so the failure is silent and arrives as corruption in
+whatever was interrupted. §1 already refuses the annotated/unannotated split everywhere else, and
+this is the same refusal.
+
+**Nothing about this is portable, and the design does not pretend otherwise.** An interrupt handler
+is the least portable code there is — it is entered by a mechanism the processor defines, and even
+the number of arguments differs. What the compiler owes is that the source says which machine it is
+for and that building it for another fails loudly, which is exactly what the table above buys.
+
+**AArch64's absence is not an oversight to fill in later.** Its exception entry goes through a vector
+table the processor indexes by cause, where each entry is a fixed-size slot of instructions — so the
+entry point is assembly by construction, and there is nothing for a convention on a sysl function to
+describe.
+
+**A handler is an entry point, so it is a root of the reachability walk** (§5 step 7's pruning). No
+program calls one, and calling one is refused outright: it leaves through a return-from-interrupt
+that would unwind a frame the call never pushed. A walk starting from what the program *runs*
+therefore cannot reach it, and dropping it would leave the vector table pointing at nothing — a fault
+at the worst available moment. Its address is still worth taking, which is what fills that table.
+
+**The rules are about the signature, so they are checked on the declaration** rather than while a
+body is walked. A generic handler nothing instantiates has no body analyzed at all, and it is exactly
+as wrong as one that does.
+
+`interrupt` is a **soft keyword**, and what keeps it one is that a name must follow it. Three things
+start with that word and only the first is a convention: `interrupt timer()` declares a handler,
+`interrupt(n: int) -> int` declares a function *called* `interrupt`, and `interrupt(4)` calls one.
+
+**The annotation carries a name and an optional argument** — RISC-V's privilege mode is the argument
+today — so a second convention is a change to what the analyzer accepts rather than to every tree
+that holds a function. `extern` still implies the C ABI with nothing written, which is what the
+overwhelming majority of foreign declarations want.
+
 ## Open (not yet decided)
 
-- **a. `opaque` structs.** A struct whose layout is withheld from its interface entirely, usable
-  downstream only behind a pointer — no stack allocation, no embedding, no `sizeof`, construction
-  through a function in the defining module. It buys unlimited private-field churn with zero
-  downstream impact, and costs an indirection and an allocation. Wanted once there is a real
-  library surface to stabilize; nothing is blocked without it. (Swift-style *resilient* value
-  types, which compute layout at runtime from metadata, are the alternative and are rejected —
-  every field access becomes an indirect load, which is why Swift itself added `@frozen` to opt
-  back out.)
-- **b. Calling-convention annotation.** `extern` implies the C ABI, but device targets need others
-  — interrupt handlers at minimum — so this wants to be a general annotation on a declaration or
-  definition rather than a flag that only `extern` understands.
-- **c. Link directives.** How a module of externs tells the driver to pass `-lc` and friends. Most
-  naturally a per-module directive sitting beside the externs it supports.
-
-  **The one library the standard module itself needs is carried by the driver in the meantime**, and
-  the shape of that stopgap is an argument for the general mechanism rather than against it.
-  `sysl.math` binds libm, and where libm *lives* is a property of the host: Darwin keeps it in
-  `libSystem` and Windows in the CRT, both of which the driver links unasked, while a program hosted
-  on ELF has to say `-lm` and a freestanding one must not, having no libc for it to be in. So the
-  driver answers that off the target's `Os` — a decision per object format, written out per case so
-  that a target added to the registry is a decision rather than whichever arm a default reached.
-
-  What that does not scale to is a *program's* externs. A binding to `libpng` or `libz` is written by
-  whoever writes the module, and the driver cannot carry a list of libraries it has never heard of.
-  The stopgap is bounded to the standard module because the standard module is the one the compiler
-  ships; every other module needs this item built.
-
-  It also cannot be tested by linking. A program that calls `sqrt` links on a Mac whether or not
-  `-lm` was passed, so the machine that finds a missing directive is never the machine the compiler
-  was developed on — which makes the assertion one about the *command line*, and `LinkCommandTests`
-  is that.
-- **d. Export to C.** The reverse of `12` §1's `extern`: mangling suppression plus the ABI
-  annotation of (b), applied to a *definition* so existing C can call into sysl. A C replacement is
-  adopted incrementally, so this direction matters as much as the importing one.
-- **e. The symbol-length threshold** at which §2 truncates and appends a hash.
-- **f. Recording file discovery.** Whether the `readdir` of step 1 is written into a build log, so
+- **a. Export to C.** The reverse of `12` §1's `extern`: mangling suppression plus §10's annotation,
+  applied to a *definition* so existing C can call into sysl. A C replacement is adopted
+  incrementally, so this direction matters as much as the importing one — and §10 built the half of
+  it that decides how a definition states its convention, leaving the mangling question.
+- **b. The symbol-length threshold** at which §2 truncates and appends a hash.
+- **c. Recording file discovery.** Whether the `readdir` of step 1 is written into a build log, so
   that adding a file to a module is a *visible* change for reproducible or sandboxed builds rather
   than an invisible one.

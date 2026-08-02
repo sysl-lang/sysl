@@ -335,10 +335,34 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case c: Type.Constrained => c.lo.isDefined || c.hi.isDefined || c.predFn.isDefined || constrains(c.base)
     case _                   => false
 
-  private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = t match
+  /** Whether the type about to be resolved is what a `*` points at, rather than a value in its own
+   * right. It is the one thing an `opaque` struct may be outside the module declaring it (`15 §9`).
+   *
+   * Set for exactly **one** level and cleared the moment any resolution begins, which is what keeps
+   * it honest under nesting: `*Outer` sets it, `Outer`'s own by-value field clears it before
+   * resolving, so a layout reached through a pointer is not itself excused by that pointer. The
+   * `indirection` counter next door answers a different question — whether a *cycle* is finite — and
+   * is deliberately not reused, since it stays raised for the whole subtree.
+   */
+  private var pointee = false
+
+  private def asPointee(resolve: => Type): Type = {
+    pointee = true
+    try resolve
+    finally pointee = false
+  }
+
+  private def resolveTypeAt(t: TypeRef, subst: Map[String, Type]): Type = {
+    val behindPointer = pointee
+    pointee = false
+
+    resolveShape(t, subst, behindPointer)
+  }
+
+  private def resolveShape(t: TypeRef, subst: Map[String, Type], behindPointer: Boolean): Type = t match
     case PtrType(inner) =>
       traitObject(inner, subst, "*")
-        .fold(Type.Ptr(addressable(underIndirection(resolveQualified(inner, subst)), "'*'")))(Type.Ptr.apply)
+        .fold(Type.Ptr(addressable(asPointee(underIndirection(resolveQualified(inner, subst))), "'*'")))(Type.Ptr.apply)
 
     // Everywhere but a field, an element, and a pointee, what is being named is a **value** — what a
     // binding holds, what a parameter receives, what a call hands back — and a value read out of a
@@ -419,7 +443,9 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
           // full (`13 §3`) — so what the tables are asked for is the key that resolves to.
           case None =>
             typeKey(n) match
-              case Some(key) if structDecls.contains(key) => instantiateStruct(key, targs)
+              case Some(key) if structDecls.contains(key) =>
+                if !behindPointer then checkLayoutKnown(key, n)
+                instantiateStruct(key, targs)
               case Some(key) if constrainedDecls.contains(key) =>
                 if targs.nonEmpty then err(s"'$n' is a constrained subtype and takes no type arguments")
                 resolveConstrained(key)

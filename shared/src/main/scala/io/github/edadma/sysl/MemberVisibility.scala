@@ -112,8 +112,14 @@ trait MemberVisibility extends AnalyzerBase {
   /** The same for a field, which is read by selecting it and written by assigning to the selection —
    * one modifier over both, since a field nobody outside may read is not one they may write.
    */
-  protected def checkFieldVisible(owner: String, name: String): Unit =
+  protected def checkFieldVisible(owner: String, name: String): Unit = {
+    // Selecting a field is reading an offset, so an `opaque` type's fields are out of reach from
+    // outside however each one is marked (`15 §9`). Asked here rather than at the three call sites
+    // for the reason the visibility question is: reading and writing a field are one question, and
+    // every way of naming one arrives through this.
+    checkLayoutKnown(owner, qn(owner))
     checkMemberVisible(owner, name, "field")
+  }
 
   /** The **positional** forms, which name every field of a struct in order rather than one of them:
    * the constructor `Point(1, 2)` and the pattern `Point(a, b)`. Each needs every field visible, and

@@ -198,6 +198,10 @@ The trap sources are the runtime safety checks the safe subset rests on: an out-
 inverted or out-of-range slice range, a checked cast that fails, an integer divide by zero, and a
 violated `require`/`ensure` contract.
 
+**Integer overflow is not one of them**, which is worth saying because Rust traps on it in a debug
+build. Arithmetic wraps at the declared width, as [values](/tour/values/) showed — that is defined
+behaviour rather than a broken invariant, so there is nothing for a trap to report.
+
 Two reasons abort is the only defensible choice here. A kernel and an embedded target have **no
 unwinding runtime** — landing pads, a personality routine and per-frame cleanup tables are exactly
 what a freestanding target does not have. And an abort is one code path, where unwinding is a second,

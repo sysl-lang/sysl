@@ -458,7 +458,14 @@ trait ExprAnalysis
     case Unary("*", e) =>
       val t = analyzeExpr(e)
       Type.pointee(t.ty) match
-        case Some(inner)                => TDeref(t, Type.unqualified(inner))
+        case Some(inner) =>
+          // Reading through the pointer produces the **value**, which is the one thing an opaque
+          // type has no shape for out here — so `*c` is refused where `c` itself was fine (`15 §9`).
+          Type.underlying(inner) match
+            case s: Type.Struct => checkLayoutKnown(s.base, s.name)
+            case _              => ()
+
+          TDeref(t, Type.unqualified(inner))
         // A trait object points somewhere, but it has forgotten what is there, so there is no type
         // to read out — its methods are the whole of what it still offers.
         case None if Type.erased(t.ty) =>

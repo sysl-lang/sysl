@@ -314,27 +314,27 @@ private[sysl] def execute(cfg: Config): Int = {
   val compiled =
     Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(core)) match
     case Left(err) => return report(err)
-    case Right((ir, notes)) =>
+    case Right(result) =>
       if cfg.explainEscapes then
-        if notes.isEmpty then Console.err.println("no arrays were promoted to the heap")
-        else notes.foreach(Console.err.println)
-      ir
+        if result.notes.isEmpty then Console.err.println("no arrays were promoted to the heap")
+        else result.notes.foreach(Console.err.println)
+      result
 
   cfg.command match
     case "emit-llvm" =>
-      stdout(compiled); 0
+      stdout(compiled.ir); 0
 
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
 
-      Toolchain.build(compiled, exe, target, archives, cfg.optimize) match
+      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links) match
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
       val exe = createTempFile("sysl-", "")
 
-      Toolchain.build(compiled, exe, target, archives, cfg.optimize) match
+      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links) match
         case Left(err) => discard(exe); fail(err)
         case Right(_) =>
           val result = exec(exe :: cfg.programArgs)

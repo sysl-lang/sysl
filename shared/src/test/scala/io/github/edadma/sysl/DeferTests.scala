@@ -318,9 +318,9 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
                   |""".stripMargin
 
       Compiler.compiled(List(Source("t.sysl", src))) match
-        case Right((_, notes)) =>
-          notes should have length 1
-          notes.head should include("'xs' is promoted to the heap")
+        case Right(built) =>
+          built.notes should have length 1
+          built.notes.head should include("'xs' is promoted to the heap")
         case Left(e) => fail(s"did not compile:\n$e")
 
       run(src) shouldBe "1 2 3\n"

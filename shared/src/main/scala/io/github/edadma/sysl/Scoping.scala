@@ -253,6 +253,36 @@ trait Scoping extends DeclTables {
     case _                     => false
   }
 
+  /** Whether a struct's **layout** is hidden from where the analyzer currently is — `opaque`, and
+   * declared somewhere other than here (`15 §9`).
+   *
+   * The reach is the **declaring module exactly**, not a subtree the way `private[M]` widens. What
+   * `opaque` buys is that a field may be added or reordered with nothing downstream recompiled, and
+   * the set of files that must be recompiled together is the module: its files share one scope
+   * (`13 §1`), so they are already one unit for this and a submodule is already not.
+   *
+   * This sits beside `visible` because the two are the same *kind* of question asked about different
+   * things — who may say the name, and who may know the shape — and are deliberately independent. A
+   * public type may be opaque, which is the whole point of one; a `private` type may be opaque too,
+   * and simply has nobody left to be opaque to.
+   */
+  protected def layoutHidden(base: String): Boolean =
+    structDecls.get(base).exists(_.opaque) && Modules.moduleOf(base) != currentModule
+
+  /** Refuses a use of an `opaque` struct that would need its layout.
+   *
+   * **The one thing allowed outside is `*Name`**, so every refusal here is a position that needs a
+   * size or an offset: a binding, a field of another type, an element, a by-value parameter or
+   * result, a type argument, a construction, a field selection, and the `sizeof` that asks outright.
+   * They are one message because they are one fact, and a reader who hits any of them needs the same
+   * next step — reach it through the module's own functions.
+   */
+  protected def checkLayoutKnown(base: String, written: String): Unit =
+    if layoutHidden(base) then
+      err(s"'$written' is opaque outside '${Modules.moduleOf(base)}', so its layout is not known " +
+        s"here — it may be named as '*$written' and passed to that module's own functions, but not " +
+        "built, held by value, laid out inside another type, taken apart, or measured")
+
   /** A resolved key, or a diagnostic where what it names is not visible here.
    *
    * A name the current module declares but may not use is **reported** rather than passed over, so

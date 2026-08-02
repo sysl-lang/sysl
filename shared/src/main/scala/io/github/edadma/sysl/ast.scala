@@ -602,6 +602,23 @@ case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
  * the same rules for what the tail may hold. The body reads it through `va_start`/`va_arg`/`va_end`
  * (`12-functions-and-closures.md` §9).
  */
+/** The calling convention a definition is entered under, where that is not the ordinary one
+ * (`15 §10`).
+ *
+ * **A name and an optional argument, rather than an LLVM convention spelled through.** What
+ * `interrupt` *is* differs by processor — a calling convention on x86-64, a function attribute on
+ * RISC-V, and nothing at all on AArch64 — so the source names the concept and the back end decides
+ * what that becomes. A pass-through would put an LLVM spelling in a source file and be wrong for
+ * every other machine the file is built for.
+ *
+ * `arg` is the parenthesised word: RISC-V's privilege mode, `interrupt(supervisor)`. It is optional
+ * because most conventions have nothing to say and because the common mode has a default.
+ *
+ * One convention is known today and the shape carries a name anyway, so that the second one is an
+ * analyzer change rather than a change to every tree that holds a function.
+ */
+case class CallConv(name: String, arg: Option[String] = None) extends Positioned
+
 case class FuncDecl(
     name: String,
     tparams: List[String],
@@ -613,6 +630,7 @@ case class FuncDecl(
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
     test: Option[TestAttr] = None,
+    conv: Option[CallConv] = None,
 ) extends Stmt
 
 /** What `#test` says about the function it is written above (`testing.md`).
@@ -684,6 +702,11 @@ case class ExternVarDecl(name: String, typ: TypeRef, link: Option[String] = None
  * parameter name, with an unbounded one simply absent. Every application of the type is held to
  * them, and its members may assume them: they are what makes a member checkable at its definition
  * rather than once per instantiation (`10 §5`).
+ *
+ * `opaque` withholds the **layout** from every module but the one declaring it (`15 §9`): outside,
+ * the type may be named only as the pointee of a `*`. It is not a `vis`, and the two are orthogonal —
+ * `vis` decides who may say the *name*, `opaque` decides who may know the *shape*, and a type whose
+ * name nobody could say would have nothing to be opaque to.
  */
 case class StructDecl(
     name: String,
@@ -694,6 +717,7 @@ case class StructDecl(
     invariants: List[Expr] = Nil,
     vis: Visibility = Visibility.Public,
     tdefaults: Map[String, TypeRef] = Map.empty,
+    opaque: Boolean = false,
 ) extends Stmt
 
 /** One variant of an `enum`. A variant with `fields` is a data-carrying (tagged-union)
@@ -841,8 +865,18 @@ enum CapabilityDirection:
  */
 case class CapabilityClause(direction: CapabilityDirection, name: String) extends Positioned
 
-/** One file's parse: the module it contributes to, the capabilities its header declares, its
- * statements, and the source it came from.
+/** `link "z"` — a library the linker must be given for this file's `extern`s to resolve (`15 §8`).
+ *
+ * The name is the library's, not a flag: `m` rather than `-lm`. What that becomes on a command line
+ * is the target's answer and not the author's, because where a library lives is a property of the
+ * machine — libm is a file of its own on ELF, part of `libSystem` on Darwin, and absent altogether
+ * from a freestanding target. A directive that spelled the flag would be right on one platform and
+ * wrong everywhere else, which is the mistake `Toolchain.libraryFlags` exists to make impossible.
+ */
+case class LinkClause(name: String) extends Positioned
+
+/** One file's parse: the module it contributes to, the capabilities and link requirements its header
+ * declares, its statements, and the source it came from.
  *
  * `module` is absent for a file that declares no header, which puts it in the **anonymous root
  * module** — the module whose name is the empty path. A single-file program is exactly that case,
@@ -851,6 +885,12 @@ case class CapabilityClause(direction: CapabilityDirection, name: String) extend
  * `capabilities` is a property of the *module* written on each of its files, so it is read per file
  * and held to agreeing across them (`13 §4`).
  *
+ * `links` is **not** held to agreeing, and that is the one place these two headers differ. A
+ * capability describes what the whole module may do, so files that disagree describe different
+ * modules; a link requirement describes what one file's `extern`s need, so a module whose externs
+ * all sit in one file has nothing to say in the other four. The module's requirement is the union of
+ * its files' (`15 §8`).
+ *
  * `source` is carried because a file is the unit several module rules are stated over, and a
  * diagnostic about one has to name it even where the file holds nothing to point at.
  */
@@ -858,5 +898,6 @@ case class Program(
     body: List[Stmt],
     module: Option[ModuleName],
     capabilities: List[CapabilityClause],
+    links: List[LinkClause],
     source: Source,
 )

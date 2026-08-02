@@ -154,9 +154,21 @@ trait CallAnalysis extends OperatorCalls {
    */
   protected def buildReceiver(mode: RecvMode, tr: TExpr): TExpr = mode match
     case RecvMode.ByValue =>
-      tr.ty match
+      val recv = tr.ty match
         case _: Type.Named => tr
         case _             => autoDeref(tr)
+
+      // A by-value receiver is a **copy**, made by the caller, so calling one needs the layout
+      // exactly as building the value does (`15 §9`). Without this an opaque type's `self` methods
+      // are reachable from outside and the copy is laid out to the fields as they stood when that
+      // caller was compiled — which is the silent ABI break the modifier exists to prevent, since
+      // adding a field to the library would leave the call site copying the old shape. `*self` and
+      // `&self` need no shape and stay reachable, which is what makes them the forms to write.
+      Type.underlying(recv.ty) match
+        case s: Type.Struct => checkLayoutKnown(s.base, s.name)
+        case _              => ()
+
+      recv
 
     case RecvMode.ByPtr =>
       tr.ty match
@@ -196,6 +208,11 @@ trait CallAnalysis extends OperatorCalls {
     // nothing worth restricting.
     checkEveryFieldVisible(name, decl.fields.map(_.name), "the constructor",
       "build it through an associated function of its own")
+
+    // Building one writes every field in order, which is the layout — so a type whose layout is
+    // withheld cannot be built from out here whatever its fields say (`15 §9`). This is not covered
+    // by resolving the name as a type: a construction never names one, it names the constructor.
+    checkLayoutKnown(name, qn(name))
 
     val (targs, pre) =
       if decl.tparams.isEmpty then (Nil, None)

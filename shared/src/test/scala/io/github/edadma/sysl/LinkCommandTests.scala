@@ -10,11 +10,18 @@ import org.scalatest.matchers.should.Matchers
  * mathematics in `libSystem` and the driver links that already; the same program on ELF fails at the
  * link without it. So the machine that finds the bug is not the machine the compiler is developed
  * on, and the only honest test is one that reads the arguments a cross target would be given.
+ *
+ * The library named throughout is `m`, because it is the one the standard module itself asks for
+ * (`lib/sysl/sys/math.sysl`) and the one whose placement differs across all four platforms.
  */
 class LinkCommandTests extends AnyFreeSpec with Matchers {
 
+  /** The command for a program that asked for the mathematics, which is what `sysl.math`'s own
+   * directive makes of every build compiled against the standard module.
+   */
   private def commandFor(target: Target): List[String] =
-    Toolchain.linkCommand("prog.ll", List("core.syslib"), "prog", target)
+    Toolchain.linkCommand("prog.ll", List("core.syslib"), "prog", target,
+                          Toolchain.defaultOptimization, List("m"))
 
   "the mathematics library" - {
     // ELF has libm as a library of its own, so a program that reaches `sysl.math` has to ask for it.
@@ -40,10 +47,46 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
 
     // A target added to the registry without a decision here would fall into whichever arm the match
     // happened to reach. Asking every target in the registry is what makes adding one a decision.
-    "every target in the registry has an answer, and only Linux's is non-empty" in {
-      val asking = Target.all.filter(t => Toolchain.systemLibraries(t).nonEmpty).map(_.os).distinct
+    "every target in the registry has an answer, and only Linux's asks for it" in {
+      val asking = Target.all.filter(t => Toolchain.libraryFlags(List("m"), t).nonEmpty).map(_.os).distinct
 
       asking shouldBe List(Os.Linux)
+    }
+
+    // The directive is what makes it happen at all now. Before `15 §8` the driver appended `-lm` to
+    // every ELF link whether or not anything asked, and this is the assertion that the list is read
+    // rather than remembered.
+    "is not asked for at all when nothing named it" in {
+      Toolchain.linkCommand("prog.ll", Nil, "prog", Target.x86_64Linux) should not contain "-lm"
+    }
+  }
+
+  // A directive names a library and the target spells the flag, which is the whole of `15 §8`'s
+  // translation. These are the cases that are not `-l` plus the name.
+  "resolving a library name for a target" - {
+
+    "passes an unknown library through on every hosted target, since only its placement is guessable" in {
+      for t <- Target.all.filterNot(_.os == Os.Freestanding) do
+        withClue(t.name) { Toolchain.libraryFlags(List("z"), t) shouldBe List("-lz") }
+    }
+
+    // The C runtime is linked unasked everywhere it exists, so naming it is legal and costs nothing.
+    // `15 §8` opened with "-lc and friends", so it has to be writable.
+    "asks for libc nowhere, because every target that has one links it already" in {
+      for t <- Target.all do
+        withClue(t.name) { Toolchain.libraryFlags(List("c"), t) shouldBe empty }
+    }
+
+    "keeps a library a freestanding target might really have" in {
+      Toolchain.libraryFlags(List("m", "boardsupport"), Target.all.find(_.os == Os.Freestanding).get)
+        .shouldBe(List("-lboardsupport"))
+    }
+
+    // Order is the author's lever: an archive is scanned once, left to right, so a library calling
+    // into another has to precede it. Sorting would decide that by spelling.
+    "keeps the order they were written in rather than sorting them" in {
+      Toolchain.libraryFlags(List("png", "z"), Target.x86_64Linux) shouldBe List("-lpng", "-lz")
+      Toolchain.libraryFlags(List("z", "png"), Target.x86_64Linux) shouldBe List("-lz", "-lpng")
     }
   }
 
@@ -108,10 +151,11 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  // A program with no library to link against still gets the system libraries: they resolve what the
-  // *program's own* externs name, not only what the standard module's do.
+  // A program with no library to link against still gets what it asked for: a directive resolves
+  // what the *program's own* externs name, not only what the standard module's do.
   "a link with no archives still asks for the mathematics on Linux" in {
-    val cmd = Toolchain.linkCommand("prog.ll", Nil, "prog", Target.aarch64Linux)
+    val cmd = Toolchain.linkCommand("prog.ll", Nil, "prog", Target.aarch64Linux,
+                                    Toolchain.defaultOptimization, List("m"))
 
     cmd should contain("-lm")
     cmd.indexOf("-lm") should be > cmd.indexOf("prog.ll")
