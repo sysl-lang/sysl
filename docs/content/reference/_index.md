@@ -28,7 +28,12 @@ connections are written down where they matter. Thorough is the point; brevity i
 
 The order runs from the smallest units upward: what the compiler reads, then what a type is, then
 what an expression is, then the declarations that bind them, then the systems built on top —
-memory, generics, modules, errors, and the foreign interface.
+memory, traits, generics, modules, errors, the foreign interface, and the forms that reach into the
+compilation itself.
+
+**What ships beside the language is a section of its own.** The
+[standard library](/library/) is ordinary sysl — no type in it is a language feature and a program
+could have written any of it — so it is documented apart from the rules the compiler enforces.
 
 Cross-references point at the [design chapters](https://github.com/edadma/sysl/tree/dev/docs/design)
 where a rule was argued out. Those are the specification and carry the alternatives that were

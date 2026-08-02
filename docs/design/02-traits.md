@@ -618,8 +618,13 @@ wanted would be inventing ownership.
 
 ### There is no way back to the type
 
-An object cannot be asked what it forgot. There is no cast, no test, no pattern, and no syntax that
-would express one — a type is not a pattern, so even `o is Circle` does not parse. **This is a
+An object cannot be asked what it forgot. There is no cast and no test that would express one. What
+there also is not is a *diagnostic* about downcasting, and that is worth stating exactly, because the
+shape of the refusal is not the one this section originally claimed. A type is not a pattern — so a
+type's name in pattern position is an ordinary **binding**, and `s is Circle` parses, binds every
+`&Shape` to a new name called `Circle`, and is refused as a test that is always true. The outcome is
+the one wanted and the diagnostic is better than a bespoke one would have been, since it also catches
+the reader who meant a binding; but nothing here rests on the form failing to parse. **This is a
 decision, not an omission.** A downcast is the one operation that makes erasure a lie: every other
 rule here says an object offers the trait's members and nothing else, and a type test would say that
 it also secretly offers its identity, which is what the vtable pointer is and what the type deliberately

@@ -156,9 +156,10 @@ sit beside arms that produce an `int` without the arms disagreeing.
 
 ## `string`
 
-A validated UTF-8 string, three words wide, and covered in full on its
-[own page](/reference/strings/). The essentials: it is immutable, indexing it by byte position gives
-bytes, iterating it gives `char`s, and `+` concatenates but will not accept a non-string operand.
+A validated UTF-8 string, three words wide. It is immutable, indexing it by byte position gives
+bytes, iterating it gives `char`s, and `+` concatenates but will not accept a non-string operand. The
+[tour's strings chapter](/tour/strings/) works through building and taking one apart, and the
+operations that live in the library are under [`sysl.text`](/library/).
 
 ## Fixed arrays and slices
 
@@ -193,8 +194,10 @@ print(a[0], a[1], b[0])
 The disagreement in that program is the whole distinction: writing through `b` did not touch `a`
 because `b` is a copy, and writing through `v` did because `v` is a view.
 
-Both carry a length, so **every index is checked**. See [arrays and slices](/reference/arrays/) for
-ranges, the repeat literal, and what a view keeps alive.
+Both carry a length, so **every index is checked**. What a view keeps alive is on
+[memory](/reference/memory/); the range forms that make one are on
+[expressions](/reference/expressions/); and the [tour's arrays chapter](/tour/arrays/) walks the
+repeat literal and the rest.
 
 ## Structs
 

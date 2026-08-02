@@ -475,4 +475,6 @@ because the trees a library ships are now a per-target answer.
 
 ---
 
-Next: [the standard library](/reference/library/).
+That is the language. What ships beside it is the [standard library](/library/), which is a section
+of its own — nothing in it is a language feature, and every type in it is one a program could have
+written.

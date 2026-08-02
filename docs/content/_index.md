@@ -29,6 +29,11 @@ The [tour](/tour/) is the way in: it starts at `print("Hello, sysl!")` and ends 
 reads its input, parses it, and reports what it found. It teaches the standard library alongside the
 language, because the two were designed together.
 
+The [reference](/reference/) is for looking things up once you are writing sysl rather than reading
+about it: every construct in its own place, with the rules complete. The
+[standard library](/library/) is documented apart from it, because none of what ships beside the
+compiler is a language feature.
+
 The [specification](https://github.com/edadma/sysl/tree/dev/docs/design) is the other kind of
 document — numbered chapters that say what the language *is* and why, written for someone deciding
 the design rather than someone learning it.
