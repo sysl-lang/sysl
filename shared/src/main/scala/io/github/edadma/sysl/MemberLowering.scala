@@ -257,11 +257,21 @@ trait MemberLowering extends TypeResolution {
       for tr <- home.fromTrait do memberTrait((home.key, filed)) = tr
 
       // A name a program spells that now reaches more than one member is recorded as reaching all of
-      // them, first one included, so a call has the whole set to answer from. Both reasons a member
-      // is filed under something other than its written name come through here — a second
-      // implementation of one trait, and a second trait declaring a name the first already used.
+      // them, so a call has the whole set to answer from. Both reasons a member is filed under
+      // something other than its written name come through here — a second implementation of one
+      // trait, and a second trait declaring a name the first already used.
+      //
+      // The bare name joins the set only if something was actually **filed** under it. A suffix is
+      // taken by the whole block, so a member the suffixed block alone declares — a default the
+      // trait supplied and the first trait never had — has no bare-named sibling, and listing one
+      // would put a name in the set that nothing can be looked up under.
       if filed != m.name then
-        memberAlts((home.key, m.name)) = memberAlts.getOrElse((home.key, m.name), List(m.name)) :+ filed
+        val prior = memberAlts.getOrElse(
+          (home.key, m.name),
+          if memberDecls.contains((home.key, m.name)) then List(m.name) else Nil,
+        )
+
+        memberAlts((home.key, m.name)) = prior :+ filed
 
       val fd = synthesize(home, m)
 

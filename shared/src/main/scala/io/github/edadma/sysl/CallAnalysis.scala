@@ -55,8 +55,6 @@ trait CallAnalysis extends OperatorCalls {
    * time the call is analyzed, and the bound is the only record of which of `int`'s members under
    * that name the body was promised.
    */
-  protected def boundTraits(written: String): Set[String] =
-    tbounds.getOrElse(written, Nil).flatMap(b => traitKey(b.name)).toSet
 
   /** `Type.name(args)` — resolves and calls an associated function (a member with no receiver).
    * The positional constructor `Type(…)` is a different form and is handled elsewhere.

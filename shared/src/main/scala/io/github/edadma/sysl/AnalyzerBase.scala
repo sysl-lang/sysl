@@ -71,6 +71,24 @@ trait AnalyzerBase extends Scoping {
    */
   protected var tbounds: Map[String, List[BoundRef]] = Map.empty
 
+  /** Which type parameter each **parameter written as a bare one** was written as. `tbounds` says
+   * what `T` was asked for; this says which of the body's names hold a `T`.
+   *
+   * Both halves are needed because the two ways of reaching a member arrive with different things.
+   * An associated function is written through the parameter's own name — `T.zero()` still has the
+   * `T` in it — but a **method** is written through a value, and by the time an instantiation
+   * analyzes `x.id()` the receiver carries the type the substitution produced. Nothing in it
+   * remembers being written as `T`, so without this the body would be refused for an ambiguity its
+   * own signature settled.
+   */
+  protected var pbounds: Map[String, String] = Map.empty
+
+  /** The traits a type parameter was bounded by, as keys — what a use inside the body may reach
+   * through it whether or not the file also imported them, since the signature has named them.
+   */
+  protected def boundTraits(written: String): Set[String] =
+    tbounds.getOrElse(written, Nil).flatMap(b => traitKey(b.name)).toSet
+
   /** Whether the function being analyzed declared its result as a **list** (`12 §5b`) rather than
    * as one type. `retTy` is the tuple its parts lay out as either way; this is what says whether
    * the body writes `a, b` or `(a, b)`, and whether a call yielding a list may stand in its result.
@@ -122,6 +140,7 @@ trait AnalyzerBase extends Scoping {
     outerNested = Set.empty
     blockDeclares = Set.empty
     tbounds = Map.empty
+    pbounds = Map.empty
   }
 
   /** Runs `body` and then restores every table the emitted program is built from.

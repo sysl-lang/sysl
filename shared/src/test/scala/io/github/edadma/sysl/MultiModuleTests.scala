@@ -332,10 +332,14 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
     // A default is copied into every implementing type, wherever those are, and its body is the
     // trait's source — so it reads the trait's module even in a copy made for a foreign type.
+    //
+    // The `import` is what lets `P(5).show()` be written at all: a member arrives with its **trait**
+    // (`13 §2`), and writing the `impl` says which trait is being implemented rather than which one
+    // this file's calls may reach.
     "and a trait's default reads the trait's module in every copy of it" in {
       runIn(
         ("", "main.sysl",
-         "struct P\n    n: int\nimpl fmt.Show for P\n    raw(self) -> int = self.n\nprint(P(5).show())"),
+         "import fmt.Show\nstruct P\n    n: int\nimpl fmt.Show for P\n    raw(self) -> int = self.n\nprint(P(5).show())"),
         ("fmt", "f.sysl",
          "module fmt\nhelper(n: int) -> int = n * 2\ntrait Show\n    raw(self) -> int\n" +
            "    show(self) -> int = helper(self.raw())"),
@@ -348,7 +352,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "and the receiver's own type still means the module the 'impl' was written in" in {
       runIn(
         ("", "main.sysl",
-         "struct P[T]\n    v: T\nimpl[T] fmt.Show for P[T]\n    raw(self) -> int = 5\nprint(P(1).show())"),
+         "import fmt.Show\nstruct P[T]\n    v: T\nimpl[T] fmt.Show for P[T]\n    raw(self) -> int = 5\nprint(P(1).show())"),
         ("fmt", "f.sysl",
          "module fmt\nhelper(n: int) -> int = n * 2\ntrait Show\n    raw(self) -> int\n" +
            "    show(self) -> int = helper(self.raw())"),
@@ -357,7 +361,7 @@ class MultiModuleTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
     "however the 'impl' spelled it" in {
       runIn(
-        ("", "main.sysl", "print(box.P(1).show())"),
+        ("", "main.sysl", "import fmt.Show\nprint(box.P(1).show())"),
         ("box", "b.sysl",
          "module box\nstruct P[T]\n    v: T\nimpl[T] fmt.Show for box.P[T]\n    raw(self) -> int = 5"),
         ("fmt", "f.sysl",

@@ -257,17 +257,24 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   // --- the neighbouring rules, asked rather than assumed -----------------------------------
 
-  "a member arrives with the type, so no import reaches for one" in {
-    // `13 §2`: an `impl` is outside the visibility rule in both directions — a *name* needs an
-    // import and a *member* does not. That was pinned for methods; a member with no receiver is
-    // reached through the type's name rather than through a value, and the rule holds there too.
+  "a member needs the import too, and it is the trait that is imported" in {
+    // `13 §2`: a member is reachable where its **trait** is, exactly as a name is reachable where
+    // its module was asked for. That was pinned for methods; a member with no receiver is reached
+    // through the type's name rather than through a value, and the rule holds there too.
     run(
-      """main()
+      """import sysl.math.Float
+        |
+        |main()
         |    print(real.epsilon() < 1.0e-15, real.max_value() > 1.0e308)
         |""".stripMargin) shouldBe "true true\n"
+
+    err(
+      """main()
+        |    print(real.epsilon() < 1.0e-15)
+        |""".stripMargin) should include("not in scope")
   }
 
-  "a name still needs the import the member did not" in {
+  "and a name needs it in the same way" in {
     err(
       """main()
         |    print(pi)
@@ -408,7 +415,9 @@ class TypeLevelTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // for one must not carry the other thirteen, which is what reachability is for and what a member
     // reached through a type has to keep obeying.
     val out = ir(
-      """main()
+      """import sysl.math.Float
+        |
+        |main()
         |    print(real.zero())
         |""".stripMargin)
 

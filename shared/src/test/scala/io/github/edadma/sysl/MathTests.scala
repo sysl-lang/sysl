@@ -543,21 +543,35 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "the error path" - {
-    // What the import does and does not gate, which is not the same answer for the two halves of the
-    // module. A *name* — `pi`, `min`, `nan` — lives in a submodule and has to be asked for, which is
-    // `13 §1`'s rule and the reason `sysl.math` is a submodule at all. A **member** does not: an
-    // `impl` block is outside the visibility rule in both directions (`13 §2`), so implementing
-    // `Float` for `real` files `sqrt` under `real`'s owner key and it is reached wherever a `real`
-    // is. Pinned here in both directions because the asymmetry is easy to change by accident.
+    // What the import gates, which is now one answer for both halves of the module. A *name* — `pi`,
+    // `min`, `nan` — lives in a submodule and has to be asked for, which is `13 §1`'s rule and the
+    // reason `sysl.math` is a submodule at all. A **member** is asked for the same way: it is
+    // reachable where its **trait** is (`13 §2`), so `Float` giving `real` a `sqrt` reaches only the
+    // files that named `Float`. Pinned in both directions because the symmetry is what a reader is
+    // owed — a submodule costs a program nothing it did not ask for, names and members alike.
     "a name from the module has to be asked for" in {
       err("print(pi)") should include("pi")
       err("print(min(1, 2))") should include("min")
       err("print(nan())") should include("nan")
     }
 
-    "a member arrives with the type it was implemented for" in {
+    "and so does a member, which is the same rule and not an exception to it" in {
+      // This suite's own `run` prepends the wildcard import, so this is the reachable direction.
       run("print((2.0).sqrt() > 1.414)") shouldBe "true\n"
-      super.run("print((144.0).sqrt(), (8.0).cbrt())") shouldBe "12 2\n"
+
+      // Without the import the member is not reachable, and the message is the import — there is
+      // nothing else a file in this position could have been missing.
+      val e = err("print((144.0).sqrt())")
+
+      e should include("'sqrt'")
+      e should include("sysl.math.Float")
+      e should include("not in scope")
+    }
+
+    // Naming the trait by hand reaches it exactly as a wildcard does, which is what makes the rule
+    // about the trait rather than about the module: `cbrt` comes with `Float` and not with `tau`.
+    "naming the trait alone is enough to reach its members" in {
+      super.run("import sysl.math.Float\nprint((144.0).sqrt(), (8.0).cbrt())") shouldBe "12 2\n"
     }
 
     "a width the trait was not implemented for" in {

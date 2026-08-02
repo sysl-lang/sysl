@@ -233,6 +233,15 @@ declared in this module, imported by name, offered by a wildcard, or carried by 
 module is in scope; a library submodule's is not until a file asks for it, exactly as its values are
 not (`§3`).
 
+**This holds whether or not anything else declares the name.** A member is not reachable because
+there is nothing it might be confused with — a file that never named `sysl.math.Float` may not call
+`x.sqrt()`, and the diagnostic is the import, because an import is the whole of what it was missing.
+That makes a submodule cost a program exactly what it asked for in both halves: `pi` and `sqrt` are
+one rule, not a name rule and a member exception to it. The alternative was tried and is worse than
+it looks — if a lone member arrived unasked, then *adding* a trait of your own with that name would
+silently change which implementation an existing call meant, since your trait is in scope and the
+library's is not.
+
 This is what keeps an `impl` for a built-in from spending names. `sysl.math`'s `Float` declares some
 forty-one members on `real` and `f32`, and a program that never imports the module may still declare
 a trait of its own with any of those names and implement it for either width. `guide/fft` does: its
@@ -1176,13 +1185,14 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   what the library asks of its host, so the surface a freestanding target would have to supply is one
   file.
 
-  **It also shows what an import does and does not gate, which is not one answer.** A *name* in a
-  submodule has to be asked for — `pi`, `min` and `nan` all need the import, which is §1's rule and
-  the reason `sysl.math` is a submodule. A **member** does not: §2 puts an `impl` outside the
-  visibility rule in both directions, so implementing the trait for `real` files those methods under
-  `real`'s owner key and a program reaches them wherever it holds a float. Adding a submodule of
-  methods on a built-in therefore widens what every program can call without any program importing
-  anything, and whether that is the wanted answer is (b)'s question asked from the other side.
+  **It also shows what an import gates, which turned out to be one answer.** A *name* in a submodule
+  has to be asked for — `pi`, `min` and `nan` all need the import, which is §1's rule and the reason
+  `sysl.math` is a submodule. A **member** is asked for the same way, and §2 is where that is
+  written: it is reachable where its **trait** is, so implementing `Float` for `real` reaches the
+  files that named `Float` and no others. This was the other answer once, and the asymmetry is what
+  made the question worth asking — a submodule of methods on a built-in would otherwise widen what
+  every program can call without any program importing anything, and claim those member names from
+  every program that would ever compile. Both halves of that went away with the one rule.
 
   What was wrong with growing a *prelude* instead is worth keeping, because it is the constraint on
   the answer: a prelude declaration is one every program carries a **layout** for whether or not it is
