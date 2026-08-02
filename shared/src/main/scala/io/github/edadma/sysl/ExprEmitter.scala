@@ -633,6 +633,45 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case TUnary(op, _, _) =>
       sys.error(s"unreachable unary '$op'")
 
+    // A fence orders the accesses around it and touches nothing, so there is no address to compute
+    // and no value to hand back. `syncscope` is deliberately absent: the default is the whole
+    // system, which is what a program sharing memory with another thread or a device needs.
+    case TFence(ord) =>
+      emit(s"fence ${Atomics.llvm(ord)}")
+      "0"
+
+    // One atomic access. `at` rather than the node's own type decides the width, since a store
+    // answers nothing and would otherwise lower at `void`; the alignment is stated because LLVM
+    // requires it on an atomic load or store and will not infer one.
+    case TAtomic(op, addr, ops, ord, at, ty) =>
+      val p    = genExpr(addr)
+      val vs   = ops.map(genExpr)
+      val ll   = at.llvm
+      val ordr = Atomics.llvm(ord)
+      val al   = Layout.align(at)
+
+      op match
+        case "atomic_load" =>
+          val r = freshTemp(); emit(s"$r = load atomic $ll, ptr $p $ordr, align $al"); r
+        case "atomic_store" =>
+          emit(s"store atomic $ll ${vs.head}, ptr $p $ordr, align $al")
+          "0"
+        // `cmpxchg` answers a pair — the value it found and whether it swapped — and what this hands
+        // back is the value. A caller comparing it against what they expected learns the same thing
+        // the flag would have told them, which is why the raw form has one result rather than a
+        // tuple the library would immediately take apart.
+        case "atomic_cas" =>
+          val pair = freshTemp()
+          emit(s"$pair = cmpxchg ptr $p, $ll ${vs.head}, $ll ${vs(1)} $ordr ${Atomics.failure(ord)}")
+          val r = freshTemp(); emit(s"$r = extractvalue { $ll, i1 } $pair, 0"); r
+        // The rest are one `atomicrmw`, which answers the value that was there *before* — the
+        // property that makes an atomic increment usable as a ticket.
+        case _ =>
+          val kind = op.stripPrefix("atomic_") match
+            case "swap" => "xchg"
+            case k      => k
+          val r = freshTemp(); emit(s"$r = atomicrmw $kind ptr $p, $ll ${vs.head} $ordr"); r
+
     // The operand is read into a register once and the comparisons index off that, which is the
     // whole reason these are a node rather than a tree of the operators they mean (`14 §5`).
     case TIntOp(op, operand, amount, width, ty) =>

@@ -7,13 +7,14 @@ enforced both against the module's own constructions and against what its calls 
 everything it did not narrow away, and `requires` against a *target* is documentation until there is
 one that could fail to satisfy it.
 
-**`no os` and `no posix` are enforced too, and against the module graph rather than against a
-target.** They became checkable the day the library grew a module that declares `requires os` —
-`sysl.fs` — because what an environment capability gates is a whole module, so the rule is that a
-module which gave one up may not *reach* one that needs it, directly or through anything in between.
-`threads` is the last of the four still refused as a narrowing: it gates thread creation and the
-growable channel, neither of which is built, and a clause enforcing nothing would read in a source
-file as a guarantee the compiler never made.
+**The three environment capabilities are enforced too, and against the module graph rather than
+against a target.** Each became checkable the day the library grew a module declaring it — `sysl.fs`
+for `os` and `posix`, `sysl.thread` for `threads` — because what an environment capability gates is a
+whole module, so the rule is that a module which gave one up may not *reach* one that needs it,
+directly or through anything in between. **All four are narrowings now.** The order is the one the
+next capability will arrive in: declared, then gated by something, then narrowable — a clause
+enforcing nothing would read in a source file as a guarantee the compiler never made, so it is
+refused for as long as that is what it would be.
 
 Capabilities govern the allocator / OS / POSIX boundary
 that lets one language span safe application code and allocator-free kernel/driver code. The
@@ -38,14 +39,15 @@ parts of the compiler:
   or heap-backed slice it was handed, because every ARC object carries its own deallocation
   hook (`03`). The **type-checker** enforces this — it is what makes "the kernel allocates
   nothing" a checked guarantee rather than a convention.
-- **`os` / `posix` — *environment* capabilities.** They do not change the language; they gate
-  which **standard-library modules exist**. `sysl.fs` requires `os`; the POSIX compatibility layer
-  would require `posix`. Enforced against the **module graph**, not by the type-checker: the unit is
-  the reference from one module to another, and the diagnostic lands at the reference rather than at
-  the clause, because that is the line a reader has to change.
+- **`os` / `posix` / `threads` — *environment* capabilities.** They do not change the language; they
+  gate which **standard-library modules exist**. `sysl.fs` requires `os`; `sysl.thread` requires
+  `threads` and `posix` both, since pthreads is what it is built on. Enforced against the **module
+  graph**, not by the type-checker: the unit is the reference from one module to another, and the
+  diagnostic lands at the reference rather than at the clause, because that is the line a reader has
+  to change.
 
-`alloc` is the load-bearing one for the memory model. `os` / `posix` layer on the same
-two-level machinery but act at the import boundary.
+`alloc` is the load-bearing one for the memory model. The other three layer on the same two-level
+machinery but act at the import boundary.
 
 ## The core set
 
@@ -54,16 +56,17 @@ two-level machinery but act at the import boundary.
 | `alloc` | language | `&T`, `weak T`, growable arrays, `&Trait`, escaping closures, allocating string ops | — |
 | `os` | environment | OS / syscall standard-library surface | — |
 | `posix` | environment | POSIX compatibility layer | `os` |
-| `threads` | environment | thread creation and the growable channel | — |
+| `threads` | environment | `sysl.thread` — spawning, joining, and the growable channel | — |
 
 `posix` implies `os` (POSIX needs an OS); config validation enforces the implication. The set
 is extensible, but these four are the core.
 
 `threads` gates *spawning*, not soundness: what may cross a domain boundary is a structural
-rule the type checker applies regardless (`06`). A target with no scheduler simply does not
-offer it, and a module may narrow it away to declare itself single-threaded. Note that a
-**fixed-capacity** channel needs neither `alloc` nor `threads` to exist — allocator-free code
-can still receive on one.
+rule (`06`), and one that has no check behind it until the channel is written. A target with no
+scheduler simply does not offer it, and a module may narrow it away to declare itself
+single-threaded. Note that a **fixed-capacity** channel needs neither `alloc` nor `threads` to
+exist — allocator-free code can still receive on one, which is the same reason `sysl.sync` requires
+nothing at all while `sysl.thread` requires two.
 
 ## Two levels: target provides, module narrows
 
@@ -193,9 +196,11 @@ allocator-free everywhere.
   rather than creating one. `guide/kernel` cannot carry it at all, because its machine and its checks
   are one module. Nothing here is wrong; what it says is that **a module is a coarse unit for this
   question**, and it is the same observation the granularity bullet above makes from the other end.
-- **Narrowing is enforced for everything but `threads`.** `os` and `posix` became narrowings the day
-  there was something for them to gate, exactly as this bullet predicted; `threads` is still read and
-  refused with the reason, since thread creation and the growable channel are not built.
+- **Narrowing is now enforced for all four.** Each became a narrowing the day there was something
+  for it to gate, exactly as this bullet predicted when it named only `alloc`: `os` and `posix` when
+  `sysl.fs` was written, `threads` when `sysl.thread` was. The refusal that carried them until then
+  refuses nothing today and stays for the next capability, which will arrive declared before it is
+  gated.
 - **The clause spends two ordinary words, and one of them is wanted.** `no alloc` and `requires
   alloc` are read by the lexer, so `no`, `alloc` and `requires` are all reserved and none of them may
   name anything. `guide/slab` ran into it immediately: an allocator's central function is called

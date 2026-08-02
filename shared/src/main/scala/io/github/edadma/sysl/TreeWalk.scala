@@ -92,6 +92,9 @@ object TreeWalk {
     case TBinary(_, l, r, _)        => List(l, r)
     case TUnary(_, v, _)            => List(v)
     case TIntOp(_, v, n, _, _)      => v :: n.toList
+    // The ordering is a keyword rather than an operand, so a walk sees the address and the values.
+    case TAtomic(_, a, ops, _, _, _) => a :: ops
+    case TFence(_)                  => Nil
     case TLogical(_, l, r)          => List(l, r)
     case TCompare(ops, _)           => ops
     case TSeq(exprs)                => exprs

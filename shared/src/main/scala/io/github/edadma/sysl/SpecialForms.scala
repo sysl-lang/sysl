@@ -27,7 +27,8 @@ trait SpecialForms extends Closures {
    * nothing else would know they are forms at all.
    */
   protected val specialFormNames: Set[String] =
-    Set("print", "str", "format", "from_utf8_unchecked", "va_start", "va_end", "va_arg", "va_copy", "ptr_cast")
+    Set("print", "str", "format", "from_utf8_unchecked", "va_start", "va_end", "va_arg", "va_copy", "ptr_cast") ++
+      Atomics.names
 
   /** `print(a, b, …)` — each value rendered by the library function its type reaches, a space
    * between and a newline at the end.

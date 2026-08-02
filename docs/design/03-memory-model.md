@@ -134,8 +134,15 @@ holds, so destroying the head of a long `&T` chain — a linked list, a degenera
 recurse one stack frame per node and overflow the stack. It does not: when a count reaches zero
 the object is pushed onto a worklist, reusing its now-dead refcount slot as the link, and the
 *first* release to hit zero drains the worklist in a loop. Each destructor it runs pushes more
-work rather than recursing, so a structure of any depth comes apart in O(1) stack. The worklist
-is per-thread in principle; while drops are single-threaded a plain global suffices.
+work rather than recursing, so a structure of any depth comes apart in O(1) stack.
+
+**The worklist is per thread**, because it is scratch space a drain uses and not state anything
+shares. Two threads letting go of the last reference to two unrelated `&sync` structures at the
+same moment both reach it, and one list between them would have each overwrite the other's head —
+an object dropped on the floor, or drained twice. Neither is a race the counts could have caught:
+the counts are what got both threads there correctly. On a target with no thread-local storage it
+stays a single list, which is exactly as correct there as it was everywhere before — nothing on a
+bare machine can spawn (`06 § Threads are a capability`).
 
 Putting the destructor *behind* the hook rather than inline at each release site is what makes
 letting go of a reference **type-erased**: one instruction sequence, no static type. Slices
@@ -1032,7 +1039,7 @@ model, and propagation through imports — is specified in **`capabilities.md`**
 | null dereference | non-null references; nullable is `Option` |
 | out-of-bounds | length-carrying arrays/slices, checked everywhere |
 | slice outliving its buffer | the slice's `owner` word retains it; escaping locals are promoted |
-| refcount race across threads | `&T` cannot cross a domain; `&sync T` is atomic (`06`) |
+| refcount race across threads | `&sync T` is atomic; `&T` may not cross a domain — *specified, and unchecked until the channel is written* (`06`) |
 | dangling / wild pointer | impossible without `*T` |
 
 Only `*T` opts out — visibly.

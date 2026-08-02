@@ -34,13 +34,15 @@ object Capability {
    */
   val environment: Set[String] = Set(Os, Posix, Threads)
 
-  /** The ones a module may give up today.
+  /** The ones a module may give up today, which is now all four.
    *
-   * `threads` is absent because nothing gates thread creation yet, and a clause that compiled and
-   * enforced nothing would read in a source file as a guarantee the compiler never made. `os` and
-   * `posix` earned their place when the first module requiring one was written.
+   * A capability is added here when something starts enforcing it, and not before: a clause that
+   * compiled and enforced nothing would read in a source file as a guarantee the compiler never
+   * made. `os` and `posix` earned their place when the first module requiring one was written, and
+   * `threads` earned its the same way, when `sysl.thread` was. The set stays because that is the
+   * order the next capability will arrive in — declared, then gated, then narrowable.
    */
-  val narrowable: Set[String] = Set(Alloc, Os, Posix)
+  val narrowable: Set[String] = Set(Alloc, Os, Posix, Threads)
 
   /** `cap` together with everything it implies. */
   def closure(cap: String): Set[String] = implies.getOrElse(cap, Set.empty) + cap
@@ -150,21 +152,22 @@ trait Capabilities extends AnalyzerBase {
 
   /** Refuses a clause that names nothing, or that narrows away a capability nothing yet gates.
    *
-   * The second is the honest half, and it is now down to one. `no alloc` is checked at every
-   * construction that makes heap storage; `no os` and `no posix` are checked against the module
-   * graph, which they could not be until a module requiring one existed (`sysl.fs` is the first).
-   * `threads` gates thread creation and the growable channel, and neither is built — a clause that
-   * compiled and enforced nothing would be worse than one that is refused, because it would read in
-   * a source file as a guarantee the compiler never made.
+   * The second half now refuses nothing, and that is the state it was built to reach rather than
+   * dead weight. `no alloc` is checked at every construction that makes heap storage; the other
+   * three are checked against the module graph, which none of them could be until a module requiring
+   * one existed — `sysl.fs` for `os` and `posix`, `sysl.thread` for `threads`. The check stays
+   * because the next capability to be declared will arrive before whatever gates it, and in that
+   * window a clause that compiled and enforced nothing would read in a source file as a guarantee
+   * the compiler never made.
    */
   private def checkClause(c: CapabilityClause): Unit = {
     if !Capability.implies.contains(c.name) then
       err(s"no capability is called '${c.name}' — the set is ${Capability.core.map(n => s"'$n'").mkString(", ")}")
 
     if c.direction == CapabilityDirection.Narrows && !Capability.narrowable(c.name) then
-      err(s"'no ${c.name}' is not enforced yet, and would say something the compiler does not check: " +
-        s"'${c.name}' gates thread creation and the growable channel, and neither is built. " +
-        "'no alloc', 'no os' and 'no posix' are the narrowings that mean something today")
+      err(s"'no ${c.name}' is not enforced yet, and would say something the compiler does not check " +
+        s"— nothing gates '${c.name}'. The narrowings that mean something today are " +
+        Capability.core.filter(Capability.narrowable).map(n => s"'no $n'").mkString(", "))
   }
 
   /** Holds the files of one module to declaring the same clauses (`13 §4`).

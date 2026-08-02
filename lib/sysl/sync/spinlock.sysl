@@ -1,0 +1,55 @@
+module sysl.sync
+
+// Mutual exclusion for code that cannot block, held by spinning rather than by sleeping.
+//
+// **This is the lock a kernel has before it has a scheduler.** Blocking means handing the processor
+// to something else, which means there is something else to hand it to; the allocator, the
+// scheduler's own run queue, and an interrupt handler are all code that has to take a lock before
+// any of that exists, and this is what they take. `sysl.sync` requires no capability, so a module
+// under `no alloc` and `no os` can reach it -- which is the whole reason the module is split this
+// way (`06 § The kernel tier`).
+//
+// **A thread that spins burns its processor for as long as it waits**, so this is right only where
+// the hold is short and bounded -- a few instructions under the lock, no allocation, no system call,
+// and above all no second lock. Where a wait may be long, or where the holder might be descheduled
+// mid-hold, the answer is a `Mutex[T]` and a real blocking primitive underneath it. On one processor
+// with no preemption a spin is a deadlock outright: nothing can release what nothing else is running
+// to release.
+//
+// **It guards nothing by construction**, unlike `Mutex[T]`, which owns what it protects. A spinlock
+// is a flag beside the data, and what the data is stays the programmer's to remember -- again as in
+// C, and for the same reason: the code that needs this is code that is also reaching through raw
+// pointers, where a type that owned its contents would have nothing coherent to own.
+struct SpinLock
+
+    // Zero when free, one when held. Not an `Atomic[i32]` even though that is exactly what it is
+    // used as: this is the file `Atomic[T]` is defined in, and a lock whose whole implementation is
+    // three atomic operations reads better as those three than as a wrapper around a wrapper.
+    held: i32
+
+    // Takes the lock, spinning until it is free.
+    lock(*self)
+        while atomic_swap(&self.held, 1i32, Acquire) != 0i32
+            // Spin on a plain **load** until it looks free, and only then try the exchange again.
+            // A read-modify-write has to take the cache line exclusively every time round, so
+            // waiters spinning on the exchange itself fight each other for the line and slow down
+            // the holder trying to write the release -- the one thread whose progress everyone is
+            // waiting on. A relaxed load spins in a shared line and costs nobody anything.
+            var busy = atomic_load(&self.held, Relaxed)
+
+            while busy != 0i32
+                busy = atomic_load(&self.held, Relaxed)
+    end lock
+
+    // Takes the lock if it is free, and answers whether it did. Never spins.
+    try_lock(*self) -> bool = atomic_swap(&self.held, 1i32, Acquire) == 0i32
+
+    // Releases the lock.
+    //
+    // Nothing checks that the releasing thread is the one that took it, or that it was held at all:
+    // that would be a second word to maintain on every take, paid by every correct program, to
+    // diagnose a bug the discipline above already asks the reader to hold to.
+    unlock(*self)
+        atomic_store(&self.held, 0i32, Release)
+
+end SpinLock
