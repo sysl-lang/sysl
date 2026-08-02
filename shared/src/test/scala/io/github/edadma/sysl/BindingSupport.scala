@@ -19,10 +19,11 @@ object Bindings {
  *
  * **These suites read the checked-in source rather than a fixture, and that is the point.** A
  * binding is not a worked example whose audience is a reader — it is a library other programs
- * depend on, exactly as `devlib/demo` is, and the failure worth catching is the one where its
- * source stops agreeing with the C library underneath it. A fixture reconstructed in the test would
- * pin a copy and leave the real file free to rot. The demo program beside each root is the reader's
- * half, and is deliberately left alone.
+ * depend on, and the failure worth catching is the one where its source stops agreeing with the C
+ * library underneath it. A fixture reconstructed in the test would pin a copy and leave the real
+ * file free to rot, which is why `DevLibraryTests` writing its library out is right for what *it*
+ * proves and would be wrong here. The demo program beside each root is the reader's half, and is
+ * deliberately left alone.
  *
  * What these suites are *not* is a second test of `15 §7` or `15 §8`. Those are pinned on fixtures
  * in `LibraryBuildCliTests`, where the inputs can be chosen to be discriminating. Here the claims
