@@ -161,6 +161,41 @@ a quiet local of the entry point. A module member that wants the form declares i
 The same spelling also takes a **result list** and a **tuple** apart, which is why a function with
 several results needs no special form at the call.
 
+### By pattern, when the shape matters
+
+A comma list says how *many* things to bind. A **pattern** says the shape, and so reaches inside a
+tuple that holds another one — which is the whole of the difference between the two forms.
+
+```sysl
+show()
+    val (a, b) = (1, 2)
+    val ((x, y), z) = ((3, 4), 5)
+    val (first, _) = (6, 7)
+
+    var (lo, hi) = (0, 10)
+
+    hi = hi + 1
+
+    print(a, b, x, y, z, first, lo, hi)
+
+show()
+```
+
+```output
+1 2 3 4 5 6 0 11
+```
+
+A `_` binds nothing and skips its part. A `var` pattern makes every name it binds assignable, and a
+`val` pattern makes each of them write-once, exactly as the single-name forms do.
+
+**Only a pattern that cannot fail may stand at a binding** — a tuple pattern, a name, a wildcard, and
+those nested inside one another. A literal, a range, or a variant is a *test*, and a binding has no
+other arm to take when the test does not match, so each is refused by name. Those belong in a `match`
+(see [Patterns](../patterns/)).
+
+Like the comma form, this is **a local form**: the parts have nowhere to carry a type, so one at the
+top of a file is refused rather than becoming a quiet local of the entry point.
+
 ## Functions
 
 A name, a parameter list, an optional `-> result`, and a body. There is no keyword: the shape is what

@@ -30,7 +30,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | `sysl.text` | the whole text surface — validation, the character cursors, `Ascii` and `Search`, splitting and joining, `StrBuilder`, the parsers, `CString` |
 | `sysl.io` | `Reader`, `stdin()`, `lines()` |
 | `sysl.fs` | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` |
-| `sysl.math` | `max`, `min`, `pi`, the float functions, and the integer traits `Signed` and `Bits` |
+| `sysl.math` | `max`, `min`, `pi`, the float functions, the integer traits `Signed` and `Bits`, and the integer arithmetic above them — `pow`, `gcd`, `lcm`, `divmod`, `is_power_of_two`, `next_power_of_two` |
 | `sysl.sync` | `Atomic[T]`, `SpinLock`, and the five memory orderings |
 | `sysl.thread` | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` |
 | `sysl.args` | `args_of`, for reading a raw `argv` |

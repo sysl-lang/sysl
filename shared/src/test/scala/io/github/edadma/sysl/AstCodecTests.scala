@@ -312,6 +312,40 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "a literate file's positions survive the round trip" in {
+    // What is stored is the text the positions were recorded against, which for a `.lsysl` file is
+    // its program with the four columns that made it program text already gone (`Literate`). A
+    // decoded source that had forgotten the margin would report every column in a library's literate
+    // file four too small — right up until someone tried to open one at the location given.
+    val src = "    add(a: int, b: int) -> int = a + b\n"
+
+    val back = roundTrip(List(SyslParser.parse(Source("m.lsysl", src)) match {
+      case Right(p) => p
+      case Left(e)  => fail(e)
+    }))
+
+    val at = positionsOf(back.head.body).flatten.head
+
+    at._1 shouldBe "m.lsysl"
+    back.head.source.columnOffset shouldBe 4
+    Pos(back.head.source, at._2, at._3).location shouldBe s"m.lsysl:${at._2}:${at._3 + 4}"
+  }
+
+  // A pattern binding carries a *pattern* rather than a list of names, so the encoder has a nested
+  // structure to write where every other binding form has a flat one. Nesting and a wildcard are
+  // both here because each is a way the shape can be lost while the names survive.
+  "a pattern binding keeps its shape across the format" in {
+    val src =
+      """show() =
+        |    val ((a, b), _) = ((1, 2), 3)
+        |    var (c, d) = (4, 5)
+        |    print(a, b, c, d)
+        |
+        |show()""".stripMargin
+
+    roundTrip(List(parsed(src))).head.body shouldBe parsed(src).body
+  }
+
   "a decoded tree compiles to the same program the parsed one does" in {
     // The point of the format: what comes back is not merely equal, it is usable. Compiling
     // through it exercises the analyzer and codegen over decoded nodes rather than parsed ones.

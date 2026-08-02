@@ -421,6 +421,60 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
+  /** A library written as a document (`15 §11`). The whole path is the point: the walk has to find
+   * the file, the build has to compile it, the artifact has to carry a source whose text is the
+   * program rather than the document, and a program that links it has to run.
+   */
+  "a literate library" - {
+
+    val doc =
+      """A library, explained
+        |====================
+        |
+        |This paragraph is not compiled, and neither is the fenced block below it.
+        |
+        |```
+        |double(n: int) -> int = n * 3
+        |```
+        |
+        |That would be wrong. This is right:
+        |
+        |    module demo
+        |
+        |    double(n: int) -> int = n * 2
+        |""".stripMargin
+
+    "builds, links, and answers what its indented half says" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = artifactOf(rootOf("demo", doc, "lib.lsysl"))
+      val prog = program("import demo.*\n\nprint(double(21))")
+
+      ran(Config(command = "run", file = prog, libs = List(lib))) shouldBe "42\n"
+    }
+
+    "and a diagnostic against it names the line and column of the document" in {
+      // The document is on disk and reached by the walk, so this is the whole path a user has: the
+      // file they are editing, the location they are given, and the line they are shown. The column
+      // counts the four that made the line program text — 23 in the text the lexer saw.
+      val wrong =
+        """A generic, whose body is checked where it is written
+          |
+          |    module demo
+          |
+          |    twice[T](x: T) -> T = x + x
+          |""".stripMargin
+
+      val out = createTempFile("sysl-cli-", LibraryArtifact.extension)
+      val (status, notes) =
+        diagnostics(Config(command = "build-lib", file = rootOf("demo", wrong, "lib.lsysl"), output = Some(out)))
+
+      status should not be 0
+      notes should include("lib.lsysl:5:27")
+      notes should include("twice[T](x: T) -> T = x + x")
+    }
+  }
+
   /** What an artifact may advertise is what a linker can resolve, and a `private` declaration is not
    * that: its symbol is emitted `internal` (`13 §2`), which says every caller is inside the module
    * that defines it.

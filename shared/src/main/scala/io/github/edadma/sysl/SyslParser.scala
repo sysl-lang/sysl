@@ -465,9 +465,26 @@ class SyslParser(val source: Source) extends DeclParser {
 
   protected lazy val varDecl: PackratParser[Stmt] =
     multiDecl("var", mutable = true) |
+      patternDecl("var", mutable = true) |
       op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
         case n ~ t ~ e => VarDecl(n, t, e.map(Placeholders.lift))
       }
+
+  /** `val (a, b) = …` / `var (a, b) = …` — a binding written as a **pattern** (`00 §13`).
+   *
+   * It is tried after the comma form and before the plain one, which is all the ordering it needs:
+   * the three are told apart by their first token, a pattern binding being the only one whose name
+   * position opens with a parenthesis. The plain form still reads a bare name, so nothing that
+   * parsed before this existed parses differently now.
+   *
+   * **The pattern is the whole of the left side, with no type annotation beside it.** That is
+   * `12 §5b`'s open question again rather than an oversight — the parts of a destructuring have
+   * nowhere to carry a type, and inference covers what the form is for.
+   */
+  protected def patternDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
+    (op(keyword) ~> tuplePattern) ~ (op("=") ~> expression) ^^ {
+      case p ~ v => PatternDecl(p, mutable, Placeholders.lift(v))
+    }
 
   /** `ref name = place` (`03 § ref`).
    *
@@ -517,6 +534,7 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val valDecl: PackratParser[Stmt] =
     multiDecl("val", mutable = false) |
+      patternDecl("val", mutable = false) |
       op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
         case n ~ t ~ v => ValDecl(n, t, Placeholders.lift(v))
       }
@@ -800,9 +818,15 @@ object SyslParser {
    * is parsed is already the file this target sees. Every other seam is unaffected — the gate is not
    * applied to an expression fragment or to a string interpolation's contents, neither of which is a
    * file, and a source with no directives in it is not even copied.
+   *
+   * **Tangling comes first, and the order is the whole of what makes the two features independent.**
+   * A literate file's directives are written in its program, which is indented (`Literate`) — so
+   * gating first would be gating a file whose `#if` lines are four columns in, and `Conditional`
+   * would have to learn about a format that is none of its business. Tangled first, what the gate
+   * receives is ordinary sysl and it behaves exactly as it does for a file that was never literate.
    */
   def parse(source: Source, target: Target): Either[String, Program] =
-    Conditional.gate(source, target).flatMap(parsed)
+    Literate.tangle(source).flatMap(Conditional.gate(_, target)).flatMap(parsed)
 
   /** The same, for the machine a caller that names none would get. Spelled as its own overload
    * rather than as a default argument because only one of these alternatives may carry defaults, and

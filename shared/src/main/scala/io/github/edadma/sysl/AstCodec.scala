@@ -281,6 +281,7 @@ object AstCodec {
         case RefDecl(n, p)                => tok("ref"); sref(n); expr(p)
         case MultiAssign(op, ts, vs)      => tok("masg"); sref(op); list(ts)(expr); list(vs)(expr)
         case MultiDecl(ns, mut, vs)       => tok("mdcl"); list(ns)(sref); bool(mut); list(vs)(expr)
+        case PatternDecl(p, mut, v)       => tok("pdcl"); pattern(p); bool(mut); expr(v)
         case ExprStmt(x)                  => tok("es"); expr(x)
         case Return(v)                    => tok("ret"); opt(v)(expr)
         case Break(l, v)                  => tok("brk"); opt(l)(sref); opt(v)(expr)
@@ -487,7 +488,12 @@ object AstCodec {
         val body  = strings(parts(1).toInt)
         val dir   = if parts(2) == "1" then Some(parts.drop(4).toList.map(x => strings(x.toInt))) else None
 
-        sources(k) = known.getOrElse(name, new Source(name, body, dir))
+        // What was stored is the text the *positions* were recorded against, which for a literate
+        // file is its program with the left margin already gone (`Literate`). The margin is how far
+        // a reported column has to move to name the file again, and it is read back off the name for
+        // the same reason it is read off the name anywhere else — nothing inside the text says.
+        sources(k) =
+          known.getOrElse(name, new Source(name, body, dir, if Literate.named(name) then Literate.Indent else 0))
 
       val count = line().toIntOption.getOrElse(fail("the program count is not a number"))
       val b     = List.newBuilder[Program]
@@ -630,6 +636,7 @@ object AstCodec {
         case "ref"  => RefDecl(sref(), expr())
         case "masg" => MultiAssign(sref(), list(expr()), list(expr()))
         case "mdcl" => MultiDecl(list(sref()), bool(), list(expr()))
+        case "pdcl" => PatternDecl(pattern(), bool(), expr())
         case "es"   => ExprStmt(expr())
         case "ret"  => Return(opt(expr()))
         case "brk"  => Break(opt(sref()), opt(expr()))

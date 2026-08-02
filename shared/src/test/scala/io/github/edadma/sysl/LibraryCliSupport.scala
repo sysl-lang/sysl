@@ -57,12 +57,12 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
    */
   protected def libraryRoot(): String = rootOf("demo", library)
 
-  protected def rootOf(module: String, text: String): String = {
+  protected def rootOf(module: String, text: String, file: String = "lib.sysl"): String = {
     val root = createTempDirectory("sysl-cli-lib-")
     val dir  = s"$root/$module"
 
     createDirectory(dir)
-    writeFile(s"$dir/lib.sysl", text)
+    writeFile(s"$dir/$file", text)
     root
   }
 

@@ -154,9 +154,9 @@ Nothing in this section is an independent decision; it is what §1–§4 and `13
 1. **Discover.** Walk from the project root — whose location is the project-config doc's to settle
    (`13` §Open a). Every directory containing sources is a module, and `readdir` gives its file
    set with no parsing at all.
-2. **Parse** every file, **for the target** — the lines of a branch this build is not for are
-   blanked first (`targets.md § Conditional compilation`), so what is parsed is already the file
-   this machine sees. `13` §3 establishes that a qualified reference can create a dependency no
+2. **Parse** every file, **for the target** — a literate file's prose is blanked first (§11) and
+   then the lines of a branch this build is not for are (`targets.md § Conditional compilation`), so
+   what is parsed is already the program this machine sees. `13` §3 establishes that a qualified reference can create a dependency no
    header mentions, so the module graph is *not* recoverable from a header scan; discovery reads
    whole files. This is a parse — no name resolution, no typechecking.
 3. **Order.** Build the module graph, reject a cycle naming the modules on it (`13` §6), and
@@ -458,6 +458,67 @@ start with that word and only the first is a convention: `interrupt timer()` dec
 today — so a second convention is a change to what the analyzer accepts rather than to every tree
 that holds a function. `extern` still implies the C ABI with nothing written, which is what the
 overwhelming majority of foreign declarations want.
+
+## 11. A source file may be a document with the program inside it
+
+**A file named `.lsysl` is Markdown, and the part of it indented four columns is the program.**
+Everything else is prose and is not compiled. There is no other marker: no name on a block, no
+directive opening one, no way to say that a block ends — a `.lsysl` file with no prose in it is a
+`.sysl` file with four spaces down the left, and a `.sysl` file is never read this way whatever its
+indentation happens to look like. Which of the two a file is, its **name** decides and nothing else.
+
+This is Knuth's *WEB* with its most famous half deliberately left out. WEB let an author write the
+program in the order that explains it and had the tangler put it back into the order the compiler
+needs, which is the feature that made a `.web` file unreadable without its tools. Here the code
+appears in the order it runs and the tangler only removes prose, so the file is legible as it sits —
+by a reader, by a Markdown renderer, and by `grep`. What is kept is the part that pays: room for an
+argument between two functions, in a place a comment cannot hold it.
+
+**Consecutive indented blocks are one block.** A paragraph between two of them does not end anything,
+so a function body can be explained a step at a time — the prose dedents to column zero, and the code
+resumes at the indentation it left off at. Without this the format would only be good for examples,
+which is the length at which it is not needed.
+
+**A fenced block is an illustration.** ` ``` ` and `~~~` mark code that is to be *looked at* rather
+than run — the wrong version beside the right one, a shell transcript, output, a fragment of C — and
+none of it is compiled however it is indented. Code that runs is indented; code that is shown is
+fenced. A chapter needs both, and confusing them is the one thing this format could get wrong that
+would not be visible on the page.
+
+### Positions survive, and that decides the implementation
+
+**Prose is blanked, not removed.** The text handed to the lexer has exactly as many lines as the
+file, and each line of program text is on the line it was written on — so every position the lexer
+records is already a position in the `.lsysl` file. There is no mapping table and no pass below the
+parser knows that any of this happened. It is the same device conditional compilation already uses
+on a branch this build is not for (`targets.md`), and the two compose in that order: **tangle, then
+gate**, so a `#if` written inside the program is an ordinary directive by the time the gate sees it.
+
+The alternative — concatenating the code blocks and compiling the result — is a third of the code and
+loses the line numbers, which are the difference between a diagnostic and a puzzle. That it also
+happens to be what a Markdown library would hand you is worth stating plainly: the AST such a library
+produces carries the block's *text* and not where the text was, so the shortest path to this feature
+is the one that cannot be made to work.
+
+The one coordinate that does move is the **column**, by the four that made the line code. The source
+carries how far, and it is added back where a position is *reported* rather than where it is
+recorded, so a location names the column of the file the reader has open.
+
+### Two things are refused that Markdown would accept
+
+Both are the same failure — a program silently missing a piece of itself — and neither can be
+diagnosed later, because what reaches the compiler afterwards is a program that is merely smaller
+than the author's.
+
+**A tab in the indentation.** A tab is as wide as whatever is displaying it, so a tab-indented line
+is program text in one editor and prose in another. It is refused *before* the four-column test
+rather than failing it, since failing it is the silent outcome: the line becomes prose, and a
+function quietly loses a statement.
+
+**A fence that is never closed.** Markdown runs an unclosed fence to the end of the document, which
+for a document is harmless. Here it turns every declaration below it into an illustration, and the
+diagnostic the author would get is about something incomplete further up — their missing half never
+enters the story. Refused at the line that opened it, which is the line to go and look at.
 
 ## Open (not yet decided)
 

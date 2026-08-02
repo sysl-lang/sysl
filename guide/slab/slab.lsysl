@@ -1,0 +1,198 @@
+A slab allocator
+================
+
+One region of bytes carved into fixed blocks, with the free list threaded through the free blocks'
+own storage.
+
+The axis this owns is **raw storage** — reinterpreting bytes as a typed pointer, asking what a type's
+storage costs, and the address arithmetic between the two. Nothing else in the set touches any of it.
+`guide/kernel` is allocator-free but never *makes* storage; it is handed three fixed tables and
+indexes them. This program is the other side of that: it is the thing a program with no allocator
+would have to write before it could have one, which is why it is written with no allocator itself.
+
+It is generic in what it holds, and that is the point rather than a flourish. A slab over one
+hardcoded struct needs no `sizeof` at all — a literal block size would do — so the generic form is
+what makes the measurement load-bearing, and it is the shape a real allocator has.
+
+The free list is **intrusive**: a block that is free holds the address of the next free block in its
+own first bytes, so the list costs no storage beside the region. That is what a slab allocator is,
+and it is only writable because a `*u8` can be read as a `**u8` and back.
+
+Deliberately not modelled: more than one block size, coalescing, and returning the region. The first
+is a different allocator, and the other two need a heap this program is written without.
+
+
+What writing it found
+---------------------
+
+**The language cannot demand that storage be aligned.** A `[N]u8` is aligned to one, because that is
+what its element needs, and there is no `alignas`. So a region declared the obvious way is not
+aligned for anything carved out of it, and every load through the resulting pointer is unaligned —
+which x86 tolerates and which faults on some of the targets this language is for. The allocator
+therefore rounds its own base up, exactly as a real one does, paying up to `alignof(T) - 1` bytes of
+the region for it. That is the right behaviour for an allocator and the wrong reason to have written
+it: an allocator rounds up because its *caller's* region is wherever it is, not because the language
+could not say what it wanted. `alignof` made the rounding writable; a declaration attribute would
+have made it unnecessary here.
+
+**`sizeof` is what makes a container generic, and `alignof` is what makes it correct.** With only the
+first, a slab over any `T` still lays its blocks at whatever offset the region began at. The two
+arrived together for this reason rather than by tidiness.
+
+**A block has to be wide enough to hold the list that threads it.** `sizeof(T) >= sizeof(*u8)` is a
+real precondition — a slab of `u16` cannot store an address inside a free block — and it is a
+`require` rather than a comment because both sides of it are constants the compiler already knows. A
+language without `sizeof` could not have stated it at all.
+
+**Nothing checks a reinterpreted pointer, and nothing should.** `ptr_cast` hands back a `*T` aimed at
+bytes that hold no `T` yet; the caller writes one before reading one, and no rule here says so. That
+is the raw tier behaving as `03` says it does — the same assertion `p[i]` past the end already is —
+and it is why the whole file is greppable for the three operations that take on the risk.
+
+**This module is allocator-free and cannot say so.** `no alloc` is what would state it — nothing here
+takes a `&T`, and the whole point of an allocator is that it runs where there is none — and the
+clause is designed (`capabilities.md`, `13 §4`) and not built, so writing it is a diagnostic saying
+exactly that. The claim therefore lives in this paragraph, which is the weakest place it could live:
+nothing checks it, and a `&T` added tomorrow would be accepted. `guide/bytecode`'s VM half recorded
+the same absence; this is the second program to want the declaration and the first for which it is
+the subject rather than a detail.
+
+**An allocator may not call its function `alloc`.** The word is reserved, because `no alloc` is a
+declaration a module carries (`13 §4`), so the most natural name in the whole program is the one name
+it cannot have. It is spelled `take` here. The cost is small and the shape of it is not: a capability
+written as two ordinary words takes both of them out of the namespace, and `alloc` is a word the code
+that *provides* the capability wants most.
+
+**The one thing the compiler still refuses is a `&T`.** An early draft tried to hand back a counted
+reference, on the grounds that a slab block outlives its user. It cannot: ARC would have no count to
+own, and the safe subset relies on a `&T` being a live object. So an allocator's result is a `*T` and
+stays in the raw tier, which is where a caller reaching for one already is.
+
+
+Reading a free block as a link
+------------------------------
+
+A block that is free holds the next free block's address in its own storage, so the list is reached
+by reading the block as a pointer to a pointer. Both halves of that are here so the reinterpretation
+appears twice in the file rather than at every use.
+
+    link(b: *u8) -> **u8
+        ptr_cast(b)
+    end link
+
+    next_free(b: *u8) -> *u8
+        *link(b)
+    end next_free
+
+
+The slab
+--------
+
+A region carved into blocks of one type, and the head of the list of the ones nobody holds.
+
+`first` is the aligned start rather than the region's own, so the region's first bytes may not belong
+to any block — see `slab_over` below. `made` is how many blocks fitted after that.
+
+    struct Slab[T]
+        first: *T
+        free: *u8
+        made: usize
+
+
+Carving the region
+------------------
+
+`slab_over` cuts `bytes` of the region at `region` into as many blocks of `T` as fit, and threads
+every one of them onto the free list.
+
+    slab_over[T](region: *u8, bytes: usize) -> Slab[T]
+
+The precondition is the one the intrusive list imposes, and both sides of it are constants — so this
+is a compile-time-known fact stated where the compiler can hold the caller to it.
+
+        require sizeof(T) >= sizeof(*u8), "a free block has to be wide enough to hold the link through it"
+
+Rounding the base up is what costs the region its first `lost` bytes, and `made` counts what fits
+after that rather than what would have fit from the region's own start.
+
+        var start = usize(region)
+        var base = aligned_up(start, alignof(T))
+        var lost = base - start
+        var block = sizeof(T)
+        var made = if bytes > lost then (bytes - lost) / block else 0usize
+        var first: *u8 = ptr_cast(base)
+        var head: *u8 = null
+        var i = made
+
+The blocks are linked **back to front**, so the head ends up at the lowest address and the first
+allocation is the first block. Nothing requires that; it is done so the checks can say where a block
+came from.
+
+        while i > 0 do
+            i -= 1
+
+            var b: *u8 = &first[i * block]
+
+            *link(b) = head
+            head = b
+
+        Slab(ptr_cast(first), head, made)
+    end slab_over
+
+The next address at or above `n` that `a` divides. `a` is a power of two here — every alignment is —
+but the arithmetic is written the way that does not depend on it, since nothing in the type says so.
+
+    aligned_up(n: usize, a: usize) -> usize
+        (n + a - 1) / a * a
+    end aligned_up
+
+
+Taking and returning a block
+----------------------------
+
+`take` takes a block off the free list, or answers `null` where the region has none left. The result
+is a `*T` aimed at storage holding no `T` yet, which is the whole of what an allocator does and the
+whole of what makes it the raw tier.
+
+    take[T](s: *Slab[T]) -> *T
+        if s.free == null then return null
+
+        var b = s.free
+
+        s.free = next_free(b)
+        ptr_cast(b)
+    end take
+
+`release` puts a block back, by writing the current head into the block itself.
+
+    release[T](s: *Slab[T], p: *T)
+        var b: *u8 = ptr_cast(p)
+
+        *link(b) = s.free
+        s.free = b
+    end release
+
+
+Asking about the region
+-----------------------
+
+How many blocks are on the free list, counted by walking it. The count is not kept as a field on
+purpose: walking it is what asserts the list really is threaded through the blocks.
+
+    free_count[T](s: *Slab[T]) -> usize
+        var n = 0usize
+        var w = s.free
+
+        while w != null do
+            n += 1
+            w = next_free(w)
+
+        n
+    end free_count
+
+Which block a pointer is, counted from the aligned start. Undefined for a pointer the slab did not
+hand out, which is the raw tier's ordinary bargain.
+
+    index_of[T](s: *Slab[T], p: *T) -> usize
+        (usize(p) - usize(s.first)) / sizeof(T)
+    end index_of
