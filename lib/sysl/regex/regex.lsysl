@@ -1,0 +1,209 @@
+sysl.regex — what a program uses
+================================
+
+    module sysl.regex
+
+    import sysl.buf.{Buf, buf}
+    import sysl.text.is_char_boundary
+
+The three files under this one are the engine: a pattern becomes a tree, the tree becomes a program,
+the program is run. This file is the part a program calling it has to know about, and it is two
+types and seven members.
+
+```
+import sysl.regex.regex
+
+main()
+    var re = regex("([[:alpha:]]+)@([[:alpha:].]+)").unwrap()
+
+    re.find("write to ed@example.com today") match
+        Some(m) -> print(m.text(), m.group(1).unwrap(), m.group(2).unwrap())
+        None -> print("no address")
+```
+
+
+A match
+-------
+
+What a match reports is spans, and the text is carried alongside so a caller can ask for either. The
+spans are **byte offsets into the input**, always on character boundaries, so `s[a..<b]` takes one
+without a boundary check failing — which is the reason the engine steps characters rather than bytes.
+
+A group that took no part in the match has no span rather than an empty one at some arbitrary place.
+`(a)|(b)` against `"b"` leaves group 1 absent, and `Option` is how that is said: there is a real
+difference between a group that matched nothing and a group that matched the empty string, and
+`(a*)b` against `"b"` is the second.
+
+    struct Match
+        src: string
+        slots: []int
+
+        // How many groups this match reports, group 0 -- the whole match -- included. So a pattern
+        // with two capture groups answers 3.
+        group_count(self) -> usize = self.slots.len / 2usize
+
+        span(self, i: usize) -> Option[(usize, usize)]
+            if i >= self.group_count() then return None
+
+            var lo = self.slots[i * 2usize]
+            var hi = self.slots[i * 2usize + 1usize]
+
+            if lo < 0 || hi < 0 then None else Some((usize(lo), usize(hi)))
+        end span
+
+        group(self, i: usize) -> Option[string] = self.span(i) match
+            Some(s) -> Some(self.src[s.0..<s.1])
+            None -> None
+
+        // The whole match. Group 0 always took part -- there would be no `Match` otherwise -- so
+        // this is the one place the `Option` is worth unwrapping on the caller's behalf.
+        text(self) -> string = self.group(0usize).unwrap()
+
+        start(self) -> usize = usize(self.slots[0])
+
+        end(self) -> usize = usize(self.slots[1])
+    end Match
+
+
+A compiled pattern
+------------------
+
+Compiling is separated from matching because it is the expensive half and a pattern is usually used
+more than once. A program matching in a loop compiles once outside it; one matching a pattern it was
+handed compiles each time and pays for it honestly.
+
+    struct Regex
+        pattern: string
+        prog: Program
+
+        // How many capture groups the pattern has, not counting the whole match.
+        group_count(self) -> int = self.prog.groups
+
+        find(self, s: string) -> Option[Match] = self.find_at(s, 0usize)
+
+The leftmost match at or after a starting position. The position does not shorten the input -- the
+anchors still speak about the whole of it -- so walking a text with this gives the same answers as
+one pass over it would.
+
+        find_at(self, s: string, from: usize) -> Option[Match] = exec_from(self.prog, s, from) match
+            Some(slots) -> Some(Match(s, slots))
+            None -> None
+
+        is_match(self, s: string) -> bool = self.find(s).is_some()
+
+Every match, left to right and non-overlapping. The next search starts where the last match ended,
+except after an **empty** match, which would otherwise be found again forever at the same place; there
+the search resumes one character on. That is the rule every engine settles on, and it is why `a*`
+against `"bb"` finds three matches -- before each `b`, and after the last.
+
+        find_all(self, s: string) -> &Buf[Match]
+            var out: &Buf[Match] = buf()
+            var at = 0usize
+            var src = s.bytes
+            var going = true
+
+            while going
+                self.find_at(s, at) match
+                    None -> going = false
+                    Some(m) ->
+                        out.push(m)
+
+                        if m.end() > at then
+                            at = m.end()
+                        else
+                            at = next_boundary(src, m.end())
+
+                        if at > src.len then going = false
+            out
+        end find_all
+
+Every match replaced. The replacement text is not a pattern, but it may name the groups the match
+found: `\1` through `\9` stand for those groups, `\0` for the whole match, and `\\` for a backslash.
+A group that took no part contributes nothing rather than the two characters that named it.
+
+        replace_all(self, s: string, with: string) -> string
+            var out = ""
+            var at = 0usize
+            var ms = self.find_all(s)
+
+            for i in 0usize..<ms.len()
+                var m = ms.at(i)
+
+                if m.start() > at then out += s[at..<m.start()]
+                out += expand_replacement(m, with)
+                at = m.end()
+
+            if at < s.len then out += s[at..<s.len]
+            out
+        end replace_all
+
+The pieces between the matches. A pattern that matches the empty string splits between every
+character, which is the same rule `find_all` follows and the reason both are written in terms of it.
+
+        split(self, s: string) -> &Buf[string]
+            var out: &Buf[string] = buf()
+            var at = 0usize
+            var ms = self.find_all(s)
+
+            for i in 0usize..<ms.len()
+                var m = ms.at(i)
+
+                out.push(s[at..<m.start()])
+                at = m.end()
+
+            out.push(s[at..<s.len])
+            out
+        end split
+    end Regex
+
+    regex(pattern: string) -> Result[Regex, RegexError]
+        var p = compile_pattern(pattern)?
+
+        Ok(Regex(pattern, p))
+    end regex
+
+
+The two helpers
+---------------
+
+Where the next character starts, for stepping past an empty match. It reads the boundary out of the
+bytes rather than decoding, because all it needs to know is where a character begins and UTF-8 says
+that in the top two bits of every byte.
+
+    private next_boundary(src: []const u8, at: usize) -> usize
+        var k = at + 1usize
+
+        while k < src.len && !is_char_boundary(src[k])
+            k += 1usize
+
+        k
+    end next_boundary
+
+    private expand_replacement(m: Match, with: string) -> string
+        var out = ""
+        var b = with.bytes
+        var i = 0usize
+
+        while i < b.len
+            var c = b[i]
+
+            if c == u8('\\') && i + 1usize < b.len then
+                var d = b[i + 1usize]
+
+                if d == u8('\\') then
+                    out += "\\"
+                elif d >= u8('0') && d <= u8('9') then
+                    m.group(usize(d - u8('0'))) match
+                        Some(g) -> out += g
+                        None -> out += ""
+                else
+                    out += with[i + 1usize..<i + 2usize]
+
+                i += 2usize
+            else
+                var stop = next_boundary(b, i)
+
+                out += with[i..<stop]
+                i = stop
+        out
+    end expand_replacement

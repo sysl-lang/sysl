@@ -252,4 +252,56 @@ class EnumRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     run(src) shouldBe "100\n"
   }
+
+  // `03 § Recursive types` allows a cycle as soon as one edge is a `*T` or a `&T`, and states it
+  // with a struct. An enum is the shape a tree actually wants — a node is one of several kinds
+  // rather than a record with unused fields — and `sysl.regex`'s AST is written on the assumption
+  // that a variant may hold a reference back to its own enum. That is the claim here.
+  //
+  // The second half is the asymmetry the compiler is precise about and a reader is not: selection
+  // reaches through a reference and a **pattern does not**, so the walk is `*n match` and not
+  // `n match`. Written the wrong way this is a diagnostic rather than a wrong answer, which is why
+  // the test is worth having in the shape that works.
+  "an enum reaches itself through '&T', and a walk takes the reference apart" in {
+    val src =
+      """enum Node
+        |    Lit(ch: char)
+        |    Seq(left: &Node, right: &Node)
+        |    Star(inner: &Node)
+        |
+        |size(n: &Node) -> int = *n match
+        |    Lit(_) -> 1
+        |    Seq(l, r) -> size(l) + size(r)
+        |    Star(i) -> size(i) + 1
+        |
+        |var a: &Node = Lit('a')
+        |var b: &Node = Lit('b')
+        |var s: &Node = Seq(a, b)
+        |var t: &Node = Star(s)
+        |
+        |print(size(t))""".stripMargin
+
+    run(src) shouldBe "3\n"
+  }
+
+  // A subtree reachable by two paths is walked twice rather than being a cycle the walk cannot
+  // leave. `a{2}` in a regex is exactly this — the interval expansion shares one child between the
+  // copies — so the count is 4 and not 3.
+  "a shared subtree is reached down both edges" in {
+    val src =
+      """enum Node
+        |    Lit(ch: char)
+        |    Seq(left: &Node, right: &Node)
+        |
+        |size(n: &Node) -> int = *n match
+        |    Lit(_) -> 1
+        |    Seq(l, r) -> size(l) + size(r)
+        |
+        |var pair: &Node = Seq(Lit('a'), Lit('b'))
+        |var both: &Node = Seq(pair, pair)
+        |
+        |print(size(both))""".stripMargin
+
+    run(src) shouldBe "4\n"
+  }
 }

@@ -1,0 +1,197 @@
+sysl.regex — running the program
+================================
+
+    module sysl.regex
+
+    import sysl.buf.{Buf, buf}
+    import sysl.text.{Chars, chars_of}
+
+Thompson's 1968 construction, extended by Rob Pike to carry capture positions. Every branch of the
+pattern is followed at once rather than one at a time with backtracking, so the cost is the input
+length times the program length and there is no pattern that makes it explode. `(a|a)*b` against
+thirty `a`s and no `b` is the standard demonstration: a backtracking engine takes a billion steps,
+and this takes about nine hundred.
+
+The whole of that guarantee rests on one thing — **at most one thread per program counter per
+step**. Two threads at the same instruction with the same input position will do exactly the same
+thing from here on, so the second is redundant, and dropping it is what bounds the thread list by
+the program length instead of by the number of paths.
+
+
+How a step is bounded
+---------------------
+
+The redundancy check is a `marks` array, one entry per instruction, holding the step at which that
+instruction was last added. It is one array for the whole run rather than one per thread, and that
+is the correction that matters most against the engine this is modelled on: there, a fresh array was
+allocated inside the character loop *for each thread*, so the check only ever deduplicated within
+one thread's own epsilon closure and the list could hold the same program counter many times over.
+
+Stamping the step number rather than clearing a flag array is what makes one array enough. The list
+being built for the *next* position is stamped with the next step, and when that list becomes the
+current one its stamps are already the ones the new step will compare against — so the thread
+started at the new position is deduplicated against the threads that arrived there from the previous
+one, which two separate arrays could not have managed.
+
+    private struct Thread
+        pc: usize
+        saves: []int
+    end Thread
+
+A capture slot holds a byte offset, or `-1` for a group that has not matched. The engine this comes
+from wrote a `-2` sentinel at save time and then swept **every slot of every thread at every input
+position** to replace the sentinels with the real position; the position is known when the `Save`
+runs, so it is simply written, and the sweep is gone.
+
+    private const unset: int = -1
+
+    private struct Vm
+        prog: Program
+        src: []const u8
+        slots: usize
+        marks: []int
+
+The epsilon closure. Everything that does not consume a character is followed here and now, so what
+lands in the list is only ever an instruction that looks at the input — which is what keeps the
+character loop to one `match` over three cases and an accept.
+
+`Save` is the one case that copies. A thread's slots are shared with whatever it was forked from
+until it writes one, at which point it needs its own; copying at that moment is what makes the fork
+in a `Split` free. It is the remaining cost of the simple representation — a persistent structure
+would share the unchanged slots too — and it is bounded by the number of `Save` instructions the
+pattern has rather than by the input length.
+
+        add(*self, list: &Buf[Thread], pc: usize, saves: []int, gen: int, at: usize)
+            if pc >= self.prog.len() then return
+            if self.marks[pc] == gen then return
+
+            self.marks[pc] = gen
+
+            self.prog.at(pc) match
+                Jump(to) ->
+                    self.add(list, to, saves, gen, at)
+                Split(a, b) ->
+                    self.add(list, a, saves, gen, at)
+                    self.add(list, b, saves, gen, at)
+                Save(slot) ->
+                    var next: []int = [unset; self.slots]
+
+                    for i in 0usize..<self.slots
+                        next[i] = saves[i]
+
+                    next[slot] = int(at)
+                    self.add(list, pc + 1usize, next, gen, at)
+                AssertStart ->
+                    if at == 0usize then self.add(list, pc + 1usize, saves, gen, at)
+                AssertEnd ->
+                    if at == self.src.len then self.add(list, pc + 1usize, saves, gen, at)
+                else
+                    list.push(Thread(pc, saves))
+        end add
+    end Vm
+
+
+Leftmost, then longest
+----------------------
+
+POSIX asks for the match that begins earliest, and among those the one that runs longest. Both fall
+out of how the run is arranged rather than from a search over candidates:
+
+  * **Leftmost** — a thread is started at every input position, but only until something matches.
+    After that no new starting position is admitted, so nothing that begins later can win.
+  * **Longest** — the run does not stop at the first accept. It keeps going while any thread is
+    alive, and each accept replaces the best so far when it ends later at the same start.
+
+**What is not implemented is POSIX's rule for the subexpressions.** The whole match is leftmost and
+longest; a capture group inside it holds what the preferred path through the pattern gave it, which
+is the greedy reading rather than the one POSIX derives for each group in turn. That is the same
+choice Go and Rust make, and it is written down here rather than claimed away because the two differ
+on patterns like `(a|ab)(c|bcd)` — worth knowing before relying on a group.
+
+    exec(prog: Program, input: string) -> Option[[]int] = exec_from(prog, input, 0usize)
+
+A run may be told to begin part way in, which is what a caller walking every match in a text needs.
+It is a *starting position*, not a smaller input: `^` still means the beginning of the whole text and
+`$` its end, so the second match in a line is not handed a `^` that suddenly holds. Slicing the input
+and searching the remainder — the obvious way to write `find_all` — gets exactly that wrong.
+
+    exec_from(prog: Program, input: string, from: usize) -> Option[[]int]
+        var src = input.bytes
+        var slots = prog.slots()
+        var vm = Vm(prog, src, slots, [unset; prog.len()])
+
+        for i in 0usize..<prog.len()
+            vm.marks[i] = -1
+
+        var clist: &Buf[Thread] = buf()
+        var nlist: &Buf[Thread] = buf()
+        var best: []int = [unset; slots]
+        var matched = false
+        var cur = Chars(src, from)
+        var gen = 0
+        var going = true
+
+        while going
+            var at = cur.offset
+            var here = cur.peek()
+            var look = cur
+
+            look.next()
+
+            var after = look.offset
+
+            if !matched
+                vm.add(clist, 0usize, [unset; slots], gen, at)
+
+            nlist.clear()
+
+            for i in 0usize..<clist.len()
+                var t = clist.at(i)
+
+                vm.prog.at(t.pc) match
+                    MatchChar(want) ->
+                        if here.is_some() && here.unwrap() == want then
+                            vm.add(nlist, t.pc + 1usize, t.saves, gen + 1, after)
+                    MatchAny ->
+                        if here.is_some() then
+                            vm.add(nlist, t.pc + 1usize, t.saves, gen + 1, after)
+                    MatchSet(cls) ->
+                        if here.is_some() && cls.admits(here.unwrap()) then
+                            vm.add(nlist, t.pc + 1usize, t.saves, gen + 1, after)
+                    Accept ->
+                        if !matched || t.saves[0] < best[0] ||
+                                (t.saves[0] == best[0] && t.saves[1] > best[1])
+                            matched = true
+
+                            for s in 0usize..<slots
+                                best[s] = t.saves[s]
+                    else
+                        print("panic: an epsilon instruction reached the thread list")
+                        exit(1)
+
+            var swap = clist
+
+            clist = nlist
+            nlist = swap
+            gen += 1
+
+            if here.is_none() then going = false
+            elif clist.len() == 0usize && matched then going = false
+            else cur.next()
+
+        if matched then Some(best) else None
+    end exec_from
+
+The last arm cannot be reached. Everything that does not consume a character is followed by the
+closure and never lands in the list, so an instruction arriving here means the closure and this loop
+disagree about which those are — a mistake in the engine rather than in the pattern, which is why it
+stops the program the way an index past the end of a `Buf` does.
+
+The `here.unwrap() == want` above is the one place a character is tested against a literal, and it
+is a comparison of characters rather than of bytes — which is why a two-byte character in the input
+is one step here and cannot be half-matched by a pattern holding one of its bytes.
+
+The loop runs **one position past the end** of the input, which is not an off-by-one: `$` is a
+zero-width assertion that only holds there, and a pattern ending in `a*` has to be given the chance
+to accept after the last character it consumed. That is why the exit is decided at the bottom from
+whether there was a character, rather than by a range over the input's length.
