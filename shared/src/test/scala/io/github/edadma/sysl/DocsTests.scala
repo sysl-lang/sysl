@@ -62,6 +62,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/library/buf.md"                       -> (8, 6, 3),
     "docs/content/library/io.md"                        -> (4, 3, 2),
     "docs/content/library/fs.md"                        -> (6, 5, 3),
+    "docs/content/library/math.md"                      -> (9, 4, 2),
   )
 
   "every page on the site is accounted for" in {
