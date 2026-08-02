@@ -354,10 +354,11 @@ trait StmtAnalysis extends TypeResolution {
    * against the whole binding rather than found later as a shadow.
    */
   private def patternNames(p: Pattern): List[String] = p match
-    case IdentPattern(n)   => List(n)
-    case TuplePattern(ps)  => ps.flatMap(patternNames)
-    case WildcardPattern   => Nil
-    case _                 => Nil
+    case IdentPattern(n)        => List(n)
+    case TuplePattern(ps)       => ps.flatMap(patternNames)
+    case StructPattern(_, fps)  => fps.flatMap((_, sub) => patternNames(sub))
+    case WildcardPattern        => Nil
+    case _                      => Nil
 
   /** `val (a, b) = …` / `var (a, b) = …` (`00 §13`).
    *
@@ -414,6 +415,33 @@ trait StmtAnalysis extends TypeResolution {
           err(s"one ${show(other)} is not something to take apart — only a tuple is")
           Nil
 
+    // A struct has exactly one shape, so naming it cannot fail and it belongs at a binding for the
+    // same reason a tuple pattern does — `09 §` calls a tuple pattern the positional form of this
+    // one. What differs from the match path is that an unlisted field binds nothing here rather than
+    // being filled with a wildcard: there is no exhaustiveness to discharge at a binding.
+    case StructPattern(name, fieldPats) =>
+      Type.underlying(subject.ty) match
+        case s: Type.Struct if typeKey(name).contains(s.base) =>
+          fieldPats.map(_._1).groupBy(identity).collectFirst { case (n, xs) if xs.size > 1 => n }
+            .foreach(n => err(s"field '$n' is matched more than once"))
+
+          (for (fname, sub) <- fieldPats
+           yield s.fields.indexWhere(_._1 == fname) match
+             case -1 =>
+               err(s"struct '${qn(s.base)}' has no field '$fname'")
+               Nil
+             case i =>
+               checkFieldVisible(s.base, fname)
+               bindPattern(sub, TField(subject, i, s.fields(i)._2), mutable)).flatten
+
+        case s: Type.Struct =>
+          err(s"'$name{…}' does not match a ${show(s)} value")
+          Nil
+
+        case other =>
+          err(s"'$name{…}' matches a struct, but the value is ${show(other)}")
+          Nil
+
     // Everything `09 §5` admits in an arm and a binding cannot use. Named individually, because the
     // reason differs: a literal or a range is a *test*, and a variant is a choice among several.
     case _: LitPattern | _: RangePattern =>
@@ -421,7 +449,7 @@ trait StmtAnalysis extends TypeResolution {
         "has no other arm to take when it does not match")
       Nil
 
-    case _: VariantPattern | _: StructPattern =>
+    case _: VariantPattern =>
       err("a binding cannot choose among variants — this pattern matches one of several shapes, " +
         "and a binding has no other arm to take when the value has another")
       Nil

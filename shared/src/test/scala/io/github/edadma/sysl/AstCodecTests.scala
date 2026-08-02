@@ -339,7 +339,8 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
       """show() =
         |    val ((a, b), _) = ((1, 2), 3)
         |    var (c, d) = (4, 5)
-        |    print(a, b, c, d)
+        |    val Point{x, y: (e, f)} = mk()
+        |    print(a, b, c, d, x, e, f)
         |
         |show()""".stripMargin
 
