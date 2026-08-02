@@ -34,9 +34,10 @@ desugarings, so they cost no import — even `s.chars`, whose cursor is `sysl.te
 compiler names `chars_of` by key rather than by resolving the word (`13 §8`). Named at the call
 site, and so imported: `from_utf8`, `from_cstring`, `char_from_u32`, `str_builder`,
 `str_builder_with_capacity`, `cstring`, `char_indices`, `is_char_boundary`, the `parse_*` family,
-and the types `Utf8Error`, `ParseError`, `Chars`, `CharIndices`, `StrBuilder`, `CString` and the
-`Ascii` trait. The split is the one `13 § Open h` describes — what a program cannot avoid needing is
-free, and what it has to ask for it asks for.
+the text operations `split`, `fields`, `join`, `repeat`, `replace_all`, `to_upper` and
+`to_lower`, the `Search` and `Ascii` traits, and the types `Utf8Error`, `ParseError`, `Chars`,
+`CharIndices`, `StrBuilder` and `CString`. The split is the one `13 § Open h` describes — what a
+program cannot avoid needing is free, and what it has to ask for it asks for.
 
 ## The decision in one paragraph
 
@@ -283,6 +284,70 @@ composed `"é"` equals a decomposed one — correct for user-facing text, surpri
 expensive in systems code, where a string is usually a path, a device name, or a protocol
 token that must compare as the bytes it is. Normalization and collation are library
 operations, applied where they are wanted and visible when they cost something.
+
+## Operations
+
+Searching, trimming, splitting and joining — what a program actually does with text once it has
+some. All of it is `sysl.text` and all of it is ordinary sysl.
+
+**The searching and trimming half is a trait, written once.** `Search` requires two members — `view`,
+the bytes to look at, and `slice`, how to cut a piece of itself out — and every operation is a
+default written against those two. There are two implementations, `string` and `[]const u8`, so
+`s.starts_with("//")` and `b.starts_with(prefix)` are the same code and an operation added is added
+to both.
+
+That is the one place this library most deliberately departs from the older sysl, which wrote the
+whole surface **twice** — `std.strings` over `string` and `std.bytes` over `[]byte`, 1,630 lines of
+near-identical code — because it had no way to say "either of these". The trait is that way, and it
+is the same mechanism `sysl.math.Float` and `Ascii` use. There is deliberately no `len` member:
+both implementations already have one the compiler provides, and a trait member of that name would
+hide it rather than agree with it.
+
+| | |
+|---|---|
+| ends | `starts_with`, `ends_with` |
+| finding | `index_of`, `last_index_of`, `index_of_byte`, `last_index_of_byte`, `contains`, `count_of` |
+| trimming | `trim`, `trim_start`, `trim_end`, and the `_matches` three taking a cutset |
+| and | `is_empty` |
+
+**A byte-level search over UTF-8 is correct, not a shortcut.** UTF-8 is self-synchronizing: a
+continuation byte is distinguishable from a lead byte, so a well-formed needle cannot match starting
+anywhere but at a character boundary. So these ignore encoding entirely, and an offset one of them
+returns is always safe to slice at — which matters, since `s[a..b]` traps on a mid-codepoint bound.
+Trimming whitespace is safe for the same reason from the other side: every whitespace byte is ASCII,
+so every byte removed is a whole character.
+
+A cutset is a set of **bytes**, and that is the one caveat in the group: a non-ASCII character in one
+is its bytes and not itself, so such a cutset can cut a character in half — a trap rather than a
+wrong answer. `index_of` returns an `Option` rather than the older sysl's `-1`, because a sentinel is
+a value the type calls ordinary and every caller has to remember to check. Counting is
+non-overlapping and left to right, the same rule `replace_all` substitutes by, so the two always
+agree: in `"aaa"` there is one `"aa"`.
+
+**The other half makes new bytes, and is free functions over `string`:** `split`, `fields`, `join`,
+`repeat`, `replace_all`, `to_upper`, `to_lower`. They are not trait defaults because a default cannot
+write them — it would have to build a `Self` out of new bytes, and no trait can say how. **That
+boundary is exactly the allocator's**, which is why the two halves are separate files: a program that
+only searches never links an allocator on account of a `join` it does not call.
+
+**What splitting hands back are views.** A piece shares the bytes of the string it came from and
+costs a retain, so `split` allocates the vector and not the text — where the older sysl copied every
+piece, for want of an O(1) substring to hand out. This is where the representation `04` chose pays
+off most visibly.
+
+`fields` is not `split` on a space: a run of whitespace separates two fields rather than producing
+empty ones between them, which is what reading a line of columns wants. `split` itself drops nothing
+— adjacent separators and separators at the ends produce the empty pieces they imply. An empty
+separator yields the whole string as one piece, and an empty pattern in `replace_all` matches
+nowhere, both for the same reason: the byte-level reading would cut multi-byte characters apart, and
+the character-level reading is what `s.chars` already is.
+
+`to_upper` and `to_lower` are ASCII, like the trait they are written on, and they walk **characters**
+rather than bytes. A byte map would be the faster loop and would need a way to put a raw byte into a
+builder — the one thing the builder deliberately does not offer. Going through `push_char` means
+every way in still carries the UTF-8 guarantee and no unchecked primitive is named; it works because
+`Ascii for char` is total, so a character outside the range is re-encoded as exactly the bytes it
+arrived as.
 
 ## Concatenation
 

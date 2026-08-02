@@ -420,4 +420,82 @@ class LibraryCliTests extends LibraryCliSupport {
         .should(not be 0)
     }
   }
+
+  /** A `private` library function reached only from a **trait default body** goes missing from the
+   * artifact, and the program that instantiates that default cannot supply it either.
+   *
+   * The mechanism, as far as it was traced: the library never materializes the hoisted copy of a
+   * default it does not itself call, so nothing in the library's own IR references the private
+   * helper and it is not emitted. The program does materialize the copy — but the helper is
+   * reported to it as *precompiled*, so it does not emit one either. Neither side has it and the
+   * link fails on an undefined symbol.
+   *
+   * Found while writing `sysl.text`'s `Search` trait, whose cutset trims called a private
+   * membership helper. That is written a different way now — the trait's own `index_of_byte`
+   * answers the same question — so nothing in the library depends on this being fixed, but the hole
+   * is real and the next default to want a helper falls in it.
+   */
+  "a private helper reached only from a trait default" - {
+
+    val withDefault =
+      """module demo
+        |
+        |trait Widen
+        |    base(self) -> int
+        |
+        |    scaled(self) -> int = tripled(self.base())
+        |
+        |impl Widen for int
+        |    base(self) -> int = self
+        |
+        |private tripled(n: int) -> int = n * 3
+        |""".stripMargin
+
+    // TODO: un-ignore when the artifact keeps a private function reached from a trait default
+    "survives into the artifact, so a program instantiating the default links" ignore {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = artifactOf(rootOf("demo", withDefault))
+      val prog = program("import demo.*\n\nvar x = 7\nprint(x.scaled())")
+
+      cli(Config(command = "run", file = prog, libs = List(lib))) shouldBe 0
+    }
+
+    // A second face of the same seam, found the same way: a **generic method** called from a trait
+    // default makes the core's two build paths disagree about whether the instantiation was
+    // precompiled — `CoreArtifactTests`' "one library built two ways" case fails with
+    // `Option.is_some.usize` present from disk and absent from `Std.sources`. `Search.contains` is
+    // written as a `match` instead of `index_of(n).is_some()` for that reason and no other.
+    //
+    // It is not pinned here because the repro needs the embedded-source path, which only the core
+    // has; building the same library from disk twice is deterministic. Recorded so the next reader
+    // of `contains` knows why it is spelled the long way.
+    "and the same library built twice from disk agrees with itself" in {
+      val root = rootOf("demo", withDefault.replace("private tripled", "tripled"))
+
+      def symbols(): Set[String] =
+        LibraryArtifact.build(Project.collect(root), Target.default, LibraryArtifact.core) match
+          case Right((_, meta)) =>
+            LibraryArtifact.read("twice.syslib", meta, Target.default) match
+              case Right((_, syms, _)) => syms
+              case Left(err)           => fail(err)
+          case Left(err) => fail(err)
+
+      val first  = symbols()
+      val second = symbols()
+
+      second shouldBe first
+    }
+
+    // The same library with the helper public links today, which is what says the fault is the
+    // visibility and not the trait default on its own.
+    "and does so today when the helper is public" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = artifactOf(rootOf("demo", withDefault.replace("private tripled", "tripled")))
+      val prog = program("import demo.*\n\nvar x = 7\nprint(x.scaled())")
+
+      cli(Config(command = "run", file = prog, libs = List(lib))) shouldBe 0
+    }
+  }
 }
