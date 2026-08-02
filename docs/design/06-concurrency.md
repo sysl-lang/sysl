@@ -223,6 +223,13 @@ defaults belong on the library surface above, where a reader can see which one t
 This is also the whole of the gate: the names live in a module, so a program that never imported it
 has no ordering to write, and none of the nine takes a name a program has declared for itself.
 
+**A load and a store take three of the five.** A release publishes the writes that came before it and
+a load makes none; an acquire sees what a release published and a store reads nothing. So `Release`
+and `AcqRel` name loads that do not exist, `Acquire` and `AcqRel` name stores that do not exist, and
+each is refused at the call. Every read-modify-write does both halves and takes all five. This is a
+fact about what the operations *are* rather than about any machine, and the narrowing is not
+something a stronger processor would lift.
+
 **`volatile` is not one of these, and the mistake is worth naming.** C's own reference material used
 to recommend the qualifier for "shared-memory variables", and it is wrong: `volatile` constrains the
 *compiler* — it stops accesses being elided, merged or reordered relative to one another — and says
@@ -235,6 +242,50 @@ reference you already hold. Atomic release is a decrement with release ordering,
 the zero transition by an acquire fence before the destructor runs, so every prior write from
 every other domain is visible to the thread that frees. This is the standard sequence, and it
 is written here because getting it wrong produces a bug nobody finds.
+
+## The types above them
+
+`sysl.sync` is the library module the forms are reached through, and it **requires no capability** —
+which is the point of it being its own module rather than part of the standard one. A module under
+`no alloc` and `no os` can import it and get `Atomic[T]` and `SpinLock`, because neither type
+allocates, calls into an operating system, or panics: a violated precondition in there traps.
+
+**`Atomic[T]`** is a struct holding one `T`, with the nine operations as methods that take the
+address of the field. Its field is **not hidden**: a thread that knows it is alone with the value —
+the one that built it, the one left after every other has been joined — is entitled to the ordinary
+read, and hiding it would only mean a method doing the same thing less visibly. Every method takes a
+`*self` receiver, including `load`, because a `self` receiver is handed a *copy* of the struct and
+the address of a copy is not the address the other threads are writing to.
+
+**An ordering on the surface is a parameter with a default.** `a.add(1)` is sequentially consistent
+and `a.add(1, Relaxed)` names another, which is the only place in the design where the ordering is
+not written at the call — and it is written at *this* call, one level up. Since the form below needs
+a name and the method has a value, each method is a five-arm match from the one to the other, in the
+shape `core::sync::atomic` uses for the same reason. **It costs nothing.** Measured on AArch64 at
+`-O1`: the scrutinee is a constant at every ordinary call, so the whole dispatch folds and each
+method call becomes the single instruction it names — `a.add(1)` is `ldaddal`, `a.add(1, Relaxed)`
+is `ldadd`, `a.load(Acquire)` is `ldapr`, `a.store(v, Release)` is `stlr`.
+
+**The narrowing on `load` and `store` lands at run time**, and it is the one check in the module that
+does. The form refuses a releasing load where the name is *written* and cannot see a name that
+arrived in a variable, which is exactly what a method taking an `Ordering` hands it — so `load` and
+`store` carry a `require`, over the `orders_a_load` and `orders_a_store` predicates `Ordering`
+declares for the purpose. It folds away with the dispatch. What it buys is that an ordering that
+cannot be honoured **traps** rather than being quietly promoted to `SeqCst`: promotion is sound, and
+it is not what the author asked for.
+
+**`SpinLock`** is a flag and three methods — `lock`, `try_lock`, `unlock` — and it guards nothing by
+construction, unlike the `Mutex[T]` above it. It takes with an acquire and releases with a release,
+so it declares no `Ordering` parameter at all: a lock's orderings are fixed by what a lock means.
+`lock` spins on a **relaxed load** once the exchange has failed, retrying the exchange only when the
+word looks free, because a read-modify-write takes the cache line exclusively every time round and
+waiters spinning on the exchange itself fight both each other and the holder trying to write the
+release.
+
+**A fence has no wrapper**, and the omission is deliberate: `atomic_fence(ord)` is the fence. A free
+function beside it could add only the default, and the default is what it could not survive —
+`Relaxed` is refused, so the wrapper would need a `Relaxed` arm whose only options are to call a form
+that refuses it or to quietly do nothing.
 
 ## No async/await
 
@@ -275,9 +326,11 @@ to do it.
 
 ## Deferred
 
-- **`Mutex`, `Atomic[T]`, `Channel`, and the thread API** are library surface and are not
-  specified here; this document fixes only what the language must know. The atomic *operations*
-  those are built from are the language's and are above, in "The kernel tier".
+- **`Mutex`, `Channel`, and the thread API** are library surface and are not specified here; this
+  document fixes only what the language must know. The atomic *operations* those are built from are
+  the language's and are above, in "The kernel tier"; `Atomic[T]` and `SpinLock` are built, and what
+  is said of them in "The types above them" is there because each answers a question this document
+  asked — where the defaults live, and what a module requiring no capability can hold.
 - **Whether `&sync` should be inferable.** An object allocated, never crossed, and provably
   domain-local could use non-atomic refcounts even when its type says `sync` — the same shape
   of analysis as `05`. Worth revisiting once there is something to measure.

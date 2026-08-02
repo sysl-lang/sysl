@@ -440,6 +440,47 @@ class AtomicTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       out should include("operates at the type its address points at")
     }
 
+    /** The half of an ordering an operation has nothing to do with. A release publishes the writes
+     * that came before it and a load makes none; an acquire sees what a release published and a
+     * store reads nothing. Found by writing `Atomic[T].load`'s five-arm dispatch, whose `Release`
+     * arm assembled into `atomic load cannot use Release ordering` against a temporary `.ll`.
+     */
+    "a load asked to release, which is not an instruction" in {
+      for written <- List("Release", "AcqRel") do
+        withClue(written) {
+          val out = err(cell + s"print(atomic_load(p, $written))")
+
+          out should include("a load has nothing to release")
+          out should include(s"'$written'")
+          out should include("'Acquire'")
+        }
+    }
+
+    "a store asked to acquire, likewise" in {
+      for written <- List("Acquire", "AcqRel") do
+        withClue(written) {
+          val out = err(cell + s"atomic_store(p, 1i64, $written)")
+
+          out should include("a store reads nothing")
+          out should include(s"'$written'")
+          out should include("'Release'")
+        }
+    }
+
+    // The halves each of them *does* have, which is what would go unnoticed if either refusal above
+    // were written a variant too wide. Every read-modify-write takes all five, so `atomic_add` is
+    // here to pin that the narrowing is these two forms' and not the tier's.
+    "while the orderings each of them does have are all accepted" in {
+      for written <- List("Relaxed", "Acquire", "SeqCst") do
+        withClue(s"load $written")(ir(cell + s"print(atomic_load(p, $written))") should include("load atomic"))
+
+      for written <- List("Relaxed", "Release", "SeqCst") do
+        withClue(s"store $written")(ir(cell + s"atomic_store(p, 1i64, $written)") should include("store atomic"))
+
+      for written <- Atomics.llvm.keys do
+        withClue(s"add $written")(ir(cell + s"print(atomic_add(p, 1i64, $written))") should include("atomicrmw add"))
+    }
+
     /** A fence is nothing but its ordering, so a relaxed one orders nothing and the machine has no
      * instruction for it. Found by writing a spin loop that fenced relaxed between attempts: it
      * analyzed and lowered, and what refused it was the assembler, with "fence cannot be monotonic"

@@ -144,10 +144,38 @@ trait Atomics extends ExprSupport {
           s"${show(ty)} — this one is a ${show(op.ty)}")
 
     val ord = ordering(name, args.last)
+
+    halves(name, ord)
+
     val out = if name == "atomic_store" then Type.Unit else ty
 
     TAtomic(name, addr, ops, ord, ty, out)
   }
+
+  /** Refuses an ordering whose half the operation has nothing to do with.
+   *
+   * This is about what the operation *is* rather than about the machine. A release publishes the
+   * writes that came before it, and a load makes none; an acquire sees what a release published, and
+   * a store reads nothing. `AcqRel` asks for both halves, so each of the two refuses it for the half
+   * it is missing. Every read-modify-write does both and takes all five, which is why only these two
+   * forms are named here.
+   *
+   * LLVM refuses both instructions outright rather than dropping the half that cannot apply, and
+   * that is the right call — an author who wrote a releasing load meant something, and it was not
+   * this. Caught here because what the assembler says is `atomic load cannot use Release ordering`,
+   * against a temporary `.ll` whose line number names nothing the author wrote.
+   */
+  private def halves(name: String, ord: String): Unit = name match
+    case "atomic_load" if ord == "Release" || ord == "AcqRel" =>
+      err(s"a load has nothing to release, so '$ord' asks it to publish writes it never made and " +
+        s"there is no such instruction — write 'Acquire' to see what the releasing side published, " +
+        s"'Relaxed' if nothing else follows from the read, or 'SeqCst'")
+    case "atomic_store" if ord == "Acquire" || ord == "AcqRel" =>
+      err(s"a store reads nothing, so '$ord' asks it to acquire writes it never looks at and there " +
+        s"is no such instruction — write 'Release' to publish what came before it, 'Relaxed' if " +
+        s"nothing else follows from the write, or 'SeqCst'")
+    case _ =>
+
 
   /** The type an atomic form runs at, read off the address it was given.
    *
