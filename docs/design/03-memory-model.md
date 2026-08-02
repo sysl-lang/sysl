@@ -210,6 +210,133 @@ carried somewhere.
 Assignment, compound assignment, and `++`/`--` all take a place, so the same three forms work
 on a variable, on a field, and through a pointer with nothing special said about any of them.
 
+## `ref` — a name for a place
+
+A place can be deep, and until now the only ways to shorten one were to copy it or to leave the safe
+tier. `var t = self.tasks[i]` binds a **copy**, so every read and every write repeats the path from
+the table; `&self.tasks[i]` gives the name back and gives up bounds checking, `within` checking,
+invariant re-checking and the guarantee at the top of this chapter, all in one step. That is a cliff
+rather than a gradient, and `guide/kernel` is the measurement of it: sixty-five occurrences of
+`self.tasks[…]`, four predicates demoted to free functions because a by-value receiver would have
+copied a task with its whole program in it.
+
+**`ref` binds a name to a place.**
+
+```
+ref t = self.tasks[i]
+t.state = Ready                // writes through to the table
+t.prio  = t.base
+```
+
+The place is evaluated **once**, where the binding is written — the index is computed once, the
+bounds are checked once — and what the name means afterwards is the storage that was found, not the
+expression that found it. So a later `i += 1` leaves `t` naming the element it always named.
+
+### It is a declaration, never a type
+
+This is the whole of why it can exist in a language with no borrow checker. `ref` may be written
+only as a local declaration. There is no `ref` type, so a ref cannot be a field, a parameter, a
+return type, an element, or a type argument; it cannot be assigned to another ref, and it does not
+outlive the block that declares it.
+
+That restriction is what keeps the compiler's knowledge complete. A `*T` is a type, so the moment
+one exists it can be carried somewhere the compiler has lost the path it came from — which is
+exactly what `16 §6` says of `wreck(&o.a)`: *"inside `wreck` there is no `Outer` to re-read and no
+way to learn there ever was one."* A ref never travels, so the analyzer still holds the place
+expression, at the point it was written, in the same body. The consequence is the point of the
+feature:
+
+**At run time a ref stores an address. At compile time it remembers a place.** Both halves are
+load-bearing. The address is what makes the sixty-five path walks one. The remembered place is what
+keeps every check that a `*T` would have severed:
+
+- a write through the ref re-runs the `invariant` clauses of every struct the place lies inside,
+  found by the same outward walk of `16 §6`, because the walk still has the whole place to walk;
+- a ref into a `val`, or into an element of one, is read-only, since reaching into read-only storage
+  keeps the property;
+- a ref to a `within`-constrained slot is checked on assignment exactly as the slot is;
+- and the bounds check that a subscript owes is paid once, at the binding, rather than not at all.
+
+A ref is therefore **not a fourth memory mode**. It introduces no representation, no new type, and
+nothing that can be stored; it is a second way to *say* a place that the three modes already
+describe. Principle 3 asks that no feature put ceremony in front of the modes, and this one puts a
+name in front of a path.
+
+### What may be written
+
+**A ref's initializer must be a place.** `ref x = f()` is refused, and says so: a call result has no
+address, so there is nothing for the name to mean.
+
+**A ref inherits the place's writability, and gets no modifier of its own.** `ref t = self.tasks[i]`
+under a `*self` receiver may be written; a ref into a `val` may not. The place already carries the
+property, so stating it twice would only create the chance to state it wrong. If a read-only alias
+of *writable* storage is ever wanted, that is the axis `[]const T` already established (`07`), and
+it should arrive as that same word rather than as a second spelling here.
+
+### The one rule: what may move underneath it
+
+A stored address is only as good as the storage staying where it is, and this is where the design
+has to say something the languages it borrows from do not. C# has ref locals and needs no such rule,
+because a tracing collector keeps the old array alive when the variable is pointed at a new one.
+sysl has no collector in this tier, so the same program is a dangle:
+
+```
+ref e = self.cell[i]           // self.cell is a []T over an ARC buffer
+self.cell = [None; n * 2]      // releases that buffer — `e` now names freed storage
+```
+
+**So: while a ref is live, no step of its place that could come to name different storage may be
+assigned, and no mutating method may be called on a prefix of one.** The check is local, decided
+from types alone, and never asks where the ref is *used* — which is the question that would need
+lifetimes.
+
+Which steps those are falls out of the model rather than being a list:
+
+- a **view, reference, or pointer** step can be made to name somewhere else, so it is a hazard, and
+  so is every prefix of one;
+- a **field, a fixed array, or an element of one** cannot: that storage *is* the enclosing object's
+  bytes, and assigning to it overwrites the bytes rather than moving them.
+
+A chain with no indirection step in it therefore has nothing to refuse at all. `guide/kernel`'s
+tables are fixed arrays in a struct the kernel owns, so every ref in it is unconditional, and the
+rule costs that program exactly nothing — which is the case it was designed for. The rule bites
+where the hazard is real, and `Map.grow` above is precisely that case.
+
+The mutating-call half is the conservative one, and deliberately: a `self.grow()` under a live ref
+into `self.cell` is refused whether or not that particular `grow` reassigns the view, because
+deciding otherwise means reading the callee's body, which is the seam `15` keeps closed. The cost is
+one refusal in a program that could have written the ref one line later.
+
+**What this does not do is make a `*T` safe**, and it does not try to. A ref's place may be rooted at
+a pointer, and whether *that* points anywhere is the raw tier's ordinary bargain. What the rule buys
+is that the storage a ref names cannot be released by the block that named it.
+
+### A ref to a slot that holds a reference
+
+`ref r = self.node`, where `node: &Node`, names the **slot**, not the object in it. So the binding
+takes no count — nothing new holds the object — and `r = other` is the assignment `self.node = other`
+by another name, releasing what was there and retaining what arrives, in that order. Reading `r`
+produces the reference and takes a count for the reader exactly as reading the field would.
+
+The distinction matters because the other reading is available and wrong: if binding retained, a ref
+would be a `&T` with extra steps, and the count it took would keep an object alive past the write
+that replaced it.
+
+### Where it comes from
+
+The form is old and lives outside this project's usual references, none of which have it — Swift,
+Kotlin, Scala and Go are all silent, so principle 2 supplies nothing and the precedent is borrowed
+further afield. **Ada's `renames`** is the general case, and evaluates the name once at the renaming
+declaration; **Fortran's `ASSOCIATE`** is the closest match in shape, being block-scoped and
+deliberately not a type; **C#'s `ref` locals** are the closest in spelling. C# also shows what the
+restriction above is worth: having added ref returns and ref fields it spent several releases
+building the escape analysis (`scoped`, ref-safety contexts) that keeping the form local avoids
+entirely.
+
+Scala's by-name parameter is the thing this is **not**. `x: => T` re-evaluates at every use; a ref
+evaluates once and remembers what it found. Re-evaluation would be the wrong answer twice over — it
+would save no check, and it would silently make `t` follow a later change to `i`.
+
 ## Recursive types
 
 A type may reach itself **through an indirection**, and only through one. `struct Node { value:
