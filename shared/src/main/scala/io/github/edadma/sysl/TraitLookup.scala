@@ -259,8 +259,47 @@ trait TraitLookup extends MemberVisibility {
     val own = memberOwner(t)
 
     if memberDecls.contains((own._1, mname)) then own
-    else shapeOwner(t).filter(s => memberDecls.contains((s._1, mname))).getOrElse(own)
+    else
+      widened(t).filter(w => memberDecls.contains((w._1, mname)))
+        .orElse(shapeOwner(t).filter(s => memberDecls.contains((s._1, mname))))
+        .getOrElse(own)
   }
+
+  /** The key a **writable** view also answers to: the read-only view of the same elements.
+   *
+   * `07 § Read-only views` settles this and states it without qualification — "it is one type with a
+   * bit, not two types", and "a `[]T` is accepted wherever a `[]const T` is wanted". A receiver is
+   * such a place, so `impl Search for []const u8` is reachable on a `[]u8`. Without this the lookup
+   * files the two under the names a diagnostic gives them, `[]byte` and `[]const byte`, and denies
+   * the member outright — which is the compiler treating them as the two types that sentence exists
+   * to deny.
+   *
+   * **It goes one way only, which is the other half of the same sentence: "and never the other way
+   * round."** A member written for a `[]T` may write through its receiver, and a `[]const T` that
+   * reached it would be a read-only view with a writing member — the one thing the bit is for. So a
+   * read-only view widens to nothing and keeps only what was written for it.
+   *
+   * A `string` is deliberately not here. It is a view of bytes that are valid UTF-8, and that
+   * invariant is the whole difference between it and a `[]const u8` (`04`) — a block written for
+   * every read-only byte view has said nothing about it, exactly as `shapeOwner` says of slices.
+   */
+  private def widened(t: Type): Option[(String, List[Type])] = widenedType(t).map(memberOwner)
+
+  private def widenedType(t: Type): Option[Type] = t match
+    case Type.Slice(elem, false) => Some(Type.Slice(elem, readOnly = true))
+    case _                       => None
+
+  /** The type a member of that name was actually found at — the receiver's own, or the read-only
+   * view it widened to.
+   *
+   * The **symbol** has to follow the key and not the receiver. `Type.memberSymbol` mangles the
+   * read-only bit deliberately (`slice.byte` against `constslice.byte`), so a member found under
+   * `[]const u8` and named from a `[]u8` receiver would be a call to a function nothing emitted.
+   */
+  protected def memberReceiverType(t: Type, mname: String): Type =
+    if memberDecls.contains((memberOwner(t)._1, mname)) then t
+    else
+      widenedType(t).filter(w => memberDecls.contains((memberOwner(w)._1, mname))).getOrElse(t)
 
   /** Whether a type has a member of that name at all, however it came by it. */
   protected def hasMember(t: Type, mname: String): Boolean =
@@ -292,7 +331,7 @@ trait TraitLookup extends MemberVisibility {
         err(s"'$mname' has type parameters of its own, so ${show(ty)} alone does not say which " +
           "instantiation is meant — call it, and the arguments will")
       case Some(fd) => instantiateFunc(fd, targs)
-      case None     => s"${Type.memberSymbol(ty)}.$mname"
+      case None     => s"${Type.memberSymbol(memberReceiverType(ty, mname))}.$mname"
   }
 
   /** Whether a member of that name is one the *compiler* provides for the type (`08`).

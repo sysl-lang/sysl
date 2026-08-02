@@ -776,6 +776,27 @@ class AnalyzerMemberErrorTests extends AnyFreeSpec with CodegenSupport {
       err("print(7u32.neg())") should include("type 'uint' has no method 'neg'")
     }
 
+    // A writable view reaches a member written for the read-only one, because `07 § Read-only
+    // views` says a `[]T` goes wherever a `[]const T` is wanted. The sentence ends "and never the
+    // other way round", and this is that half: a member written for a `[]T` may write through its
+    // receiver, so a `[]const T` reaching it would be a read-only view with a writing member —
+    // which is the one thing the bit exists to stop.
+    "a read-only view does not reach a member written for a writable one" in {
+      err(
+        """trait Bump
+          |    bump(*self)
+          |
+          |impl Bump for []int
+          |    bump(*self)
+          |        self[0] = self[0] + 1
+          |
+          |val fixed: [3]int = [1, 2, 3]
+          |var v: []const int = fixed[..]
+          |
+          |v.bump()""".stripMargin
+      ) should include("has no method 'bump'")
+    }
+
     // The call is checked against the trait's signature, where the argument type is `Self` — which
     // on this receiver is `int`, so a bool is the wrong thing to hand it.
     "a built-in trait method checks its argument against 'Self'" in {

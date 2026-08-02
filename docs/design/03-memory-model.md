@@ -481,9 +481,12 @@ is produced afresh at each call that omits it, in a scope holding none of the ca
 what it names has to outlive every frame — and every candidate is closed. A construction is refused
 by the paragraph above; a top-level `var` is a local of the entry point, so naming one is naming the
 caller's locals; and a module-level `val` counts nothing (`13 §7`), which a reference does.
-So a `weak T` parameter takes no default, and nothing is special-cased to make that so — it falls
-out of what a default may name meeting the one thing a weak reference may not be made from. A `&T`
-parameter is unaffected, because the construction a `weak T` is refused there is exactly what serves
+So **the only default a `weak T` parameter can have is `None`**, and nothing is special-cased to make
+that so — it falls out of what a default may name meeting the one thing a weak reference may not be
+made from. `None` is reached by none of the argument above: it is the type's own empty state (below),
+it names no object, and there is nothing for it to fail to outlive, so `parent: weak Node = None`
+compiles and runs. What is closed is every default that would name an *object*. A `&T` parameter is
+unaffected either way, because the construction a `weak T` is refused there is exactly what serves
 it.
 
 ### An empty one is written `None`

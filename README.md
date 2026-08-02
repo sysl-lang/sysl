@@ -1,6 +1,6 @@
 # sysl
 
-A modern, ref-counted, OS-level systems language — easier than Rust.
+A modern, ref-counted, general-purpose systems language — easier than Rust.
 
 > **Status: design-first, and it runs.** This repository is a clean reimplementation of the sysl
 > language — not a port of the earlier prototype, which survives only as a source of lessons. The
@@ -10,11 +10,11 @@ A modern, ref-counted, OS-level systems language — easier than Rust.
 
 ## What sysl is
 
-sysl is a systems language that aims to keep the control a systems language is used for while being
-meaningfully easier to learn and work with than Rust. It is ref-counted rather than borrow-checked:
-memory is managed through three explicit modes — `T` (value/stack), `&T` (ARC reference-counted
-heap), and `*T` (raw pointer) — with no garbage collector. Its intended showcase is an operating
-system written in sysl and readable end to end.
+sysl is a general-purpose systems language that aims to keep the control a systems language is used
+for while being meaningfully easier to learn and work with than Rust. It is ref-counted rather than
+borrow-checked: memory is managed through explicit modes written on the type — `T` (value/stack),
+`&T` (ARC reference-counted heap), and `*T` (raw pointer) — with no garbage collector, plus `ref`,
+a local binding that gives a second name to storage something else already owns.
 
 ## Documentation
 

@@ -161,10 +161,16 @@ installs its own panic handler and enters it. The *decision to stop* is the lang
 **Trap sources** are the runtime safety checks the safe subset relies on: an out-of-bounds array
 or slice index, an inverted or out-of-range slice range, a checked cast that fails (`char(u)` on
 an invalid scalar, `Color(n)` on an undeclared discriminant, `09 §2`), an integer divide-by-zero,
-and a violated design-by-contract `require`/`ensure` where contracts are in force. These are the
-checks that make the safe subset segfault-proof (`03`), and like the bounds checks they are
-**strippable** for a release build that accepts the risk (a `--no-contracts`-style removal), on
-the same footing as C's `assert` compiled out by `NDEBUG`.
+and a violated design-by-contract `require`/`ensure`. These are the checks that make the safe subset
+segfault-proof (`03`).
+
+**None of them is strippable, and there is no build option that removes one.** An earlier draft of
+this paragraph said the opposite — that the checks were removable for a release build that accepted
+the risk, on the footing of C's `assert` under `NDEBUG` — and that was never true of the
+implementation and is ruled against by `16 §7`, which settles the question for contracts with the
+argument that decides it for all of them: a switch that removed a check would make a program's
+meaning depend on how it was compiled. The bounds test is emitted unconditionally, the contract
+clauses are analyzed into every build, and no flag reaches either.
 
 > **Cross-doc note.** *Integer overflow is deliberately not on that list.* Arithmetic wraps at
 > the declared width (`00 §5`, `01`), so overflow is defined behaviour rather than a broken
