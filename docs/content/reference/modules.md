@@ -699,8 +699,9 @@ print(check(4usize))
 'limit' is a 'val', which is read while the program runs, so a pattern cannot match against it — compare it in a guard, or bind a different name
 ```
 
-The rest of what a module-level `val` may hold — read-only at every depth, no counted type, the
-`[]const T` a slice of one yields — is on [declarations](/reference/declarations/#val).
+The rest of what a module-level `val` may hold — read-only at every depth, nothing that owes a
+release, and the `[]const T` a slice of one yields — is on
+[declarations](/reference/declarations/#val).
 
 ## Separate compilation
 
