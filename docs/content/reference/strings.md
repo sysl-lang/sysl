@@ -112,6 +112,8 @@ retain and release both test for that and do nothing. Three consequences:
   instruction to build either.
 - Allocator-free code can hold, pass, compare, index and slice literals.
 - Any string derived from a literal by slicing is immortal too, because it shares the owner.
+- A module-level `val` may hold one. That storage exists for the whole run and is never let go of, so
+  a value that owed a release would have nowhere to write it — and a literal owes none.
 
 A sentinel refcount in a header would say the same thing. The null owner is better because it is not
 string-specific: it is already how a slice of static storage says "nothing to keep alive", so
@@ -720,6 +722,27 @@ print(tail, name.len, name[0], count, tail == "console", name < "/dev/null")
 ```output
 console 12 47 12 true true
 ```
+
+**A module-level `val` may hold one, which is where a table of messages lives.** Storage that exists
+for the whole run is never let go of, so such a `val` normally holds nothing that owes a release —
+but a literal owes none, so the refusal does not reach it ([`13 §7`](/reference/declarations/)):
+
+```sysl
+no alloc
+
+val messages: [3]string = ["out of range", "not permitted", "no such device"]
+
+var i = 2
+
+print(messages[i], messages[i].len, messages[0][0..<3])
+```
+
+```output
+no such device 14 out
+```
+
+A `const` could not have served that: a constant is folded into its uses and has no address, so
+there is nothing to index at `i`.
 
 Requiring an allocator: `from_utf8`, `copy()`, concatenation, `string(c)`, `str_builder()` and
 `cstring` — every operation that produces new bytes.

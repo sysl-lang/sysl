@@ -66,23 +66,42 @@ show()
 The two `val`s in that program are one keyword doing one thing: the one at file scope is visible
 outside it and says `: int`, and the one inside `show` is visible to nobody and does not have to.
 
-**A module-level `val` holds no counted type.** A `&T`, a `weak T`, a slice and a `string` are each
-refused, for the one thing that is true of module storage and of no other storage: it exists for the
-whole run and is therefore never let go of, so a count taken in one is a count with no line to write
-the release on.
+**A module-level `val` holds nothing that owes a release.** There is one thing true of module storage
+and of no other storage: it exists for the whole run and is therefore never let go of, so a count
+taken in one is a count with no line to write the release on. A `&T`, a `weak T` and a slice are each
+refused for that reason, and so is a `string` the program **builds**:
 
 ```sysl
-val name: string = "sysl"
+val name: string = str(2026)
 
 print(name)
 ```
 
 ```error
-storage that exists for the whole run is never let go of
+'name' cannot be a 'val': storage that exists for the whole run is never let go of, so a count taken in one is a count with nowhere to write the release — and this string is built while the program runs. One the object file can carry as it stands may be held: a string literal owns nothing, and neither does a table of them
 ```
 
-The same value as a **local** is ordinary — which is what the program above does with its
-`val name` — and a module that wants one at file scope builds it where it is used instead.
+The question is asked of the **value**, not of the type, and a string *literal* answers it: its bytes
+are a constant in the object file and its owner word is null, so nothing was allocated and nothing is
+owed. A `val` may hold one, and a table of them:
+
+```sysl
+val greeting: string = "hello"
+val names: [3]string = ["alpha", "beta", "gamma"]
+
+var i = 1
+
+print(greeting, names[i])
+```
+
+```output
+hello beta
+```
+
+This is what a module with no allocator uses for its messages. A `const` could not serve it: a
+constant is folded into its uses and has no address, so it cannot be indexed at a position computed
+while running. Anything the program had to build is a **local** instead, which is ordinary — that is
+what the first program above does with its `val name`.
 
 **A raw pointer may be held**, because it counts nothing and so there is no release to write. What a
 `val` promises is that its *own* storage is written once and never again, and holding an address

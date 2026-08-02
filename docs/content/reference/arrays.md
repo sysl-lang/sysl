@@ -191,8 +191,9 @@ it can size an array but cannot *be* one; a `val` is storage, so it may be index
 known while running, sliced, and iterated. What it may not be is written, and slicing one therefore
 yields a `[]const T` — which is the whole of why a `val` is sliceable at all.
 
-**A `val` may not hold a slice, and the reason is the count.** Storage that exists for the whole run
-is never let go of, so anything in it that owes a release has nowhere to write one:
+**A `val` may not hold a value the program had to build, and the reason is the count.** Storage that
+exists for the whole run is never let go of, so anything in it that owes a release has nowhere to
+write one:
 
 ```sysl
 squares(k: usize) -> []int
@@ -206,12 +207,28 @@ val table: []int = squares(4)
 ```
 
 ```error
-'table' cannot be a 'val': its type is []int, and storage that exists for the whole run is never let go of — a reference, a weak reference, a slice, or a string in one would be a count with nowhere to write the release. A raw pointer may be held: it counts nothing
+'table' cannot be a 'val': storage that exists for the whole run is never let go of, so a count taken in one is a count with nowhere to write the release — and this []int is built while the program runs. One the object file can carry as it stands may be held: a string literal owns nothing, and neither does a table of them
 ```
 
-The diagnostic names the whole family — a reference, a weak reference, a slice, or a string — and
-the one exception: a raw pointer may be held, because it counts nothing. An array of plain values,
-like `order` above, is storage all the way down and is exactly what the form is for.
+What decides is the **value**, not the type. A string literal owes no release — its bytes are a
+constant in the object file and its owner word is null — so a table of them is storage all the way
+down, exactly as `order` above is:
+
+```sysl
+val names: [3]string = ["alpha", "beta", "gamma"]
+
+var i = 2
+
+print(names[i], names[0].len)
+```
+
+```output
+gamma 5
+```
+
+That is the case a `const` could never have served: a constant is folded into its uses and has no
+address, so there is nothing to index at `i`. A raw pointer may be held for the same reason a
+literal may — it counts nothing, so there is no release to write.
 
 ## Storage sized while running
 

@@ -575,4 +575,45 @@ class LibraryCliTests extends LibraryCliSupport {
       ran(Config(command = "run", file = prog, libs = List(lib))) shouldBe "21\n"
     }
   }
+
+  /** A library's module-level `val` at a counted type, through the artifact (`13 §7`).
+   *
+   * A `val` may hold a string whose bytes the object file carries, and the shape that asked for it —
+   * a table of messages a module with no allocator can index — is exactly the shape a *library*
+   * supplies. So the value has to survive the crossing: the artifact carries the declaration's
+   * untyped tree, and the program that links it lays the storage down on this side.
+   */
+  "a library's 'val' holding a table of string literals" - {
+
+    val messages =
+      """module demo
+        |
+        |val names: [3]string = ["alpha", "beta", "gamma"]
+        |
+        |struct Device
+        |    name: string
+        |    code: int
+        |end Device
+        |
+        |val devices: [2]Device = [Device("uart", 16), Device("timer", 32)]
+        |""".stripMargin
+
+    "crosses the artifact and is indexed at a value only known while running" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = artifactOf(rootOf("demo", messages))
+      val prog = program("import demo.*\n\nvar i = 2\n\nprint(names[i], names[0].len)")
+
+      ran(Config(command = "run", file = prog, libs = List(lib))) shouldBe "gamma 5\n"
+    }
+
+    "and so does a table of structs holding them" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      val lib  = artifactOf(rootOf("demo", messages))
+      val prog = program("import demo.*\n\nvar i = 1\n\nprint(devices[i].name, devices[i].code)")
+
+      ran(Config(command = "run", file = prog, libs = List(lib))) shouldBe "timer 32\n"
+    }
+  }
 }

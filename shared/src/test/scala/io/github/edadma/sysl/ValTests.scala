@@ -188,6 +188,350 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "and reaching an element is a 'getelementptr' from the global itself" in {
       irMain("val k: [4]int = [1, 2, 3, 4]\nprint(str(k[1]))") should include("ptr @k")
     }
+
+    // A struct is fields laid side by side, so it is a constant tree exactly when its fields are —
+    // the same rule the array above follows. It used to be a `global` the prologue filled in with a
+    // store per field, which is the opposite of what a table wants.
+    "as a struct constant, field by field, rather than stores a prologue makes" in {
+      val out = ir(
+        """struct Pair
+          |    a: int
+          |    b: int
+          |end Pair
+          |val p: Pair = Pair(1, 2)
+          |print(str(p.a))""".stripMargin,
+      )
+
+      out should include("@p = private constant %struct.Pair { i32 1, i32 2 }")
+      out should not include "@p = private global"
+    }
+
+    "and a table of structs, which is the shape a driver's device list has" in {
+      ir(
+        """struct Pair
+          |    a: int
+          |    b: int
+          |end Pair
+          |val ps: [2]Pair = [Pair(1, 2), Pair(3, 4)]
+          |print(str(ps[1].a))""".stripMargin,
+      ) should include(
+        "@ps = private constant [2 x %struct.Pair] " +
+          "[%struct.Pair { i32 1, i32 2 }, %struct.Pair { i32 3, i32 4 }]",
+      )
+    }
+
+    // The other side of the line, which is what keeps the arm above from being vacuous: one field
+    // that has to be computed makes the whole struct code, and the storage writable again.
+    "while a struct with one computed field is a computed 'val' like any other" in {
+      val out = ir(
+        """struct Pair
+          |    a: int
+          |    b: int
+          |end Pair
+          |n() -> int = 1
+          |val p: Pair = Pair(n(), 2)
+          |print(str(p.a))""".stripMargin,
+      )
+
+      out should include("@p = private global %struct.Pair zeroinitializer")
+      out should not include "@p = private constant"
+    }
+  }
+
+  /** A `val` holds a string whose bytes the object file carries (`13 §7`).
+   *
+   * The rule it relaxes was never about `string`. It is about a count with nowhere to write the
+   * release, and a literal takes none: its bytes are a constant in read-only data and its owner word
+   * is null, which both retain and release test for and do nothing about (`04`). So what decides is
+   * the initializer — a literal is admitted and a built string is not, and the two are told apart by
+   * the same test that decides whether any `val` is laid into the object file.
+   *
+   * The shape this exists for is a module with **no allocator** naming its messages once. `const`
+   * could not serve it: a constant has no address (`13 §7`), so it cannot be indexed at a position
+   * computed while running, which is the whole of what a table is for.
+   */
+  "a module-level 'val' holds a string literal" - {
+    "read by name" in {
+      run("val greeting: string = \"hello\"\nprint(greeting)") shouldBe "hello\n"
+    }
+
+    "as three words with a null owner, laid straight into the object file" in {
+      val out = ir("val greeting: string = \"hello\"\nprint(greeting)")
+
+      out should include("@greeting = private constant { ptr, ptr, i64 } { ptr null, ptr @.str")
+      out should not include "@greeting = private global"
+    }
+
+    // The case the whole feature is for: a table indexed at a position only known while running,
+    // which is the one thing a `const` can never be.
+    "a table of them, indexed at a value only known while running" in {
+      run(
+        """val names: [3]string = ["alpha", "beta", "gamma"]
+          |var i = 2
+          |print(names[i])""".stripMargin,
+      ) shouldBe "gamma\n"
+    }
+
+    "which is iterated, since it is storage rather than a folded value" in {
+      run(
+        """val names: [3]string = ["a", "bb", "ccc"]
+          |var total: usize = 0
+          |for s in names do total += s.len
+          |print(str(total))""".stripMargin,
+      ) shouldBe "6\n"
+    }
+
+    "a repeat, written out as a global has no loop to run" in {
+      run("val xs: [3]string = [\"x\"; 3]\nvar i = 1\nprint(xs[i])") shouldBe "x\n"
+    }
+
+    // A text block is joined by the lexer into one constant (`04 § Text blocks`), so it arrives here
+    // as a literal and needs no rule of its own.
+    "a text block, which is one literal by the time the analyzer sees it" in {
+      run(
+        "val banner: string = \"\"\"\n    one\n    two\n    \"\"\"\nprint(banner)",
+      ) shouldBe "one\ntwo\n\n"
+    }
+
+    // A struct is admitted by the same recursion, so a `{name, code}` pair — which is what a device
+    // table actually is — is one declaration rather than two parallel arrays.
+    "a struct with one in it, and a table of those" in {
+      run(
+        """struct Device
+          |    name: string
+          |    code: int
+          |end Device
+          |val devices: [2]Device = [Device("uart", 16), Device("timer", 32)]
+          |var i = 1
+          |print(devices[i].name, str(devices[i].code))""".stripMargin,
+      ) shouldBe "timer 32\n"
+    }
+
+    "a tuple with one in it, which is a struct with its fields named for their positions" in {
+      run("val t: (int, string) = (1, \"one\")\nprint(str(t.0), t.1)") shouldBe "1 one\n"
+    }
+
+    // The motivation, stated as a test: a module that has declared it will not allocate may still
+    // name its messages, index them, measure them, and cut them up.
+    "in a module that declared 'no alloc', which is what the relaxation is for" in {
+      run(
+        """no alloc
+          |
+          |val messages: [3]string = ["out of range", "not permitted", "no such device"]
+          |
+          |var i = 2
+          |print(messages[i])
+          |print(messages[i].len)
+          |print(messages[0][0..<3])""".stripMargin,
+      ) shouldBe "no such device\n14\nout\n"
+    }
+  }
+
+  /** The corners of the constant tree, now that it reaches strings and structs.
+   *
+   * A constant expression is written out in full rather than built, so every shape that can nest
+   * inside another has to be spelled correctly at every depth — which is where a lowering with no
+   * basic block to fall back on breaks if it breaks at all.
+   */
+  "a constant tree nests" - {
+    "a struct inside a struct" in {
+      val out = ir(
+        """struct Inner
+          |    a: int
+          |    b: int
+          |end Inner
+          |struct Outer
+          |    i: Inner
+          |    c: int
+          |end Outer
+          |val o: Outer = Outer(Inner(1, 2), 3)
+          |print(str(o.i.b))""".stripMargin,
+      )
+
+      out should include("@o = private constant %struct.Outer { %struct.Inner { i32 1, i32 2 }, i32 3 }")
+    }
+
+    "an array inside a struct" in {
+      val out = ir(
+        """struct S
+          |    xs: [2]int
+          |    n:  int
+          |end S
+          |val s: S = S([4, 5], 6)
+          |print(str(s.xs[1]))""".stripMargin,
+      )
+
+      out should include("@s = private constant %struct.S { [2 x i32] [i32 4, i32 5], i32 6 }")
+    }
+
+    "a bool and a narrow float in one, each at its own width" in {
+      val out = ir(
+        """struct S
+          |    on: bool
+          |    w:  f32
+          |end S
+          |val s: S = S(true, 0.1)
+          |print(str(s.on))""".stripMargin,
+      )
+
+      out should include("@s = private constant %struct.S { i1 1, float 0x3FB99999A0000000 }")
+    }
+
+    // A pointer written as a number is an `inttoptr`, which is itself a constant expression — so it
+    // nests inside a struct constant the same way a number does. This is the driver's register block
+    // with its own name beside it, which is the shape the two halves of this feature meet in.
+    "an address the datasheet gives, inside a struct beside its name" in {
+      val out = ir(
+        """const UART: usize = 0x1000_0000
+          |struct Device
+          |    name: string
+          |    base: *u32
+          |end Device
+          |val uart: Device = Device("uart", ptr_cast(UART))
+          |print(uart.name)""".stripMargin,
+      )
+
+      out should include("ptr inttoptr (i64 268435456 to ptr) }")
+      out should include("@uart = private constant %struct.Device")
+    }
+
+    "an array of tuples carrying strings" in {
+      run(
+        """val rows: [2](int, string) = [(1, "one"), (2, "two")]
+          |var i = 1
+          |print(str(rows[i].0), rows[i].1)""".stripMargin,
+      ) shouldBe "2 two\n"
+    }
+
+    "a generic struct instantiated at 'string'" in {
+      run(
+        """struct Cell[T]
+          |    v: T
+          |end Cell
+          |val c: Cell[string] = Cell("held")
+          |print(c.v)""".stripMargin,
+      ) shouldBe "held\n"
+    }
+
+    // The length a literal carries is its bytes, not its characters, and the empty one is a real
+    // value rather than an absent pointer — both of which the three-word constant has to say.
+    "the empty literal, whose bytes are none of them" in {
+      run("val e: string = \"\"\nprint(e.len, e == \"\")") shouldBe "0 true\n"
+    }
+
+    "a literal with an escape and a character outside ASCII" in {
+      run("val s: string = \"a\\tb\\u{e9}\"\nprint(s.len)\nprint(s)") shouldBe "5\na\tbé\n"
+    }
+
+    // A literal may carry a NUL as an ordinary byte, since a string carries its length — so the
+    // constant's length has to come from the bytes rather than from where a terminator falls.
+    "a literal with a NUL inside it, which is a byte like any other" in {
+      run("val s: string = \"a\\u{0}b\"\nprint(s.len)") shouldBe "3\n"
+    }
+
+    // The bytes of a literal are not interned across uses, so two `val`s written the same way name
+    // two globals. Equality is over the bytes rather than the address, so nothing in the language
+    // can see the difference — which is what makes the duplication a size question and not a
+    // correctness one.
+    "the same literal in two 'val's, which are two globals and one value" in {
+      run(
+        """val a: string = "same"
+          |val b: string = "same"
+          |print(a == b, a.len == b.len)""".stripMargin,
+      ) shouldBe "true true\n"
+    }
+
+    // The premise the whole relaxation rests on, exercised rather than asserted: a literal's owner
+    // word is null, so retain and release find nothing to do — including where the value is copied
+    // into heap storage that outlives the read and is then let go of.
+    "a literal read out of one, handed to the heap and released with it" in {
+      run(
+        """struct Box
+          |    s: string
+          |end Box
+          |val greeting: string = "hello"
+          |hold() -> string
+          |    var b: &Box = Box(greeting)
+          |    b.s
+          |end hold
+          |print(hold())""".stripMargin,
+      ) shouldBe "hello\n"
+    }
+  }
+
+  /** What the relaxation had to leave alone, checked against the chapters rather than assumed.
+   *
+   * A constant `val` skips the initializer order entirely, and it skips every check that would have
+   * run in one. Both are correct only if nothing that *needs* either has become constant.
+   */
+  "what a constant string 'val' does not disturb" - {
+
+    // `13 §7`: a value that has to be checked is code, whatever it looks like. A `val` at a
+    // constrained type and a table of them are pinned in `ComputedValTests`; the case the struct arm
+    // adds is a constrained field *inside* one, where the check is at the argument. The load-bearing
+    // assertion is the out-of-range one, since an in-range value reads back either way.
+    "a struct with a constrained field is filled by code, so the field's check still runs" in {
+      val out = ir(
+        """type Age = int within 0..150
+          |struct P
+          |    age: Age
+          |end P
+          |val p: P = P(40)
+          |print(p.age)""".stripMargin,
+      )
+
+      out should include("@p = private global %struct.P zeroinitializer")
+      out should not include "@p = private constant"
+
+      exits(
+        """type Age = int within 0..150
+          |struct P
+          |    age: Age
+          |end P
+          |val p: P = P(200)
+          |print(p.age)""".stripMargin,
+      )
+    }
+
+    // A constant `val` is readable before any initializer runs, so a computed one may read it — the
+    // ordering graph is over the computed ones, and a constant is already there.
+    "a computed 'val' may read a constant string one, which is already in place" in {
+      run(
+        """val greeting: string = "hello"
+          |val n: usize = twice()
+          |twice() -> usize = greeting.len * 2
+          |print(n)""".stripMargin,
+      ) shouldBe "10\n"
+    }
+
+    // Read-only at every depth is about the storage the declaration lays down, and a struct one lays
+    // down a struct — so a field of it is no more writable than an element of a table.
+    "a struct 'val' is read-only at every depth, field as well as name" in {
+      err(
+        """struct Pair
+          |    a: int
+          |    b: int
+          |end Pair
+          |val p: Pair = Pair(1, 2)
+          |p.a = 3""".stripMargin,
+      ) should include("written once")
+    }
+
+    // `07 § A view that may not be written`: slicing a `val` yields a `[]const T`, and the element
+    // type being a counted one changes nothing about that.
+    "slicing a table of literals yields a view that may be read and not written" in {
+      run(
+        """val names: [3]string = ["alpha", "beta", "gamma"]
+          |var v = names[1..<3]
+          |print(v[0], v.len)""".stripMargin,
+      ) shouldBe "beta 2\n"
+
+      err(
+        """val names: [3]string = ["alpha", "beta", "gamma"]
+          |var v = names[1..<3]
+          |v[0] = "other" """.stripMargin,
+      ) should include("views elements it may not write")
+    }
   }
 
   /** A `val` at pointer type — the file-scope register block (`13 §7`).
@@ -584,9 +928,17 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
 
     // Storage that outlives every frame is never let go of, so a count taken in one has nowhere to
-    // write the release. A string is a view with an owner word, so it is one. Cost noted in `13 §7`.
-    "a string, which is a view with an owner rather than a value" in {
-      err("val s: string = \"hi\"") should include("a count with nowhere to write the release")
+    // write the release. What decides is the **value**: a string the program builds takes a count,
+    // and the literal above does not.
+    "a string built while the program runs" in {
+      err("val s: string = str(1)") should include("a count with nowhere to write the release")
+    }
+
+    // Two literals joined is the discriminating pair against the section above: it looks constant
+    // and is not, because joining them allocates. Folding it is separate work, deliberately not done
+    // here — admitting it on the strength of how it reads would be admitting a leak.
+    "a string joined from two literals, which allocates however constant it looks" in {
+      err("val s: string = \"a\" + \"b\"") should include("built while the program runs")
     }
 
     "a reference, which is the count itself" in {
@@ -599,10 +951,25 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
         include("a count with nowhere to write the release")
     }
 
-    // The diagnostic says which types are meant and which one is not, because "not plain data" left
-    // a reader looking for a spelling rather than reading the reason.
-    "and the message names what may be held instead" in {
-      err("val s: string = \"hi\"") should include("A raw pointer may be held: it counts nothing")
+    // A struct that carries an `invariant` has to be *checked*, and a check is code (`13 §7`), so
+    // there is nowhere for the object file to carry it — which means a counted field in one is
+    // refused even though every part of it was written as a literal. That is the specification's own
+    // rule rather than a gap, and it is pinned because it is the surprising corner of the relaxation.
+    "a struct whose invariant has to run, even with a literal in it" in {
+      err(
+        """struct Tag
+          |    name: string
+          |    invariant name.len > 0
+          |end Tag
+          |val t: Tag = Tag("uart")""".stripMargin,
+      ) should include("a count with nowhere to write the release")
+    }
+
+    // The diagnostic names the value rather than the type, because once a literal is legal "its type
+    // is string" sends a reader looking for a spelling instead of at what they wrote.
+    "and the message says what may be held instead" in {
+      err("val s: string = str(1)") should
+        include("a string literal owns nothing, and neither does a table of them")
     }
 
     // The line between the two declarations, from the other side: a `const` sizes an array because
