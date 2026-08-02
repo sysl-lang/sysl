@@ -45,9 +45,23 @@ What the compiler produces
 A program plus the number of capture groups it writes. Group `k` owns slots `2k` and `2k+1`, and
 group 0 is the whole match — so a pattern with two groups needs six slots.
 
+How long a program is allowed to get. It is a bound on the *pattern*, not on anything a match does,
+and it exists because intervals compose multiplicatively: `a{200}{200}{200}` is sixteen characters
+and eight million instructions, and one more factor is a billion. Matching being bounded says nothing
+about that, so an engine that can be handed a pattern from outside needs the other end bounded too.
+
+A hundred thousand is far past any pattern written on purpose — the whole POSIX grammar of a
+real-world pattern is a few dozen — and small enough that the worst case is a few megabytes.
+
+    const max_program: usize = 100000usize
+
     struct Program
         code: &Buf[Inst]
         groups: int
+
+        // Set when a program ran past the limit. Everything after that point is not emitted and the
+        // walk stops descending, so the cost of refusing is paid once rather than per node.
+        over: bool
 
         len(self) -> usize = self.code.len()
 
@@ -59,6 +73,10 @@ group 0 is the whole match — so a pattern with two groups needs six slots.
         // Append an instruction and answer where it landed, which is what every jump target below
         // is derived from.
         emit(*self, i: Inst) -> usize
+            if self.code.len() >= max_program
+                self.over = true
+                return 0usize
+
             var pc = self.code.len()
 
             self.code.push(i)
@@ -104,6 +122,8 @@ branch; it decides which thread is already at a program counter when a second on
 which is what makes the answer the longest one rather than merely a matching one.
 
         private walk(*self, n: &Node)
+            if self.over then return
+
             *n match
                 Empty ->
                     return
@@ -172,20 +192,21 @@ The whole pattern is wrapped in group 0's pair of `Save`s, so the matcher needs 
 of where the match began and ended: the span of the whole match is the span of a capture group like
 any other, and reporting it is reading slots 0 and 1.
 
-    compile(root: &Node, groups: int) -> Program
-        var p = Program(buf(), groups)
+    compile(root: &Node, groups: int) -> Result[Program, RegexError]
+        var p = Program(buf(), groups, false)
 
         p.emit(Save(0usize))
         p.walk(root)
         p.emit(Save(1usize))
         p.emit(Accept)
-        p
+
+        if p.over then Err(PatternTooLarge) else Ok(p)
     end compile
 
     compile_pattern(pattern: string) -> Result[Program, RegexError]
         var t = parse_counted(pattern)?
 
-        Ok(compile(t.0, t.1))
+        compile(t.0, t.1)
     end compile_pattern
 
 

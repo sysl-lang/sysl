@@ -75,6 +75,98 @@ class RegexVmTests extends AnyFreeSpec with RunSupport {
     }
   }
 
+  /** All twelve named classes, each shown the character it should take and one it should not.
+   *
+   * Worth having in full rather than by sample, because each one is a separate line of the table
+   * mapping a POSIX name onto a `sysl.text.Ascii` member — and the way that table goes wrong is one
+   * line pointing at the neighbouring classifier, which no sample catches.
+   */
+  "the twelve named classes" in {
+    matches(
+      "[[:alpha:]]" -> "1a",
+      "[[:digit:]]" -> "a1",
+      "[[:alnum:]]" -> "-a",
+      "[[:upper:]]" -> "aA",
+      "[[:lower:]]" -> "Aa",
+      "[[:space:]]" -> "a b",
+      "[[:blank:]]" -> "a\\tb",
+      "[[:print:]]" -> " ",
+      "[[:graph:]]" -> " !",
+      "[[:cntrl:]]" -> "a\\t",
+      "[[:punct:]]" -> "a!",
+      "[[:xdigit:]]" -> "gf",
+    ) shouldBe
+      """1:2
+        |1:2
+        |1:2
+        |1:2
+        |1:2
+        |1:2
+        |1:2
+        |0:1
+        |1:2
+        |1:2
+        |1:2
+        |1:2
+        |""".stripMargin
+  }
+
+  // Each named class is ASCII and says so by answering `false` above it — which is not a gap but
+  // the guarantee, since the negated class has to admit exactly what the plain one refuses.
+  "a named class answers false above ASCII, and its negation therefore answers true" in {
+    matches("[[:alpha:]]" -> "é", "[^[:alpha:]]" -> "é") shouldBe
+      """no
+        |0:2
+        |""".stripMargin
+  }
+
+  "the special characters, inside a bracket expression and escaped outside one" - {
+
+    // POSIX makes a backslash ordinary inside brackets, so `[\t]` is the two characters backslash
+    // and `t` rather than a tab. It is the strict reading, and it is the one `grep -E` gives.
+    "a backslash inside brackets is an ordinary character" in {
+      matches("[\\\\t]+" -> "x\\\\tty") shouldBe "1:4\n"
+    }
+
+    "the metacharacters are ordinary inside brackets" in {
+      matches("[*+?()|]+" -> "ab*+?()|c") shouldBe "2:8\n"
+    }
+
+    // `{` always begins an interval, so a literal brace is escaped — the case that would otherwise
+    // be read as a malformed interval.
+    "an escaped brace is a literal brace" in {
+      matches("\\\\{" -> "a{b") shouldBe "1:2\n"
+    }
+  }
+
+  // A range inside brackets is between two *characters*. A parser stepping bytes would see four
+  // here and read a range between two halves of a character.
+  "a range over characters outside ASCII" in {
+    matches("[é-ü]+" -> "aéñüb", "[^é]+" -> "éab") shouldBe
+      """1:7
+        |2:4
+        |""".stripMargin
+  }
+
+  // Three ways of writing a pattern that matches nothing at all, each of which a matcher can get
+  // wrong by refusing rather than matching empty.
+  "the degenerate patterns match the empty string at the leftmost position" in {
+    matches("a{0}" -> "bbb", "()" -> "ab", "(|)" -> "ab") shouldBe
+      """0:0
+        |0:0 0:0
+        |0:0 0:0
+        |""".stripMargin
+  }
+
+  // Ten levels, so both the compiler's walk and the VM's epsilon closure recurse ten deep and the
+  // slot array is twenty-two long. Every group reports the same span, which is what nesting means.
+  "deep nesting is walked, compiled and captured" in {
+    matches("((((((((((a))))))))))" -> "za", "(a(b(c(d))))" -> "abcd") shouldBe
+      """1:2 1:2 1:2 1:2 1:2 1:2 1:2 1:2 1:2 1:2 1:2
+        |0:4 0:4 1:4 2:4 3:4
+        |""".stripMargin
+  }
+
   "the anchors are zero-width assertions about position" - {
 
     "start and end together pin the whole input" in {

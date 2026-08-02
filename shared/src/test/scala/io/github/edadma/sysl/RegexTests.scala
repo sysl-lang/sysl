@@ -132,6 +132,59 @@ class RegexTests extends AnyFreeSpec with RunSupport {
       "false true 0\n"
   }
 
+  /** The inputs and patterns that are nothing much, which is where a surface breaks.
+   *
+   * Each of these is a place `find_all` and the two written on top of it could reasonably answer
+   * something silly — a replacement that loses the text between empty matches, a split that drops
+   * the ends, a search resumed past the end of the input that walks off it.
+   */
+  "the degenerate cases" - {
+
+    // Three empty matches over "bb", so the replacement lands before each character and after the
+    // last, and the characters between them are kept. Losing them is the obvious way to get this
+    // wrong, since there is no text "between" two matches that are both empty.
+    "replacing and splitting on a pattern that matches empty" in {
+      uses("""var re = regex("a*").unwrap()
+              |var p = re.split("bb")
+              |var out = ""
+              |
+              |for i in 0usize..<p.len() do out += s"[${p.at(i)}]"
+              |print(s"[${re.replace_all("bb", "X")}]", p.len(), out)""".stripMargin) shouldBe
+        "[XbXbX] 4 [][b][b][]\n"
+    }
+
+    "an empty input" in {
+      uses("""print(regex("a").unwrap().find_all("").len(),
+              |      regex("a*").unwrap().find_all("").len(),
+              |      s"[${regex("x").unwrap().replace_all("", "Y")}]",
+              |      regex(",").unwrap().split("").len())""".stripMargin) shouldBe "0 1 [] 1\n"
+    }
+
+    "a search resumed at the very end of the input" in {
+      uses("""print(regex("a").unwrap().find_at("abc", 3usize).is_some(),
+              |      regex("a*").unwrap().find_at("abc", 3usize).unwrap().start())""".stripMargin) shouldBe
+        "false 3\n"
+    }
+
+    // Ten groups is twenty-two slots, which is the arithmetic `slots()` does and the one place an
+    // off-by-one would put the last group's end past the end of the array.
+    "a pattern with ten groups sizes its slots right" in {
+      uses("""var re = regex("(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)").unwrap()
+              |var m = re.find("abcdefghij").unwrap()
+              |
+              |print(re.group_count(), m.group_count(), m.group(10usize).unwrap())""".stripMargin) shouldBe
+        "10 11 j\n"
+    }
+
+    "a text that is entirely separator splits into two empty pieces" in {
+      uses("""var q = regex("a+").unwrap().split("aaa")
+              |var out = ""
+              |
+              |for i in 0usize..<q.len() do out += s"[${q.at(i)}]"
+              |print(q.len(), out)""".stripMargin) shouldBe "2 [][]\n"
+    }
+  }
+
   // Compiling is where a pattern is refused, so a caller handles the error once rather than at
   // every match.
   "a pattern that does not parse is refused at compile time" in {

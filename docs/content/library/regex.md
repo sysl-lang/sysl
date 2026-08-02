@@ -51,6 +51,24 @@ false
 The price of that guarantee is the feature backtracking buys and this cannot have: there are **no
 backreferences**. `(a)\1` is not a pattern that matches a doubled character; `\1` is an escaped `1`.
 
+The bound is on *matching*, and the other end needs bounding too. An interval is expanded into that
+many copies of what precedes it, so intervals stack multiplicatively: `a{200}{200}{200}` is sixteen
+characters and eight million instructions, and one more factor is a billion. A pattern is therefore
+refused if it would lay out more than a hundred thousand — far past anything written on purpose, and
+what keeps a pattern arriving from somewhere untrusted from exhausting memory before it ever runs.
+
+```sysl
+import sysl.regex.{regex, describe}
+
+regex("a{200}{200}{200}") match
+    Ok(_) -> print("compiled")
+    Err(e) -> print(describe(e))
+```
+
+```output
+the pattern expands past 100000 instructions
+```
+
 ## Compiling
 
 `regex` answers a `Result`, because a pattern is text and text can be wrong. Compiling is separated

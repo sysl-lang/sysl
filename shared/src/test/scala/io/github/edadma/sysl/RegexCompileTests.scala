@@ -16,6 +16,16 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class RegexCompileTests extends AnyFreeSpec with RunSupport {
 
+  /** The instruction count alone, for the patterns whose listing would be ten thousand lines. */
+  private def size(pattern: String): String =
+    run(s"""import sysl.regex.{compile_pattern, describe}
+           |
+           |main()
+           |    compile_pattern("$pattern") match
+           |        Ok(p) -> print(p.len())
+           |        Err(e) -> print(describe(e))
+           |""".stripMargin)
+
   private def compiles(pattern: String): String =
     run(s"""import sysl.regex.{compile_pattern, dump, describe}
            |
@@ -197,5 +207,31 @@ class RegexCompileTests extends AnyFreeSpec with RunSupport {
 
   "a pattern that does not parse is refused before anything is emitted" in {
     compiles("(a") shouldBe "a group is never closed, opened at 0\n"
+  }
+
+  /** How long a program a pattern is allowed to become.
+   *
+   * The engine's promise is that no pattern makes *matching* blow up. Nothing about that bounds
+   * **compiling**, and intervals stack multiplicatively: each `{n}` is expanded into `n` copies of
+   * whatever precedes it, and the copies share one subtree — so the parse tree stays tiny while the
+   * program the compiler lays out from it does not.
+   *
+   * The third of these is a sixteen-character pattern that asked for eight million instructions
+   * before the limit existed, and the fourth is the same shape asking for a billion. Both are
+   * refused at once rather than after the memory is spent, which is what the walk stopping rather
+   * than merely the emit refusing is for.
+   */
+  "the size of the program a pattern may become" - {
+
+    "a big but reasonable expansion is laid out" in {
+      size("a{100}") shouldBe "103\n"
+      size("a{100}{100}") shouldBe "10003\n"
+    }
+
+    "stacked intervals past the limit are refused rather than laid out" in {
+      size("a{100}{100}{10}") shouldBe "the pattern expands past 100000 instructions\n"
+      size("a{200}{200}{200}") shouldBe "the pattern expands past 100000 instructions\n"
+      size("a{1000}{1000}{1000}") shouldBe "the pattern expands past 100000 instructions\n"
+    }
   }
 }

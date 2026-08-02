@@ -58,7 +58,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/reference/attributes.md"             -> (3, 11, 1),
     "docs/content/library/_index.md"                   -> (0, 0, 0),
     "docs/content/library/core.md"                     -> (13, 4, 8),
-    "docs/content/library/regex.md"                    -> (15, 0, 0),
+    "docs/content/library/regex.md"                    -> (16, 0, 0),
   )
 
   "every page on the site is accounted for" in {
