@@ -179,6 +179,59 @@ class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
+  /** The wrapping operators at widths that are not a register and not a byte.
+   *
+   * A value of an odd width is held in a container wider than the type — a `u5` in eight bits, a
+   * `u12` in sixteen — so every one of these has a *plausible* wrong answer available to it: the one
+   * the container would give. `7 * 9` at `u5` is `31`, and a multiply that forgot to narrow would
+   * answer `63` and still look like arithmetic.
+   *
+   * The operand pairs are therefore chosen so the two answers differ. A product that fits the type
+   * proves nothing, since the container would agree with it.
+   */
+  "multiplication and the rest wrap at the type's width, not the container's" - {
+    "a product wraps at an odd unsigned width" in {
+      run("var a: u5 = 7\nvar b: u5 = 9\nprint(a * b)") shouldBe "31\n"
+    }
+
+    // Both operands at the type's maximum, so the true product needs ten bits and the answer is one.
+    "the largest pair of a width multiplies to something small" in {
+      run("var a: u5 = 31\nvar b: u5 = 31\nprint(a * b)") shouldBe "1\n"
+    }
+
+    "a signed product wraps into the signed range, keeping the two's-complement meaning" in {
+      run("var a: i5 = -13\nvar b: i5 = 5\nprint(a * b)") shouldBe "-1\n"
+      run("var a: i3 = 3\nvar b: i3 = 3\nprint(a * b)") shouldBe "1\n"
+    }
+
+    "a width between two byte sizes multiplies at its own width" in {
+      run("var a: u12 = 4000\nvar b: u12 = 3\nprint(a * b)") shouldBe "3808\n"
+    }
+
+    // The identity `(2^n - 1)^2 ≡ 1 (mod 2^n)`, at a wide width that is not a multiple of 64.
+    "the widest value of an odd wide width squares to one" in {
+      run("var a: u96 = 79228162514264337593543950335\n\nprint(a * a)") shouldBe "1\n"
+    }
+
+    "addition and subtraction wrap at the same width" in {
+      run("var a: u5 = 30\nvar b: u5 = 5\nprint(a + b, b - a)") shouldBe "3 7\n"
+    }
+
+    // Negating the most negative value has no representable answer and wraps to itself — the same
+    // rule `abs` follows, and the reason `abs` follows it.
+    "negating an odd width's minimum answers the minimum" in {
+      run("var a: i3 = -4\nprint(-a)") shouldBe "-4\n"
+    }
+
+    "shifts move within the width and off the end of it" in {
+      run("var a: u5 = 1\nprint(a << 4u5, (a << 4u5) << 1u5)") shouldBe "16 0\n"
+    }
+
+    "a signed right shift carries the sign at an odd width" in {
+      run("var a: i5 = -16\nprint(a >> 1i5, a >> 4i5)") shouldBe "-8 -1\n"
+    }
+  }
+
   /** Division and remainder at widths that are not a register and not a byte multiple.
    *
    * These are where a division goes wrong quietly rather than loudly: the value is stored in a
