@@ -25,7 +25,8 @@ trait ExprAnalysis
     extends MemberExprAnalysis
     with CollectionExprAnalysis
     with ControlFlowExprAnalysis
-    with RawStorage {
+    with RawStorage
+    with Atomics {
 
   // --- expressions ---------------------------------------------------------------------
 
@@ -539,6 +540,13 @@ trait ExprAnalysis
     case Call(Ident("va_arg"), args)                        => vaArg(args, expected)
     case Call(Ident("va_copy"), args)                       => vaCopy(args)
     case Call(Ident("ptr_cast"), args)                      => ptrCast(args, expected)
+
+    // The atomic tier, which is the raw one — an address, values, and an ordering the call spells
+    // out. The fence is separate because it reaches no address at all (`06 § The kernel tier`).
+    // Unlike the forms above, these stand aside for a declaration of the same name — nine names is
+    // too much of a program's vocabulary to take outright (`Atomics.unclaimed`).
+    case Call(Ident("atomic_fence"), args) if atomicFenceForm => atomicFence(args)
+    case Call(Ident(name), args) if atomicForm(name)          => atomicCall(name, args)
 
     // `sizeof(T)` / `alignof(T)` — the parser has already read the operand as a type, which is what
     // separates these from every form above: they are syntax rather than a name the analyzer knows.

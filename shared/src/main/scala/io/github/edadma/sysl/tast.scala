@@ -205,6 +205,25 @@ case class TUnary(op: String, operand: TExpr, ty: Type)             extends TExp
  */
 case class TIntOp(op: String, operand: TExpr, amount: Option[TExpr], width: Type, ty: Type) extends TExpr
 
+/** One atomic access, at the address `addr` points at (`06 § The kernel tier`, `Atomics`).
+ *
+ * `ops` are the value operands the form takes — none for a load, one for a store or a
+ * read-modify-write, two for a compare-and-swap — and `at` is the type they and the access run at,
+ * read off the address rather than off the operands so that a widened literal cannot decide it.
+ *
+ * `ordering` is a variant *name* rather than a value, because that is what it becomes in the emitted
+ * instruction: LLVM spells the ordering as a keyword, so nothing here could be computed. The
+ * analyzer is what refuses an ordering the call did not write out.
+ *
+ * `ty` differs from `at` for exactly one form — a store answers nothing — which is why both are
+ * carried instead of the result being derived where it is read.
+ */
+case class TAtomic(op: String, addr: TExpr, ops: List[TExpr], ordering: String, at: Type, ty: Type)
+    extends TExpr
+
+/** `atomic_fence(ord)` — a barrier that reaches no address, ordering the accesses around it. */
+case class TFence(ordering: String) extends TExpr { def ty: Type = Type.Unit }
+
 /** `&&` / `||` — short-circuit, always boolean. */
 case class TLogical(op: String, left: TExpr, right: TExpr) extends TExpr { def ty: Type = Type.Bool }
 

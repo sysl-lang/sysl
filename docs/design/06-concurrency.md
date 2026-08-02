@@ -192,6 +192,37 @@ memory: the compiler guarantees nothing, the code is auditable by grep, and it i
 scheduler and the allocator are written. Kernel code does not use `&sync T`; it uses a raw
 pointer and a spinlock, as C does.
 
+**The operations themselves are the language's, and the types over them are the library's.** Nine
+forms sit beside `sizeof` and `ptr_cast` in the raw tier, each one machine instruction that no sysl
+body could write:
+
+```
+atomic_load(p, ord)                  atomic_swap(p, v, ord)
+atomic_store(p, v, ord)              atomic_cas(p, expected, desired, ord)
+atomic_add / _sub / _and / _or / _xor(p, v, ord)
+atomic_fence(ord)
+```
+
+Each takes an address, so `Atomic[T]` and `SpinLock` are ordinary structs with a field and methods
+that take the address of it — which is what "built on `*T`" means, and what keeps every type in the
+library where a reader can see it. Every read-modify-write answers the value that was **there
+before**, which is the property that makes an atomic increment usable as a ticket; `atomic_cas`
+answers the value it **found**, so a caller comparing it against what they expected learns whether
+it swapped.
+
+**What may be reached is what the machine has an instruction for**: an integer of 8, 16, 32 or 64
+bits, or a pointer. sysl's integers are an open family, so `u12` is a type a program may name and no
+processor can touch indivisibly — it is refused where it is written rather than at the assembler. An
+aggregate is what a lock is for.
+
+**An ordering is written at the call, always.** `sysl.sync` declares the five C11 names — `Relaxed`,
+`Acquire`, `Release`, `AcqRel`, `SeqCst` — and the form requires one of them *spelled there*, because
+it becomes a keyword in the instruction rather than a value the instruction reads. An ordering held
+in a variable is well-typed sysl that cannot be lowered, so it is refused with that reason. The
+defaults belong on the library surface above, where a reader can see which one they are getting.
+This is also the whole of the gate: the names live in a module, so a program that never imported it
+has no ordering to write, and none of the nine takes a name a program has declared for itself.
+
 **`volatile` is not one of these, and the mistake is worth naming.** C's own reference material used
 to recommend the qualifier for "shared-memory variables", and it is wrong: `volatile` constrains the
 *compiler* — it stops accesses being elided, merged or reordered relative to one another — and says
@@ -244,8 +275,9 @@ to do it.
 
 ## Deferred
 
-- **`Mutex`, `Atomic`, `Channel`, and the thread API** are library surface and are not
-  specified here; this document fixes only what the language must know.
+- **`Mutex`, `Atomic[T]`, `Channel`, and the thread API** are library surface and are not
+  specified here; this document fixes only what the language must know. The atomic *operations*
+  those are built from are the language's and are above, in "The kernel tier".
 - **Whether `&sync` should be inferable.** An object allocated, never crossed, and provably
   domain-local could use non-atomic refcounts even when its type says `sync` — the same shape
   of analysis as `05`. Worth revisiting once there is something to measure.
