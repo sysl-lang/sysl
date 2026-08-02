@@ -519,6 +519,21 @@ case class MultiAssign(op: String, targets: List[Expr], values: List[Expr]) exte
  */
 case class MultiDecl(names: List[String], mutable: Boolean, values: List[Expr]) extends Stmt
 
+/** `val (a, b) = …` / `var (a, b) = …` — one binding that takes a tuple apart by **pattern**
+ * (`00 §13`).
+ *
+ * This is the comma form's sibling and not a replacement for it: `val a, b = f()` takes a result
+ * list or a tuple apart at one level, while a pattern says the *shape* and so reaches inside a
+ * nested one — `val ((a, b), c) = p` names three things across two levels, which no list of names
+ * can say.
+ *
+ * **Only an irrefutable pattern may stand here**, which for a tuple means the parts are themselves
+ * tuple patterns, names, or wildcards. A binding has no arm to fall through to, so a pattern that
+ * can fail to match would leave its names standing for nothing; `09 §5`'s refutable forms are
+ * refused with that as the reason.
+ */
+case class PatternDecl(pattern: Pattern, mutable: Boolean, value: Expr) extends Stmt
+
 case class ExprStmt(expr: Expr)                                    extends Stmt
 
 /** `['label] while cond body [else elseBody]` as an **expression**. A `break expr` in the body

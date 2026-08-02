@@ -465,9 +465,26 @@ class SyslParser(val source: Source) extends DeclParser {
 
   protected lazy val varDecl: PackratParser[Stmt] =
     multiDecl("var", mutable = true) |
+      patternDecl("var", mutable = true) |
       op("var") ~> ident ~ opt(op(":") ~> typeRef) ~ opt(op("=") ~> expression) ^^ {
         case n ~ t ~ e => VarDecl(n, t, e.map(Placeholders.lift))
       }
+
+  /** `val (a, b) = …` / `var (a, b) = …` — a binding written as a **pattern** (`00 §13`).
+   *
+   * It is tried after the comma form and before the plain one, which is all the ordering it needs:
+   * the three are told apart by their first token, a pattern binding being the only one whose name
+   * position opens with a parenthesis. The plain form still reads a bare name, so nothing that
+   * parsed before this existed parses differently now.
+   *
+   * **The pattern is the whole of the left side, with no type annotation beside it.** That is
+   * `12 §5b`'s open question again rather than an oversight — the parts of a destructuring have
+   * nowhere to carry a type, and inference covers what the form is for.
+   */
+  protected def patternDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
+    (op(keyword) ~> tuplePattern) ~ (op("=") ~> expression) ^^ {
+      case p ~ v => PatternDecl(p, mutable, Placeholders.lift(v))
+    }
 
   /** `ref name = place` (`03 § ref`).
    *
@@ -517,6 +534,7 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val valDecl: PackratParser[Stmt] =
     multiDecl("val", mutable = false) |
+      patternDecl("val", mutable = false) |
       op("val") ~> ident ~ opt(op(":") ~> typeRef) ~ (op("=") ~> expression) ^^ {
         case n ~ t ~ v => ValDecl(n, t, Placeholders.lift(v))
       }

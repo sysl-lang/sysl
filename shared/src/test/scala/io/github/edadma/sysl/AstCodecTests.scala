@@ -331,6 +331,21 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     Pos(back.head.source, at._2, at._3).location shouldBe s"m.lsysl:${at._2}:${at._3 + 4}"
   }
 
+  // A pattern binding carries a *pattern* rather than a list of names, so the encoder has a nested
+  // structure to write where every other binding form has a flat one. Nesting and a wildcard are
+  // both here because each is a way the shape can be lost while the names survive.
+  "a pattern binding keeps its shape across the format" in {
+    val src =
+      """show() =
+        |    val ((a, b), _) = ((1, 2), 3)
+        |    var (c, d) = (4, 5)
+        |    print(a, b, c, d)
+        |
+        |show()""".stripMargin
+
+    roundTrip(List(parsed(src))).head.body shouldBe parsed(src).body
+  }
+
   "a decoded tree compiles to the same program the parsed one does" in {
     // The point of the format: what comes back is not merely equal, it is usable. Compiling
     // through it exercises the analyzer and codegen over decoded nodes rather than parsed ones.

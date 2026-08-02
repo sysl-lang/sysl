@@ -44,6 +44,7 @@ trait StmtAnalysis extends TypeResolution {
       case ValDecl(n, _, _, _)   => List(n)
       case RefDecl(n, _)         => List(n)
       case MultiDecl(ns, _, _)   => ns
+      case PatternDecl(p, _, _)  => patternNames(p)
       case ConstDecl(n, _, _, _) => List(n)
     }.flatten
 
@@ -193,6 +194,9 @@ trait StmtAnalysis extends TypeResolution {
     case RefDecl(name, _)       => declare(name, Type.Unknown)
     case MultiDecl(names, mutable, _) =>
       for n <- names do if mutable then declare(n, Type.Unknown) else declareReadOnly(n, Type.Unknown)
+    case PatternDecl(p, mutable, _) =>
+      for n <- patternNames(p) do
+        if mutable then declare(n, Type.Unknown) else declareReadOnly(n, Type.Unknown)
     case _                      =>
 
   /** Whether a `?` sits anywhere in this tree.
@@ -346,12 +350,89 @@ trait StmtAnalysis extends TypeResolution {
     )
   }
 
+  /** Every name a pattern binds, in the order it binds them, so that a repeat can be reported
+   * against the whole binding rather than found later as a shadow.
+   */
+  private def patternNames(p: Pattern): List[String] = p match
+    case IdentPattern(n)   => List(n)
+    case TuplePattern(ps)  => ps.flatMap(patternNames)
+    case WildcardPattern   => Nil
+    case _                 => Nil
+
+  /** `val (a, b) = …` / `var (a, b) = …` (`00 §13`).
+   *
+   * The value is analyzed once into a temporary and the pattern is then walked against its type,
+   * each part reading a field of what is above it. That is `spread`'s mechanism — the comma form
+   * takes a tuple apart exactly this way — with the one difference that a pattern may go deeper, so
+   * the walk recurses where `spread` stops after a level.
+   *
+   * **A part that is not a name is checked here rather than at `PatternAnalysis`**, because the
+   * question is not the one a match arm asks. An arm may be refutable and fall through; a binding
+   * has nowhere to fall, so what is refused is a pattern that could fail to match at all — and the
+   * diagnostic names that, rather than the match-arm rules the reader is not in.
+   */
+  private def patternDecl(d: PatternDecl): List[TStmt] = {
+    val names = patternNames(d.pattern)
+
+    for (n, i) <- names.zipWithIndex do
+      if names.indexOf(n) != i then err(s"'$n' is named twice in one binding")
+
+    val tv = at(d.value.pos)(analyzeExpr(d.value, None))
+
+    if tv.ty == Type.Never then
+      at(d.value.pos)(err("cannot bind a name to an expression that never returns"))
+
+    // The whole value is held once, under a name no program can write, and every part is read out
+    // of it. Reading the value expression again per part would run its side effects once each.
+    val temp = declare(s"${Modules.sep}parts", tv.ty)
+
+    TVarDecl(temp, tv.ty, tv) :: bindPattern(d.pattern, TLoad(temp, tv.ty), d.mutable)
+  }
+
+  /** One level of a pattern binding: bind a name, ignore a wildcard, or read the parts of a tuple
+   * and descend into each.
+   */
+  private def bindPattern(p: Pattern, subject: TExpr, mutable: Boolean): List[TStmt] = p match
+    case WildcardPattern => Nil
+
+    case IdentPattern(n) =>
+      List(TVarDecl(if mutable then declare(n, subject.ty) else declareReadOnly(n, subject.ty),
+        subject.ty, subject))
+
+    case TuplePattern(ps) =>
+      Type.underlying(subject.ty) match
+        case t: Type.Tuple if t.targs.length == ps.length =>
+          (for (sub, i) <- ps.zipWithIndex
+           yield bindPattern(sub, TField(subject, i, t.fields(i)._2), mutable)).flatten
+
+        case t: Type.Tuple =>
+          err(s"this pattern takes ${quantity(ps.length, "part")}, and a ${show(subject.ty)} has " +
+            s"${quantity(t.targs.length, "part")} to give it")
+          Nil
+
+        case other =>
+          err(s"one ${show(other)} is not something to take apart — only a tuple is")
+          Nil
+
+    // Everything `09 §5` admits in an arm and a binding cannot use. Named individually, because the
+    // reason differs: a literal or a range is a *test*, and a variant is a choice among several.
+    case _: LitPattern | _: RangePattern =>
+      err("a binding cannot test a value — this pattern matches only some values, and a binding " +
+        "has no other arm to take when it does not match")
+      Nil
+
+    case _: VariantPattern | _: StructPattern =>
+      err("a binding cannot choose among variants — this pattern matches one of several shapes, " +
+        "and a binding has no other arm to take when the value has another")
+      Nil
+
   /** Most statements are one statement. The two comma forms are the exception, and the only reason
    * this hands back a list: a binding that names several things is several declarations.
    */
   private def analyzeStmtAt(stmt: Stmt): List[TStmt] = stmt match
     case m: MultiAssign => multiAssign(m)
     case m: MultiDecl   => multiDecl(m)
+    case d: PatternDecl => patternDecl(d)
 
     // An import binds a name for the statements after it and emits nothing. It is read here rather
     // than gathered ahead of the block because it takes effect where it is written, as Scala's
