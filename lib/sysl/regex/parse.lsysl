@@ -1,0 +1,388 @@
+sysl.regex — reading a pattern
+==============================
+
+    module sysl.regex
+
+    import sysl.buf.{Buf, buf}
+    import sysl.text.{Ascii, Chars, chars_of}
+
+A recursive-descent parser for POSIX Extended Regular Expressions. The grammar it implements, which
+is POSIX's own with the recursion arranged for descent:
+
+```
+regex   → branch ('|' branch)*
+branch  → piece*
+piece   → atom quantifier*
+atom    → '.' | '^' | '$' | '[' set ']' | '(' regex ')' | '\' char | ordinary
+quantif → '*' | '+' | '?' | '{' n '}' | '{' n ',' '}' | '{' n ',' m '}'
+set     → '^'? ']'? item* ']'
+item    → char '-' char | '[:' name ':]' | char
+```
+
+A branch may be empty, which is what makes `a|` and `()` legal, and is why `branch` is `piece*`
+rather than `piece+`.
+
+
+Escaping, and what is deliberately not supported
+------------------------------------------------
+
+In ERE the metacharacters are unescaped and a backslash makes the next character ordinary: `(` opens
+a group and `\(` is a left parenthesis, which is the opposite of Basic Regular Expressions. Only ERE
+is implemented. BRE exists for `expr` and `sed`, and nothing here has asked for it.
+
+**A backslash inside a bracket expression is an ordinary character**, as POSIX requires. So `[\t]`
+is the two characters backslash and `t`, not a tab, and a `]` is included by writing it first:
+`[]abc]`. This is the one place where the strict reading is likely to surprise, and it is strict on
+purpose — the alternative silently gives a different set than the same pattern gives to `grep -E`.
+
+**`{` always begins an interval.** A pattern wanting a literal brace writes `\{`.
+
+
+The cursor
+----------
+
+Position is kept by a `Chars` cursor from `sysl.text` rather than by an index into the bytes, which
+is what lets the parser handle a pattern containing text: `[é-ü]` is a range over two characters,
+and a parser stepping bytes would see four. The cursor reports the byte offset of the character it
+is about to read, so every error position below is directly an offset into the pattern string.
+
+A `Chars` is a value, so a copy of one is a second cursor — which is the whole of the two-character
+lookahead that a range inside a bracket expression needs.
+
+    private struct Parser
+        cur: Chars
+        groups: int
+
+        at(self) -> usize = self.cur.offset
+
+        peek(self) -> Option[char] = self.cur.peek()
+
+        done(self) -> bool = self.cur.peek().is_none()
+
+        bump(*self)
+            self.cur.next()
+
+The character after the one the cursor is on, without moving: a second cursor, made by copying the
+first and stepping it once.
+
+        peek2(self) -> Option[char]
+            var look = self.cur
+
+            look.next()
+            look.peek()
+        end peek2
+
+Whether the cursor is on exactly this character, and the step-past that every caller closing a
+bracket, a group or an interval turns into its error.
+
+        on(self, c: char) -> bool = self.cur.peek() match
+            Some(x) -> x == c
+            None -> false
+
+        on2(self, c: char) -> bool = self.peek2() match
+            Some(x) -> x == c
+            None -> false
+
+        eat(*self, c: char) -> bool
+            if self.on(c)
+                self.bump()
+                return true
+
+            false
+        end eat
+
+Alternation is the loosest operator, so it is the outermost rule. It is left-associated, which for
+`a|b|c` gives `alt(alt(a, b), c)` — the shape does not matter to the matcher, since both branches of
+an `Alt` are tried, but it is fixed here so the tests can say what it is.
+
+        parse_alt(*self) -> Result[&Node, RegexError]
+            var left = self.parse_branch()?
+
+            while self.on('|')
+                self.bump()
+
+                var right = self.parse_branch()?
+
+                left = Alt(left, right)
+
+            Ok(left)
+        end parse_alt
+
+A branch runs until something that cannot start an atom: the end of the pattern, a `|`, or a `)`.
+Anything else is a piece, and the pieces are concatenated left to right.
+
+        parse_branch(*self) -> Result[&Node, RegexError]
+            var left: &Node = Empty
+            var any = false
+
+            while !self.done() && !self.on('|') && !self.on(')')
+                var piece = self.parse_piece()?
+
+                left = if any then Seq(left, piece) else piece
+                any = true
+
+            Ok(left)
+        end parse_branch
+
+Quantifiers are looped rather than taken singly, so `a*?` is `quest(star(a))` — the reading every
+ERE implementation gives it, and the reason it is not laziness: ERE has no lazy quantifiers, and the
+second `?` makes the already-optional star optional again.
+
+        parse_piece(*self) -> Result[&Node, RegexError]
+            var node = self.parse_atom()?
+            var more = true
+
+            while more && !self.done()
+                var here = self.at()
+
+                if self.eat('*') then
+                    node = Star(node)
+                elif self.eat('+') then
+                    node = Plus(node)
+                elif self.eat('?') then
+                    node = Quest(node)
+                elif self.eat('{') then
+                    node = self.parse_interval(node, here)?
+                else
+                    more = false
+
+            Ok(node)
+        end parse_piece
+
+        parse_atom(*self) -> Result[&Node, RegexError]
+            var here = self.at()
+
+            self.peek() match
+                None -> Err(NothingToRepeat(here))
+                Some(c) ->
+                    if c == '.' then
+                        self.bump()
+                        Ok(AnyChar)
+                    elif c == '^' then
+                        self.bump()
+                        Ok(AtStart)
+                    elif c == '$' then
+                        self.bump()
+                        Ok(AtEnd)
+                    elif c == '[' then
+                        self.bump()
+                        self.parse_set(here)
+                    elif c == '(' then
+                        self.bump()
+                        self.parse_group(here)
+                    elif c == '\\' then
+                        self.bump()
+                        self.parse_escape(here)
+                    elif c == '*' || c == '+' || c == '?' || c == '{' then
+                        Err(NothingToRepeat(here))
+                    else
+                        self.bump()
+                        Ok(Lit(c))
+        end parse_atom
+
+        parse_escape(*self, start: usize) -> Result[&Node, RegexError]
+            self.peek() match
+                None -> Err(TrailingBackslash(start))
+                Some(e) ->
+                    self.bump()
+                    Ok(Lit(e))
+        end parse_escape
+
+Groups are numbered in the order their `(` is read, which is what makes the numbering match the way
+a pattern reads left to right even when the groups nest. The counter is bumped before the body is
+parsed for that reason: `((a)b)` gives the outer group 1 and the inner group 2.
+
+        parse_group(*self, open_at: usize) -> Result[&Node, RegexError]
+            self.groups += 1
+
+            var index = self.groups
+            var inner = self.parse_alt()?
+
+            if !self.eat(')') then return Err(UnterminatedGroup(open_at))
+            Ok(Group(inner, index))
+        end parse_group
+
+`a{2,4}` is not a node kind. It is expanded into the nodes that already exist, which keeps the
+matcher's instruction set at nine and means nothing downstream has to know intervals happened. The
+expansion itself is `expand`, below.
+
+        parse_interval(*self, child: &Node, open_at: usize) -> Result[&Node, RegexError]
+            var lo = self.parse_count()
+
+            if lo < 0 then return Err(MissingIntervalCount(open_at))
+
+            var hi = lo
+
+            if self.eat(',')
+                if self.on('}') then
+                    hi = -1
+                else
+                    hi = self.parse_count()
+                    if hi < 0 then return Err(MissingIntervalCount(open_at))
+
+            if !self.eat('}') then return Err(UnterminatedInterval(open_at))
+            if hi >= 0 && hi < lo then return Err(BackwardsInterval(open_at))
+
+            Ok(expand(child, lo, hi))
+        end parse_interval
+
+        parse_count(*self) -> int
+            var n = 0
+            var any = false
+
+            while !self.done()
+                var c = self.peek().unwrap()
+
+                if !c.is_digit() then break
+                n = n * 10 + int(u32(c)) - 48
+                any = true
+                self.bump()
+
+            if any then n else -1
+        end parse_count
+
+The two quirks POSIX puts at the front of a bracket expression are both about a character that would
+otherwise close or negate it. A `^` first negates; anywhere else it is ordinary. A `]` first is an
+ordinary `]`; anywhere else it closes. Both fall out of reading the `^` before the loop and of the
+loop's `first` flag.
+
+        parse_set(*self, open_at: usize) -> Result[&Node, RegexError]
+            var cls = char_class()
+
+            if self.eat('^') then cls.negated = true
+
+            var first = true
+
+            while true
+                if self.done() then return Err(UnterminatedClass(open_at))
+                if self.on(']') && !first then break
+
+                first = false
+                self.parse_set_item(cls)?
+
+            self.bump()
+            Ok(InSet(cls))
+        end parse_set
+
+One member of a class: a named class, a range, or a single character. A `-` counts as a range only
+when there is something on both sides of it, so a trailing `[a-]` is the two ordinary characters `a`
+and `-`, which is again what POSIX says.
+
+        parse_set_item(*self, cls: CharClass) -> Result[unit, RegexError]
+            var here = self.at()
+
+            if self.on('[') && self.on2(':')
+                self.bump()
+                self.bump()
+                return self.parse_class_name(cls, here)
+
+            var lo = self.peek().unwrap()
+
+            self.bump()
+
+            if self.on('-') && self.peek2().is_some() && !self.on2(']')
+                self.bump()
+
+                var hi = self.peek().unwrap()
+
+                self.bump()
+
+                if u32(hi) < u32(lo) then return Err(BackwardsRange(here))
+                cls.ranges.push(CharRange(u32(lo), u32(hi)))
+                return Ok(())
+
+            cls.ranges.push(CharRange(u32(lo), u32(lo)))
+            Ok(())
+        end parse_set_item
+
+The name between `[:` and `:]`. An unknown one is refused rather than treated as ordinary
+characters: `[[:alhpa:]]` is a typo every time, and a class that quietly stood for the letters of
+"alhpa" plus a colon would match and give a wrong answer instead of an error.
+
+        parse_class_name(*self, cls: CharClass, open_at: usize) -> Result[unit, RegexError]
+            var name = ""
+
+            while !self.done() && !self.on(':')
+                name += str(self.peek().unwrap())
+                self.bump()
+
+            if !self.eat(':') then return Err(UnterminatedClassName(open_at))
+            if !self.eat(']') then return Err(UnterminatedClassName(open_at))
+
+            named_class(name) match
+                Some(n) ->
+                    cls.names.push(n)
+                    Ok(())
+                None -> Err(UnknownClassName(open_at, name))
+        end parse_class_name
+    end Parser
+
+
+Expanding an interval
+---------------------
+
+An interval becomes the nodes that already exist:
+
+```
+a{3}    →  seq(seq(a, a), a)
+a{2,4}  →  seq(seq(a, a), seq(quest(a), quest(a)))
+a{3,}   →  seq(seq(seq(a, a), a), star(a))
+a{0,2}  →  seq(quest(a), quest(a))
+a{0}    →  empty
+```
+
+The child subtree is *shared* between the copies rather than duplicated. That is sound because
+nothing mutates a parsed tree, and the compiler emits an independent run of instructions for each
+place it walks to. A capture group inside a repeated piece therefore has one number and is written
+by every repetition that runs, so the group holds what the last one matched — which is what POSIX
+says it should.
+
+    private expand(child: &Node, lo: int, hi: int) -> &Node
+        var out: &Node = Empty
+        var any = false
+
+        for _ in 0..<lo
+            out = if any then Seq(out, child) else child
+            any = true
+
+        if hi < 0 then
+            var tail: &Node = Star(child)
+
+            out = if any then Seq(out, tail) else tail
+        else
+            for _ in 0..<(hi - lo)
+                var opt: &Node = Quest(child)
+
+                out = if any then Seq(out, opt) else opt
+                any = true
+
+        out
+    end expand
+
+
+The entry points
+----------------
+
+A pattern is a whole regex followed by nothing. The leftover-input case is reported as an unmatched
+`)` because that is the only thing it can be: a branch stops at `)` whether or not a group is open,
+so an unbalanced one is exactly what is left behind.
+
+    parse(pattern: string) -> Result[&Node, RegexError]
+        var p = Parser(chars_of(pattern.bytes), 0)
+        var n = p.parse_alt()?
+
+        if !p.done() then return Err(UnmatchedParen(p.at()))
+        Ok(n)
+    end parse
+
+How many capture groups a pattern has, which the compiler needs before it can size the capture
+slots. It is returned alongside the tree rather than counted by walking it afterwards, because the
+parser has already counted and a second walk is a second chance for the two to disagree.
+
+    parse_counted(pattern: string) -> Result[(&Node, int), RegexError]
+        var p = Parser(chars_of(pattern.bytes), 0)
+        var n = p.parse_alt()?
+
+        if !p.done() then return Err(UnmatchedParen(p.at()))
+        Ok((n, p.groups))
+    end parse_counted

@@ -70,6 +70,22 @@ class AsciiTests extends AnyFreeSpec with RunSupport {
               |      u8(127u32).is_control(), u8(32u32).is_control())""".stripMargin) shouldBe
         "true true true false\n"
     }
+
+    // The discriminating character is the newline: it is whitespace and it is not blank, which is
+    // the whole difference between the two questions and the one a field splitter gets wrong by
+    // reaching for `is_space`.
+    "blank is the two within-a-line separators, and a newline is not one" in {
+      ascii("""print(u8(' ').is_blank(), u8(9u32).is_blank(),
+              |      u8(10u32).is_blank(), u8(10u32).is_space(), u8('x').is_blank())""".stripMargin) shouldBe
+        "true true false true false\n"
+    }
+
+    // `is_graph` is `is_print` minus the space, so the space is where the two part company.
+    "graph is print without the space" in {
+      ascii("""print(u8(' ').is_graph(), u8(' ').is_print(), u8('!').is_graph(),
+              |      u8('~').is_graph(), u8(127u32).is_graph())""".stripMargin) shouldBe
+        "false true true true false\n"
+    }
   }
 
   "the range the trait speaks for" - {
