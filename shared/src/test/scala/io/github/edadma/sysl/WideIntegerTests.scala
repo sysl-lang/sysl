@@ -84,6 +84,27 @@ class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       ) shouldBe "-1 -1 0\n"
     }
 
+    // Zero is the one width the shape admits and the family does not, so it is a diagnostic about
+    // the number rather than "unknown type" — which would send a reader looking for a declaration
+    // they never wrote. `scalarType` consults the width family before the declared types, so the
+    // shape is reserved whether or not it resolves; the message is the whole difference.
+    "a zero width says it has no bits, rather than reading as a missing declaration" in {
+      err("var x: i0 = 0") should include("has no bits")
+      err("var x: u0 = 0") should include("has no bits")
+      err("var x: i000 = 0") should include("has no bits")
+    }
+
+    "a leading zero says how to write the width plainly" in {
+      err("var x: i01 = 0") should include("leading zero")
+      err("var x: u008 = 0") should include("'u8'")
+    }
+
+    // The shape is a family letter and digits only. Anything else is an ordinary identifier and
+    // must stay available to a program that declares one.
+    "a name that only looks like a width is left to the program" in {
+      err("var x: i5x = 0") should include("unknown type 'i5x'")
+    }
+
     "and the bit surface counts against a width of one" in {
       run(
         """import sysl.math.*

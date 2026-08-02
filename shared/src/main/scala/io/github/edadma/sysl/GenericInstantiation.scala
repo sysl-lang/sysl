@@ -67,8 +67,21 @@ trait GenericInstantiation extends ConstFolding {
   protected def widthType(name: String): Option[Type] = {
     val digits = name.drop(1)
 
+    // A family letter followed by digits and nothing else. Anything that is not that shape is not
+    // this family's business and may be a name a program declared — `i5x` is an ordinary identifier.
     if name.length < 2 || !"iuf".contains(name.head) then None
-    else if digits.head == '0' || !digits.forall(c => c >= '0' && c <= '9') then None
+    else if !digits.forall(c => c >= '0' && c <= '9') then None
+    // **Once the shape matches, the name belongs to the family and a bad width is a diagnostic** —
+    // never a fall-through to "unknown type", which sends a reader looking for a missing
+    // declaration when what is wrong is the number they wrote. `scalarType` consults this before it
+    // consults the declared types, so the shape is reserved either way; saying so is the whole
+    // difference between the two messages.
+    else if digits.head == '0' then
+      if digits.forall(_ == '0') then
+        err(s"'$name' has no bits — the width families start at 1, and a single bit is " +
+          s"'${name.head}1'")
+      else err(s"'$name' has a leading zero — a width is written plainly, as '${name.head}" +
+        s"${digits.dropWhile(_ == '0')}'")
     else
       val bits = digits.toIntOption.getOrElse(err(s"'$name' is far wider than anything can hold"))
 
