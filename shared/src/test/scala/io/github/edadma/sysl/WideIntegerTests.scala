@@ -179,6 +179,121 @@ class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
+  /** Division and remainder at widths that are not a register and not a byte multiple.
+   *
+   * These are where a division goes wrong quietly rather than loudly: the value is stored in a
+   * container wider than the type, so an operand that was not narrowed to its own width first
+   * divides as the wrong number, and the answer is plausible instead of absent. Every case below
+   * therefore uses operands whose correct answer differs from what the next width up would give.
+   */
+  "division and remainder at widths that are neither a register nor a byte" - {
+    // Truncation toward zero with the remainder taking the dividend's sign, at a width narrower
+    // than any C type. `-13 / 4` is `-3` and not `-4`, which is the difference between truncating
+    // and flooring.
+    "a narrow signed width truncates toward zero and keeps the dividend's sign" in {
+      run(
+        """var a: i5 = -13
+          |var b: i5 = 4
+          |
+          |print(a / b, a % b, (-a) / b, (-a) % b)""".stripMargin
+      ) shouldBe "-3 -1 3 1\n"
+    }
+
+    "the narrowest signed width that can divide at all" in {
+      run("var a: i3 = -4\nvar b: i3 = 3\nprint(a / b, a % b)") shouldBe "-1 -1\n"
+    }
+
+    // The top bit is set, so a division that read the value as signed would answer a negative one.
+    "an unsigned width with its top bit set is not read as negative" in {
+      run("var a: u5 = 31\nvar b: u5 = 4\nprint(a / b, a % b)") shouldBe "7 3\n"
+    }
+
+    "a width between two byte sizes" in {
+      run("var a: u12 = 4000\nvar b: u12 = 7\nprint(a / b, a % b)") shouldBe "571 3\n"
+    }
+
+    // Wide, and not a multiple of 64, so the value straddles its registers unevenly — the case an
+    // implementation that assumed whole limbs would get wrong.
+    "a wide width that does not fill its last register" in {
+      run(
+        """var a: u96 = 79228162514264337593543950335
+          |var b: u96 = 1000000007
+          |
+          |print(a / b, a % b)""".stripMargin
+      ) shouldBe "79228161959667203875 873523210\n"
+    }
+
+    "and the same, signed and negative" in {
+      run(
+        """var a: i100 = -633825300114114700748351602687
+          |var b: i100 = 12345
+          |
+          |print(a / b, a % b)""".stripMargin
+      ) shouldBe "-51342673156266885439315642 -2197\n"
+    }
+  }
+
+  /** The two divisions with no answer, which are guarded rather than left to the machine.
+   *
+   * **The overflow guard is computed at the operand's own width**, and that is what these pin: the
+   * emitted test is `icmp eq i4 %x, -8`, `i4`'s minimum, not a constant borrowed from a wider type.
+   * A guard written against the wrong width would simply not fire at a narrow one, and `sdiv`
+   * overflow is poison — so the failure would be a plausible wrong number rather than a stop.
+   *
+   * arm64 makes this sharper than it looks: its `sdiv` answers the minimum silently for this case
+   * and never faults, so nothing here is inherited from the hardware.
+   */
+  "a division with no representable answer stops the program" - {
+    "the most negative value over minus one, at a narrow width" in {
+      exits("var a: i4 = -8\nvar b: i4 = -1\nprint(a / b)")
+    }
+
+    // **The remainder does not, and the asymmetry is the right one.** `min / -1` has no
+    // representable answer and must stop; `min % -1` is `0`, which every width can hold. LLVM calls
+    // both undefined, so the answer is not simply left to `srem`: the divisor is replaced by `1`
+    // when it is `-1`, and since `x % 1` and `x % -1` are both zero for every `x`, that is the same
+    // answer with the undefined case never reached.
+    "while the remainder of the same pair is zero, which is representable" in {
+      run("var a: i4 = -8\nvar b: i4 = -1\nprint(a % b)") shouldBe "0\n"
+    }
+
+    "and that substitution is the answer at every width, not a narrow-width special case" in {
+      run(
+        """var a: i100 = -633825300114114700748351602688
+          |var b: i100 = -1
+          |var c: int = -2147483648
+          |var d: int = -1
+          |
+          |print(a % b, c % d)""".stripMargin
+      ) shouldBe "0 0\n"
+    }
+
+    "the same at an odd wide width, where the minimum is a bignum" in {
+      exits(
+        """var a: i100 = -633825300114114700748351602688
+          |var b: i100 = -1
+          |
+          |print(a / b)""".stripMargin
+      )
+    }
+
+    // One below the minimum divides perfectly well, which is what says the guard is testing the
+    // right value rather than refusing every negative division.
+    "while one step away from the minimum divides normally" in {
+      run("var a: i4 = -7\nvar b: i4 = -1\nprint(a / b)") shouldBe "7\n"
+    }
+
+    "an unsigned width has no overflow to guard, only the zero" in {
+      run("var a: u4 = 15\nvar b: u4 = 1\nprint(a / b)") shouldBe "15\n"
+      exits("var a: u4 = 15\nvar b: u4 = 0\nprint(a / b)")
+    }
+
+    "division by zero stops it at a narrow width too" in {
+      exits("var a: i5 = 7\nvar b: i5 = 0\nprint(a / b)")
+      exits("var a: u12 = 7\nvar b: u12 = 0\nprint(a % b)")
+    }
+  }
+
   "comparison sees the whole value, not its low half" - {
     "two values that agree in their low 64 bits still order correctly" in {
       run("""var a: u128 = 18446744073709551616
