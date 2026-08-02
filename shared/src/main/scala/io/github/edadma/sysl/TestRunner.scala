@@ -66,7 +66,7 @@ object TestRunner {
 
     val exe = createTempFile("sysl-test-", "")
 
-    Toolchain.build(ir, exe, target, archives) match
+    Toolchain.build(ir, exe, target, archives, cfg.optimize) match
       case Left(err) => discard(exe); fail(err)
       case Right(_) =>
         val outcomes = execute(exe, selected, opts)

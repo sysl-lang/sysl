@@ -47,12 +47,17 @@
 //     whole body is one index. That is a small price and the alternative — copying eighty words
 //     per block — is not one. The initial values escape it because there are only eight of them,
 //     so `start` takes a `[8]T` **by value** and a `val` copies into a parameter perfectly well.
-//   * **A literal at a generic callee's parameter had no type.** `rotr(x, 7)` was
-//     "'n' of 'rotr' is uint, but int was given", and `f(v, 7)` against `f[T](x: T, n: usize)` the
-//     same, though `01` lists the parameter type at a call among the positions that fix a literal
-//     and says nothing about the callee. Fixed while writing this, in two halves: a parameter that
-//     names no type parameter is known up front and is used up front, and a literal is now
-//     consulted **last** by inference and analyzed against whatever the parameter turned out to be.
+//   * **A literal at a generic callee's parameter had no type.** `f(v, 7)` against
+//     `f[T](x: T, n: usize)` was "'n' of 'f' is uint, but int was given", though `01` lists the
+//     parameter type at a call among the positions that fix a literal and says nothing about the
+//     callee. Fixed while writing this, in two halves: a parameter that names no type parameter is
+//     known up front and is used up front, and a literal is now consulted **last** by inference and
+//     analyzed against whatever the parameter turned out to be.
+//   * **The rotation everybody writes is undefined at zero.** The mixing functions used to go
+//     through a generic `rotr(x, n) = (x >> n) | (x << (T.bits() - n))`, which shifts by the whole
+//     width when `n` is zero — undefined, and invisible here because SHA-2 rotates by a nonzero
+//     constant every time. `sysl.math`'s `Bits` has the machine's own instruction, defined at every
+//     amount, so the four mixing functions rotate rather than reconstructing a rotation.
 //   * **A line could not be continued** — answered, and the answer corrected the diagnosis. A
 //     trailing operator now carries the line, which is what `guide/bytecode` and `guide/shapes`
 //     wanted; it does not shorten `digest_of`'s 107-character signature, because the length there
@@ -65,6 +70,8 @@
 // on a struct really does mean its members inherit it. `[v; n]` with a length worked out while
 // running gives the message buffers their storage, and copying a started hasher is what lets HMAC
 // take "a hash function" as an argument without a trait that could not have promised one.
+
+import sysl.math.Bits
 
 check(name: string, got: string, want: string)
     if got == want then print(s"ok    $name = $got")
@@ -273,11 +280,15 @@ print("-- the pieces both widths are built from")
 var x32 = 0x12345678u32
 var x64 = 0x0123456789abcdefu64
 
-check("a 32-bit rotate by four", w32(rotr(x32, 4)), "81234567")
-check("a 32-bit rotate all the way round but four", w32(rotr(x32, 28)), "23456781")
-check("a 64-bit rotate by eight", w64(rotr(x64, 8)), "ef0123456789abcd")
-check("a 64-bit rotate all the way round but eight", w64(rotr(x64, 56)), "23456789abcdef01")
-check("a rotate composes with its complement", w32(rotr(rotr(x32, 4), 28)), w32(x32))
+check("a 32-bit rotate by four", w32(x32.rotate_right(4)), "81234567")
+check("a 32-bit rotate all the way round but four", w32(x32.rotate_right(28)), "23456781")
+check("a 64-bit rotate by eight", w64(x64.rotate_right(8)), "ef0123456789abcd")
+check("a 64-bit rotate all the way round but eight", w64(x64.rotate_right(56)), "23456789abcdef01")
+check("a rotate composes with its complement", w32(x32.rotate_right(4).rotate_right(28)), w32(x32))
+// The two amounts the expression this replaces could not answer: zero shifts by the whole width,
+// and a whole turn is the same shift once the amount has been reduced.
+check("a rotate by nothing", w32(x32.rotate_right(0)), w32(x32))
+check("a rotate all the way round", w32(x32.rotate_right(32)), w32(x32))
 check("the top byte of a 32-bit word", f"${top_byte(x32)}%02x", "12")
 check("the top byte of a 64-bit word", f"${top_byte(x64)}%02x", "01")
 check("choose, at 32 bits", w32(ch(0xf0f0f0f0u32, 0xaaaaaaaau32, 0x55555555u32)), "a5a5a5a5")

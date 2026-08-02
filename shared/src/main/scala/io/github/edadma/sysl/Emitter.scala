@@ -44,8 +44,11 @@ trait Emitter {
    */
   protected var usesMemcpy = false
 
-  /** LLVM intrinsic `declare` lines the module turned out to need — the saturating
-   * float-to-integer casts, each declared once under its overload-mangled name.
+  /** LLVM intrinsic `declare` lines the module turned out to need — the saturating float-to-integer
+   * casts, the checked arithmetic, and the bit operations `sysl.math`'s `Bits` lowers to. Each is
+   * declared once under its overload-mangled name, which is why this is a set rather than a flag:
+   * the name carries the width, so a program using one member at three widths needs three
+   * declarations and a flag could not tell them apart.
    */
   protected val satDecls = mutable.LinkedHashSet.empty[String]
 
