@@ -188,10 +188,41 @@ show()
 A `_` binds nothing and skips its part. A `var` pattern makes every name it binds assignable, and a
 `val` pattern makes each of them write-once, exactly as the single-name forms do.
 
-**Only a pattern that cannot fail may stand at a binding** — a tuple pattern, a name, a wildcard, and
-those nested inside one another. A literal, a range, or a variant is a *test*, and a binding has no
-other arm to take when the test does not match, so each is refused by name. Those belong in a `match`
-(see [Patterns](../patterns/)).
+A **struct pattern** stands here on the same terms, naming fields rather than positions. It may name
+them in any order, may leave fields out, and may rename one to a sub-pattern:
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+struct Line
+    a: Point
+    b: Point
+
+show()
+    val Point{x, y} = Point(3, 4)
+    val Line{a: Point{x: ax}, b} = Line(Point(1, 2), Point(5, 6))
+
+    print(x, y, ax, b.x, b.y)
+
+show()
+```
+
+```output
+3 4 1 5 6
+```
+
+A field the pattern does not name simply binds nothing — unlike a `match` arm, a binding has no
+exhaustiveness to discharge.
+
+**Only a pattern that cannot fail may stand at a binding** — a tuple pattern, a struct pattern, a
+name, a wildcard, and those nested inside one another. A struct qualifies because it has exactly one
+shape, which is the same property that makes a tuple pattern irrefutable.
+
+A literal, a range, or a **variant** is a *test*, and a binding has no other arm to take when the
+test does not match, so each is refused with that as the reason. Those belong in a `match` (see
+[Patterns](../patterns/)).
 
 Like the comma form, this is **a local form**: the parts have nowhere to carry a type, so one at the
 top of a file is refused rather than becoming a quiet local of the entry point.

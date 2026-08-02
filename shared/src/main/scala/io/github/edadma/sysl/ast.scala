@@ -527,10 +527,15 @@ case class MultiDecl(names: List[String], mutable: Boolean, values: List[Expr]) 
  * nested one — `val ((a, b), c) = p` names three things across two levels, which no list of names
  * can say.
  *
- * **Only an irrefutable pattern may stand here**, which for a tuple means the parts are themselves
- * tuple patterns, names, or wildcards. A binding has no arm to fall through to, so a pattern that
- * can fail to match would leave its names standing for nothing; `09 §5`'s refutable forms are
- * refused with that as the reason.
+ * **Only an irrefutable pattern may stand here** — a tuple pattern, a **struct** pattern, a name, a
+ * wildcard, and those nested inside one another. A binding has no arm to fall through to, so a
+ * pattern that can fail to match would leave its names standing for nothing; `09 §5`'s refutable
+ * forms are refused with that as the reason.
+ *
+ * **A struct pattern qualifies because a struct has exactly one shape**, which is the same property
+ * that makes a tuple pattern irrefutable — `09 §` calls a tuple pattern the positional form of this
+ * one. A *variant* pattern is the one that does not qualify: an enum has several shapes and naming
+ * one of them is a test.
  */
 case class PatternDecl(pattern: Pattern, mutable: Boolean, value: Expr) extends Stmt
 

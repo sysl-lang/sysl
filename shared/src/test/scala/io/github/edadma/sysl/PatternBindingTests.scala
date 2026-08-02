@@ -133,6 +133,222 @@ class PatternBindingTests extends AnyFreeSpec with RunSupport with CodegenSuppor
     ) shouldBe "side\n1 2 3\n"
   }
 
+  // A struct has exactly one shape, so naming it cannot fail — the same property that makes a tuple
+  // pattern irrefutable, and `09 §` calls a tuple pattern the positional form of this one.
+  "a struct, taken apart by field name" - {
+    "every field" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val Point{x, y} = Point(3, 4)
+          |    print(x, y)
+          |
+          |show()""".stripMargin
+      ) shouldBe "3 4\n"
+    }
+
+    // Unlisted fields bind nothing, which is where a binding differs from a match arm: there is no
+    // exhaustiveness to discharge, so nothing has to stand in for the fields left out.
+    "only the fields it names" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |    z: int
+          |
+          |show() =
+          |    val Point{y} = Point(1, 2, 3)
+          |    print(y)
+          |
+          |show()""".stripMargin
+      ) shouldBe "2\n"
+    }
+
+    "fields in an order of its own" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val Point{y, x} = Point(3, 4)
+          |    print(x, y)
+          |
+          |show()""".stripMargin
+      ) shouldBe "3 4\n"
+    }
+
+    "a field renamed to a sub-pattern, and a struct nested in one" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |struct Line
+          |    a: Point
+          |    b: Point
+          |
+          |show() =
+          |    val Line{a: Point{x, y}, b: Point{x: bx}} = Line(Point(1, 2), Point(3, 4))
+          |    print(x, y, bx)
+          |
+          |show()""".stripMargin
+      ) shouldBe "1 2 3\n"
+    }
+
+    "a struct inside a tuple, and a tuple inside a struct" in {
+      run(
+        """struct Pair
+          |    both: (int, int)
+          |
+          |struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val (Point{x, y}, n) = (Point(1, 2), 3)
+          |    val Pair{both: (a, b)} = Pair((4, 5))
+          |    print(x, y, n, a, b)
+          |
+          |show()""".stripMargin
+      ) shouldBe "1 2 3 4 5\n"
+    }
+
+    "var makes the named fields assignable" in {
+      run(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    var Point{x, y} = Point(3, 4)
+          |    x = x + 10
+          |    print(x, y)
+          |
+          |show()""".stripMargin
+      ) shouldBe "13 4\n"
+    }
+
+    "a counted field is retained by the read" in {
+      run(
+        """struct Inner
+          |    n: int
+          |
+          |struct Outer
+          |    cell: &Inner
+          |
+          |make() -> Outer =
+          |    val c: &Inner = Inner(7)
+          |    Outer(c)
+          |
+          |show() =
+          |    val Outer{cell} = make()
+          |    print(cell.n)
+          |
+          |show()""".stripMargin
+      ) shouldBe "7\n"
+    }
+  }
+
+  "what a struct binding will not accept" - {
+    "a field the struct does not have" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val Point{x, w} = Point(3, 4)
+          |    print(x)
+          |
+          |show()""".stripMargin
+      ) should include("has no field 'w'")
+    }
+
+    // `{x, x}` is a duplicate on both counts — one field twice, and one name bound twice — and the
+    // name check is the one that fires, which is the more useful of the two to hear first.
+    "one field named twice binds one name twice" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val Point{x, x} = Point(3, 4)
+          |    print(x)
+          |
+          |show()""".stripMargin
+      ) should include("named twice in one binding")
+    }
+
+    // Renaming the second one leaves the names distinct, so only the field check can catch it. This
+    // is the case that would pass silently if a struct binding did not check its fields at all.
+    "the same field twice under two names is still the same field twice" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val Point{x: a, x: b} = Point(3, 4)
+          |    print(a, b)
+          |
+          |show()""".stripMargin
+      ) should include("more than once")
+    }
+
+    "a struct name that is not the value's" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |struct Size
+          |    w: int
+          |    h: int
+          |
+          |show() =
+          |    val Size{w, h} = Point(3, 4)
+          |    print(w)
+          |
+          |show()""".stripMargin
+      ) should include("does not match")
+    }
+
+    "a value that is not a struct at all" in {
+      err(
+        """struct Point
+          |    x: int
+          |    y: int
+          |
+          |show() =
+          |    val Point{x, y} = 5
+          |    print(x)
+          |
+          |show()""".stripMargin
+      ) should include("matches a struct, but the value is")
+    }
+
+    // The pattern that is still refused, and the one the rule is really about: an enum has several
+    // shapes, so naming one of them is a test rather than a description.
+    "a variant, which is still a choice among shapes" in {
+      err(
+        """enum Shape
+          |    Circle(r: int)
+          |    Square(s: int)
+          |
+          |show() =
+          |    val Circle(r) = Circle(1)
+          |    print(r)
+          |
+          |show()""".stripMargin
+      ) should include("no other arm")
+    }
+  }
+
   "the edges" - {
     // The expansion holds the whole value in a temporary and reads fields out of it, so a part that
     // is counted has to be retained by the read exactly as a field read anywhere else is. If it
