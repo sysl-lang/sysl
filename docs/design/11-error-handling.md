@@ -106,13 +106,18 @@ This is the shipping behavior and the baseline the spec commits to. The known er
 a program with its own `AppError` cannot `?`-propagate a library's `IoError` without a manual
 conversion at each call — is real, and the eventual answer is **`From`-style conversion**: `?`
 inserts a conversion from the callee's `E` to the caller's `E` when a conversion trait connects
-them, exactly as Rust's `?` calls `From::from`. That is **designed but deferred** (`§ Open a`), and
-what it waits on is now precise. A `From[E]` is writable — a trait takes type parameters (`02`) — but
-a type implements one trait **once**, so an `AppError` cannot be `From[IoError]` and
-`From[ParseError]` both. Lifting that needs a way for a use to say which implementation it means,
-which is `02`'s own open item. The conversion stays additive either way: turning it on later does
-not invalidate any exact-match `?` written before it, and until then exact match keeps the feature
-simple and its failures legible.
+them, exactly as Rust's `?` calls `From::from`. That is **designed but deferred** (`§ Open a`).
+
+**What it used to wait on has arrived.** This section said a `From[E]` was writable but useless,
+because a type implemented one trait once and so an `AppError` could not be `From[IoError]` and
+`From[ParseError]` both. `02`'s parameterized traits closed that: a type implements a trait once **at
+each argument list**, and the two `impl`s coexist and resolve — measured, not assumed. So nothing in
+the type system is missing any more, and what remains is the work in `?` itself: finding the
+conversion where the types differ, deciding what happens when none connects them, and saying whether
+a chain of conversions is looked for or only a single step.
+
+The conversion stays additive either way: turning it on later does not invalidate any exact-match `?`
+written before it, and until then exact match keeps the feature simple and its failures legible.
 
 ## 5. `?` and the memory model
 
@@ -233,8 +238,9 @@ where a call asks for one, and an `extern` nothing reaches is not declared in th
 
 - **a. `From`-style error conversion in `?`.** Let `?` convert the callee's `E` to the caller's
   `E` through a conversion trait, so cross-error-type propagation needs no manual step (§4).
-  Additive over the exact-match baseline; waits on a way to choose between several implementations
-  of one trait for one type (`02`), which is what a useful `From` needs.
+  Additive over the exact-match baseline. It used to wait on a way to choose between several
+  implementations of one trait for one type; `02`'s parameterized traits supplied that, so what is
+  left is in `?` itself rather than in the type system (§4).
 - **b. `Result`/`Option` combinator library.** `map`, `and_then`, `or_else`, `ok_or`, and the
   rest are stdlib surface, designed when the standard library is (they are not language
   features). The *forcing* ones are settled and shipped (§8); these are the transforming ones.

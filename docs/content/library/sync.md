@@ -358,7 +358,7 @@ print(f.load())
 ```
 
 ```error
-and real is neither
+'atomic_load' reaches a word the machine can touch indivisibly — an integer of 8, 16, 32 or 64 bits, or a pointer — and real is neither. An aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for (`06`)
 ```
 
 **The arithmetic members are refused on a pointer**, and for a third reason again: an address plus a

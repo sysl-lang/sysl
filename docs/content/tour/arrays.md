@@ -140,7 +140,7 @@ scale(data[..])
 ```
 
 ```error
-views elements it may not write
+this element belongs to a '[]const int', which views elements it may not write, so there is nothing to assign through. Elements you may write are elements of your own: copy them into a '[]int' first
 ```
 
 The `const` is a property of the *view*, not of the element type — which is why it sits after the

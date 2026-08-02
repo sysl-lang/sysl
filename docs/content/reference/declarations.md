@@ -78,7 +78,7 @@ print(name)
 ```
 
 ```error
-storage that exists for the whole run is never let go of
+'name' cannot be a 'val': storage that exists for the whole run is never let go of, so a count taken in one is a count with nowhere to write the release — and this string is built while the program runs. One the object file can carry as it stands may be held: a string literal owns nothing, and neither does a table of them
 ```
 
 The question is asked of the **value**, not of the type, and a string *literal* answers it: its bytes

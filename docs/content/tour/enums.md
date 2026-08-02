@@ -151,7 +151,7 @@ area(s: Shape) -> int
 ```
 
 ```error
-missing Rect
+match on 'Shape' is not exhaustive; missing Rect (add an 'else' arm)
 ```
 
 That is the central payoff of a closed set of variants: adding one turns every match on the enum into
@@ -274,7 +274,7 @@ describe(s: Shape) -> string
 ```
 
 ```error
-carries data
+variant 'Circle' carries data — match it as 'Circle(…)'
 ```
 
 Without that rule, `Circle` would have quietly become a binding that matched everything, and the

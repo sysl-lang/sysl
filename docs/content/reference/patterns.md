@@ -327,7 +327,7 @@ show()
 ```
 
 ```error
-has 3 fields, but 2 sub-patterns were given
+struct 'Point' has 3 fields, but 2 sub-patterns were given
 ```
 
 That `Name(…)` is a struct pattern here at all is the ordinary resolution rule: the spelling reads as
@@ -469,7 +469,7 @@ print(area(Circle(2)))
 ```
 
 ```error
-is not exhaustive; missing Rect
+match on 'Shape' is not exhaustive; missing Rect (add an 'else' arm)
 ```
 
 That is the central payoff of a closed sum type: adding a variant turns every non-catch-all match on

@@ -1,6 +1,6 @@
 ---
 title: Modules and the library
-summary: A module is a directory, an import only shortens a name you could always write in full, and the standard library is a tree of six.
+summary: A module is a directory, an import only shortens a name you could always write in full, and the standard library is a prelude with ten submodules under it.
 weight: 110
 ---
 
@@ -275,6 +275,7 @@ import anything to call `print`. Everything else is a submodule you ask for by n
 | `sysl.io` | `Reader`, `stdin()`, `lines()` |
 | `sysl.fs` | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` |
 | `sysl.math` | `max`, `min`, `pi`, the float functions, the integer traits `Signed` and `Bits`, and the integer arithmetic above them — `pow`, `gcd`, `lcm`, `divmod`, `is_power_of_two`, `next_power_of_two` |
+| `sysl.regex` | POSIX Extended Regular Expressions — `regex`, `Regex`, `Match` |
 | `sysl.sync` | `Atomic[T]`, `SpinLock`, and the five memory orderings — requires nothing |
 | `sysl.thread` | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` |
 | `sysl.args` | `args_of`, for reading a raw `argv` |

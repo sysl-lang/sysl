@@ -207,7 +207,7 @@ val table: []int = squares(4)
 ```
 
 ```error
-a count with nowhere to write the release
+'table' cannot be a 'val': storage that exists for the whole run is never let go of, so a count taken in one is a count with nowhere to write the release — and this []int is built while the program runs. One the object file can carry as it stands may be held: a string literal owns nothing, and neither does a table of them
 ```
 
 What decides is the **value**, not the type. A string literal owes no release — its bytes are a
