@@ -47,7 +47,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     "docs/content/reference/types.md"                 -> (8, 0, 0),
     "docs/content/reference/expressions.md"           -> (16, 3, 0),
     "docs/content/reference/statements.md"            -> (13, 1, 1),
-    "docs/content/reference/declarations.md"          -> (11, 2, 0),
+    "docs/content/reference/declarations.md"          -> (12, 2, 0),
     "docs/content/reference/patterns.md"              -> (8, 9, 0),
     "docs/content/reference/memory.md"                -> (21, 15, 0),
     "docs/content/reference/arrays.md"                -> (17, 9, 1),

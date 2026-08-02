@@ -472,17 +472,26 @@ class SyslParser(val source: Source) extends DeclParser {
 
   /** `val (a, b) = …` / `var (a, b) = …` — a binding written as a **pattern** (`00 §13`).
    *
+   * Two patterns may stand here, and they are the two that cannot fail to match: a **tuple**
+   * pattern, and a **struct** pattern, which names a type that has exactly one shape.
+   *
+   * **A variant pattern is parsed here too, so that it can be refused with a reason.** It is not
+   * legal — an enum has several shapes and naming one is a test — but leaving it out of the grammar
+   * does not make it an error a reader can act on: the parse fails somewhere above and reports
+   * against the enclosing declaration's own line, which is the diagnostic this whole form exists to
+   * stop happening. Accepting it and complaining in the analyzer puts the message on the binding.
+   *
    * It is tried after the comma form and before the plain one, which is all the ordering it needs:
-   * the three are told apart by their first token, a pattern binding being the only one whose name
-   * position opens with a parenthesis. The plain form still reads a bare name, so nothing that
-   * parsed before this existed parses differently now.
+   * a tuple pattern opens with a parenthesis, and the other two are a name followed by a brace or a
+   * parenthesis, neither of which a plain binding or a comma list can begin with. The plain form
+   * still reads a bare name, so nothing that parsed before this existed parses differently now.
    *
    * **The pattern is the whole of the left side, with no type annotation beside it.** That is
    * `12 §5b`'s open question again rather than an oversight — the parts of a destructuring have
    * nowhere to carry a type, and inference covers what the form is for.
    */
   protected def patternDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
-    (op(keyword) ~> tuplePattern) ~ (op("=") ~> expression) ^^ {
+    (op(keyword) ~> (structPattern | variantPattern | tuplePattern)) ~ (op("=") ~> expression) ^^ {
       case p ~ v => PatternDecl(p, mutable, Placeholders.lift(v))
     }
 
