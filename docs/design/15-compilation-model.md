@@ -74,7 +74,7 @@ Three rules follow:
 
 Deeply nested instantiations produce very long symbols — a standing C++ complaint. Truncating past
 a threshold and appending a hash of the full name, as Rust and Swift do, is cheaper to build in now
-than to retrofit when a linker chokes (§Open c).
+than to retrofit when a linker chokes (§Open b).
 
 ## 3. Visibility chooses linkage
 
@@ -395,15 +395,77 @@ every access forever.
 Codegen needs nothing for it. Pointers lower to `ptr` (`codegen.md`), so a `*Opaque` downstream never
 asks for the aggregate, and the check is entirely a front-end rule.
 
+## 10. A definition may name the convention it is entered under
+
+**`interrupt` before a definition says the processor enters it, not a caller.** It is written where a
+visibility modifier is, on the declaration rather than folded into `extern`, because it is about a
+*definition* — the handler is code this program supplies.
+
+```
+interrupt timer()               // RISC-V: takes nothing
+interrupt(supervisor) trap()    // ...at a named privilege level
+
+interrupt fault(f: *Frame)      // x86-64: the ABI requires the frame
+```
+
+**One concept, three answers, and every one of them was read off clang rather than out of a
+document.** This is the fact the whole design turns on:
+
+| processor | what `interrupt` is | the signature it demands |
+|---|---|---|
+| **x86-64** | an LLVM calling convention, `x86_intrcc` | a pointer to the frame the hardware pushed, optionally then an integer error code |
+| **RISC-V** | a function *attribute*, `"interrupt"="machine"` | nothing at all |
+| **AArch64** | it does not exist | — |
+
+So the annotation names the **concept** and the back end decides what that becomes. A directive that
+spelled `x86_intrcc` would put one machine's answer in a source file and be wrong on the other two —
+and the author could not be told, because the build that breaks is elsewhere. This is the same shape
+as §8's rule that a link directive names a library rather than a flag, and it is the same reason.
+
+**On a processor without it, the annotation is refused rather than ignored.** Clang answers
+`__attribute__((interrupt))` on AArch64 with "unknown attribute ignored" and compiles an ordinary
+function. That is defensible for C, where an attribute is advisory by tradition. It is not defensible
+here: the handler then returns with `ret` where the machine needs `eret`, having saved none of the
+registers an asynchronous entry clobbers, so the failure is silent and arrives as corruption in
+whatever was interrupted. §1 already refuses the annotated/unannotated split everywhere else, and
+this is the same refusal.
+
+**Nothing about this is portable, and the design does not pretend otherwise.** An interrupt handler
+is the least portable code there is — it is entered by a mechanism the processor defines, and even
+the number of arguments differs. What the compiler owes is that the source says which machine it is
+for and that building it for another fails loudly, which is exactly what the table above buys.
+
+**AArch64's absence is not an oversight to fill in later.** Its exception entry goes through a vector
+table the processor indexes by cause, where each entry is a fixed-size slot of instructions — so the
+entry point is assembly by construction, and there is nothing for a convention on a sysl function to
+describe.
+
+**A handler is an entry point, so it is a root of the reachability walk** (§5 step 7's pruning). No
+program calls one, and calling one is refused outright: it leaves through a return-from-interrupt
+that would unwind a frame the call never pushed. A walk starting from what the program *runs*
+therefore cannot reach it, and dropping it would leave the vector table pointing at nothing — a fault
+at the worst available moment. Its address is still worth taking, which is what fills that table.
+
+**The rules are about the signature, so they are checked on the declaration** rather than while a
+body is walked. A generic handler nothing instantiates has no body analyzed at all, and it is exactly
+as wrong as one that does.
+
+`interrupt` is a **soft keyword**, and what keeps it one is that a name must follow it. Three things
+start with that word and only the first is a convention: `interrupt timer()` declares a handler,
+`interrupt(n: int) -> int` declares a function *called* `interrupt`, and `interrupt(4)` calls one.
+
+**The annotation carries a name and an optional argument** — RISC-V's privilege mode is the argument
+today — so a second convention is a change to what the analyzer accepts rather than to every tree
+that holds a function. `extern` still implies the C ABI with nothing written, which is what the
+overwhelming majority of foreign declarations want.
+
 ## Open (not yet decided)
 
-- **a. Calling-convention annotation.** `extern` implies the C ABI, but device targets need others
-  — interrupt handlers at minimum — so this wants to be a general annotation on a declaration or
-  definition rather than a flag that only `extern` understands.
-- **b. Export to C.** The reverse of `12` §1's `extern`: mangling suppression plus the ABI
-  annotation of (a), applied to a *definition* so existing C can call into sysl. A C replacement is
-  adopted incrementally, so this direction matters as much as the importing one.
-- **c. The symbol-length threshold** at which §2 truncates and appends a hash.
-- **d. Recording file discovery.** Whether the `readdir` of step 1 is written into a build log, so
+- **a. Export to C.** The reverse of `12` §1's `extern`: mangling suppression plus §10's annotation,
+  applied to a *definition* so existing C can call into sysl. A C replacement is adopted
+  incrementally, so this direction matters as much as the importing one — and §10 built the half of
+  it that decides how a definition states its convention, leaving the mangling question.
+- **b. The symbol-length threshold** at which §2 truncates and appends a hash.
+- **c. Recording file discovery.** Whether the `readdir` of step 1 is written into a build log, so
   that adding a file to a module is a *visible* change for reproducible or sandboxed builds rather
   than an invisible one.

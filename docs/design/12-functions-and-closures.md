@@ -133,6 +133,13 @@ coerced form is wider than the value the surplus is what the convention leaves u
 conventions and how each was measured are `targets.md`. Nothing about this is visible in a program,
 and nothing about it applies to a struct handed over behind a `*T`.
 
+**`extern` implies C's convention and says nothing about any other**, which is what the overwhelming
+majority of foreign declarations want. The one case that needs something else is a function the
+*processor* enters rather than a caller — an interrupt handler — and that is a property of a
+**definition** rather than of a foreign declaration, so it is written where a modifier goes and is
+`15 §10`'s. It is deliberately not a flag `extern` understands: the thing being described is code
+this program supplies.
+
 **An extern may end in `...`.** C's ellipsis is the one arity in the language a declaration does not
 fix, and it exists for one reason: `printf`, `snprintf`, `execl`, `open` — the calls every C library
 reserves for a variable tail — cannot be declared at all without it, and a language whose only seam
