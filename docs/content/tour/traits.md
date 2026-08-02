@@ -308,6 +308,82 @@ That is the shape the standard library's byte surface uses: `Reader` and `Writer
 `Fallible`, so a type that is **both** carries one `failed` rather than two that nothing at a call
 site could tell apart.
 
+## A trait may take type arguments
+
+Every trait so far has been a property of one type — a `Cat` greets, a `Rect` has an area. A trait
+with **parameters** says something about a *relation* between types instead: what a sink accepts,
+what a conversion converts from, what an iterator yields.
+
+The arguments are written in the same place wherever the trait is named — `impl Sink[int] for Buffer`,
+a bound `[X: Sink[int]]`, an object `&Sink[int]` — and they mean the same thing in each. What that
+buys is the rule underneath: **a type implements a parameterized trait once at each argument list**,
+so two implementations on one type are ordinary rather than a conflict:
+
+```sysl
+trait From[T]
+    from(x: T) -> Self
+
+struct Temp
+    tenths: int
+end Temp
+
+impl From[int] for Temp
+    from(x: int) -> Temp = Temp(x * 10)
+
+impl From[real] for Temp
+    from(x: real) -> Temp = Temp(int(x * 10.0))
+
+var a = Temp.from(21)
+var b = Temp.from(21.5)
+
+print(a.tenths, b.tenths)
+```
+
+```output
+210 215
+```
+
+`Temp` has two members called `from`, and what says which a call means is the **argument list**. The
+resolution is *determined*, not preferred: a call is answered by the one implementation whose
+parameters match the types the arguments have, and nothing ranks two candidates — so a call matching
+none of them is reported rather than resolved to the nearest.
+
+Which is exactly why the arguments have to appear where they can be *seen* at a call. A trait
+parameter that shows up only in a **return** type leaves the call with nothing to select on:
+
+```sysl
+trait Into[T]
+    into(self) -> T
+
+struct Reading
+    raw: int
+end Reading
+
+impl Into[real] for Reading
+    into(self) -> real = f64(self.raw) / 10.0
+
+impl Into[string] for Reading
+    into(self) -> string = "raw " + str(self.raw)
+
+var r = Reading(215)
+
+var celsius: real = r.into()
+
+print(celsius)
+```
+
+```error
+'into' comes from 2 implementations of one trait on Reading, and the arguments do not say which was meant
+```
+
+Rust answers that one with turbofish and inference from the expected type; sysl does not, and writing
+the conversion as `From[T]` — where the thing being converted is an argument — is the shape that
+needs no such machinery.
+
+This is also the mechanism the [error handling](/tour/errors/) chapter points at. A `?` that converts
+a callee's error into the caller's needs an `AppError` that is `From[IoError]` **and**
+`From[ParseError]`, and those are two argument lists rather than two implementations of one thing.
+
 ## Implementing `Display`
 
 The trait worth writing first, because it is what `print` and `str` reach:

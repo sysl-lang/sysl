@@ -1179,7 +1179,7 @@ print(x)
 ```
 
 ```error
-is the type of *storage*, and this is a value
+'volatile u32' is the type of *storage*, and this is a value — what a read of a volatile place hands back is an ordinary 'u32'. The qualifier goes where the storage is named: a struct field, an element, or the pointee of a '*T', as '*volatile u32'
 ```
 
 The diagnostic says which spelling was wanted, because a program that writes `var x: volatile u32`

@@ -236,6 +236,60 @@ chain: 6
 `null` exists for `*T` and only for `*T`. That is the trade the three modes make explicit: the one
 place a null can appear is the one place you asked for C's rules.
 
+### `volatile` — storage the program is not the only one writing
+
+`ptr_cast` gets a driver to a register block; it does not get it a *correct* one. An optimizer is
+entitled to assume that reading the same storage twice gives the same value, that a store nobody
+reads is a store nobody needs, and that two accesses in a row may be merged into one wider access.
+Every one of those is false at a device, and the last of them is why a poll loop can spin forever on
+the first value it read.
+
+So sysl has C's qualifier, spelled where C spells it — in the type:
+
+```sysl
+struct Gpio
+    input:  volatile u32
+    output: volatile u32
+    shadow: u32
+end Gpio
+
+var block = Gpio(0b1010u32, 0u32, 0u32)
+var regs: *Gpio = &block
+
+regs.output = 0b0110u32
+regs.shadow = regs.output
+
+print(regs.input, regs.output, regs.shadow)
+```
+
+```output
+10 6 6
+```
+
+A `volatile` place is one whose reads and writes are **effects rather than value computations**, so
+the compiler emits exactly the accesses the source wrote, exactly once each, in the order written.
+
+Two things about it are worth carrying away. It **constrains the compiler, not the machine** — no
+atomicity, no ordering against another core, no protection from a torn read, so a program reaching
+for this word to share a counter between threads has written a race with a keyword in front of it.
+And it is **per field**, which is what `shadow` above is there to show: a driver keeps ordinary
+values beside its registers, and a qualifier on the whole struct would sweep them in and make every
+touch of a cached flag an unoptimizable access.
+
+It also qualifies **storage**, never a value — which is the rule the spelling follows from:
+
+```sysl
+var x: volatile u32 = 0u32
+
+print(x)
+```
+
+```error
+'volatile u32' is the type of *storage*, and this is a value — what a read of a volatile place hands back is an ordinary 'u32'. The qualifier goes where the storage is named: a struct field, an element, or the pointee of a '*T', as '*volatile u32'
+```
+
+What a load hands back is a number, and a number is not somewhere a device can write.
+
 ## `ref` — a name for a place
 
 A place can be deep, and the two ways to shorten one both cost something. `var t = self.tasks[i]`

@@ -294,6 +294,65 @@ the rule is written **once, where the thing is declared**, instead of being re-c
 every call — and that when it is broken, the program stops at the write that broke it rather than
 somewhere downstream where the wrong value finally mattered.
 
+## Tests live beside the code
+
+The third checking tool, and the one that runs on examples rather than on rules. A `#test` attribute
+on an ordinary function marks it as a test, and `assert` is what a test uses to state what it
+expects:
+
+```sysl
+clamp(n: int, lo: int, hi: int) -> int
+    if n < lo then lo
+    elif n > hi then hi
+    else n
+
+#test
+clamps_both_ends()
+    assert(clamp(5, 0, 3) == 3, "above the ceiling")
+    assert(clamp(-2, 0, 3) == 0, "below the floor")
+
+#test("a value already inside is left alone")
+leaves_the_middle()
+    assert(clamp(2, 0, 3) == 2, "untouched")
+
+print(clamp(9, 0, 3), clamp(1, 0, 3))
+```
+
+```output
+3 1
+```
+
+That program prints `3 1` and runs **neither** test, which is the whole arrangement: `sysl run`
+builds the program and the tests are not part of it. They have a caller nothing else has:
+
+```
+$ sysl test clamp.sysl
+running 2 tests
+
+clamp.sysl
+  ok    clamps_both_ends                      2561ms
+  ok    a value already inside is left alone  3ms
+
+2 passed, 0 failed — 2564ms
+```
+
+A test is an ordinary function with **no parameters, no result, and no type parameters** — all three
+being the same requirement seen from different sides, since the runner calls it with nothing and
+reads the answer off whether it returned. Each is checked at the attribute rather than at the
+function, because the function is a perfectly good function and it is `#test` that made a promise
+about it.
+
+The attribute has four forms. Bare `#test` names the test after the function; `#test("a sentence")`
+names it by the sentence, which is what the second one above does and why the runner prints prose
+for it. The other two are for the channel this chapter has been about: `#test(should_trap)` **passes
+by stopping the program**, and `#test(should_trap: "past the end")` additionally requires that text
+in what the run printed. That is how a trap gets tested at all — there is no catching it, so the
+runner is the thing that survives it.
+
+`assert(cond, msg)` traps when the condition is false, and its message is **required** rather than
+optional. There is no stringizer in the language, so nothing can reconstruct the expression that
+failed; a message you had to write is better than a source line you did not.
+
 ---
 
 Next: [a program that reads its input](/tour/capstone/) — putting the whole tour to work.
