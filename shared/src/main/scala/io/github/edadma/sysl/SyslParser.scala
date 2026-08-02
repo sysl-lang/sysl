@@ -800,9 +800,15 @@ object SyslParser {
    * is parsed is already the file this target sees. Every other seam is unaffected — the gate is not
    * applied to an expression fragment or to a string interpolation's contents, neither of which is a
    * file, and a source with no directives in it is not even copied.
+   *
+   * **Tangling comes first, and the order is the whole of what makes the two features independent.**
+   * A literate file's directives are written in its program, which is indented (`Literate`) — so
+   * gating first would be gating a file whose `#if` lines are four columns in, and `Conditional`
+   * would have to learn about a format that is none of its business. Tangled first, what the gate
+   * receives is ordinary sysl and it behaves exactly as it does for a file that was never literate.
    */
   def parse(source: Source, target: Target): Either[String, Program] =
-    Conditional.gate(source, target).flatMap(parsed)
+    Literate.tangle(source).flatMap(Conditional.gate(_, target)).flatMap(parsed)
 
   /** The same, for the machine a caller that names none would get. Spelled as its own overload
    * rather than as a default argument because only one of these alternatives may carry defaults, and

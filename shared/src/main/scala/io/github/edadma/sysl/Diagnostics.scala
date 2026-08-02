@@ -17,8 +17,14 @@ package io.github.edadma.sysl
  * is a directory (`13 §1`), which makes this the module the file's header has to agree with, and
  * it is the driver that knows it: `None` says the file was handed over with no project around it,
  * and the header is then the whole of what says which module the file is in.
+ *
+ * `columnOffset` is how many columns were taken off the front of every line to make this text, which
+ * is zero for a file the compiler was handed as it was written and four for the program inside a
+ * literate one (`Literate`). It is added back wherever a position is *reported*, so that a location
+ * names the column of the file the reader has open rather than of the text the lexer saw.
  */
-final class Source(val name: String, val text: String, val dir: Option[List[String]] = None) {
+final class Source(val name: String, val text: String, val dir: Option[List[String]] = None,
+                   val columnOffset: Int = 0) {
 
   /** The text split into lines, kept for the one line a diagnostic quotes. Splitting with a
    * negative limit keeps a trailing empty line, so line numbers stay 1:1 with the file.
@@ -44,8 +50,13 @@ object Source {
 /** A place in a source file: 1-based line and column, as the lexer counts them. */
 final case class Pos(source: Source, line: Int, col: Int) {
 
-  /** Where this is, as a compiler conventionally spells it: `file.sysl:12:7`. */
-  def location: String = s"${source.name}:$line:$col"
+  /** Where this is, as a compiler conventionally spells it: `file.sysl:12:7`.
+   *
+   * The column is the one in the **file**, which is not the one the lexer counted when the text it
+   * lexed had its left margin removed (`Source.columnOffset`). An editor told to go to a location
+   * goes to the file, so the file's column is the one worth giving.
+   */
+  def location: String = s"${source.name}:$line:${col + source.columnOffset}"
 
   /** The message, the location, and the offending line with a caret under the column:
    *

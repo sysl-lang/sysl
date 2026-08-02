@@ -151,7 +151,7 @@ object Conditional {
     failed match
       case Some(err)        => Left(err)
       case None if !touched => Right(source)
-      case None             => Right(new Source(source.name, out.mkString("\n"), source.dir))
+      case None             => Right(new Source(source.name, out.mkString("\n"), source.dir, source.columnOffset))
   }
 
   /** One open `#if` group.

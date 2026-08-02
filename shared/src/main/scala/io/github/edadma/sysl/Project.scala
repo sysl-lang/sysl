@@ -23,8 +23,15 @@ object Project {
    * Naming a single **file** compiles that file alone, as the root module with nothing else in it.
    */
   def collect(path: String): List[Source] =
-    if isDirectory(path) then walk(path, Nil, ".sysl")
+    if isDirectory(path) then walk(path, Nil, sysl)
     else List(Source(path, readFile(path), Nil))
+
+  /** The two suffixes a program may be written under: the ordinary one, and the literate one whose
+   * program is the indented part of a Markdown document (`Literate`). A directory may hold both, and
+   * which a file is decides nothing beyond how its text is read — the module it belongs to is where
+   * it sits, as it is for every other file.
+   */
+  private val sysl: List[String] = List(".sysl", Literate.Extension)
 
   /** The C files of a library, which a `.sysl` file reaches by `extern` and the build compiles
    * alongside it (`15 §7`).
@@ -39,17 +46,17 @@ object Project {
    * is a directory before it is anything else, and a lone C file is not a library.
    */
   def cSources(path: String): List[Source] =
-    if isDirectory(path) then walk(path, Nil, ".c") else Nil
+    if isDirectory(path) then walk(path, Nil, List(".c")) else Nil
 
-  /** One directory of the project: its own files of the wanted kind, then the sub-directories under
+  /** One directory of the project: its own files of the wanted kinds, then the sub-directories under
    * it. A directory holding no source is not a module and contributes nothing; it is still walked,
    * since modules further down are reached through it.
    */
-  private def walk(path: String, dir: List[String], ext: String): List[Source] = {
+  private def walk(path: String, dir: List[String], exts: List[String]): List[Source] = {
     val entries = listFiles(path).toList.sorted
-    val here    = entries.filter(f => isFile(f) && f.endsWith(ext)).map(f => Source(f, readFile(f), dir))
+    val here    = entries.filter(f => isFile(f) && exts.exists(f.endsWith)).map(f => Source(f, readFile(f), dir))
 
-    here ::: entries.filter(isDirectory).flatMap(sub => walk(sub, dir :+ basename(sub), ext))
+    here ::: entries.filter(isDirectory).flatMap(sub => walk(sub, dir :+ basename(sub), exts))
   }
 
   /** The last segment of a path, whichever separator the platform wrote it with. */

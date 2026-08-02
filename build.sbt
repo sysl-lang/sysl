@@ -69,8 +69,12 @@ lazy val embedCoreLibrary = Def.task {
   // different submodules that share a name stay apart. Separators are normalised because the name
   // is a diagnostic's file name and half of a module's, neither of which is the build host's
   // business.
+  // Both spellings, because a library file may be literate (`Literate`) and the walk that reads the
+  // library off disk takes both. A generator that took only one would leave a file out of the
+  // embedded copy while it sat in plain sight in the tree -- which is the failure this generator
+  // exists to prevent, arrived at from a third side.
   val files =
-    (dir ** "*.sysl").get
+    ((dir ** "*.sysl").get ++ (dir ** "*.lsysl").get)
       .map(f => IO.relativize(dir, f).getOrElse(sys.error(s"$f is not under $dir")).replace('\\', '/') -> f)
       .sortBy(_._1)
 
