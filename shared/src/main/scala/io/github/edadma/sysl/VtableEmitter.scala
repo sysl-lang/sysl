@@ -32,7 +32,10 @@ trait VtableEmitter extends ArcEmitter {
 
   private def adapter(vt: TVtable, slot: TVSlot): String = {
     val name    = s"vt.adapt.${if vt.boxed then "ref." else ""}${slot.target}"
-    val ret     = if Type.noValue(slot.retTy) then "void" else slot.retTy.llvm
+    val ret     = syslResult(slot.retTy)
+    // A large result is written into the caller's storage, so the adapter neither receives it in a
+    // register nor returns one — it forwards the out-pointer it was handed and returns nothing.
+    val out     = syslSret(slot.retTy)
     // A zero-sized parameter is not in the implementation's signature, so it is not in the
     // adapter's either — the two have to agree, and the argument was never a word to forward.
     val forwarded = slot.params.zipWithIndex.filterNot((t, _) => Type.zeroSized(t))
@@ -40,7 +43,9 @@ trait VtableEmitter extends ArcEmitter {
     val pass      = forwarded.map { case (t, i) => s"${t.llvm} %a$i" }
 
     request(name) {
-      inFunction(s"define private $ret @$name(${("ptr %d" :: declare).mkString(", ")})") {
+      inFunction(
+        s"define private $ret @$name(" +
+          (out.map(_ + s" $sretParam").toList ::: "ptr %d" :: declare).mkString(", ") + ")") {
         val payload =
           if !vt.boxed then "%d"
           else
@@ -60,7 +65,8 @@ trait VtableEmitter extends ArcEmitter {
           // counted one the implementation is named directly, so no adapter is ever built for it.
           case RecvMode.ByRef(_) => sys.error("unreachable adapter for a '&self' method")
 
-        val call = (self :: pass).mkString(", ")
+        val forward = out.map(o => s"${o.replace("noalias ", "")} $sretParam").toList
+        val call    = (forward ::: self :: pass).mkString(", ")
 
         if ret == "void" then
           emit(s"call void @${slot.target}($call)")

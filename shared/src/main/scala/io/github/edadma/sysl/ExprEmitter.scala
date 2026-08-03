@@ -118,9 +118,9 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
   private val variadics: Map[String, String] =
     val fromExterns = program.externs.filter(_.variadic).map(e => e.name -> foreignFnType(e.retTy, e.params))
     val fromFuncs   = program.funcs.filter(_.variadic).map { f =>
-      val params = Type.stored(f.params).map(_._2.llvm) :+ "..."
+      val params = syslSret(f.retTy).toList ++ Type.stored(f.params).map(_._2.llvm) :+ "..."
 
-      f.name -> s"${if Type.noValue(f.retTy) then "void" else f.retTy.llvm} (${params.mkString(", ")})"
+      f.name -> s"${syslResult(f.retTy)} (${params.mkString(", ")})"
     }
 
     (fromExterns ++ fromFuncs).toMap
@@ -154,12 +154,41 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
   private def calleeOf(name: String, ty: Type): String =
     val symbol = symbolOf(name)
     // A foreign result may be named by a type the sysl signature never mentions — a coerced
-    // aggregate, or `void` where the value comes back through an out-parameter.
-    val result = if foreigns.contains(name) then foreignResultType(ty) else if Type.noValue(ty) then "void" else ty.llvm
+    // aggregate, or `void` where the value comes back through an out-parameter. A sysl result may
+    // be `void` for the second of those reasons alone.
+    val result = if foreigns.contains(name) then foreignResultType(ty) else syslResult(ty)
 
     variadics.get(name) match
       case Some(fnTy) => s"$fnTy @$symbol"
       case None       => s"$result @$symbol"
+
+  /** Emits a call from sysl to sysl and hands back the register holding its result.
+   *
+   * `dest`, where there is one, is the storage a **large** result is to land in — the caller's own,
+   * named in front of every argument, so the value is never an LLVM value at either end. A caller
+   * with nowhere to put one makes a slot here and reads the value back out of it, which is correct
+   * and is exactly the shape `genInto` exists to save the callers that *do* have somewhere.
+   */
+  private def genSyslCall(callee: String, argVals: List[String], ty: Type, dest: Option[String]): String =
+    syslSret(ty) match
+      case Some(_) =>
+        val slot = dest.getOrElse(emitAlloca(freshTemp(), ty.llvm))
+
+        emit(s"call $callee(${(s"ptr sret(${ty.llvm}) align ${Layout.align(ty)} $slot" :: argVals).mkString(", ")})")
+
+        if dest.isDefined then ""
+        else
+          val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $slot")
+          ownTemp(r, ty)
+
+      case None if Type.noValue(ty) =>
+        emit(s"call $callee(${argVals.mkString(", ")})")
+        if ty == Type.Never then emitTerm("unreachable")
+        ""
+
+      case None =>
+        val r = freshTemp(); emit(s"$r = call $callee(${argVals.mkString(", ")})")
+        ownTemp(r, ty)
 
   /** One comparison, over two values the caller is holding: an instruction where the operand type
    * has one, the method its `Eq`/`Ord` supplies otherwise.
@@ -300,6 +329,120 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     resize(reduced, from, Type.Integer(bits, signed = false))
   }
 
+  // --- writing a value where it is going to live ----------------------------------------
+  //
+  // A **large** aggregate (`Layout.indirect`) is built, copied and returned through memory, so the
+  // two forms below exist beside `genExpr`: they take the address the value is wanted at and write
+  // it there, instead of handing back a register the caller then stores. That is the difference
+  // between a struct literal that is fourteen `insertvalue` instructions over multi-kilobyte SSA
+  // values and one that is fourteen stores.
+  //
+  // Everything smaller goes on being a value. The two forms still accept one — a field of a large
+  // struct is usually a small one, and the recursion has to bottom out somewhere — and for those
+  // they emit exactly what the caller would have emitted itself.
+
+  /** Writes `e`'s value into `dest` and leaves the destination **owning** it: a count taken for
+   * every reference inside, which is what a slot that will later release them needs.
+   */
+  protected def genOwnedInto(dest: String, e: TExpr): Unit =
+    if !Layout.indirect(e.ty) then
+      val v = genExpr(e)
+
+      retainValue(e.ty, v)
+      emit(s"store ${e.ty.llvm} $v, ptr $dest")
+    else
+      e match
+        // A result already arrives with its count taken, and the out-pointer is what says where.
+        // This is the case the whole mechanism is for: `val k = kernel()` writes the callee's work
+        // straight into `k`'s slot, and no `%struct.Kernel` is ever an LLVM value.
+        case TCall(name, args, ty, _) if !foreigns.contains(name) =>
+          genSyslCall(calleeOf(name, ty), argList(args), ty, Some(dest))
+
+        case _ =>
+          genBorrowedInto(dest, e)
+          retainAt(e.ty, dest)
+
+  /** Writes `e`'s value into `dest` without taking a count for anything in it — what lands there is
+   * borrowed, exactly as the register `genExpr` hands back is.
+   *
+   * A **call** is deliberately not special-cased here. Its result arrives owned, and giving it this
+   * destination would leave a count in a place with nothing registered to release it; sending it
+   * through `genExpr` instead costs the whole-value load this file exists to avoid, but only where
+   * a large result is nested inside a literal that is itself being built in place, which is rare
+   * and is what the code did before any of this.
+   */
+  protected def genBorrowedInto(dest: String, e: TExpr): Unit = e match
+    case TStructNew(struct, args) =>
+      for (a, i) <- args.zipWithIndex if !Type.zeroSized(struct.fields(i)._2) do
+        val p = freshTemp()
+
+        emit(s"$p = getelementptr ${struct.llvm}, ptr $dest, i32 0, i32 ${struct.slot(i)}")
+        genBorrowedInto(p, a)
+
+    case TArrayLit(elems, arrayTy) =>
+      for (el, i) <- elems.zipWithIndex do
+        val p = freshTemp()
+
+        emit(s"$p = getelementptr ${arrayTy.elem.llvm}, ptr $dest, i64 $i")
+        genBorrowedInto(p, el)
+
+    // The value is generated once, above the loop, exactly as the value form does — every element
+    // is a copy of that one evaluation. It is generated even where there are no elements, because
+    // one evaluation is what the form promises and an empty array does not take that back.
+    case TArrayFill(value, arrayTy) =>
+      val v = genExpr(value)
+
+      if arrayTy.length > 0 then
+        fillLoop(dest, arrayTy) { at => emit(s"store ${arrayTy.elem.llvm} $v, ptr $at") }
+
+    // A copy from one place to another is a copy of bytes. Reading the value out first would make
+    // a first-class aggregate of it for the length of one instruction, which is the whole cost.
+    case place if hasAddress(place) =>
+      val src = address(place)
+
+      usesMemcpy = true
+      emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(e.ty)} $dest, " +
+        s"ptr align ${Layout.align(e.ty)} $src, i64 ${Layout.size(e.ty)}, i1 false)")
+
+    case _ =>
+      val v = genExpr(e)
+
+      emit(s"store ${e.ty.llvm} $v, ptr $dest")
+
+  /** `e` built where a value of it is wanted, for a caller that asked for a register rather than
+   * offering somewhere to put one. The load is the very thing the destination forms avoid, so this
+   * is the fallback and not the path anything hot takes.
+   */
+  private def throughSlot(e: TExpr): String = {
+    val slot = emitAlloca(freshTemp(), e.ty.llvm)
+
+    genBorrowedInto(slot, e)
+
+    val r = freshTemp(); emit(s"$r = load ${e.ty.llvm}, ptr $slot"); r
+  }
+
+  /** Runs `each` once per element of an array laid down at `base`, with the element's address. */
+  private def fillLoop(base: String, arrayTy: Type.Array)(each: String => Unit): Unit = {
+    val i     = emitAlloca(freshTemp(), "i64")
+    val condL = freshLabel("fill.test")
+    val bodyL = freshLabel("fill.elem")
+    val endL  = freshLabel("fill.done")
+
+    emit(s"store i64 0, ptr $i")
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
+    val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, ${arrayTy.length}")
+    emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+    emitLabel(bodyL)
+    val ep = freshTemp(); emit(s"$ep = getelementptr ${arrayTy.elem.llvm}, ptr $base, i64 $iv")
+    each(ep)
+    val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
+    emit(s"store i64 $nxt, ptr $i")
+    emitTerm(s"br label %$condL")
+    emitLabel(endL)
+  }
+
   // --- expressions ---------------------------------------------------------------------
 
   /** Lowers an expression, returning the register or immediate holding its value (empty for a
@@ -317,6 +460,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case TUnitLit()    => ""
     case TZero(ty)     => zero(ty)
 
+    // A large one is built where it is going to live and read back out only because this caller
+    // asked for a value; a small one is the `insertvalue` chain it always was.
+    case e @ TArrayLit(_, arrayTy) if Layout.indirect(arrayTy) => throughSlot(e)
+
     case TArrayLit(elems, arrayTy) =>
       val vals = elems.map(genExpr)
       var acc  = "zeroinitializer"
@@ -331,32 +478,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // count is where someone writes a large one on purpose. The value is generated once, above the
     // loop — every element is a copy of that one evaluation. Its references are borrowed here and
     // retained by whatever binds the array, whose ARC walk visits all n elements.
-    case TArrayFill(value, arrayTy) =>
-      val v = genExpr(value)
+    case TArrayFill(value, arrayTy) if arrayTy.length == 0 =>
+      genExpr(value); "zeroinitializer"
 
-      if arrayTy.length == 0 then "zeroinitializer"
-      else
-        val buf   = emitAlloca(freshTemp(), arrayTy.llvm)
-        val i     = emitAlloca(freshTemp(), "i64")
-        val condL = freshLabel("fill.test")
-        val bodyL = freshLabel("fill.elem")
-        val endL  = freshLabel("fill.done")
-
-        emit(s"store i64 0, ptr $i")
-        emitTerm(s"br label %$condL")
-        emitLabel(condL)
-        val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
-        val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, ${arrayTy.length}")
-        emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
-        emitLabel(bodyL)
-        val ep = freshTemp(); emit(s"$ep = getelementptr ${arrayTy.elem.llvm}, ptr $buf, i64 $iv")
-        emit(s"store ${arrayTy.elem.llvm} $v, ptr $ep")
-        val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
-        emit(s"store i64 $nxt, ptr $i")
-        emitTerm(s"br label %$condL")
-        emitLabel(endL)
-
-        val r = freshTemp(); emit(s"$r = load ${arrayTy.llvm}, ptr $buf"); r
+    case e: TArrayFill => throughSlot(e)
 
     // The same two forms, sized and owned rather than laid out in a frame. Each element the buffer
     // takes is a share of its own — the box holds them until its hook lets them go — so the value
@@ -825,15 +950,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // follows in the same block is unreachable and `emit` drops it, which is exactly why a
     // diverging arm needs no special handling anywhere else.
     case TCall(name, args, ty, _) =>
-      val argVals = argList(args)
-      val callee  = calleeOf(name, ty)
-      if Type.noValue(ty) then
-        emit(s"call $callee(${argVals.mkString(", ")})")
-        if ty == Type.Never then emitTerm("unreachable")
-        ""
-      else
-        val r = freshTemp(); emit(s"$r = call $callee(${argVals.mkString(", ")})")
-        ownTemp(r, ty)
+      genSyslCall(calleeOf(name, ty), argList(args), ty, None)
 
     // Erasing costs one word: the value goes on pointing where it pointed, and the table for the
     // type it is losing is a constant beside it. Nothing is retained — a counted object holds the
@@ -853,15 +970,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val argVals = argList(args)
       val entry   = freshTemp(); emit(s"$entry = getelementptr ptr, ptr $table, i64 $slot")
       val fn      = freshTemp(); emit(s"$fn = load ptr, ptr $entry")
-      val passed  = (s"ptr $data" :: argVals).mkString(", ")
-
-      if Type.noValue(ty) then
-        emit(s"call void $fn($passed)")
-        if ty == Type.Never then emitTerm("unreachable")
-        ""
-      else
-        val r = freshTemp(); emit(s"$r = call ${ty.llvm} $fn($passed)")
-        ownTemp(r, ty)
+      genSyslCall(s"${syslResult(ty)} $fn", s"ptr $data" :: argVals, ty, None)
 
     // The tail walk is the ABI's, so all three are LLVM's own: two intrinsic calls and the one
     // instruction whose lowering every backend supplies for it.
@@ -906,6 +1015,8 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val s = genExpr(src)
       emit(s"call void @llvm.va_copy.p0(ptr $d, ptr $s)"); ""
 
+    case e @ TStructNew(struct, _) if Layout.indirect(struct) => throughSlot(e)
+
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)
       var acc  = "undef"
@@ -945,6 +1056,13 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case e @ TField(receiver, _, ty) if Type.volatileIn(e.placeTy) && hasAddress(receiver) =>
       val p = address(e)
       val r = freshTemp(); emit(s"$r = load volatile ${ty.llvm}, ptr $p"); r
+
+    // So is a field of a **large** struct, for a reason that is arithmetic rather than hardware:
+    // lifting one field out of a value means producing the whole value first, and for a receiver of
+    // kilobytes that is a first-class aggregate emitted to read four bytes out of it.
+    case e @ TField(receiver, _, ty) if Layout.indirect(receiver.ty) && hasAddress(receiver) =>
+      val p = address(e)
+      val r = freshTemp(); emit(s"$r = load ${ty.llvm}, ptr $p"); r
 
     case TField(receiver, index, ty) =>
       val rv = genExpr(receiver); val r = freshTemp()

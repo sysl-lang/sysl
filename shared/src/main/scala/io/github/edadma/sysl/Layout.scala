@@ -54,6 +54,35 @@ object Layout {
     case e: Type.Enum                    => if e.simple then size(e.underlying) else enumSize(e)
     case other                           => sys.error(s"unreachable size of ${other.llvm}")
 
+  /** The widest an aggregate may be and still be handed about as a first-class LLVM value.
+   *
+   * Below it a value is a value: LLVM carries it in registers, and the handful of `insertvalue` and
+   * `extractvalue` instructions that build and read one cost the optimizer nothing. Above it the
+   * back end is copying memory whatever the IR says, and a first-class value only obliges every
+   * pass to reason about each byte of it — which does not stay linear. `guide/kernel` builds a
+   * 20 KB struct and hands it about as a value at thirty-five call sites; that one module took
+   * **408 seconds** to compile at `-O1` and **0.88 seconds** once the same program was lowered
+   * through memory, with the whole of the difference inside InstCombine's walk over the allocas.
+   *
+   * The number is a judgement rather than a rule someone else wrote down. It is well above every
+   * aggregate the language itself uses — a slice and a string are twenty-four bytes, a trait object
+   * sixteen — so nothing in ordinary code changes shape, and far below the sizes at which the
+   * optimizer starts to struggle.
+   */
+  val DirectBytes = 128
+
+  /** Whether a value of `t` is handed about through memory rather than as a first-class LLVM value:
+   * built where it is going to live, copied with `llvm.memcpy`, read a field at a time through its
+   * address, and returned through an out-pointer the caller supplies.
+   *
+   * Only an aggregate can be one. A scalar is a register whatever its width — an `i8388607` is a
+   * back-end problem of a different kind, and pretending it were a struct would not help.
+   */
+  def indirect(t: Type): Boolean = Type.underlying(t) match
+    case _: Type.Struct | _: Type.Array => size(t) > DirectBytes
+    case e: Type.Enum                   => !e.simple && size(t) > DirectBytes
+    case _                              => false
+
   /** The address a value of `t` must start at. */
   def align(t: Type): Int = Type.underlying(t) match
     case Type.Bool                       => 1

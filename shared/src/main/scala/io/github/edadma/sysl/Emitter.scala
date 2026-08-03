@@ -140,6 +140,30 @@ trait Emitter {
     if a == "true" then "false"
     else { val r = freshTemp(); emit(s"$r = xor i1 $a, true"); r }
 
+  // --- how a sysl signature is spelled --------------------------------------------------
+  //
+  // Six places write down what a sysl function looks like to LLVM — its definition, a declaration
+  // of one linked in from a library, a call, the whole function type a variadic call has to name,
+  // a method table's adapter, and the `ret` itself. They agree because they all ask here.
+
+  /** The out-pointer a **large** result comes back through, in front of every declared parameter.
+   *
+   * A result that fits in registers is returned as itself, as it always was. One that does not is
+   * written straight into storage the caller supplies, so it is never a first-class LLVM value at
+   * either end — which is the whole of what `Layout.indirect` buys. It is the same `sret` the
+   * foreign boundary has always used (`ForeignEmitter`), asked for the same reason on a call that
+   * happens to have this compiler on both sides.
+   */
+  protected def syslSret(retTy: Type): Option[String] =
+    Option.when(Layout.indirect(retTy))(s"ptr noalias sret(${retTy.llvm}) align ${Layout.align(retTy)}")
+
+  /** What a sysl `define`, `declare` and `call` name as the result type. */
+  protected def syslResult(retTy: Type): String =
+    if Type.noValue(retTy) || Layout.indirect(retTy) then "void" else retTy.llvm
+
+  /** The name the out-pointer takes inside a function that has one. */
+  protected val sretParam = "%sret.out"
+
   // --- hooks provided by the Codegen class ---------------------------------------------
   //
   // The recursive entry points live in the class that walks the tree; the emitting traits call
@@ -147,6 +171,16 @@ trait Emitter {
 
   /** Lowers an expression, returning the register or immediate holding its value. */
   protected def genExpr(expr: TExpr): String
+
+  /** Lowers an expression into the storage at `dest`, leaving the destination owning what lands
+   * there — a count taken for every reference inside (`ExprEmitter`).
+   */
+  protected def genOwnedInto(dest: String, e: TExpr): Unit
+
+  /** The same, taking no counts: what lands at `dest` is borrowed, exactly as the register
+   * `genExpr` hands back is (`ExprEmitter`).
+   */
+  protected def genBorrowedInto(dest: String, e: TExpr): Unit
 
   /** Lowers one statement for its effects. */
   protected def genStmt(stmt: TStmt): Unit

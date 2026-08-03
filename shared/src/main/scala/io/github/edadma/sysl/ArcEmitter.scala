@@ -90,6 +90,86 @@ trait ArcEmitter extends Emitter {
     case t if containsRef(t) => emit(s"call void @${valueHelper(t, retain = false)}(${t.llvm} $v)")
     case _                   => ()
 
+  /** Takes a share of everything the value **at an address** refers to, and gives one back.
+   *
+   * The pair exists for a type `Layout.indirect` calls large, which never becomes a first-class
+   * value: there is nothing to hand `retainValue`, and loading one so that there were would undo
+   * the whole point of lowering it through memory. Everything smaller is read out and walked as
+   * before, so the two forms agree on what they count — only on where they read it from.
+   */
+  protected def retainAt(ty: Type, p: String): Unit = walkAt(ty, p, retain = true)
+
+  protected def releaseAt(ty: Type, p: String): Unit = walkAt(ty, p, retain = false)
+
+  private def walkAt(ty: Type, p: String, retain: Boolean): Unit =
+    if containsRef(ty) then
+      if Layout.indirect(ty) then emit(s"call void @${slotHelper(ty, retain)}(ptr $p)")
+      else
+        val v = freshTemp(); emit(s"$v = load ${ty.llvm}, ptr $p")
+        if retain then retainValue(ty, v) else releaseValue(ty, v)
+
+  /** The retain / release helper a large aggregate takes at its address. Same walk as the one over
+   * a value, reaching each reference-carrying member with `getelementptr` instead of lifting it out
+   * of an aggregate the caller would have had to materialize first.
+   */
+  private def slotHelper(ty: Type, retain: Boolean): String = {
+    val name = s"arc.${if retain then "copy" else "dispose"}_at.${Type.mangle(ty)}"
+
+    request(name) {
+      inFunction(s"define private void @$name(ptr %p)") {
+        walkSlot(ty, "%p", retain)
+        emitTerm("ret void")
+      }
+    }
+  }
+
+  private def walkSlot(ty: Type, p: String, retain: Boolean): Unit = {
+    def each(fields: List[(String, Type)], aggregate: String, base: String): Unit =
+      for ((_, fty), i) <- fields.zipWithIndex if containsRef(fty) do
+        val f = freshTemp()
+        emit(s"$f = getelementptr $aggregate, ptr $base, i32 0, i32 ${Type.slot(fields, i)}")
+        walkAt(fty, f, retain)
+
+    ty match
+      case s: Type.Struct => each(s.fields, s.llvm, p)
+
+      case Type.Array(n, elem) =>
+        val i = emitAlloca(freshTemp(), "i64")
+        emit(s"store i64 0, ptr $i")
+        val condL = freshLabel("arc.each")
+        val bodyL = freshLabel("arc.elem")
+        val endL  = freshLabel("arc.done")
+        emitTerm(s"br label %$condL")
+        emitLabel(condL)
+        val iv   = freshTemp(); emit(s"$iv = load i64, ptr $i")
+        val more = freshTemp(); emit(s"$more = icmp ult i64 $iv, $n")
+        emitTerm(s"br i1 $more, label %$bodyL, label %$endL")
+        emitLabel(bodyL)
+        val ep = freshTemp(); emit(s"$ep = getelementptr ${elem.llvm}, ptr $p, i64 $iv")
+        walkAt(elem, ep, retain)
+        val nxt = freshTemp(); emit(s"$nxt = add i64 $iv, 1")
+        emit(s"store i64 $nxt, ptr $i")
+        emitTerm(s"br label %$condL")
+        emitLabel(endL)
+
+      case e: Type.Enum =>
+        val tag  = freshTemp(); emit(s"$tag = load i32, ptr $p")
+        val endL = freshLabel("arc.done")
+        for variant <- e.variants if variant.fields.exists(f => containsRef(f._2)) do
+          val hitL  = freshLabel("arc.variant")
+          val nextL = freshLabel("arc.next")
+          val is    = freshTemp(); emit(s"$is = icmp eq i32 $tag, ${variant.tag}")
+          emitTerm(s"br i1 $is, label %$hitL, label %$nextL")
+          emitLabel(hitL)
+          each(variant.fields, e.payloadLlvm(variant), payloadPtr(e, p))
+          emitTerm(s"br label %$endL")
+          emitLabel(nextL)
+        emitTerm(s"br label %$endL")
+        emitLabel(endL)
+
+      case _ => ()
+  }
+
   /** The owner word of a view — the reference that keeps its elements alive, or null when they
    * are static (every string literal), on a frame, or reached through a `*T`.
    */

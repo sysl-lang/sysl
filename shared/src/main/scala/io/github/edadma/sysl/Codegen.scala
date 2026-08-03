@@ -138,8 +138,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // sysl's convention and not C's — getting that wrong passes arguments the other way, which is a
     // corrupt run rather than a link error.
     for f <- imported do
-      val params = (Type.stored(f.params).map(_._2.llvm) ++ Option.when(f.variadic)("...")).mkString(", ")
-      out ++= s"declare ${f.retTy.llvm} @${symbolOf(f.name)}($params)\n"
+      val params =
+        (syslSret(f.retTy).toList ++ Type.stored(f.params).map(_._2.llvm) ++
+          Option.when(f.variadic)("...")).mkString(", ")
+      out ++= s"declare ${syslResult(f.retTy)} @${symbolOf(f.name)}($params)\n"
     if imported.nonEmpty then out ++= "\n"
 
     if boolStrs then
@@ -324,6 +326,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
     // already terminated the block and the `ret` emitted here is dropped.
     f.body.result match
+      case Some(r) if Layout.indirect(f.retTy) => genIndirectReturn(r)
       case Some(r) if !Type.noValue(f.retTy) =>
         val v = genExpr(r)
         retainValue(f.retTy, v)
@@ -334,12 +337,17 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         genExpr(r); emitEnsures(None); releaseAll(); emitTerm("ret void")
       case None if Type.noValue(f.retTy) =>
         emitEnsures(None); releaseAll(); emitTerm("ret void")
+      case None if Layout.indirect(f.retTy) =>
+        emit(s"store ${f.retTy.llvm} zeroinitializer, ptr $sretParam")
+        releaseAll(); emitTerm("ret void")
       case None =>
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
     val stored   = Type.stored(f.params)
     val declared = stored.map { case (name, ty) => s"${ty.llvm}${frameOf(f, ty, name)} %$name.param" }
-    val params   = (declared ++ Option.when(f.variadic)("...")).mkString(", ")
+    val params   =
+      (syslSret(f.retTy).map(_ + s" $sretParam").toList ++ declared ++
+        Option.when(f.variadic)("...")).mkString(", ")
     // A file-private declaration has every caller in the module that defines it (`13 §2`), so its
     // symbol is `internal`: nothing outside may resolve it, and the linker is free to discard it
     // when nothing inside calls it either — which is what an exported helper in a library artifact
@@ -347,7 +355,27 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val linkage = if f.internal then "internal " else ""
 
     finishFunction(
-      s"define $linkage${convention(f)}${f.retTy.llvm} @${symbolOf(f.name)}($params)${attribute(f)}")
+      s"define $linkage${convention(f)}${syslResult(f.retTy)} @${symbolOf(f.name)}($params)${attribute(f)}")
+  }
+
+  /** The `return` of a **large** result: it is written into the caller's storage rather than handed
+   * back in registers, so what would have been the returned value is built where it is going.
+   *
+   * A postcondition still gets the value it is written about. Reading it back out of the slot is a
+   * whole-aggregate load of the kind this lowering exists to avoid — but only on a function that
+   * *has* an `ensures`, and only once at each of its returns, which is a price a contract already
+   * announces it is willing to pay.
+   */
+  private def genIndirectReturn(r: TExpr): Unit = {
+    genOwnedInto(sretParam, r)
+
+    if ensures.nonEmpty then
+      val v = freshTemp(); emit(s"$v = load ${r.ty.llvm}, ptr $sretParam")
+      emitEnsures(Some(v))
+    else emitEnsures(None)
+
+    releaseAll()
+    emitTerm("ret void")
   }
 
   /** What a calling convention becomes on the `define` line for **this** machine (`15 §10`).
@@ -415,11 +443,11 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       emit(s"store ${ty.llvm} $v, ptr %$name.addr")
       ownBox(name, box, elem)
 
+    // The slot is laid down **before** the initializer runs, because a large one is written into it
+    // rather than handed to it: the callee of `val k = kernel()` needs somewhere to write.
     case TVarDecl(name, ty, init) =>
-      val v = genExpr(init)
       emitAlloca(s"%$name.addr", ty.llvm)
-      retainValue(ty, v)
-      emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+      genOwnedInto(s"%$name.addr", init)
       ownSlot(name, ty)
 
     // `ref name = place` (`03 § ref`). The walk to the place is made **once**, here, and its result
@@ -449,6 +477,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     case TReturn(opt) =>
       opt match
+        case Some(t) if Layout.indirect(t.ty) => genIndirectReturn(t)
         case Some(t) =>
           val v = genExpr(t)
           retainValue(t.ty, v)
