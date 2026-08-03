@@ -85,6 +85,44 @@ u64 max: 18446744073709551615
 is. An unsuffixed literal like `100` takes the type of what is around it, which is what lets that
 line be written without a suffix on every number.
 
+### The family is open, and that is not a figure of speech
+
+`i8` through `i64` are the widths with familiar names, not the widths that exist. `iN` and `uN` are an
+**open family parameterized by a bit width**, so `u12`, `i5` and `u256` are types you may write, and
+each is its own type with its own arithmetic — a `u12` wraps at 4096 because that is what twelve bits
+hold:
+
+```sysl
+struct Pixel
+    red:   u5
+    green: u6
+    blue:  u5
+end Pixel
+
+var p = Pixel(31u5, 40u6, 17u5)
+
+var counter: u12 = 4000
+
+print("wraps at 4096:", counter + 100u12)
+print("and divides:", counter / 7u12)
+print("packed:", int(p.red), int(p.green), int(p.blue))
+```
+
+```output
+wraps at 4096: 4
+and divides: 571
+packed: 31 40 17
+```
+
+That is the reason the rule above is worth stating as "a width is a type" rather than "there are eight
+integer types". A 16-bit colour pixel really is a 5-bit field, a 6-bit field and another 5-bit field,
+and writing it that way gets the wrapping and the range checking for free instead of hand-masking
+them out of a `u16`.
+
+Storage rounds up to whole bytes and an alignment the machine has — a `u12` occupies two bytes — so a
+narrow width buys correct arithmetic rather than tight packing. The
+[reference](/reference/types/) has the ceiling and the two costs at extreme widths.
+
 Ask for a wider type and the compiler will not do it silently:
 
 ```sysl
