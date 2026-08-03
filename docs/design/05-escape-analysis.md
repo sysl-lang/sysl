@@ -7,9 +7,12 @@ array a view of which gets out is now moved to the heap as described below, so t
 used to be refused compile and run. What is still a diagnostic is storage the body did not declare —
 an array a caller passed **by value**, and an array that is a **field** of a struct on the frame,
 the second being the *Deferred* section's unspecified promotion-of-aggregates. A field of a
-`&Struct` is neither: it is on the heap already, and is the section below. Under `no alloc` every promotion
-becomes an error again, which is the paragraph below; capabilities are not built, so today every
-promotable escape promotes. `--explain-escapes` is built and reports every promotion. The
+`&Struct` is neither: it is on the heap already, and is the section below. Under `no alloc` every
+promotion becomes an error again, which is the paragraph below — **and that half is built too**:
+capabilities ship, and `Escape.noAllocPromotion` refuses a promotion in a module that declared one,
+reported against the view that leaves the frame rather than against the array, because the array is
+fine and what the reader has to change is where its contents go. Everywhere else a promotable escape
+still promotes, silently and by design. `--explain-escapes` is built and reports every promotion. The
 approximations the analysis takes are the ones *Deferred* permits.
 
 ## What it is for
@@ -158,20 +161,25 @@ allocation-gated feature behaves in the allocator-free subset — growable array
 closures, and `&T` creation are all compile errors there — so it introduces no new rule to
 learn.
 
+This is built, and what it writes is a single span at the **view** rather than at the declaration —
+the array is fine, and the line a reader has to change is the one that lets a view of it out:
+
 ```
-tty.sysl:31: the slice returned here outlives 'buf', the array it views
-   31 |     return buf[0..<n]
-      |            ^^^^^^^^^^
-   28 |     var buf: [64]u8
-      |         --- 'buf' is a local array; its storage ends when this function returns
-   this module is 'no alloc', so 'buf' cannot be promoted to the heap.
-   make the storage outlive the slice — a static buffer, or one the caller supplies —
-   or return the length and let the caller slice its own array
+error: this view of 'buf' is returned, so the array would move to the heap to outlive the frame — and this module declared 'no alloc', so there is nothing to move it into. Keep the view inside the frame, or take the storage from a caller as a '[]T' parameter, which is already wherever its owner put it
+  --> tty.sysl:31:12
+  |
+31 |     return buf[0..<n]
+  |            ^
 ```
 
-The last suggestion is the idiom worth reaching for first even where an allocator exists:
-returning a count and letting the caller slice its own buffer is what `snprintf` does, what
-Rust's buffer writers do, and what most kernel code wants.
+"is returned" is one of the several ways a view gets out, and the same sentence carries whichever
+applies — stored somewhere the frame does not own, put on the heap, passed to something that holds
+on to it, passed through a trait object or a function pointer.
+
+The second of the two suggestions is the idiom worth reaching for first even where an allocator
+exists: taking the storage as a `[]T` parameter — or returning a count and letting the caller slice
+its own buffer — is what `snprintf` does, what Rust's buffer writers do, and what most kernel code
+wants.
 
 ## Promotion is silent, not hidden
 

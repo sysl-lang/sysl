@@ -442,14 +442,19 @@ arity.
 
 ## Deliberate shortcuts (unwind these as the language grows)
 
-1. **The scalar table stops short of its widest member.** ~~An integer wider than 64 bits~~ and
-   `f128` are diagnosed rather than lowered: printing them portably needs a runtime this
-   stage does not have (`long double` is 64-bit on the arm64 Apple ABI, so `fp128` cannot go
-   through `printf`). The integer half is **built** — the widths run to **128 bits**, and `u256` is
-   what the back end now refuses. What made it possible is that a wide integer does not need a
-   `printf` conversion at all: it renders itself through `str` and goes out as the string that came
-   back, which is the one scalar whose printing allocates. `f128` has no such route, since rendering
-   a float is `snprintf`'s job either way, and it stays the open question it was.
+1. **The scalar table stops short of its widest member — and by now that is `f128` alone.**
+   ~~An integer wider than 64 bits~~ and `f128` were both diagnosed rather than lowered: printing
+   them portably needs a runtime this stage does not have (`long double` is 64-bit on the arm64
+   Apple ABI, so `fp128` cannot go through `printf`). **The integer half has stopped being a
+   shortcut at all.** The ceiling is LLVM's own `2^23 - 1` (`Type.MaxIntegerBits`), so there is no
+   width the language names and the back end refuses — `u256`, `i1024` and `i8192` all lower, with
+   division, remainder and the wrapping operators expanded inline and no compiler-rt routine behind
+   them. What made it possible is that a wide integer does not need a `printf` conversion at all: it
+   renders itself through `str` and goes out as the string that came back, which is the one scalar
+   whose printing allocates, and the renderer is generated per width from the width itself rather
+   than written once at the widest. `00 §5` records the two reasons this was believed to stop at
+   128 and why neither held. `f128` has no such route, since rendering a float is `snprintf`'s job
+   either way, and it stays the open question it was.
    `usize` / `isize` are fixed at 64 bits by a constant. There **is** a
    target description now (`targets.md`) and this does not read it, for the reason `Layout` does
    not: every target in the registry is 64-bit, and the registry refuses one that is not.
