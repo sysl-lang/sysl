@@ -716,6 +716,14 @@ exactly (`§5`), one row further down the catalog.
   takes none, so a type implementing `Iterate` twice leaves a `for` nothing to decide with. That is
   reported at the loop rather than at the call, because the sentence a program needs names the loop.
 
+  **A `for` walks an erased cursor too.** `next` takes `*self` and mentions `Self` nowhere else, so
+  `Iterate` has an object, and the loop's question — what may be *called* on this value — is what a
+  table answers (`10 §5`). The element type comes out of the trait the object was erased to, read
+  from the same requirement closure the table was laid out from, so the loop cannot disagree with the
+  table about which member it is calling; and a trait *requiring* `Iterate` is walked for that
+  reason. The ambiguity above cannot arise here, since an object names one trait at one argument
+  list. What this buys is a function returning a cursor without naming which one it built.
+
 - **~~A heterogeneous *operand*.~~ The catalog change is built; what it turned out to wait on is
   something else.** `§1` argues that `Self`-homogeneity costs nothing, because the scalars already
   obey it — `u8 + u8` is a `u8` and no operator promotes. That is true of every pair of scalars and

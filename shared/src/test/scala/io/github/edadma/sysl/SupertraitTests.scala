@@ -263,6 +263,44 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(hail(o))""".stripMargin) shouldBe "hello, ed\n"
     }
 
+    /** The rule answers a bound and **nothing writes an `impl` that could answer it too**, so there
+     * is one answer rather than two that might disagree. Coherence is what stops the second: an
+     * object type names the trait and nothing of the program's, so a block written for it has no
+     * module it belongs in — the same reason `impl Display for []int` has none.
+     */
+    "no program may write an implementation for the object type itself" in {
+      err(
+        shape +
+          """impl Display for &Shape
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_pad("o".bytes, out, fmt)""".stripMargin,
+      ) should include("&Shape")
+    }
+
+    /** The **iteration protocol** is a trait, so a `for` over an object is the bound rule and not a
+     * feature of its own. Worth pinning because it is the first place someone meets the rule without
+     * having written a bound: `for x in it` is `Iterate`'s member called through whatever `it` is.
+     */
+    "a for loop walks an erased iterator, the protocol being a trait like any other" in {
+      run(
+        """struct Countdown
+          |    n: int
+          |
+          |impl Iterate[int] for Countdown
+          |    next(*self) -> Option[int]
+          |        if self.n <= 0 then None else
+          |            self.n -= 1
+          |            Some(self.n)
+          |end Countdown
+          |
+          |var c = Countdown(3)
+          |var it: *Iterate[int] = &c
+          |var total = 0
+          |
+          |for x in it do total += x
+          |
+          |print(total)""".stripMargin) shouldBe "3\n"
+    }
+
     /** A **multi-trait** bound is a list and every entry is asked separately, so an object meets it
      * exactly when it meets each — which for a required trait it does, and for an unrelated one it
      * does not. Both halves here, because the interesting failure would be a list answered by its

@@ -557,6 +557,35 @@ is untouched by the walk. That matters for a cursor meaning to report something 
 reader's failure latch, say — which is why such a cursor has to borrow what it reports on rather than
 own it. [`sysl.io`](/library/io/)'s `lines()` is built that way for exactly this reason.
 
+**A `for` also walks an erased cursor**, since `next` takes `*self` and mentions no `Self` elsewhere
+— so `Iterate` has an object, and the loop calls its member through the table. The element type is
+whatever the object was erased to, which is why there is nothing to annotate:
+
+```sysl
+struct Countdown
+    n: int
+
+impl Iterate[int] for Countdown
+    next(*self) -> Option[int]
+        if self.n <= 0 then return None
+        self.n -= 1
+        Some(self.n + 1)
+
+var it: &Iterate[int] = Countdown(3)
+
+for x in it do print(x)
+```
+
+```output
+3
+2
+1
+```
+
+That is the same rule that lets a trait object satisfy a bound — a `for` asks what may be *called* on
+the value, and a table is an answer to that. It means a function may hand back a cursor without
+saying which one it built.
+
 ## Calling a value
 
 ```sysl

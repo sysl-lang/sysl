@@ -57,7 +57,16 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("mentions 'Self' away from its receiver")
     }
 
-    "an associated function has no receiver to dispatch on" in {
+    /** **Object safety is all-or-nothing**, and this is where that is pinned: `Make` declares a
+     * dispatchable `use` beside the associated function, and the answer is that there is no `*Make`
+     * rather than a `*Make` without `build`.
+     *
+     * A good deal rests on it. A trait object satisfying a bound (`10 §5`) is total *because* of
+     * this: a `&Shape` existing is already the proof that every member of `Shape` is reachable
+     * through it, so nothing has to say what a bound does when it reaches a member the object cannot
+     * offer. A language deciding safety per member owes that rule; sysl owes none.
+     */
+    "an associated function has no receiver to dispatch on, and takes the whole trait with it" in {
       err(
         """trait Make
           |    build() -> int
