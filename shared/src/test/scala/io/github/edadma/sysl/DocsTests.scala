@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 import io.github.edadma.cross_platform.*
 
-import org.scalatest.ParallelTestExecution
+import org.scalatest.{ParallelTestExecution, Suite}
 import org.scalatest.freespec.AnyFreeSpec
 
 /** The documentation site's programs, compiled and run out of the markdown a reader is looking at
@@ -18,6 +18,11 @@ import org.scalatest.freespec.AnyFreeSpec
  * and it was learned there the hard way.
  */
 class DocsTests extends AnyFreeSpec with DocsSupport with ParallelTestExecution {
+
+  /** Only the JVM can supply this by reflection; on JS and Native it is abstract, so a suite that
+   * runs its tests in parallel has to say how one of itself is made.
+   */
+  override def newInstance: Suite & ParallelTestExecution = new DocsTests
 
   /** How many `sysl` blocks of each kind a page carries: runnable programs, refusals, fragments.
    *

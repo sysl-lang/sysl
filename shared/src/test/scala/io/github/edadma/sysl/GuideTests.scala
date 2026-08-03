@@ -1,6 +1,6 @@
 package io.github.edadma.sysl
 
-import org.scalatest.ParallelTestExecution
+import org.scalatest.{ParallelTestExecution, Suite}
 import org.scalatest.freespec.AnyFreeSpec
 
 /** The guide programs, compiled from `guide/` and run (see `guide/README.md`).
@@ -23,6 +23,11 @@ import org.scalatest.freespec.AnyFreeSpec
  * them sequential was the runner taking one test at a time.
  */
 class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecution {
+
+  /** Only the JVM can supply this by reflection; on JS and Native it is abstract, so a suite that
+   * runs its tests in parallel has to say how one of itself is made.
+   */
+  override def newInstance: Suite & ParallelTestExecution = new GuideTests
 
   private def checks(out: String): Int = out.linesIterator.count(_.startsWith("ok"))
 
