@@ -139,11 +139,12 @@ grammar, guards, alternatives, bindings — is on [patterns and matching](/refer
 
 ## Loops
 
-Four forms, and each is an expression.
+Five forms, and each is an expression.
 
 | form | when |
 |---|---|
 | `while cond` | test before each iteration |
+| `do … while cond` | test after each iteration, so the body runs at least once |
 | `loop` | no test at all; something inside leaves it |
 | `for x in seq` | walk a range, an array, a slice, or an `Iterate` |
 | `for init; cond; step` | a stride, a descent, a compound test, several variables |
@@ -219,6 +220,67 @@ this loop breaks with a int but has no 'else' to give a value when it finishes n
 
 Every `break` value and the `else` value share one type, which becomes the loop's. A bare `break`
 with no `else` is the ordinary statement loop, of type `unit`.
+
+### `do … while`
+
+The test goes at the foot, so the body runs before anything is asked. The body is an indented block
+with the `while` on the line that closes it, or a single statement on one line.
+
+```sysl
+digits(n: int) -> string
+    var rest = n
+    var s = ""
+
+    do
+        s = str(rest % 10) + s
+        rest /= 10
+    while rest > 0
+
+    s
+
+var i = 0
+
+do i += 1 while i < 4
+
+print(digits(0), digits(4071), i)
+```
+
+```output
+0 4071 4
+```
+
+Written as a `while`, `digits` prints nothing for `0`. The value rules are `while`'s: a `break`
+carries the loop's value, and an `else` runs when the test at the foot finally fails.
+
+**`continue` runs the test**, and that is what the form is for. The shape written instead is `loop`
+with the test inverted at the bottom:
+
+```
+loop
+    body
+    if !cond then break        // NOT the same loop
+```
+
+That has no test for a `continue` to reach, so the first `continue` added to it jumps over the exit
+and the loop never leaves — the same trap the three-clause `for` exists to avoid, where a `continue`
+skips the step.
+
+The test takes no `is` binding, and cannot read what the body declared: it guards nothing, because
+the body it belongs to has already run.
+
+```sysl
+do
+    var k = 1
+while k < 2
+```
+
+```error
+undefined name 'k'
+```
+
+`do` is never ambiguous with the `do` that introduces a one-line body. That one only ever follows a
+loop header on the same line, so it is never a statement's first token; a `do` that starts a line
+opens this form and nothing else.
 
 ### `loop`
 

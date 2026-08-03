@@ -555,7 +555,7 @@ line means something after all, and the point of continuing is that it does not.
 
 ## 10. Control flow is expression-oriented — `if`, `match`, and loops yield values
 
-`if`, `match`, `while`, `loop`, and `for` are **expressions**, not statements. Each yields a value, so
+`if`, `match`, `while`, `do … while`, `loop`, and `for` are **expressions**, not statements. Each yields a value, so
 it can initialize a binding, be a function's body, or feed a branch of another:
 
 ```
@@ -617,6 +617,52 @@ way looks like one that might finish, and the code after it looks reachable. Rus
 its type for the same reason.
 
 `continue` starts the next iteration as it does in any loop, and a label works unchanged.
+
+**A loop whose body must run before anything is asked is written `do … while`.** The test goes at
+the foot, so the first pass is not conditional on anything:
+
+```
+do
+    s = str(n % 10) + s
+    n /= 10
+while n > 0
+```
+
+Written as a `while`, that program prints nothing for `n = 0`, and the fix everybody reaches for is
+to special-case zero above the loop. The one-line form is `do n /= 10 while n > 0`, and the value
+rules are `while`'s exactly: a `break` carries the loop's value, and an `else` runs when the test at
+the foot finally fails.
+
+**It is not sugar, and the reason is the one the three-clause form has.** The shape a program writes
+instead is `loop` with the test inverted at the bottom:
+
+```
+loop
+    body
+    if !cond then break        // NOT the same loop
+```
+
+That rewrite has no test for a `continue` to reach, so the first `continue` anybody adds to it jumps
+straight over the exit and the loop never leaves. In a `do … while`, `continue` runs the **test** —
+an iteration that is skipped still asks whether to stop. The two differ on exactly the point the
+three-clause `for` differs from its own `while` rewrite, and it is the same bug wearing the other
+hat: there, `continue` skips the step; here, it skips the exit.
+
+**`do` is unambiguous by position, so it does both jobs.** Everywhere else it is a body
+*introducer* — `while c do …`, `loop do …`, `for x in xs do …` — and it only ever appears there
+after a loop header **on the same line**, so it is never the first token of a statement. A `do` that
+starts a line can therefore only open this form. The tail needs no rule of its own either: this loop
+is *incomplete* without its `while`, and there is no bare `do` block in the language for that `while`
+to have belonged to instead, so a `while` found where the body ends is this loop's test and nothing
+else can want it. Nothing is written with an `end` marker, because the tail already names where the
+body stopped.
+
+**The test is an ordinary condition and takes no `is` binding.** `while p is Some(x)` binds `x` for
+the body it guards; a test at the foot guards nothing, because the body it belongs to has already
+run — so an `is` there would bind a name with no branch to be read from. The body's scope has closed
+by the time the test is reached for the same reason: a `var` declared in the body is remade every
+round, and a test reading one would be reading the round that has just ended. That is C's rule, and
+it is the only one the form can have.
 
 **A counted loop that a range cannot describe is written with three clauses.** `for init; cond;
 step` is C's loop without the parentheses, as Go writes it — every other header in the language is
@@ -963,7 +1009,10 @@ work:
   `for`), `->` (a `match` arm), and `=` (a function's or member's body, where the short form is one
   expression rather than a statement); `else` takes a body directly, with no introducer of its own to
   need. So `if c then x = 1` and `if c` + an indented block are both written, and `while c do …`
-  likewise. The *lexing* mechanics were settled earlier by adopting `IndentationLexical` (see
+  likewise. `do … while`'s leading `do` is the one place the word is a **head** rather than an
+  introducer, and the two never meet: an introducer only ever follows a loop header on the same line,
+  so it is never a statement's first token. The *lexing* mechanics were settled earlier by adopting
+  `IndentationLexical` (see
   `front-end.md`), and the trailing-continuation operator set that was also filed here is settled in
   § *Continuing a line* below.
 - ~~Zero-sized types~~ — **done**, see §12. A `unit` field is skipped in the layout with the

@@ -102,6 +102,34 @@ t minus 1
 go
 ```
 
+When the body has to run before anything is asked, put the test at the foot with `do … while`:
+
+```sysl
+digits(n: int) -> string
+    var rest = n
+    var s = ""
+
+    do
+        s = str(rest % 10) + s
+        rest /= 10
+    while rest > 0
+
+    s
+
+print(digits(0), digits(4071))
+```
+
+```output
+0 4071
+```
+
+Written as a `while`, that prints nothing at all for `0`, and the usual patch is a special case
+above the loop. The test at the foot is the fix. The one-line form is `do rest /= 10 while rest > 0`.
+
+`continue` in a `do … while` runs the **test**, which is why the loop is worth having rather than
+writing `loop` with `if !cond then break` at the bottom: that shape has no test for a `continue` to
+reach, so the first one added to it skips the exit and the loop never finishes.
+
 A loop with nothing to test is written `loop`, which is what `while true` was always being used to
 say:
 
