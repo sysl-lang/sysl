@@ -648,7 +648,7 @@ exactly (`§5`), one row further down the catalog.
   **The index is not held to being an integer**, which the built-in subscript is: what a container
   is read by is the trait's own argument, so `e["answer"]` on a type that implements
   `Index[string, int]` is ordinary. A type may implement `Index` at more than one index type, and
-  the written index says which (`02 § A trait may be implemented at more than one argument list`).
+  the written index says which (`02 § One implementation per argument list`).
   Built-in indexing of arrays, slices and strings is compiler-provided and unaffected; nothing a
   program writes competes with it.
 

@@ -286,15 +286,23 @@ before they appear and may be mutually recursive).
   are fixed by the implementation, which puts them alongside `Self` in what a member's signature and
   body resolve under — a method written in the trait's `T` and one written in the type that `T` is
   are the same signature. A trait may bound its own parameters, and everything applying it is held
-  to them. A type implements a trait **once**: the arguments are what an implementation supplies,
-  not part of what it is filed under, because two of them would give the type two members of each
-  name with no rule for choosing between them.
+  to them. A type implements a trait **once at each argument list** — the arguments are part of what
+  an implementation is filed under, so `Sink[int]` and `Sink[string]` on one type are two
+  implementations and a call picks between them by the arguments written at it
+  (`02 § One implementation per argument list`). What has no rule to choose by
+  is a parameter appearing only in a *return* type: nothing at the call says which was meant, and the
+  compiler says so rather than guessing.
 - **Rendering, through `Display` and its `Writer` sink (`14 §6`).** A value that is not a scalar
   writes itself into a sink rather than returning a string, so rendering allocates nothing and a
   `no alloc` module can still log. The sink is a `*Writer` trait object; `print` supplies one over
   standard output and `str` supplies a growable buffer whose bytes become the string, and both are
-  the compiler's, because a stateless writer has no struct to be and a growable buffer is not yet
-  something sysl can express. A **scalar** keeps its direct path in `print` and its own `str`, so a
+  the compiler's — **not for want of a way to write them**, which is what this used to say. A
+  growable buffer is ordinary sysl (`sysl.buf.Buf[T]`) and so is a sink over one
+  (`sysl.buf.ByteSink`, a struct with an `impl Writer`). The reason is narrower: `str(x)` renders
+  without a program naming a sink, so it cannot reach a module the program never imported, and it
+  goes through storage the compiler lays out instead. `lib/sysl/buf/buf.sysl` says the same thing
+  from the other side, and it is why the sink sits beside the buffer it wraps rather than in the
+  prelude. A **scalar** keeps its direct path in `print` and its own `str`, so a
   program that prints only numbers builds no sink at all. A `Writer` **borrows** the bytes it is
   written — checked by escape analysis, which is what lets a renderer pass a slice of its own stack
   buffer through a trait object. A hole's format specifier travels to the `Display` it calls and is
@@ -508,15 +516,19 @@ arity.
    expression is evaluated once into a slot the loop owns, `next` takes that slot's address each
    round, and running out is normal completion so the `else` runs. A container is deliberately not
    one — a `Buf` is walked as `b.view()`, which costs an index rather than a call (`14 §7`).
-9. **Escape analysis rejects rather than promotes.** An array whose view escapes is
-   diagnosed where `05` says an allocator should silently promote it to the heap, so a program
-   that means to return a view writes `&[N]T` itself. That is `05`'s `no alloc` behaviour
-   applied everywhere — the safe direction to be wrong in — and `--explain-escapes` arrives
-   with promotion. Two more approximations `05` allows: a call's result is treated as viewing
-   *every* slice argument rather than the ones it really views, and a value's provenance is
+9. **~~Escape analysis rejects rather than promotes.~~ No longer a shortcut.** An array whose view
+   escapes is moved to the heap, silently, exactly as `05` specifies; a program that means to return
+   a view writes the ordinary `var buf: [64]u8` and says nothing. Refusal survives only where there
+   is nothing to promote *into* — a module that declared `no alloc` — or nothing the body owns to
+   promote: an array a caller passed by value, and an array that is a field of a value on the frame.
+   `--explain-escapes` arrived with it and reports every promotion the compiler made.
+   What is still an approximation is the two things `05` allows: a call's result is treated as
+   viewing *every* slice argument rather than the ones it really views, and a value's provenance is
    tracked per local rather than per field, so a struct that holds one confined view is
-   confined entirely. There is also no growable array: no `append`, no capacity, no `[]T` that
-   owns rather than views. A bounds failure traps with no message, exactly as `char(u)` does.
+   confined entirely. **A growable sequence is no longer missing either** — `sysl.buf.Buf[T]` has
+   `push`, a capacity, and storage it owns, and it is ordinary sysl rather than anything lowered
+   here; a `[]T` still views and is meant to. A bounds failure traps with no message, exactly as
+   `char(u)` does.
 10. **Generics are monomorphized with local inference only.** Type arguments come from the
     argument types and the expected type of the expression; there is no unification across a
     whole function body and no explicit type application at a call site. A parameter nothing
