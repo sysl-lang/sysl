@@ -366,9 +366,10 @@ impl Writer for ByteSink
     write(*self, bytes: []const u8) = self.bytes.extend(bytes)
 ```
 
-That is the entire type. It is **the one `Writer` the library supplies** — the two that `print` and
-`str` use are the compiler's, and the standard-output one has to be, since it holds no state and
-there is no struct with no fields to give it.
+That is the entire type. It is **one of the two `Writer`s the library supplies** — the other is
+[`Stdout`](/reference/declarations/), which stands for standard output, holds no state at all, and
+is therefore a struct with no fields. The buffer `str` and an `f"…"` hole render into is still the
+compiler's, since a growable byte array is not something it can name at the layer it needs one.
 
 `impl Fallible for ByteSink` has no block, and does not need one: every member of `Fallible` has a
 default, so implementing the latch on a buffer that has nothing to fail at is entirely a matter of

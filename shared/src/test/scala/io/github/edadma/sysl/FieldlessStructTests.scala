@@ -40,6 +40,28 @@ class FieldlessStructTests extends AnyFreeSpec with RunSupport with CodegenSuppo
       |end show
       |""".stripMargin
 
+  /** A type rendering itself, and a `report` that writes it into whatever sink it is handed — the
+   * shape a program takes when the destination is a parameter rather than a fixed global.
+   */
+  private val point =
+    """struct Point
+      |    x: int
+      |    y: int
+      |end Point
+      |
+      |impl Display for Point
+      |    display(self, out: *Writer, fmt: FormatSpec)
+      |        display_str("pt(", out, fmt)
+      |        display_int(long(self.x), out, fmt)
+      |        display_str(")", out, fmt)
+      |end Point
+      |
+      |report(where: *Writer, p: Point)
+      |    p.display(where, FormatSpec(0, -1, false))
+      |    where.write("\n".bytes)
+      |end report
+      |""".stripMargin
+
   "the declaration" - {
 
     "a struct with no fields is written closed by its 'end'" in {
@@ -228,6 +250,41 @@ class FieldlessStructTests extends AnyFreeSpec with RunSupport with CodegenSuppo
     "which means something only because that clause is enforced" in {
       err("no alloc\n\n" + stdout + "var boxed: &int = 1\n\nshow(*boxed)\n") should
         include("declared 'no alloc'")
+    }
+  }
+
+  /** The library's own sink, which is the one above written once in `print.sysl` — `Stdout`, its
+   * `impl Writer`, and the `stdout()` that hands one out.
+   *
+   * This is what the language change was for. The destination `print` writes into used to be a node
+   * the compiler built and a method table it laid out by hand, so it was reachable from exactly one
+   * place and nothing could be said about it in sysl. It is now a type a program may name, a value
+   * it may hold, and an argument it may pass — and swapping it for a serial port is writing another
+   * `impl Writer`, not editing the compiler.
+   */
+  "the library declares that sink once, and a program may use it" - {
+
+    "the sink 'print' uses is one a program can ask for by name" in {
+      run(point + "report(stdout(), Point(1, 2))\n") shouldBe "pt(1)\n"
+    }
+
+    "and the type behind it is one a program can build for itself" in {
+      run(point + "var own = Stdout()\n\nreport(&own, Point(3, 4))\n") shouldBe "pt(3)\n"
+    }
+
+    "the two are the same destination, in the order the writes happened" in {
+      run(point + "var own = Stdout()\n\nreport(stdout(), Point(1, 2))\nreport(&own, Point(3, 4))\n") shouldBe
+        "pt(1)\npt(3)\n"
+    }
+
+    // What `print` of a user type now emits: a call for the sink rather than two words the compiler
+    // laid down, and no hand-written table anywhere in the program.
+    "and 'print' reaches it as an ordinary call" in {
+      val out = ir(point + "print(Point(1, 2))\n")
+
+      out should include regex raw"""call \{ ptr, ptr \} @${keyRe("stdout")}\(\)"""
+      out should not include "@sysl.vt.out"
+      out should not include "@sysl.w.out.write"
     }
   }
 }

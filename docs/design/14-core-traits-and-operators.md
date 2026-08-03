@@ -297,10 +297,21 @@ Three decisions, each following Rust's experience rather than its packaging:
 `*self` on both methods is what makes a writer stateful — a counter, a latch, a buffer — while
 staying object-safe for a raw object (`02`), so a sink needs no allocator.
 
-**Which writers the library supplies: one, `ByteSink`, and it is `sysl.buf`'s.** The two that `print`
-and `str` themselves use are the compiler's, and the standard-output one has to be — it holds no
-state, and there is no struct with no fields to give it. Its `write` is the library's own `putbytes`,
-which is one of the two seams a freestanding target replaces — the other being `FdReader.read`, below.
+**Which writers the library supplies: two — `Stdout`, in the standard module, and `ByteSink`, which
+is `sysl.buf`'s.** The standard-output one used to be the compiler's, for a reason that has since
+stopped being true: it holds no state, and there was no struct with no fields to give it. There is
+now (`00 §12`), so it is three ordinary declarations in `print.sysl` — the struct, its `impl Writer`,
+and a `stdout()` that hands one out — and `print` reaches it by calling that. Its `write` is still
+the library's own `putbytes`, which is one of the two seams a freestanding target replaces, the other
+being `FdReader.read`, below.
+
+**What that bought is the sink as a value.** A destination the compiler built could be reached from
+exactly one place; one the library declares can be passed to a function, held in a struct, and chosen
+by a caller, and a program can build its own. Swapping standard output for a serial port is another
+`impl Writer`, not an edit to the compiler.
+
+The buffer `str` and an `f"…"` hole render into is still the compiler's, and for the reason that
+still holds: a growable byte array is `07`'s *Not yet* at the layer the compiler needs one.
 
 That the sink is imported while `Writer`, `Display`, `FormatSpec` and the renderers are not is the
 line `04` draws, applied here: a `print` is a keyword and reaches all four of those for itself, so

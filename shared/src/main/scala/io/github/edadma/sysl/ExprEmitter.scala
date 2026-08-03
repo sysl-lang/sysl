@@ -685,13 +685,6 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       val r   = freshTemp(); emit(s"$r = call ${Type.Str.llvm} @$fn(ptr $p, i64 $n)")
       ownTemp(r, Type.Str)
 
-    // A sink with no state: the table is the compiler's and the data word is null, because a writer
-    // over standard output has nothing to point at.
-    case TStdout() =>
-      val a = freshTemp(); emit(s"$a = insertvalue ${Type.fatPointer} undef, ptr @${stdoutTable()}, 0")
-      val b = freshTemp(); emit(s"$b = insertvalue ${Type.fatPointer} $a, ptr null, 1")
-      b
-
     // Rendering into a buffer: a zeroed stack slot becomes the sink, the value writes itself into
     // it, and what landed there is copied into a string the statement owns. The slot is re-zeroed
     // on every arrival rather than once, since an alloca is hoisted to the entry block and a render
