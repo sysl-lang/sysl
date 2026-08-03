@@ -228,7 +228,7 @@ this family, one function per shape, which the compiler routes a scalar's `displ
 |---|---|
 | `display_str` | a `string`; precision **truncates** |
 | `display_int`, `display_uint` | an integer; precision is a **minimum digit count**, zero-filled |
-| `display_wide` | a 128-bit integer, whose digits `snprintf` cannot produce |
+| `display_wide` | an integer **above 64 bits**, whose digits `snprintf` cannot produce |
 | `display_real` | a float; precision is **significant digits**, defaulting to 6 and capped at 40 |
 | `display_bool`, `display_char` | `true`/`false`, and a code point encoded to UTF-8 |
 | `display_pad` | **where they all end up** — puts finished bytes in the field the spec asked for |
