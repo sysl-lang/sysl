@@ -588,6 +588,30 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         include("declares no method 'volume'")
     }
 
+    /** The other half of what flattening costs, and the half a reader meets first. The object's
+     * table already holds `Display`'s slots — the tests above print through them — but a **bound**
+     * cannot see them, because a bound asks which types have an `impl` and an object is not one of
+     * them. So a required trait is reachable by *name* and unreachable by *constraint*, and one
+     * generic function cannot be written to take both a `Rect` and a `&Shape`.
+     *
+     * Both sigils, because the two are separate types and only the erasure they share is the
+     * reason: neither is a type anything has an `impl` for.
+     */
+    "a bound on a required trait is not satisfied by the object" in {
+      val show =
+        """
+          |show[T: Display](x: T)
+          |    print(x)
+          |end show
+          |""".stripMargin
+
+      err(shape + show + "var o: &Shape = Rect(3, 4)\nshow(o)") should
+        include(s"'show' requires its type parameter 'T' to implement '${lib("Display")}', but &Shape does not")
+
+      err(shape + show + "var r = Rect(3, 4)\nvar o: *Shape = &r\nshow(o)") should
+        include(s"'show' requires its type parameter 'T' to implement '${lib("Display")}', but *Shape does not")
+    }
+
     /** `13 §2`'s rule, and a requirement is the sharpest case of it: implementing the trait means
      * implementing the required one too, so a requirement the implementer cannot name leaves the
      * trait unimplementable from outside. Reported at the declaration that made the promise, not at
