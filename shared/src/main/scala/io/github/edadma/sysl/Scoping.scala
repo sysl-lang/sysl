@@ -396,6 +396,28 @@ trait Scoping extends DeclTables {
   /** The key a written **function** name resolves to. */
   protected def funcKey(written: String): Option[String] = resolveName(written)(funcDecls.contains)
 
+  /** Whether this module declares the name as **storage, a constant, or an enum variant** — the
+   * question a bare name has to be asked before it is treated as a function.
+   *
+   * `resolveName` ranks a program's own declaration above an import's and the library's, but it
+   * ranks *within one table*, and the tables are asked one at a time. So a walk that asks the
+   * function table first is asking "is there a function of this name anywhere, the library
+   * included?" before "is there storage of this name right here" — and the library wins a name the
+   * program declared itself, which no reader would predict from the source in front of them. A
+   * program's own declaration is the likelier thing to have been meant, and unlike the library's it
+   * is on the screen.
+   *
+   * A module that declares both is left exactly as it was, so the duplicate is still reported as a
+   * duplicate rather than quietly resolved one way by this.
+   */
+  protected def ownValueName(written: String): Boolean = {
+    val own = Modules.qualify(currentModule, written)
+
+    !funcDecls.contains(own) && visible(own) &&
+    (constDecls.contains(own) || valDecls.contains(own) || externVarDecls.contains(own) ||
+      variantOwner.contains(own))
+  }
+
   /** The key a written **enum variant** name resolves to. A variant is reachable unqualified — a
    * bare `Circle(5)` — so it is a name of the module its enum was declared in, which is why two
    * modules may each have a `Circle` where one program could not have two.

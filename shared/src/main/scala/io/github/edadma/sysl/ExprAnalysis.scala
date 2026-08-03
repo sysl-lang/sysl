@@ -329,7 +329,7 @@ trait ExprAnalysis
     // (`12 §5`). It is asked for only where the context says a callable, so a bare function name
     // anywhere else is still the mistake it was.
     case Ident(name)
-        if lookupOpt(name).isEmpty && funcKey(name).isDefined &&
+        if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined &&
           expected.flatMap(callableSignature).isDefined =>
       val (ptypes, result) = expected.flatMap(callableSignature).get
 
@@ -354,7 +354,7 @@ trait ExprAnalysis
     // convention (`§6a`). Where the context asks for one of those outright — a `pthread_create`, a
     // `qsort`, any interface that calls back — the missing `&` is the whole of the mistake, so the
     // message names it rather than the two callable forms the reader did not want.
-    case Ident(name) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+    case Ident(name) if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined =>
       err(
         if expected.exists(t => cfnOf(t).isDefined) then
           s"'$name' is a function, and what is wanted here is the address of one — write '&$name'. A " +
@@ -438,7 +438,7 @@ trait ExprAnalysis
     // A function is not a place — nothing holds it, and there is no slot to point at — so its
     // address is taken here rather than by the walk below, which asks for one (`12 §6a`). A local
     // shadowing the name is an ordinary value and keeps the ordinary reading.
-    case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+    case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined =>
       functionAddress(name, funcKey(name).get)
 
     // A nested function's environment is the frame it was declared in (`12 §5a`), and an address is

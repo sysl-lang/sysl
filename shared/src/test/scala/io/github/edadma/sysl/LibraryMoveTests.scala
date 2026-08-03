@@ -457,6 +457,62 @@ class LibraryMoveTests extends LibrarySeamSupport {
             |print(putbytes("x".bytes), g.text().len)
             |""".stripMargin) shouldBe "7 2\n"
     }
+
+    /** The two above are a program declaring a **function** where the library has one. This is a
+     * program declaring **storage** where the library has a function, and it is a different
+     * question, because the two live in different tables and the tables are asked one at a time.
+     *
+     * Nothing made the order visible until `stdout`: a bare name was asked "is there a function of
+     * this name anywhere, the library included?" before "is there a value of this name right here",
+     * and while no library function bore a name a program would declare as storage, no program could
+     * tell. `stdout` is that name — what C calls its stream and what the library now calls the sink
+     * writing to it — so a declaration at the top of the program was answered by the library.
+     */
+    "and its own storage under a library function's name, which is a different table" - {
+
+      // The case that found it: reaching libc's real stream, which every program does by declaring
+      // it. `run` is what makes this a check rather than a spelling — a program whose `stdout`
+      // resolved to the library's function does not compile at all.
+      "an 'extern' variable, which is how a program reaches libc's own stream" in {
+        run(
+          """extern "__stdoutp" stdout: *u8
+            |extern fputs(s: *u8, stream: *u8) -> i32
+            |print("one")
+            |fputs(c"two\n", stdout)
+            |print("three")""".stripMargin) shouldBe "one\ntwo\nthree\n"
+      }
+
+      "a module-level 'val', which is storage this program laid down" in {
+        run("val stdout: int = 7\n\nprint(stdout + 1)") shouldBe "8\n"
+      }
+
+      // A constant is folded into its use rather than loaded, so it reaches the name by a third
+      // route again — and one that runs before most of the walk does.
+      "a 'const', which is folded into the use rather than loaded" in {
+        run("const stdout: int = 7\n\nprint(stdout + 1)") shouldBe "8\n"
+      }
+
+      // A variant is reached unqualified, so it is the fourth kind that a bare name can be and the
+      // fourth that the function table used to answer for.
+      "an enum variant, which is reached unqualified and so collides the same way" in {
+        run(
+          """enum Stream
+            |    stdout
+            |    stderr
+            |
+            |var s: Stream = stderr
+            |
+            |s match
+            |    stdout -> print("out")
+            |    stderr -> print("err")""".stripMargin) shouldBe "err\n"
+      }
+
+      // The library's is still there under the path that names it, which is what makes this
+      // shadowing rather than the program's declaration having displaced anything.
+      "while the library's function is still reached by the path that names it" in {
+        run("val stdout: int = 7\n\nprint(stdout)\nsysl.stdout().write(\"hi\\n\".bytes)") shouldBe "7\nhi\n"
+      }
+    }
   }
 
   "a moved GENERIC, which is what a growable sequence is" - {
