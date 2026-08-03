@@ -230,8 +230,8 @@ trait ExprAnalysis
 
   /** Whether an expression yields its value through branches rather than producing one itself. */
   private def branching(expr: Expr): Boolean = expr match
-    case _: IfExpr | _: MatchExpr | _: While | _: For => true
-    case _                                            => false
+    case _: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: For => true
+    case _                                                         => false
 
   /** The four conversions a context may apply to a value that does not already have its type: a
    * `T` the context wanted by reference is boxed, a `&T` the context wanted weakly is weakened,
@@ -776,8 +776,8 @@ trait ExprAnalysis
     case e @ (_: ArrayLit | _: ArrayFill | _: Index) => sequenceExpr(e, expected)
     // Control flow that yields a value (`00 §10`), and the forms that carry several at once.
     // `ControlFlowExprAnalysis`.
-    case e @ (_: IfExpr | _: MatchExpr | _: While | _: Loop | _: CFor | _: For | _: TryExpr |
-        _: RangeExpr | _: ResultList | _: Lambda | _: Tuple) =>
+    case e @ (_: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: Loop | _: CFor | _: For |
+        _: TryExpr | _: RangeExpr | _: ResultList | _: Lambda | _: Tuple) =>
       controlExpr(e, expected, discarded)
 
     // Reached only where an `is` was written somewhere a condition's terms are not read one by one:

@@ -70,6 +70,7 @@ object SelfAlias {
       // A loop's value comes from its `break`s and its `else`, so a pointer carried out of the loop
       // is carried out of whatever the loop's value is used for.
       case w: TWhile            => loopCarries(w.body, w.elseBlock)
+      case d: TDoWhile          => loopCarries(d.body, d.elseBlock)
       case l: TLoop             => loopCarries(l.body, None)
       case f: TFor              => loopCarries(f.body, f.elseBlock)
       case e: TForEach          => loopCarries(e.body, e.elseBlock)
