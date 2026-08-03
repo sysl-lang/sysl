@@ -17,8 +17,8 @@ trait ControlFlowExprAnalysis extends ExprSupport {
    * that the match below is exhaustive over exactly what the dispatch sends here.
    */
   protected def controlExpr(
-      expr: IfExpr | MatchExpr | While | Loop | CFor | For | TryExpr | RangeExpr | ResultList |
-        Lambda | Tuple,
+      expr: IfExpr | MatchExpr | While | DoWhile | Loop | CFor | For | TryExpr | RangeExpr |
+        ResultList | Lambda | Tuple,
       expected: Option[Type],
       discarded: Boolean,
   ): TExpr = expr match
@@ -64,6 +64,20 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       popScope()
       val telse         = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       TWhile(tc, tbody, telse, loopResultType(ctx, telse))
+
+    // The body is analyzed first and in its own scope, which has closed by the time the test is
+    // reached — so the foot's condition reads what the enclosing block holds and nothing the body
+    // declared. That is C's rule, and it is also the only one the form can have: a `var` made in the
+    // body is remade every round, and a test that read one would be reading the last round's.
+    //
+    // The condition is `analyzeBool` rather than `analyzeCond` for the reason the three-clause
+    // `for`'s is: an `is` binding is live through the branch that the test guards, and a test at the
+    // foot guards nothing — the body it belongs to has already run.
+    case DoWhile(label, body, cond, elseOpt) =>
+      val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))
+      val tcond        = analyzeBool(cond)
+      val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
+      TDoWhile(tbody, tcond, telse, loopResultType(ctx, telse))
 
     case Loop(label, body) =>
       val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))

@@ -49,7 +49,7 @@ object TreeWalk {
   }
 
   def ownBreaksInExpr(e: TExpr): List[TExpr] = e match
-    case _: TWhile | _: TLoop | _: TFor | _: TForEach | _: TCFor | _: TIterate => Nil
+    case _: TWhile | _: TDoWhile | _: TLoop | _: TFor | _: TForEach | _: TCFor | _: TIterate => Nil
     case TIf(_, t, el, _)   => ownBreakValues(t.stmts) ::: el.toList.flatMap(b => ownBreakValues(b.stmts))
     case TMatch(_, arms, _) => arms.flatMap(a => ownBreakValues(a.body.stmts))
     case _                  => Nil
@@ -61,6 +61,7 @@ object TreeWalk {
     case TIf(_, t, el, _)   => t :: el.toList ::: children(e).flatMap(blocks)
     case TMatch(_, arms, _) => arms.map(_.body) ::: children(e).flatMap(blocks)
     case TWhile(_, body, el, _)           => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
+    case TDoWhile(body, _, el, _)         => TBlock(body, None, Type.Unit) :: el.toList ::: children(e).flatMap(blocks)
     case TLoop(body, _)                   => TBlock(body, None, Type.Unit) :: children(e).flatMap(blocks)
     // The init and the step are statements of the loop's own scope, so they are walked as part of
     // the block its body makes rather than as expressions beside it.
@@ -147,6 +148,7 @@ object TreeWalk {
     // A loop's own sub-expressions plus its `else` value; the `break` values are reached through the
     // body statements, so they are not repeated here.
     case TWhile(c, _, el, _)             => condExprs(c) ::: el.flatMap(_.result).toList
+    case TDoWhile(_, c, el, _)           => c :: el.flatMap(_.result).toList
     case TFor(_, _, lo, hi, _, _, el, _) => lo :: hi :: el.flatMap(_.result).toList
     case TForEach(_, _, seq, _, el, _)   => seq :: el.flatMap(_.result).toList
     // The cursor's initializer and the `next` call that reads it are both the loop's own, and the

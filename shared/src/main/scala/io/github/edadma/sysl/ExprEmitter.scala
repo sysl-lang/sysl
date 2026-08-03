@@ -1091,6 +1091,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       genMatch(scrutinee, arms, ty)
 
     case w: TWhile   => genWhile(w)
+    case d: TDoWhile => genDoWhile(d)
     case l: TLoop    => genLoop(l)
     case f: TCFor    => genCFor(f)
     case f: TFor     => genFor(f)
