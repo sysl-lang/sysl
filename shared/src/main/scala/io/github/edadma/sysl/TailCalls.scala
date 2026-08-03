@@ -104,6 +104,7 @@ object TailCalls {
     // to use. Recognizing a `break` of a self-call as a tail call is a real case and a later one —
     // it needs the release bounded to the loop rather than to the frame.
     case TWhile(_, body, els, _)             => loop(f, body, els, deferred)
+    case TDoWhile(body, _, els, _)           => loop(f, body, els, deferred)
     case TLoop(body, _)                      => loop(f, body, None, deferred)
     case TFor(_, _, _, _, _, body, els, _)   => loop(f, body, els, deferred)
     case TCFor(_, _, _, body, els, _)        => loop(f, body, els, deferred)

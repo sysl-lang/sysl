@@ -673,6 +673,28 @@ class SyslParser(val source: Source) extends DeclParser {
       case lbl ~ c ~ b ~ e ~ _ => While(lbl, c, b, e)
     }
 
+  /** `do body while cond [else …]` — the post-test loop (`00 §10`).
+   *
+   * **`do` is unambiguous by position, which is what lets the same word do both jobs.** Everywhere
+   * else it is a body *introducer*, and it only ever appears there after a loop header on the same
+   * line — `while c do …`, `loop do …`, `for x in xs do …` — so it is never the first token of a
+   * statement. Here it is the head, so a `do` that starts a line can only open this form.
+   *
+   * The tail needs no rule of its own for the same reason: this loop is *incomplete* without its
+   * `while`, and there is no bare `do` block in the language for that `while` to have belonged to
+   * instead. So a `while` found where the body ends is this loop's test and nothing else can want
+   * it. Both bodies are written: `do total += 1 while more()` on one line, or an indented block with
+   * the `while` on the line that closes it.
+   *
+   * There is no `end do`: the tail already names where the body stopped, and a marker after it would
+   * be closing a block that has just been closed.
+   */
+  protected lazy val doWhileExpr: PackratParser[Expr] =
+    opt(labelRef) ~ (op("do") ~> (suite | inlineBody)) ~ (opt(newlines) ~> op("while") ~> expression) ~
+      opt(elseClause) ^^ {
+        case lbl ~ b ~ c ~ e => DoWhile(lbl, b, c, e)
+      }
+
   /** `loop body` — a `while` with the condition left out, ended by a `break` rather than by a test.
    *
    * It takes no `else`: an `else` runs when a loop finishes on its own, and this one never does.

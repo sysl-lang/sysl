@@ -550,6 +550,22 @@ case class ExprStmt(expr: Expr)                                    extends Stmt
  */
 case class While(label: Option[String], cond: Expr, body: List[Stmt], elseBody: Option[List[Stmt]]) extends Expr
 
+/** `['label] do body while cond [else elseBody]` — the post-test loop, whose body runs once before
+ * anything is asked.
+ *
+ * The value rules are `while`'s exactly: a `break expr` carries the loop's value, and the `else`
+ * runs on normal completion, which here means the test at the foot finally failed. What it carries
+ * that `while` cannot is the same thing the three-clause `for` carries — a `continue` runs the
+ * **test** rather than restarting the body blind. The shape a program reaches for otherwise is
+ * `loop` with `if !cond then break` at the foot, and that rewrite is not this loop: a `continue`
+ * added to it jumps over the test and never leaves.
+ *
+ * `cond` is an ordinary boolean rather than a condition's term list, for the reason the three-clause
+ * `for`'s is: a test at the foot of the body has no branch after it for an `is` binding to be read
+ * from.
+ */
+case class DoWhile(label: Option[String], body: List[Stmt], cond: Expr, elseBody: Option[List[Stmt]]) extends Expr
+
 /** `['label] loop body` — a loop with no condition, which runs until something leaves it.
  *
  * It is `while true` with the part that was never a question taken out, and it carries one thing

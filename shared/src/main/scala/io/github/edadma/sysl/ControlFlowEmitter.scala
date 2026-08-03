@@ -356,6 +356,40 @@ trait ControlFlowEmitter extends PlaceEmitter {
     genLoopResult(slot, ty, elseL, endL, elseBlock)
   }
 
+  /** The post-test loop. It is `genWhile`'s shape entered one label later — the entry branch goes to
+   * the body rather than to the test — so the body runs before anything is asked.
+   *
+   * `continue` targets the **test**, which is what the form exists for: the `loop` with `if !cond
+   * then break` at its foot that a program writes instead has no test for a `continue` to reach, so
+   * the first one added to it jumps over the exit and never leaves.
+   */
+  protected def genDoWhile(d: TDoWhile): String = {
+    val TDoWhile(body, cond, elseBlock, ty) = d
+    val bodyL = freshLabel("dowhile.body")
+    val condL = freshLabel("dowhile.cond")
+    val endL  = freshLabel("dowhile.end")
+    val elseL = if elseBlock.isDefined then freshLabel("dowhile.else") else endL
+    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
+
+    emitTerm(s"br label %$bodyL")
+    emitLabel(bodyL)
+    pushOwned()
+    body.foreach(genStmt)
+    popOwned()
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    // Re-evaluated every round, so what the test borrows is let go before the branch rather than
+    // piling up in the enclosing statement's region — as the three-clause loop's test does.
+    pushTemps()
+    val v = genExpr(cond)
+    popTemps()
+    emitTerm(s"br i1 $v, label %$bodyL, label %$elseL")
+
+    genLoops = genLoops.tail
+    genLoopResult(slot, ty, elseL, endL, elseBlock)
+  }
+
   /** A `loop` is the same shape with the test gone: the body branches straight back to itself, and
    * the end is reached only by a `break`. `continue` targets the body's own label, since starting
    * the next iteration is all there is to do. Where nothing breaks, the loop's type is `never` and

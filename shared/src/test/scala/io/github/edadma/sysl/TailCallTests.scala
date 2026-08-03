@@ -99,6 +99,25 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       ) shouldBe s"$deep\n"
     }
 
+    "a 'return' from inside a post-test loop is a tail position too" in {
+      // The walk names the loop forms one by one, so a loop form added later is a tail call it stops
+      // finding — safely, since an unrecognized one is compiled as the call it already was, but
+      // silently. This is the case that says the `do … while` added beside this feature is named.
+      // A post-test loop yields `unit` rather than `never` — it is a loop that can complete — so the
+      // body needs a trailing expression the `return`s above make unreachable.
+      run(
+        s"""count(n: int, acc: int) -> int
+           |    do
+           |        if n == 0 then
+           |            return acc
+           |        return count(n - 1, acc + 1)
+           |    while true
+           |
+           |    0
+           |print(count($deep, 0))""".stripMargin
+      ) shouldBe s"$deep\n"
+    }
+
     "a loop's own bindings are released on the way out of the frame" in {
       // `held` is a fresh string per invocation and the jump leaves the loop scope from inside it,
       // so a release the jump skipped would be a million strings the program never gives back —

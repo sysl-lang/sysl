@@ -569,6 +569,12 @@ case class TMultiAssign(writes: List[TWrite]) extends TStmt
  */
 case class TWhile(cond: List[TCondTerm], body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
 
+/** `do body while cond [else …]` — `TWhile`'s shape entered at the body instead of at the test, so
+ * the body runs once before `cond` is asked. `continue` targets the test, which is what the `loop` +
+ * `if !cond then break` rewrite cannot say.
+ */
+case class TDoWhile(body: List[TStmt], cond: TExpr, elseBlock: Option[TBlock], ty: Type) extends TExpr
+
 /** `loop body` — the same shape with the condition removed, so the only way out is a `break`.
  * `ty` is the type its `break`s meet at, and `never` where it has none: nothing arrives after a
  * loop that cannot end.

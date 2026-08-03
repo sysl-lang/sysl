@@ -46,8 +46,16 @@ object AstCodec {
   /** The format's version, stamped into the header and checked on the way back in. Bump it whenever
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
+   *
+   * **Two branches bumping to the same number is the one way this check can be defeated**, and it
+   * has happened once: a post-test loop and a function attribute were built in parallel, each moved
+   * 15 to 16 against a tree the other had not touched, and the merge kept one 16 standing for a
+   * format neither branch alone could read. An artifact stamped by either would have passed the
+   * check and then been decoded as something it was not. The merge takes the next number for that
+   * reason — the value has to be later than every version any compiler has ever stamped, not merely
+   * later than the one this branch started from.
    */
-  val Version: Int = 16
+  val Version: Int = 17
 
   private val Magic = "sysl-ast"
 
@@ -261,6 +269,7 @@ object AstCodec {
         case IsPattern(s, ps, neg)   => tok("is"); expr(s); list(ps)(pattern); bool(neg)
         case ResultList(vs)          => tok("rl"); list(vs)(expr)
         case While(l, c, b, e2)      => tok("whl"); opt(l)(sref); expr(c); list(b)(stmt); opt(e2)(x => list(x)(stmt))
+        case DoWhile(l, b, c, e2)    => tok("dwl"); opt(l)(sref); list(b)(stmt); expr(c); opt(e2)(x => list(x)(stmt))
         case Loop(l, b)              => tok("lop"); opt(l)(sref); list(b)(stmt)
         case For(l, n, it, b, e2)    => tok("for"); opt(l)(sref); sref(n); expr(it); list(b)(stmt); opt(e2)(x => list(x)(stmt))
         case CFor(l, i, c, s, b, e2) =>
@@ -619,6 +628,7 @@ object AstCodec {
         case "is"   => IsPattern(expr(), list(pattern()), bool())
         case "rl"   => ResultList(list(expr()))
         case "whl"  => While(opt(sref()), expr(), list(stmt()), opt(list(stmt())))
+        case "dwl"  => DoWhile(opt(sref()), list(stmt()), expr(), opt(list(stmt())))
         case "lop"  => Loop(opt(sref()), list(stmt()))
         case "for"  => For(opt(sref()), sref(), expr(), list(stmt()), opt(list(stmt())))
         case "cfor" => CFor(opt(sref()), opt(stmt()), opt(expr()), opt(stmt()), list(stmt()), opt(list(stmt())))
