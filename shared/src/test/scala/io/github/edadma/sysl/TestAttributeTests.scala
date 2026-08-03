@@ -106,10 +106,10 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
   "an attribute the language does not have is refused by name" - {
     // The point of naming it: a mechanism with one member should say which member it has, rather
     // than reporting the grammar's own confusion about a token it could not place.
-    "an unknown word after '#' says what the one attribute is" in {
+    "an unknown word after '#' says what the attributes are" in {
       err("""#packed
             |t() = 0
-            |""".stripMargin) should include("'#test' is the only one")
+            |""".stripMargin) should include("'#test' and '#tailrec' are the two")
     }
 
     "a declaration that is not a function cannot be a test" in {

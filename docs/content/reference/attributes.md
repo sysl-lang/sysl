@@ -1,22 +1,25 @@
 ---
 title: Attributes and compile time
-summary: `::` attributes a type answers, the `#test` attribute, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the `#test` and `#tailrec` attributes, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
-Three forms in sysl reach into the *compilation* rather than into the running program, and they are
-easy to confuse because two of them start with `#`:
+Three kinds of form in sysl reach into the *compilation* rather than into the running program, and
+they are easy to confuse because two of them start with `#`:
 
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | a question a **type's own name** answers | the analyzer, at the use |
-| `#test` | an **attribute** on a declaration, indented with it | the grammar |
+| `#test`, `#tailrec` | an **attribute** on a declaration, indented with it | the grammar |
 | `#if` | a **directive** at the left margin | a pass before the lexer |
 
 The last two never meet, and the margin is why. A directive sits at column 1 and is gone before
 anything counts a column; an attribute is indented with the declaration it is on and arrives at the
-grammar as part of it. The words tell them apart in any case — `test` is not one of `if` / `elif` /
-`else` / `endif`.
+grammar as part of it. The words tell them apart in any case — neither `test` nor `tailrec` is one of
+`if` / `elif` / `else` / `endif`.
+
+There are two attributes, both on functions and both written on their own line above the
+declaration. More than one may be stacked, and writing the same one twice is refused.
 
 ## `::` — what a type's own name answers
 
@@ -278,6 +281,46 @@ rather than through the trap instruction, because **a check a program makes is o
 cannot see, and the message is the whole point of it.** The message is required rather than
 defaulted, because the condition's source is not available to print and a failure saying only
 "assertion failed" sends its reader looking for which one.
+
+## `#tailrec` — an assertion that the frame is reused
+
+A function whose last act is a call to itself compiles to a branch back to its own entry rather than
+a second frame, so the recursion is bounded by the arithmetic and not by the stack. That happens
+whether or not anything is written — see
+[tail calls](/reference/declarations/#tail-calls) for what counts as the last act, and for the two
+things that end a tail position.
+
+`#tailrec` asserts the jump is there:
+
+```sysl
+#tailrec
+count(n: int, acc: int) -> int =
+    if n == 0 then acc else count(n - 1, acc + 1)
+
+print(count(100000, 0))
+```
+
+```output
+100000
+```
+
+What it buys is the refusal. The optimization is silent, so an edit that costs it is silent too —
+until the day the recursion is deep enough to matter:
+
+```sysl
+#tailrec
+count(n: int, acc: int) -> int =
+    if n == 0 then acc else 1 + count(n - 1, acc)
+
+print(count(5, 0))
+```
+
+```error
+calls itself nowhere the jump can replace
+```
+
+It changes nothing about what is emitted. Write it where losing the jump silently would be a bug,
+and leave it off everywhere else.
 
 ## `#if` — gating lines before the lexer
 

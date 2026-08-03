@@ -404,6 +404,16 @@ promises, not because that is when it runs. Clauses may not be nested inside an 
 early `return` that violates the postcondition traps exactly as the fall-through path would. Both
 take an optional message: `require x >= 0, "a half of a negative is not what this means"`.
 
+**Both sentences survive the tail-call rule intact, and that is what decides how far it goes**
+(`12 §3a`). A self-call in tail position is compiled as a jump back to the function's entry, and the
+jump lands *before* the precondition — so "checked on entry" stays true of every invocation, the
+ones a jump made included, and a recursion that violates its own `require` at depth four stops at
+depth four. The postcondition cannot be kept that way: it is checked when a call **returns**, and a
+tail call never returns. So a function with an `ensure` is not transformed at all. The optimization
+gives way to the contract rather than the contract being narrowed to fit it — a check that runs at
+some depths and not others is worse than no optimization, because what it costs is not speed but the
+guarantee the clause was written to make.
+
 Contracts work the same on a **method**, including one with a `*self` receiver, where they are at
 their most useful: `ensure result > old(self.n)` on a mutating method says the thing the method is
 for.

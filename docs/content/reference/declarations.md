@@ -282,6 +282,66 @@ hi you
 `= ` may also open an indented block, so a body does not have to change shape when it outgrows a
 line.
 
+### Tail calls
+
+A function whose **last act** is a call to itself does not open a second frame. The call becomes a
+branch back to the function's own entry, so the recursion is bounded by the arithmetic rather than by
+the stack:
+
+```sysl
+count(n: int, acc: int) -> int =
+    if n == 0 then acc else count(n - 1, acc + 1)
+
+print(count(1000000, 0))
+```
+
+```output
+1000000
+```
+
+A million frames is not a stack any machine has. Nothing is written to ask for this — it applies
+wherever it applies.
+
+**In tail position** is the last thing the function does: the body's trailing expression, the operand
+of a `return`, and the arms of the `if` and `match` those reach through. Nothing may wait on the
+result — `n + count(n - 1)` is an ordinary call, because the addition happens after it comes back.
+
+A tail call is a call, so the jump lands where a call would: **every `require` is checked again** on
+the arguments the jump wrote, and **every `old(e)` is snapshotted again**. A recursion that violates
+its own precondition at depth four stops at depth four.
+
+Two things end a tail position instead of being optimized around:
+
+- **a `defer` in scope**, which runs on the way out of a scope — after the callee returns for an
+  ordinary call, and before it is entered for a jump;
+- **an `ensures` on the function**, which is checked when a call *returns*, and a tail call never
+  returns.
+
+Either one leaves the function compiled exactly as written.
+
+It is **self-recursion only**. Mutual recursion and calls through a `Fn` or a `*extern` are ordinary
+calls, however they are written.
+
+### `#tailrec`
+
+The jump is silent, which is what you want until an edit takes it away. `#tailrec` asserts it is
+there and is refused when it is not:
+
+```sysl
+#tailrec
+sum(n: int) -> int =
+    if n == 0 then 0 else n + sum(n - 1)
+
+print(sum(5))
+```
+
+```error
+calls itself nowhere the jump can replace
+```
+
+It changes nothing about what is emitted — write it on the functions where losing the jump silently
+would be a bug, and leave it off the rest.
+
 ### Several results
 
 A signature may declare more than one result, and the trailing expression or `return` supplies them
