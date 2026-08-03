@@ -916,7 +916,7 @@ trait ProgramWalk
     // function, and only the second answers for an instantiation; a symbol is file-private if either
     // says so, since both name the one declaration.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
-      fileLocal(name) || fileLocal(f.name), f.conv)
+      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec)
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

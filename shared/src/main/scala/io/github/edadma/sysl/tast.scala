@@ -641,6 +641,12 @@ case class TFunc(
     olds: List[TExpr] = Nil,
     internal: Boolean = false,
     conv: Option[CallConv] = None,
+    /** `#tailrec` was written above it: an assertion that its self-call is the last thing it does,
+     * and a demand to be told at the compile rather than at the stack overflow when an edit stops
+     * that being true (`12 § Tail calls`). The jump itself does not wait on this — it applies
+     * wherever it applies — so what the flag reaches is `TailCalls.check` and nothing in codegen.
+     */
+    tailrec: Boolean = false,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones

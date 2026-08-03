@@ -315,6 +315,25 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         retainValue(ty, s"%$name.param")
       ownSlot(name, ty)
 
+    // Where the function calls itself as the last thing it does, that call is a jump to here rather
+    // than a second frame (`TailCalls`). The target sits *after* the parameter slots are written and
+    // *before* everything below, so a jump arrives where a fresh call would: the arguments are in the
+    // slots the body reads, and the preconditions and `old(e)` snapshots that follow belong to the
+    // invocation rather than to the frame, so they are taken again.
+    //
+    // The slots themselves are the entry block's and are not re-entered, which is what makes the jump
+    // free: `emitAlloca` hoists every one of them, including a block's, so going round again reuses
+    // the frame instead of growing it.
+    tailCalls = TailCalls.of(f)
+
+    if tailCalls.nonEmpty then
+      val l = freshLabel("tailrec")
+
+      tailParams = f.params
+      tailTarget = Some(l)
+      emitTerm(s"br label %$l")
+      emitLabel(l)
+
     for (cond, _) <- f.requires do emitContract(cond, "require")
 
     // Each `old(e)` snapshots the entry value into a hidden owned slot, exactly as a `var` would,

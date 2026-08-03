@@ -124,6 +124,7 @@ object Compiler {
         for
           typed    <- Analyzer.analyze(units, core = whole, target = target)
           promoted <- Escape.check(typed)
+          _        <- TailCalls.check(typed)
         yield
           val kept = Tests.only(typed)
 
@@ -175,6 +176,7 @@ object Compiler {
       // program that links it — with the helpers only it reaches dragged in behind.
       typed    = Tests.strip(analysed)
       promoted <- Escape.check(typed)
+      _        <- TailCalls.check(typed)
     yield
       val mine            = units.map(moduleOf).toSet
       val (own, supplied) = typed.funcs.partition(f => mine(Modules.moduleOf(f.name)))
@@ -214,6 +216,7 @@ object Compiler {
     for
       typed    <- Analyzer.analyze(units, core = core, target = target)
       promoted <- Escape.check(typed)
+      _        <- TailCalls.check(typed)
     yield
       // Pruning still runs, and still from `main`: a library function this program never calls is
       // dropped from the tree exactly as before. What `precompiled` changes is only what happens to

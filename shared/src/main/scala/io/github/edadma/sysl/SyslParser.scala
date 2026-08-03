@@ -103,57 +103,85 @@ class SyslParser(val source: Source) extends DeclParser {
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
   protected lazy val declaration: PackratParser[Stmt] =
-    testDecl |
+    attributedDecl |
       implVisibility |
       visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
         case Visibility.Public ~ d => d
         case v ~ d                 => restrict(v, d)
       }
 
-  /** A function carrying `#test`, which is a declaration with a line in front of it (`testing.md`).
+  /** A function carrying attributes, which is a declaration with a line or more in front of it.
    *
-   * The attribute is its own line and the declaration follows on the next, which is why the newlines
-   * between them are consumed here: the statement separator would otherwise end the statement at the
-   * attribute, leaving a prefix with nothing to attach to. Everything about the declaration itself is
-   * still `declaration`'s — a test may be `private`, and is written exactly as any other function.
+   * Each attribute is its own line and the declaration follows the last of them, which is why the
+   * newlines between them are consumed here: the statement separator would otherwise end the
+   * statement at an attribute, leaving a prefix with nothing to attach to. Everything about the
+   * declaration itself is still `declaration`'s — an attributed function may be `private`, and is
+   * written exactly as any other.
    *
-   * Only a function may carry it, and the refusal below is what says so. A struct or a `val` with
+   * Only a function may carry one, and the refusal below is what says so. A struct or a `val` with
    * `#test` above it is a mistake about what a test *is* rather than a syntax error, so it is
    * answered with the sentence rather than with the list of forms the grammar could still have read.
    */
-  protected lazy val testDecl: PackratParser[Stmt] =
-    testAttr >> { a =>
-      // Once the attribute has been read the statement is committed to being a test, which is what
-      // `>>` buys: everything after it is read against that, so a declaration that cannot carry one
-      // is answered with the sentence below rather than with the grammar's complaint about whichever
-      // alternative it went on to try.
-      // The newlines are consumed *before* the choice so that both arms start at the same token. A
-      // combinator choice keeps whichever alternative reached furthest, so an `err` written behind
-      // the newline would sit earlier than the declaration rule's own failure and lose to it —
-      // leaving the reader with "identifier expected" at a line whose problem is the one above it.
-      opt(newlines) ~> ((visibility ~ funcDecl) ^^ {
-        case Visibility.Public ~ (f: FuncDecl) => f.copy(test = Some(a))
-        case v ~ (f: FuncDecl)                 => restrict(v, f.copy(test = Some(a)))
-        case _ ~ other                         => other
-      } | err(
-        "'#test' marks a function as a unit test, and only a function — there is nothing for " +
-          "'sysl test' to call in any other declaration",
-      ))
+  protected lazy val attributedDecl: PackratParser[Stmt] =
+    rep1(attribute <~ opt(newlines)) >> { as =>
+      // Once an attribute has been read the statement is committed to being an attributed
+      // declaration, which is what `>>` buys: everything after it is read against that, so a
+      // declaration that cannot carry one is answered with the sentence below rather than with the
+      // grammar's complaint about whichever alternative it went on to try.
+      duplicated(as) match
+        case Some(dup) =>
+          err(s"'#$dup' is written twice above one declaration, and it says nothing the once does not")
+        case None =>
+          (visibility ~ funcDecl) ^^ {
+            case Visibility.Public ~ (f: FuncDecl) => attributed(f, as)
+            case v ~ (f: FuncDecl)                 => restrict(v, attributed(f, as))
+            case _ ~ other                         => other
+          } | err(
+            "an attribute marks a function, and only a function — neither what 'sysl test' calls " +
+              "nor what recurses is anything a declaration of another kind supplies",
+          )
     }
+
+  /** One attribute: what it says about the function under it. Each alternative reads the `#` for
+   * itself so that the attribute's own position is the `#`, which is the line a test report names.
+   */
+  private lazy val attribute: PackratParser[Attr] =
+    testAttr ^^ Attr.Test.apply | tailrecAttr | unknownAttr
 
   /** `#test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
    */
   protected lazy val testAttr: PackratParser[TestAttr] =
-    at(op("#") ~> testWord ~> opt(op("(") ~> testArgs <~ op(")")) ^^ (_.getOrElse(TestAttr(None, false, None))))
+    at(op("#") ~> attrWord("test") ~> opt(op("(") ~> testArgs <~ op(")"))
+      ^^ (_.getOrElse(TestAttr(None, false, None))))
 
-  /** The attribute's name. `test` stays an ordinary identifier — reserving it would spend the word
-   * out of every program's namespace for the sake of one line per test, which is the trade `alloc`
+  /** `#tailrec` — the assertion that this function's call to itself is the last thing it does
+   * (`12 § Tail calls`). It takes no arguments: there is nothing to configure about a jump, and
+   * what the attribute buys is the refusal when there is no jump to make.
+   */
+  protected lazy val tailrecAttr: PackratParser[Attr] =
+    op("#") ~> attrWord("tailrec") ^^ (_ => Attr.TailRec)
+
+  private lazy val unknownAttr: PackratParser[Attr] =
+    op("#") ~> ident >> (n =>
+      err(s"'$n' is not an attribute sysl knows — '#test' and '#tailrec' are the two"))
+
+  /** An attribute's name. Each stays an ordinary identifier — reserving them would spend the words
+   * out of every program's namespace for the sake of one line apiece, which is the trade `alloc`
    * made and the one `capabilities.md § Open` is still paying for.
    */
-  protected lazy val testWord: Parser[Unit] =
-    accept("'test'", { case t: lexical.Identifier if t.chars == "test" => () }) |
-      ident >> (n => err(s"'$n' is not an attribute sysl knows — '#test' is the only one"))
+  private def attrWord(w: String): Parser[Unit] =
+    accept(s"'$w'", { case t: lexical.Identifier if t.chars == w => () })
+
+  /** The attribute written twice, where one is, for the refusal above. */
+  private def duplicated(as: List[Attr]): Option[String] =
+    as.map(_.word).groupBy(identity).collectFirst { case (w, ws) if ws.length > 1 => w }
+
+  private def attributed(f: FuncDecl, as: List[Attr]): FuncDecl =
+    as.foldLeft(f) {
+      case (d, Attr.Test(t)) => d.copy(test = Some(t))
+      case (d, Attr.TailRec) => d.copy(tailrec = true)
+    }
 
   private lazy val testArgs: Parser[TestAttr] =
     contractMsg ~ opt(op(",") ~> testExpectation) ^^ {

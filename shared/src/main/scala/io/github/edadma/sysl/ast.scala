@@ -651,6 +651,8 @@ case class FuncDecl(
     tdefaults: Map[String, TypeRef] = Map.empty,
     test: Option[TestAttr] = None,
     conv: Option[CallConv] = None,
+    /** `#tailrec` — see `TFunc.tailrec`. */
+    tailrec: Boolean = false,
 ) extends Stmt
 
 /** What `#test` says about the function it is written above (`testing.md`).
@@ -670,6 +672,15 @@ case class FuncDecl(
  * from the *right* trap where the failure prints something first.
  */
 case class TestAttr(display: Option[String], shouldTrap: Boolean, expected: Option[String]) extends Positioned
+
+/** One attribute written above a declaration, before it has been folded into the `FuncDecl` it
+ * qualifies. It exists for the fold and for the refusal of a repeat — `word` is the spelling that
+ * refusal names, and is what makes two attributes the same one.
+ */
+enum Attr(val word: String) {
+  case Test(attr: TestAttr) extends Attr("test")
+  case TailRec              extends Attr("tailrec")
+}
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
  * by the linker under the name it is declared with.

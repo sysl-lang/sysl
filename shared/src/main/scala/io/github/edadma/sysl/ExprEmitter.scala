@@ -46,6 +46,57 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         Option.unless(Type.zeroSized(a.ty))(s"${a.ty.llvm} $v")
     }
 
+  /** A call the function makes to itself as the last thing it does, lowered as a jump back to its
+   * own entry rather than a second frame (`TailCalls`).
+   *
+   * **The order is the whole of the correctness, and it is the order a `return` already uses.** Each
+   * argument is computed while the frame is still whole — it may well read the very slots about to
+   * be overwritten — and a count is taken for it there, so what it names cannot reach zero when the
+   * old bindings let go. Only then does the frame give up everything it holds, and only then do the
+   * new values land. Written the other way round, `go(next, list)` would free the list at the moment
+   * the parameter holding it was reassigned and pass the second argument a dangling reference.
+   *
+   * The jump is a `br` and the block ends there, which is all any caller needs to know: this returns
+   * no register because there is no value — the call does not come back, and everything the emitters
+   * would have gone on to lay down is dropped by `emit`, exactly as it is after a `-> never` call.
+   */
+  private def genTailSelfCall(args: List[TExpr]): String = {
+    // A large argument is staged in a slot of its own rather than a register, because that is how a
+    // large value moves at all here. The staging slot is what makes it safe as well: `address` on an
+    // argument that is simply a parameter hands back that parameter's own slot, so writing straight
+    // through would have the first argument's landing change what the second one reads.
+    val staged =
+      tailParams.zip(args).map { case ((_, ty), a) =>
+        if Type.zeroSized(ty) then { genExpr(a); None }
+        else if Layout.indirect(ty) then
+          val slot = emitAlloca(freshTemp(), ty.llvm)
+
+          genOwnedInto(slot, a)
+          Some(Left(slot))
+        else
+          val v = genExpr(a)
+
+          retainValue(ty, v)
+          Some(Right(v))
+      }
+
+    releaseAll()
+
+    for case ((name, ty), Some(s)) <- tailParams.zip(staged) do
+      s match
+        // The count came with the bytes and stays with them: what the staging slot took is now the
+        // parameter's, so nothing is retained here and nothing released.
+        case Left(slot) =>
+          usesMemcpy = true
+          emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(ty)} %$name.addr, " +
+            s"ptr align ${Layout.align(ty)} $slot, i64 ${Layout.size(ty)}, i1 false)")
+
+        case Right(v) => emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+
+    emitTerm(s"br label %${tailTarget.get}")
+    ""
+  }
+
   /** What a compound assignment stores: a slot that holds a count — a string, or a struct with a
    * reference in it — builds a fresh value the slot will take a count for, and a slot of anything
    * else is arithmetic.
@@ -358,6 +409,12 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       emit(s"store ${e.ty.llvm} $v, ptr $dest")
     else
       e match
+        // A tail self-call needs no destination: the jump keeps the frame, so the `sret` pointer the
+        // caller handed in is still the one the return that eventually happens will write through.
+        // `dest` here *is* that pointer, and passing it on would be writing the result of a call that
+        // is not being made.
+        case c: TCall if isTailCall(c) => genTailSelfCall(c.args)
+
         // A result already arrives with its count taken, and the out-pointer is what says where.
         // This is the case the whole mechanism is for: `val k = kernel()` writes the callee's work
         // straight into `k`'s slot, and no `%struct.Kernel` is ever an LLVM value.
@@ -954,6 +1011,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // callee is the result type and then the value, exactly where a direct one names the symbol.
     case TCallPtr(callee, args, _, ty) =>
       genForeignCall(s"${foreignResultType(ty)} ${genExpr(callee)}", args, ty)
+
+    // The last thing a recursive function does, where it is a call to itself: a jump to its own
+    // entry over the frame it already has (`TailCalls`).
+    case c: TCall if isTailCall(c) => genTailSelfCall(c.args)
 
     // A call to a foreign function is lowered under the other side's convention rather than sysl's
     // own, which is a difference only an aggregate can see (`ForeignEmitter`).
