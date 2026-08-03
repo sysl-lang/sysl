@@ -437,12 +437,58 @@ changed together.
 `invariant` is a contextual word — an ordinary identifier everywhere else. See
 [errors and contracts](/reference/errors/) for what happens when one is broken.
 
+### A struct with no fields
+
+A struct may declare no fields at all. Its emptiness has to be *written* — the `end` marker, optional
+everywhere else, is what says so — because a struct whose body the author forgot to indent looks
+exactly like one that has no body, and that is much the likelier mistake.
+
+```sysl
+struct Stdout
+end Stdout
+
+impl Fallible for Stdout
+
+impl Writer for Stdout
+    write(*self, bytes: []const u8) = putbytes(bytes)
+end Stdout
+
+show[T: Display](x: T)
+    var out = Stdout()
+
+    x.display(&out, FormatSpec(0, -1, false))
+    printc('\n')
+end show
+
+show(42)
+show("through a sink of one's own")
+
+print(sizeof(Stdout))
+```
+
+```output
+42
+through a sink of one's own
+0
+```
+
+What wants one is a **sink**: a value standing for a destination fixed at compile time — the console,
+a serial port — which has nothing to keep and so has no field to keep it in. Being a value rather
+than a global is what lets it be passed to a function, held in a struct, and chosen by a caller.
+
+Such a type occupies no bytes, so embedding one costs the struct holding it nothing. The cost of that
+is that two of them have nothing to tell their storage apart, and `&a == &b` on two such locals may
+well be true. There is no state behind either address for the answer to be about.
+
 ### `opaque`
 
 `opaque struct Name` withholds the layout from every module but the one declaring it. Outside, the
 type is *incomplete*: only `*Name` may be said, so a value cannot be built, copied, or have a field
 read. This is a **different axis from visibility** — `private` decides who may say the name, `opaque`
 decides who may know the shape. See [modules](/reference/modules/).
+
+An opaque struct with no body at all is C's incomplete type, `struct sqlite3;` — nothing in sysl lays
+one out, and the declaration exists so that `*Session` is a type a `*u8` cannot be mistaken for.
 
 ## Enums
 
@@ -544,6 +590,9 @@ The details — what a module is, how the reach is computed, and how visibility 
 
 Every block-shaped declaration may be closed with `end Name`, naming what it closes. It is optional
 everywhere and checked when written, so it cannot drift from the thing it claims to close.
+
+The one place it is **required** is a struct with no fields, where it is the only thing distinguishing
+a body that is deliberately empty from one that was meant to be there.
 
 `end` is a **soft** word: it is an ordinary identifier everywhere except immediately before a name or
 a construct keyword, so `end` stays usable as a variable.

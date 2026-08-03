@@ -782,10 +782,14 @@ print(1) == print(2)        // no — a type with one value has no question to a
 printf(fmt, ())             // no — a C variadic counts what it was handed
 ```
 
-The array case is the one worth spelling out: an array *is* its elements, and an array of nothing
-would put every element at one address, leaving a bounds check as the whole of what `a[i]` did. A
-read-only view of one would be no better. So an array and a slice ask for something to point at,
+The array case is the one worth spelling out: an array *is* its elements, and `unit` is the type that
+gets **dropped** wherever it is stored, so an array of it would have nothing left to be an array of.
+A read-only view of one would be no better. So an array and a slice ask for something to point at,
 exactly as `&T` and `*T` do.
+
+That is a rule about `unit` in particular and not about zero-sizedness, which matters because the two
+come apart: an array of a *fieldless struct* is admitted, and its elements do all sit at one address.
+The paragraph on that at the end of this section says why the two answers differ.
 
 **Inference is held to the same split.** A generic parameter accepts whatever its argument turns
 out to be, so `f[T](x: T)` handed `print(1)` instantiates at `unit` — and that is fine, because the
@@ -811,6 +815,31 @@ across the two programs now say what they mean.
 zero-sized is emitted as an empty aggregate, and it is still a type with an address that a `&T` may
 point at. Making *that* zero-sized as well would be a second rule with its own consequences for
 identity and for `&T`'s non-null guarantee, and nothing has asked for it.
+
+**A struct may have no fields at all, and that is the limiting case of the paragraph above rather
+than a new rule.** It is written `struct Name` closed by `end Name` — emptiness is stated rather than
+inferred, since a body the author forgot to indent is indistinguishable from one that was never
+meant to exist and is by far the likelier of the two. What such a type *is* is unchanged by having
+nothing in it: an ordinary named type, constructed, given methods and `impl` blocks, embedded,
+pointed at, held behind `&`, and passed as a type argument. None of `unit`'s dropping rules reach it;
+`sizeof` is `0` and `alignof` is `1`.
+
+The reason to want one is that a **sink** has no state. A writer standing for a destination fixed at
+compile time — the console, a serial port — keeps nothing, so every field it could have would be a
+field it did not need, and until it could have none it could not be written in sysl at all. The gain
+is not that such a destination becomes reachable but that it becomes a *value*: passed to a function,
+held in a struct, chosen by a caller, where a fixed global is none of those things.
+
+Two consequences follow and neither is a defect. Embedding one costs the enclosing struct nothing,
+which is the point. And two of them have nothing to separate their storage, so `*T`s taken to two
+such locals may compare equal — the same answer C gives for the same declaration, and one that can be
+observed only by asking a question about identity that an empty value has no state to answer. A `&T`
+to one is still distinct, since the reference header is real whatever it is a header for.
+
+This is also why `[4]unit` stays refused (above) while `[4]Marker` does not. The refusal there is
+about `unit` — the type the compiler *drops*, so an array of it would have no elements to speak of
+rather than empty ones. A fieldless struct is an ordinary type all the way down, and an array of them
+is a real array of a real type whose stride happens to be zero.
 
 ## 13. Tuples — a product type with no name
 

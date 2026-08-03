@@ -141,13 +141,14 @@ trait DeclParser extends ExprParser {
       val tp     = tps.getOrElse(TypeParams.none)
       val opaque = hidden.isDefined
 
-      // Whether there is an indented block **decides** which of the two this is, so it is settled by
-      // lookahead and committed to with `>>`. Written as an alternation it would not work: a body
-      // whose first line is bad fails deep inside the file, and a combinator choice keeps whichever
-      // alternative reached furthest — so the sentence below, raised back at the declaration, would
-      // lose to it and a struct with a mistake in its body would be reported as having no body.
-      opt(guard(newline ~ indent)) >> {
-        case Some(_) =>
+      // Which of the three this is **decides** how the rest is read, so it is settled by lookahead
+      // and committed to with `>>`. Written as an alternation it would not work: a body whose first
+      // line is bad fails deep inside the file, and a combinator choice keeps whichever alternative
+      // reached furthest — so the sentence below, raised back at the declaration, would lose to it
+      // and a struct with a mistake in its body would be reported as having no body. Neither guard
+      // consumes, so both are asked at the same position and at most one of them can succeed.
+      (opt(guard(newline ~ indent)) ~ opt(guard(opt(newlines) ~> softEnd))) >> {
+        case Some(_) ~ _ =>
           (newline ~> indent ~> opt(newlines) ~> repsep(structItem, newlines) <~ opt(newlines) <~ dedent) <~
             endName(name) ^^ { items =>
               val fields     = items.collect { case StructPart.Fld(f)  => f }
@@ -157,17 +158,28 @@ trait DeclParser extends ExprParser {
                          tdefaults = tp.defaults, opaque = opaque)
             }
 
+        // A struct with **no fields**, whose emptiness is *written* rather than inferred from an
+        // absence: an `end Name` and nothing between it and the declaration. A type like this is
+        // one value carrying no data, which is what a sink standing for a fixed destination — the
+        // console, a UART — has to be to be a value at all. Requiring the marker is what keeps a
+        // misindented body from quietly becoming one; a lone `struct Name` is still the mistake it
+        // has always been, and still says so below.
+        case None ~ Some(_) =>
+          endName(name) ^^^ StructDecl(name, tp.names, Nil, Nil, tp.bounds, Nil,
+                                       tdefaults = tp.defaults, opaque = opaque)
+
         // A struct with **no body at all**, which only an `opaque` one may be: it is C's incomplete
         // type, `struct sqlite3;`, and it is what a handle from a C library should be declared as.
         // Nothing in sysl lays one out — the storage belongs to whoever allocated it — so the
         // declaration exists to give `*sqlite3` a type of its own that a `*u8` cannot be mistaken for.
-        case None if opaque =>
+        case _ if opaque =>
           success(StructDecl(name, tp.names, Nil, Nil, tp.bounds, Nil,
                              tdefaults = tp.defaults, opaque = true))
 
-        case None =>
-          err(s"'struct $name' declares no fields — a struct's body is indented under it, and a " +
-            s"type with no layout of its own is written 'opaque struct $name'")
+        case _ =>
+          err(s"'struct $name' declares no fields — a struct's body is indented under it, a type " +
+            s"with no fields at all is written 'struct $name' closed by 'end $name', and one with " +
+            s"no layout of its own is written 'opaque struct $name'")
       }
     }
 
