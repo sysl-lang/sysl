@@ -28,7 +28,12 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
    * or builds one — opts out of this entirely and is run exactly as it was written. Otherwise this
    * default would quietly rewrite the premise of the very tests that exist to pin it.
    */
-  protected def cli(cfg: Config): Int =
+  protected def cli(cfg: Config): Int = Console.withOut(Discarded)(driver(cfg))
+
+  /** The same run with stdout left where it was, for the three helpers below that capture it. Every
+   * other call goes through `cli`, which throws it away — see `Discarded`.
+   */
+  private def driver(cfg: Config): Int =
     io.github.edadma.sysl.execute(if mentionsCore(cfg) then cfg else cfg.copy(noCoreLib = true))
 
   protected def mentionsCore(cfg: Config): Boolean =
@@ -76,9 +81,10 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
   protected def artifact(): String = artifactOf(libraryRoot())
 
   protected def artifactOf(root: String): String = {
-    val out = createTempFile("sysl-cli-", LibraryArtifact.extension)
+    val out             = createTempFile("sysl-cli-", LibraryArtifact.extension)
+    val (status, notes) = diagnostics(Config(command = "build-lib", file = root, output = Some(out)))
 
-    cli(Config(command = "build-lib", file = root, output = Some(out))) shouldBe 0
+    withClue(notes)(status shouldBe 0)
     out
   }
 
@@ -87,8 +93,10 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
    */
   protected lazy val core: String = {
     val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
+    val (status, notes) =
+      diagnostics(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true))
 
-    cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
+    withClue(notes)(status shouldBe 0)
     out
   }
 
@@ -116,7 +124,7 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
   protected def ran(cfg: Config): String = {
     val out    = new java.io.ByteArrayOutputStream
     val notes  = new java.io.ByteArrayOutputStream
-    val status = Console.withOut(out)(Console.withErr(notes)(cli(cfg)))
+    val status = Console.withOut(out)(Console.withErr(notes)(driver(cfg)))
 
     if status != 0 then fail(s"the driver exited with $status:\n${out.toString}${notes.toString}")
 
@@ -143,7 +151,7 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
   protected def emitted(cfg: Config): String = {
     val captured = new java.io.ByteArrayOutputStream
 
-    Console.withOut(captured)(cli(cfg)) shouldBe 0
+    Console.withOut(captured)(driver(cfg)) shouldBe 0
     captured.toString
   }
 

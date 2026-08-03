@@ -20,7 +20,12 @@ class TestCliTests extends AnyFreeSpec with Matchers {
    * `--no-core-lib`: *this test is about the test command, not about which standard module a
    * compilation gets.*
    */
-  private def cli(cfg: Config): Int =
+  private def cli(cfg: Config): Int = Console.withOut(Discarded)(driver(cfg))
+
+  /** The same run with stdout left where it was, for `ran` below. Everything else throws it away —
+   * the report `sysl test` prints is this suite's subject, not something to read off the console.
+   */
+  private def driver(cfg: Config): Int =
     io.github.edadma.sysl.execute(cfg.copy(noCoreLib = true))
 
   private def program(text: String): String = {
@@ -36,7 +41,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
     val out = new java.io.ByteArrayOutputStream
     val errs = new java.io.ByteArrayOutputStream
 
-    val status = Console.withOut(out)(Console.withErr(errs)(cli(cfg)))
+    val status = Console.withOut(out)(Console.withErr(errs)(driver(cfg)))
 
     (status, out.toString, errs.toString)
   }

@@ -15,6 +15,20 @@ import io.github.edadma.cross_platform.*
  */
 class LibraryCliTests extends LibraryCliSupport {
 
+  // These suites drive `emit-llvm` a few dozen times and they run beside other suites, so a run
+  // whose output nobody asked for has to print nothing at all. An unread module on the console is
+  // several hundred lines of IR landing in the middle of another suite's test names — which is
+  // where this assertion came from. The second half is what keeps the first from being satisfied
+  // by a fixture that swallowed the module outright.
+  "a run nobody captured prints nothing, and a captured one still gets the module" in {
+    val cfg  = Config(command = "emit-llvm", file = program("print(demo.double(21))"), libs = List(artifact()))
+    val loud = new java.io.ByteArrayOutputStream
+
+    Console.withOut(loud)(cli(cfg)) shouldBe 0
+    loud.toString shouldBe ""
+    emitted(cfg) should startWith("target triple")
+  }
+
   "--lib pointed at an artifact" - {
 
     "compiles a program against it" in {
