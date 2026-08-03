@@ -39,8 +39,8 @@ trait VtableEmitter extends ArcEmitter {
     // A zero-sized parameter is not in the implementation's signature, so it is not in the
     // adapter's either — the two have to agree, and the argument was never a word to forward.
     val forwarded = slot.params.zipWithIndex.filterNot((t, _) => Type.zeroSized(t))
-    val declare   = forwarded.map { case (t, i) => s"${t.llvm} %a$i" }
-    val pass      = forwarded.map { case (t, i) => s"${t.llvm} %a$i" }
+    val declare   = forwarded.map { case (t, i) => s"${syslParam(t)} %a$i" }
+    val pass      = forwarded.map { case (t, i) => s"${syslParam(t)} %a$i" }
 
     request(name) {
       inFunction(
@@ -57,6 +57,9 @@ trait VtableEmitter extends ArcEmitter {
         // entry and releases them on return, so handing it a value loaded out of the object leaves
         // the object's own count exactly where it was.
         val self = slot.recv match
+          // A large receiver is passed at its address like any other large argument, so the
+          // implementation makes the copy it was always going to make and the adapter makes none.
+          case RecvMode.ByValue if Layout.indirect(vt.forType) => s"ptr $payload"
           case RecvMode.ByValue =>
             val v = freshTemp(); emit(s"$v = load ${vt.forType.llvm}, ptr $payload")
             s"${vt.forType.llvm} $v"

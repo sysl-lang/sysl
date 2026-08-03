@@ -139,7 +139,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // corrupt run rather than a link error.
     for f <- imported do
       val params =
-        (syslSret(f.retTy).toList ++ Type.stored(f.params).map(_._2.llvm) ++
+        (syslSret(f.retTy).toList ++ Type.stored(f.params).map(p => syslParam(p._2)) ++
           Option.when(f.variadic)("...")).mkString(", ")
       out ++= s"declare ${syslResult(f.retTy)} @${symbolOf(f.name)}($params)\n"
     if imported.nonEmpty then out ++= "\n"
@@ -303,8 +303,16 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // so it takes no slot and the emitted signature below does not mention it.
     for (name, ty) <- f.params if !Type.zeroSized(ty) do
       emitAlloca(s"%$name.addr", ty.llvm)
-      emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
-      retainValue(ty, s"%$name.param")
+      // A large one arrived as an address, so the copy the callee makes for itself is a copy of
+      // bytes and the count it takes is taken at the slot rather than off a value it never had.
+      if Layout.indirect(ty) then
+        usesMemcpy = true
+        emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(ty)} %$name.addr, " +
+          s"ptr align ${Layout.align(ty)} %$name.param, i64 ${Layout.size(ty)}, i1 false)")
+        retainAt(ty, s"%$name.addr")
+      else
+        emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
+        retainValue(ty, s"%$name.param")
       ownSlot(name, ty)
 
     for (cond, _) <- f.requires do emitContract(cond, "require")
@@ -344,7 +352,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
     val stored   = Type.stored(f.params)
-    val declared = stored.map { case (name, ty) => s"${ty.llvm}${frameOf(f, ty, name)} %$name.param" }
+    val declared = stored.map { case (name, ty) => s"${syslParam(ty)}${frameOf(f, ty, name)} %$name.param" }
     val params   =
       (syslSret(f.retTy).map(_ + s" $sretParam").toList ++ declared ++
         Option.when(f.variadic)("...")).mkString(", ")

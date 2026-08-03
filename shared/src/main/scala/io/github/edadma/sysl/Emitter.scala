@@ -161,6 +161,12 @@ trait Emitter {
   protected def syslResult(retTy: Type): String =
     if Type.noValue(retTy) || Layout.indirect(retTy) then "void" else retTy.llvm
 
+  /** How a parameter is declared. A **large** one arrives as the address of storage the caller
+   * holds; the callee makes its own copy at entry, which is the copy it always made — the only
+   * difference is that the value crosses the boundary in memory rather than in registers.
+   */
+  protected def syslParam(ty: Type): String = if Layout.indirect(ty) then "ptr" else ty.llvm
+
   /** The name the out-pointer takes inside a function that has one. */
   protected val sretParam = "%sret.out"
 

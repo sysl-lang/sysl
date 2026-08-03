@@ -35,9 +35,15 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    */
   private def argList(args: List[TExpr]): List[String] =
     args.flatMap { a =>
-      val v = genExpr(a)
+      // A large one is handed over as the address of storage the caller holds — its own where the
+      // argument is a place, a slot made here where it is not. The callee copies at entry either
+      // way, so the copy the by-value convention promises still happens; it just happens once, in
+      // memory, instead of as a multi-kilobyte value crossing the call.
+      if Layout.indirect(a.ty) then Some(s"ptr ${address(a)}")
+      else
+        val v = genExpr(a)
 
-      Option.unless(Type.zeroSized(a.ty))(s"${a.ty.llvm} $v")
+        Option.unless(Type.zeroSized(a.ty))(s"${a.ty.llvm} $v")
     }
 
   /** What a compound assignment stores: a slot that holds a count — a string, or a struct with a
@@ -118,7 +124,7 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
   private val variadics: Map[String, String] =
     val fromExterns = program.externs.filter(_.variadic).map(e => e.name -> foreignFnType(e.retTy, e.params))
     val fromFuncs   = program.funcs.filter(_.variadic).map { f =>
-      val params = syslSret(f.retTy).toList ++ Type.stored(f.params).map(_._2.llvm) :+ "..."
+      val params = syslSret(f.retTy).toList ++ Type.stored(f.params).map(p => syslParam(p._2)) :+ "..."
 
       f.name -> s"${syslResult(f.retTy)} (${params.mkString(", ")})"
     }
