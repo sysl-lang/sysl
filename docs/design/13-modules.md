@@ -356,6 +356,16 @@ is reachable two ways and they agree: it is auto-imported into every file, so it
 import step and takes part in the wildcard rules above, and it is also the last step on its own, so
 a name it declares resolves even where a file's imports say nothing.
 
+**The three steps rank a name by where it was written, not by what kind of thing it is.** A
+function, a `const`, a module-level `val`, an `extern` variable and an enum variant are five tables,
+and a bare name may be any of them — but a program's own declaration answers before an import's and
+an import's before the library's *whichever* table each is in. So a program that declares `extern
+"__stdoutp" stdout: *u8` reaches C's stream, though the library declares a `stdout()` of its own, and
+the library's is still there under `sysl.stdout`. The rule is worth stating because the tables can
+only be asked one at a time, and asking them in a fixed order is precisely how a nearer declaration
+loses to a further one — the reader is looking at a declaration on their own screen, and nothing
+about a name says which table will claim it.
+
 **The library's own files take the same three steps.** They are files of modules, and the module each
 is in is one of the library's, so "this module first" can only ever hand a library file the library's
 own declaration — there is nothing for a special order to protect it from. A file of the library may

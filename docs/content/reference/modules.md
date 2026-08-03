@@ -237,6 +237,25 @@ neither are the root module's, which have no path to be reached by at all.
 **Resolution is innermost-first.** A local binding shadows an imported name; the fully-qualified path
 is always available to break a tie or reach a name deliberately not imported.
 
+**The three steps rank a name by where it was written, not by what kind of thing it is.** A function,
+a `const`, a module-level `val`, an `extern` variable and an enum variant are different kinds of
+declaration, and a bare name may be any of them — a program's own answers before an import's, and an
+import's before the library's, whichever kind each one is. The library declares a `stdout()`; a
+program that declares storage of that name reaches its own, and the library's is still there under
+the path that names it.
+
+```sysl
+val stdout: int = 7
+
+sysl.stdout().write("the library's\n".bytes)
+print(stdout + 1)
+```
+
+```output
+the library's
+8
+```
+
 | situation | result |
 |---|---|
 | a wildcard offers a name that is also defined locally or imported selectively | the more specific one wins |
