@@ -105,6 +105,36 @@ class ClosureRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |""".stripMargin) shouldBe "42\n"
     }
 
+    /** The static and dynamic halves of `§6` meet, in the direction that used to be closed. A
+      * bare-arrow parameter **is** the bound, monomorphized, and a bound is satisfied by the table a
+      * trait object carries — the call trait being a trait like any other. So a function written the
+      * static way takes a boxed callable, and a library is not closed to a caller holding one.
+      *
+      * Both arguments in one program, so the only difference between the two lines is what was passed:
+      * `twice` arrives as itself and the call inside is direct, `boxed` arrives erased and it is a
+      * slot. Two instantiations of one body, which is `§7` doing nothing unusual.
+      */
+    "and a bare-arrow parameter — which is that bound — takes the object as well" in {
+      run("""twice(a: int) -> int = a * 2
+            |apply(f: int -> int, x: int) -> int = f(x)
+            |
+            |var boxed: &Fn(int) -> int = twice
+            |print(apply(twice, 21))
+            |print(apply(boxed, 21))
+            |""".stripMargin) shouldBe "42\n42\n"
+    }
+
+    // A closure that captured is a struct with an implementation rather than a declared function, and
+    // it reaches the same parameter through the same bound once it has been boxed.
+    "including one the erasure boxed out of a capturing closure" in {
+      run("""apply(f: int -> int, x: int) -> int = f(x)
+            |
+            |var k = 3
+            |var boxed: &Fn(int) -> int = n -> n * k
+            |print(apply(boxed, 14))
+            |""".stripMargin) shouldBe "42\n"
+    }
+
     // `§6`'s own example of the stored case, down to the field name.
     "a struct field holds one" in {
       run("""greet()

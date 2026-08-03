@@ -104,9 +104,32 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
       err(shape + "var s: *Shape = Rect(1, 2)") should include("write '&' in front of the Rect")
     }
 
-    "a bound is not satisfied by an object over the same trait" in {
-      err(shape + "f[T: Shape](x: T) -> int = x.area()\nvar r = Rect(1,2)\nvar s: *Shape = &r\nprint(f(s))") should
-        include("but *Shape does not")
+    /** An object satisfies a bound on the trait it dispatches through, and on nothing else — the
+     * table it carries is what answers the bound, so a trait with no slots in it is not answered.
+     * `SupertraitTests` has the other side, where the bound is met.
+     */
+    "a bound on some other trait is still not satisfied by an object" in {
+      err(
+        shape +
+          """trait Other
+            |    other(self) -> int
+            |f[T: Other](x: T) -> int = x.other()
+            |var r = Rect(1,2)
+            |var s: *Shape = &r
+            |print(f(s))""".stripMargin) should include("but *Shape does not")
+    }
+
+    // Erasing again is a different question from satisfying a bound, and only the second of them the
+    // table can answer.
+    "and an object may not be erased into the object of another trait" in {
+      err(
+        shape +
+          """trait Other
+            |    other(self) -> int
+            |var r = Rect(1,2)
+            |var s: *Shape = &r
+            |var t: *Other = s""".stripMargin) should
+        include("a *Shape has forgotten which type it holds, so there is nothing for a *Other to be built from")
     }
   }
 

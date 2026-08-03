@@ -796,6 +796,13 @@ position can afford the static side because it introduces the type parameter; th
 must take the dynamic side because a field has one fixed layout. The language routes you to the
 cheaper representation wherever it is possible and to the visible box exactly where it is not.
 
+**And the two sides meet at the parameter, because a bound takes an object** (`10 §5`). A `&Fn` is
+passed to a bare-arrow parameter and called there, so a callable that had to be boxed to be *stored*
+does not have to be unboxed to be *handed on*. That closes what would otherwise be the split's one
+sharp edge: a struct holding an `on_click: &Fn() -> unit` could not pass it to anything written the
+ordinary way, and every such function would have needed a `&Fn` twin. What is monomorphized is the
+receiving function, once per shape of argument, and the erased one is one of those shapes.
+
 ## 6a. A function's address — `*extern(A, B) -> R`
 
 `Fn` is sysl's answer to "what is the type of a callable", and it is the right one for sysl: a bound

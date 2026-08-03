@@ -28,6 +28,22 @@ trait TraitObjects extends TypeResolution {
     (want, t.ty) match
       case (_, from) if from == want => t
 
+      // The value is **already an object**, over some other trait. It gets here because a bound on
+      // `Named` is satisfied by a `&Greet`, and it would be a short step from there to reading a
+      // `&Named` as the same kind of thing — but the two questions are not the same one. Satisfying a
+      // bound asks what may be *called* through the value, and the table answers it. Building an
+      // object asks what may be *assembled* from the value's type, and an object has no
+      // implementations to assemble from.
+      //
+      // It is the upcast that flattening gives up (`02 § A trait may require another trait`), stated
+      // where someone meets it: `Named`'s members really are slots in a `&Greet`'s table, laid out
+      // there so that a required trait's method stays one indirect call — but a run of slots inside
+      // another table is not a table anything can point at.
+      case (_, from) if Type.erasedTrait(from).exists(_.bound.key != tr.bound.key) =>
+        at(t.pos)(err(s"a ${show(from)} has forgotten which type it holds, so there is nothing for a " +
+          s"${show(want)} to be built from — '${tr.bound.show}' is reachable *through* the value, and " +
+          "a bound on it is satisfied by one, but its slots are not a table of their own"))
+
       case (Type.Ptr(_), Type.Ptr(inner))              => erase(t, tr, inner, want, boxed = false)
       case (Type.Ref(_, s), Type.Ref(inner, s2)) if s == s2 => erase(t, tr, inner, want, boxed = true)
 
