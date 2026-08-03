@@ -240,10 +240,20 @@ class TraitObjectCodegenTests extends AnyFreeSpec with CodegenSupport {
     "counts the box in its second word, and nothing else" in {
       val body = mainOf(ir(counted))
 
-      // The temporary is named by a regex rather than by number: what the assertion is about is
-      // that the *second* word is what is released, and the numbering moves whenever the box header
-      // does.
-      body should include regex raw"%t(\d+) = extractvalue \{ ptr, ptr \} %t\d+, 1\n  call void @arc\.release\(ptr %t\1\)"
+      // The temporary is matched by shape rather than by number, since the numbering moves whenever
+      // the box header does, and the release on the next line has to name that same temporary.
+      //
+      // Two steps rather than one pattern carrying a backreference: a backreference is what makes a
+      // regex engine need to backtrack, so the linear-time engines do not offer one at all and Scala
+      // Native's rejects `\1` while it is still parsing the pattern.
+      val extracted = raw"%(t\d+) = extractvalue \{ ptr, ptr \} %t\d+, 1".r.unanchored
+
+      val released = body.linesIterator.sliding(2).exists {
+        case Seq(extracted(word), next) => next.trim == s"call void @arc.release(ptr %$word)"
+        case _                          => false
+      }
+
+      withClue(body)(released shouldBe true)
     }
   }
 }

@@ -278,8 +278,11 @@ class LibraryCliTests extends LibraryCliSupport {
 
         // Replaced, not merely worked around: what is at the path afterwards is a standard module
         // this compiler will read, which is the whole of what the rebuild is for.
+        // Matched rather than asked whether it `isRight`: the symbol form of that question is
+        // answered by reflection, which the JVM has and no other platform does — there it silently
+        // becomes an equality against the symbol itself, and fails whatever the value is.
         LibraryArtifact.metadataOf(where, readBytes(where))
-          .flatMap(Core.read(where, _, Target.default)) shouldBe Symbol("right")
+          .flatMap(Core.read(where, _, Target.default)) should matchPattern { case Right(_) => }
       }
 
       "and a stale one is replaced too, which is the state it is actually found in" in {
