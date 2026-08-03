@@ -2,6 +2,7 @@ package io.github.edadma.sysl
 
 import io.github.edadma.cross_platform.*
 
+import org.scalatest.ParallelTestExecution
 import org.scalatest.freespec.AnyFreeSpec
 
 /** The documentation site's programs, compiled and run out of the markdown a reader is looking at
@@ -16,7 +17,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * That is the same reason `GuideTests` counts the `ok` lines rather than only looking for `FAIL`,
  * and it was learned there the hard way.
  */
-class DocsTests extends AnyFreeSpec with DocsSupport {
+class DocsTests extends AnyFreeSpec with DocsSupport with ParallelTestExecution {
 
   /** How many `sysl` blocks of each kind a page carries: runnable programs, refusals, fragments.
    *
@@ -95,14 +96,29 @@ class DocsTests extends AnyFreeSpec with DocsSupport {
     pages.toSet shouldBe expected.keySet
   }
 
-  "the programs on each page do what the page says" in {
-    assume(Toolchain.clangAvailable, "clang not available")
-    assume(isDirectory("docs/content"), "the docs tree is not reachable from the working directory")
+  /** One test per page, rather than one test over every page — which is what lets the suite run
+   * them at the same time.
+   *
+   * **The cost here is not the checking, it is the toolchain.** A page's `output` block makes its
+   * program a whole compile, link and run: a clang invocation, a linker invocation and a process,
+   * for a program of six lines. There are close to four hundred of those across the site, and as one
+   * test they were four hundred of them in a row on one core while the rest of the machine idled.
+   * They are completely independent — separate temporary files, separate processes, nothing shared —
+   * so the only thing that made them sequential was being written inside a single `in`.
+   *
+   * A page is the unit rather than a snippet because it is the one a reader would go and fix, and
+   * because ScalaTest's own parallelism works over tests. The `error` blocks come along for the ride
+   * at no cost: a refusal never reaches the toolchain at all (`check`), so a page of them finishes
+   * immediately whichever thread takes it.
+   */
+  for page <- if isDirectory("docs/content") then pages else Nil do
+    s"the programs on $page do what the page says" in {
+      assume(Toolchain.clangAvailable, "clang not available")
 
-    val complaints = pages.flatMap(snippets).flatMap(check)
+      val complaints = snippets(page).flatMap(check)
 
-    if complaints.nonEmpty then fail(complaints.mkString("\n\n"))
-  }
+      if complaints.nonEmpty then fail(complaints.mkString("\n\n"))
+    }
 
   "each page carries the programs it is supposed to" in {
     assume(isDirectory("docs/content"), "the docs tree is not reachable from the working directory")

@@ -136,6 +136,20 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   )
   .jvmSettings(
     libraryDependencies += "org.scala-js" %% "scalajs-stubs" % "1.1.0" % "provided",
+    // Hands ScalaTest a thread pool, which is what a suite mixing in `ParallelTestExecution`
+    // needs before it can run its tests at the same time. Without it the mixin is not an error
+    // and not a warning — it simply has nowhere to distribute to and runs everything in order,
+    // which is how `DocsTests` came to spend six minutes doing four hundred compilations on one
+    // core while seventeen sat idle.
+    //
+    // JVM-only on purpose: the JS and Native runners are single-threaded, so the two suites that
+    // ask for parallelism there get the sequential behaviour they had before rather than an
+    // argument their runner has no use for.
+    // The thread count is explicit because sbt refuses a bare `-P` — it will not infer one on
+    // ScalaTest's behalf. Eight rather than the machine's full count: what these threads do is
+    // wait on `clang`, and past a handful the compilations contend for memory bandwidth instead
+    // of finding another core, on a machine whose cores are not interchangeable anyway.
+    Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-P8"),
   )
   .nativeSettings(
 //    libraryDependencies += "io.github.cquiroz" %%% "scala-java-time" % "2.7.0",

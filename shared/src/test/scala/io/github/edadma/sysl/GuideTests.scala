@@ -1,5 +1,6 @@
 package io.github.edadma.sysl
 
+import org.scalatest.ParallelTestExecution
 import org.scalatest.freespec.AnyFreeSpec
 
 /** The guide programs, compiled from `guide/` and run (see `guide/README.md`).
@@ -15,7 +16,13 @@ import org.scalatest.freespec.AnyFreeSpec
  * file, where the code that produced them is not — and the round-trips in particular are only
  * legible next to the documents they are about.
  */
-class GuideTests extends AnyFreeSpec with GuideSupport {
+/** **Each guide is its own test, and they run at the same time.** A guide program is a real compile,
+ * link and run of a few hundred lines, and there are fourteen of them; sequentially that was the
+ * larger half of this suite's time with one core busy. Nothing is shared between them — each
+ * compiles from its own directory into its own temporary files — so the only thing that had made
+ * them sequential was the runner taking one test at a time.
+ */
+class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecution {
 
   private def checks(out: String): Int = out.linesIterator.count(_.startsWith("ok"))
 
