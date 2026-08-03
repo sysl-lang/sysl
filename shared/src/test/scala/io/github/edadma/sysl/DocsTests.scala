@@ -96,8 +96,8 @@ class DocsTests extends AnyFreeSpec with DocsSupport with ParallelTestExecution 
     pages.toSet shouldBe expected.keySet
   }
 
-  /** One test per page, rather than one test over every page — which is what lets the suite run
-   * them at the same time.
+  /** One test per **program**, rather than one test over every page — which is what lets the suite
+   * run them at the same time.
    *
    * **The cost here is not the checking, it is the toolchain.** A page's `output` block makes its
    * program a whole compile, link and run: a clang invocation, a linker invocation and a process,
@@ -106,18 +106,25 @@ class DocsTests extends AnyFreeSpec with DocsSupport with ParallelTestExecution 
    * They are completely independent — separate temporary files, separate processes, nothing shared —
    * so the only thing that made them sequential was being written inside a single `in`.
    *
-   * A page is the unit rather than a snippet because it is the one a reader would go and fix, and
-   * because ScalaTest's own parallelism works over tests. The `error` blocks come along for the ride
-   * at no cost: a refusal never reaches the toolchain at all (`check`), so a page of them finishes
-   * immediately whichever thread takes it.
+   * **The unit is a program and not a page, because a page is not small enough.** Splitting by page
+   * first was the obvious step and it stalled at sixty seconds, all but one of which was
+   * `reference/errors.md` — forty-seven programs on one page, nineteen of them a full build, taking
+   * forty-nine seconds on whichever single thread drew it while the rest of the machine finished
+   * and waited. A run is only as short as its longest test, so the longest test has to be one
+   * program. The `error` blocks come along at no cost either way: a refusal never reaches the
+   * toolchain at all (`check`).
+   *
+   * A failure still names the page, because that is what a reader goes and fixes; the ordinal beside
+   * it is the same one the census counts in, so it says which block without anyone counting fences.
    */
-  for page <- if isDirectory("docs/content") then pages else Nil do
-    s"the programs on $page do what the page says" in {
+  for
+    page <- if isDirectory("docs/content") then pages else Nil
+    s    <- snippets(page)
+  do
+    s"${s.page} program ${s.nth} does what the page says" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      val complaints = snippets(page).flatMap(check)
-
-      if complaints.nonEmpty then fail(complaints.mkString("\n\n"))
+      check(s).foreach(fail(_))
     }
 
   "each page carries the programs it is supposed to" in {

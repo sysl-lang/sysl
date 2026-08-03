@@ -146,10 +146,9 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
     // ask for parallelism there get the sequential behaviour they had before rather than an
     // argument their runner has no use for.
     // The thread count is explicit because sbt refuses a bare `-P` — it will not infer one on
-    // ScalaTest's behalf. Eight rather than the machine's full count: what these threads do is
-    // wait on `clang`, and past a handful the compilations contend for memory bandwidth instead
-    // of finding another core, on a machine whose cores are not interchangeable anyway.
-    Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-P8"),
+    // ScalaTest's behalf. What these threads do is wait on `clang` and on the linker, so the
+    // count is the machine's rather than a fraction of it: the work is in the child processes.
+    Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-P18"),
   )
   .nativeSettings(
 //    libraryDependencies += "io.github.cquiroz" %%% "scala-java-time" % "2.7.0",
