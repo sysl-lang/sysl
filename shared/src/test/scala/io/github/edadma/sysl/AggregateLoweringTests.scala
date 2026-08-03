@@ -232,6 +232,92 @@ class AggregateLoweringTests extends AnyFreeSpec with CodegenSupport with RunSup
     }
   }
 
+  // Five lowerings changed at once, so what is worth asking is not whether each works but whether
+  // anything a large aggregate can still *reach* was left behind. Each of these is a path where the
+  // value form is still what runs, or where the destination is not known until the expression is
+  // half-emitted — and each has to keep producing the right answer either way.
+  "everywhere else a large one can turn up still works" - {
+    "a branch that yields one" in {
+      run(big +
+        """pick(which: bool) -> Big = if which then Big([1; 64], 1) else Big([2; 64], 2)
+          |print(pick(true).cells[0], pick(false).cells[0])""".stripMargin) shouldBe "1 2\n"
+    }
+
+    "an arm of a match that yields one" in {
+      run(big +
+        """pick(n: int) -> Big = n match
+          |    0 -> Big([5; 64], 0)
+          |    _ -> Big([6; 64], 1)
+          |print(pick(0).cells[0], pick(1).cells[0])""".stripMargin) shouldBe "5 6\n"
+    }
+
+    // The box's address does not exist until `malloc` has returned, so this is the one destination
+    // that cannot be handed to the expression before the expression starts.
+    "one put on the heap behind a reference" in {
+      run(big +
+        """var b: &Big = Big([3; 64], 4)
+          |var c = b
+          |c.tag = 5
+          |print(b.cells[63], b.tag)""".stripMargin) shouldBe "3 5\n"
+    }
+
+    "an element of an array of them" in {
+      run(big +
+        """var bs: [3]Big = [Big([7; 64], 1); 3]
+          |bs[1].tag = 2
+          |print(bs[0].cells[0], bs[0].tag, bs[1].tag)""".stripMargin) shouldBe "7 1 2\n"
+    }
+
+    "one a closure captured and returns" in {
+      run(big +
+        """call(f: () -> Big) -> int = f().tag
+          |var b = Big([8; 64], 9)
+          |print(call(() -> b))""".stripMargin) shouldBe "9\n"
+    }
+
+    "one bound at module level" in {
+      run(big +
+        """val shared: Big = Big([4; 64], 5)
+          |print(shared.cells[0], shared.tag)""".stripMargin) shouldBe "4 5\n"
+    }
+
+    "one behind a pointer, written through" in {
+      run(big +
+        """bump(p: *Big)
+          |    p.tag = p.tag + 1
+          |var b = Big([0; 64], 1)
+          |bump(&b)
+          |print(b.tag)""".stripMargin) shouldBe "2\n"
+    }
+
+    "and the two the edge-case pass turned up are destinations too" in {
+      val boxed = irMain(big + "var b: &Big = Big([3; 64], 4)\nprint(b.tag)")
+
+      boxed should not include "insertvalue %struct.Big"
+      boxed should not include "store %struct.Big"
+
+      val tagged = ir(big +
+        """enum Slot
+          |    Empty
+          |    Full(b: Big)
+          |take(s: Slot) -> int = 0
+          |print(take(Full(Big([0; 64], 6))))""".stripMargin)
+
+      mainOf(tagged) should not include "load %enum.Slot"
+    }
+
+    "and a large payload inside a data enum" in {
+      run(big +
+        """enum Slot
+          |    Empty
+          |    Full(b: Big)
+          |take(s: Slot) -> int = s match
+          |    Full(b) -> b.tag
+          |    Empty -> 0
+          |print(take(Full(Big([0; 64], 6))), take(Empty))""".stripMargin) shouldBe "6 0\n"
+    }
+  }
+
   // The value a postcondition is written about is read back out of the out-pointer, which is the
   // one whole-aggregate load this lowering still emits — and only on a function that asked for it.
   "a contract on one still sees the value it is written about" in {

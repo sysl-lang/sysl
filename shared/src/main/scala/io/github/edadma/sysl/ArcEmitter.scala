@@ -278,7 +278,11 @@ trait ArcEmitter extends Emitter {
   protected def genBox(value: TExpr, refTy: Type.Ref): String = {
     val inner = refTy.inner
     val bn    = boxName(inner)
-    val v     = genExpr(value)
+    // A large payload is written into the box rather than produced and then stored into it, for the
+    // reason every other destination has: the value would be a first-class aggregate of kilobytes
+    // for the length of one instruction. The address is not known until the box exists, so this is
+    // the one destination that cannot be handed over before the expression runs.
+    val v     = if Layout.indirect(inner) then "" else genExpr(value)
 
     val end  = freshTemp(); emit(s"$end = getelementptr $bn, ptr null, i32 1")
     val size = freshTemp(); emit(s"$size = ptrtoint ptr $end to i64")
@@ -293,8 +297,11 @@ trait ArcEmitter extends Emitter {
     emit(s"store i64 1, ptr $wc")
 
     val slot = freshTemp(); emit(s"$slot = getelementptr $bn, ptr $p, i32 0, i32 $headerFields")
-    retainValue(inner, v)
-    emit(s"store ${inner.llvm} $v, ptr $slot")
+
+    if Layout.indirect(inner) then genOwnedInto(slot, value)
+    else
+      retainValue(inner, v)
+      emit(s"store ${inner.llvm} $v, ptr $slot")
 
     ownTemp(p, refTy)
   }

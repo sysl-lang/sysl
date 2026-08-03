@@ -392,6 +392,21 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         emit(s"$p = getelementptr ${arrayTy.elem.llvm}, ptr $dest, i64 $i")
         genBorrowedInto(p, el)
 
+    // The tag, and then the variant's own fields written into the region every variant shares.
+    // Reaching the region by address is what the value form has to use a stack slot for anyway —
+    // a union has no `insertvalue` — so this is the shorter of the two lowerings as well.
+    case TEnumNew(en, variant, args) if !en.simple =>
+      emit(s"store i32 ${variant.tag}, ptr $dest")
+
+      if variant.carries then
+        val base = payloadPtr(en, dest)
+
+        for (a, i) <- args.zipWithIndex if !Type.zeroSized(variant.fields(i)._2) do
+          val p = freshTemp()
+
+          emit(s"$p = getelementptr ${en.payloadLlvm(variant)}, ptr $base, i32 0, i32 ${variant.slot(i)}")
+          genBorrowedInto(p, a)
+
     // The value is generated once, above the loop, exactly as the value form does — every element
     // is a copy of that one evaluation. It is generated even where there are no elements, because
     // one evaluation is what the form promises and an empty array does not take that back.
@@ -1022,6 +1037,8 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
       emit(s"call void @llvm.va_copy.p0(ptr $d, ptr $s)"); ""
 
     case e @ TStructNew(struct, _) if Layout.indirect(struct) => throughSlot(e)
+
+    case e @ TEnumNew(en, _, _) if !en.simple && Layout.indirect(en) => throughSlot(e)
 
     case TStructNew(struct, args) =>
       val vals = args.map(genExpr)
