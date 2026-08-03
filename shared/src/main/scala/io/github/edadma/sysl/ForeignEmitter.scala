@@ -2,12 +2,13 @@ package io.github.edadma.sysl
 
 /** The seam with a foreign function: what an `extern` is declared as, and what a call to one emits.
  *
- * A call from sysl to sysl needs none of this. Both sides are this compiler, so a struct handed over
- * as a struct is a convention like any other and the two agree by construction. A foreign callee was
- * compiled by somebody else against a published document, and the document is then the only thing
- * that can make the two agree — so a declaration here names the types **that** convention asks for
- * (`CAbi`) rather than the ones the sysl signature is written in, and the call converts each value
- * between the two.
+ * A call from sysl to sysl needs none of this. Both sides are this compiler, so whatever it does
+ * with an aggregate is a convention like any other and the two agree by construction — a small one
+ * crosses as itself, a large one through memory (`Emitter`'s `syslSret` / `syslParam`), and neither
+ * has to match what any other language would have done. A foreign callee was compiled by somebody
+ * else against a published document, and the document is then the only thing that can make the two
+ * agree — so a declaration here names the types **that** convention asks for (`CAbi`) rather than
+ * the ones the sysl signature is written in, and the call converts each value between the two.
  *
  * Every conversion goes **through memory**: the value is stored to a slot and the coerced shape is
  * read back over the same bytes. That is what clang does and it is what is available — LLVM has no

@@ -399,10 +399,26 @@ either — and `store`s through it, which is one mechanism for `x = v`, `s.f = v
 `p.f = v` alike. A place whose storage is qualified `volatile` (`03 § Device memory`) takes the
 marker on the instruction — `load volatile` / `store volatile` — and that is the whole of what the
 qualifier costs; the field itself is laid out exactly as an unqualified one, so a register block is
-the same aggregate it looks like. A qualified **field** is the one exception to the `extractvalue`
+the same aggregate it looks like. A qualified **field** is one exception to the `extractvalue`
 read above: it is reached at its own address instead, because loading the aggregate to lift one field
 out of it would read every register in the block. A whole-aggregate access is marked whenever the
-type holds a qualified field anywhere in it. `*T` and `&T` are both the opaque `ptr`; inside a
+type holds a qualified field anywhere in it.
+
+**A large aggregate is the other exception, and it is a whole lowering rather than one
+instruction.** Above `Layout.DirectBytes` — 128 bytes — a value is never a first-class LLVM value
+at all: it is built where it is going to live, copied with `llvm.memcpy`, read a field at a time
+through its address, returned through an `sret` out-pointer the caller supplies, and passed as the
+address of storage the caller holds, the callee making its own copy at entry. Nothing about the
+language changes; `Name(a, b)` still constructs and a struct still passes and returns **by value**,
+with the copy that promises. What changes is where the copy happens. The reason is arithmetic: an
+optimizer asked to reason about a first-class value of kilobytes reasons about every byte of it, and
+that does not stay linear. `guide/kernel` builds a 20 KB struct and hands it about at thirty-five
+call sites, and the module took **408 seconds** to compile at `-O1` as values and **0.93 seconds**
+through memory. The threshold is well clear of everything the language itself uses — a slice and a
+string are twenty-four bytes, a trait object sixteen — so nothing in ordinary code changes shape.
+Six places spell a sysl signature (the definition, a library declaration, a call, a variadic
+callee's whole function type, a method table's adapter, and the `ret`), and they agree because they
+all ask `syslSret` / `syslResult` / `syslParam`. `*T` and `&T` are both the opaque `ptr`; inside a
 mangled name a memory mode is spelled as a word (`ptr.` / `ref.` / `sync.` / `volatile.`), since a
 sigil is not an LLVM name character, and the qualifier is mangled for the reason a view's read-only
 bit is — one layout, two sets of instructions, so no instantiation may share a body across them.
