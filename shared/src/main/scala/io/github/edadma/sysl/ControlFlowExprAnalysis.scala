@@ -322,12 +322,30 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     val (key, targs) = memberOwner(ty)
     val iterate      = Library.key("Iterate")
 
-    implsOf(iterate, key).map(suppliedBound(_, iterate, ty, targs).args) match
-      case Nil            => None
-      case List(elem) :: Nil => Some(elem)
-      case several =>
-        err(s"${show(ty)} implements '${qn(iterate)}' " +
-          s"${conjoin(several.map(a => s"'${Type.Bound(iterate, a).show}'"))}, and a 'for' has " +
-          "nothing to say which of them it means — call 'next' yourself, with the element type written")
+    // A **trait object** has no implementations filed for it and needs none: the table it carries
+    // holds `Iterate`'s member, which is the one thing the loop calls. Reaching it here is the same
+    // rule that lets an object satisfy a bound (`10 §5`) — a `for` asks what may be called on the
+    // value, and the answer comes from the same table.
+    //
+    // The several-implementations case below cannot arise for one, which is why this is a lookup
+    // rather than a choice: a trait-object type names one trait at one argument list, so the element
+    // type is whatever the object was erased to. It is read out of the requirement closure so that a
+    // trait *requiring* `Iterate` is walked too, exactly as its members are.
+    def erased =
+      for
+        tr   <- Type.erasedTrait(ty)
+        b    <- traitClosure(tr.bound, selfBinding(ty)).find(_.name == iterate)
+        elem <- b.args.headOption
+      yield elem
+
+    erased.orElse(
+      implsOf(iterate, key).map(suppliedBound(_, iterate, ty, targs).args) match
+        case Nil               => None
+        case List(elem) :: Nil => Some(elem)
+        case several =>
+          err(s"${show(ty)} implements '${qn(iterate)}' " +
+            s"${conjoin(several.map(a => s"'${Type.Bound(iterate, a).show}'"))}, and a 'for' has " +
+            "nothing to say which of them it means — call 'next' yourself, with the element type written"),
+    )
   }
 }

@@ -231,6 +231,37 @@ Same trait, two strategies, chosen by **how you spell the parameter** — a boun
 sigil-carried trait object for dynamic. There is no `dyn` keyword either way, because the sigil
 already says everything one would.
 
+**The two are not separate worlds.** A trait object satisfies a bound on the trait it dispatches
+through, so `announce` above takes a `&Named` as readily as it takes a `Dog` — the table it carries
+holds exactly the members the bound names:
+
+```sysl
+trait Named
+    label(self) -> string
+
+struct Dog
+    n: string
+end Dog
+
+impl Named for Dog
+    label(self) -> string = "dog " + self.n
+
+announce[T: Named](x: T) -> string = x.label()
+
+var d: &Named = Dog("rex")
+
+print(announce(Dog("rex")), announce(d))
+```
+
+```output
+dog rex dog rex
+```
+
+So the table above is about what the **caller** holds, not about which functions it can reach. A
+library written against bounds is open to a program that erased, and needs no second signature
+written the other way. See [generics](/reference/generics/) for what the rule rests on — an object
+type is a concrete type, so nothing about monomorphization changes to allow it.
+
 ## Any type may carry an `impl`
 
 `impl Show for int` is as ordinary as `impl Show for Point`, and `impl Show for []int` is as ordinary
@@ -915,6 +946,42 @@ settled; what is missing is a spelling, and any spelling must keep the crossing 
 
 The other direction stays refused for a stronger reason: a raw object points at a value with no count
 to take a share of, so accepting one where a counted object is wanted would be **inventing ownership**.
+
+### An object cannot be erased a second time
+
+`trait Shape: Display` puts `Display`'s slots in a `&Shape`'s table, and a `[T: Display]` bound is
+satisfied by the object — but a `&Display` is not, and the difference is worth being exact about. A
+bound asks what may be **called** through the value, and the table answers it. Forming an object asks
+what may be **assembled** from the value's type, and a table is laid out from a type's
+implementations, which an object has none of.
+
+```sysl
+trait Shape: Display
+    area(self) -> int
+
+struct Rect
+    w: int
+    h: int
+end Rect
+
+impl Shape for Rect
+    area(self) -> int = self.w * self.h
+
+impl Display for Rect
+    display(self, out: *Writer, fmt: FormatSpec) = display_pad("a rect".bytes, out, fmt)
+
+var o: &Shape = Rect(3, 4)
+var d: &Display = o
+```
+
+```error
+a &Shape has forgotten which type it holds, so there is nothing for a &sysl.Display to be built from
+```
+
+`Display`'s members really are in that table — they are laid out inline, so that a required trait's
+method stays the one indirect call the trait's own methods are. What is missing is a *name* for that
+run of slots. This is the upcast flattening gives up, and it is the reason it is worth giving up:
+every call through a `&Shape` costs one indirection instead of two.
 
 ### There is no way back to the type
 

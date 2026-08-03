@@ -290,19 +290,58 @@ class IterateTraitTests extends AnyFreeSpec with RunSupport with CodegenSupport 
                    |walk(Upto(1, 2))""".stripMargin) shouldBe "1\n2\n"
     }
 
-    // `02 § An object keeps one trait and what that trait requires` — an erased value reaches its
-    // trait's members through a table, and `next` is object-safe (`*self`, no `Self` away from the
-    // receiver). What a `for` cannot do is find an *implementation* for an erased type, since there
-    // is none: the object is the implementation. Both halves are pinned, because the second is the
-    // one a program would be surprised by.
-    "an erased cursor answers 'next' and is still not what a 'for' takes" in {
+    /** `02 § An object keeps one trait and what that trait requires` — an erased value reaches its
+     * trait's members through a table, and `next` is object-safe (`*self`, no `Self` away from the
+     * receiver). So a `for` walks one: the loop asks what may be *called* on the value, which is the
+     * question the table answers, and the element type is whatever the object was erased to.
+     *
+     * The loop looks for an implementation filed under the receiver's type for every *other* kind of
+     * value, and an object has none — it **is** the implementation. Reading the element out of the
+     * object's own trait instead is the same step that lets a bound take one (`10 §5`), and both
+     * sigils are pinned because the two are separate types.
+     */
+    "a 'for' walks an erased cursor, and so does a direct 'next'" in {
       run(upto + """var o: &Iterate[int] = Upto(1, 2)
                    |print(o.next().unwrap())
                    |print(o.next().unwrap())
                    |print(o.next().is_none())""".stripMargin) shouldBe "1\n2\ntrue\n"
 
-      err(upto + """var o: &Iterate[int] = Upto(1, 2)
-                   |for x in o do print(x)""".stripMargin) should include("Iterate")
+      run(upto + """var o: &Iterate[int] = Upto(1, 3)
+                   |for x in o do print(x)""".stripMargin) shouldBe "1\n2\n3\n"
+
+      run(upto + """var c = Upto(1, 3)
+                   |var o: *Iterate[int] = &c
+                   |for x in o do print(x)""".stripMargin) shouldBe "1\n2\n3\n"
+    }
+
+    /** An object over a trait that **requires** `Iterate` is walked too, since the element is read
+     * out of the requirement closure — the same list the table is laid out from, so the loop cannot
+     * disagree with the table about which member it is calling.
+     */
+    "and one over a trait that requires it, which is the closure being read rather than the name" in {
+      run("""trait Counted: Iterate[int]
+            |    seen(self) -> int
+            |
+            |struct Upto
+            |    at: int
+            |    hi: int
+            |
+            |impl Iterate[int] for Upto
+            |    next(*self) -> Option[int]
+            |        if self.at > self.hi then None else
+            |            var v = self.at
+            |            self.at += 1
+            |            Some(v)
+            |
+            |impl Counted for Upto
+            |    seen(self) -> int = self.at
+            |end Upto
+            |
+            |var o: &Counted = Upto(1, 3)
+            |
+            |for x in o do print(x)
+            |
+            |print(o.seen())""".stripMargin) shouldBe "1\n2\n3\n4\n"
     }
 
     // The built-in walk of a slice is not something a program competes with, exactly as the

@@ -70,38 +70,20 @@ class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppo
       ) should include("'Maybe' requires its type parameter 'T' to implement 'Show', but P does not")
     }
 
-    // A trait object has forgotten which type it holds, so it is not a type anything has an `impl`
-    // for — the same reason a bounded generic function will not take one.
-    "and a trait object is not a type that implements the trait" in {
-      err(s"${wrap}var w: Wrap[&Show] = Wrap(P(1))") should
-        include("'Wrap' requires its type parameter 'T' to implement 'Show', but &Show does not")
-    }
-
-    /** The same refusal at a **generic function**, which is where a reader meets it, and stated on
-     * the object's *own* trait so that nothing else can be blamed for it.
-     *
-     * That last part is the point of the test. The refusal is easy to read as a gap in some
-     * neighbouring feature — a required trait not propagating, an erasure that dropped something —
-     * and it is neither: `&Show` fails a bound on `Show` itself, with no requirement in sight and
-     * every member present in the table. An object is not a type anything wrote an `impl` for, and a
-     * bound asks exactly that question. Reaching the member **by name** through the same value still
-     * works, and the first line is what says the two answers really do differ.
-     */
-    "which is a bound on its own trait, at a function, with the member still reachable by name" in {
-      val src =
-        s"""${show}struct R
+    // A trait object still fails a bound on a trait it does *not* dispatch through — the one it
+    // holds a table for is the one it implements, and nothing else follows from erasing.
+    "and a trait object still fails a bound on some other trait" in {
+      err(
+        s"""${show}trait Other
+           |    other(self) -> int
+           |struct P
            |    v: int
-           |impl Show for R
-           |    show(self) -> string = "r"
-           |f[T: Show](x: T) -> string = x.show()
-           |var o: &Show = R(1)
-           |print(o.show())
-           |print(f(o))""".stripMargin
-
-      err(src) should include("'f' requires its type parameter 'T' to implement 'Show', but &Show does not")
-
-      // …and with the bounded call gone, the by-name reach through the object compiles and runs.
-      run(src.linesIterator.filterNot(_.contains("f(o)")).mkString("\n")) shouldBe "r\n"
+           |impl Show for P
+           |    show(self) -> string = "p"
+           |struct Wrap[T: Other]
+           |    inner: T
+           |var w: Wrap[&Show] = Wrap(P(1))""".stripMargin,
+      ) should include("'Wrap' requires its type parameter 'T' to implement 'Other', but &Show does not")
     }
 
     // A type an implementation *covers* is told what that implementation asked of it, so the reader

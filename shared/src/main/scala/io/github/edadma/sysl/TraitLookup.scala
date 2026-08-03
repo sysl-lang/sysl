@@ -428,8 +428,31 @@ trait TraitLookup extends MemberVisibility {
     // not `Mul` at anything else. The arguments are compared the way an assignment compares two
     // types, so a transparent subtype is its base's member exactly as it is its base's operand.
     case _ =>
-      conforms(tr, t) ||
+      conforms(tr, t) || erasedSatisfies(tr, t) ||
         (tr.args.forall(!disagree(_, t)) && Library.spelling(tr.name).exists(CoreTraits.builtin(_, t)))
+
+  /** Whether a **trait object** satisfies a bound, which it does for the trait it dispatches through
+   * and for every trait that one requires.
+   *
+   * A `&Shape` has forgotten which type it holds, so there is no `impl` filed for it and nothing for
+   * `conforms` to find. What it has instead is a table, and the table is the thing a bound was going
+   * to be used for: a `[T: Shape]` body calls `Shape`'s members on its parameter, and every one of
+   * them is a slot. So the object implements the trait by dispatching, and the members a bound
+   * licenses are exactly the members the table lays out — the two lists are `traitMembers` read
+   * twice, which is what makes this an identity rather than a coincidence.
+   *
+   * **It is total, and that is a property of sysl's object safety rather than of this rule.** A trait
+   * with a member that cannot be dispatched has no object at all, so a `&Shape` existing is already
+   * the proof that every member of `Shape` is reachable through it. There is no partial case to
+   * exclude here, and none of the "this method is unavailable on the object" apparatus a language
+   * with per-member object safety needs.
+   *
+   * The required traits come for free from the same closure the table is laid out from, so a bound on
+   * a trait the object's own trait requires needs no rule of its own (`02 § Requiring another
+   * trait`).
+   */
+  protected def erasedSatisfies(tr: Type.Bound, t: Type): Boolean =
+    Type.erasedTrait(t).exists(o => traitClosure(Type.Bound(o.name, o.args), selfBinding(t)).exists(_.key == tr.key))
 
   /** The same question about a trait that takes no arguments, which is every trait the compiler
    * knows by name and most of the ones a program declares.

@@ -157,6 +157,264 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       |    display(self, out: *Writer, fmt: FormatSpec) = display_pad("a rect".bytes, out, fmt)
       |""".stripMargin
 
+  /** A bound is satisfied by an object, which is the other half of "what an object reaches" and the
+   * half that used to be missing. A `&Shape` reaches `Shape`'s members by *name* because the table
+   * holds them; these say the same table answers a **constraint**, so one generic function takes
+   * both a `Rect` and a `&Shape`.
+   *
+   * Every one of these runs rather than merely compiling, because the interesting failure is not the
+   * bound being refused — it is the bound being accepted and the body then calling nothing, or
+   * calling the wrong slot. Only a value coming back says which slot was reached.
+   */
+  "what a bound reaches through an object" - {
+    "a bound on the object's own trait is satisfied by the object" in {
+      run(
+        shape +
+          """area_of[T: Shape](x: T) -> int = x.area()
+            |var o: &Shape = Rect(3, 4)
+            |print(area_of(o))""".stripMargin) shouldBe "12\n"
+    }
+
+    // The raw sigil is a separate type and gets its own test for that reason: what licenses both is
+    // the erasure they share, not anything about counting.
+    "and by a raw one" in {
+      run(
+        shape +
+          """area_of[T: Shape](x: T) -> int = x.area()
+            |var r = Rect(3, 4)
+            |var o: *Shape = &r
+            |print(area_of(o))""".stripMargin) shouldBe "12\n"
+    }
+
+    /** The whole point of the rule: **one** function body, reached by a concrete type and by the
+     * object erased from it, printing the same answer twice. Written as one program rather than two
+     * so that nothing but the argument differs between the two calls.
+     */
+    "so one generic function takes both a concrete type and the object erased from it" in {
+      run(
+        shape +
+          """area_of[T: Shape](x: T) -> int = x.area()
+            |var o: &Shape = Rect(3, 4)
+            |print(area_of(Rect(3, 4)))
+            |print(area_of(o))""".stripMargin) shouldBe "12\n12\n"
+    }
+
+    /** A bound on a **required** trait, which needs no rule of its own — the object satisfies its own
+     * trait, and entailment already carries a requirement from there. That it falls out is the claim,
+     * so the test asks for `Display` rather than `Shape`.
+     */
+    "a bound on a required trait is satisfied by the object too" in {
+      run(
+        shape +
+          """show[T: Display](x: T)
+            |    print(x)
+            |end show
+            |var o: &Shape = Rect(3, 4)
+            |show(o)""".stripMargin) shouldBe "a rect\n"
+    }
+
+    "and by a raw object, through the same requirement" in {
+      run(
+        shape +
+          """show[T: Display](x: T)
+            |    print(x)
+            |end show
+            |var r = Rect(3, 4)
+            |var o: *Shape = &r
+            |show(o)""".stripMargin) shouldBe "a rect\n"
+    }
+
+    // A bound is also what a *type* asks of its parameters (`10 §5`), and it is the one check, so an
+    // object is a legal argument there as well.
+    "a type's own bound takes an object" in {
+      run(
+        shape +
+          """struct Holder[T: Shape]
+            |    held: T
+            |var o: &Shape = Rect(3, 4)
+            |var h = Holder(o)
+            |print(h.held.area())""".stripMargin) shouldBe "12\n"
+    }
+
+    /** Entailment from the object, which is the composition of the two rules rather than either. The
+     * object satisfies `Shape`; `f`'s bound is `Shape`; `f` hands its parameter to `g`, which asks
+     * for `Display`. Nothing here knows an object is involved — that is what makes it the test.
+     */
+    "an object handed on to a bound that only the requirement satisfies" in {
+      run(
+        shape +
+          """g[U: Display](y: U)
+            |    print(y)
+            |end g
+            |f[T: Shape](x: T)
+            |    g(x)
+            |end f
+            |var o: &Shape = Rect(3, 4)
+            |f(o)""".stripMargin) shouldBe "a rect\n"
+    }
+
+    // A default body is written against the trait's own promises, and reaching one through an object
+    // exercises a slot the implementer never wrote.
+    "a bounded call reaches a default body through the object" in {
+      run(
+        greet +
+          """hail[T: Greet](x: T) -> string = x.greet()
+            |var o: &Greet = P("ed")
+            |print(hail(o))""".stripMargin) shouldBe "hello, ed\n"
+    }
+
+    /** The rule answers a bound and **nothing writes an `impl` that could answer it too**, so there
+     * is one answer rather than two that might disagree. Coherence is what stops the second: an
+     * object type names the trait and nothing of the program's, so a block written for it has no
+     * module it belongs in — the same reason `impl Display for []int` has none.
+     */
+    "no program may write an implementation for the object type itself" in {
+      err(
+        shape +
+          """impl Display for &Shape
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_pad("o".bytes, out, fmt)""".stripMargin,
+      ) should include("&Shape")
+    }
+
+    /** The **iteration protocol** is a trait, so a `for` over an object is the bound rule and not a
+     * feature of its own. Worth pinning because it is the first place someone meets the rule without
+     * having written a bound: `for x in it` is `Iterate`'s member called through whatever `it` is.
+     */
+    "a for loop walks an erased iterator, the protocol being a trait like any other" in {
+      run(
+        """struct Countdown
+          |    n: int
+          |
+          |impl Iterate[int] for Countdown
+          |    next(*self) -> Option[int]
+          |        if self.n <= 0 then None else
+          |            self.n -= 1
+          |            Some(self.n)
+          |end Countdown
+          |
+          |var c = Countdown(3)
+          |var it: *Iterate[int] = &c
+          |var total = 0
+          |
+          |for x in it do total += x
+          |
+          |print(total)""".stripMargin) shouldBe "3\n"
+    }
+
+    /** A **multi-trait** bound is a list and every entry is asked separately, so an object meets it
+     * exactly when it meets each — which for a required trait it does, and for an unrelated one it
+     * does not. Both halves here, because the interesting failure would be a list answered by its
+     * first entry.
+     */
+    "a multi-trait bound is met entry by entry" in {
+      run(
+        shape +
+          """both[T: Shape + Display](x: T) -> int
+            |    print(x)
+            |    x.area()
+            |end both
+            |var o: &Shape = Rect(3, 4)
+            |print(both(o))""".stripMargin) shouldBe "a rect\n12\n"
+
+      err(
+        shape +
+          """trait Weighed
+            |    weight(self) -> int
+            |both[T: Shape + Weighed](x: T) -> int = x.area() + x.weight()
+            |var o: &Shape = Rect(3, 4)
+            |print(both(o))""".stripMargin) should
+        include("'both' requires its type parameter 'T' to implement 'Weighed', but &Shape does not")
+    }
+
+    /** A **weak** reference to an object does not satisfy the bound, and should not: a `weak` has to
+     * be upgraded before anything may be called through it, so the members the bound names are not
+     * available on the value as it stands. The rule keys on the two modes that carry a table, which
+     * is what makes this fall out rather than needing to be excluded.
+     */
+    "a weak reference to an object does not satisfy the bound" in {
+      err(
+        shape +
+          """area_of[T: Shape](x: T) -> int = x.area()
+            |var o: &Shape = Rect(3, 4)
+            |var w: weak Shape = o
+            |print(area_of(w))""".stripMargin) should
+        include("requires its type parameter 'T' to implement 'Shape'")
+    }
+
+    // The bound licenses behaviour and nothing about layout, so a body reaching for layout is refused
+    // at its definition whatever it is instantiated at — the object is not a special case of that.
+    "a bounded body may still not read a field, and the object changes nothing about it" in {
+      err(shape + "wide[T: Shape](x: T) -> int = x.w") should
+        include("'T' is a type parameter, so it has no fields to read")
+    }
+
+    // Recursion instantiates at a fixed set of arguments, so an object recurses like anything else.
+    "a bounded generic recurses at the object" in {
+      run(
+        shape +
+          """repeat[T: Shape](x: T, n: int) -> int
+            |    if n <= 0 then 0 else x.area() + repeat(x, n - 1)
+            |end repeat
+            |var o: &Shape = Rect(3, 4)
+            |print(repeat(o, 3))""".stripMargin) shouldBe "36\n"
+    }
+
+    // The object is an ordinary argument, so it is an ordinary result too — the parameter appearing
+    // in the return type is not a second question.
+    "an object comes back out of a bounded function" in {
+      run(
+        shape +
+          """same[T: Shape](x: T) -> T = x
+            |var o: &Shape = Rect(3, 4)
+            |print(same(o).area())""".stripMargin) shouldBe "12\n"
+    }
+
+    /** **Conditional conformance** reached through an object: a `Box` implements `Display` when its
+     * element implements `Shape`, and the element here is an object. The condition is `satisfies`
+     * asked one step in, so this says the new answer is available to the recursive question and not
+     * only to the outermost one.
+     */
+    "a conditional implementation's condition is met by an object" in {
+      run(
+        shape +
+          """struct Box[T]
+            |    v: T
+            |impl[T: Shape] Display for Box[T]
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_pad(str(self.v.area()).bytes, out, fmt)
+            |var o: &Shape = Rect(3, 4)
+            |print(Box(o))""".stripMargin) shouldBe "12\n"
+    }
+
+    /** A trait that takes arguments is a **family** of promises, and erasing one of them erases one
+     * of them. The object satisfies the bound at the argument list it was written at and no other,
+     * which is the same rule an `impl` is held to — the erasure changes what is known about the
+     * receiver, never what the trait was applied to.
+     */
+    "an object over a generic trait satisfies that trait at its own arguments" in {
+      val sink =
+        """trait Sink[T]
+          |    take(self, v: T) -> int
+          |struct S
+          |    v: int
+          |impl Sink[int] for S
+          |    take(self, v: int) -> int = self.v + v
+          |""".stripMargin
+
+      run(
+        sink +
+          """feed[U: Sink[int]](x: U) -> int = x.take(5)
+            |var o: &Sink[int] = S(2)
+            |print(feed(o))""".stripMargin) shouldBe "7\n"
+
+      err(
+        sink +
+          """feed[U: Sink[string]](x: U) -> int = 0
+            |var o: &Sink[int] = S(2)
+            |print(feed(o))""".stripMargin) should
+        include("'feed' requires its type parameter 'U' to implement 'Sink[string]', but &Sink[int] does not")
+    }
+  }
+
   "what an object reaches" - {
     "an object answers the trait's own members" in {
       run(shape + "var o: &Shape = Rect(3, 4)\nprint(o.area())") shouldBe "12\n"
@@ -521,6 +779,37 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "what erasure still refuses" - {
+    /** **Erasing an object again**, which is the case the bound rule could have opened by accident and
+     * must not. A `&Greet` now satisfies a bound on `Named`, and it would be an easy step from there
+     * to accepting it where a `&Named` is wanted — but a table is laid out from a *type*'s
+     * implementations, and an object has none to lay a second one out from. Satisfying a bound is a
+     * question about what can be called; building an object is a question about what can be
+     * assembled, and only the first of those an object can answer.
+     */
+    "an object may not be erased a second time, into the object of a trait it requires" in {
+      val out = err(
+        greet +
+          """var o: &Greet = P("ed")
+            |var q: &Named = o""".stripMargin,
+      )
+
+      out should include("a &Greet has forgotten which type it holds, so there is nothing for a " +
+        "&Named to be built from")
+      out should include("a bound on it is satisfied by one, but its slots are not a table of their own")
+
+      // And the reason is erasure rather than the requirement, so it reads the same for a trait the
+      // object's own trait says nothing about.
+      err(
+        greet +
+          """trait Other
+            |    other(self) -> int
+            |var o: &Greet = P("ed")
+            |var q: &Other = o""".stripMargin,
+      ) should include("a &Greet has forgotten which type it holds, so there is nothing for a " +
+        "&Other to be built from")
+    }
+
+
     // A required trait that cannot be erased makes the trait that required it unerasable too, and
     // the message names the trait the offending member came from.
     "a trait that requires an unerasable one has no object" in {
@@ -605,30 +894,6 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     "a method no trait in the closure declares is still refused" in {
       err(shape + "var o: &Shape = Rect(3, 4)\nprint(o.volume())") should
         include("declares no method 'volume'")
-    }
-
-    /** The other half of what flattening costs, and the half a reader meets first. The object's
-     * table already holds `Display`'s slots — the tests above print through them — but a **bound**
-     * cannot see them, because a bound asks which types have an `impl` and an object is not one of
-     * them. So a required trait is reachable by *name* and unreachable by *constraint*, and one
-     * generic function cannot be written to take both a `Rect` and a `&Shape`.
-     *
-     * Both sigils, because the two are separate types and only the erasure they share is the
-     * reason: neither is a type anything has an `impl` for.
-     */
-    "a bound on a required trait is not satisfied by the object" in {
-      val show =
-        """
-          |show[T: Display](x: T)
-          |    print(x)
-          |end show
-          |""".stripMargin
-
-      err(shape + show + "var o: &Shape = Rect(3, 4)\nshow(o)") should
-        include(s"'show' requires its type parameter 'T' to implement '${lib("Display")}', but &Shape does not")
-
-      err(shape + show + "var r = Rect(3, 4)\nvar o: *Shape = &r\nshow(o)") should
-        include(s"'show' requires its type parameter 'T' to implement '${lib("Display")}', but *Shape does not")
     }
 
     /** `13 §2`'s rule, and a requirement is the sharpest case of it: implementing the trait means

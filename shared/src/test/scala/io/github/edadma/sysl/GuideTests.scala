@@ -164,7 +164,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     val out = guide("shapes")
 
     out should not include "FAIL"
-    checks(out) shouldBe 90
+    checks(out) shouldBe 92
     sections(out) shouldBe List(
       "-- each shape answers for itself",
       "-- one call site, many implementations",

@@ -259,6 +259,12 @@ them.
 What an object offers is the trait's methods and nothing else. No dereference, no fields, no
 comparison, and no way back to the concrete type.
 
+**But the two halves of this page's opening meet at a bound.** An object carries a table of the
+trait's members, which is exactly what a bound asks for — so a `[T: Shape]` function takes a `&Shape`
+as readily as it takes a `Rect`, with an indirect call where the other gets a direct one. The choice
+between static and dynamic is about what the *caller* holds, not about which functions it can reach,
+and a library written against bounds is not closed to a program that erased.
+
 ### Object safety
 
 Erasure forgets the type, so a member may promise nothing that depends on knowing it. A trait can be
