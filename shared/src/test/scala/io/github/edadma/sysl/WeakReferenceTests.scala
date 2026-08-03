@@ -120,6 +120,21 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
         "a weak reference does not keep Node alive, and nothing else here holds this one")
     }
 
+    /** The advice that message gives has to be **writable**, which is the whole of what advice is.
+     * `weak T` already means a weak edge to a counted `T`, so someone who wrote the `&` as well has
+     * written the mode twice — and telling them to hold it in a `&&Node` would be sending them to a
+     * spelling the parser does not take. The reply is what they meant instead.
+     */
+    "a doubled mode is told what it already means, not sent to a spelling that does not parse" in {
+      val out = err(node + "var r: &Node = Node(1)\nvar w: weak &Node = r")
+
+      out should include("'weak Node' is already a weak edge to a counted Node")
+      out should not include "'&&Node'"
+
+      // The parser is why: the advice that used to be given cannot be typed.
+      err(node + "var r: &&Node = Node(1)") should include("newline expected")
+    }
+
     "'null' is not the empty weak reference, and the message says what is" in {
       err(node + "var w: weak Node = null") should include(
         "'null' is a raw pointer, and an empty weak Node is written 'None'")

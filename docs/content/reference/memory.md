@@ -306,6 +306,22 @@ live at the boundaries a program annotates and neither appears in a body.
 The conversion goes one way. A `weak T` is not a `&T` and never silently becomes one, because
 becoming one is the operation that can fail.
 
+**The `&` is in the mode already, so `weak &T` is the word said twice** — and it is refused rather
+than read as a weak edge to a box holding a reference, which is not a thing sysl has:
+
+```sysl
+struct Node
+    v: int
+end Node
+
+var r: &Node = Node(1)
+var w: weak &Node = r
+```
+
+```error
+'weak Node' is already a weak edge to a counted Node, so the '&' says the mode a second time — write 'weak Node'
+```
+
 **Reading one is a question, and it is `get()`.** The answer is `Option[&T]`: a live strong reference
 with a count taken for the caller, or `None`. Nothing else may be done to a weak reference — no field
 selection, no method call, no `==`:

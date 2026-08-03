@@ -263,6 +263,64 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
             |print(hail(o))""".stripMargin) shouldBe "hello, ed\n"
     }
 
+    /** A **multi-trait** bound is a list and every entry is asked separately, so an object meets it
+     * exactly when it meets each — which for a required trait it does, and for an unrelated one it
+     * does not. Both halves here, because the interesting failure would be a list answered by its
+     * first entry.
+     */
+    "a multi-trait bound is met entry by entry" in {
+      run(
+        shape +
+          """both[T: Shape + Display](x: T) -> int
+            |    print(x)
+            |    x.area()
+            |end both
+            |var o: &Shape = Rect(3, 4)
+            |print(both(o))""".stripMargin) shouldBe "a rect\n12\n"
+
+      err(
+        shape +
+          """trait Weighed
+            |    weight(self) -> int
+            |both[T: Shape + Weighed](x: T) -> int = x.area() + x.weight()
+            |var o: &Shape = Rect(3, 4)
+            |print(both(o))""".stripMargin) should
+        include("'both' requires its type parameter 'T' to implement 'Weighed', but &Shape does not")
+    }
+
+    /** A **weak** reference to an object does not satisfy the bound, and should not: a `weak` has to
+     * be upgraded before anything may be called through it, so the members the bound names are not
+     * available on the value as it stands. The rule keys on the two modes that carry a table, which
+     * is what makes this fall out rather than needing to be excluded.
+     */
+    "a weak reference to an object does not satisfy the bound" in {
+      err(
+        shape +
+          """area_of[T: Shape](x: T) -> int = x.area()
+            |var o: &Shape = Rect(3, 4)
+            |var w: weak Shape = o
+            |print(area_of(w))""".stripMargin) should
+        include("requires its type parameter 'T' to implement 'Shape'")
+    }
+
+    // The bound licenses behaviour and nothing about layout, so a body reaching for layout is refused
+    // at its definition whatever it is instantiated at — the object is not a special case of that.
+    "a bounded body may still not read a field, and the object changes nothing about it" in {
+      err(shape + "wide[T: Shape](x: T) -> int = x.w") should
+        include("'T' is a type parameter, so it has no fields to read")
+    }
+
+    // Recursion instantiates at a fixed set of arguments, so an object recurses like anything else.
+    "a bounded generic recurses at the object" in {
+      run(
+        shape +
+          """repeat[T: Shape](x: T, n: int) -> int
+            |    if n <= 0 then 0 else x.area() + repeat(x, n - 1)
+            |end repeat
+            |var o: &Shape = Rect(3, 4)
+            |print(repeat(o, 3))""".stripMargin) shouldBe "36\n"
+    }
+
     // The object is an ordinary argument, so it is an ordinary result too — the parameter appearing
     // in the return type is not a second question.
     "an object comes back out of a bounded function" in {

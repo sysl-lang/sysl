@@ -249,6 +249,16 @@ trait ExprAnalysis
     case _ if Type.erased(expected)     => eraseTo(t, expected)
     case r: Type.Ref if t.ty == r.inner => TBox(t, r).setPos(t.pos)
     case w: Type.Weak if t.ty == w.strong => TDowngrade(t, w).setPos(t.pos)
+
+    // The mode written twice — `weak &Node` against a `&Node`. `weak T` is *already* the weak edge
+    // to a counted `T`, so the value on the right is the right shape and the type on the left says
+    // the same word twice. What this must not do is fall into the case below and advise holding it
+    // in a `&&Node`, which is a spelling the parser does not take: advice that cannot be typed is
+    // worse than none, because the reader spends the time before finding that out.
+    case Type.Weak(inner: Type.Ref) if t.ty == inner =>
+      err(s"'weak ${show(inner.inner)}' is already a weak edge to a counted ${show(inner.inner)}, so " +
+        s"the '&' says the mode a second time — write 'weak ${Type.show(inner.inner)}'")
+
     case w: Type.Weak if t.ty == w.inner =>
       err(s"a weak reference does not keep ${show(w.inner)} alive, and nothing else here holds this " +
         s"one — so it would be gone before it could be read. Hold it in a '&${Type.show(w.inner)}' " +
