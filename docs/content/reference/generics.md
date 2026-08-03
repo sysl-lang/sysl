@@ -317,6 +317,49 @@ declaration — and what a body may then do with that parameter is what *its* bo
 does not run backwards through a bound: a parameter appearing only there is solved from the result type
 or annotated.
 
+### A bound asks for a type, so a trait object never satisfies one
+
+A bound is answered by looking up which types were given an `impl`. A trait object has *forgotten*
+which type it holds, so it is not among them — not even for its own trait:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Rect
+    w: int
+    h: int
+
+impl Shape for Rect
+    area(self) -> int = self.w * self.h
+
+total[T: Shape](x: T) -> int = x.area()
+
+var o: &Shape = Rect(3, 4)
+
+print(o.area())
+print(total(o))
+```
+
+```error
+'total' requires its type parameter 'T' to implement 'Shape', but &Shape does not
+```
+
+**The member is still reachable by name.** `o.area()` on the line above compiles and is one indirect
+call — the table is right there. What is unavailable is the *constraint*: an erased value passes
+through nothing that asks for a type. So the two spellings of "this thing is a `Shape`" part company
+at exactly the point a value stops knowing what it is.
+
+This is a consequence of [monomorphization](#monomorphization) rather than a gap in erasure. A
+generic is compiled once per concrete argument, and there is no concrete argument here; serving an
+object would mean a second body that dispatches indirectly, which is a different compilation
+strategy wearing the same syntax. The two ways to write one function over several types stay
+separate: a bound, resolved at compile time, or a `*Trait` parameter, resolved through a table.
+
+It follows for **required** traits without a rule of its own. `trait Shape: Display` puts `Display`'s
+slots in the object's table, and `print(o)` reaches them — but `show[T: Display](x: T)` will not take
+`o`, because the bound was never the thing that failed to propagate.
+
 ### A type's own parameters carry bounds too
 
 The same bracketed list, in the same place, means the same thing on a struct or an enum — and that is

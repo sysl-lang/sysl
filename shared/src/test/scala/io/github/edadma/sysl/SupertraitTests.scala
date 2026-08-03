@@ -37,6 +37,25 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       run(greet + "f[T: Greet](x: T) -> string = x.greet()\nprint(f(P(\"ed\")))") shouldBe "hello, ed\n"
     }
 
+    /** **Entailment**, which is a stronger claim than the two above and the one they read as if they
+     * had made. Licensing a *member* says the bound can reach `name` through `T`. This says the
+     * bound satisfies another **bound**: `T: Greet` is accepted where `U: Named` is asked for, so a
+     * requirement is a fact about `T` that the whole constraint system knows, not a lookup rule for
+     * member names.
+     *
+     * Worth its own test because the difference is invisible until something depends on it. A
+     * language could plausibly do the first and not the second — resolve `x.name()` by searching the
+     * requirement closure while leaving the bound tables ignorant of it — and every test above would
+     * still pass.
+     */
+    "and a bound on a required trait is satisfied by one on the trait that requires it" in {
+      run(
+        greet +
+          """g[U: Named](y: U) -> string = y.name()
+            |f[T: Greet](x: T) -> string = g(x)
+            |print(f(P("ed")))""".stripMargin) shouldBe "ed\n"
+    }
+
     // The point of a supertrait rather than a bound alias: the default body may use what the trait
     // required, because the trait itself made that promise.
     "a default body may call a required trait's method" in {

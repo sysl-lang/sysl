@@ -9,7 +9,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * And its members may assume no more than it asks — that is checked once, at the definition, which
  * is the asymmetry with a generic function that having somewhere to write the bound removes.
  */
-class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport {
+class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   private val show = "trait Show\n    show(self) -> string\n"
 
@@ -75,6 +75,33 @@ class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport {
     "and a trait object is not a type that implements the trait" in {
       err(s"${wrap}var w: Wrap[&Show] = Wrap(P(1))") should
         include("'Wrap' requires its type parameter 'T' to implement 'Show', but &Show does not")
+    }
+
+    /** The same refusal at a **generic function**, which is where a reader meets it, and stated on
+     * the object's *own* trait so that nothing else can be blamed for it.
+     *
+     * That last part is the point of the test. The refusal is easy to read as a gap in some
+     * neighbouring feature — a required trait not propagating, an erasure that dropped something —
+     * and it is neither: `&Show` fails a bound on `Show` itself, with no requirement in sight and
+     * every member present in the table. An object is not a type anything wrote an `impl` for, and a
+     * bound asks exactly that question. Reaching the member **by name** through the same value still
+     * works, and the first line is what says the two answers really do differ.
+     */
+    "which is a bound on its own trait, at a function, with the member still reachable by name" in {
+      val src =
+        s"""${show}struct R
+           |    v: int
+           |impl Show for R
+           |    show(self) -> string = "r"
+           |f[T: Show](x: T) -> string = x.show()
+           |var o: &Show = R(1)
+           |print(o.show())
+           |print(f(o))""".stripMargin
+
+      err(src) should include("'f' requires its type parameter 'T' to implement 'Show', but &Show does not")
+
+      // …and with the bounded call gone, the by-name reach through the object compiles and runs.
+      run(src.linesIterator.filterNot(_.contains("f(o)")).mkString("\n")) shouldBe "r\n"
     }
 
     // A type an implementation *covers* is told what that implementation asked of it, so the reader
