@@ -81,10 +81,9 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
   protected def artifact(): String = artifactOf(libraryRoot())
 
   protected def artifactOf(root: String): String = {
-    val out             = createTempFile("sysl-cli-", LibraryArtifact.extension)
-    val (status, notes) = diagnostics(Config(command = "build-lib", file = root, output = Some(out)))
+    val out = createTempFile("sysl-cli-", LibraryArtifact.extension)
 
-    withClue(notes)(status shouldBe 0)
+    succeeds(Config(command = "build-lib", file = root, output = Some(out)))
     out
   }
 
@@ -93,10 +92,8 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
    */
   protected lazy val core: String = {
     val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
-    val (status, notes) =
-      diagnostics(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true))
 
-    withClue(notes)(status shouldBe 0)
+    succeeds(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true))
     out
   }
 
@@ -109,6 +106,26 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
     val status = Console.withErr(captured)(cli(cfg))
 
     (status, captured.toString)
+  }
+
+  /** A run asserted to have succeeded, and one asserted to have been refused — both with the
+   * driver's diagnostics caught rather than let out onto the console.
+   *
+   * `build-lib` announces the artifact it wrote, and a refusal prints the reason it was refused; a
+   * suite made largely of those two says a great deal on stderr and none of it about the tests that
+   * ran. Nothing is lost by catching them, because it is the *failing* assertion that wants them:
+   * what was captured becomes the failure message, which is more than a bare status ever said.
+   */
+  protected def succeeds(cfg: Config): Unit = {
+    val (status, notes) = diagnostics(cfg)
+
+    withClue(notes)(status shouldBe 0)
+  }
+
+  protected def refused(cfg: Config): Unit = {
+    val (status, notes) = diagnostics(cfg)
+
+    withClue(notes)(status should not be 0)
   }
 
   /** A driver run with the program's own output captured — `run` prints what the child wrote, so
@@ -150,8 +167,10 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
    */
   protected def emitted(cfg: Config): String = {
     val captured = new java.io.ByteArrayOutputStream
+    val notes    = new java.io.ByteArrayOutputStream
+    val status   = Console.withOut(captured)(Console.withErr(notes)(driver(cfg)))
 
-    Console.withOut(captured)(driver(cfg)) shouldBe 0
+    withClue(notes.toString)(status shouldBe 0)
     captured.toString
   }
 

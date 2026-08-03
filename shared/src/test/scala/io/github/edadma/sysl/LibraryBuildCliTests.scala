@@ -38,7 +38,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       // an extension that did not match `--lib`'s test would make the two halves disagree.
       val root = libraryRoot()
 
-      cli(Config(command = "build-lib", file = root)) shouldBe 0
+      succeeds(Config(command = "build-lib", file = root))
 
       val expected = Project.basename(root) + LibraryArtifact.extension
 
@@ -47,7 +47,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     }
 
     "refuses a root holding no source rather than writing an empty artifact" in {
-      cli(Config(command = "build-lib", file = createTempDirectory("sysl-cli-empty-"))) should not be 0
+      refused(Config(command = "build-lib", file = createTempDirectory("sysl-cli-empty-")))
     }
 
     "takes the archiver it is told to use" in {
@@ -60,7 +60,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
 
       val out = createTempFile("sysl-cli-named-ar-", LibraryArtifact.extension)
 
-      cli(Config(command = "build-lib", file = libraryRoot(), output = Some(out), ar = Some(ar))) shouldBe 0
+      succeeds(Config(command = "build-lib", file = libraryRoot(), output = Some(out), ar = Some(ar)))
 
       LibraryArtifact.metadataOf(out, readBytes(out)) should matchPattern { case Right(_) => }
     }
@@ -86,7 +86,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
 
       val out = s"$root/out${LibraryArtifact.extension}"
 
-      cli(Config(command = "build-lib", file = root, output = Some(out))) should not be 0
+      refused(Config(command = "build-lib", file = root, output = Some(out)))
       isFile(out) shouldBe false
     }
   }
@@ -234,7 +234,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
 
       val out = createTempFile("sysl-cli-two-c-", LibraryArtifact.extension)
 
-      cli(Config(command = "build-lib", file = root, output = Some(out))) shouldBe 0
+      succeeds(Config(command = "build-lib", file = root, output = Some(out)))
 
       Ar.members(readBytes(out)) match
         case Right(members) => members.map(_.name) should contain allOf ("one.util.o", "two.util.o")
@@ -429,7 +429,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
 
       val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
 
-      cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
+      succeeds(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true))
 
       LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _, Target.default)) match
         case Right((trees, syms, fingerprint)) =>
@@ -459,9 +459,8 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       // The one combination that cannot mean anything: the declarations being compiled are the ones
       // the artifact holds. Refused before the artifact is even read — ignoring it would leave a
       // command line reading as though it were used, which is the failure worth preventing.
-      cli(Config(command = "build-lib", file = CoreLib.root.get, core = true,
+      refused(Config(command = "build-lib", file = CoreLib.root.get, core = true,
         coreLib = Some(s"${createTempDirectory("sysl-cli-core-")}/any${LibraryArtifact.extension}")))
-        .should(not be 0)
     }
 
     "and without it the same root is refused, because the module is the library's" in {
@@ -473,7 +472,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
 
       deleteFile(out)
-      cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out))) should not be 0
+      refused(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out)))
       isFile(out) shouldBe false
     }
   }

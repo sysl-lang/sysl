@@ -53,7 +53,7 @@ trait BindingSupport extends LibraryCliSupport {
   protected lazy val bound: String = {
     val out = createTempFile(s"sysl-$binding-", LibraryArtifact.extension)
 
-    cli(Config(command = "build-lib", file = bindingRoot.get, output = Some(out))) shouldBe 0
+    succeeds(Config(command = "build-lib", file = bindingRoot.get, output = Some(out)))
     out
   }
 

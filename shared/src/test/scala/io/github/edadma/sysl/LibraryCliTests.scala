@@ -34,19 +34,19 @@ class LibraryCliTests extends LibraryCliSupport {
     "compiles a program against it" in {
       val prog = program("print(demo.double(21))\nprint(demo.larger(3, 7))")
 
-      cli(Config(command = "emit-llvm", file = prog, libs = List(artifact()))) shouldBe 0
+      succeeds(Config(command = "emit-llvm", file = prog, libs = List(artifact())))
     }
 
     "runs one, with the precompiled body linked from the artifact" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      cli(Config(command = "run", file = program("print(demo.double(21))"), libs = List(artifact()))) shouldBe 0
+      succeeds(Config(command = "run", file = program("print(demo.double(21))"), libs = List(artifact())))
     }
 
     "takes a source root just as well, which is the other shape of the same flag" in {
       val prog = program("print(demo.double(21))")
 
-      cli(Config(command = "emit-llvm", file = prog, libs = List(libraryRoot()))) shouldBe 0
+      succeeds(Config(command = "emit-llvm", file = prog, libs = List(libraryRoot())))
     }
 
     "leaves no unpacked object behind" in {
@@ -61,7 +61,7 @@ class LibraryCliTests extends LibraryCliSupport {
 
       val before = listFiles(tempDir).count(_.contains("sysl-lib-"))
 
-      cli(Config(command = "run", file = program("print(demo.double(1))"), libs = List(artifact())))
+      succeeds(Config(command = "run", file = program("print(demo.double(1))"), libs = List(artifact())))
 
       listFiles(tempDir).count(_.contains("sysl-lib-")) shouldBe before
     }
@@ -111,37 +111,36 @@ class LibraryCliTests extends LibraryCliSupport {
     "and runs, which is what says both object halves reached the linker" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      cli(Config(command = "run", file = program("print(demo.double(21) + extra.triple(2))"),
-        libs = List(artifact(), artifactOf(rootOf("extra", other))))) shouldBe 0
+      succeeds(Config(command = "run", file = program("print(demo.double(21) + extra.triple(2))"),
+        libs = List(artifact(), artifactOf(rootOf("extra", other)))))
     }
   }
 
   "--lib pointed at something that is not an artifact" - {
 
     "refuses a file that is not one of ours" in {
-      cli(Config(command = "emit-llvm", file = program("print(1)"),
-        libs = List(corrupt("not a library\n".getBytes)))) should not be 0
+      refused(Config(command = "emit-llvm", file = program("print(1)"),
+        libs = List(corrupt("not a library\n".getBytes))))
     }
 
     "refuses one built by a different compiler" in {
-      cli(Config(command = "emit-llvm", file = program("print(1)"),
-        libs = List(corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)))) should not be 0
+      refused(Config(command = "emit-llvm", file = program("print(1)"),
+        libs = List(corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes))))
     }
 
     "refuses a truncated one" in {
-      cli(Config(command = "emit-llvm", file = program("print(1)"),
-        libs = List(corrupt(truncated)))) should not be 0
+      refused(Config(command = "emit-llvm", file = program("print(1)"),
+        libs = List(corrupt(truncated))))
     }
 
     "refuses one that is not there at all" in {
-      cli(Config(command = "emit-llvm", file = program("print(1)"),
+      refused(Config(command = "emit-llvm", file = program("print(1)"),
         libs = List(s"${createTempDirectory("sysl-cli-gone-")}/absent${LibraryArtifact.extension}")))
-        .should(not be 0)
     }
 
     "refuses a source root holding no sysl files" in {
-      cli(Config(command = "emit-llvm", file = program("print(1)"),
-        libs = List(createTempDirectory("sysl-cli-empty-lib-")))) should not be 0
+      refused(Config(command = "emit-llvm", file = program("print(1)"),
+        libs = List(createTempDirectory("sysl-cli-empty-lib-"))))
     }
 
     "reports a link that fails rather than falling over cleaning up after it" in {
@@ -157,7 +156,7 @@ class LibraryCliTests extends LibraryCliSupport {
       val junk = corrupt(FakeAr(LibraryArtifact.codeMember -> "not an object file".getBytes,
         LibraryArtifact.metadataMember -> LibraryArtifact.frame("0\n")))
 
-      cli(Config(command = "run", file = program("print(1)"), libs = List(junk))) should not be 0
+      refused(Config(command = "run", file = program("print(1)"), libs = List(junk)))
     }
   }
 
@@ -242,7 +241,7 @@ class LibraryCliTests extends LibraryCliSupport {
 
         val where = s"${createTempDirectory("sysl-cli-found-")}/core${LibraryArtifact.extension}"
 
-        cli(Config(command = "build-lib", file = CoreLib.root.get, core = true, coreSearch = where)) shouldBe 0
+        succeeds(Config(command = "build-lib", file = CoreLib.root.get, core = true, coreSearch = where))
         isFile(where) shouldBe true
 
         val (status, notes) =
@@ -368,8 +367,8 @@ class LibraryCliTests extends LibraryCliSupport {
       // this is the path the compiler's own unit tests take and the bootstrap took.
       val nowhere = s"${createTempDirectory("sysl-cli-bare-")}/core${LibraryArtifact.extension}"
 
-      cli(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
-        coreSearch = nowhere)) shouldBe 0
+      succeeds(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
+        coreSearch = nowhere))
 
       // Nothing was written, where the same run without the flag would have built one there.
       isFile(nowhere) shouldBe false
@@ -429,9 +428,8 @@ class LibraryCliTests extends LibraryCliSupport {
       // Two spellings a character apart, so a typo lands here. Refused rather than resolved by
       // precedence: either precedence discards half of what the command line asked for, silently.
       // The path names nothing, which says the refusal comes before the artifact is read.
-      cli(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
+      refused(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
         coreLib = Some(s"${createTempDirectory("sysl-cli-both-")}/any${LibraryArtifact.extension}")))
-        .should(not be 0)
     }
   }
 
@@ -527,7 +525,7 @@ class LibraryCliTests extends LibraryCliSupport {
       val lib  = artifactOf(rootOf("demo", withDefault))
       val prog = program("import demo.*\n\nvar x = 7\nprint(x.scaled())")
 
-      cli(Config(command = "run", file = prog, libs = List(lib))) shouldBe 0
+      succeeds(Config(command = "run", file = prog, libs = List(lib)))
     }
 
     // The neighbouring determinism, which is the weaker half of `CoreArtifactTests`' "one library
@@ -559,7 +557,7 @@ class LibraryCliTests extends LibraryCliSupport {
       val lib  = artifactOf(rootOf("demo", withDefault.replace("private tripled", "tripled")))
       val prog = program("import demo.*\n\nvar x = 7\nprint(x.scaled())")
 
-      cli(Config(command = "run", file = prog, libs = List(lib))) shouldBe 0
+      succeeds(Config(command = "run", file = prog, libs = List(lib)))
     }
 
     // The other direction through the same seam: the library calls its *own* default, and the
