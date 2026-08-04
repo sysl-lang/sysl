@@ -781,6 +781,12 @@ never make: a rebuild compiles against *this* library, from the sources the comp
 the same fingerprint on the way back in. Nothing is substituted, so there is nothing to be misled
 about.
 
+The default path is keyed by a fingerprint of the library, so every compilation of the same library
+on the machine finds the same artifact — and a rebuild therefore **publishes by rename**: it is
+assembled beside its destination and moved onto it. Two builds may run at once; a reader gets the
+whole of one artifact or the whole of the other, and a rebuild that fails leaves the one that was
+already there.
+
 An artifact **named** on the command line is never rebuilt, and one that cannot be read stops the
 compilation — corrupt, truncated, built by another sysl, or built from other sources. Someone who
 wrote down which standard module to compile against is owed the truth about that one.

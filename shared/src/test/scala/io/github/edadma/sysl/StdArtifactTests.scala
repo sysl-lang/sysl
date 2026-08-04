@@ -584,5 +584,42 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
 
       exists(out) shouldBe false
     }
+
+    "and a build that fails leaves the artifact that was already there readable" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+      assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
+
+      // A program that runs, is given the archiver's arguments, and writes nothing — which is the
+      // only way to fail at the *archive* step, since an archiver that cannot run at all is caught
+      // by the search before a single member is compiled.
+      val inert = List("/usr/bin/true", "/bin/true").find(exists)
+
+      assume(inert.isDefined, "no do-nothing program to stand in for an archiver")
+
+      val dir = createTempDirectory("sysl-write-")
+      val out = s"$dir/std${LibraryArtifact.extension}"
+
+      Stdlib.writeArtifact(out, Target.default) shouldBe Right(())
+
+      val was = readBytes(out).toList
+
+      // The artifact at the default path is *shared* — it is named by a fingerprint of the library,
+      // so every compilation of the same library on the machine names the same file, and separate
+      // worktrees at one commit name it at the same time. Assembling in place would mean `ar`
+      // truncating that file before it wrote, so a rebuild that then failed would take a working
+      // artifact with it and a reader arriving mid-build would find half an archive.
+      Stdlib.writeArtifact(out, Target.default, inert) match
+        case Right(_)  => fail("an archiver that produced no archive should not have reported success")
+        case Left(err) => err should include(out)
+
+      readBytes(out).toList shouldBe was
+
+      // And the half-built one is not left lying beside it under whatever name it was assembled
+      // under: the artifact is the only thing either run put in this directory.
+      listFiles(dir).map(Project.basename) shouldBe List(Project.basename(out))
+
+      deleteFile(out)
+      deleteFile(dir)
+    }
   }
 }

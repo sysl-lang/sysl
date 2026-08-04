@@ -138,6 +138,15 @@ object Stdlib {
    *
    * `ar` names the archiver where it is somewhere a search would not look, exactly as `--ar` does;
    * given none, the search runs.
+   *
+   * **The archive is assembled under another name and renamed onto `out`**, which is what makes the
+   * default path safe to share. Two compilations of the same library compute the same fingerprint
+   * and so name the same artifact, and there is nothing keeping them apart: separate worktrees at
+   * one commit, or two runs of the same suite. `ar` truncates its output before it writes, so a
+   * build that wrote in place would leave every concurrent reader a file that is briefly absent and
+   * then briefly half an archive. Published by rename, a reader sees the whole of the previous
+   * artifact or the whole of the new one — and a build that fails leaves the one that was already
+   * there, rather than deleting a working artifact on its way to not producing one.
    */
   def writeArtifact(out: String, target: Target, ar: Option[String] = None): Either[String, Unit] =
     for
@@ -150,15 +159,32 @@ object Stdlib {
 
                     Project.parentOf(out).foreach(createDirectories)
 
+                    // Beside its destination rather than in the staging directory, because a rename
+                    // is only a rename within one filesystem and the system's temporary directory
+                    // need not be on the same one as the cache. The unique part of the name is the
+                    // staging directory's own, which the system has already made unique — two
+                    // builds racing for one artifact must not agree on a pending name either, or
+                    // one of them would publish the other's half-written archive.
+                    val pending = s"$out.${Project.basename(staging)}"
+
                     val outcome =
                       for
                         _ <- Toolchain.compileObject(built._1, code, target)
                         _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(built._2, target), metadata, target)
-                        _ <- Toolchain.archive(List(code, metadata), out, archiver)
+                        _ <- Toolchain.archive(List(code, metadata), pending, archiver)
+                        _ <- publish(pending, out)
                       yield ()
 
-                    List(code, metadata, staging).foreach(Project.discard)
+                    List(code, metadata, staging, pending).foreach(Project.discard)
                     outcome
                   }
     yield ()
+
+  /** The rename itself, as an answer rather than an exception: everything else in the build reports
+   * what went wrong by returning it, and a full disk or a read-only cache directory is the ordinary
+   * way this step fails.
+   */
+  private def publish(pending: String, out: String): Either[String, Unit] =
+    try Right(moveFile(pending, out))
+    catch case e: Exception => Left(s"cannot put the standard module at $out: ${e.getMessage}")
 }
