@@ -178,6 +178,22 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .nativeSettings(
 //    libraryDependencies += "io.github.cquiroz" %%% "scala-java-time" % "2.7.0",
     libraryDependencies += "org.scala-js" %% "scalajs-stubs" % "1.1.0" % "provided",
+    // The binary that gets installed is built in release mode; the one built while developing is
+    // not. Scala Native defaults to debug, and that default is the right one here — a link is
+    // seconds rather than minutes, and nothing about this project is iterated on from Native
+    // anyway (the JVM build is the development loop). But an installed compiler is run by people
+    // who did not build it, and shipping the unoptimized link would make sysl look slow for a
+    // reason that has nothing to do with sysl.
+    //
+    // Gated on the environment rather than made the default, so that asking for the slow, careful
+    // link is a deliberate act performed when cutting a release: `SYSL_RELEASE=1 sbt
+    // syslNative/nativeLink`.
+    nativeConfig ~= { c =>
+      if (sys.env.get("SYSL_RELEASE").contains("1"))
+        c.withMode(scala.scalanative.build.Mode.releaseFast)
+          .withLTO(scala.scalanative.build.LTO.thin)
+      else c
+    },
   )
   .jsSettings(
     jsEnv := new org.scalajs.jsenv.nodejs.NodeJSEnv(),
