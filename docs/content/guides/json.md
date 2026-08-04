@@ -55,7 +55,8 @@ perfectly well *in an expression*, and what it cannot do is be an array bound.
 
 **There was no growable collection.** An array and an object were each a linked list built by
 appending through the tail reference — honest for a tree of references, and not what the data is.
-Answered by [`Buf[T]`](/library/buf/) reaching the prelude: an array became a `&Buf[&Json]` and an
+Answered by [`Buf[T]`](/library/buf/) reaching the standard library — `sysl.buf`, which a program
+asks for by name rather than getting for nothing: an array became a `&Buf[&Json]` and an
 object a `&Buf[Field]`. That deleted two list-cell structs, both tail-threading loops, and the two
 recursive renderers.
 

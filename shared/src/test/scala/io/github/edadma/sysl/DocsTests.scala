@@ -34,6 +34,8 @@ class DocsTests extends AnyFreeSpec with DocsSupport with ParallelTestExecution 
     "docs/content/getting-started/_index.md"          -> (0, 0, 0),
     "docs/content/getting-started/installation.md"    -> (0, 0, 0),
     "docs/content/getting-started/first-program.md"   -> (1, 0, 1),
+    "docs/content/getting-started/cli.md"             -> (0, 0, 0),
+    "docs/content/getting-started/from-c.md"          -> (6, 3, 0),
     "docs/content/tour/_index.md"                     -> (0, 0, 0),
     "docs/content/tour/values.md"                     -> (7, 1, 0),
     "docs/content/tour/control-flow.md"               -> (10, 0, 0),

@@ -61,3 +61,6 @@ functions in a directory. The tour uses `run` throughout.
 
 The [tour](/tour/) starts here and builds up. It is meant to be read in order, and every program in
 it is one you can paste into a file and run.
+
+[The command line](/getting-started/cli/) is the other direction: the rest of the subcommands, the
+flags they share, and what each one leaves as an exit status. Nothing in the tour needs it.

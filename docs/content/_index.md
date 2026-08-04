@@ -36,6 +36,9 @@ The [tour](/tour/) is the way in: it starts at `print("Hello, sysl!")` and ends 
 reads its input, parses it, and reports what it found. It teaches the standard library alongside the
 language, because the two were designed together.
 
+If you write C, [coming from C](/getting-started/from-c/) is shorter: a map of what translates
+straight across, the six things that change shape, and the refusals a C program meets first.
+
 The [reference](/reference/) is for looking things up once you are writing sysl rather than reading
 about it: every construct in its own place, with the rules complete. The
 [standard library](/library/) is documented apart from it, because none of what ships beside the

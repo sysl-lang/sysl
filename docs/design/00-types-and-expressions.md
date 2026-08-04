@@ -985,10 +985,15 @@ work:
 - **Arbitrary-width integer details** (§5): ~~storage size and alignment of a standalone odd-width
   value~~ — **that half is settled, and settled by deferring to the target**: an odd-width value is
   stored the way LLVM stores it, aligned to the smallest named width at least as wide and strided to
-  that alignment, which is written into §5 above. What remains open is **the maximum permitted `N`**
-  (the back end stops at 128 today, which is a toolchain fact and not a ruling); whether `i1`/`u1`
-  are allowed and how they relate to `bool`; and whether packed structs lay out an `i5` field in
-  exactly 5 bits (the bitfield / hardware register payoff), since it is about a *field* rather than a
+  that alignment, which is written into §5 above. ~~Whether `i1`/`u1` are allowed~~ — **also settled,
+  and settled by having no exception**: §5 admits every `N ≥ 1`, so `u1` and `i1` are ordinary
+  members of the family and the compiler builds them like any other width. They lower to `i1`, which
+  is what `bool` lowers to as well, so the two are layout-compatible and distinct types — the
+  relationship `char` already has to `u32`. What remains open is **the maximum permitted `N`** (the
+  back end stops at `2^23 - 1`, which is a toolchain fact and not a ruling — the language has never
+  said what a *program* should be allowed to want); what, if anything, should connect `u1` to `bool`
+  beyond that shared representation; and whether packed structs lay out an `i5` field in exactly 5
+  bits (the bitfield / hardware register payoff), since it is about a *field* rather than a
   standalone value.
 - **Storage declared at a required alignment**, the sibling of the packed question above and the
   direction nothing covers: `packed` would lower a struct's alignment, and there is no way to *raise*
