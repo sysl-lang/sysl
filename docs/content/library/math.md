@@ -739,14 +739,27 @@ It answers a [result list](/reference/declarations/) and not a tuple, because th
 callee to caller and nothing afterwards needs to hold the two together. A caller that *does* need to
 hold them writes the tuple itself.
 
-That is also why the program above puts the call inside a function. A binding naming several things
-is a **local** form — its parts have nowhere to write a type — so one at the top of a file is
-refused rather than becoming a quiet local of the entry point:
+A binding naming several things is a **local** form — its parts have nowhere to write a type — so the
+top of a program, which is a body, takes one exactly as a function does:
 
 ```sysl
 import sysl.math.divmod
 
 val q, r = divmod(17, 5)
+
+print(q, r)
+```
+
+```output
+3 2
+```
+
+Asking for the module's storage instead is what has nowhere to put the types, and is refused:
+
+```sysl
+import sysl.math.divmod
+
+static val q, r = divmod(17, 5)
 
 print(q, r)
 ```

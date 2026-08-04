@@ -447,9 +447,11 @@ restriction is on the directory graph, never on how a module's own files refer t
 A top-level **statement** is not a declaration. A declaration is hoisted and belongs to the module as
 a whole; a statement runs, and running happens in an order — and a module's files have no order at
 all, being one unordered scope. So **one file of a program carries the statements it runs**, and a
-second that carries any is an error naming both.
+second that carries any is an error naming both. That file is the program's **entry file**, and its
+top level is a **body**: what it declares is local to it, which the section below is about.
 
-A program may also declare `main`, which runs **after** those statements:
+**A program starts in one place.** Statements at the top of a file and a `main` are two ways of
+writing that place, so a program that writes both is refused:
 
 ```sysl
 print("initialization")
@@ -458,14 +460,24 @@ main(args: []string)
     print("then main, with", args.len, "argument")
 ```
 
-```output
-initialization
-then main, with 1 argument
+```error
+a program starts in one place, and this 'main' is a second — whichever of the two the program means, the other belongs inside it
 ```
 
-Both halves are real and neither replaces the other. The top-level statements are the program's
-**initialization**: they are where a top-level `var` lives, and they are what the `val` order below is
-settled against. `main` is what runs once that is done.
+Whichever of the two the program means, the other belongs inside it. What a `main` has that statements
+do not is a parameter list, so a program that wants the arguments writes `main` and puts inside it what
+it would otherwise have written above:
+
+```sysl
+main(args: []string)
+    print("initialization")
+    print("then the work, with", args.len, "argument")
+```
+
+```output
+initialization
+then the work, with 1 argument
+```
 
 **What `main` gets at that a statement cannot is the arguments.** A statement has nowhere to receive
 them — it is not a call, so it has no parameter list, and a program's arguments are not a module-level
@@ -525,10 +537,11 @@ accident. Until it is decided, a program that must choose its status calls `exit
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to, which
 is what it should compile to — a library is not an error.
 
-### A top-level `var` is a local of the entry point
+### The entry file is a body, and what it declares is local to it
 
-It is scoped to the entry point and initialized in its order, and it is **not a member of the module**
-— so a function declared in the same file cannot see it:
+`val` and `var` at the top of the entry file are **locals**: initialized where they are written, in
+the order the statements around them run. A function declared there is a **nested function**
+([functions](../functions/)), so it reads and writes the bindings above it with nothing passed in:
 
 ```sysl
 var counter = 0
@@ -537,19 +550,50 @@ bump()
     counter += 1
 
 bump()
+bump()
 
 print(counter)
 ```
 
-```error
-undefined name 'counter'
+```output
+2
 ```
 
-**There is no module-level `var`, when there is a module-level `val`**, and the reason is that the
-keyword is taken. Every program that writes statements at the top of a file already uses `var` there
-to mean a local of the entry point, and redefining it as a module member would not fail to compile —
-it would silently change name resolution, those bindings becoming visible to every function in the
-module. That is a breaking change that still builds, which is the worst kind.
+That is the whole point of the arrangement, and it is what a script wants: a sequence that is a
+sequence. A `val` bound from what the statements above it produced is ordinary here, and could never
+be a module member — a module member is bound before any statement runs.
+
+**A helper pays nothing for this unless it uses it.** Whether a function at the top of the entry file
+belongs to the body is settled by whether it reads one of the body's bindings. One that reads none is
+an ordinary module function: generic if it says so, addressable, passable as a value, and reachable
+from another file. Only one that reads a binding is nested, and only that one takes the nested
+function's limits.
+
+### `static` — asking for the module instead
+
+A `val` or `var` in the entry file that should be the **module's** says so:
+
+```sysl
+static val table: [3]int = [1, 2, 3]
+
+sum() -> int = table[0] + table[1] + table[2]
+
+print(sum())
+```
+
+```output
+6
+```
+
+It is then hoisted, laid into the object file, visible to every file of the module, and initialized
+before any statement runs — which is also why its initializer may not call a helper that reads the
+body: at that moment there is no body yet.
+
+**`static` is meaningful only in the entry file**, since only that file has a body for a declaration
+to *not* belong to. In a file with a `module` header, or a headerless file carrying no statements,
+everything is the module's already and the modifier is refused rather than ignored. A function never
+takes it either: settled by what it reads, the modifier would be redundant on one and impossible on
+the other.
 
 ## `const` — a value
 
@@ -661,13 +705,14 @@ passed as an argument before it can be named.
 
 ## `val` — a thing
 
-A **`val` is a thing, where a `const` is a value.** Written at the top of a file it is a module member
-— read-only storage that exists for the whole run — and written inside a block it is a local, the
-immutable counterpart of `var`, in the same frame with the same lifetime. One keyword at both levels,
-because it is one idea at both.
+A **`val` is a thing, where a `const` is a value.** As a module member it is read-only storage that
+exists for the whole run; as a local it is the immutable counterpart of `var`, in the same frame with
+the same lifetime. One keyword at both levels, because it is one idea at both — and which one it is
+follows the file it is written in: the module's everywhere except the entry file, whose top level is a
+body, and where `static` asks for the member.
 
 ```sysl
-val order: [8]usize = [3usize, 1usize, 4usize, 1usize, 5usize, 9usize, 2usize, 6usize]
+static val order: [8]usize = [3usize, 1usize, 4usize, 1usize, 5usize, 9usize, 2usize, 6usize]
 
 at(i: usize) -> usize = order[i]
 
@@ -710,7 +755,7 @@ value at compile time for a pattern to compare against, and the diagnostic names
 instead:
 
 ```sysl
-val limit: usize = 4
+static val limit: usize = 4
 
 check(n: usize) -> string
     n match

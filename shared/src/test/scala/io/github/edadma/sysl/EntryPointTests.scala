@@ -25,7 +25,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |    print("main")
             |
             |print("statements")
-            |""".stripMargin) should include("already carries the statements this one starts with")
+            |""".stripMargin) should include("this 'main' is a second")
     }
 
     "a main with nothing above it still runs" in {
@@ -56,7 +56,7 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |
             |main()
             |    print(count)
-            |""".stripMargin) should include("already carries the statements this one starts with")
+            |""".stripMargin) should include("this 'main' is a second")
     }
 
     // `main` is renamed on the way out, because the symbol it is written as is the one the platform

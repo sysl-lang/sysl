@@ -38,24 +38,23 @@ A top-level *statement* is not a declaration. A declaration is hoisted and belon
 whole; a statement runs, and running happens in an order — so **one file of a program carries the
 statements it runs**, and a second that carries any is an error naming both.
 
-A program may also declare `main`, which runs after those statements:
+That file is the program's **entry file**, and its top level is a **body**: a `val` or `var` there is
+a local initialized where it stands, and a function there reads the bindings above it.
+
+A program may instead declare `main`, which is the other way of writing the place a program starts:
 
 ```sysl
-print("initialization first")
-
 main(args: []string)
-    print("then main, with", args.len, "argument")
+    print("the work runs here, with", args.len, "argument")
 ```
 
 ```output
-initialization first
-then main, with 1 argument
+the work runs here, with 1 argument
 ```
 
-Both halves are real and neither replaces the other. The top-level statements are the program's
-**initialization** — they are where a top-level `var` lives. `main` is what runs once that is done,
-and what it gets at that a statement cannot is **the arguments**: a statement has nowhere to receive
-them, because it is not a call and has no parameter list.
+**A program starts in one place**, so it writes one or the other and never both. What `main` gets at
+that a statement cannot is **the arguments**: a statement has nowhere to receive them, because it is
+not a call and has no parameter list.
 
 A program in which no file carries a statement is a complete program that does nothing. That is what
 a tree of pure declarations compiles to, which is what it should compile to — a library is not an

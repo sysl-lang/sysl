@@ -45,7 +45,7 @@ sysl's signatures were already explicit for other reasons.
 
 ```sysl
 const Limit: int = 3
-val Scale: int = 2
+static val Scale: int = 2
 
 show()
     var count = 0
@@ -63,8 +63,10 @@ show()
 1 6 sysl 3
 ```
 
-The two `val`s in that program are one keyword doing one thing: the one at file scope is visible
-outside it and says `: int`, and the one inside `show` is visible to nobody and does not have to.
+The two `val`s in that program are one keyword doing one thing: the module member says `: int`
+because it is visible outside its file, and the one inside `show` is visible to nobody and does not
+have to. The `static` is what asks for the member — this is the file the program starts in, so a plain
+`val` there would be a local of its body, and a local infers exactly as a `var` does.
 
 **A module-level `val` holds nothing that owes a release.** There is one thing true of module storage
 and of no other storage: it exists for the whole run and is therefore never let go of, so a count
@@ -72,7 +74,7 @@ taken in one is a count with no line to write the release on. A `&T`, a `weak T`
 refused for that reason, and so is a `string` the program **builds**:
 
 ```sysl
-val name: string = str(2026)
+static val name: string = str(2026)
 
 print(name)
 ```

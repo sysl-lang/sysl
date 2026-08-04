@@ -17,26 +17,23 @@ foreign types are named in one place instead of in every program that wants its 
 
 ## Where it is actually called
 
-A program's top-level statements are its entry point and go on being that. What a declared `main`
-adds is a **named place** for the work those statements would otherwise do, plus the one thing the
-statements cannot get at — the arguments the program was started with.
+A program's top-level statements are its entry point, and a declared `main` is the other way of
+writing that same place — one that has the thing statements cannot get at: the arguments the program
+was started with. A program starts in **one** place, so it writes one or the other, and a program that
+wants its arguments puts inside `main` what it would otherwise have written above.
 
 ```sysl
-print("top-level runs first")
-
 main(args: []string)
-    print("main runs after", args.len)
+    print("the work runs here, with", args.len, "argument")
 ```
 
 ```output
-top-level runs first
-main runs after 1
+the work runs here, with 1 argument
 ```
 
-So `main` is **additive**: the statements run first, in the order they were written, and `main` runs
-after them. And declaring it with a parameter is the whole of what asks for the conversion — the
-entry point the compiler lays out is what calls `args_of`, which is why a program that reads its
-arguments still contains no mention of this module.
+Declaring it with a parameter is the whole of what asks for the conversion — the entry point the
+compiler lays out is what calls `args_of`, which is why a program that reads its arguments still
+contains no mention of this module.
 
 The count is `1` above because the program was started with no arguments of its own. Element zero is
 always there, and it is the program's own path — the same convention C has, and the reason a loop

@@ -107,6 +107,16 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
       ) shouldBe "2\n"
     }
 
+    // The one-line `=` form works here as it does anywhere, assignment included — so a helper whose
+    // whole body writes a binding above it needs no indented block.
+    "and the one-line '=' form writes one just as well" in {
+      run("""var count = 0
+            |bump() = count += 1
+            |bump()
+            |bump()
+            |print(str(count))""".stripMargin) shouldBe "2\n"
+    }
+
     // Names hoist, captures do not (`12 §5a`). Two helpers may call each other whichever order they
     // are written in, which is what makes the group a group.
     "while two of them call each other, whichever order they are written in" in {
@@ -183,7 +193,7 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
         """var count = 0
           |main()
           |    print(count)""".stripMargin,
-      ) should include("already carries the statements this one starts with")
+      ) should include("this 'main' is a second")
     }
 
     "and neither may one that only calls such a helper" in {
@@ -215,6 +225,23 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
           |print(str(n))""".stripMargin,
       ) should include("undefined function 'helper'")
     }
+  }
+
+  /** Module storage that may be **written** is a different thing from a `static val`, and not built:
+    * whether it may hold a value that owes a release, what `&` of it means, and what a `@pure`
+    * function may do with it are its questions and not this one's.
+    *
+    * It is refused at the spelling rather than left to fail as an unbound name, which is what it did
+    * while the parser took the word and nothing registered the storage.
+    */
+  "a 'static var' says what is not built, rather than failing as an unknown name" in {
+    err(
+      """static var ticks: int = 0
+        |tick()
+        |    ticks += 1
+        |tick()
+        |print(str(ticks))""".stripMargin,
+    ) should include("module storage that may be *written* is not built yet")
   }
 
   "'static' says nothing anywhere else, and is refused rather than ignored" - {

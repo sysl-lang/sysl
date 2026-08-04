@@ -423,9 +423,11 @@ trait ProgramWalk
       m      <- f.body.collectFirst { case d: FuncDecl if d.name == "main" => d }
     do
       currentPos = m.pos
-      recover(())(err(s"a program starts in one place, and ${u.source.name} already carries the " +
-        "statements this one starts with — so this 'main' is a second. Whichever of the two the " +
-        "program means, the other belongs inside it"))
+      // The file's name goes last so that a page quoting this can quote the sentence and leave the
+      // name out — a name that is whatever the reader called their file, and never part of the point.
+      recover(())(err("a program starts in one place, and this 'main' is a second — whichever of the " +
+        "two the program means, the other belongs inside it. The statements this program starts " +
+        s"with are in ${u.source.name}"))
 
   private def declaredEntry(entry: Option[(Program, Scope)]): Option[TEntry] = {
     val declared = funcDecls.keys.filter(k => Modules.bare(k) == "main" && !externDecls.contains(k)).toList
