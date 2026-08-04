@@ -243,6 +243,12 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
    * `f[T: Iter[U], U: Display]` know that what `T`'s iterator yields is something printable. A bound
    * that reaches back around to the parameter it belongs to is broken by dropping that parameter's
    * own bounds one level in — the promise stays, and only the walk stops.
+   *
+   * **It must be called in the terms of the declaration whose parameters these are** — under an
+   * `inDecl` or an `inScope` for it — because a bound names a trait the way anything else does, and
+   * what a short name means is what the *declaring* file imported. Read from anywhere else the bound
+   * silently keeps the name as written, and the parameter goes on carrying a promise that no
+   * conformance check can match against the same bound resolved properly.
    */
   protected def abstractSubst(tparams: List[String], bounds: Map[String, List[BoundRef]]): Map[String, Type] = {
     def build(tp: String, seen: Set[String]): Type.Abstract =

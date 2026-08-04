@@ -188,6 +188,19 @@ class AssociatedGenericRunTests extends AnyFreeSpec with RunSupport {
 
       run(src) shouldBe "4\n"
     }
+
+    // Reached through `Self` from inside the type's own body, which is the spelling a member writes
+    // when it wants a sibling associated function without repeating the type's name.
+    "and a member reaches one through Self, at its own instantiation" in {
+      val src =
+        """struct Box[T]
+          |    v: T
+          |    of(x: T) -> Box[T] = Box(x)
+          |    twin(self) -> Box[T] = Self.of(self.v)
+          |print(Box(7).twin().v, Box("s").twin().v)""".stripMargin
+
+      run(src) shouldBe "7 s\n"
+    }
   }
 
   "it is an ordinary member in every other respect" - {

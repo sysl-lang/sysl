@@ -1,0 +1,103 @@
+module sysl.math.complex
+
+import sysl.math.Float
+
+// The operators a `Complex` answers to, and how it renders.
+//
+// They are here rather than in `complex.sysl` because they are `impl` blocks rather than members of
+// the type's own body -- the same split every type in the library makes, and the reason the file is
+// short while the one beside it is not.
+//
+// **Each of the four arithmetic operators is written twice: once for another complex number and once
+// for a real.** The complex numbers are a vector space over the reals, and scaling is the operation
+// a transform performs most often -- every sample of an inverse, every window function, every
+// spectrum read in decibels. `z * k` where `k` is a real is the same answer as `z * Complex(k, 0)`
+// and costs a quarter as much, so it is `Mul` at a second argument list rather than a second trait
+// (`02 § A trait may be implemented at more than one argument list`). Which of the two a `*` means is
+// settled by the type of its right operand.
+//
+// **There is no `Ord`.** The complex numbers are not ordered -- no order on them is compatible with
+// the arithmetic -- and `14 §2` keeps `Eq` and `Ord` independent traits precisely so that a type can
+// have the one without the other. There is nothing to opt out of.
+//
+// **There is no scalar on the left.** `2.0 * z` would need an `impl Mul[Complex[F]] for F`, which is
+// an implementation of a library trait for a built-in written by the module that owns neither -- and
+// it would be one implementation per width rather than one generic block, since `F` is a parameter
+// and not a type an `impl` may be written for. `z * 2.0` is the same product.
+
+impl[F: Float] Add for Complex[F]
+    add(self, rhs: Complex[F]) -> Complex[F] = Complex(self.re + rhs.re, self.im + rhs.im)
+
+impl[F: Float] Add[F] for Complex[F]
+    add(self, k: F) -> Complex[F] = Complex(self.re + k, self.im)
+
+impl[F: Float] Sub for Complex[F]
+    sub(self, rhs: Complex[F]) -> Complex[F] = Complex(self.re - rhs.re, self.im - rhs.im)
+
+impl[F: Float] Sub[F] for Complex[F]
+    sub(self, k: F) -> Complex[F] = Complex(self.re - k, self.im)
+
+impl[F: Float] Mul for Complex[F]
+    mul(self, rhs: Complex[F]) -> Complex[F] =
+        Complex(self.re * rhs.re - self.im * rhs.im, self.re * rhs.im + self.im * rhs.re)
+
+impl[F: Float] Mul[F] for Complex[F]
+    mul(self, k: F) -> Complex[F] = Complex(self.re * k, self.im * k)
+
+// **Smith's algorithm, and not `(ac + bd) / (c*c + d*d)`.**
+//
+// The textbook quotient computes the divisor's squared magnitude, which overflows to infinity for a
+// divisor whose parts are above the square root of the largest float and underflows to zero for one
+// below the square root of the smallest -- in both cases at operands whose quotient is perfectly
+// representable, and in both cases silently. Dividing the smaller part by the larger first keeps
+// every intermediate within a factor of two of the answer's own scale, which is the whole of the
+// trick and costs one comparison.
+//
+// **A zero divisor is a NaN and not an infinity**, which is the one place the complex quotient does
+// not follow the real one. Among the reals `1/0` runs off in the only direction there is; a complex
+// quotient has an argument as well as a magnitude, and a zero divisor fixes neither -- so there is
+// no complex number to answer with, and the value meaning exactly that is what comes back. A caller
+// that has a direction in mind knows it, and `is_zero` is the test.
+impl[F: Float] Div for Complex[F]
+    div(self, rhs: Complex[F]) -> Complex[F] =
+        if rhs.re.abs() >= rhs.im.abs() then scaled_by_re(self, rhs) else scaled_by_im(self, rhs)
+
+impl[F: Float] Div[F] for Complex[F]
+    div(self, k: F) -> Complex[F] = Complex(self.re / k, self.im / k)
+
+impl[F: Float] Neg for Complex[F]
+    neg(self) -> Complex[F] = Complex(-self.re, -self.im)
+
+impl[F: Float] Eq for Complex[F]
+    eq(self, rhs: Complex[F]) -> bool = self.re == rhs.re && self.im == rhs.im
+
+// `a+bi`, with the sign of the imaginary part written out and never a `+-`.
+//
+// **The field applies to the whole value and not to each part** (`14 §2`), so the three pieces are
+// gathered into a string first and padded once. Padding each piece would put spaces inside the
+// number.
+//
+// The bound is `Float + Display` rather than `Float`, because rendering a part means asking `F` for
+// its own rendering and `Float` does not require one. Both widths have it, so nothing a program can
+// reach is excluded -- the compound bound is what says why.
+impl[F: Float + Display] Display for Complex[F]
+    display(self, out: *Writer, fmt: FormatSpec) =
+        val negative = self.im < F.zero()
+        val magnitude = if negative then -self.im else self.im
+
+        display_str(str(self.re) + (if negative then "-" else "+") + str(magnitude) + "i", out, fmt)
+
+// The two halves of Smith's algorithm, told apart by which part of the divisor is the larger. Each
+// divides by that part first, so the ratio it forms is at most one and nothing along the way leaves
+// the scale of the answer.
+private scaled_by_re[F: Float](z: Complex[F], w: Complex[F]) -> Complex[F] =
+    val r = w.im / w.re
+    val d = w.re + w.im * r
+
+    Complex((z.re + z.im * r) / d, (z.im - z.re * r) / d)
+
+private scaled_by_im[F: Float](z: Complex[F], w: Complex[F]) -> Complex[F] =
+    val r = w.re / w.im
+    val d = w.re * r + w.im
+
+    Complex((z.re * r + z.im) / d, (z.im * r - z.re) / d)

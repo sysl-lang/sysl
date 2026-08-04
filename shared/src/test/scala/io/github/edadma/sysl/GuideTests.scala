@@ -110,11 +110,11 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
     )
   }
 
-  // The one program in the set that defines what `+` and `*` mean and then leans on the answer a
-  // few hundred thousand times. Nothing it checks was computed by itself: the transforms of an
-  // impulse, a constant and a cosine are known in closed form, four bins can be done on paper, and
-  // the rest came out of numpy.
-  "fft — arithmetic on a type of the program's own, and floats" in {
+  // The one program in the set that carries the definition its fast version is a rearrangement of
+  // and runs both. Nothing it checks was computed by itself either: the transforms of an impulse, a
+  // constant and a cosine are known in closed form, four bins can be done on paper, and the rest
+  // came out of numpy.
+  "fft — an algorithm checked against its own definition" in {
     val out = guide("fft")
 
     out should not include "FAIL"

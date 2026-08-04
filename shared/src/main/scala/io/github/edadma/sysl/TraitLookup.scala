@@ -38,6 +38,11 @@ trait TraitLookup extends MemberVisibility {
    *     resolved because one bound may name another of the block's parameters, and only the
    *     arguments a particular `Box` was made with say what that means. An unconditional block has
    *     `None`, which is what makes the ordinary case a lookup that asks nothing further.
+   *   - `scope` is the terms the block was **written** in, which is what a held-as-written bound has
+   *     to be resolved under. Whether a type conforms is asked wherever the trait is used, and a
+   *     bound naming a trait by a short name means what the *block's* file imported — so resolving
+   *     it where the question was asked reaches whatever that module happens to see, which for a
+   *     program that imported only the type is nothing at all.
    */
   protected case class TraitImpl(
       decl: ImplDecl,
@@ -46,6 +51,7 @@ trait TraitLookup extends MemberVisibility {
       alt: String,
       tparams: List[String],
       bounds: Option[(List[String], Map[String, List[BoundRef]])],
+      scope: Scope,
   )
 
   /** Every `impl Trait for Type` for one (trait name, the implementing type's **owner key**), in the
@@ -126,11 +132,30 @@ trait TraitLookup extends MemberVisibility {
    */
   protected var implsHoisted: Boolean = false
 
-  /** Type applications whose bounds could not be answered where they were written, each with the
-   * position to report it against. Drained once, as soon as the answer is available.
+  /** One type application whose bounds could not be answered where it was written: what was applied,
+   * to what, the bounds to hold it to, the position to report against — and **the terms the bounds
+   * were written in**.
+   *
+   * The scope is carried because the check is run later, from a walk that is nowhere near the file
+   * that wrote the bound. A bound names a trait the way anything else does, so resolving `[T: Scale]`
+   * from wherever the drain happens to be reaches whatever *that* module can see, which for an
+   * imported name is nothing at all — and a bound that resolved to nothing is compared against the
+   * same bound that resolved properly, so the type is told its own parameter is not bounded by the
+   * trait it is bounded by.
    */
-  protected val boundChecks =
-    mutable.ListBuffer.empty[(String, List[String], Map[String, List[BoundRef]], List[Type], Option[Pos])]
+  protected case class DeferredBound(
+      what: String,
+      tparams: List[String],
+      bounds: Map[String, List[BoundRef]],
+      targs: List[Type],
+      pos: Option[Pos],
+      scope: Scope,
+  )
+
+  /** Type applications whose bounds could not be answered where they were written. Drained once, as
+   * soon as the answer is available.
+   */
+  protected val boundChecks = mutable.ListBuffer.empty[DeferredBound]
 
   /** `impl` blocks whose trait requires other traits, each with the type it was written for and the
    * position to report against. Held for the same reason a bound is: the implementation that
@@ -156,7 +181,7 @@ trait TraitLookup extends MemberVisibility {
   ): Unit =
     if bounds.nonEmpty && tparams.length == targs.length then
       if implsHoisted then checkParamBounds(what, tparams, bounds, targs)
-      else boundChecks += ((what, tparams, bounds, targs, currentPos))
+      else boundChecks += DeferredBound(what, tparams, bounds, targs, currentPos, currentScope)
 
   /** Whether the type arguments a generic declaration was applied to implement what it asked of its
    * parameters — the one rule, wherever the parameters came from: a function's, an `impl` block's,
@@ -502,9 +527,12 @@ trait TraitLookup extends MemberVisibility {
         val subst = tps.zip(targs).toMap
 
         targs.length == tps.length &&
-        tps.zip(targs).forall { case (tp, arg) =>
+        // In the block's own terms, because the condition is the block's: a `[T: Display]` written in
+        // a library file means that file's `Display`, and this question is asked wherever the trait
+        // is used — in a program that may have imported neither.
+        inScope(ti.scope)(tps.zip(targs).forall { case (tp, arg) =>
           bounds.getOrElse(tp, Nil).forall(b => satisfies(resolveBound(b, subst ++ selfBinding(arg)), arg))
-        }
+        })
       }
     }
 
@@ -570,12 +598,15 @@ trait TraitLookup extends MemberVisibility {
         (tps, bounds) <- ti.bounds
         if targs.length == tps.length
         subst = tps.zip(targs).toMap
-        (arg, unmet) <- tps
+        // Read in the block's terms, as the condition itself is — so the name in the message is the
+        // one the block wrote resolved against the block's imports, and not a bare word this module
+        // happens not to know.
+        (arg, unmet) <- inScope(ti.scope)(tps
           .zip(targs)
           .flatMap((tp, a) =>
             bounds.getOrElse(tp, Nil).map(resolveBound(_, subst ++ selfBinding(a))).filterNot(satisfies(_, a))
               .map((a, _)))
-          .headOption
+          .headOption)
       yield s"the 'impl' that covers it asks '${unmet.show}' of ${show(arg)}, which does not implement it"
 
     wrongArgs.headOption.orElse(unmetCondition).orElse(tooWide(tr, t))

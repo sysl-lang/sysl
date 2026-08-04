@@ -164,9 +164,11 @@ trait ProgramWalk
     // signatures resolved above were read before the `impl` blocks below them were registered, so
     // the question was held rather than answered against a table still being filled.
     implsHoisted = true
-    for (name, tparams, bounds, targs, pos) <- boundChecks.toList do
-      currentPos = pos
-      recover(())(checkParamBounds(name, tparams, bounds, targs))
+    for b <- boundChecks.toList do
+      currentPos = b.pos
+      // In the terms the bound was written in, not in whatever the walk was last reading: a bound is
+      // a reference like any other, and a short name means what the file that wrote it imported.
+      inScope(b.scope)(recover(())(checkParamBounds(b.what, b.tparams, b.bounds, b.targs)))
     boundChecks.clear()
 
     // And whether each `impl` of a trait that requires others supplies those too, which is the same
@@ -700,13 +702,18 @@ trait ProgramWalk
       tparams.map(subst)
     }
 
+    // Each layout is built in **the declaring file's** terms, because a bound is a reference like
+    // any other and an `import` is what a short name means by. Reading `[T: Scale]` from anywhere
+    // else leaves the parameter carrying a bound that never resolved, which the instantiation then
+    // compares against the same bound resolved properly — and the type is told its own parameter is
+    // not bounded by the trait it is bounded by.
     for (n, d) <- structDecls if d.tparams.nonEmpty do
       currentPos = d.pos
-      recover(())(sandboxed(instantiateStruct(n, abstracts(d.tparams, d.bounds))))
+      inDecl(n)(recover(())(sandboxed(instantiateStruct(n, abstracts(d.tparams, d.bounds)))))
 
     for (n, d) <- enumDecls if d.tparams.nonEmpty do
       currentPos = d.pos
-      recover(())(sandboxed(instantiateEnum(n, abstracts(d.tparams, d.bounds))))
+      inDecl(n)(recover(())(sandboxed(instantiateEnum(n, abstracts(d.tparams, d.bounds)))))
   }
 
   /** One generic body, analyzed with each of its type parameters substituted by itself. */

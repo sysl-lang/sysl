@@ -74,9 +74,12 @@ trait SignatureVisibility extends TypeResolution {
    */
   protected def checkTraitSignatures(): Unit =
     for (key, t) <- traitDecls.toList do
-      val subst = abstractSubst(t.tparams, t.bounds) + (selfName -> abstractSelf)
-
       inDecl(key) {
+        // The parameters are read here rather than outside, because a bound on one of them names a
+        // trait in the terms of the file that wrote it: `[T: Scale]` under an `import` means the
+        // imported trait, and read from anywhere else means nothing at all.
+        val subst = abstractSubst(t.tparams, t.bounds) + (selfName -> abstractSelf)
+
         for m <- t.methods do
           recover(())(at(m.pos) {
             for p <- m.params do resolveType(p.typ, subst)
