@@ -33,6 +33,44 @@ class ConstTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pa
     }
   }
 
+  /** A constant is folded into its uses before the program runs, so there is nothing for one written
+    * inside a body to be folded *in* — it belongs to a module or to nowhere.
+    *
+    * The second assertion is the one with history. A block listed its constants among the names it
+    * binds, so that a use above a declaration could be told it was written too early — but nothing
+    * ever bound them, so every use of one got that sentence instead, from *below* the declaration as
+    * readily as from above it. The message named a mistake the program had not made.
+    */
+  "a constant belongs to a module, not to a block" - {
+    val inABody =
+      """f() -> int
+        |    const k: int = 7
+        |    k + 1
+        |
+        |print(str(f()))
+        |""".stripMargin
+
+    "so one written inside a function body is refused where it stands" in {
+      err(inABody) should include("a constant is a module member and is declared at the top level")
+    }
+
+    "and the use below it is never told the name was declared below it" in {
+      err(inABody) should not include "declared below this"
+    }
+
+    "the same inside a loop body, which is a block like any other" in {
+      err("""var i = 0
+            |while i < 2
+            |    const step: int = 1
+            |    i += step
+            |""".stripMargin) should include("a constant is a module member")
+    }
+
+    "while the one written at the top of the file is untouched" in {
+      run("const k: int = 7\nprint(str(k + 1))") shouldBe "8\n"
+    }
+  }
+
   "a constant is a value" - {
     "read in an expression" in {
       run("const n: int = 7\nprint(str(n + 1))") shouldBe "8\n"

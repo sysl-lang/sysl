@@ -39,13 +39,16 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // written above a declaration be told that rather than told the name stands for nothing.
     // Accumulated rather than replaced: a name bound further down an *enclosing* block is still one
     // this block was written above, and a body nested inside this one is written above it too.
+    // A `const` is deliberately absent: one written in a block is refused outright, so it binds
+    // nothing and a use of its name is genuinely undefined rather than written too early. Listing it
+    // here made every such use report that it was "declared below" — from above it and from below it
+    // alike, since the name was never bound at all.
     blockDeclares = savedDeclares ++ stmts.collect {
-      case VarDecl(n, _, _)      => List(n)
-      case ValDecl(n, _, _, _)   => List(n)
-      case RefDecl(n, _)         => List(n)
-      case MultiDecl(ns, _, _)   => ns
-      case PatternDecl(p, _, _)  => patternNames(p)
-      case ConstDecl(n, _, _, _) => List(n)
+      case VarDecl(n, _, _)     => List(n)
+      case ValDecl(n, _, _, _)  => List(n)
+      case RefDecl(n, _)        => List(n)
+      case MultiDecl(ns, _, _)  => ns
+      case PatternDecl(p, _, _) => patternNames(p)
     }.flatten
 
     try body
@@ -659,9 +662,14 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // one architecture's instructions and no record that there were others.
     case a: AsmStmt => List(analyzeAsm(a))
 
-    // A constant is a declaration that was hoisted and folded into its uses (`13 §7`), so where the
-    // walk meets one among the entry point's statements there is nothing left to run.
-    case _: ConstDecl => List(TExprStmt(TUnitLit()))
+    // A `const` written at the top of a file is hoisted and folded into its uses before anything
+    // runs, so it never reaches the statement walk — `ProgramWalk.entryPoint` filters it out with the
+    // other declarations. One that reaches here was written **inside a body**, where there is nothing
+    // to hoist it into, and is refused for the same reason the types below are.
+    case _: ConstDecl =>
+      err("a constant is a module member and is declared at the top level — it is folded into its " +
+        "uses before the program runs, so there is no block for one written here to belong to. A " +
+        "name bound to a value inside a body is a 'val'")
 
     // A function declared inside a body is a **nested function** (`12 §5a`), and the block's are
     // lowered together the first time one is reached — so the ones after it in the same block have
