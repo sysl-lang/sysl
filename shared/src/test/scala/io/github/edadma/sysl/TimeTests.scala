@@ -222,6 +222,23 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           """print(offset_text(Offset(330)), offset_text(Offset(-300)), offset_text(Offset(0)))""") shouldBe
         "+05:30 -05:00 Z\n"
     }
+
+    /** An instant renders without a zone being supplied, which is the one rendering here that could
+      * be mistaken for a conversion and is not: an offset of zero is what the count is measured
+      * from. It has to be the module's, because `Display` and `Instant` both belong to the library
+      * and coherence leaves no module outside it able to write the block — so a hole here would be a
+      * type nothing may ever render.
+      */
+    "an instant renders as its own UTC reading, and through Display" in {
+      run(
+        imp +
+          """var t = Instant(1772548200000000i64)
+            |
+            |print(instant_text(t))
+            |print(t, Instant(0i64))
+            |print(f"$t%25s|")""".stripMargin) shouldBe
+        "2026-03-03 14:30 Z\n2026-03-03 14:30 Z 1970-01-01 00:00 Z\n       2026-03-03 14:30 Z|\n"
+    }
   }
 
   "reading text back" - {
