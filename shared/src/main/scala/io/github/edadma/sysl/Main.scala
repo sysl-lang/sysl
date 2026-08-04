@@ -145,6 +145,12 @@ private[sysl] val parser = {
       cmd("targets")
         .action((_, c) => c.copy(command = "targets"))
         .text("list the machines sysl can build for"),
+      // A flag rather than a subcommand, because it is what somebody types before they know there
+      // are subcommands — and it satisfies `checkConfig` below by naming a command of its own, so
+      // `sysl --version` stands alone rather than being an option to something else.
+      opt[Unit]("version")
+        .action((_, c) => c.copy(command = "version"))
+        .text("print which build of sysl this is"),
       opt[Unit]("explain-escapes")
         .action((_, c) => c.copy(explainEscapes = true))
         .text("report every local array promoted to the heap, and the view that forced it"),
@@ -212,6 +218,7 @@ private[sysl] def parseArgs(own: Seq[String]): Option[Config] =
  * none of them is reachable from the compiler's own API.
  */
 private[sysl] def execute(cfg: Config): Int = {
+  if cfg.command == "version" then return printVersion()
   if cfg.command == "targets" then return listTargets()
 
   val sources =
@@ -558,6 +565,18 @@ private def readPackageConfig(file: String): Either[String, PackageConfig] = {
   else
     try PackageConfig.read(readFile(path))
     catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
+}
+
+/** Which build of sysl this is.
+ *
+ * On stdout rather than stderr, and alone on its line, because the first thing anyone does with a
+ * version is read it out of a script — and a bug report that quotes it is the reason it exists at
+ * all. The number comes from the build (`BuildInfo`), so a binary cannot claim a version it was not
+ * cut at.
+ */
+private def printVersion(): Int = {
+  stdout(s"sysl ${BuildInfo.version}\n")
+  0
 }
 
 /** The registry, as a reader of `sysl targets` sees it: the name to write, the LLVM triple it

@@ -99,6 +99,28 @@ lazy val embedCoreLibrary = Def.task {
   Seq(out)
 }
 
+// The version, carried into the compiler so that `sysl --version` can answer with it.
+//
+// Generated rather than hand-kept beside `ThisBuild / version`, for the reason the core library is:
+// two places holding one fact drift, and this one drifts *silently* — a binary that reports the
+// version before last is worse than one that reports none, since the whole use of the flag is telling
+// which build somebody has when they report something.
+lazy val embedVersion = Def.task {
+  val utf8 = java.nio.charset.StandardCharsets.UTF_8
+  val out  = (Compile / sourceManaged).value / "io" / "github" / "edadma" / "sysl" / "BuildInfo.scala"
+  val text =
+    s"""package io.github.edadma.sysl
+       |
+       |/** Generated from `version` by `build.sbt` -- do not edit. */
+       |private[sysl] object BuildInfo {
+       |  val version: String = "${version.value}"
+       |}
+       |""".stripMargin
+
+  if (!out.exists || IO.read(out, utf8) != text) IO.write(out, text, utf8)
+  Seq(out)
+}
+
 lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .in(file("."))
   .settings(
@@ -120,6 +142,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
         "-language:dynamics",
       ),
     Compile / sourceGenerators += embedCoreLibrary.taskValue,
+    Compile / sourceGenerators += embedVersion.taskValue,
     libraryDependencies += "org.scalatest" %%% "scalatest" % "3.2.20" % "test",
     libraryDependencies ++= Seq(
       "com.github.scopt"         %%% "scopt"                    % "4.1.0",
