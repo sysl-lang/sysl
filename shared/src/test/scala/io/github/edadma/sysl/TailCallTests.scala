@@ -210,6 +210,27 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       out should include("call i32 @count")
       out should not include "tailrec"
     }
+
+    // `12 §3` says the jump is self-recursion only, and gives the reason: a large argument crosses as
+    // the address of the caller's storage, and a frame being replaced cannot be the frame an argument
+    // still points into. So `even` ending in `odd` emits an ordinary call.
+    //
+    // **The assertion is on the IR and not on the depth, deliberately.** A run would be measuring the
+    // *back end*: at the default `-O1` LLVM's sibling-call pass turns exactly this pair into jumps
+    // and ten million of them return, while the same source at `-O0` dies of a stack overflow. That
+    // is a property of clang rather than a promise of sysl's, so what belongs here is what sysl's own
+    // walk did, which is the same at every optimization level.
+    "a mutual call is a tail call in the same sense and is still emitted as a call" in {
+      val out = defineOf(
+        ir("""even(n: int) -> bool = if n == 0 then true else odd(n - 1)
+             |odd(n: int) -> bool = if n == 0 then false else even(n - 1)
+             |print(even(4))""".stripMargin),
+        "even",
+      )
+
+      out should include("call i1 @odd")
+      out should not include "tailrec"
+    }
   }
 
   "the invocation, not the frame" - {

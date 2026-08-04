@@ -342,4 +342,38 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
       "-- sharing, and the copy that ends it",
     )
   }
+
+  // The one program whose subject is what ARC *cannot* do. A closure has to see the environment it
+  // was written in and a recursive definition puts it back into that environment, so the cycle is
+  // the semantics rather than an artefact of the encoding — and the program is built twice over, once
+  // with that edge strong and once with it `weak`, to price both answers.
+  //
+  // The counts in the last three sections are the assertion that matters and they are exact: they
+  // come from a `Buf[weak Env]` holding one witness per environment ever made, read *after* the
+  // interpreter that owned them is gone. sysl has no user-facing destructor, so a weak reference
+  // being asked whether it still answers is the only live-object counter available — and it needs no
+  // runtime support and perturbs nothing it counts.
+  "lisp — the reference cycle, and a live-object count built out of weak references" in {
+    val out = guide("lisp")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 68
+    sections(out) shouldBe List(
+      "-- reading and writing",
+      "-- arithmetic, and the values it works on",
+      "-- lists",
+      "-- functions, and recursion",
+      "-- what the reader refuses",
+      "-- the cycle a reference count cannot reclaim",
+      "-- the same interpreter with the edge weakened",
+      "-- scale",
+    )
+  }
+
+  // The interpreter's refusals, which its own run cannot state for the same reason `ring`'s cannot.
+  // The split is itself a claim: a malformed *text* arrives from outside and answers with a
+  // `Result`, a malformed *program* is a bug in the thing being run and stops the way sysl stops.
+  "lisp — what the interpreter refuses, which its own run cannot assert" in {
+    guideTests("lisp") should have length 17
+  }
 }

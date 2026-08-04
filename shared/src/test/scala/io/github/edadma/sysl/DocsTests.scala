@@ -80,6 +80,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport with ParallelTestExecution 
     "docs/content/guides/matrix.md"                    -> (0, 0, 0),
     "docs/content/guides/ring.md"                      -> (0, 0, 0),
     "docs/content/guides/slab.md"                      -> (0, 0, 1),
+    "docs/content/guides/lisp.md"                      -> (0, 0, 2),
     "docs/content/library/core.md"                     -> (15, 4, 8),
     "docs/content/library/text.md"                      -> (15, 6, 4),
     "docs/content/library/regex.md"                      -> (16, 0, 0),

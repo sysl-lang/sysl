@@ -54,6 +54,7 @@ contract.
 | `matrix` | an operator whose result is neither operand's type — a vector space, then Gaussian elimination |
 | `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts and struct invariants |
 | `slab` | raw storage — reinterpreting bytes as a typed pointer, `sizeof`/`alignof`, and a free list threaded through the free blocks themselves |
+| `lisp` | the reference cycle — the one shape a count cannot reclaim, `weak T` as both the cure and the instrument that measures it |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

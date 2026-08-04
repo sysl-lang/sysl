@@ -269,6 +269,39 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
                    |print("ok")
                    |""".stripMargin) shouldBe "ok\n"
     }
+
+    // The other half of that pair, and the half a program can *use*: with the back-edge strong the
+    // objects are unreachable and still alive, and a weak reference is the only thing that can say
+    // so. sysl has no user-facing destructor to hang a live-object count on (`03`'s open list), so
+    // this is what makes a leak an observation rather than a suspicion — `guide/lisp` counts an
+    // interpreter's environments with nothing else.
+    //
+    // The chain is what makes the cycle mean something. Both build two objects the same way and drop
+    // every reference from outside; only the back-edge differs, so a `weak` that answered `true` for
+    // both would be reporting on nothing.
+    "and stands, observably, when it is not — which is how a leak is counted at all" in {
+      run(node + """    next: Option[&Node]
+                   |cycle() -> weak Node
+                   |    var a: &Node = Node(1, None)
+                   |    var b: &Node = Node(2, None)
+                   |    a.next = Some(b)
+                   |    b.next = Some(a)
+                   |    var w: weak Node = a
+                   |    w
+                   |end cycle
+                   |chain() -> weak Node
+                   |    var a: &Node = Node(1, None)
+                   |    var b: &Node = Node(2, None)
+                   |    a.next = Some(b)
+                   |    var w: weak Node = a
+                   |    w
+                   |end chain
+                   |var leaked: weak Node = cycle()
+                   |var freed: weak Node = chain()
+                   |print(leaked.get().is_some(), freed.get().is_none())
+                   |print(leaked.get().unwrap().value)
+                   |""".stripMargin) shouldBe "true true\n1\n"
+    }
   }
 
   "an empty weak reference is written the way an empty answer reads" - {

@@ -1,0 +1,590 @@
+// A Lisp small enough to read in one sitting, written to force one question.
+//
+// The axis this owns is **the reference cycle** — the one shape a reference count cannot reclaim,
+// and the reason `weak T` is in the language at all. Nothing else in `guide/` reaches it: `json` is
+// a tree, `scheduler`'s graphs are acyclic in the direction that matters, and `kernel` avoids the
+// question by giving objects indices instead of references. A Lisp cannot avoid it. A closure has to
+// see the environment it was written in, and a recursive definition puts that closure *into* that
+// environment, so `(define (fact n) ... (fact ...))` closes a loop on the first useful thing anyone
+// types.
+//
+// The interpreter is therefore two interpreters wearing one body. `Lambda` carries the edge back to
+// its environment in two spellings — `held`, an ordinary `&Env`, and `seen`, a `weak Env` — and an
+// `Interp` is built one way or the other. Both run the same source to the same answers. What differs
+// is only what is left over afterwards, which is what this program measures.
+//
+// **How it measures it, which is the trick worth stealing.** A weak reference does not keep its
+// referent alive, so a `Buf[weak Env]` holding one witness per environment ever created is a
+// live-object counter that costs nothing and needs no hook in the runtime — sysl has no user-facing
+// destructor to hang one on. Ask the witnesses after the interpreter is gone and the answer is the
+// number of environments that outlived it.
+//
+// What writing it turned up, in the order it bit:
+//
+//   * **What leaks is one environment per environment a definition lands in** — which is not the
+//     same as one per program and not the same as one per call, and the difference decides whether a
+//     naive interpreter is usable. Every *top-level* `define` binds into the one globals frame, so
+//     five hundred calls leave exactly the single witness alive that one call does. Move the
+//     definition inside a function and the identical rule reads the other way: each call makes a
+//     frame, each frame gets a closure pointing back at it, and three calls reclaim nothing at all.
+//     The first half was the guess and the second half was not; the counts are what told them apart,
+//     which is the argument for having a count rather than an opinion.
+//   * **The cure costs more than the disease.** Making the back-edge `weak` means something else has
+//     to own every environment, and the only owner available is the interpreter — so nothing is
+//     freed until the *whole run* is over. The naive interpreter holds one environment forever; the
+//     careful one holds every environment until it exits. ARC offers a choice between two leaks
+//     here, and there is no third option, because the cycle is the semantics rather than an artefact
+//     of how the semantics were encoded.
+//   * **Breaking a cycle turns a total operation into a partial one.** `held` is an `&Env` and always
+//     answers; `seen` is a `weak Env` and answers `Option`. The interpreter unwraps it on a path that
+//     cannot fail — the owner table is what makes it so — and the unwrap is still written. That is
+//     the honest price of `weak` and it shows up as code rather than as a comment.
+//   * **`eval` and `apply` are mutually recursive, and that is the one kind of tail call sysl does
+//     not turn into a jump** — `12 §3` gives the reason, which is the calling convention rather than
+//     a gap in the walk. So `eval` carries the loop itself: a tail position reassigns `expr` and
+//     `env` and goes round again where a recursive call would have gone.
+//
+//     **The chapter's claim is about sysl and turned out not to be a claim about the stack**, which
+//     is worth writing down because it nearly cost this loop. Built at the default `-O1`, a mutual
+//     recursion ten million deep returns an answer — LLVM's sibling-call pass does what sysl
+//     declined to. Built `--optimize 0`, the identical source segfaults. The loop stays either way:
+//     what rescued it is a back-end pass rather than a guarantee, and the first argument too large
+//     for a register would take it away again. `12 §3` now says so; it did not before this program
+//     was written.
+//   * **A hundred thousand cons cells come apart without a stack.** `03`'s teardown is iterative, so
+//     dropping a long list drains a worklist rather than recursing. Confirmed here at a scale a
+//     recursive release would not survive.
+//   * **Three recursive walks, and one limit closes all of them.** `read_value`, `render` and the
+//     non-tail arms of `eval` each recurse on nesting, and nothing but the reader ever *makes* a
+//     nested value — `cons` grows a list to the right, which every walk over it takes as a loop. So
+//     the depth cap belongs in the reader and belongs nowhere else, and a form the reader accepted
+//     is one the other two are already bounded on. That is a property of the value representation
+//     rather than of the code, and it is the reason the cap is one constant instead of three.
+
+import sysl.buf.{Buf, buf}
+
+// ----------------------------------------------------------------------------------- the values
+
+enum Value
+    Nil
+    Int(n: long)
+    Sym(name: string)
+    Bool(b: bool)
+    Pair(head: &Value, tail: &Value)
+    Closure(lam: &Lambda)
+    Builtin(code: int, name: string)
+end Value
+
+// A lambda and the environment it was written in. The two spellings of that one edge are the whole
+// subject of this program, and exactly one of them is ever filled.
+struct Lambda
+    params: &Buf[string]
+    body: &Value
+    held: Option[&Env]
+    seen: weak Env
+end Lambda
+
+// A frame of bindings and the frame it was written inside. Names and values are kept in step in two
+// buffers rather than in one buffer of pairs, because a binding is replaced in place by `define` and
+// two `set` calls say that more plainly than rebuilding a struct.
+struct Env
+    names: &Buf[string]
+    slots: &Buf[&Value]
+    parent: Option[&Env]
+end Env
+
+// `owning` picks which spelling of the closure edge is used, and with it who owns an environment.
+// `owned` is empty unless it does; `witnesses` is filled either way, and holds nothing alive.
+struct Interp
+    globals: &Env
+    owned: &Buf[&Env]
+    witnesses: &Buf[weak Env]
+    owning: bool
+end Interp
+
+// ---------------------------------------------------------------------------------- reading text
+
+enum ReadError
+    Expected(at: usize, what: string)
+    Unclosed(at: usize)
+    Unbalanced(at: usize)
+    TooBig(at: usize)
+    TooDeep(at: usize)
+end ReadError
+
+describe(e: ReadError) -> string
+    e match
+        Expected(at, what) -> s"$what expected at $at"
+        Unclosed(at) -> s"unclosed list at $at"
+        Unbalanced(at) -> s"unbalanced ')' at $at"
+        TooBig(at) -> s"number too large at $at"
+        TooDeep(at) -> s"nested too deeply at $at"
+end describe
+
+// **One limit, and it bounds every recursion in the interpreter.** The reader is the only thing that
+// builds a nested value — `cons` grows a list to the right, which is a loop everywhere it is walked —
+// so a form no deeper than this is one `render` cannot recurse off the stack, and one whose
+// non-tail `eval` positions are bounded too. Capping the reader is therefore not a limit on input so
+// much as the single place the three walks are made finite.
+private const max_depth: int = 128
+
+// The reader is a position in a source text, and keeps both spellings of it for the same reason
+// `guide/json` does: the bytes are what decisions are made on, and the `string` is what a symbol's
+// name is cut out of.
+private struct Reader
+    text: string
+    src: []const u8
+    at: usize
+
+    done(*self) -> bool = self.at >= self.src.len
+
+    bump(*self)
+        self.at += 1usize
+
+    skip_ws(*self)
+        while !self.done()
+            var c = self.src[self.at]
+
+            if c == 32u8 || c == 9u8 || c == 10u8 || c == 13u8 then self.bump()
+            else break
+    end skip_ws
+
+    // A symbol runs to the next space or paren, which is the whole of the token grammar: there are
+    // no strings, no quote and no comments, so nothing else can end one.
+    delimiter(*self, c: u8) -> bool =
+        c == 32u8 || c == 9u8 || c == 10u8 || c == 13u8 || c == u8('(') || c == u8(')')
+
+    read_value(*self, depth: int) -> Result[&Value, ReadError]
+        if depth > max_depth then return Err(TooDeep(self.at))
+        self.skip_ws()
+        if self.done() then return Err(Expected(self.at, "a value"))
+
+        var c = self.src[self.at]
+
+        if c == u8(')') then return Err(Unbalanced(self.at))
+        if c == u8('(') then return self.read_list(depth)
+
+        // `-` is the subtraction builtin when nothing follows it, and a sign when a digit does.
+        if digit(c) || (c == u8('-') && self.at + 1usize < self.src.len && digit(self.src[self.at + 1usize])) then
+            return self.read_number()
+
+        self.read_symbol()
+    end read_value
+
+    read_list(*self, depth: int) -> Result[&Value, ReadError]
+        var open = self.at
+
+        self.bump()
+
+        // The elements are gathered and the list is built from the tail back, because a list is a
+        // right-nested pair and there is nothing to hang the front of one on until the end is known.
+        var items: &Buf[&Value] = buf()
+
+        while true
+            self.skip_ws()
+            if self.done() then return Err(Unclosed(open))
+            if self.src[self.at] == u8(')')
+                self.bump()
+                break
+
+            items.push(self.read_value(depth + 1)?)
+
+        var out: &Value = Nil
+        var i = items.len()
+
+        while i > 0usize
+            i -= 1usize
+            out = Pair(items.at(i), out)
+
+        Ok(out)
+    end read_list
+
+    read_number(*self) -> Result[&Value, ReadError]
+        var start = self.at
+        var neg = self.src[self.at] == u8('-')
+
+        if neg then self.bump()
+
+        var n: long = 0
+        var digits = 0
+
+        while !self.done() && digit(self.src[self.at])
+            n = n * 10 + long(int(self.src[self.at]) - 48)
+            digits += 1
+            if digits > 18 then return Err(TooBig(start))
+            self.bump()
+
+        // `12x` is one token, so a digit run that stops at something other than a delimiter is a
+        // malformed number rather than a number followed by a symbol.
+        if !self.done() && !self.delimiter(self.src[self.at]) then
+            return Err(Expected(self.at, "a delimiter"))
+
+        Ok(Int(if neg then -n else n))
+    end read_number
+
+    read_symbol(*self) -> Result[&Value, ReadError]
+        var start = self.at
+
+        while !self.done() && !self.delimiter(self.src[self.at])
+            self.bump()
+
+        Ok(Sym(self.text[start..<self.at]))
+    end read_symbol
+end Reader
+
+private digit(c: u8) -> bool = c >= 48u8 && c <= 57u8
+
+// Every form in a source text, in order. A program is a sequence of them and its value is the last
+// one's, so the reader hands back all of them rather than one.
+read_all(text: string) -> Result[&Buf[&Value], ReadError]
+    var r = Reader(text, text.bytes, 0usize)
+    var forms: &Buf[&Value] = buf()
+
+    while true
+        r.skip_ws()
+        if r.done() then break
+        forms.push(r.read_value(0)?)
+
+    Ok(forms)
+end read_all
+
+// Read one form and write it straight back out, evaluating nothing. A form that is well-formed text
+// and not a well-formed *program* — a list whose head is an integer, a nesting no evaluation would
+// survive — can be checked this way and no other, since evaluating it is what would stop the run.
+reads_back(src: string) -> string
+    read_all(src) match
+        Ok(forms) -> if forms.len() == 1usize then render(forms.at(0)) else s"${forms.len()} forms"
+        Err(e) -> s"error: ${describe(e)}"
+end reads_back
+
+// -------------------------------------------------------------------------------- writing it back
+
+render(v: &Value) -> string
+    *v match
+        Nil -> "()"
+        Int(n) -> str(n)
+        Sym(name) -> name
+        Bool(b) -> if b then "true" else "false"
+        Builtin(_, name) -> s"#<$name>"
+        Closure(_) -> "#<lambda>"
+        Pair(_, _) -> render_list(v)
+end render
+
+private render_list(v: &Value) -> string
+    var out = "("
+    var cur = v
+    var first = true
+
+    while true
+        *cur match
+            Pair(head, tail) ->
+                if !first then out = out + " "
+                out = out + render(head)
+                first = false
+                cur = tail
+            Nil -> break
+            // A pair whose tail is not a list is written the way it was built, so nothing the
+            // interpreter can make is unprintable. Only `cons` produces one; the reader cannot.
+            _ ->
+                out = out + " . " + render(cur)
+                break
+
+    out + ")"
+end render_list
+
+// ------------------------------------------------------------------------------- environments
+
+// Every environment ever made passes through here, which is what makes the witness list complete.
+private new_env(i: &Interp, parent: Option[&Env]) -> &Env
+    var e: &Env = Env(buf(), buf(), parent)
+
+    i.witnesses.push(e)
+    if i.owning then i.owned.push(e)
+
+    e
+end new_env
+
+// `define` on a name already bound in this frame replaces it, which is what makes a definition
+// re-readable and what lets a program be given twice.
+private define_in(e: &Env, name: string, v: &Value)
+    var i = 0usize
+
+    while i < e.names.len()
+        if e.names.at(i) == name
+            e.slots.set(i, v)
+            return
+        i += 1usize
+
+    e.names.push(name)
+    e.slots.push(v)
+end define_in
+
+private lookup(env: &Env, name: string) -> &Value
+    var cur: Option[&Env] = Some(env)
+
+    while cur.is_some()
+        var e = cur.unwrap()
+        var i = 0usize
+
+        while i < e.names.len()
+            if e.names.at(i) == name then return e.slots.at(i)
+            i += 1usize
+
+        cur = e.parent
+
+    panic(s"unbound name '$name'")
+end lookup
+
+// The one place the two spellings of the closure edge are read, and the price of the weak one: an
+// `Option` on a path the owner table has already made total.
+private env_of(lam: &Lambda) -> &Env
+    lam.held match
+        Some(e) -> e
+        None ->
+            lam.seen.get() match
+                Some(e) -> e
+                None -> panic("a closure outlived the environment it was written in")
+end env_of
+
+private make_closure(i: &Interp, params: &Buf[string], body: &Value, env: &Env) -> &Value
+    if i.owning then Closure(Lambda(params, body, None, env))
+    else Closure(Lambda(params, body, Some(env), None))
+end make_closure
+
+// ------------------------------------------------------------------------------------ evaluating
+
+private car(v: &Value) -> &Value
+    *v match
+        Pair(head, _) -> head
+        _ -> panic(s"'${render(v)}' is not a pair")
+end car
+
+private cdr(v: &Value) -> &Value
+    *v match
+        Pair(_, tail) -> tail
+        _ -> panic(s"'${render(v)}' is not a pair")
+end cdr
+
+private nth(v: &Value, n: int) -> &Value
+    var cur = v
+    var i = 0
+
+    while i < n
+        cur = cdr(cur)
+        i += 1
+
+    car(cur)
+end nth
+
+private list_len(v: &Value) -> int
+    var cur = v
+    var n = 0
+
+    while true
+        *cur match
+            Pair(_, tail) ->
+                n += 1
+                cur = tail
+            _ -> break
+
+    n
+end list_len
+
+// The symbol at the head of a form, or the empty string for anything else. A form headed by
+// something that is not a symbol is an application, and so is one headed by a symbol that is not a
+// special form -- the two cases meet again below.
+private head_symbol(v: &Value) -> string
+    *v match
+        Sym(name) -> name
+        _ -> ""
+end head_symbol
+
+// Only `false` is false. Every other value, `()` included, is true — the Scheme rule rather than the
+// Common Lisp one, because `null?` already answers the other question and one of the two has to go.
+private truthy(v: &Value) -> bool
+    *v match
+        Bool(b) -> b
+        _ -> true
+end truthy
+
+private param_names(v: &Value) -> &Buf[string]
+    var names: &Buf[string] = buf()
+    var cur = v
+
+    while true
+        *cur match
+            Pair(head, tail) ->
+                *head match
+                    Sym(name) -> names.push(name)
+                    _ -> panic(s"'${render(head)}' is not a parameter name")
+                cur = tail
+            Nil -> break
+            _ -> panic("a parameter list is a list")
+
+    names
+end param_names
+
+// **`eval` carries its own loop.** A tail position reassigns `expr` and `env` and goes round again
+// instead of calling `eval` — `12 §3` optimizes self-recursion and says plainly that it does not
+// optimize the mutual kind, and eval-and-apply is the mutual kind. Written the obvious way, a Lisp
+// function that tail-calls itself a hundred thousand times would need a hundred thousand sysl
+// frames; written this way it needs one.
+eval(i: &Interp, expr0: &Value, env0: &Env) -> &Value
+    var expr = expr0
+    var env = env0
+
+    while true
+        *expr match
+            Sym(name) -> return lookup(env, name)
+            Pair(head, tail) ->
+                var form = head_symbol(head)
+
+                if form == "if"
+                    if list_len(tail) != 3 then panic("'if' takes a test and two branches")
+
+                    var test = eval(i, nth(tail, 0), env)
+
+                    expr = if truthy(test) then nth(tail, 1) else nth(tail, 2)
+                else if form == "lambda"
+                    if list_len(tail) != 2 then panic("'lambda' takes a parameter list and a body")
+
+                    return make_closure(i, param_names(nth(tail, 0)), nth(tail, 1), env)
+                else if form == "define"
+                    return eval_define(i, tail, env)
+                else
+                    var callee = eval(i, head, env)
+                    var args: &Buf[&Value] = buf()
+                    var cur = tail
+
+                    while true
+                        *cur match
+                            Pair(a, rest) ->
+                                args.push(eval(i, a, env))
+                                cur = rest
+                            _ -> break
+
+                    *callee match
+                        Builtin(code, name) -> return apply_builtin(code, name, args)
+                        Closure(lam) ->
+                            var frame = new_env(i, Some(env_of(lam)))
+
+                            if lam.params.len() != args.len() then
+                                panic(s"a lambda of ${lam.params.len()} parameters got ${args.len()} arguments")
+
+                            var k = 0usize
+
+                            while k < lam.params.len()
+                                frame.names.push(lam.params.at(k))
+                                frame.slots.push(args.at(k))
+                                k += 1usize
+
+                            expr = lam.body
+                            env = frame
+                        _ -> panic(s"'${render(callee)}' is not applicable")
+            // An integer, a boolean, `()`, and anything already evaluated stand for themselves.
+            _ -> return expr
+
+    expr
+end eval
+
+// `(define x e)` and `(define (f a b) e)`, the second being the first with a lambda written for it.
+// The shorthand is what closes the cycle: the closure it makes sees the environment the binding is
+// about to land in.
+private eval_define(i: &Interp, tail: &Value, env: &Env) -> &Value
+    if list_len(tail) != 2 then panic("'define' takes a target and a value")
+
+    var target = nth(tail, 0)
+
+    *target match
+        Sym(name) ->
+            define_in(env, name, eval(i, nth(tail, 1), env))
+            Sym(name)
+        Pair(f, params) ->
+            var name = head_symbol(f)
+
+            if name == "" then panic("a definition names a function with a symbol")
+
+            define_in(env, name, make_closure(i, param_names(params), nth(tail, 1), env))
+            Sym(name)
+        _ -> panic("'define' takes a name or a call shape")
+end eval_define
+
+// ------------------------------------------------------------------------------------- builtins
+
+private const b_add: int = 0
+private const b_sub: int = 1
+private const b_mul: int = 2
+private const b_eq: int = 3
+private const b_lt: int = 4
+private const b_cons: int = 5
+private const b_car: int = 6
+private const b_cdr: int = 7
+private const b_null: int = 8
+
+private arity(code: int) -> usize = if code == b_car || code == b_cdr || code == b_null then 1usize else 2usize
+
+private int_of(v: &Value, name: string) -> long
+    *v match
+        Int(n) -> n
+        _ -> panic(s"'$name' wants an integer, got '${render(v)}'")
+end int_of
+
+private apply_builtin(code: int, name: string, args: &Buf[&Value]) -> &Value
+    if args.len() != arity(code) then
+        panic(s"'$name' takes ${arity(code)} arguments, got ${args.len()}")
+
+    if code == b_cons then return Pair(args.at(0), args.at(1))
+    if code == b_car then return car(args.at(0))
+    if code == b_cdr then return cdr(args.at(0))
+
+    if code == b_null
+        *args.at(0) match
+            Nil -> return Bool(true)
+            _ -> return Bool(false)
+
+    var a = int_of(args.at(0), name)
+    var b = int_of(args.at(1), name)
+
+    if code == b_add then Int(a + b)
+    else if code == b_sub then Int(a - b)
+    else if code == b_mul then Int(a * b)
+    else if code == b_eq then Bool(a == b)
+    else Bool(a < b)
+end apply_builtin
+
+// ---------------------------------------------------------------------------------- running one
+
+// An interpreter, and the choice this whole program is about. `witnesses` is handed in from outside
+// rather than made here, because what it is for is to be read *after* the interpreter is gone.
+interp(owning: bool, witnesses: &Buf[weak Env]) -> &Interp
+    var i: &Interp = Interp(Env(buf(), buf(), None), buf(), witnesses, owning)
+
+    i.globals = new_env(i, None)
+
+    define_in(i.globals, "true", Bool(true))
+    define_in(i.globals, "false", Bool(false))
+    define_in(i.globals, "+", Builtin(b_add, "+"))
+    define_in(i.globals, "-", Builtin(b_sub, "-"))
+    define_in(i.globals, "*", Builtin(b_mul, "*"))
+    define_in(i.globals, "=", Builtin(b_eq, "="))
+    define_in(i.globals, "<", Builtin(b_lt, "<"))
+    define_in(i.globals, "cons", Builtin(b_cons, "cons"))
+    define_in(i.globals, "car", Builtin(b_car, "car"))
+    define_in(i.globals, "cdr", Builtin(b_cdr, "cdr"))
+    define_in(i.globals, "null?", Builtin(b_null, "null?"))
+
+    i
+end interp
+
+// A program's value is its last form's, and an empty program's is `()`.
+run(i: &Interp, src: string) -> Result[string, ReadError]
+    var forms = read_all(src)?
+    var out: &Value = Nil
+    var k = 0usize
+
+    while k < forms.len()
+        out = eval(i, forms.at(k), i.globals)
+        k += 1usize
+
+    Ok(render(out))
+end run

@@ -1,0 +1,106 @@
+// What the interpreter refuses, asserted in the program rather than beside it.
+//
+// The split is deliberate and it is a claim about where a failure comes from. A malformed *text*
+// arrives from outside, so `read_all` answers with a `Result` and `main.sysl` checks the message.
+// A malformed *program* — a name nothing bound, a `car` of an integer, a lambda handed the wrong
+// number of arguments — is a bug in the thing being run, and the interpreter stops the way sysl
+// stops. A stop cannot be observed by the run that it ends, so it is observed here instead:
+// `@test(should_trap)` runs each one in a process of its own and passes by not coming back.
+//
+// **Every refusal is written next to the call that is not refused.** A `should_trap` test passes for
+// any failure at all, its own setup included, so on its own it cannot tell "the interpreter stopped
+// this" from "nothing worked". One call over the line and one call up to it, and the difference
+// between them is the rule.
+
+private naive(src: string) -> string = answer(src, false)
+
+// -- names ---------------------------------------------------------------------------------------
+
+@test(should_trap)
+a_name_nothing_bound_is_not_a_value() =
+    print(naive("(define x 1) y"))
+
+@test
+and_one_something_bound_is() =
+    assert(naive("(define x 1) x") == "1", "a bound name")
+
+// -- what the list operations are for ------------------------------------------------------------
+
+@test(should_trap)
+an_integer_has_no_car() =
+    print(naive("(car 5)"))
+
+@test(should_trap)
+and_the_empty_list_has_no_cdr() =
+    print(naive("(cdr ())"))
+
+@test
+a_pair_has_both() =
+    assert(naive("(car (cons 1 2))") == "1", "the head")
+    assert(naive("(cdr (cons 1 2))") == "2", "the tail")
+
+// -- what arithmetic is for ----------------------------------------------------------------------
+
+@test(should_trap)
+a_boolean_is_not_an_addend() =
+    print(naive("(+ 1 true)"))
+
+@test(should_trap)
+nor_is_a_list() =
+    print(naive("(< (cons 1 ()) 2)"))
+
+@test
+two_integers_are() =
+    assert(naive("(+ 1 2)") == "3", "two integers add")
+
+// -- applying ------------------------------------------------------------------------------------
+
+@test(should_trap)
+an_integer_is_not_applicable() =
+    print(naive("(1 2)"))
+
+@test(should_trap)
+a_lambda_takes_the_arguments_it_declared() =
+    print(naive("(define (f x) x) (f 1 2)"))
+
+@test(should_trap)
+and_so_does_a_builtin() =
+    print(naive("(+ 1)"))
+
+@test
+the_right_number_of_arguments_applies() =
+    assert(naive("(define (f x) x) (f 1)") == "1", "one parameter, one argument")
+    assert(naive("(+ 1 2)") == "3", "and a builtin's two")
+
+// -- the shapes of the special forms ---------------------------------------------------------------
+
+@test(should_trap)
+an_if_without_both_branches_is_not_an_if() =
+    print(naive("(if true 1)"))
+
+@test(should_trap)
+a_parameter_list_holds_names() =
+    print(naive("(lambda (1) 1)"))
+
+@test(should_trap)
+and_a_definition_names_something() =
+    print(naive("(define 1 2)"))
+
+@test
+the_forms_written_the_way_they_read() =
+    assert(naive("(if true 1 2)") == "1", "a test and two branches")
+    assert(naive("((lambda (x) x) 1)") == "1", "a parameter list of names")
+    assert(naive("(define f 2) f") == "2", "a definition of a name")
+
+// -- the environment a closure was written in ------------------------------------------------------
+
+// The `weak` half of `Lambda` is what makes this reachable at all: with the edge held strongly there
+// is no arrangement in which a closure's environment can be gone, which is the whole cost of the
+// cure stated as a test. Here the interpreter that owned the environments is still standing, so the
+// unwrap succeeds -- and the pair is what shows the check is on the live path rather than dead.
+@test
+an_owned_environment_is_found_again() =
+    assert(answer("(define (adder n) (lambda (x) (+ x n))) ((adder 3) 4)", true) == "7",
+           "a closure over an owned environment")
+    assert(answer("(define (adder n) (lambda (x) (+ x n))) ((adder 3) 4)", false) == "7",
+           "and over a held one")

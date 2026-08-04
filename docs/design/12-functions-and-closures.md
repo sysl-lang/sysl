@@ -459,6 +459,16 @@ points into. Making those tail calls work needs the convention to change, so it 
 recognizing more shapes. Calls through a `Fn` or a `*extern` are out for the same reason and one
 more: nothing at the call knows the callee is the caller.
 
+**"Not optimized" is a statement about sysl, and it is not a prediction about the stack.** The
+back end is free to do what sysl declined to, and at the default `-O1` it does: LLVM's sibling-call
+pass turns `even`/`odd` into jumps, and ten million of them return an answer. The same source built
+`--optimize 0` dies of a stack overflow. Both are correct — sysl promised nothing either way — but
+the difference decides whether a program needs a trampoline, so it is worth saying which claim is
+being made. **A mutual recursion whose depth is bounded by its input needs the trampoline**, because
+the thing that made it work is a pass, not a guarantee, and the first argument too large for a
+register takes it away again. `guide/lisp` carries the loop inside `eval` for exactly this reason:
+eval-and-apply is the mutual kind, and a Lisp cannot make its tail calls proper by hoping for one.
+
 **`@tailrec` asserts it, and buys the refusal.** The attribute changes nothing about what is
 emitted — the jump applies written or not — so what it is for is the compile that tells you the
 jump has gone:
