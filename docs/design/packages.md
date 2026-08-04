@@ -1,8 +1,17 @@
 # Packages
 
-**Status:** decided in outline, nothing built. This is the project-config half of the doc
-`capabilities.md` promised and `13 § Open a` tracks — what `package.hocon` says, and what it means
-to depend on somebody else's code. `targets.md` already settled the other half, what a machine is.
+**Status:** §1–2 are **built**; §3–11 are decided in outline and unbuilt. This is the project-config
+half of the doc `capabilities.md` promised and `13 § Open a` tracks — what `package.hocon` says, and
+what it means to depend on somebody else's code. `targets.md` already settled the other half, what a
+machine is.
+
+**What exists today:** the file is found beside the sources, parsed (`PackageConfig`), and read for
+identity, the active target and per-target capability sets. That last one is the thing it was needed
+for: `capabilities.md`'s *target provides* level had no way to be stated before, so every target
+offered everything. A target that provides no allocator now makes every module of the program
+allocator-free with no clause written anywhere, and a module's `requires` is answered against the
+machine — which is the "one clean error if built for a no-alloc target" that chapter promises.
+**Dependencies are not read at all**, and nothing below §3 is implemented.
 
 **Written ahead of need, deliberately, and that is worth knowing when reading it.**
 `capabilities.md` advises designing only the minimum that unblocks the work at hand and letting real

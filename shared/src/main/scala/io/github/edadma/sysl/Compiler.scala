@@ -67,13 +67,15 @@ object Compiler {
    * exactly as one compiled alone does.
    */
   def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
-                   precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None)
+                   precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
+                   provides: Set[String] = Capability.core.toSet)
       : Either[String, Compiled] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case Nil =>
-        analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled, carried(std, target))
+        analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled,
+          carried(std, target), provides)
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -212,9 +214,10 @@ object Compiler {
    * the only thing between the checks and the lowering.
    */
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
-                       std: Stdlib): Either[String, Compiled] =
+                       std: Stdlib, provides: Set[String] = Capability.core.toSet)
+      : Either[String, Compiled] =
     for
-      typed    <- Analyzer.analyze(units, std = std, target = target)
+      typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
     yield

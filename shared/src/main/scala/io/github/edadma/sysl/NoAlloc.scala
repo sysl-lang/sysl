@@ -21,9 +21,24 @@ package io.github.edadma.sysl
  */
 trait NoAlloc extends AnalyzerBase {
 
-  /** Whether `module` gave the allocator up. */
+  /** Whether `module` is allocator-free — because it gave the allocator up, or because the target it
+   * is being built for has none (`capabilities.md § Two levels`, `packages.md § 2`).
+   *
+   * The two arrive at the same place by design: a module's effective set is the target's
+   * intersected with its own narrowing, so a target that provides no allocator makes every module
+   * allocator-free without a clause being written anywhere. That is what a bare-metal build wants —
+   * `no alloc` on every file of a kernel is ceremony, and forgetting it on one file is the bug the
+   * clause existed to prevent.
+   *
+   * **The library is exempt from the target's half, and that is not a loophole.** Its files are
+   * compiled into every program, so applying this to them would report the allocating half of the
+   * standard module as a mistake in source the program's author did not write and cannot change.
+   * What a program does with that half is still refused, one step later and in the right place: the
+   * call into it is in the program's own body, and `Allocators.blame` lands the diagnostic there.
+   */
   protected def noAlloc(module: String): Boolean =
-    moduleNarrows.get(module).exists(_.contains(Capability.Alloc))
+    (!targetProvides(Capability.Alloc) && !std.carries(module)) ||
+      moduleNarrows.get(module).exists(_.contains(Capability.Alloc))
 
   /** Reports every construction that makes heap storage in a module that declared `no alloc`, and
    * every call out of one that arrives somewhere that does.
@@ -43,15 +58,30 @@ trait NoAlloc extends AnalyzerBase {
     lazy val allocator = new Allocators(funcs, vtables)
 
     for f <- funcs if noAlloc(Modules.moduleOf(f.name)) do
-      scan(f.body)
-      allocator.blame(f.body)
+      val why = because(Modules.moduleOf(f.name))
+
+      scan(f.body, why)
+      allocator.blame(f.body, why)
     for v <- vals if noAlloc(Modules.moduleOf(v.symbol)) do
-      scan(v.init)
-      allocator.blame(v.init)
+      val why = because(Modules.moduleOf(v.symbol))
+
+      scan(v.init, why)
+      allocator.blame(v.init, why)
     if noAlloc(mainModule) then
-      scan(main)
-      allocator.blame(main)
+      scan(main, because(mainModule))
+      allocator.blame(main, because(mainModule))
   }
+
+  /** Which of the two made this module allocator-free, said the way the diagnostic needs it.
+   *
+   * The distinction is the whole reason it is carried rather than assumed: a reader told their
+   * module "declared 'no alloc'" when no file of it says any such thing would go looking for a
+   * clause that is not there. Where the target is what has no allocator, the thing to change is the
+   * config or the target, and the message has to point at that instead.
+   */
+  private def because(module: String): String =
+    if moduleNarrows.get(module).exists(_.contains(Capability.Alloc)) then "this module declared 'no alloc'"
+    else s"'${target.name}' provides no allocator"
 
   /** Which functions make heap storage, and which trees reach one (`13 §4` — *propagation is over
    * the module graph*).
@@ -94,21 +124,20 @@ trait NoAlloc extends AnalyzerBase {
      * node answers on its own, which is what keeps `str(a) + str(b)` reaching one allocator from
      * being a message per node on the way down.
      */
-    def blame(x: Any): Unit =
+    def blame(x: Any, why: String): Unit =
       if reached(x).nonEmpty then
         parts(x).filter(c => reached(c).nonEmpty) match
-          case Nil  => report(x)
-          case kids => kids.foreach(blame)
+          case Nil  => report(x, why)
+          case kids => kids.foreach(blame(_, why))
 
     /** One site, naming the allocator it reaches. Where it reaches several, the name is the least of
      * them rather than whichever the set happened to yield first — the site is what the reader has to
      * change, and a diagnostic that varied between runs would be a poor thing to assert on.
      */
-    private def report(site: Any): Unit =
+    private def report(site: Any, why: String): Unit =
       for who <- reached(site).toList.sorted.headOption do
         recover(())(at(position(site))(err(s"this reaches '${Modules.show(who)}', which makes heap " +
-          "storage, and this module declared 'no alloc' — an allocator-free module may only call " +
-          "what is allocator-free itself")))
+          s"storage, and $why — an allocator-free module may only call what is allocator-free itself")))
 
     private def parts(x: Any): List[Any] = x match
       case _: Type         => Nil
@@ -157,12 +186,12 @@ trait NoAlloc extends AnalyzerBase {
    * The descent is through the shape of the tree rather than a case per node, for the reason
    * `Reachability`'s is: a node added later is walked without anyone remembering to come back here.
    */
-  private def scan(x: Any): Unit = x match
+  private def scan(x: Any, why: String): Unit = x match
     case _: Type => ()
     case e: TExpr if allocates(e).isDefined =>
-      recover(())(at(e.pos)(err(s"${allocates(e).get} needs an allocator, and this module declared " +
-        "'no alloc' — it may hold and release storage made elsewhere, and may make none of its own")))
-    case xs: Iterable[?] => xs.foreach(scan)
-    case p: Product      => p.productIterator.foreach(scan)
+      recover(())(at(e.pos)(err(s"${allocates(e).get} needs an allocator, and $why — it may hold and " +
+        "release storage made elsewhere, and may make none of its own")))
+    case xs: Iterable[?] => xs.foreach(scan(_, why))
+    case p: Product      => p.productIterator.foreach(scan(_, why))
     case _               => ()
 }

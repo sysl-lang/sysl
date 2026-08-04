@@ -52,6 +52,19 @@ trait DeclTables extends Reporting {
    */
   protected def target: Target
 
+  /** What the target **provides**, which the project config says and the registry does not
+   * (`packages.md § 2`, `capabilities.md § Two levels: target provides, module narrows`).
+   *
+   * This is the ceiling half of the two-level rule: a module's effective set is what the target
+   * offers intersected with what the module gave up, so a capability absent here is absent
+   * everywhere in the build no matter what any file declares. A compilation with no config behind it
+   * gets all of them, which is what every build did before there was a file to say otherwise.
+   */
+  protected def provides: Set[String]
+
+  /** Whether the target offers `cap` at all. */
+  protected def targetProvides(cap: String): Boolean = provides(cap)
+
   /** Whether a declaration written in `module` is one the **library** supplies.
    *
    * Normally that is a question about which file it came from and nothing else (`Stdlib.owns`), and

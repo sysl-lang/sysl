@@ -220,9 +220,24 @@ private[sysl] def execute(cfg: Config): Int = {
 
   if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
 
-  val target = chooseTarget(cfg.target) match
+  val project = readPackageConfig(cfg.file) match
+    case Left(err) => return fail(err)
+    case Right(p)  => p
+
+  val target = chooseTarget(cfg.target, project.defaultTarget) match
     case Left(err) => return fail(err)
     case Right(t)  => t
+
+  val provides = project.provides(target.name)
+
+  // What the package says it cannot be built without, asked of the machine it is being built for.
+  // This is the config's own half of `requires`, and it is answered here rather than in the analyzer
+  // because it is a statement about the *project* — there is no source position to point at, and a
+  // build that cannot mean anything should stop before it parses a line.
+  val unmet = project.requires.filterNot(provides).toList.sorted
+
+  if unmet.nonEmpty then
+    return fail(s"this package requires '${unmet.head}', and '${target.name}' does not provide it")
 
   // Building the standard module against a prebuilt copy of itself is the one combination that
   // cannot mean anything: the declarations being compiled are the ones the artifact holds. Refused
@@ -312,7 +327,8 @@ private[sysl] def execute(cfg: Config): Int = {
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled =
-    Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(std)) match
+    Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(std),
+      provides) match
     case Left(err) => return report(err)
     case Right(result) =>
       if cfg.explainEscapes then
@@ -549,16 +565,48 @@ private def loadCore(path: String, target: Target): Either[String, (Stdlib, Set[
     Stdlib.read(path, meta, target).map((std, symbols) => (std, symbols, Some(path))))
 }
 
-/** Which machine this invocation is for: the one it names, or this one. A machine sysl has no entry
- * for is reported rather than guessed at — the guess would be a module that looks right and is
- * built for something else.
+/** Which machine this invocation is for: the one it names, the one the project config names, or this
+ * one. A machine sysl has no entry for is reported rather than guessed at — the guess would be a
+ * module that looks right and is built for something else.
+ *
+ * `--target` beats the config, which beats the host. That is the order every other tool uses and the
+ * only one that lets a project with a default still be cross-built from the command line without
+ * editing a file.
  */
-private def chooseTarget(named: Option[String]): Either[String, Target] = named match
-  case Some(name) => Target.named(name)
-  case None =>
-    Target.host.toRight(
-      "this machine is not one sysl knows, so a build has to name its target with --target " +
-        "('sysl targets' lists them)")
+private def chooseTarget(named: Option[String], configured: Option[String]): Either[String, Target] =
+  named.orElse(configured) match
+    case Some(name) => Target.named(name)
+    case None =>
+      Target.host.toRight(
+        "this machine is not one sysl knows, so a build has to name its target with --target " +
+          "('sysl targets' lists them)")
+
+/** The project config, read from the root this invocation was given (`packages.md § 1`).
+ *
+ * **A missing file is not an error.** A single-file program has no config and wants none, so what
+ * comes back is the empty one — the same shape `13 §1` gives the anonymous root module. A file that
+ * is *there* and will not read is a different thing entirely and stops the build: somebody wrote it,
+ * and building while ignoring it would be building something other than what they asked for.
+ *
+ * The file is looked for beside the sources rather than searched for upwards. `13 § Open a` settles
+ * that the driver is *given* a root rather than discovering one, and a search that walked upward
+ * would make a build depend on directories above the one named.
+ */
+private def readPackageConfig(file: String): Either[String, PackageConfig] = {
+  val root =
+    if isDirectory(file) then file
+    else
+      val slash = math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))
+
+      if slash >= 0 then file.substring(0, slash) else "."
+
+  val path = s"$root/${PackageConfig.FileName}"
+
+  if !isFile(path) then Right(PackageConfig.empty)
+  else
+    try PackageConfig.read(readFile(path))
+    catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
+}
 
 /** The registry, as a reader of `sysl targets` sees it: the name to write, the LLVM triple it
  * stands for, and — for one sysl knows and cannot build for — why not.

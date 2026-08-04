@@ -3,7 +3,7 @@
 **Status:** decided and built. This is the target half of the doc `capabilities.md` said was
 still to be written — what a machine is, how one is named, and what naming one changes. The
 project-config half of that promise is now `packages.md` — the `package.hocon` schema and
-per-target capability sets — though it is designed and unbuilt, and filename-axis platform
+per-target capability sets, both of which are built — and filename-axis platform
 selection is still open. What remains open here is listed at the bottom.
 
 A systems language cannot be vague about the machine. Two of them differ in more than speed:

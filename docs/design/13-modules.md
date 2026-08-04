@@ -1185,7 +1185,8 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   takes one, as the path it is given — `sysl run <dir>` makes that directory the root and compiles
   the tree beneath it, and a config file only ever *names* a root the driver would otherwise be told.
   **What is left of this item is the platform-file suffix grammar and resolution (§5)**, which
-  `packages.md` does not attempt. Nothing in `packages.md` is built.
+  `packages.md` does not attempt. Of `packages.md` itself, the file and its capability sets are
+  built; the dependency model is not.
 - **b. Re-export / facade modules.** Whether a module can re-export another's names (a `pub
   import`-style forwarding, so `std` can surface `std.fs.read`) is a real ergonomic want for
   building a curated public surface over sub-modules, and is left until the standard library's

@@ -24,7 +24,8 @@ modes). **The target registry is now its own doc and is built — `targets.md`**
 target *is* and how one is named are settled, and the project-config half around it is now
 `packages.md`: the `package.hocon` schema, per-target capability sets, and the dependency model
 that lets a *package* carry a capability requirement the way a module does. `packages.md` is
-designed and unbuilt, so what it says about capabilities is a promise rather than a check.
+**built for exactly the capability half** — the file is parsed and its per-target sets are what
+the two-level rule below is now measured against — and unbuilt for everything about dependencies.
 This one is the capability model.
 
 ## Two kinds of capability
