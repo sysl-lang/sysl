@@ -1,0 +1,186 @@
+module sysl.time
+
+import sysl.text.{parse_int, parse_long}
+
+// Reading a date, a time or an offset back out of text — the direction rendering does not go.
+//
+// **The module rendered and did not read**, which is half a library. A program handed `"2026-03-08"`
+// by a configuration file, an argument vector or a log line had nowhere to take it, and the loop it
+// would have written itself is the one nobody writes correctly the first time: the digits are easy
+// and the edges are not.
+//
+// **One format, and it is ISO 8601.** Not a pattern language, not a locale, not a list of
+// alternatives tried in turn — `YYYY-MM-DD`, `HH:MM[:SS[.ffffff]]`, and the two joined by a space or
+// a `T`. That is the format `date_text` and `time_text` produce, so **the pair round-trips**, and it
+// is the format every machine-readable timestamp in the world is already written in. A pattern
+// language is a bigger feature than this module and belongs above it.
+//
+// **A parse checks the calendar, not only the shape.** `2026-02-30` is four digits, a dash, two
+// digits, a dash and two digits, and it is not a date — so the day is held against the month's real
+// length, which `days_in_month` knows. Without that check the civil conversion accepts it silently
+// and hands back the 2nd of March, which is the failure mode a caller has no way to notice.
+
+// Why a parse refused, at the granularity a caller can act on.
+//
+// The three are separated by what a caller would *do*: a shape error is a message about the format,
+// a range error is a message about the value, and a trailing error usually means the text held
+// something more that the caller meant to split off first.
+enum TimeParseError
+    // The text is not the shape the format calls for — a missing separator, a field of the wrong
+    // width, a non-digit where a digit belongs. `at` is the byte offset, for the reason
+    // `sysl.text`'s `BadDigit` carries one: a message naming where is worth writing and cannot be
+    // reconstructed afterwards.
+    BadShape(at: usize)
+    // Every field is a number and one of them is not a legal value — month 13, day 30 of February,
+    // hour 24. `what` names the field so the message can.
+    OutOfRange(what: string)
+    // The shape was read and text was left over.
+    Trailing(at: usize)
+
+impl Display for TimeParseError
+    display(self, out: *Writer, fmt: FormatSpec)
+        var text = self match
+            BadShape(at) -> s"not the expected shape at byte $at"
+            OutOfRange(what) -> s"$what is out of range"
+            Trailing(at) -> s"unexpected text at byte $at"
+
+        display_str(text, out, fmt)
+    end display
+
+// A run of exactly `n` digits starting at `at`, as a number. It is the whole of what the field
+// parsers below need, and it is written here rather than reached for from `sysl.text` because that
+// one reads a *whole* string: a date is six fields with separators between them, so what is wanted
+// is a reader that stops after a known width and says where it stopped.
+private digits(b: []const u8, at: usize, n: usize) -> Result[int, TimeParseError]
+    if at + n > b.len then return Err(BadShape(at))
+
+    var v = 0
+
+    for i in at..<(at + n)
+        var c = int(b[i])
+
+        if c < 48 || c > 57 then return Err(BadShape(i))
+
+        v = v * 10 + (c - 48)
+
+    Ok(v)
+end digits
+
+private expect(b: []const u8, at: usize, c: u8) -> Result[unit, TimeParseError]
+    if at >= b.len || b[at] != c then Err(BadShape(at)) else Ok(())
+end expect
+
+// `YYYY-MM-DD`. The year is four digits, which is what ISO 8601 says and what `date_text` writes;
+// a year outside 0..9999 has no ISO spelling without a sign prefix, and that extension is not here.
+parse_date(s: string) -> Result[LocalDate, TimeParseError]
+    var b = s.bytes
+    var d = date_from(b, 0usize)?
+
+    if d.1 != b.len then return Err(Trailing(d.1))
+
+    Ok(d.0)
+end parse_date
+
+// The date, and where reading it stopped — which is what lets a date-time reuse it.
+private date_from(b: []const u8, at: usize) -> Result[(LocalDate, usize), TimeParseError]
+    var y = digits(b, at, 4usize)?
+    expect(b, at + 4usize, 45u8)?
+    var m = digits(b, at + 5usize, 2usize)?
+    expect(b, at + 7usize, 45u8)?
+    var d = digits(b, at + 8usize, 2usize)?
+
+    if m < 1 || m > 12 then return Err(OutOfRange("month"))
+    if d < 1 || d > days_in_month(y, m) then return Err(OutOfRange("day"))
+
+    Ok((date_at(y, m, d), at + 10usize))
+end date_from
+
+// `HH:MM`, `HH:MM:SS`, or `HH:MM:SS.ffffff` — the seconds and the fraction each optional, on the
+// same terms `time_text` writes them.
+parse_time(s: string) -> Result[LocalTime, TimeParseError]
+    var b = s.bytes
+    var t = time_from(b, 0usize)?
+
+    if t.1 != b.len then return Err(Trailing(t.1))
+
+    Ok(t.0)
+end parse_time
+
+private time_from(b: []const u8, at: usize) -> Result[(LocalTime, usize), TimeParseError]
+    var h = digits(b, at, 2usize)?
+    expect(b, at + 2usize, 58u8)?
+    var mi = digits(b, at + 3usize, 2usize)?
+
+    if h > 23 then return Err(OutOfRange("hour"))
+    if mi > 59 then return Err(OutOfRange("minute"))
+
+    var us = long(h) * us_per_hour + long(mi) * us_per_minute
+    var next = at + 5usize
+
+    // A seconds field is present only where a colon follows, and a fraction only where a dot
+    // follows that. Anything else ends the time, which is what lets a date-time read an offset off
+    // the tail without this having to know one is coming.
+    if next >= b.len || b[next] != 58u8 then return Ok((LocalTime(us), next))
+
+    var sec = digits(b, next + 3usize - 2usize, 2usize)?
+
+    if sec > 59 then return Err(OutOfRange("second"))
+
+    us = us + long(sec) * us_per_second
+    next = next + 3usize
+
+    if next >= b.len || b[next] != 46u8 then return Ok((LocalTime(us), next))
+
+    // Up to six digits of fraction, each worth ten times less than the last. Fewer than six is legal
+    // and means what it says: `.5` is half a second, not five microseconds.
+    var scale = us_per_second
+    var i = next + 1usize
+    var seen = 0usize
+
+    while i < b.len && b[i] >= 48u8 && b[i] <= 57u8 && seen < 6usize
+        scale = scale / 10i64
+        us = us + long(int(b[i]) - 48) * scale
+        i = i + 1usize
+        seen = seen + 1usize
+
+    if seen == 0usize then return Err(BadShape(next + 1usize))
+
+    Ok((LocalTime(us), i))
+end time_from
+
+// A date and a time, joined by a space or a `T`. Both spellings are read because both are written:
+// ISO 8601 says `T`, and `datetime_text` writes a space because that is what a person reads.
+parse_datetime(s: string) -> Result[LocalDateTime, TimeParseError]
+    var b = s.bytes
+    var d = date_from(b, 0usize)?
+
+    if d.1 >= b.len then return Err(BadShape(d.1))
+    if b[d.1] != 32u8 && b[d.1] != 84u8 then return Err(BadShape(d.1))
+
+    var t = time_from(b, d.1 + 1usize)?
+
+    if t.1 != b.len then return Err(Trailing(t.1))
+
+    Ok(LocalDateTime(d.0, t.0))
+end parse_datetime
+
+// `Z`, `+05:30`, `-08:00`. The `Z` is zero, which is the spelling `offset_text` writes it back as.
+parse_offset(s: string) -> Result[Offset, TimeParseError]
+    var b = s.bytes
+
+    if b.len == 1usize && b[0] == 90u8 then return Ok(Offset(0))
+    if b.len != 6usize then return Err(BadShape(0usize))
+
+    var sign = if b[0] == 45u8 then -1 else 1
+
+    if b[0] != 43u8 && b[0] != 45u8 then return Err(BadShape(0usize))
+
+    var h = digits(b, 1usize, 2usize)?
+    expect(b, 3usize, 58u8)?
+    var m = digits(b, 4usize, 2usize)?
+
+    if h > 23 then return Err(OutOfRange("offset hour"))
+    if m > 59 then return Err(OutOfRange("offset minute"))
+
+    Ok(Offset(sign * (h * 60 + m)))
+end parse_offset
