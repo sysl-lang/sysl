@@ -145,8 +145,25 @@ object Std {
       // level too high.
       if found.isEmpty then sys.error(s"the library at $dir holds no sysl source files")
 
-      found
+      found.map(named(dir, _))
     case Left(err) => sys.error(err)
+
+  /** A library file under the name a **diagnostic** should call it: the library root's own name and
+   * the file's place below it, never the path it was read from.
+   *
+   * **A message naming a library file has to read the same on every machine.** The library moves
+   * with the installation — `/opt/homebrew/Cellar/sysl/0.0.3/share/sysl/lib` on one machine, `lib`
+   * in a checkout, wherever `SYSL_LIB` says on a third — and a diagnostic that quoted that path
+   * would be noise on the first, different on the second, and unquotable by the documentation on
+   * all of them. Which is how this was found: two library pages quote
+   * `lib/sysl/thread/mutex.sysl` in a refusal about a private field, and the executable-docs suite
+   * failed the moment the name became absolute.
+   *
+   * A program's own files keep the path they were given, and should: those a reader can open, and
+   * the whole point of a diagnostic pointing at one is that they go and look.
+   */
+  private[sysl] def named(root: String, s: Source): Source =
+    Source(s"${Project.basename(root)}/${place(s)}", s.text, s.dir.getOrElse(Nil))
 
   /** A file's place in the library: the module directories it sits under, then its own name. The
    * same key the fingerprint sorts and hashes by, and for the same reason — it is what is true of a

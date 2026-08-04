@@ -158,11 +158,24 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
       Std.sources.map(s => place(s) -> s.text).toMap shouldBe onDisk
     }
 
-    "and names each file where it actually is, so a diagnostic points at something openable" in {
-      // Not at a path relative to a root the reader would have to know: the name is where the walk
-      // found the file, which is what it was before only by accident of the generator having written
-      // `lib/sysl/...` down.
-      Std.sources.foreach(s => withClue(s"${s.name}: ")(isFile(s.name) shouldBe true))
+    "and names each file by its place in the library rather than by where it was read from" in {
+      // So that a diagnostic naming a library file reads the same on every machine. See `Std.named`
+      // — this is the claim the full suite caught being broken, in two library pages that quote a
+      // refusal about a private field of `sysl.thread.Mutex`.
+      Std.sources.map(_.name) shouldBe Std.sources.map(s => s"lib/${place(s)}")
+    }
+
+    "the same name whether it was read from a checkout or from an install" in {
+      // The discriminating case, which the checkout alone cannot show: the two roots differ in every
+      // segment but the last, and the names have to come out identical.
+      val checkout = Std.named("lib", Source("lib/sysl/print.sysl", "x", List("sysl")))
+
+      val installed =
+        Std.named("/opt/homebrew/Cellar/sysl/0.0.3/share/sysl/lib",
+          Source("/opt/homebrew/Cellar/sysl/0.0.3/share/sysl/lib/sysl/print.sysl", "x", List("sysl")))
+
+      checkout.name shouldBe "lib/sysl/print.sysl"
+      installed.name shouldBe checkout.name
     }
 
     "in a fixed order, decided by the library rather than by a directory listing" in {
