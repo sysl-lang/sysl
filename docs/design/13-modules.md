@@ -12,12 +12,13 @@ as it does, and the graph those references make held to being acyclic. The capab
 clause does not currently parse at all. What it is *not* waiting for any more is the target — that
 used to be the stated blocker, and it is stale: `Target` is a real value with a registry of ten
 targets, a `--target` flag and a `targets` command. What is genuinely missing from open item (a) is
-the `sysl.conf` schema and platform-file selection, neither of which a `no alloc` check needs. Two written docs already lean on modules: `capabilities.md` attaches
+the `package.hocon` schema and platform-file selection, neither of which a `no alloc` check needs. Two written docs already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
 `cross-platform.md` fixes that "module names follow the directory tree relative to the project
 root." This chapter defines what a module **is** so those have something to name, and consolidates
 the module-side of the capability machinery `capabilities.md` specifies. Where it commits a
-spelling it says so; the *open* list records what waits for the project-config doc.
+spelling it says so; the *open* list records what waits for the project-config doc, which is now
+written as `packages.md`.
 
 This chapter rests on `capabilities.md` (capabilities are a per-module property that propagates
 through imports — this chapter is the module half of that contract), `cross-platform.md` (the
@@ -505,8 +506,9 @@ for (`cross-platform.md`, and the pattern the old compiler reached for with its 
 relaxation).
 
 The **exact suffix grammar and the resolution rule** — which filename shapes mark a platform, how
-the active target is chosen, and the `sysl.conf` schema that ties it together — belong to the
-**project-config doc**, which `capabilities.md` already flags as unwritten. This chapter fixes
+the active target is chosen, and the `package.hocon` schema that ties it together — belong to
+**`packages.md`**, which now carries the schema; the suffix grammar itself is the one part of that
+promise still unwritten. This chapter fixes
 only that the *module identity* is invariant under platform selection; the file axis lives below
 the module name, not beside it.
 
@@ -1174,14 +1176,16 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
 
 ## Open (not yet decided)
 
-- **a. The project-config doc.** The `sysl.conf` (HOCON) schema, the target registry, and the
-  platform-file suffix grammar and resolution (§5) are a separate doc `capabilities.md` already
-  defers. **The project root is no longer part of it**: the driver takes one, as the path it is
-  given — `sysl run <dir>` makes that directory the root and compiles the tree beneath it. That is
-  the minimum that unblocks multi-module builds, and it costs nothing to keep when a config file
-  arrives, since a file only ever *names* a root the driver would otherwise be told. What is left
-  is the active target, the capability declarations, and platform-file selection; let real needs
-  drive dependency resolution, workspaces, and publishing rather than guessing them now.
+- **a. The project-config doc — mostly CLOSED, by `packages.md`.** The `package.hocon` schema, the
+  active target, the capability declarations and the dependency model are written there, along with
+  the namespacing rule this chapter's §1 forces (a module name is local and relative, so a fetched
+  `json` and your own `json` are one name — resolved by an optional per-consumer *mount*, with a
+  collision an error rather than a silent winner, and canonical identity taken from the coordinate so
+  `15 § 2`'s mangling never sees a mount). **The project root was already out of it**: the driver
+  takes one, as the path it is given — `sysl run <dir>` makes that directory the root and compiles
+  the tree beneath it, and a config file only ever *names* a root the driver would otherwise be told.
+  **What is left of this item is the platform-file suffix grammar and resolution (§5)**, which
+  `packages.md` does not attempt. Nothing in `packages.md` is built.
 - **b. Re-export / facade modules.** Whether a module can re-export another's names (a `pub
   import`-style forwarding, so `std` can surface `std.fs.read`) is a real ergonomic want for
   building a curated public surface over sub-modules, and is left until the standard library's

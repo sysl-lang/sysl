@@ -824,6 +824,7 @@ type-argument entry already records.
   it was never a decision about traits or about properties: it was one parser alternative narrower
   than the member beside it. See `08 § Properties`.
 - **`&Trait` is not yet gated on `alloc`.** `capabilities.md` puts a counted trait object behind the
-  allocator capability, alongside `&T` itself. Neither is gated, because the capability system needs
-  the project config and the module system, and both are still to be written — so this is the same
-  gap `&T` already has rather than a new one.
+  allocator capability, alongside `&T` itself. Neither is gated — this is the same gap `&T` already
+  has rather than a new one. **The stated reason is now stale**: it said the capability system was
+  waiting on the project config and the module system, and `13` is written and the config is
+  designed in `packages.md`. What the gate waits on is an implementation, not a decision.

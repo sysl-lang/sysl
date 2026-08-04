@@ -151,9 +151,9 @@ trade here.
 
 Nothing in this section is an independent decision; it is what §1–§4 and `13` require.
 
-1. **Discover.** Walk from the project root — whose location is the project-config doc's to settle
-   (`13` §Open a). Every directory containing sources is a module, and `readdir` gives its file
-   set with no parsing at all.
+1. **Discover.** Walk from the project root — the path the driver is given, which `packages.md § 1`
+   confirms a `package.hocon` only ever *names* rather than replaces. Every directory containing
+   sources is a module, and `readdir` gives its file set with no parsing at all.
 2. **Parse** every file, **for the target** — a literate file's prose is blanked first (§11) and
    then the lines of a branch this build is not for are (`targets.md § Conditional compilation`), so
    what is parsed is already the program this machine sees. `13` §3 establishes that a qualified reference can create a dependency no

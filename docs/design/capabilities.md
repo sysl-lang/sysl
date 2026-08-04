@@ -21,9 +21,11 @@ that lets one language span safe application code and allocator-free kernel/driv
 mechanism spans three layers — project config (targets declare capabilities), the module
 system (propagation, per-module restriction), and the type system (`alloc` gates the memory
 modes). **The target registry is now its own doc and is built — `targets.md`** — so what a
-target *is* and how one is named are settled; what is still to be written is the project-config
-and module-resolution half around it (the HOCON `sysl.conf` schema, per-target capability sets,
-and filename-axis platform selection). This one is the capability model.
+target *is* and how one is named are settled, and the project-config half around it is now
+`packages.md`: the `package.hocon` schema, per-target capability sets, and the dependency model
+that lets a *package* carry a capability requirement the way a module does. `packages.md` is
+designed and unbuilt, so what it says about capabilities is a promise rather than a check.
+This one is the capability model.
 
 ## Two kinds of capability
 
@@ -170,17 +172,19 @@ allocator-free everywhere.
   `no posix`, and the assertion is enforced against the module graph. What settled it was not a
   decision but an arrival: the question was academic while nothing required `os`, and `sysl.fs` is
   what gave the clause something to refuse.
-- **Config / module-resolution details** — the HOCON `sysl.conf` schema, per-target capability
-  sets, and filename-axis platform selection are still to be written. **The target registry
-  itself is done (`targets.md`)**: a target is a value with a name, a triple, and the ABI facts
-  codegen reads, and `--target` selects one. What it deliberately does *not* carry is
-  capabilities — that is exactly the part a project has an opinion about, so it belongs to the
-  config rather than to the fixed table.
-  **Expect the project config to be revisited repeatedly** as the language grows, and
-  especially once external libraries and dependency management arrive. Design only the minimum
-  that unblocks the work at hand (root, active target, capabilities, build flags, platform-file
-  selection); let real needs drive versioning, dependency resolution, workspaces, and
-  publishing rather than guessing at them upfront.
+- **Config / module-resolution details** — **now written, in `packages.md`**: the `package.hocon`
+  schema, per-target capability sets, and a package-level `requires` block. Filename-axis platform
+  selection is the one piece still unwritten. **The target registry itself is done (`targets.md`)**:
+  a target is a value with a name, a triple, and the ABI facts codegen reads, and `--target` selects
+  one. What it deliberately does *not* carry is capabilities — that is exactly the part a project
+  has an opinion about, so it belongs to the config rather than to the fixed table, and
+  `packages.md § 2` fixes the line: **capabilities are policy and ABI is not**, so a config may add
+  capabilities to a registry target but may not overrule a measured fact.
+  **Expect the project config to be revisited repeatedly** as the language grows. That advice stands
+  and `packages.md` deliberately went past it — it designs versioning, resolution and vendoring
+  ahead of anything needing them, at the user's direction and with the risk recorded in its own
+  status header. Nothing there is built, so it is a design to be checked against a first
+  implementation rather than a constraint on one.
 - **`requires` granularity** — module-level only, or also finer? Module-level is the unit a
   *declaration* is written at, and that has not changed. What did change is that the **question**
   turned out to be finer than the declaration: `alloc` is checked against what a module calls, for
