@@ -681,6 +681,13 @@ for want of it: what a program does with a required trait is call its members, w
 upcast is ever wanted the extension is additive — a table for the required trait, and a pointer to
 it appended *after* the slots, so no index moves.
 
+The price is smaller than it first reads, because the case that would have wanted an upcast mostly
+wants a **bound**, and a bound an object satisfies (`10 §5`). A function written `[T: Super]` takes a
+`&Sub` — the slots it needs are in the table, and finding them is what the closure the table was laid
+out from already did. What stays refused is the *conversion*, and the two are worth keeping apart: a
+bound asks what may be called through the value, which the table answers; forming a `&Super` asks
+what may be assembled from the value's type, and an object has no implementations to assemble from.
+
 The diamond needs no rule of its own. `D: A + C` with both `A: B` and `C: B` carries `B`'s members
 once, because the walk takes each trait the first time it reaches it. What *is* refused is two traits
 in one closure declaring a member of the same name — and the reason is the **table**, not the
@@ -817,6 +824,7 @@ type-argument entry already records.
   it was never a decision about traits or about properties: it was one parser alternative narrower
   than the member beside it. See `08 § Properties`.
 - **`&Trait` is not yet gated on `alloc`.** `capabilities.md` puts a counted trait object behind the
-  allocator capability, alongside `&T` itself. Neither is gated, because the capability system needs
-  the project config and the module system, and both are still to be written — so this is the same
-  gap `&T` already has rather than a new one.
+  allocator capability, alongside `&T` itself. Neither is gated — this is the same gap `&T` already
+  has rather than a new one. **The stated reason is now stale**: it said the capability system was
+  waiting on the project config and the module system, and `13` is written and the config is
+  designed in `packages.md`. What the gate waits on is an implementation, not a decision.

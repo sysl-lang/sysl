@@ -20,7 +20,7 @@ package io.github.edadma.sysl
  * **The two questions have since parted, and where the line falls is the point of this file.** The
  * first one is about *these* trees: whether a declaration is the library's is answered by which
  * source it came from, and which sources those are depends on whether the compilation parsed the
- * library or decoded it. It moved to `Core`, which a compilation is given. The second is about the
+ * library or decoded it. It moved to `Stdlib`, which a compilation is given. The second is about the
  * standard module as such — its name, the key a declaration in it is filed under, the spelling a key
  * renders as, which names the compiler reaches for itself — and none of that turns on the carrier.
  * That is what is left here.
@@ -33,7 +33,7 @@ package io.github.edadma.sysl
  */
 object Library {
 
-  /** The **named** modules the library's own source declares — what `sysl build-lib --core` is
+  /** The **named** modules the library's own source declares — what `sysl build-lib --std` is
    * producing, and the only compilation allowed to declare any of them.
    *
    * Read off the library's own headers rather than written down, because a module is a directory
@@ -41,7 +41,7 @@ object Library {
    * being, and a list kept beside that would have to be edited in step with it or would quietly
    * leave the new module out of the build that is supposed to be producing it.
    *
-   * What a given compilation was *handed* is `Core.modules`, and that is the one to ask about
+   * What a given compilation was *handed* is `Stdlib.modules`, and that is the one to ask about
    * scope. This is about the source in the tree, like everything else here.
    */
   lazy val modules: List[String] = carried.modules
@@ -56,16 +56,16 @@ object Library {
    */
   val autoImported: List[String] = List(Std.module)
 
-  /** Every declaration the library carries, as the compiler carries it.
+  /** Every declaration the library declares, read from its **source**.
    *
-   * The **embedded** copy specifically, and that is the right one for the questions asked of this:
-   * what the library declares, which the compiler-known names are held to, is a claim about the
-   * source under `lib/sysl` rather than about whatever a given compilation was handed. A
-   * compilation's own core is `Core`, which it is given rather than looks up.
+   * From the source specifically, and that is the right one for the questions asked of this: what
+   * the library declares, which the compiler-known names are held to, is a claim about the files
+   * under `lib/sysl` rather than about whatever a given compilation was handed. A compilation's own
+   * std is `Stdlib`, which it is given rather than looks up.
    */
   def decls: List[Stmt] = carried.decls
 
-  /** The copy of the library the compiler carries, read for the machine sysl is **running** on.
+  /** The library as this compiler is installed with it, read for the machine sysl is **running** on.
    *
    * **Every question on this object is about the standard module as such** — which modules it
    * declares, which key a name is filed under, which names the compiler is allowed to spell for
@@ -76,10 +76,10 @@ object Library {
    * on that target, whatever this said — so the choice is only between failing at the gated name and
    * failing here, and `LibraryTests` holds every target in the registry to declaring all of them.
    *
-   * What a given *compilation* was handed is `Core`, which it is given rather than looks up. This is
+   * What a given *compilation* was handed is `Stdlib`, which it is given rather than looks up. This is
    * the copy in the tree, and it is the one a test asking about the library itself wants.
    */
-  def carried: Core = Core.embedded(Target.default)
+  def carried: Stdlib = Stdlib.fromSource(Target.default)
 
   /** The key the library's declaration named `name` is filed under — what the compiler names one
    * by, wherever it names one rather than reading a name out of source.

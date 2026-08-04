@@ -31,6 +31,16 @@
 //     difference between a thing being writable and not, and it is the one that decided the table
 //     layout. What the object still cannot do is become a `&Display`: the slots are there and no
 //     word names them as a table of their own, which is the price of flattening.
+//   * **A bound did not see the object's table — answered.** This program reported a second, sharper
+//     charge on the same price: `show[T: Display](x: T)` would not take a `&Shape`, so a required
+//     trait was reachable by *name* and not by *constraint*, and no one generic function covered
+//     both a `Rect` and the `&Shape` holding it. A bound now asks what may be **called** on the
+//     value, and an object's table is exactly the members it names — so `show(s)` compiles, and a
+//     `[T: Shape]` function serves a `Circle` with a direct call and a `&Shape` with an indirect
+//     one, from one signature. Nothing about monomorphization moved to allow it: an object type is a
+//     concrete type, so the body is instantiated at `&Shape` the way it is at `Circle`. The
+//     conversion is what stays refused, and the distinction is the whole of the rule — being callable
+//     is not being assemblable, and only the first of the two is what a bound asks about.
 //   * **A `*Writer` rendered bytes and nothing turned them back into a string — answered.** The
 //     natural way to write the trait's text member is not to build a string at all — it is
 //     `render(self, out: *Writer)`, which is what `Display` already is and what costs no
@@ -86,17 +96,20 @@ end check
 
 section(title: string) = print("-- " + title)
 
-// The two numbers a shape is asked for, to six decimals — written twice, once per sigil.
+// The two numbers a shape is asked for, to six decimals — once, over a **bound**, for every way of
+// holding one.
 //
-// A `&Shape` is not accepted where a `*Shape` is wanted. For a plain reference the crossing is
-// available and is spelled `&*x`: a dereference is a place and the address of a place is a raw
-// pointer, so lending a counted value to a function that only looks at it costs two characters and
-// stays greppable, which is exactly the discipline `03` wants for the unsafe tier. An object has no
-// dereference — `&*o` is "a &Shape has forgotten what it points at" — so for a trait object the
-// crossing has no spelling at all, and an observer has to be written once for each sigil.
-size(s: &Shape) -> string = six(s.area()) + " " + six(s.perimeter())
-
-size_raw(s: *Shape) -> string = six(s.area()) + " " + six(s.perimeter())
+// This used to be two functions, `size(s: &Shape)` and `size_raw(s: *Shape)`, with identical bodies.
+// A `&Shape` is still not accepted where a `*Shape` is wanted, and there is still no spelling for
+// that crossing: for a plain reference it is `&*x` — a dereference is a place and the address of a
+// place is a raw pointer, which is the greppable discipline `03` wants for the unsafe tier — but an
+// object has no dereference, so `&*o` is "a &Shape has forgotten what it points at".
+//
+// What removed the duplication is not a conversion, it is that a bound takes an object. Both sigils
+// carry a table of `Shape`'s members, which is what `[T: Shape]` asks for, so one body serves both —
+// and serves a bare `Circle` as well, with a direct call instead of an indirect one. An observer per
+// sigil was never the only way to write this; a bound was, once it could see the table.
+size[T: Shape](s: T) -> string = six(s.area()) + " " + six(s.perimeter())
 
 // A bound, to six decimals.
 extent(b: Box) -> string =
@@ -124,14 +137,24 @@ var rect = Rect(1.0, 2.0, 3.0, 4.0)
 var tri = Tri(Point(0.0, 0.0), Point(4.0, 0.0), Point(0.0, 3.0))
 var poly = Poly(pentagon())
 
-check("a circle of radius two", size_raw(&circle), "12.566371 12.566371")
+// The bound takes the value itself here, so these four are direct calls into four monomorphized
+// bodies — no erasure, no table, nothing to forget.
+check("a circle of radius two", size(circle), "12.566371 12.566371")
 check("and the box around it", extent(circle.bounds()), "-2.000000 -2.000000 2.000000 2.000000")
-check("a three-by-four rectangle", size_raw(&rect), "12.000000 14.000000")
+check("a three-by-four rectangle", size(rect), "12.000000 14.000000")
 check("and the box around it", extent(rect.bounds()), "1.000000 2.000000 4.000000 6.000000")
-check("a three-four-five triangle", size_raw(&tri), "6.000000 12.000000")
+check("a three-four-five triangle", size(tri), "6.000000 12.000000")
 check("and the box around it", extent(tri.bounds()), "0.000000 0.000000 4.000000 3.000000")
-check("a five-sided polygon", size_raw(&poly), "21.000000 17.535658")
+check("a five-sided polygon", size(poly), "21.000000 17.535658")
 check("and the box around it", extent(poly.bounds()), "-1.000000 0.000000 5.000000 5.000000")
+
+// …and the same body, reached with the shape erased behind each sigil in turn. One signature, three
+// ways of holding the argument, one answer.
+var as_raw: *Shape = &circle
+var as_counted: &Shape = Circle(0.0, 0.0, 2.0)
+
+check("the same function through a raw object", size(as_raw), "12.566371 12.566371")
+check("and through a counted one", size(as_counted), "12.566371 12.566371")
 
 // The two spans a box answers with, which is what a layout asks one for rather than its corners.
 check("a circle's box is as wide as it is tall",

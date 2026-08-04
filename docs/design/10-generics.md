@@ -258,6 +258,46 @@ sysl's Rust-flavored trait system already implies. A `where`-clause form for lon
 bound lists is a possible ergonomic extension (`§ Open c`); the inline `[T: A + B]` form is the
 settled baseline.
 
+### A trait object satisfies a bound on the trait it dispatches through
+
+A bound asks whether the members it names can be called on the value, and a `*Trait` / `&Trait`
+carries a **table** of exactly those members — so it answers yes, and one generic function serves
+both a concrete type and the object erased from it:
+
+```
+total[T: Shape](x: T) -> int = x.area()
+
+var o: &Shape = Rect(3, 4)
+
+total(Rect(3, 4))                                  // direct call, one instantiation
+total(o)                                           // indirect call, another
+```
+
+**Monomorphization is not bent to allow it,** which is why this is a small rule rather than a second
+compilation strategy. An object type is a concrete type — a pair of words (`02`) — so §7 instantiates
+the body at `&Shape` exactly as it does at `Rect`, once each; what differs is that `x.area()` lowers
+to an indirect call in the one and a direct call in the other. That difference was already there
+between any two instantiations, and it is decided the same way, by the type the parameter is bound
+to. No dictionary is passed, and no body is compiled that was not going to be.
+
+**It is total, and that is object safety's doing rather than a promise made here.** A trait with a
+member that cannot be dispatched has no object *at all* in sysl (`02`), rather than an object missing
+that member — so a `&Shape` existing is already the proof that every member of `Shape` is reachable
+through it. Languages that decide object safety per member owe a rule about what happens when a bound
+reaches an absent one; sysl owes none, because the case does not exist.
+
+**A requirement follows with no rule of its own.** `trait Shape: Display` flattens `Display`'s slots
+into the object's table (`02`), and a bound on a trait is satisfied wherever a bound on one that
+requires it is — so the object meets `[T: Display]` by the same step that a `[T: Shape]` parameter
+meets it.
+
+**What this does not license is erasing an object again.** A bound asks what may be *called* through
+a value; forming an object asks what may be *assembled* from its type, and a table is laid out from a
+type's implementations, which an object has none of. So a `&Shape` satisfies `[T: Display]` and
+cannot be converted to a `&Display` — the slots are in its table but a run of slots inside one table
+is not a table anything can point at, which is the upcast `02` gives up by flattening. The two
+questions look alike and only the first of them is about behaviour.
+
 ### A type's own parameters carry bounds too, and that is where the type says what it assumes
 
 The same bracketed list, in the same place, means the same thing on a struct or an enum:
@@ -318,6 +358,13 @@ Same trait, two strategies, chosen by how you *spell the parameter* — a bound 
 sigil-carried trait object for dynamic — with no `dyn` keyword either way (`02`). By-value
 generic bounded code is the norm; the trait object is the escape hatch for genuine runtime
 heterogeneity.
+
+**They are not two worlds, though: a bound takes an object** (§5), so a function written the static
+way is not closed to callers who erased. `total[T: Shape]` serves a `Rect` with a direct call and a
+`&Shape` with an indirect one, from one signature. The choice above is therefore about what the
+*caller* holds rather than about which functions it can reach, and the common case — a library
+written against bounds, used by a program keeping a heterogeneous collection — needs no second
+signature written the other way.
 
 ## 7. Monomorphization
 

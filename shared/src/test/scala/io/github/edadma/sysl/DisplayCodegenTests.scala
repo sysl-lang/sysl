@@ -6,10 +6,15 @@ import org.scalatest.freespec.AnyFreeSpec
  *
  * What is worth pinning here rather than leaving to the run suite is the part a working program
  * cannot tell you about — that a scalar still renders with no sink at all, that the sink a `print`
- * builds costs nothing but two words, and that a program which never renders a user type carries
- * neither writer.
+ * reaches is the library's own value rather than anything the compiler built, and that a program
+ * which never renders a user type carries neither writer.
  */
 class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
+
+  /** The table standing for the library's `impl Writer for Stdout`, named the way every erasure
+   * names one. Read off `Library` rather than spelled, since a key is what an emitted name is.
+   */
+  private val outTable = s"vt.${Library.key("Writer")}.${Library.key("Stdout")}"
 
   private val point =
     """struct Point
@@ -33,7 +38,8 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     "a program that prints only scalars carries no writer" in {
       val out = ir("print(5, \"a\", true)")
 
-      out should not include "@sysl.vt.out"
+      out should not include s"@$outTable"
+      out should not include s"@${Library.key("stdout")}("
       out should not include "@sysl.w.buf.write"
     }
 
@@ -45,14 +51,15 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     }
   }
 
-  "the sink a print builds" - {
-    // Two words and no allocation: the table is a constant and the data word is null, because a
-    // writer over standard output has nothing to point at.
-    "is a constant table beside a null" in {
+  "the sink a print reaches" - {
+    // Nothing is built here any more. The sink is a value the library hands out, so what `print`
+    // emits is a call — and the two words it comes back as are assembled inside that function,
+    // out of an ordinary `impl Writer` for a struct with no fields.
+    "is a call to the library's own, not two words the compiler laid down" in {
       val out = irMain(point + "print(Point(1, 2))")
 
-      out should include("insertvalue { ptr, ptr } undef, ptr @sysl.vt.out, 0")
-      out should include regex """insertvalue \{ ptr, ptr \} %t\d+, ptr null, 1"""
+      out should include regex raw"""call \{ ptr, ptr \} @${keyRe("stdout")}\(\)"""
+      out should not include "@sysl.vt.out"
     }
 
     "hands the value, the sink, and the specifier to the type's own display" in {
@@ -64,9 +71,13 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
         s"""call void @Point\\.display\\(%struct\\.Point %t\\d+, \\{ ptr, ptr \\} %t\\d+, $spec %t\\d+\\)"""
     }
 
-    "reaches standard output through the library's own byte sink" in {
-      defineOf(ir(point + "print(Point(1, 2))"), "sysl.w.out.write") should
-        include(s"call void @${Library.key("putbytes")}({ ptr, ptr, i64 } %b)")
+    // The `write` a print ends in is a library function like any other, so what the program carries
+    // is a table pointing at it rather than a body the compiler wrote. That the body reaches
+    // `putbytes` is `print.sysl`'s business now, and the run suite's.
+    "through a table pointing at the library's own writer" in {
+      ir(point + "print(Point(1, 2))") should include(
+        s"@$outTable = private constant [2 x ptr] " +
+          s"[ptr @${Library.key("Stdout")}.failed, ptr @${Library.key("Stdout")}.write]")
     }
   }
 
@@ -89,16 +100,20 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "the writers' tables" - {
-    // The compiler lays these out by hand, so the order is the contract, and the order is the one a
-    // trait *offers* rather than the one `Writer` declares: `Writer: Fallible` puts the required
-    // trait's members first, so slot 0 is `failed` and slot 1 is `write`. That is what a call
-    // through the object indexes by, and getting it backwards would call the wrong function with
-    // the right arguments — which is why `SpecialForms.checkWriterShape` asks as well.
+    // The buffer's is laid out by hand, so its order is a contract the compiler keeps, and the order
+    // is the one a trait *offers* rather than the one `Writer` declares: `Writer: Fallible` puts the
+    // required trait's members first, so slot 0 is `failed` and slot 1 is `write`. That is what a
+    // call through the object indexes by, and getting it backwards would call the wrong function
+    // with the right arguments — which is why `SpecialForms.checkWriterShape` asks as well.
+    //
+    // The sink's is now built by the ordinary erasure machinery from the library's `impl`, and it
+    // comes out in the same order — which is the point of checking both here rather than one: the
+    // hand-written table and the derived one have to agree, and nothing else compares them.
     "hold failed first and write second, the order the trait offers them" in {
       val out = ir(point + "print(Point(1, 2))\nprint(str(Point(3, 4)))")
 
-      out should include("@sysl.vt.out = private constant [2 x ptr] " +
-        "[ptr @sysl.w.out.failed, ptr @sysl.w.out.write]")
+      out should include(s"@$outTable = private constant [2 x ptr] " +
+        s"[ptr @${Library.key("Stdout")}.failed, ptr @${Library.key("Stdout")}.write]")
       out should include("@sysl.vt.buf = private constant [2 x ptr] " +
         "[ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write]")
     }
@@ -106,13 +121,13 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
     "are emitted once however many values render" in {
       val out = ir(point + "print(Point(1, 2))\nprint(Point(3, 4))\nprint(Point(5, 6))")
 
-      out.linesIterator.count(_.startsWith("@sysl.vt.out =")) shouldBe 1
+      out.linesIterator.count(_.startsWith(s"@$outTable =")) shouldBe 1
     }
 
     "a program that only prints a user type carries no buffer" in {
       val out = ir(point + "print(Point(1, 2))")
 
-      out should include("@sysl.vt.out")
+      out should include(s"@$outTable")
       out should not include "@sysl.vt.buf"
     }
   }

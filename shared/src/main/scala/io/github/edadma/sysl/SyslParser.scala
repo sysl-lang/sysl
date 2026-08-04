@@ -53,9 +53,9 @@ class SyslParser(val source: Source) extends DeclParser {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      misplacedCapability | misplacedLink | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
-        breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign |
-        resultListStmt | exprStmt,
+      misplacedHeaderAttr | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
+        breakStmt | continueStmt | deferStmt | asmStmt | requireStmt | ensureStmt | invariantStmt |
+        variantStmt | multiAssign | resultListStmt | exprStmt,
     )
 
   /** A statement written on the same line as the keyword that introduces it.
@@ -93,6 +93,25 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val ensureStmt: PackratParser[Stmt] =
     op("ensure") ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Ensure(c, m) }
 
+  /** `invariant <cond> [, "message"]` and `variant <expr>` — the loop clauses of `17 §3`, and, for
+   * `variant`, the recursion measure a function's contract block carries (`17 §4`).
+   *
+   * **Both words are contextual**, matched as soft words exactly as the struct `invariant` of
+   * `16 §6` is — which is also where `invariant` was already being read this way, so this spends no
+   * new word. The cost of that is the cost `is` and `not` already pay: a *bare statement* that calls
+   * a function of the same name, `invariant(x)`, reads as a clause over `(x)`. Anywhere that is not
+   * a bare statement — `val v = invariant(x)`, an argument, a condition — the call is unambiguous,
+   * and a value named `invariant` is untouched. That trade buys the clause its natural spelling in
+   * the position a reader writes it.
+   */
+  protected lazy val invariantStmt: PackratParser[Stmt] =
+    invariantKw ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Invariant(c, m) }
+
+  protected lazy val variantStmt: PackratParser[Stmt] =
+    variantKw ~> expression ^^ Variant.apply
+
+  protected lazy val variantKw: Parser[Unit] = softWord("variant")
+
   protected lazy val contractMsg: Parser[String] =
     accept("string literal", { case t: lexical.StrLit => t.value })
 
@@ -103,57 +122,130 @@ class SyslParser(val source: Source) extends DeclParser {
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
   protected lazy val declaration: PackratParser[Stmt] =
-    testDecl |
+    attributedDecl |
       implVisibility |
       visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
         case Visibility.Public ~ d => d
         case v ~ d                 => restrict(v, d)
       }
 
-  /** A function carrying `#test`, which is a declaration with a line in front of it (`testing.md`).
+  /** A function carrying annotations, which is a declaration with a line or more in front of it.
    *
-   * The attribute is its own line and the declaration follows on the next, which is why the newlines
-   * between them are consumed here: the statement separator would otherwise end the statement at the
-   * attribute, leaving a prefix with nothing to attach to. Everything about the declaration itself is
-   * still `declaration`'s — a test may be `private`, and is written exactly as any other function.
+   * Each annotation is its own line and the declaration follows the last of them, which is why the
+   * newlines between them are consumed here: the statement separator would otherwise end the
+   * statement at an annotation, leaving a prefix with nothing to attach to. Everything about the
+   * declaration itself is still `declaration`'s — an annotated function may be `private`, and is
+   * written exactly as any other.
    *
-   * Only a function may carry it, and the refusal below is what says so. A struct or a `val` with
-   * `#test` above it is a mistake about what a test *is* rather than a syntax error, so it is
+   * Only a function may carry one, and the refusal below is what says so. A struct or a `val` with
+   * `@test` above it is a mistake about what a test *is* rather than a syntax error, so it is
    * answered with the sentence rather than with the list of forms the grammar could still have read.
    */
-  protected lazy val testDecl: PackratParser[Stmt] =
-    testAttr >> { a =>
-      // Once the attribute has been read the statement is committed to being a test, which is what
-      // `>>` buys: everything after it is read against that, so a declaration that cannot carry one
-      // is answered with the sentence below rather than with the grammar's complaint about whichever
-      // alternative it went on to try.
-      // The newlines are consumed *before* the choice so that both arms start at the same token. A
-      // combinator choice keeps whichever alternative reached furthest, so an `err` written behind
-      // the newline would sit earlier than the declaration rule's own failure and lose to it —
-      // leaving the reader with "identifier expected" at a line whose problem is the one above it.
-      opt(newlines) ~> ((visibility ~ funcDecl) ^^ {
-        case Visibility.Public ~ (f: FuncDecl) => f.copy(test = Some(a))
-        case v ~ (f: FuncDecl)                 => restrict(v, f.copy(test = Some(a)))
-        case _ ~ other                         => other
-      } | err(
-        "'#test' marks a function as a unit test, and only a function — there is nothing for " +
-          "'sysl test' to call in any other declaration",
-      ))
+  protected lazy val attributedDecl: PackratParser[Stmt] =
+    rep1(attribute <~ opt(newlines)) >> { as =>
+      // Once an attribute has been read the statement is committed to being an attributed
+      // declaration, which is what `>>` buys: everything after it is read against that, so a
+      // declaration that cannot carry one is answered with the sentence below rather than with the
+      // grammar's complaint about whichever alternative it went on to try.
+      duplicated(as) match
+        case Some(dup) =>
+          err(s"'@$dup' is written twice above one declaration, and it says nothing the once does not")
+        case None =>
+          (visibility ~ funcDecl) ^^ {
+            case Visibility.Public ~ (f: FuncDecl) => attributed(f, as)
+            case v ~ (f: FuncDecl)                 => restrict(v, attributed(f, as))
+            case _ ~ other                         => other
+          } | err(
+            "an annotation marks a function, and only a function — neither what 'sysl test' calls " +
+              "nor what recurses is anything a declaration of another kind supplies",
+          )
     }
 
-  /** `#test`, and the three things it may say about the test: the name a report gives it, that it is
+  /** One annotation: what it says about the function under it. Each alternative reads the `@` for
+   * itself so that the annotation's own position is the `@`, which is the line a test report names.
+   */
+  private lazy val attribute: PackratParser[Attr] =
+    testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | unknownAttr | hashAttr
+
+  /** `@test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
    */
   protected lazy val testAttr: PackratParser[TestAttr] =
-    at(op("#") ~> testWord ~> opt(op("(") ~> testArgs <~ op(")")) ^^ (_.getOrElse(TestAttr(None, false, None))))
+    at(op("@") ~> attrWord("test") ~> opt(op("(") ~> testArgs <~ op(")"))
+      ^^ (_.getOrElse(TestAttr(None, false, None))))
 
-  /** The attribute's name. `test` stays an ordinary identifier — reserving it would spend the word
-   * out of every program's namespace for the sake of one line per test, which is the trade `alloc`
+  /** `@tailrec` — the assertion that this function's call to itself is the last thing it does
+   * (`12 § Tail calls`). It takes no arguments: there is nothing to configure about a jump, and
+   * what the annotation buys is the refusal when there is no jump to make.
+   */
+  protected lazy val tailrecAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("tailrec") ^^ (_ => Attr.TailRec)
+
+  /** `@pure` — the assertion that a caller can observe nothing about this call but its result
+   * (`17 §6`). Like `@tailrec` it takes no arguments: purity is not a thing to configure, and what
+   * the annotation buys is the refusal when the body does something a caller could observe.
+   */
+  protected lazy val pureAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("pure") ^^ (_ => Attr.Pure)
+
+  /** `@ghost` — the function exists for the specification alone and is erased before codegen
+   * (`17 §8`).
+   */
+  protected lazy val ghostAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("ghost") ^^ (_ => Attr.Ghost)
+
+  private lazy val unknownAttr: PackratParser[Attr] =
+    op("@") ~> ident >> (n =>
+      err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure' and " +
+        "'@ghost' are the four. '@no_<capability>', '@requires(...)' and '@link(\"...\")' belong in " +
+        "the file's header"))
+
+  /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
+   *
+   * It is answered here rather than left to the lexer because the two sigils mark two different
+   * kinds of thing, and saying which is which is the whole of what the reader is missing: `#` gates
+   * lines before the lexer sees them and sits at the margin, `@` says something about the
+   * declaration under it. A directive word is *not* named here, since `#if` at the margin never
+   * reaches the grammar at all.
+   */
+  private lazy val hashAttr: PackratParser[Attr] =
+    op("#") ~> ident >> (n =>
+      err(s"an annotation is written '@$n' — '#' opens a directive, which gates lines before the " +
+        "lexer sees them and sits at the margin"))
+
+  /** An annotation's name. Each stays an ordinary identifier — reserving them would spend the words
+   * out of every program's namespace for the sake of one line apiece, which is the trade `alloc`
    * made and the one `capabilities.md § Open` is still paying for.
    */
-  protected lazy val testWord: Parser[Unit] =
-    accept("'test'", { case t: lexical.Identifier if t.chars == "test" => () }) |
-      ident >> (n => err(s"'$n' is not an attribute sysl knows — '#test' is the only one"))
+  private def attrWord(w: String): Parser[Unit] =
+    accept(s"'$w'", { case t: lexical.Identifier if t.chars == w => () })
+
+  /** An annotation whose name *carries* its argument — `@no_alloc` is `no_` and then the capability.
+   * What comes back is the part after the prefix, so the caller never sees the joint.
+   *
+   * The prefix alone is not one of these: `@no_` names no capability, and matching it would hand the
+   * analyzer an empty name to complain about instead of the parser refusing a word that is visibly
+   * unfinished.
+   */
+  private def attrWordPrefixed(prefix: String): Parser[String] =
+    accept(
+      s"'$prefix…'",
+      { case t: lexical.Identifier if t.chars.startsWith(prefix) && t.chars.length > prefix.length =>
+        t.chars.drop(prefix.length)
+      },
+    )
+
+  /** The attribute written twice, where one is, for the refusal above. */
+  private def duplicated(as: List[Attr]): Option[String] =
+    as.map(_.word).groupBy(identity).collectFirst { case (w, ws) if ws.length > 1 => w }
+
+  private def attributed(f: FuncDecl, as: List[Attr]): FuncDecl =
+    as.foldLeft(f) {
+      case (d, Attr.Test(t)) => d.copy(test = Some(t))
+      case (d, Attr.TailRec) => d.copy(tailrec = true)
+      case (d, Attr.Pure)    => d.copy(pure = true)
+      case (d, Attr.Ghost)   => d.copy(ghost = true)
+    }
 
   private lazy val testArgs: Parser[TestAttr] =
     contractMsg ~ opt(op(",") ~> testExpectation) ^^ {
@@ -218,70 +310,68 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val moduleHeader: Parser[ModuleName] =
     at(op("module") ~> dottedName ^^ ModuleName.apply)
 
-  /** A capability clause: `no alloc` narrowing the module below what its target offers, or
-   * `requires alloc` declaring what it cannot be built without (`13 §4`, `capabilities.md`).
+  /** A file-header attribute: `@no_alloc`, `@requires(os, posix)`, `@link("z")` (`13 §4`,
+   * `15 §8`, `capabilities.md`).
    *
-   * `no` and `alloc` are **reserved**, not contextual, so they are matched with `op` — a `softWord`
-   * matches an identifier and these never lex as one. Every other capability's name is an ordinary
-   * identifier, which is why the name is read either way and left to the analyzer to recognize: the
-   * set is a property of the project rather than of the grammar.
+   * **These are attributes rather than grammar, and that is the point of the spelling.** A capability
+   * and a library name are things said *about* a module, not constructs the language executes, so
+   * they take the notation sysl already uses for that — the one `@test` and `@tailrec` are written
+   * in. What it buys is the whole reason to prefer it: **no word is spent.** `alloc` was a reserved
+   * word, which took the most natural name in an allocator away from the code that provides one, and
+   * `guide/slab` had to call its function `take`. Every name here arrives through `attrWord`, which
+   * matches an ordinary identifier, so `alloc`, `no`, `requires` and `link` are all available to a
+   * program again.
+   *
+   * One attribute may yield several clauses, because `@requires` takes a list.
    */
-  protected lazy val capabilityClause: Parser[CapabilityClause] =
-    at(
-      op("no") ~> capabilityName ^^ (CapabilityClause(CapabilityDirection.Narrows, _)) |
-        op("requires") ~> capabilityName ^^ (CapabilityClause(CapabilityDirection.Requires, _)),
-    )
+  private lazy val headerAttr: Parser[List[CapabilityClause | LinkClause]] =
+    op("@") ~> (noAttr | requiresAttr | linkAttr)
 
-  /** The name in a capability clause. `alloc` is a reserved word, because the clause reads it, so it
-   * would never arrive as an identifier; the rest of the set is spelled the ordinary way.
+  /** `@no_alloc` and its siblings — the module narrowing itself below what the target offers.
+   *
+   * The capability is the part after `no_`, and it is **not checked here**: the set is a property of
+   * the project rather than of the grammar (`Capability`), so `@no_sockets` parses and the analyzer
+   * is what says there is no such capability. That keeps one message about an unknown capability
+   * instead of two that differ by where it was written.
+   *
+   * One word per capability rather than `@no(alloc)` follows Rust's `#![no_std]`, which is the
+   * nearest precedent and reads the way the thing is spoken.
    */
-  protected lazy val capabilityName: Parser[String] = op("alloc") ^^^ "alloc" | ident
+  private lazy val noAttr: Parser[List[CapabilityClause | LinkClause]] =
+    at(attrWordPrefixed("no_") ^^ (CapabilityClause(CapabilityDirection.Narrows, _))) ^^ (List(_))
 
-  /** A capability clause written where a statement goes, which is refused for the reason
-   * `noVisibility` is: the clause has a place, and a reader who writes it in the wrong one should be
-   * told which place that is rather than answered with "newline expected".
+  /** `@requires(os)`, `@requires(threads, posix)` — what the module cannot be built without.
    *
-   * It is a *header*, not a statement, because it is a property of the module and the module is
-   * settled before anything in the file runs — and because a clause part-way down a file would read
-   * as though the statements above it were outside its reach.
+   * Parenthesised and plural where the narrowing form is neither, because that is how each is used:
+   * a module gives up one capability at a time and needs several at once. `sysl.thread` requires
+   * both `threads` and `posix`, and writing that as two attributes would be two lines saying one
+   * thing.
    */
-  protected lazy val misplacedCapability: Parser[Nothing] =
-    capabilityClause ~> err(
-      "a capability clause belongs in the file's header, on the lines directly after 'module' and " +
-        "before everything else — it is a property of the whole module, not of the statements below it")
+  private lazy val requiresAttr: Parser[List[CapabilityClause | LinkClause]] =
+    attrWord("requires") ~> op("(") ~>
+      rep1sep(at(ident ^^ (CapabilityClause(CapabilityDirection.Requires, _))), op(",")) <~ op(")")
 
-  /** A link directive: `link "z"`, naming a library the linker must be given for this file's
-   * `extern`s to resolve (`15 §8`).
+  /** `@link("z")` — a library the linker must be given for this file's `extern`s to resolve.
    *
-   * **`link` is a soft keyword and cannot be anything else.** `guide/slab` declares a function called
-   * `link` — the pointer into a free block — and reserving the word would break it, which is exactly
-   * the kind of name a systems language must not spend. Nothing is lost by it: a directive is `link`
-   * followed by a *string*, and no statement has that shape, so the grammar tells them apart with no
-   * lookahead.
-   *
-   * The library is named by a string rather than by an identifier because it is a name from outside
-   * sysl, exactly as an `extern`'s symbol is — and because plenty of real ones are not identifiers at
+   * The library is named by a **string** rather than an identifier because it is a name from outside
+   * sysl, exactly as an `extern`'s symbol is, and because plenty of real ones are not identifiers at
    * all. `stdc++` is the everyday example.
    */
-  protected lazy val linkClause: Parser[LinkClause] = at(softWord("link") ~> linkName ^^ LinkClause.apply)
+  private lazy val linkAttr: Parser[List[CapabilityClause | LinkClause]] =
+    at(attrWord("link") ~> op("(") ~> linkName <~ op(")") ^^ LinkClause.apply) ^^ (List(_))
 
-  /** One line of a file's header: either kind of clause, read in whatever order they were written.
+  /** A header attribute written where a statement goes, which is refused for the reason
+   * `noVisibility` is: it has a place, and a reader who writes it in the wrong one should be told
+   * which place that is rather than answered with "newline expected".
    *
-   * They interleave freely because they are about different things — what the module may do, and what
-   * its `extern`s need — and demanding one group before the other would be a rule with nothing behind
-   * it that every author would have to remember.
+   * It is a *header*, not a statement, because it is a property of the module and the module is
+   * settled before anything in the file runs — and because one part-way down a file would read as
+   * though the statements above it were outside its reach.
    */
-  private lazy val headerClause: Parser[CapabilityClause | LinkClause] = capabilityClause | linkClause
-
-  /** A link directive written where a statement goes, refused for the reason `misplacedCapability`
-   * is: the clause has a place, and a reader who wrote it in the wrong one should be told which place
-   * that is rather than answered with "newline expected".
-   */
-  protected lazy val misplacedLink: Parser[Nothing] =
-    linkClause ~> err(
-      "a link directive belongs in the file's header, on the lines directly after 'module' and " +
-        "before everything else — the linker is given its libraries once for the whole build, not " +
-        "at the point in the file where the directive is written")
+  protected lazy val misplacedHeaderAttr: Parser[Nothing] =
+    guard(op("@") ~ (attrWordPrefixed("no_") | attrWord("requires") | attrWord("link"))) ~> err(
+      "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
+        "everything else — it is a property of the whole module, not of the statements below it")
 
   /** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — the Scala forms (`13 §3`).
    *
@@ -491,8 +581,21 @@ class SyslParser(val source: Source) extends DeclParser {
    * nowhere to carry a type, and inference covers what the form is for.
    */
   protected def patternDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
-    (op(keyword) ~> (structPattern | variantPattern | tuplePattern)) ~ (op("=") ~> expression) ^^ {
+    (op(keyword) ~> destructuring) ~ (op("=") ~> expression) ^^ {
       case p ~ v => PatternDecl(p, mutable, Placeholders.lift(v))
+    }
+
+  /** The patterns a **binding** may be written with: the two that cannot fail, the variant one that
+   * is parsed to be refused, and any of those three named with `n @`.
+   *
+   * The name is optional rather than a fourth alternative so that `var whole @ Point{x, y} = p`
+   * reads as the same form with a name on it, which is what it is. It commits on the `@`, so a plain
+   * `var x = e` — which is not this production at all — is unaffected.
+   */
+  private lazy val destructuring: Parser[Pattern] =
+    opt(ident <~ op("@")) ~ (structPattern | variantPattern | tuplePattern) ^^ {
+      case Some(n) ~ p => BindPattern(n, p)
+      case None ~ p    => p
     }
 
   /** `ref name = place` (`03 § ref`).
@@ -599,6 +702,78 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val deferStmt: PackratParser[Stmt] =
     op("defer") ~> inlineStatement ^^ Defer.apply
 
+  /** `asm` with an architecture arm per line under it (`inline-assembly.md §1`).
+   *
+   * Every word the construct spends is contextual, `asm` included: each is recognized in one
+   * position and is an ordinary identifier everywhere else, so a program may still call a variable
+   * `out` or `clobbers` — and use it as an operand in the same function. What commits this rule is
+   * the indented arm list, which a bare mention of a variable named `asm` does not have, so the
+   * fall-through to an expression statement is exact rather than a matter of ordering.
+   */
+  protected lazy val asmStmt: PackratParser[Stmt] =
+    softWord("asm") ~> newline ~> indent ~> opt(newlines) ~>
+      repsep(asmArm, newlines) <~ opt(newlines) <~ dedent ^^ AsmStmt.apply
+
+  /** `[x86_64, aarch64]` and what answers for them. The architecture names are not checked here —
+   * the grammar has no idea which processors exist, and a name outside the set is a diagnostic
+   * about a target rather than a parse error about a token.
+   */
+  protected lazy val asmArm: Parser[AsmArm] =
+    at((op("[") ~> rep1sep(ident, op(",")) <~ op("]")) ~ asmArmBody ^^ { case archs ~ body =>
+      AsmArm(archs, body)
+    })
+
+  /** The four things an arm may be: no answer, one instruction inline, an indented block, or
+   * nothing at all. Nothing at all is last because it consumes no input and would otherwise take
+   * every arm; it is the architecture on which the operation costs no instruction.
+   */
+  protected lazy val asmArmBody: Parser[AsmBody] =
+    (softWord("unavailable") ~> asmText ^^ AsmUnavailable.apply) |
+      (asmText ^^ (line => AsmCode(List(line), Nil, Nil))) |
+      (newline ~> indent ~> opt(newlines) ~> repsep(asmItem, newlines) <~ opt(newlines) <~ dedent ^^ gatherAsm) |
+      success(AsmCode(Nil, Nil, Nil))
+
+  /** A line inside an arm: an instruction, an operand, or what the arm destroys. They are collected
+   * by kind rather than kept in order, because only the instructions have an order that matters.
+   */
+  protected lazy val asmItem: Parser[AsmItem] =
+    (asmText ^^ AsmItem.Line.apply) |
+      (asmOperand ^^ AsmItem.Operand.apply) |
+      (softWord("clobbers") ~> rep1sep(asmText, op(",")) ^^ AsmItem.Clobber.apply)
+
+  /** `in name : reg` / `out name : "dx"`.
+   *
+   * The class slot is required even though `reg` is the only class there is, so that every operand
+   * line has one shape and a second class arrives as a peer rather than as the exception to an
+   * invisible default. Its `:` is not a type annotation — the operand names a variable that already
+   * has a type — so what follows is a class or a machine register and never a type.
+   */
+  protected lazy val asmOperand: Parser[AsmOperand] =
+    at((asmDir ~ ident <~ op(":")) ~ asmPlace ^^ { case dir ~ name ~ place =>
+      AsmOperand(dir, name, place)
+    })
+
+  /** `in` is a reserved word already, for `for x in xs`, and is reused rather than added to. */
+  protected lazy val asmDir: Parser[AsmDir] =
+    (op("in") ^^^ AsmDir.In) | (softWord("out") ^^^ AsmDir.Out)
+
+  /** A bare word is sysl's and a quoted one is the assembler's, which is the rule everywhere in the
+   * construct: `reg` is a class this language names, and `"dx"` is a register only the assembler
+   * knows about.
+   */
+  protected lazy val asmPlace: Parser[Option[String]] =
+    (softWord("reg") ^^^ None) | (asmText ^^ Some.apply)
+
+  protected lazy val asmText: Parser[String] =
+    accept("string literal", { case t: lexical.StrLit => t.value })
+
+  private def gatherAsm(items: List[AsmItem]): AsmCode =
+    AsmCode(
+      items.collect { case AsmItem.Line(t) => t },
+      items.collect { case AsmItem.Operand(o) => o },
+      items.collect { case AsmItem.Clobber(rs) => rs }.flatten,
+    )
+
   /** A `'name` label reference, as used before a loop and after `break`/`continue`. */
   protected lazy val labelRef: Parser[String] =
     accept("label", { case t: lexical.Label => t.name })
@@ -645,6 +820,28 @@ class SyslParser(val source: Source) extends DeclParser {
       case lbl ~ c ~ b ~ e ~ _ => While(lbl, c, b, e)
     }
 
+  /** `do body while cond [else …]` — the post-test loop (`00 §10`).
+   *
+   * **`do` is unambiguous by position, which is what lets the same word do both jobs.** Everywhere
+   * else it is a body *introducer*, and it only ever appears there after a loop header on the same
+   * line — `while c do …`, `loop do …`, `for x in xs do …` — so it is never the first token of a
+   * statement. Here it is the head, so a `do` that starts a line can only open this form.
+   *
+   * The tail needs no rule of its own for the same reason: this loop is *incomplete* without its
+   * `while`, and there is no bare `do` block in the language for that `while` to have belonged to
+   * instead. So a `while` found where the body ends is this loop's test and nothing else can want
+   * it. Both bodies are written: `do total += 1 while more()` on one line, or an indented block with
+   * the `while` on the line that closes it.
+   *
+   * There is no `end do`: the tail already names where the body stopped, and a marker after it would
+   * be closing a block that has just been closed.
+   */
+  protected lazy val doWhileExpr: PackratParser[Expr] =
+    opt(labelRef) ~ (op("do") ~> (suite | inlineBody)) ~ (opt(newlines) ~> op("while") ~> expression) ~
+      opt(elseClause) ^^ {
+        case lbl ~ b ~ c ~ e => DoWhile(lbl, b, c, e)
+      }
+
   /** `loop body` — a `while` with the condition left out, ended by a `break` rather than by a test.
    *
    * It takes no `else`: an `else` runs when a loop finishes on its own, and this one never does.
@@ -653,6 +850,29 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val loopExpr: PackratParser[Expr] =
     opt(labelRef) ~ (op("loop") ~> body("do")) ~ opt(endMarker("loop")) ^^ { case lbl ~ b ~ _ => Loop(lbl, b) }
+
+  /** `for all i in 0..<n do a[i] > 0`, `for some k in 0..n do a[k] == t` — a quantifier over an
+   * integer range (`17 §2`).
+   *
+   * **`all` and `some` stay ordinary identifiers**, matched here as soft words, so nothing a program
+   * already names is spent on this. Telling the form from a counted loop takes one token: a
+   * quantifier is `for` `all`/`some` `name` `in`, and a loop is `for` `name` `in`, so `for all in
+   * 0..<n do …` is still a loop over a variable called `all`. This rule is tried before `forExpr` in
+   * `expression` and backtracks into it when the name is missing.
+   *
+   * The separator is `do` — the word every loop header already uses to introduce what it does with
+   * each element — rather than Ada's `=>`, which is not in the operator set and would have been
+   * added for this one form. The predicate is a full `expression`, so the body extends as far to the
+   * right as one can: `for all i in r do P(i) && Q(i)` quantifies over the conjunction, which is the
+   * reading a specification wants and the one a reader of the line already expects from `->`.
+   */
+  protected lazy val quantifier: PackratParser[Expr] =
+    (op("for") ~> quantifierKind) ~ ident ~ (op("in") ~> expression) ~ (op("do") ~> expression) ^^ {
+      case univ ~ n ~ it ~ p => Quantifier(univ, n, it, p)
+    }
+
+  private lazy val quantifierKind: Parser[Boolean] =
+    softWord("all") ^^^ true | softWord("some") ^^^ false
 
   protected lazy val forExpr: PackratParser[Expr] = cForExpr | forInExpr
 
@@ -727,7 +947,27 @@ class SyslParser(val source: Source) extends DeclParser {
    * the scrutinee's enum, and as a binding otherwise. A name may be qualified wherever a variant
    * may be, which is every form: a nullary variant is spelled like a name and reached like one.
    */
+  /** A pattern, with the **binding** form read first so that the name before an `@` is not taken as
+   * a pattern in its own right. Everything after the `@` is an ordinary pattern, which is what makes
+   * the form nest: `outer @ Wrap(inner @ Val(v))` is two of these.
+   */
   override protected lazy val pattern: Parser[Pattern] =
+    bindPattern | unboundPattern
+
+  /** `n @ pat` — the value bound whole, and taken apart, in one pattern.
+   *
+   * The name is an `ident` rather than a `qualifiedName`: what a binding introduces is a local, and
+   * a name with a dot in it is not a name a program can declare. A qualified one before an `@` is
+   * therefore a mistake about what is being bound rather than a pattern the grammar could go on to
+   * read, and it is answered as one.
+   */
+  protected lazy val bindPattern: Parser[Pattern] =
+    (ident <~ op("@")) ~ unboundPattern ^^ { case n ~ p => BindPattern(n, p) } |
+      (qualifiedName <~ guard(op("@"))) >> (n =>
+        err(s"'$n' has a dot in it, and what a binding introduces is a local — write a name a " +
+          "program can declare"))
+
+  private lazy val unboundPattern: Parser[Pattern] =
     patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
       structPattern |
       variantPattern |
@@ -773,16 +1013,16 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val program: PackratParser[Program] =
     opt(newlines) ~> opt(moduleHeader) >> { m =>
-      // A clause goes on a line of its own, which is what both `13 §4` and `capabilities.md` show
-      // and what keeps `module m no alloc requires os` from being a line anyone has to read. The
-      // exception is a file that declares no module: the root module is a module like any other, and
-      // there is no header for its clause to sit below, so there the clause may open the file.
+      // An attribute goes on a line of its own, which is what both `13 §4` and `capabilities.md`
+      // show and what keeps `module m @no_alloc @requires(os)` from being a line anyone has to read.
+      // The exception is a file that declares no module: the root module is a module like any other,
+      // and there is no header for its attributes to sit below, so there they may open the file.
       val lead = if m.isDefined then success(List.empty[CapabilityClause | LinkClause])
-                 else opt(headerClause) ^^ (_.toList)
+                 else opt(headerAttr) ^^ (_.toList.flatten)
 
-      lead ~ rep(newlines ~> headerClause) ~ statements ^^ {
+      lead ~ rep(newlines ~> headerAttr) ~ statements ^^ {
         case first ~ rest ~ body =>
-          val clauses = first ::: rest
+          val clauses = first ::: rest.flatten
 
           Program(body, m,
                   clauses.collect { case c: CapabilityClause => c },

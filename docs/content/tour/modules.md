@@ -211,7 +211,7 @@ A capability clause narrows a module, and it is written in the header on a line 
 
 ```sysl
 module oskit.arch
-no alloc
+@no_alloc
 
 halt()
     print("halted")
@@ -243,8 +243,8 @@ symbol lives, so a module binding a C library says it with `link`:
 
 ```sysl
 module image.png
-link "png"
-link "z"
+@link("png")
+@link("z")
 
 extern "png_create_read_struct" create(ver: *u8, err: *u8, fn: *u8) -> *u8
 ```
@@ -339,9 +339,11 @@ target substitutes one body.
 ## Separate compilation
 
 A module is compiled once and linked, which is what the acyclic import graph buys. The standard
-library itself is an artifact — `.sysl/core.syslib`, a real `ar` archive — and the compiler builds it
-for you when nothing usable is at the default path, announced on stderr and in well under a second.
-There is no bootstrap step to run and none to remember.
+library itself is an artifact — a real `ar` archive — and the compiler builds it for you when nothing
+usable is at the default path, announced on stderr and in well under a second. It lives in your cache
+directory under a fingerprint of the library it was built from, so every project on the machine shares
+one and a new compiler makes its own without disturbing the old. There is no bootstrap step to run and
+none to remember.
 
 ---
 

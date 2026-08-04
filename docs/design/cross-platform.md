@@ -23,7 +23,7 @@ Everything in that pipeline is a pure function over strings and data. Consequenc
   generation is a String-producing pure function, not a native-binding call.
 
 **All I/O is confined to a thin edge layer** — the CLI/driver: reading source files, resolving
-module paths, loading `sysl.conf`, writing output, command-line arguments, stdout, exit codes.
+module paths, loading `package.hocon`, writing output, command-line arguments, stdout, exit codes.
 
 **And one question that is not I/O but is just as platform-shaped: what machine is this?**
 Each platform describes the same machine in its own words — a JVM says `aarch64` / `Mac OS X`,

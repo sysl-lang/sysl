@@ -1,4 +1,15 @@
-# sysl
+<p align="center">
+  <img src="docs/static/sysl-wordmark.svg" alt="sysl" width="360">
+</p>
+
+<p align="center">
+  <a href="https://sysl.sh/"><img alt="Site" src="https://img.shields.io/badge/docs-sysl.sh-6f1f9e"></a>
+  <a href="https://github.com/edadma/sysl/commits"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/edadma/sysl"></a>
+  <img alt="License" src="https://img.shields.io/github/license/edadma/sysl">
+  <img alt="Scala Version" src="https://img.shields.io/badge/Scala-3.8.4-blue.svg">
+  <img alt="Scala.js Version" src="https://img.shields.io/badge/Scala.js-1.21.0-blue.svg">
+  <img alt="Scala Native Version" src="https://img.shields.io/badge/Scala_Native-0.5.12-blue.svg">
+</p>
 
 A modern, ref-counted, general-purpose systems language — easier than Rust.
 
@@ -61,30 +72,42 @@ sbt "syslJVM/run run bindings/regex/match.sysl --lib /tmp/rx.syslib"
 ```
 
 `bindings/regex` binds POSIX regular expressions and needs nothing installed, since they are part of
-libc. `bindings/sqlite3` binds SQLite and needs its header and library; the program says nothing
-about linking, because `link "sqlite3"` is written once in the binding and travels in the artifact.
+libc. A program built against it says nothing about linking, because `link "regex"` is written once
+in the binding and travels in the artifact.
 
-A program's own unit tests are `#test` functions written beside what they test, and `sysl test` is
+**The SQLite binding used to live here and now has a repository of its own** —
+[sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package outside this tree
+(`docs/design/packages.md`). It moved because a binding to a library nobody is obliged to have
+installed is a *package*, not an example, and keeping it here made the compiler's own suite depend on
+SQLite being present.
+
+A program's own unit tests are `@test` functions written beside what they test, and `sysl test` is
 what runs them (`docs/design/testing.md`):
 
 ```bash
-sbt "syslJVM/run test guide/ring"                  # every #test under a directory
+sbt "syslJVM/run test guide/ring"                  # every @test under a directory
 sbt "syslJVM/run test guide/ring --filter empty"   # the ones whose name holds this
 ```
 
-A test passes by returning; `#test(should_trap)` is for the ones whose subject is a check that
+A test passes by returning; `@test(should_trap)` is for the ones whose subject is a check that
 should fire, and passes only if the run does not come back. Every other build drops the tests, so
 they cost a program nothing.
 
-Every program is compiled against the standard module, which is built once after a clone:
+Every program is compiled against the standard module, and **there is no step to run for it**. The
+library's own source ships with the compiler and is read off disk — `share/sysl/lib` under the
+install prefix, found from the binary's own location, or `lib/` in a checkout. The artifact built
+from it is a derived file — object code for one machine — so a clone, a fresh worktree, or a stale
+container after the encoding moved all have the same answer, and the compiler gives it in well under
+a second, announced on stderr. It goes in your cache directory, keyed by a fingerprint of the library
+it was built from, so every project on the machine shares one and an upgrade needs no invalidating.
+`sysl build-lib lib --std` writes one explicitly if you want to.
 
-```bash
-sbt "syslJVM/run build-lib lib --core"   # writes .sysl/core.syslib
-```
-
-A compilation with no `--core-lib` looks there and stops if it finds nothing, the same as a C
-compiler that cannot find its libc. `--no-core-lib` compiles against the copy built into the
-compiler, which is what the test suite uses and what makes the first build possible.
+That rebuild is not a silent fallback. What the design refuses is compiling against a *different*
+standard module than the one asked for, so an artifact named with `--std-lib` is never rebuilt and a
+compilation stops when it will not read: somebody who wrote down which artifact to use is owed the
+truth about that one. `--no-std-lib` is the third way — it compiles the library's source into the
+program with no toolchain at all, which is what the test suite takes and what makes the first build
+possible.
 
 Building a library also needs an **`llvm-ar`**, because a `.syslib` is an `ar` archive whose members
 are objects for the machine it was built *for*: a platform archiver indexes only its own format and

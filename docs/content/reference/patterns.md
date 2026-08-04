@@ -67,6 +67,7 @@ Two evaluation guarantees:
 | struct, positional | `Point(a, b)` | a struct, binding every field by position |
 | struct, named | `Point{x, y}`, `Point{x: a}` | a struct, binding fields by name; unlisted fields unconstrained |
 | tuple | `(a, b)`, `(a, _)` | a tuple, by position |
+| named | `c @ Circle(r)` | what the sub-pattern matches, binding the **whole** value too |
 
 **Literal patterns match any type with equality; range patterns need a contiguous order.** The two
 gates are deliberately different. A literal pattern works on the integers, `char`, `string`, and
@@ -164,6 +165,76 @@ alternative patterns joined by '|' cannot bind a name
 
 This is stricter than Rust, which permits `A(x) | B(x)` when every alternative binds the same names
 at the same types. The rule here is simple and unambiguous: an arm with `|` binds nothing.
+
+### A name may be bound twice in one match, but not in one pattern
+
+Each arm is its own scope, so two arms may reuse a name freely. **Inside one pattern a repeat is
+refused**, because a pattern binds once however deeply it nests, and a second binding of the name
+would quietly stand for a different part of the value:
+
+```sysl
+struct Point
+    x: int
+    y: int
+end Point
+
+var p = Point(3, 3)
+
+p match
+    Point(v, v) -> print(v)
+```
+
+```error
+'v' is bound twice in one pattern, and the second would quietly stand for a different part of the value — rename it, or compare the two in a guard
+```
+
+The reading it stops is the tempting one: `Point(v, v)` looks like a test that the two fields are
+*equal*, and it is not one — no pattern here compares two parts of the value. That is what a
+[guard](#guards) is for. Scala, Rust, OCaml and Haskell all refuse it for the same reason.
+
+### `n @ pat` — matching and naming at once
+
+A pattern that takes a value apart leaves the arm holding only the parts. Where the arm wants the
+whole as well — to hand it on, to store it, to return it — `@` binds it beside them:
+
+```sysl
+enum Shape
+    Circle(r: int)
+    Rect(w: int, h: int)
+
+area(s: Shape) -> int
+    s match
+        Circle(r) -> r * r * 3
+        Rect(w, h) -> w * h
+
+describe(s: Shape) -> string
+    s match
+        c @ Circle(r) -> "circle r=" + str(r) + " area=" + str(area(c))
+        other -> "other, area=" + str(area(other))
+
+print(describe(Circle(2)))
+```
+
+```output
+circle r=2 area=12
+```
+
+Without it the arm has to choose: destructure and lose the value, or bind it and test the shape a
+second time inside the body.
+
+**A binding is not a test**, so a named arm covers exactly what the sub-pattern covers — no `else` is
+owed that would not have been owed anyway, and none becomes unreachable. It nests, the part after
+the `@` being an ordinary pattern: `whole @ One(part @ Val(n))` names three things at three depths.
+It is also read at an [`is` test](#) and at a [binding](#a-pattern-at-a-binding), where
+`var whole @ Point{x, y} = p` gives the value a name alongside its fields.
+
+The name must be one a program could declare, so a qualified name is refused — what a binding
+introduces is a local, and a name with a dot in it is not one.
+
+**This `@` and an [annotation's](/reference/attributes/) are the same character and never compete.**
+An annotation's is a prefix, on its own line above a declaration; this one is infix, between a name
+and a pattern. No declaration may stand where a pattern is read, so neither position is reachable by
+the other form — the arrangement Scala has carried for twenty years.
 
 ### Struct patterns
 

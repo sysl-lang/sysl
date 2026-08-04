@@ -17,11 +17,16 @@ class TestCliTests extends AnyFreeSpec with Matchers {
   /** The driver, under a name of its own — `Suite` has an `execute` too, and it wins unqualified.
    *
    * These run in a tree where no standard module has been built, so everything here says
-   * `--no-core-lib`: *this test is about the test command, not about which standard module a
+   * `--no-std-lib`: *this test is about the test command, not about which standard module a
    * compilation gets.*
    */
-  private def cli(cfg: Config): Int =
-    io.github.edadma.sysl.execute(cfg.copy(noCoreLib = true))
+  private def cli(cfg: Config): Int = Console.withOut(Discarded)(driver(cfg))
+
+  /** The same run with stdout left where it was, for `ran` below. Everything else throws it away —
+   * the report `sysl test` prints is this suite's subject, not something to read off the console.
+   */
+  private def driver(cfg: Config): Int =
+    io.github.edadma.sysl.execute(cfg.copy(noStdLib = true))
 
   private def program(text: String): String = {
     val path = createTempFile("sysl-test-cli-", ".sysl")
@@ -36,17 +41,17 @@ class TestCliTests extends AnyFreeSpec with Matchers {
     val out = new java.io.ByteArrayOutputStream
     val errs = new java.io.ByteArrayOutputStream
 
-    val status = Console.withOut(out)(Console.withErr(errs)(cli(cfg)))
+    val status = Console.withOut(out)(Console.withErr(errs)(driver(cfg)))
 
     (status, out.toString, errs.toString)
   }
 
   private val passing =
-    """#test
+    """@test
       |arithmetic_holds() =
       |    assert(1 + 1 == 2, "two")
       |
-      |#test("a trap is what a broken promise leaves")
+      |@test("a trap is what a broken promise leaves")
       |a_broken_promise() =
       |    assert(false, "down")
       |""".stripMargin
@@ -55,7 +60,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
     "a run where everything passes exits 0" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      cli(Config(command = "test", file = program("""#test
+      cli(Config(command = "test", file = program("""@test
                                                     |t() =
                                                     |    assert(true, "up")
                                                     |""".stripMargin))) shouldBe 0
@@ -74,7 +79,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
     "a file-private test is still one the runner reaches" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      cli(Config(command = "test", file = program("""#test
+      cli(Config(command = "test", file = program("""@test
                                                     |private t() =
                                                     |    assert(true, "up")
                                                     |""".stripMargin))) shouldBe 0
@@ -86,7 +91,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
       val (status, _, errs) = ran(Config(command = "test", file = program("""print("nothing to test")""")))
 
       status shouldBe 0
-      errs should include("no '#test' functions")
+      errs should include("no '@test' functions")
     }
 
     "a filter that matches nothing says how many there were" in {
@@ -124,7 +129,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
   "a test build is a build, and is refused for the same reasons" - {
     "a program that does not compile is reported rather than run" in {
       val (status, _, errs) =
-        ran(Config(command = "test", file = program("""#test
+        ran(Config(command = "test", file = program("""@test
                                                       |t() =
                                                       |    print(undefined_name)
                                                       |""".stripMargin)))

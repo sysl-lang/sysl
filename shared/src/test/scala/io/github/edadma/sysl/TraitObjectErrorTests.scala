@@ -57,7 +57,16 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("mentions 'Self' away from its receiver")
     }
 
-    "an associated function has no receiver to dispatch on" in {
+    /** **Object safety is all-or-nothing**, and this is where that is pinned: `Make` declares a
+     * dispatchable `use` beside the associated function, and the answer is that there is no `*Make`
+     * rather than a `*Make` without `build`.
+     *
+     * A good deal rests on it. A trait object satisfying a bound (`10 §5`) is total *because* of
+     * this: a `&Shape` existing is already the proof that every member of `Shape` is reachable
+     * through it, so nothing has to say what a bound does when it reaches a member the object cannot
+     * offer. A language deciding safety per member owes that rule; sysl owes none.
+     */
+    "an associated function has no receiver to dispatch on, and takes the whole trait with it" in {
       err(
         """trait Make
           |    build() -> int
@@ -104,9 +113,32 @@ class TraitObjectErrorTests extends AnyFreeSpec with CodegenSupport {
       err(shape + "var s: *Shape = Rect(1, 2)") should include("write '&' in front of the Rect")
     }
 
-    "a bound is not satisfied by an object over the same trait" in {
-      err(shape + "f[T: Shape](x: T) -> int = x.area()\nvar r = Rect(1,2)\nvar s: *Shape = &r\nprint(f(s))") should
-        include("but *Shape does not")
+    /** An object satisfies a bound on the trait it dispatches through, and on nothing else — the
+     * table it carries is what answers the bound, so a trait with no slots in it is not answered.
+     * `SupertraitTests` has the other side, where the bound is met.
+     */
+    "a bound on some other trait is still not satisfied by an object" in {
+      err(
+        shape +
+          """trait Other
+            |    other(self) -> int
+            |f[T: Other](x: T) -> int = x.other()
+            |var r = Rect(1,2)
+            |var s: *Shape = &r
+            |print(f(s))""".stripMargin) should include("but *Shape does not")
+    }
+
+    // Erasing again is a different question from satisfying a bound, and only the second of them the
+    // table can answer.
+    "and an object may not be erased into the object of another trait" in {
+      err(
+        shape +
+          """trait Other
+            |    other(self) -> int
+            |var r = Rect(1,2)
+            |var s: *Shape = &r
+            |var t: *Other = s""".stripMargin) should
+        include("a *Shape has forgotten which type it holds, so there is nothing for a *Other to be built from")
     }
   }
 

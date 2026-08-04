@@ -32,6 +32,8 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.io`](/library/io/) | `Reader`, `stdin()`, `lines()` | — |
 | [`sysl.fs`](/library/fs/) | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` | `os` |
 | [`sysl.math`](/library/math/) | `max`, `min`, `pi`, the float functions, the integer traits `Signed` and `Bits`, and the integer arithmetic above them — `pow`, `gcd`, `lcm`, `divmod`, `is_power_of_two`, `next_power_of_two` | — |
+| [`sysl.math.complex`](/library/complex/) | `Complex[F: Float]` — the operators at two argument lists each, the transcendental set, and the branch cuts | — |
+| [`sysl.time`](/library/time/) | `Instant` and `Duration`, the civil calendar — `LocalDate`, `LocalTime`, `LocalDateTime`, `Offset` — the fixed-offset conversions, and the ISO 8601 renderers and parsers | — |
 | [`sysl.sync`](/library/sync/) | `Atomic[T]`, `SpinLock`, and the five memory orderings | — |
 | [`sysl.thread`](/library/thread/) | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` | `threads`, `posix` |
 | [`sysl.args`](/library/args/) | `args_of`, for reading a raw `argv` | — |
@@ -60,7 +62,7 @@ machinery that only makes sense beside them:
 - **`Option`, `Result` and the `Fallible` latch** are on [errors and
   contracts](/reference/errors/), because `?` is a language form and it is what those types are for.
 - **`assert` and `panic`** are on [attributes and compile time](/reference/attributes/), beside the
-  `#test` protocol they exist to serve.
+  `@test` protocol they exist to serve.
 - **The operator traits** — which trait a `+` or a `<` reaches — are on
   [expressions](/reference/expressions/), because dispatch is a rule about the operator rather than
   about the trait.

@@ -1,4 +1,4 @@
-# Core Traits, Operators, and Definition-Checked Bounds
+# Stdlib Traits, Operators, and Definition-Checked Bounds
 
 **Status:** decided, and **§1–§6 are implemented** — `Self`, the whole catalog, the one dispatch
 rule, definition-checked bounds on both method calls and operators, the compiler-provided scalar
@@ -297,10 +297,21 @@ Three decisions, each following Rust's experience rather than its packaging:
 `*self` on both methods is what makes a writer stateful — a counter, a latch, a buffer — while
 staying object-safe for a raw object (`02`), so a sink needs no allocator.
 
-**Which writers the library supplies: one, `ByteSink`, and it is `sysl.buf`'s.** The two that `print`
-and `str` themselves use are the compiler's, and the standard-output one has to be — it holds no
-state, and there is no struct with no fields to give it. Its `write` is the library's own `putbytes`,
-which is one of the two seams a freestanding target replaces — the other being `FdReader.read`, below.
+**Which writers the library supplies: two — `Stdout`, in the standard module, and `ByteSink`, which
+is `sysl.buf`'s.** The standard-output one used to be the compiler's, for a reason that has since
+stopped being true: it holds no state, and there was no struct with no fields to give it. There is
+now (`00 §12`), so it is three ordinary declarations in `print.sysl` — the struct, its `impl Writer`,
+and a `stdout()` that hands one out — and `print` reaches it by calling that. Its `write` is still
+the library's own `putbytes`, which is one of the two seams a freestanding target replaces, the other
+being `FdReader.read`, below.
+
+**What that bought is the sink as a value.** A destination the compiler built could be reached from
+exactly one place; one the library declares can be passed to a function, held in a struct, and chosen
+by a caller, and a program can build its own. Swapping standard output for a serial port is another
+`impl Writer`, not an edit to the compiler.
+
+The buffer `str` and an `f"…"` hole render into is still the compiler's, and for the reason that
+still holds: a growable byte array is `07`'s *Not yet* at the layer the compiler needs one.
 
 That the sink is imported while `Writer`, `Display`, `FormatSpec` and the renderers are not is the
 line `04` draws, applied here: a `print` is a keyword and reaches all four of those for itself, so
@@ -705,6 +716,14 @@ exactly (`§5`), one row further down the catalog.
   takes none, so a type implementing `Iterate` twice leaves a `for` nothing to decide with. That is
   reported at the loop rather than at the call, because the sentence a program needs names the loop.
 
+  **A `for` walks an erased cursor too.** `next` takes `*self` and mentions `Self` nowhere else, so
+  `Iterate` has an object, and the loop's question — what may be *called* on this value — is what a
+  table answers (`10 §5`). The element type comes out of the trait the object was erased to, read
+  from the same requirement closure the table was laid out from, so the loop cannot disagree with the
+  table about which member it is calling; and a trait *requiring* `Iterate` is walked for that
+  reason. The ambiguity above cannot arise here, since an object names one trait at one argument
+  list. What this buys is a function returning a cursor without naming which one it built.
+
 - **~~A heterogeneous *operand*.~~ The catalog change is built; what it turned out to wait on is
   something else.** `§1` argues that `Self`-homogeneity costs nothing, because the scalars already
   obey it — `u8 + u8` is a `u8` and no operator promotes. That is true of every pair of scalars and
@@ -740,11 +759,12 @@ exactly (`§5`), one row further down the catalog.
 
 - **One trait at more than one argument list — the half the catalog change did not cover, now
   shipped too.** The parameter on `Mul` did not by itself free the program that motivated it. A
-  transform needs **both** `Complex * Complex`, the butterfly, and `Complex * f64`, the scaling an
-  inverse does to every sample — and those are `Mul[Complex]` and `Mul[f64]`, two argument lists for
-  one trait on one type, which `02`'s coherence rule refused. Both are written in
-  `guide/fft/complex.sysl` now and `scale` is gone; what tells them apart is what was always going
-  to tell them apart, the type of the right operand.
+  transform needs **both** `Complex * Complex`, the butterfly, and `Complex * real`, the scaling an
+  inverse does to every sample — and those are `Mul[Complex]` and `Mul[real]`, two argument lists for
+  one trait on one type, which `02`'s coherence rule refused. Both are in `sysl.math.complex` now,
+  which writes each of its four arithmetic operators twice for exactly that reason, and `scale` is
+  gone; what tells them apart is what was always going to tell them apart, the type of the right
+  operand.
 
   It is **not** general member overloading, and that is the whole reason it was affordable. What is
   chosen among is the implementations of *one* parameterized trait, told apart by the argument list

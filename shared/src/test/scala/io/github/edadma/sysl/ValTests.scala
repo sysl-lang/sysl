@@ -313,9 +313,9 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
 
     // The motivation, stated as a test: a module that has declared it will not allocate may still
     // name its messages, index them, measure them, and cut them up.
-    "in a module that declared 'no alloc', which is what the relaxation is for" in {
+    "in a module that declared '@no_alloc', which is what the relaxation is for" in {
       run(
-        """no alloc
+        """@no_alloc
           |
           |val messages: [3]string = ["out of range", "not permitted", "no such device"]
           |

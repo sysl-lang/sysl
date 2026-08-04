@@ -45,7 +45,7 @@ object Compiler {
    * whether a declaration was read from source or from an artifact.
    */
   def compileTrees(units: List[Program], target: Target = Target.default): Either[String, String] =
-    analyzed(units, target, Set.empty, Core.embedded(target)).map(_._1)
+    analyzed(units, target, Set.empty, Stdlib.fromSource(target)).map(_._1)
 
   /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
    * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
@@ -67,13 +67,41 @@ object Compiler {
    * exactly as one compiled alone does.
    */
   def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
-                   precompiled: Set[String] = Set.empty, core: Option[Core] = None)
+                   precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
+                   provides: Set[String] = Capability.core.toSet)
       : Either[String, Compiled] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case Nil =>
-        analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled, carried(core, target))
+        analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled,
+          carried(std, target), provides)
+      case errs => Left(errs.mkString("\n"))
+  }
+
+  /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
+   *
+   * It stops before pruning and before lowering, and both matter. A function nothing calls is still
+   * one the program declared and still one somebody may want proved; and a `@ghost` declaration is
+   * dropped from the emitted module by design (`17 §8`), so a proof run reading the lowered tree
+   * would have lost exactly the predicates the specification is written in.
+   */
+  def typedWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
+                std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet)
+      : Either[String, (TProgram, Set[String])] = {
+    val parsed = sources.map(SyslParser.parse(_, target))
+
+    parsed.collect { case Left(e) => e } match
+      case Nil =>
+        val own = parsed.collect { case Right(p) => p }
+
+        // **Which modules are the program's own travels back beside the tree**, because nothing in
+        // the tree says. `TProgram.mainModule` names the file that carries the statements, and a
+        // module of pure declarations carries none — so a proof run over a library-shaped file would
+        // have found nothing to translate. The sources given are what the reader meant by "this
+        // module", and they are only known here.
+        Analyzer.analyze(libraries ::: own, std = carried(std, target), target = target,
+                         provides = provides).map((_, own.map(moduleOf).toSet))
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -85,7 +113,7 @@ object Compiler {
    * honest shape anyway: "none was given" and "this particular one was" are different facts, and
    * only the first has an answer that varies with the machine.
    */
-  private def carried(core: Option[Core], target: Target): Core = core.getOrElse(Core.embedded(target))
+  private def carried(std: Option[Stdlib], target: Target): Stdlib = std.getOrElse(Stdlib.fromSource(target))
 
   /** The same compilation, keeping the notes the driver may want to show — currently the heap
    * promotions, for `--explain-escapes` (`05`). Separate from `compile` so that the ordinary path
@@ -98,11 +126,11 @@ object Compiler {
     // Every file is parsed before any is rejected, so a syntax error in one does not hide the
     // syntax errors in the rest — the same reason the analyzer reports every mistake it finds.
     parsed.collect { case Left(e) => e } match
-      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target, Set.empty, Core.embedded(target))
+      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target, Set.empty, Stdlib.fromSource(target))
       case errs => Left(errs.mkString("\n"))
   }
 
-  /** The same compilation as a **test build**: the IR whose entry point dispatches to one `#test`
+  /** The same compilation as a **test build**: the IR whose entry point dispatches to one `@test`
    * function by name, and the tests it can be asked for (`testing.md`).
    *
    * This is the one compilation that keeps the tests and drops the program — `Tests.only` says why —
@@ -111,7 +139,7 @@ object Compiler {
    * again, is how the two come to disagree about what a test is called.
    */
   def compileTests(sources: List[Source], libraries: List[Program], target: Target = Target.default,
-                   precompiled: Set[String] = Set.empty, core: Option[Core] = None)
+                   precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None)
       : Either[String, (Compiled, List[TTest])] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
@@ -119,11 +147,12 @@ object Compiler {
       case errs if errs.nonEmpty => Left(errs.mkString("\n"))
       case _ =>
         val units = libraries ::: parsed.collect { case Right(p) => p }
-        val whole = carried(core, target)
+        val whole = carried(std, target)
 
         for
-          typed    <- Analyzer.analyze(units, core = whole, target = target)
+          typed    <- Analyzer.analyze(units, std = whole, target = target)
           promoted <- Escape.check(typed)
+          _        <- TailCalls.check(typed)
         yield
           val kept = Tests.only(typed)
 
@@ -167,14 +196,15 @@ object Compiler {
    * them, so that the compiler does not supply the files it is being asked to compile.
    */
   def compileLibrary(units: List[Program], target: Target = Target.default, building: Set[String] = Set.empty,
-                     core: Option[Core] = None): Either[String, (String, Set[String])] =
+                     std: Option[Stdlib] = None): Either[String, (String, Set[String])] =
     for
-      analysed <- Analyzer.analyze(units, building, carried(core, target), target)
+      analysed <- Analyzer.analyze(units, building, carried(std, target), target)
       // A library ships no tests. They are the library author's, they run against the sources rather
       // than against the artifact, and emitting them would put a function nothing can call into every
       // program that links it — with the helpers only it reaches dragged in behind.
       typed    = Tests.strip(analysed)
       promoted <- Escape.check(typed)
+      _        <- TailCalls.check(typed)
     yield
       val mine            = units.map(moduleOf).toSet
       val (own, supplied) = typed.funcs.partition(f => mine(Modules.moduleOf(f.name)))
@@ -210,10 +240,12 @@ object Compiler {
    * the only thing between the checks and the lowering.
    */
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
-                       core: Core): Either[String, Compiled] =
+                       std: Stdlib, provides: Set[String] = Capability.core.toSet)
+      : Either[String, Compiled] =
     for
-      typed    <- Analyzer.analyze(units, core = core, target = target)
+      typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides)
       promoted <- Escape.check(typed)
+      _        <- TailCalls.check(typed)
     yield
       // Pruning still runs, and still from `main`: a library function this program never calls is
       // dropped from the tree exactly as before. What `precompiled` changes is only what happens to
@@ -221,14 +253,14 @@ object Compiler {
       // library's object file at link time.
       //
       // The tests go first, and they go **after** the analysis above rather than instead of it: a
-      // `#test` that does not compile is an error in a build that would never have run it, which is
+      // `@test` that does not compile is an error in a build that would never have run it, which is
       // what makes it safe to leave one beside the code it tests (`Tests`).
       val pruned = Reachability.prune(Tests.strip(typed))
 
-      // The core's units are asked as well as the program's, and this is what makes an artifact's
-      // directives mean anything: the standard module arrives as `Core` rather than in `units`, so a
+      // The std's units are asked as well as the program's, and this is what makes an artifact's
+      // directives mean anything: the standard module arrives as `Stdlib` rather than in `units`, so a
       // collection that read only the latter would drop every directive the library ships with.
       Compiled(Codegen.generate(pruned.copy(precompiled = precompiled), promoted, target),
                promoted.explanations,
-               LinkDirectives.required(units ::: core.units))
+               LinkDirectives.required(units ::: std.units))
 }

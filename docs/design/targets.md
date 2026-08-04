@@ -2,8 +2,9 @@
 
 **Status:** decided and built. This is the target half of the doc `capabilities.md` said was
 still to be written — what a machine is, how one is named, and what naming one changes. The
-project-config half of that promise — the `sysl.conf` schema, per-target capability sets, and
-filename-axis platform selection — is still open, and is listed at the bottom.
+project-config half of that promise is now `packages.md` — the `package.hocon` schema and
+per-target capability sets, both of which are built — and filename-axis platform
+selection is still open. What remains open here is listed at the bottom.
 
 A systems language cannot be vague about the machine. Two of them differ in more than speed:
 they disagree about how a C function is called, and a compiler that guesses produces a module
@@ -209,7 +210,7 @@ indentation-sensitive, and indentation is how the language reads block structure
 written *in* that channel would look like it takes part in a nesting it has nothing to do with,
 when in fact the line is gone before anything counts a column. At the margin it is visibly not
 part of the code's shape, which is what it is. It is also how C is written, and it is what keeps a
-declaration's `#test` attribute — indented with its declaration — from ever being mistaken for one
+declaration's `@test` attribute — indented with its declaration — from ever being mistaken for one
 of these.
 
 **Why lines and not a construct wrapping declarations.** Rust spells this `#[cfg]`, an attribute on
@@ -285,10 +286,14 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
 
 ## Open
 
-- **The project config.** `sysl.conf`, per-target capability sets (`capabilities.md`'s
-  `alloc` / `os` / `posix` / `threads`), and filename-axis platform selection. The registry here
-  is the fixed table a config would eventually extend, and deliberately does not try to be one:
-  a target's *capabilities* are exactly the part that a project has an opinion about.
+- **The project config — now designed in `packages.md`, and unbuilt.** `package.hocon` carries
+  per-target capability sets (`capabilities.md`'s `alloc` / `os` / `posix` / `threads`); filename-axis
+  platform selection is the part still unwritten. The registry here is the fixed table that config
+  extends, and deliberately does not try to be one: a target's *capabilities* are exactly the part
+  a project has an opinion about. `packages.md § 2` states the boundary the other way round —
+  **a config may add capabilities to a registry target, and may not overrule a measured ABI fact** —
+  which is what keeps *Adding one* above honest: an ABI answer is measured against clang, not
+  configured.
 - **Whether a condition may ask about a capability.** `#if` asks only what the *target* says, which
   is what let it be built while the config is still open. Asking `#if no alloc` is a coherent thing
   to want and belongs with the config that would define it — and it is where the two `posix` senses

@@ -230,8 +230,8 @@ trait ExprAnalysis
 
   /** Whether an expression yields its value through branches rather than producing one itself. */
   private def branching(expr: Expr): Boolean = expr match
-    case _: IfExpr | _: MatchExpr | _: While | _: For => true
-    case _                                            => false
+    case _: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: For => true
+    case _                                                         => false
 
   /** The four conversions a context may apply to a value that does not already have its type: a
    * `T` the context wanted by reference is boxed, a `&T` the context wanted weakly is weakened,
@@ -249,6 +249,16 @@ trait ExprAnalysis
     case _ if Type.erased(expected)     => eraseTo(t, expected)
     case r: Type.Ref if t.ty == r.inner => TBox(t, r).setPos(t.pos)
     case w: Type.Weak if t.ty == w.strong => TDowngrade(t, w).setPos(t.pos)
+
+    // The mode written twice — `weak &Node` against a `&Node`. `weak T` is *already* the weak edge
+    // to a counted `T`, so the value on the right is the right shape and the type on the left says
+    // the same word twice. What this must not do is fall into the case below and advise holding it
+    // in a `&&Node`, which is a spelling the parser does not take: advice that cannot be typed is
+    // worse than none, because the reader spends the time before finding that out.
+    case Type.Weak(inner: Type.Ref) if t.ty == inner =>
+      err(s"'weak ${show(inner.inner)}' is already a weak edge to a counted ${show(inner.inner)}, so " +
+        s"the '&' says the mode a second time — write 'weak ${Type.show(inner.inner)}'")
+
     case w: Type.Weak if t.ty == w.inner =>
       err(s"a weak reference does not keep ${show(w.inner)} alive, and nothing else here holds this " +
         s"one — so it would be gone before it could be read. Hold it in a '&${Type.show(w.inner)}' " +
@@ -329,7 +339,7 @@ trait ExprAnalysis
     // (`12 §5`). It is asked for only where the context says a callable, so a bare function name
     // anywhere else is still the mistake it was.
     case Ident(name)
-        if lookupOpt(name).isEmpty && funcKey(name).isDefined &&
+        if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined &&
           expected.flatMap(callableSignature).isDefined =>
       val (ptypes, result) = expected.flatMap(callableSignature).get
 
@@ -354,7 +364,7 @@ trait ExprAnalysis
     // convention (`§6a`). Where the context asks for one of those outright — a `pthread_create`, a
     // `qsort`, any interface that calls back — the missing `&` is the whole of the mistake, so the
     // message names it rather than the two callable forms the reader did not want.
-    case Ident(name) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+    case Ident(name) if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined =>
       err(
         if expected.exists(t => cfnOf(t).isDefined) then
           s"'$name' is a function, and what is wanted here is the address of one — write '&$name'. A " +
@@ -438,7 +448,7 @@ trait ExprAnalysis
     // A function is not a place — nothing holds it, and there is no slot to point at — so its
     // address is taken here rather than by the walk below, which asks for one (`12 §6a`). A local
     // shadowing the name is an ordinary value and keeps the ordinary reading.
-    case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && funcKey(name).isDefined =>
+    case Unary("&", Ident(name)) if lookupOpt(name).isEmpty && !ownValueName(name) && funcKey(name).isDefined =>
       functionAddress(name, funcKey(name).get)
 
     // A nested function's environment is the frame it was declared in (`12 §5a`), and an address is
@@ -766,8 +776,8 @@ trait ExprAnalysis
     case e @ (_: ArrayLit | _: ArrayFill | _: Index) => sequenceExpr(e, expected)
     // Control flow that yields a value (`00 §10`), and the forms that carry several at once.
     // `ControlFlowExprAnalysis`.
-    case e @ (_: IfExpr | _: MatchExpr | _: While | _: Loop | _: CFor | _: For | _: TryExpr |
-        _: RangeExpr | _: ResultList | _: Lambda | _: Tuple) =>
+    case e @ (_: IfExpr | _: MatchExpr | _: While | _: DoWhile | _: Loop | _: CFor | _: For |
+        _: Quantifier | _: TryExpr | _: RangeExpr | _: ResultList | _: Lambda | _: Tuple) =>
       controlExpr(e, expected, discarded)
 
     // Reached only where an `is` was written somewhere a condition's terms are not read one by one:

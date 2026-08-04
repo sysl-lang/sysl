@@ -9,7 +9,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * And its members may assume no more than it asks — that is checked once, at the definition, which
  * is the asymmetry with a generic function that having somewhere to write the bound removes.
  */
-class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport {
+class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
   private val show = "trait Show\n    show(self) -> string\n"
 
@@ -70,11 +70,20 @@ class TypeBoundsErrorTests extends AnyFreeSpec with CodegenSupport {
       ) should include("'Maybe' requires its type parameter 'T' to implement 'Show', but P does not")
     }
 
-    // A trait object has forgotten which type it holds, so it is not a type anything has an `impl`
-    // for — the same reason a bounded generic function will not take one.
-    "and a trait object is not a type that implements the trait" in {
-      err(s"${wrap}var w: Wrap[&Show] = Wrap(P(1))") should
-        include("'Wrap' requires its type parameter 'T' to implement 'Show', but &Show does not")
+    // A trait object still fails a bound on a trait it does *not* dispatch through — the one it
+    // holds a table for is the one it implements, and nothing else follows from erasing.
+    "and a trait object still fails a bound on some other trait" in {
+      err(
+        s"""${show}trait Other
+           |    other(self) -> int
+           |struct P
+           |    v: int
+           |impl Show for P
+           |    show(self) -> string = "p"
+           |struct Wrap[T: Other]
+           |    inner: T
+           |var w: Wrap[&Show] = Wrap(P(1))""".stripMargin,
+      ) should include("'Wrap' requires its type parameter 'T' to implement 'Other', but &Show does not")
     }
 
     // A type an implementation *covers* is told what that implementation asked of it, so the reader

@@ -17,8 +17,10 @@ package io.github.edadma.sysl
  * (`12` §9). `from_utf8_unchecked` is permanent for the same reason from the other direction: every
  * safe route to a `string` carries the UTF-8 guarantee, so the one operation that sets it aside can
  * only come from underneath the language. The other three are the temporary ones: all three are now
- * desugarings onto a `Display`, and what keeps them here is the sink each supplies — standard output
- * for `print`, a fresh buffer for `str` and `format` — neither of which the library can name yet.
+ * desugarings onto a `Display`, and what keeps them here is the **arity** — `print(a, b, c)` is
+ * variadic and heterogeneous, and sysl has no overloading — together with the buffer `str` and
+ * `format` render into, which is a growable byte array the library cannot yet name. The sink
+ * `print` writes into is no longer one of the reasons: it is an ordinary library value now.
  */
 trait SpecialForms extends Closures {
 
@@ -329,13 +331,19 @@ trait SpecialForms extends Closures {
         s"but 'Writer' offers ${offered.mkString("'", "', '", "'")}")
   }
 
-  /** Standard output as a sink. Recording `putbytes` is what brings it into the program: the table
-   * this node's writer dispatches through ends at that function, and a library declaration nothing
-   * reaches is neither analyzed nor emitted.
+  /** Standard output as a sink — an ordinary call to the library function that hands one out.
+   *
+   * There is nothing for the compiler to build here. The sink is a fieldless struct with an
+   * `impl Writer` of its own, so the table is the one any erasure of that type produces and the
+   * behaviour is library sysl; recording the name is all this does, since a library declaration
+   * nothing reaches is neither analyzed nor emitted.
    */
   private def stdout(): TExpr = {
-    funcsUsed += Library.key("putbytes")
-    TStdout()
+    val key        = Library.key("stdout")
+    val (_, rtype) = funcInsts(key)
+
+    funcsUsed += key
+    TCall(key, Nil, rtype)
   }
 
   /** The specifier `print` and `str` hand a `Display`: no width, no precision, no justification,

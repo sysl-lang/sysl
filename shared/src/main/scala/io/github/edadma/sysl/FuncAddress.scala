@@ -43,7 +43,7 @@ trait FuncAddress extends CallCore {
         "no width a signature could state, so a variadic function is reached by calling it")
 
     if decl.test.isDefined then
-      err(s"'$written' is a '#test' function, which 'sysl test' calls and nothing else does — every " +
+      err(s"'$written' is a '@test' function, which 'sysl test' calls and nothing else does — every " +
         "other build leaves it out, so its address would be of a definition the program does not have")
 
     // An intrinsic is a name the back end recognises and lowers, not a function that exists to be

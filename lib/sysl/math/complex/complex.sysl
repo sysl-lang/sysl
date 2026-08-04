@@ -1,0 +1,274 @@
+module sysl.math.complex
+
+import sysl.math.Float
+
+// Complex numbers, at whichever floating-point width the program is already using.
+//
+// **Generic over the width rather than fixed at `real`, because `Float` already paid for that.**
+// `sysl.math` made the one-trait-two-widths investment so that `x.sqrt()` is the same three words at
+// `real` and at `f32`; a `Complex` that worked only at the wider one would be the first thing in the
+// library to ignore it, and a program doing signal processing in `f32` would have to write its own.
+// The parameter costs nothing at run time -- `Complex[real]` and `Complex[f32]` are two structs of
+// two fields, laid out at their own widths, with no dispatch between them.
+//
+// **A submodule rather than part of `sysl.math`, because these are names a program should have to
+// ask for.** `sysl.math`'s own header says it is mathematics *on the floating-point types*, which is
+// not a sentence a type belongs in, and `Complex` is not a name every numeric program wants taking
+// up space in its scope. Its siblings, if they ever come, are `sysl.math.rational` and
+// `sysl.math.fixed`.
+//
+// **Two files, and the split is by what a member is written inside.** A type's own members live in
+// its body and are here; the operators are `impl` blocks and live beside it in `operators.sysl`.
+//
+// The arithmetic below is written for the operands a program actually has rather than for the ones a
+// textbook formula assumes. Three places differ from the obvious expression, and each is a case
+// where the obvious one overflows or loses digits at inputs that are perfectly ordinary:
+// `abs` goes through `hypot`, division scales before it divides, and `sqrt` never squares what it is
+// about to take the root of.
+struct Complex[F: Float]
+    re: F
+    im: F
+
+    // --- The values that need no receiver. ---
+    //
+    // Each is reached through the type -- `Complex.zero()` -- so the width comes from what the
+    // context expects, exactly as `F.zero()`'s does.
+
+    zero() -> Complex[F] = Complex(F.zero(), F.zero())
+
+    one() -> Complex[F] = Complex(F.one(), F.zero())
+
+    // The imaginary unit, which is the one constant here that has no counterpart among the reals.
+    i() -> Complex[F] = Complex(F.zero(), F.one())
+
+    // A real number as a complex one. Worth a name because the alternative -- writing the zero out
+    // -- is the place a `Complex(x, y)` gets its arguments the wrong way round.
+    from_real(x: F) -> Complex[F] = Complex(x, F.zero())
+
+    // The point at distance `r` and angle `theta`, which is the constructor a rotation writes.
+    from_polar(r: F, theta: F) -> Complex[F] = Complex(r * theta.cos(), r * theta.sin())
+
+    // `e^(i*theta)`, the point on the unit circle at that angle. It is `from_polar` at radius one,
+    // and it is separate because that is how it is reached: a Fourier transform's twiddle factor, a
+    // rotation, a phasor.
+    expi(theta: F) -> Complex[F] = Complex(theta.cos(), theta.sin())
+
+    // --- What a value is, read off it. ---
+
+    // The reflection in the real axis, which is what turns a division into a multiplication and a
+    // squared magnitude into a product.
+    conj(self) -> Complex[F] = Complex(self.re, -self.im)
+
+    // The distance from the origin.
+    //
+    // **Through `hypot` and not `norm_sqr().sqrt()`.** Squaring first overflows to infinity for any
+    // value whose parts are above the square root of the largest float, when the answer itself is
+    // perfectly representable -- `Complex(1e200, 1e200)` has a magnitude of about `1.4e200` and a
+    // squared magnitude that does not exist. libm's `hypot` does the scaling that avoids it, and it
+    // underflows correctly at the other end too.
+    abs(self) -> F = self.re.hypot(self.im)
+
+    // The squared magnitude, which is what a comparison of two magnitudes wants: the root is
+    // monotone, so taking it to compare is arithmetic thrown away.
+    //
+    // **The name says `sqr` because the two languages that shipped this first disagree about the
+    // bare word.** C++'s `std::norm(z)` is this, and Rust's `num-complex` `.norm()` is `abs`. Either
+    // spelling of `norm` would read as the other one to half of its readers, so neither is used.
+    norm_sqr(self) -> F = self.re.square() + self.im.square()
+
+    // The angle from the positive real axis, in radians and in `(-pi, pi]`.
+    //
+    // Through `atan2` rather than `atan` of the ratio, which is what tells the second quadrant from
+    // the fourth -- and what gives the negative real axis an answer of `pi` rather than a division by
+    // zero.
+    arg(self) -> F = self.im.atan2(self.re)
+
+    // The magnitude and angle together, which is the pair `from_polar` takes back.
+    to_polar(self) -> (F, F) = (self.abs(), self.arg())
+
+    // The point on the unit circle in the same direction. At zero there is no such direction and the
+    // answer is a NaN in both parts, which is the division saying so.
+    unit(self) -> Complex[F] = self * self.abs().recip()
+
+    // One over the value, which is the division the operator would do and is worth a name for the
+    // reason `Float.recip` is: a loop dividing repeatedly by the same value should multiply instead.
+    recip(self) -> Complex[F] = one_like(self) / self
+
+    // --- Questions with a yes or a no. ---
+
+    is_zero(self) -> bool = self.re == F.zero() && self.im == F.zero()
+
+    // On the real axis, and on the imaginary one. Both are about the *other* part being zero, so a
+    // zero is both -- which is the arithmetic being honest rather than a case going unhandled.
+    is_real(self) -> bool = self.im == F.zero()
+    is_imaginary(self) -> bool = self.re == F.zero()
+
+    // A NaN in either part poisons every arithmetic result the value reaches, so one is enough.
+    is_nan(self) -> bool = self.re.is_nan() || self.im.is_nan()
+
+    // Infinite where either part is, and finite only where both are -- so the two are not each
+    // other's negation, and a value with a NaN in it is neither.
+    is_infinite(self) -> bool = self.re.is_infinite() || self.im.is_infinite()
+    is_finite(self) -> bool = self.re.is_finite() && self.im.is_finite()
+
+    // Within `eps` of another value, which is the comparison a float program means almost every time
+    // it writes `==`.
+    near(self, rhs: Complex[F], eps: F) -> bool = (self - rhs).abs() < eps
+
+    // --- Exponentials and logarithms. ---
+
+    // `e^z`, which is the magnitude `e^re` turned through the angle `im`.
+    exp(self) -> Complex[F] = Complex.expi(self.im) * self.re.exp()
+
+    // The principal logarithm: the real part is the logarithm of the magnitude, and the imaginary
+    // part is the angle.
+    //
+    // **The branch cut is the negative real axis**, which is where `arg` jumps between `pi` and
+    // `-pi`, and `arg` puts `pi` itself on the cut -- so a value approaching the axis from below
+    // arrives at `-pi` and one sitting on it reads `pi`. Every function below that is written over
+    // `ln` inherits this cut, which is why it is stated here once.
+    ln(self) -> Complex[F] = Complex(self.abs().ln(), self.arg())
+
+    // The logarithm in a real base, which is the general one and the reason `ln` is spelled for what
+    // it is rather than as C's bare `log`.
+    log(self, base: F) -> Complex[F] = self.ln() * base.ln().recip()
+
+    // The two bases worth their own names. Each is `ln` scaled, and the scale is asked of the width
+    // rather than written as a literal -- `log2(e)` and `log10(e)` are what `F` can answer exactly at
+    // its own precision, where a decimal expansion copied into the source would be a `real`'s.
+    log2(self) -> Complex[F] = Complex(self.abs().log2(), self.arg() * F.one().exp().log2())
+    log10(self) -> Complex[F] = Complex(self.abs().log10(), self.arg() * F.one().exp().log10())
+
+    // The principal square root, the one with a non-negative real part.
+    //
+    // **Not `from_polar(abs().sqrt(), arg() / 2)`**, which loses half the digits of a value near the
+    // real axis: the angle is computed and halved and turned back into components, and the
+    // cancellation in that round trip is exactly where the answer's accuracy went. The form below
+    // does one root and one division, and never squares a part.
+    sqrt(self) -> Complex[F] = if self.is_zero() then zero_like(self) else principal_root(self)
+
+    // `z^w`, by way of the logarithm -- so it carries `ln`'s branch cut, and `(-1)^(1/2)` is `i`
+    // rather than `-i`.
+    //
+    // **A zero base is answered without the logarithm**, which would be an infinity times a zero. It
+    // is `1` at a zero exponent and `0` at any other, which is what the limit gives along every path
+    // that has one.
+    powc(self, w: Complex[F]) -> Complex[F] =
+        if self.is_zero() then (if w.is_zero() then one_like(self) else zero_like(self))
+        else (self.ln() * w).exp()
+
+    // `z^x` for a real exponent, which is polar rather than logarithmic: the magnitude is raised by
+    // the width's own `pow` and the angle is multiplied, so nothing is turned into a logarithm and
+    // back.
+    powf(self, x: F) -> Complex[F] =
+        if self.is_zero() then (if x == F.zero() then one_like(self) else zero_like(self))
+        else Complex.from_polar(self.abs().pow(x), self.arg() * x)
+
+    // `z^n` for an integer exponent, by repeated squaring.
+    //
+    // **This is the one power that is exact.** `powf(2.0)` goes through a logarithm-free polar form
+    // and still ends in a `cos` and a `sin`, so `Complex(0.0, 1.0).powf(2.0)` misses `-1` by an
+    // ulp or two; squaring reaches it exactly, because it is one multiplication of exact operands.
+    // A negative exponent is the reciprocal of the positive one.
+    powi(self, n: int) -> Complex[F] =
+        var acc = one_like(self)
+        var b = if n < 0 then self.recip() else self
+        var e = if n < 0 then -n else n
+
+        while e > 0 do
+            if e % 2 == 1 then acc = acc * b
+
+            b = b * b
+            e = e / 2
+
+        acc
+
+    // --- Circular trigonometry. ---
+    //
+    // Each is the real identity with a hyperbolic function of the imaginary part in it, which is what
+    // the two trigonometries being one thing over the complex numbers comes to.
+
+    sin(self) -> Complex[F] =
+        Complex(self.re.sin() * self.im.cosh(), self.re.cos() * self.im.sinh())
+
+    cos(self) -> Complex[F] =
+        Complex(self.re.cos() * self.im.cosh(), -(self.re.sin() * self.im.sinh()))
+
+    tan(self) -> Complex[F] = self.sin() / self.cos()
+
+    // The inverses, each written over `ln` and `sqrt` and so carrying their cuts. `asin` and `acos`
+    // are cut outside `[-1, 1]` on the real axis and `atan` outside `[-i, i]` on the imaginary one,
+    // which is what the standard libraries do and what a program comparing against one expects.
+    asin(self) -> Complex[F] = times_neg_i(((one_like(self) - self * self).sqrt() + times_i(self)).ln())
+
+    acos(self) -> Complex[F] = Complex.from_real(F.pi() * half(F.one())) - self.asin()
+
+    // **The difference of two logarithms and not the logarithm of a quotient**, for the reason
+    // `atanh` below is written the same way: at a pole the quotient form divides by zero, and a
+    // complex division by zero is a NaN. The difference reaches the pole through `ln(0)` instead,
+    // which is the infinity the pole actually is -- and it treats the two poles alike, where the
+    // quotient form gives one of them an infinity and the other a NaN depending on which end the
+    // zero landed at.
+    atan(self) -> Complex[F] =
+        val iz = times_i(self)
+
+        times_i((one_like(self) - iz).ln() - (one_like(self) + iz).ln()) * half(F.one())
+
+    // --- Hyperbolic trigonometry, and its inverses. ---
+
+    sinh(self) -> Complex[F] =
+        Complex(self.re.sinh() * self.im.cos(), self.re.cosh() * self.im.sin())
+
+    cosh(self) -> Complex[F] =
+        Complex(self.re.cosh() * self.im.cos(), self.re.sinh() * self.im.sin())
+
+    tanh(self) -> Complex[F] = self.sinh() / self.cosh()
+
+    asinh(self) -> Complex[F] = (self + (self * self + one_like(self)).sqrt()).ln()
+
+    // **Two roots multiplied rather than one root of a product**, which is not the same function:
+    // `sqrt(z*z - 1)` picks the wrong branch for `z` on the negative real axis, where this form keeps
+    // the cut where `acosh`'s is supposed to be -- everything to the left of one.
+    acosh(self) -> Complex[F] =
+        (self + (self + one_like(self)).sqrt() * (self - one_like(self)).sqrt()).ln()
+
+    // Cut outside `[-1, 1]` on the real axis, with a pole at each end of it. Two logarithms rather
+    // than one over a quotient, for the reason `atan` gives.
+    atanh(self) -> Complex[F] =
+        ((one_like(self) + self).ln() - (one_like(self) - self).ln()) * half(F.one())
+end Complex
+
+// Half of a value, which the inverses above need and which is a division rather than a constant so
+// that it is exact at whichever width `F` is.
+private half[F: Float](x: F) -> F = x / (F.one() + F.one())
+
+// The two identities, at the width of a value already in hand.
+//
+// They are written this way rather than as `Complex.one()` because an associated function of a
+// generic type takes its type arguments from what the context expects (`10 §2`), and every use above
+// sits in the middle of a larger expression where nothing in particular is expected. The value being
+// operated on is what says which width is meant, so it is what the helper is handed.
+private one_like[F: Float](z: Complex[F]) -> Complex[F] = Complex(F.one(), F.zero())
+private zero_like[F: Float](z: Complex[F]) -> Complex[F] = Complex(F.zero(), F.zero())
+
+// Multiplication by `i` and by `-i`, which are a swap and a sign rather than a multiplication. The
+// inverse functions are full of them, and writing them out as `Complex(F.zero(), F.one()) * z` would
+// be four multiplications and two additions to compute something that moves two fields.
+private times_i[F: Float](z: Complex[F]) -> Complex[F] = Complex(-z.im, z.re)
+private times_neg_i[F: Float](z: Complex[F]) -> Complex[F] = Complex(z.im, -z.re)
+
+// The principal square root of a value that is not zero.
+//
+// The magnitude of the answer's larger part is `sqrt((|z| + |re|) / 2)`, and the smaller part follows
+// from it by one division -- so the two parts are never both computed from the angle, and the
+// cancellation that a polar round trip suffers near the real axis does not arise. Which of the two
+// parts is the larger depends on the sign of `re`, and that is the whole of the branch: a
+// non-negative real part gives the answer a non-negative real part, and a negative one puts the
+// magnitude into the imaginary part with the sign of the operand's, which is what keeps the cut on
+// the negative real axis.
+private principal_root[F: Float](z: Complex[F]) -> Complex[F] =
+    val two = F.one() + F.one()
+    val t = half(z.abs() + z.re.abs()).sqrt()
+
+    if z.re >= F.zero() then Complex(t, z.im / (two * t))
+    else Complex(z.im.abs() / (two * t), t.copysign(z.im))

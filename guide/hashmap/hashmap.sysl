@@ -64,6 +64,13 @@
 //     `Map`'s parameters from its arguments while the bare `None` waits to hear what it is a `None`
 //     *of*, and neither can go first — so the binding is annotated. Inference is bidirectional
 //     (`10 §4`) but not simultaneous.
+//   * **An arm that took a value apart could not name it — answered.** Four places here rebuilt the
+//     option they had just destructured: `Some(e) -> … break Some(e)`. Three were tidiness, the
+//     value still sitting in the scrutinee variable. `Cursor.next` was not — it steps `self.entry`
+//     *before* handing back what it matched, so by then the matched value has nowhere left to be
+//     read from and rebuilding it was the only way to get it back. `cur @ Some(e)` names the whole
+//     and the part at once (`09 §6`), which is what all four wanted. Building that form found an
+//     older bug beside it: a name bound twice in one pattern used to bind the second silently.
 //
 // What went in without friction is worth recording too, since the point of the exercise is where
 // the language stops rather than a list of complaints: the definition-time bound check does what
@@ -107,8 +114,8 @@ struct Map[K: Hash + Eq, V]
         loop
             at match
                 None -> break None
-                Some(e) ->
-                    if e.key == k then break Some(e)
+                hit @ Some(e) ->
+                    if e.key == k then break hit
                     at = e.next
     end find
 
@@ -145,14 +152,14 @@ struct Map[K: Hash + Eq, V]
         loop
             at match
                 None -> break false
-                Some(e) ->
+                cur @ Some(e) ->
                     if e.key == k
                         prev match
                             None -> bucket = e.next
                             Some(p) -> p.next = e.next
                         self.count -= 1usize
                         break true
-                    prev = Some(e)
+                    prev = cur
                     at = e.next
     end remove
 
@@ -176,14 +183,14 @@ struct Map[K: Hash + Eq, V]
             loop
                 at match
                     None -> break
-                    Some(e) ->
+                    cur @ Some(e) ->
                         // The rest of the old chain is read before the entry is relinked, since
                         // relinking is what overwrites the link to it.
                         var rest = e.next
                         var j = self.index(e.key)
 
                         e.next = self.cell[j]
-                        self.cell[j] = Some(e)
+                        self.cell[j] = cur
                         at = rest
     end grow
 
@@ -220,9 +227,13 @@ struct Cursor[K, V]
     next(*self) -> Option[&Entry[K, V]]
         loop
             self.entry match
-                Some(e) ->
+                // The cursor is stepped **before** the entry it found is handed back, so by then
+                // `self.entry` is the next one and the value this arm matched has nowhere left to be
+                // read from. `cur @` keeps it: the arm names the whole option as well as the entry
+                // inside it, which is the one thing rebuilding it by hand was standing in for.
+                cur @ Some(e) ->
                     self.entry = e.next
-                    break Some(e)
+                    break cur
                 None ->
                     if self.at >= self.cell.len then break None
 

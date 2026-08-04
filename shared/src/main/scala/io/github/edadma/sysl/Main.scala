@@ -31,30 +31,37 @@ import scopt.OParser
  * only the members that resolve something are pulled in. Building one therefore needs an `llvm-ar`
  * as well as a `clang`; `--ar` names it where it is somewhere a search would not look.
  *
- * **`--core-lib` is the same thing for the standard module**, which every program is compiled against
- * whether or not it names one. Built by `build-lib --core` and given back here, it replaces the copy
- * of the library the compiler carries: the signatures arrive decoded instead of parsed, and the half
- * that was already compiled is linked rather than emitted a second time into every program.
+ * **The standard module's own source is read off disk**, from the library installed with this
+ * compiler — `<prefix>/share/sysl/lib` beside the binary, or `lib/` in a checkout (`Std.root`).
+ * There is no copy inside the executable: a library nobody can open is not one anybody can learn
+ * from or edit, which is what every other toolchain concluded too.
  *
- * **It need not be given, and it need not already exist.** `build-lib --core` with no `-o` writes to
- * `LibraryArtifact.coreDefault`, and a compilation with no `--core-lib` looks there — one path at both
- * ends. Where nothing usable is at that path the compiler **builds one**, from the library source it
- * carries, and says so on stderr. The artifact is derived rather than authored: not committed, object
- * code for one machine, and computed entirely from sources the compiler already has, so being absent
- * after a clone or stale after a format change has one answer and it is not a question for whoever
- * ran the command.
+ * **`--std-lib` is the same thing for the standard module** as `--lib` is for any other, and every
+ * program is compiled against it whether or not one is named. Built by `build-lib --std` and given
+ * back here, it replaces the parse of that source: the signatures arrive decoded, and the half that
+ * was already compiled is linked rather than emitted a second time into every program.
+ *
+ * **It need not be given, and it need not already exist.** `build-lib --std` with no `-o` writes to
+ * `LibraryArtifact.stdDefault`, and a compilation with no `--std-lib` looks there — one path at both
+ * ends. Where nothing usable is at that path the compiler **builds one**, from the library source,
+ * and says so on stderr. The artifact is derived rather than authored: not committed, object code
+ * for one machine, and computed entirely from the source beside the compiler, so being absent after
+ * a clone or stale after a format change has one answer and it is not a question for whoever ran the
+ * command. It sits in the user's cache under a fingerprint of the library it was built from, so
+ * every project on a machine shares one and a compiler installed with a different library gets a
+ * path of its own rather than a stale hit.
  *
  * **Which is not the same as substituting a library.** What a compiler must never do is answer *I
  * could not find the library you meant* by quietly using a different one — and a rebuild uses **this**
- * one, held to `Std.fingerprint` on the way back in. A `--core-lib` that was named and cannot be read
+ * one, held to `Std.fingerprint` on the way back in. A `--std-lib` that was named and cannot be read
  * still stops the compilation, because there the reader asked for a particular artifact and is owed
  * the truth about it.
  *
- * **`--no-core-lib` is the one route to the copy the compiler carries**, ignoring whatever is on
- * disk. That copy is what makes bootstrap possible — there is no released sysl to build the first
- * artifact with — so it is reached deliberately rather than by a lookup coming up empty. Taken
- * silently it would be taken always, because then nobody would have any reason to build an artifact
- * at all.
+ * **`--no-std-lib` is the one route to the library as source**, ignoring whatever artifact is on
+ * disk. Compiling it rather than linking it is what makes bootstrap possible — there is no released
+ * sysl to build the first artifact with — so it is reached deliberately rather than by a lookup
+ * coming up empty. Taken silently it would be taken always, because then nobody would have any
+ * reason to build an artifact at all.
  *
  * **Everything after a bare `--` belongs to the program being run**, not to sysl: it is passed
  * straight through to the executable, which is what lets `sysl run prog.sysl -- -v file` reach a
@@ -82,15 +89,27 @@ case class Config(
     explainEscapes: Boolean = false,
     target: Option[String] = None,
     libs: List[String] = Nil,
-    core: Boolean = false,
-    coreLib: Option[String] = None,
-    noCoreLib: Boolean = false,
-    coreSearch: String = LibraryArtifact.coreDefault,
+    std: Boolean = false,
+    stdLib: Option[String] = None,
+    noStdLib: Boolean = false,
+    /** Where to look for a prebuilt standard module, when somewhere other than the default.
+      *
+      * **An `Option` so that the default is worked out when it is wanted rather than when a `Config`
+      * is built.** The default path holds a fingerprint of the library, so naming it here would have
+      * read the library's source during argument parsing — before the driver had a chance to report
+      * not finding it, and from a place where the failure could only be an exception. A compiler
+      * that cannot find its library has to say so on stderr like anything else (`Std.root`).
+      */
+    stdSearch: Option[String] = None,
     ar: Option[String] = None,
     programArgs: List[String] = Nil,
     filter: Option[String] = None,
     failFast: Boolean = false,
     optimize: String = Toolchain.defaultOptimization,
+    /** `prove --emit-whyml` — print the translation instead of running the prover (`17 §9`). */
+    emitWhyML: Boolean = false,
+    /** `prove --overflow` — whether staying in an integer's range is a proof obligation. */
+    overflow: String = "check",
 )
 
 /** The option grammar, held apart from the entry point so that a test can ask what an argument list
@@ -122,13 +141,13 @@ private[sysl] val parser = {
         .children(
           arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
           opt[String]('o', "output").action((o, c) => c.copy(output = Some(o))).text("output artifact path"),
-          opt[Unit]("core")
-            .action((_, c) => c.copy(core = true))
+          opt[Unit]("std")
+            .action((_, c) => c.copy(std = true))
             .text("this library is sysl's own standard module, which the compiler otherwise supplies"),
         ),
       cmd("test")
         .action((_, c) => c.copy(command = "test"))
-        .text("run the '#test' functions of a sysl module")
+        .text("run the '@test' functions of a sysl module")
         .children(
           arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
           opt[String]("filter")
@@ -142,9 +161,40 @@ private[sysl] val parser = {
         .action((_, c) => c.copy(command = "emit-llvm"))
         .text("print the generated LLVM IR")
         .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
+      cmd("prove")
+        .action((_, c) => c.copy(command = "prove"))
+        .text("translate a module to WhyML and discharge its proof obligations with Why3 (17)")
+        .children(
+          arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
+          opt[Unit]("emit-whyml")
+            .action((_, c) => c.copy(emitWhyML = true))
+            .text("print the WhyML instead of proving it"),
+          opt[String]("overflow")
+            .action((o, c) => c.copy(overflow = o))
+            .text("'check' (the default) makes staying in an integer's range a proof obligation; " +
+              "'ignore' drops those obligations, for reasoning about the rest of a function first"),
+        ),
       cmd("targets")
         .action((_, c) => c.copy(command = "targets"))
         .text("list the machines sysl can build for"),
+      // A heading, because everything below belongs to no command and the usage would otherwise
+      // print it flush against the last one — where an option renders exactly as that command's own
+      // children do, so `--target` read as an option of `targets`.
+      note("\nOptions, which any command takes:"),
+      // Flags rather than subcommands, because they are what somebody types before they know there
+      // are subcommands — and each satisfies `checkConfig` below by naming a command of its own, so
+      // `sysl --version` and `sysl --help` stand alone rather than being options to something else.
+      opt[Unit]("version")
+        .action((_, c) => c.copy(command = "version"))
+        .text("print which build of sysl this is"),
+      // Not scopt's own `help("help")`, though it exists and would render the same text. That one is
+      // a *terminating* option: it reaches `OEffect.Terminate`, which the default setup answers with
+      // `sys.exit`, so a test that asked what `--help` does would take the test runner down with it.
+      // Naming a command instead keeps it on the same footing as every other one — driven through
+      // `execute`, answerable in a test, and printing the usage that `OParser` generates anyway.
+      opt[Unit]("help")
+        .action((_, c) => c.copy(command = "help"))
+        .text("print this usage text"),
       opt[Unit]("explain-escapes")
         .action((_, c) => c.copy(explainEscapes = true))
         .text("report every local array promoted to the heap, and the view that forced it"),
@@ -156,14 +206,14 @@ private[sysl] val parser = {
         .action((l, c) => c.copy(libs = c.libs :+ l))
         .text("a library to compile against — a '.syslib' artifact or a source root; " +
           "may be given more than once"),
-      opt[String]("core-lib")
-        .action((l, c) => c.copy(coreLib = Some(l)))
-        .text("a prebuilt standard module to compile against, from 'build-lib --core'; " +
+      opt[String]("std-lib")
+        .action((l, c) => c.copy(stdLib = Some(l)))
+        .text("a prebuilt standard module to compile against, from 'build-lib --std'; " +
           "one that cannot be read stops the compilation, being the one that was asked for"),
-      opt[Unit]("no-core-lib")
-        .action((_, c) => c.copy(noCoreLib = true))
-        .text("compile against the copy of the standard module built into the compiler, " +
-          "ignoring any prebuilt one"),
+      opt[Unit]("no-std-lib")
+        .action((_, c) => c.copy(noStdLib = true))
+        .text("compile the standard module from its source rather than linking a prebuilt one, " +
+          "ignoring whatever artifact is on disk"),
       opt[String]("ar")
         .action((a, c) => c.copy(ar = Some(a)))
         .text("the llvm-ar to build a library with; defaults to searching for one"),
@@ -212,6 +262,8 @@ private[sysl] def parseArgs(own: Seq[String]): Option[Config] =
  * none of them is reachable from the compiler's own API.
  */
 private[sysl] def execute(cfg: Config): Int = {
+  if cfg.command == "version" then return printVersion()
+  if cfg.command == "help" then return printUsage()
   if cfg.command == "targets" then return listTargets()
 
   val sources =
@@ -220,32 +272,47 @@ private[sysl] def execute(cfg: Config): Int = {
 
   if sources.isEmpty then return fail(s"${cfg.file} holds no sysl source files")
 
-  val target = chooseTarget(cfg.target) match
+  val project = readPackageConfig(cfg.file) match
+    case Left(err) => return fail(err)
+    case Right(p)  => p
+
+  val target = chooseTarget(cfg.target, project.defaultTarget) match
     case Left(err) => return fail(err)
     case Right(t)  => t
+
+  val provides = project.provides(target.name)
+
+  // What the package says it cannot be built without, asked of the machine it is being built for.
+  // This is the config's own half of `requires`, and it is answered here rather than in the analyzer
+  // because it is a statement about the *project* — there is no source position to point at, and a
+  // build that cannot mean anything should stop before it parses a line.
+  val unmet = project.requires.filterNot(provides).toList.sorted
+
+  if unmet.nonEmpty then
+    return fail(s"this package requires '${unmet.head}', and '${target.name}' does not provide it")
 
   // Building the standard module against a prebuilt copy of itself is the one combination that
   // cannot mean anything: the declarations being compiled are the ones the artifact holds. Refused
   // rather than ignored, since ignoring it leaves a command line that reads as though it were used.
-  if cfg.core && cfg.coreLib.isDefined then
-    return fail("--core-lib compiles against the standard module, and 'build-lib --core' is what builds it")
+  if cfg.std && cfg.stdLib.isDefined then
+    return fail("--std-lib compiles against the standard module, and 'build-lib --std' is what builds it")
 
   // Naming an artifact and refusing all of them at once has no reading either way round, and the two
   // spellings are near enough that a typo produces exactly this line. Refused rather than resolved by
   // precedence, since whichever precedence were chosen would silently discard half of what was asked.
-  if cfg.noCoreLib && cfg.coreLib.isDefined then
-    return fail("--no-core-lib and --core-lib ask for different standard modules")
+  if cfg.noStdLib && cfg.stdLib.isDefined then
+    return fail("--no-std-lib and --std-lib ask for different standard modules")
 
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
-  val (core, coreSymbols, coreArchive) = chooseCore(cfg, target) match
+  val (std, coreSymbols, coreArchive) = chooseCore(cfg, target) match
     case Left(err) => return fail(err)
     case Right(c)  => c
 
   // Building a library stops here — there is no program to link it into. An artifact is **for a
   // machine**, exactly as an rlib is, because half of it is compiled object code; the generic half
   // travels as trees because there is nothing to compile until a caller fixes its type arguments.
-  if cfg.command == "build-lib" then return buildLibrary(cfg, sources, target, core)
+  if cfg.command == "build-lib" then return buildLibrary(cfg, sources, target, std)
 
   // Running the result is what makes `run` different from `build`, and only this machine can do
   // that — so a cross target is refused here rather than built and then failed to execute.
@@ -294,7 +361,7 @@ private[sysl] def execute(cfg: Config): Int = {
 
   // What the libraries already compiled, so this module declares those rather than defining them a
   // second time. Their bodies arrive from the archives at link time. The standard module's are in
-  // here on the same footing as a named library's: what a prebuilt core buys a program is exactly
+  // here on the same footing as a named library's: what a prebuilt std buys a program is exactly
   // that its share of the library stops being emitted into every one.
   val precompiled = read.flatMap(_._2).toSet ++ coreSymbols
 
@@ -303,16 +370,23 @@ private[sysl] def execute(cfg: Config): Int = {
   val archives = artifacts ::: coreArchive.toList
 
   // A test build is its own compilation and branches before the one below, rather than sharing it:
-  // it keeps the `#test` functions every other build drops, and it lowers a different entry point
+  // it keeps the `@test` functions every other build drops, and it lowers a different entry point
   // (`Tests`). Everything up to here — the libraries, the standard module, the target — is the same,
   // which is why the branch is here and not at the top.
   if cfg.command == "test" then
-    return TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, core, archives)
+    return TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, std, archives)
+
+  // Proving stops at the typed tree and never lowers, so it branches before the compilation below
+  // (`17 §9`). It reads the tree before pruning and before `@ghost` erasure, because the predicates a
+  // specification is written in are exactly what the lowering drops.
+  if cfg.command == "prove" then
+    return prove(cfg, librarySources ::: sources, libraryTrees, target, std, provides)
 
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled =
-    Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(core)) match
+    Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(std),
+      provides) match
     case Left(err) => return report(err)
     case Right(result) =>
       if cfg.explainEscapes then
@@ -335,10 +409,10 @@ private[sysl] def execute(cfg: Config): Int = {
       val exe = createTempFile("sysl-", "")
 
       Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links) match
-        case Left(err) => discard(exe); fail(err)
+        case Left(err) => Project.discard(exe); fail(err)
         case Right(_) =>
           val result = exec(exe :: cfg.programArgs)
-          discard(exe)
+          Project.discard(exe)
           stdout(result.stdout)
           if result.stderr.nonEmpty then Console.err.print(result.stderr)
           result.exitCode
@@ -347,16 +421,46 @@ private[sysl] def execute(cfg: Config): Int = {
       fail(s"unknown command '$other'")
 }
 
-/** Removes a temporary file, whether or not it is there.
+/** `sysl prove` — the module as WhyML, and what Why3 made of it (`17 §9`).
  *
- * Cleanup runs on the paths that failed, and those are exactly the paths where the file may never
- * have been created: `createTempFile` reserves a name, and it is the toolchain that writes to it. A
- * `deleteFile` on a link that failed therefore threw, and the stack trace replaced the linker's own
- * message — the one thing the user needed to see.
+ * **A proof is not a build.** Nothing is emitted and nothing about `sysl build` changes, which is
+ * `17 §1`: a module that fails to prove still compiles and still runs, with every check `16` and `17`
+ * describe. What the prover buys is finding out before the program runs rather than at the trap.
+ *
+ * The exit status is Why3's, so a proof run is usable in a build script that wants to fail on an
+ * undischarged goal.
  */
-private def discard(path: String): Unit =
-  try deleteFile(path)
-  catch case _: Exception => ()
+private def prove(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
+                  std: Stdlib, provides: Set[String]): Int = {
+  val (typed, ownModules) = Compiler.typedWith(sources, libraries, target, Some(std), provides) match
+    case Left(err)  => return report(err)
+    case Right(out) => out
+
+  if cfg.overflow != "check" && cfg.overflow != "ignore" then
+    return fail(s"--overflow is 'check' or 'ignore', and '${cfg.overflow}' is neither")
+
+  val mlw = WhyML.generate(typed, moduleName(cfg.file), cfg.overflow == "check", ownModules) match
+    case Left(err)  => return fail(err)
+    case Right(out) => out
+
+  if cfg.emitWhyML then { stdout(mlw); return 0 }
+
+  Toolchain.why3Prove(mlw) match
+    case Left(err) => fail(err)
+    case Right((code, out)) =>
+      stdout(out)
+      if code == 0 then Console.err.println("every goal was discharged")
+      code
+}
+
+/** A WhyML module's name, taken from the file the program was given. It is only a label — Why3 needs
+ * one and sysl's module names hold dots a WhyML identifier may not.
+ */
+private def moduleName(path: String): String = {
+  val base = path.split('/').last.takeWhile(_ != '.')
+
+  if base.isEmpty then "Program" else base.filter(c => c.isLetterOrDigit || c == '_')
+}
 
 /** `sysl build-lib <path> -o <artifact>` — a library compiled once, into the two halves a program
  * links against (`LibraryArtifact`).
@@ -365,13 +469,13 @@ private def discard(path: String): Unit =
  * The other half is the tree, which would travel anywhere: a generic has no compiled form until the
  * program that calls it fixes its type arguments, so it is monomorphized in that program instead.
  *
- * `--core` says the library being built is sysl's own standard module, which is the one thing an
+ * `--std` says the library being built is sysl's own standard module, which is the one thing an
  * ordinary compilation may not declare. It is written down rather than inferred from the module
  * names in the tree: guessing it would turn a clear refusal — *you cannot add to the module every
  * program is compiled against* — into an artifact that builds and then collides with the built-in
  * copy at whatever link tried to use it.
  */
-private def buildLibrary(cfg: Config, sources: List[Source], target: Target, core: Core): Int = {
+private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std: Stdlib): Int = {
   // Before the library is compiled rather than after. Compiling it is the slow part and the archiver
   // is not needed until the end, so discovering it late would make "there is no llvm-ar" a thing a
   // user waited for the whole build to be told.
@@ -389,7 +493,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
     case Some(err) => return fail(err)
     case None      => ()
 
-  LibraryArtifact.build(sources, target, if cfg.core then LibraryArtifact.core else Set.empty, Some(core),
+  LibraryArtifact.build(sources, target, if cfg.std then LibraryArtifact.std else Set.empty, Some(std),
                         native) match
     case Left(err) => report(err)
     case Right((ir, meta)) =>
@@ -398,9 +502,9 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
       // is named after the root it was built from, there being nowhere in particular it belongs.
       val out =
         cfg.output.getOrElse(
-          if cfg.core then cfg.coreSearch else defaultOutputName(cfg.file) + LibraryArtifact.extension)
+          if cfg.std then stdSearchOf(cfg) else defaultOutputName(cfg.file) + LibraryArtifact.extension)
 
-      parentOf(out).foreach(createDirectories)
+      Project.parentOf(out).foreach(createDirectories)
 
       // The members are named rather than left as whatever a temporary file was called, so an
       // artifact holds the same names wherever it was built and `ar t` shows a reader something they
@@ -421,7 +525,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
           _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), out, ar)
         yield ()
 
-      (code :: metadata :: objects.map(_._2) ::: List(staging)).foreach(discard)
+      (code :: metadata :: objects.map(_._2) ::: List(staging)).foreach(Project.discard)
 
       outcome match
         case Left(err) => fail(err)
@@ -431,27 +535,42 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, cor
 /** The standard module this compilation gets, or why it has none.
  *
  * Two places, and they are governed by different rules. **A named one is taken as it is**: someone
- * who wrote `--core-lib` down is owed an error when what they named is not there or will not read,
+ * who wrote `--std-lib` down is owed an error when what they named is not there or will not read,
  * rather than a different standard module built underneath them. That is the rule `Toolchain.findAr`
  * applies to a named archiver, and for the same reason.
  *
- * **The one at the default path is a cache, and is rebuilt when it is not usable.** See `foundCore`.
+ * **The one at the default path is a cache, and is rebuilt when it is not usable.** See `foundStd`.
  *
- * `--no-core-lib` is the one way to the copy the compiler carries *as source*. That copy exists for
- * bootstrap — there is no released sysl to build the first artifact with — and for the compiler's own
- * unit tests, which run in a tree where nothing has been built. Reaching it is a deliberate act, and
- * that is worth keeping distinct from the rebuild below: this one compiles the library's source into
- * the program, where the rebuild produces the artifact and links it.
+ * `--no-std-lib` is the one way to the library **as source**, with no artifact in between. It is
+ * what bootstrap needs — there is no released sysl to build the first artifact with — and what the
+ * compiler's own unit tests take, running as they do in a tree where nothing has been built.
+ * Reaching it is a deliberate act, and that is worth keeping distinct from the rebuild below: this
+ * one compiles the library's source into the program, where the rebuild produces the artifact and
+ * links it. Both read the same files off disk (`Std.root`); what differs is what they do with them.
  *
- * **`build-lib --core` is exempt, and has to be.** It is the command that produces the artifact, so
+ * **`build-lib --std` is exempt, and has to be.** It is the command that produces the artifact, so
  * consulting one would be a deadlock with nothing to break it.
  */
-private def chooseCore(cfg: Config, target: Target): Either[String, (Core, Set[String], Option[String])] =
-  if cfg.noCoreLib || cfg.core then Right((Core.embedded(target), Set.empty, None))
-  else
-    cfg.coreLib match
-      case Some(named) => loadCore(named, target)
-      case None        => foundCore(cfg.coreSearch, target)
+/** Where this compilation looks for a prebuilt standard module: wherever the config points, or the
+ * path both ends agree on.
+ *
+ * Resolved here rather than in `Config`, because the default is keyed by a fingerprint of the
+ * library and so cannot be computed until the library has been found. Every caller is downstream of
+ * `chooseCore`'s check, so by the time this runs there is a library to fingerprint.
+ */
+private def stdSearchOf(cfg: Config): String = cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault)
+
+private def chooseCore(cfg: Config, target: Target): Either[String, (Stdlib, Set[String], Option[String])] =
+  // Every branch below reads the library's source: two of them compile it, and the third checks a
+  // prebuilt artifact against a fingerprint of it. So a compiler that cannot find its library fails
+  // here, once, with the diagnostic that names where it looked — rather than at whichever of the
+  // three happened to touch `Std.sources` first, where it would arrive as an exception.
+  Std.root.flatMap: _ =>
+    if cfg.noStdLib || cfg.std then Right((Stdlib.fromSource(target), Set.empty, None))
+    else
+      cfg.stdLib match
+        case Some(named) => loadCore(named, target)
+        case None        => foundStd(stdSearchOf(cfg), target)
 
 /** The standard module at the path both ends agree on, **built there when what is there is not one.**
  *
@@ -464,7 +583,7 @@ private def chooseCore(cfg: Config, target: Target): Either[String, (Core, Set[S
  * **This is not the silent fallback the design refuses**, and the distinction is the whole of why it
  * is allowed. What is refused is compiling against a *different* standard module than the one asked
  * for — answering "I could not find your library" by quietly using another. A rebuild answers with
- * **this** library: the sources are the ones the compiler carries, `Core.read` holds the result to
+ * **this** library: the sources are the ones the compiler carries, `Stdlib.read` holds the result to
  * `Std.fingerprint` on the way back in, and a program compiled after it is compiled against exactly
  * what it would have been compiled against had the artifact been there. Nothing is substituted, so
  * there is nothing for a reader to be misled about.
@@ -477,8 +596,8 @@ private def chooseCore(cfg: Config, target: Target): Either[String, (Core, Set[S
  * the flag — the same one they would have got before — with the reason the compiler could not do it
  * for them appended.
  */
-private def foundCore(path: String, target: Target)
-    : Either[String, (Core, Set[String], Option[String])] = {
+private def foundStd(path: String, target: Target)
+    : Either[String, (Stdlib, Set[String], Option[String])] = {
   val found = if isFile(path) then loadCore(path, target) else Left(s"$path does not exist")
 
   found match
@@ -486,50 +605,13 @@ private def foundCore(path: String, target: Target)
     case Left(why)  =>
       Console.err.println(s"building the standard module at $path ($why)")
 
-      writeCore(path, target) match
+      Stdlib.writeArtifact(path, target) match
         case Right(_) => loadCore(path, target)
         case Left(err) =>
           Left(s"cannot find or build the standard module — build it with " +
-            s"'sysl build-lib lib --core', or pass --no-core-lib to compile against the copy built " +
+            s"'sysl build-lib lib --std', or pass --no-std-lib to compile against the copy built " +
             s"into the compiler ($err)")
 }
-
-/** The standard module compiled to an artifact at `out`, from the library source the compiler
- * carries.
- *
- * The sources are `Std.sources` and not the `lib/` in some tree, which is what makes this usable at
- * all: an installed compiler has no repository beside it, and `Core.read` checks a decoded artifact
- * against `Std.fingerprint` — the fingerprint of exactly these files — so building from them is the
- * one thing guaranteed to produce an artifact this compiler will accept.
- *
- * No C files are gathered, and none can be missed: `15 §7` lets a library carry `.c` beside its
- * modules, and the standard module carries none. It could not — the fingerprint an artifact is held
- * to covers a library's C sources with its sysl ones, while the one the compiler carries covers only
- * what `CoreSource` embeds, so a `.c` under `lib/sysl` would make every artifact built from the tree
- * fail the check it is read back through.
- */
-private def writeCore(out: String, target: Target): Either[String, Unit] =
-  for
-    ar    <- Toolchain.findAr(None)
-    built <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.core, Some(Core.embedded(target)))
-    _     <- {
-               val staging  = createTempDirectory("sysl-core-")
-               val code     = s"$staging/${LibraryArtifact.codeMember}"
-               val metadata = s"$staging/${LibraryArtifact.metadataMember}"
-
-               parentOf(out).foreach(createDirectories)
-
-               val outcome =
-                 for
-                   _ <- Toolchain.compileObject(built._1, code, target)
-                   _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(built._2, target), metadata, target)
-                   _ <- Toolchain.archive(List(code, metadata), out, ar)
-                 yield ()
-
-               List(code, metadata, staging).foreach(discard)
-               outcome
-             }
-  yield ()
 
 /** A prebuilt standard module read back: the trees to compile against, the symbols its object half
  * already defines, and the archive to link that half from — which is the file itself, since it is
@@ -540,25 +622,88 @@ private def writeCore(out: String, target: Target): Either[String, Unit] =
  * kind as not finding it at all, and is reported rather than worked around. A standard module that
  * cannot be read is not a standard module.
  */
-private def loadCore(path: String, target: Target): Either[String, (Core, Set[String], Option[String])] = {
+private def loadCore(path: String, target: Target): Either[String, (Stdlib, Set[String], Option[String])] = {
   val bytes =
     try readBytes(path)
     catch case e: Exception => return Left(s"cannot read $path: ${e.getMessage}")
 
   LibraryArtifact.metadataOf(path, bytes).flatMap(meta =>
-    Core.read(path, meta, target).map((core, symbols) => (core, symbols, Some(path))))
+    Stdlib.read(path, meta, target).map((std, symbols) => (std, symbols, Some(path))))
 }
 
-/** Which machine this invocation is for: the one it names, or this one. A machine sysl has no entry
- * for is reported rather than guessed at — the guess would be a module that looks right and is
- * built for something else.
+/** Which machine this invocation is for: the one it names, the one the project config names, or this
+ * one. A machine sysl has no entry for is reported rather than guessed at — the guess would be a
+ * module that looks right and is built for something else.
+ *
+ * `--target` beats the config, which beats the host. That is the order every other tool uses and the
+ * only one that lets a project with a default still be cross-built from the command line without
+ * editing a file.
  */
-private def chooseTarget(named: Option[String]): Either[String, Target] = named match
-  case Some(name) => Target.named(name)
-  case None =>
-    Target.host.toRight(
-      "this machine is not one sysl knows, so a build has to name its target with --target " +
-        "('sysl targets' lists them)")
+private def chooseTarget(named: Option[String], configured: Option[String]): Either[String, Target] =
+  named.orElse(configured) match
+    case Some(name) => Target.named(name)
+    case None =>
+      Target.host.toRight(
+        "this machine is not one sysl knows, so a build has to name its target with --target " +
+          "('sysl targets' lists them)")
+
+/** The project config, read from the root this invocation was given (`packages.md § 1`).
+ *
+ * **A missing file is not an error.** A single-file program has no config and wants none, so what
+ * comes back is the empty one — the same shape `13 §1` gives the anonymous root module. A file that
+ * is *there* and will not read is a different thing entirely and stops the build: somebody wrote it,
+ * and building while ignoring it would be building something other than what they asked for.
+ *
+ * The file is looked for beside the sources rather than searched for upwards. `13 § Open a` settles
+ * that the driver is *given* a root rather than discovering one, and a search that walked upward
+ * would make a build depend on directories above the one named.
+ */
+private def readPackageConfig(file: String): Either[String, PackageConfig] = {
+  val root =
+    if isDirectory(file) then file
+    else
+      val slash = math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))
+
+      if slash >= 0 then file.substring(0, slash) else "."
+
+  val path = s"$root/${PackageConfig.FileName}"
+
+  if !isFile(path) then Right(PackageConfig.empty)
+  else
+    try PackageConfig.read(readFile(path))
+    catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
+}
+
+/** Which build of sysl this is.
+ *
+ * On stdout rather than stderr, and alone on its line, because the first thing anyone does with a
+ * version is read it out of a script — and a bug report that quotes it is the reason it exists at
+ * all. The number comes from the build (`BuildInfo`), so a binary cannot claim a version it was not
+ * cut at.
+ */
+private def printVersion(): Int = {
+  stdout(s"sysl ${BuildInfo.version}\n")
+  0
+}
+
+/** The usage text, for someone who asked for it.
+ *
+ * It was already reachable — an invocation naming no subcommand prints it, because `checkConfig`
+ * refuses one — but only by *failing*, on stderr and with a non-zero status. `--help` is the first
+ * thing anyone types at an unfamiliar command, and answering it with `Error: Unknown option --help`
+ * is the worst first impression a compiler can make.
+ *
+ * Asked for, it is not an error: stdout, and a zero status, so `sysl --help | less` works and a
+ * script that checks the status is not told something went wrong. That is the whole difference
+ * between this and the failure path, which keeps stderr and its 2.
+ *
+ * `OParser.usage` renders it, so this is scopt's own text rather than a second copy to keep in step
+ * with the parser above.
+ */
+private def printUsage(): Int = {
+  stdout(OParser.usage(parser) + "\n")
+  0
+}
 
 /** The registry, as a reader of `sysl targets` sees it: the name to write, the LLVM triple it
  * stands for, and — for one sysl knows and cannot build for — why not.
@@ -577,15 +722,6 @@ private def listTargets(): Int = {
   stdout(s"\nthis machine reports: ${Target.hostMachineShown}\n")
 
   0
-}
-
-/** The directory an output path sits in, where it names one — the default core path does, and it is
- * a directory a fresh clone has never had, so writing the artifact has to make it.
- */
-private def parentOf(path: String): Option[String] = {
-  val slash = math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
-
-  Option.when(slash > 0)(path.substring(0, slash))
 }
 
 private def defaultOutputName(file: String): String = {

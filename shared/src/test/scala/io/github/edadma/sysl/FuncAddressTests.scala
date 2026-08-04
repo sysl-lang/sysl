@@ -280,15 +280,15 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     // A test is dropped from every build but `sysl test`, so its address would be of a definition
     // the program does not have — the same refusal a call to one gets, for the same reason.
-    "a '#test' function, which no ordinary build contains" in {
-      val e = err("""#test
+    "a '@test' function, which no ordinary build contains" in {
+      val e = err("""@test
                     |t()
                     |    print(1)
                     |
                     |var f: *extern() -> unit = &t
                     |""".stripMargin)
 
-      e should include("'t' is a '#test' function")
+      e should include("'t' is a '@test' function")
       e should include("its address would be of a definition the program does not have")
     }
 
@@ -617,12 +617,12 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       */
     "an address in a 'no alloc' module reaches what the function reaches" in {
       irOf("thing/a.sysl" ->
-        ("module thing\nno alloc\n\nplain(n: i32) -> i32 = n * 2\n" +
+        ("module thing\n@no_alloc\n\nplain(n: i32) -> i32 = n * 2\n" +
           "addr() -> *extern(i32) -> i32 = &plain\n"),
         "main.sysl" -> "print(thing.addr()(21))") should include("define")
 
       errOf("thing/a.sysl" ->
-        ("module thing\nno alloc\n\nboxes(n: int) -> &int = n\n" +
+        ("module thing\n@no_alloc\n\nboxes(n: int) -> &int = n\n" +
           "addr() -> *extern(int) -> &int = &boxes\n"),
         "main.sysl" -> "print(*thing.addr()(1))") should
         include("an allocator-free module may only call what is allocator-free itself")

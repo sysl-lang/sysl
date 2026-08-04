@@ -17,8 +17,8 @@ trait ControlFlowExprAnalysis extends ExprSupport {
    * that the match below is exhaustive over exactly what the dispatch sends here.
    */
   protected def controlExpr(
-      expr: IfExpr | MatchExpr | While | Loop | CFor | For | TryExpr | RangeExpr | ResultList |
-        Lambda | Tuple,
+      expr: IfExpr | MatchExpr | While | DoWhile | Loop | CFor | For | Quantifier | TryExpr |
+        RangeExpr | ResultList | Lambda | Tuple,
       expected: Option[Type],
       discarded: Boolean,
   ): TExpr = expr match
@@ -63,11 +63,25 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       val (tbody, ctx)  = analyzeLoopBody(expected, label)(analyzeStmts(body))
       popScope()
       val telse         = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-      TWhile(tc, tbody, telse, loopResultType(ctx, telse))
+      checkedLoop(ctx, TWhile(tc, tbody, telse, loopResultType(ctx, telse)))
+
+    // The body is analyzed first and in its own scope, which has closed by the time the test is
+    // reached — so the foot's condition reads what the enclosing block holds and nothing the body
+    // declared. That is C's rule, and it is also the only one the form can have: a `var` made in the
+    // body is remade every round, and a test that read one would be reading the last round's.
+    //
+    // The condition is `analyzeBool` rather than `analyzeCond` for the reason the three-clause
+    // `for`'s is: an `is` binding is live through the branch that the test guards, and a test at the
+    // foot guards nothing — the body it belongs to has already run.
+    case DoWhile(label, body, cond, elseOpt) =>
+      val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))
+      val tcond        = analyzeBool(cond)
+      val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
+      checkedLoop(ctx, TDoWhile(tbody, tcond, telse, loopResultType(ctx, telse)))
 
     case Loop(label, body) =>
       val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))
-      TLoop(tbody, endlessResultType(ctx))
+      checkedLoop(ctx, TLoop(tbody, endlessResultType(ctx)))
 
     // The init's binding belongs to the loop and to nothing outside it, so the scope opens before
     // the condition — which reads that binding — and closes after the `else`, which may too.
@@ -75,7 +89,7 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       pushScope()
       val tinit        = init.toList.flatMap(recoverStmt)
       val tcond        = cond.map(analyzeBool)
-      val (tbody, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+      val (tbody, ctx) = analyzeLoopBody(expected, label)(loopStmts(body))
       val tstep        = step.toList.flatMap(recoverStmt)
       val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       popScope()
@@ -83,8 +97,9 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       // carry, exactly as `loop`'s is — and an `else` that can never run is a mistake worth saying.
       if tcond.isEmpty && telse.isDefined then
         err("this 'for' has no condition, so it never finishes on its own and its 'else' cannot run")
-      TCFor(tinit, tcond, tstep, tbody, telse,
-            if tcond.isEmpty then endlessResultType(ctx) else loopResultType(ctx, telse))
+      checkedLoop(ctx,
+                  TCFor(tinit, tcond, tstep, tbody, telse,
+                        if tcond.isEmpty then endlessResultType(ctx) else loopResultType(ctx, telse)))
 
     case For(label, name, iter, body, elseOpt) =>
       iter match
@@ -103,11 +118,12 @@ trait ControlFlowExprAnalysis extends ExprSupport {
           // The loop variable is a `T`, since what the range walks are the values of the subtype —
           // the bounds and the comparison stay at the base, which is what `T` is laid out as.
           val u         = declare(name, c)
-          val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+          val (tb, ctx) = analyzeLoopBody(expected, label)(loopStmts(body))
           popScope()
           val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-          TFor(u, i, TIntLit(lo.toBigInt, i), TIntLit(last.toBigInt, i), inclusive = true, tb, telse,
-               loopResultType(ctx, telse))
+          checkedLoop(ctx,
+                      TFor(u, i, TIntLit(lo.toBigInt, i), TIntLit(last.toBigInt, i), inclusive = true, tb,
+                           telse, loopResultType(ctx, telse)))
 
         case RangeExpr(Some(lo), Some(hi), inclusive) =>
           val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
@@ -118,10 +134,10 @@ trait ControlFlowExprAnalysis extends ExprSupport {
             case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
           pushScope()
           val u            = declare(name, vty)
-          val (tb, ctx)    = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+          val (tb, ctx)    = analyzeLoopBody(expected, label)(loopStmts(body))
           popScope()
           val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-          TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
+          checkedLoop(ctx, TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse)))
 
         case _ =>
           val seq = autoDeref(analyzeExpr(iter))
@@ -139,6 +155,30 @@ trait ControlFlowExprAnalysis extends ExprSupport {
             case other =>
               err(s"'for' iterates an integer range, an array, a slice, or a type that implements " +
                 s"'${qn(Library.key("Iterate"))}', and ${show(other)} is none of those")
+
+    // `for all i in lo..hi do pred` (`17 §2`). The range is read exactly as a counted `for`'s is —
+    // same node, same two diagnostics — so the two forms cannot come to disagree about what a range
+    // is. What it does not share is the loop machinery: a quantifier has no `break` to meet a type
+    // at, so nothing here consults the loop context.
+    case Quantifier(universal, name, iter, pred) =>
+      val word = if universal then "for all" else "for some"
+
+      iter match
+        case RangeExpr(Some(lo), Some(hi), inclusive) =>
+          val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
+          if tlo.ty != thi.ty then
+            err(s"a '$word' range needs matching bounds, got ${show(tlo.ty)} and ${show(thi.ty)}")
+          val vty = tlo.ty match
+            case i: Type.Integer => i
+            case other           => err(s"a '$word' range iterates integer bounds, not ${show(other)}")
+          pushScope()
+          val u  = declare(name, vty)
+          val tp = analyzeBool(pred)
+          popScope()
+          TQuantifier(universal, u, vty, tlo, thi, inclusive, tp)
+
+        case _ =>
+          err(s"'$word' quantifies over an integer range, written 'lo..<hi' or 'lo..hi'")
 
     case TryExpr(e) =>
       analyzeTry(analyzeExpr(e))
@@ -263,10 +303,10 @@ trait ControlFlowExprAnalysis extends ExprSupport {
                       elseOpt: Option[List[Stmt]], expected: Option[Type], discarded: Boolean): TExpr = {
     pushScope()
     val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+    val (tb, ctx) = analyzeLoopBody(expected, label)(loopStmts(body))
     popScope()
     val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-    TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
+    checkedLoop(ctx, TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse)))
   }
 
   /** `for name in cursor` over a sequence that has to be produced a value at a time (`14 §7`).
@@ -290,11 +330,11 @@ trait ControlFlowExprAnalysis extends ExprSupport {
 
     pushScope()
     val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+    val (tb, ctx) = analyzeLoopBody(expected, label)(loopStmts(body))
     popScope()
     val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
     val bind      = TVariantPattern(opt, opt.variant("Some").get, List(TBindPattern(u, elem)))
-    TIterate(cursor, seq.ty, seq, step, bind, tb, telse, loopResultType(ctx, telse))
+    checkedLoop(ctx, TIterate(cursor, seq.ty, seq, step, bind, tb, telse, loopResultType(ctx, telse)))
   }
 
   /** What a type's `Iterate` implementation yields, or `None` where it has none.
@@ -308,12 +348,30 @@ trait ControlFlowExprAnalysis extends ExprSupport {
     val (key, targs) = memberOwner(ty)
     val iterate      = Library.key("Iterate")
 
-    implsOf(iterate, key).map(suppliedBound(_, iterate, ty, targs).args) match
-      case Nil            => None
-      case List(elem) :: Nil => Some(elem)
-      case several =>
-        err(s"${show(ty)} implements '${qn(iterate)}' " +
-          s"${conjoin(several.map(a => s"'${Type.Bound(iterate, a).show}'"))}, and a 'for' has " +
-          "nothing to say which of them it means — call 'next' yourself, with the element type written")
+    // A **trait object** has no implementations filed for it and needs none: the table it carries
+    // holds `Iterate`'s member, which is the one thing the loop calls. Reaching it here is the same
+    // rule that lets an object satisfy a bound (`10 §5`) — a `for` asks what may be called on the
+    // value, and the answer comes from the same table.
+    //
+    // The several-implementations case below cannot arise for one, which is why this is a lookup
+    // rather than a choice: a trait-object type names one trait at one argument list, so the element
+    // type is whatever the object was erased to. It is read out of the requirement closure so that a
+    // trait *requiring* `Iterate` is walked too, exactly as its members are.
+    def erased =
+      for
+        tr   <- Type.erasedTrait(ty)
+        b    <- traitClosure(tr.bound, selfBinding(ty)).find(_.name == iterate)
+        elem <- b.args.headOption
+      yield elem
+
+    erased.orElse(
+      implsOf(iterate, key).map(suppliedBound(_, iterate, ty, targs).args) match
+        case Nil               => None
+        case List(elem) :: Nil => Some(elem)
+        case several =>
+          err(s"${show(ty)} implements '${qn(iterate)}' " +
+            s"${conjoin(several.map(a => s"'${Type.Bound(iterate, a).show}'"))}, and a 'for' has " +
+            "nothing to say which of them it means — call 'next' yourself, with the element type written"),
+    )
   }
 }

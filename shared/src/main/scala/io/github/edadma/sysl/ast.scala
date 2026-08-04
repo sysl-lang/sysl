@@ -171,6 +171,21 @@ case class StructPattern(name: String, fields: List[(String, Pattern)]) extends 
  */
 case class TuplePattern(args: List[Pattern]) extends Pattern
 
+/** `n @ Circle(r)` — matches what the inner pattern matches, and binds the **whole** value to `n`
+ * besides.
+ *
+ * It answers the one thing destructuring cannot: a pattern that takes a value apart has, by the time
+ * the arm runs, only the parts. Where the arm wants the value back — to hand it on, to store it, to
+ * return it — the alternative is a wildcard arm that tests the shape a second time, or a binding
+ * that gives up the destructuring. This is both at once, which is why Scala, Rust, OCaml and Haskell
+ * all carry it.
+ *
+ * The `@` is the same character an annotation opens with and the two never compete: an annotation's
+ * is a **prefix**, at the start of a line above a declaration, and this one is **infix**, between a
+ * name and a pattern, inside a pattern. Nothing reads a pattern where a declaration may stand.
+ */
+case class BindPattern(name: String, inner: Pattern) extends Pattern
+
 /** `pat, pat, … [if guard] -> body`. Alternatives share one body; the optional guard is a
  * boolean the scrutinee value must additionally satisfy. Each body is a statement list whose
  * trailing expression is the arm's value.
@@ -550,6 +565,22 @@ case class ExprStmt(expr: Expr)                                    extends Stmt
  */
 case class While(label: Option[String], cond: Expr, body: List[Stmt], elseBody: Option[List[Stmt]]) extends Expr
 
+/** `['label] do body while cond [else elseBody]` — the post-test loop, whose body runs once before
+ * anything is asked.
+ *
+ * The value rules are `while`'s exactly: a `break expr` carries the loop's value, and the `else`
+ * runs on normal completion, which here means the test at the foot finally failed. What it carries
+ * that `while` cannot is the same thing the three-clause `for` carries — a `continue` runs the
+ * **test** rather than restarting the body blind. The shape a program reaches for otherwise is
+ * `loop` with `if !cond then break` at the foot, and that rewrite is not this loop: a `continue`
+ * added to it jumps over the test and never leaves.
+ *
+ * `cond` is an ordinary boolean rather than a condition's term list, for the reason the three-clause
+ * `for`'s is: a test at the foot of the body has no branch after it for an `is` binding to be read
+ * from.
+ */
+case class DoWhile(label: Option[String], body: List[Stmt], cond: Expr, elseBody: Option[List[Stmt]]) extends Expr
+
 /** `['label] loop body` — a loop with no condition, which runs until something leaves it.
  *
  * It is `while true` with the part that was never a question taken out, and it carries one thing
@@ -600,6 +631,56 @@ case class Continue(label: Option[String]) extends Stmt
  */
 case class Defer(stmt: Stmt) extends Stmt
 
+/** `asm` — machine instructions, in an arm per architecture (`inline-assembly.md`).
+ *
+ * Exactly one arm is selected, and every architecture the compiler can build for has to appear in
+ * one, so a processor with no answer is reported while building for a different one. What an arm
+ * holds is deliberately not a statement list: the instructions are text sysl does not read, and the
+ * operands beside them are the whole of what it does.
+ */
+case class AsmStmt(arms: List[AsmArm]) extends Stmt
+
+/** One architecture arm. `archs` names the processors it answers for, spelled as `#if` spells them. */
+case class AsmArm(archs: List[String], body: AsmBody) extends Positioned
+
+sealed trait AsmBody
+
+/** Instructions, the operands they name, and what they destroy besides. All three lists may be
+ * empty, and an arm written with nothing under it is exactly that — an architecture on which the
+ * operation costs no instruction, which is a different claim from having no answer.
+ */
+case class AsmCode(lines: List[String], operands: List[AsmOperand], clobbers: List[String]) extends AsmBody
+
+/** `unavailable "reason"` — there is no answer on these processors, and the reason is what a call
+ * from one of them is told.
+ */
+case class AsmUnavailable(reason: String) extends AsmBody
+
+/** Which way a value crosses the instruction boundary. Reading and writing one variable is not
+ * spelled with both of these — it is a single operand the language does not have yet, and the pair
+ * would compile to two registers rather than one.
+ */
+enum AsmDir {
+  case In, Out
+}
+
+/** One operand: a variable already in scope, a direction, and where it has to live. `reg` is the
+ * machine register named for it, or `None` for the `reg` class — any general-purpose register the
+ * allocator likes.
+ */
+case class AsmOperand(dir: AsmDir, name: String, reg: Option[String]) extends Positioned
+
+/** One line inside an arm, before the lines are sorted into the three lists `AsmCode` holds. It
+ * exists only between the parser reading a block and building the arm from it: the instructions
+ * keep their order and nothing else in the block has one, so a single pass over a mixed list is
+ * simpler than a grammar that insists on which kind comes first.
+ */
+enum AsmItem {
+  case Line(text: String)
+  case Operand(operand: AsmOperand)
+  case Clobber(regs: List[String])
+}
+
 /** A design-by-contract clause at the top of a function body. `require` is a precondition,
  * checked once on entry; `ensure` is a postcondition, checked before every return. The optional
  * `msg` accompanies the runtime trap. Inside an `ensure` condition the identifier `result`
@@ -607,6 +688,31 @@ case class Defer(stmt: Stmt) extends Stmt
  */
 case class Require(cond: Expr, msg: Option[String]) extends Stmt
 case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
+
+/** `invariant <bool> [, "message"]` at the head of a loop body — a condition that holds on every
+ * entry to the body (`17 §3`).
+ *
+ * It is a statement rather than a slot in each loop's header so that one rule serves all five loop
+ * forms. Where it may stand is the analyzer's: at the head of a loop's body and nowhere else.
+ */
+case class Invariant(cond: Expr, msg: Option[String]) extends Stmt
+
+/** `variant <int>` — a measure that strictly decreases (`17 §3`, `17 §4`).
+ *
+ * At the head of a loop body it decreases from one iteration to the next. In a function's contract
+ * block it decreases at each direct recursive call, and there it may read only the parameters, which
+ * is what lets the check be made entirely at the call site.
+ */
+case class Variant(expr: Expr) extends Stmt
+
+/** `for all i in 0..<n do P(i)` / `for some i in 0..<n do P(i)` — a quantifier over an integer
+ * range, yielding a `bool` (`17 §2`).
+ *
+ * `universal` tells the two apart. The bound name is visible only inside `pred`, and `iter` is a
+ * range expression — the same `RangeExpr` a counted `for` takes, so the two forms cannot drift
+ * apart over what a range is.
+ */
+case class Quantifier(universal: Boolean, name: String, iter: Expr, pred: Expr) extends Expr
 
 /** A function declaration. The body is a statement list whose trailing expression is the
  * implicit return value; an `= expr` short body is stored as a single-element list. A
@@ -651,16 +757,22 @@ case class FuncDecl(
     tdefaults: Map[String, TypeRef] = Map.empty,
     test: Option[TestAttr] = None,
     conv: Option[CallConv] = None,
+    /** `@tailrec` — see `TFunc.tailrec`. */
+    tailrec: Boolean = false,
+    /** `@pure` — see `TFunc.pure`. */
+    pure: Boolean = false,
+    /** `@ghost` — see `TFunc.ghost`. */
+    ghost: Boolean = false,
 ) extends Stmt
 
-/** What `#test` says about the function it is written above (`testing.md`).
+/** What `@test` says about the function it is written above (`testing.md`).
  *
  * A test is a function the program does not call: `sysl test` calls it, and whether it *returned* is
  * the whole of the result. So the attribute carries only what the runner cannot work out for itself
  * — what to call the test in its report, and whether returning is the outcome it was after.
  *
  * `display` is the name a report shows, defaulting to the function's own. It exists because a
- * function name is a name and a test's subject is a sentence: `#test("an empty slice has no first
+ * function name is a name and a test's subject is a sentence: `@test("an empty slice has no first
  * element")` says something `first_of_empty` only gestures at.
  *
  * `shouldTrap` inverts the verdict: the test passes exactly when the process does *not* come back.
@@ -670,6 +782,17 @@ case class FuncDecl(
  * from the *right* trap where the failure prints something first.
  */
 case class TestAttr(display: Option[String], shouldTrap: Boolean, expected: Option[String]) extends Positioned
+
+/** One attribute written above a declaration, before it has been folded into the `FuncDecl` it
+ * qualifies. It exists for the fold and for the refusal of a repeat — `word` is the spelling that
+ * refusal names, and is what makes two attributes the same one.
+ */
+enum Attr(val word: String) {
+  case Test(attr: TestAttr) extends Attr("test")
+  case TailRec              extends Attr("tailrec")
+  case Pure                 extends Attr("pure")
+  case Ghost                extends Attr("ghost")
+}
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
  * by the linker under the name it is declared with.

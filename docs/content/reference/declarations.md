@@ -282,6 +282,66 @@ hi you
 `= ` may also open an indented block, so a body does not have to change shape when it outgrows a
 line.
 
+### Tail calls
+
+A function whose **last act** is a call to itself does not open a second frame. The call becomes a
+branch back to the function's own entry, so the recursion is bounded by the arithmetic rather than by
+the stack:
+
+```sysl
+count(n: int, acc: int) -> int =
+    if n == 0 then acc else count(n - 1, acc + 1)
+
+print(count(1000000, 0))
+```
+
+```output
+1000000
+```
+
+A million frames is not a stack any machine has. Nothing is written to ask for this — it applies
+wherever it applies.
+
+**In tail position** is the last thing the function does: the body's trailing expression, the operand
+of a `return`, and the arms of the `if` and `match` those reach through. Nothing may wait on the
+result — `n + count(n - 1)` is an ordinary call, because the addition happens after it comes back.
+
+A tail call is a call, so the jump lands where a call would: **every `require` is checked again** on
+the arguments the jump wrote, and **every `old(e)` is snapshotted again**. A recursion that violates
+its own precondition at depth four stops at depth four.
+
+Two things end a tail position instead of being optimized around:
+
+- **a `defer` in scope**, which runs on the way out of a scope — after the callee returns for an
+  ordinary call, and before it is entered for a jump;
+- **an `ensures` on the function**, which is checked when a call *returns*, and a tail call never
+  returns.
+
+Either one leaves the function compiled exactly as written.
+
+It is **self-recursion only**. Mutual recursion and calls through a `Fn` or a `*extern` are ordinary
+calls, however they are written.
+
+### `@tailrec`
+
+The jump is silent, which is what you want until an edit takes it away. `@tailrec` asserts it is
+there and is refused when it is not:
+
+```sysl
+@tailrec
+sum(n: int) -> int =
+    if n == 0 then 0 else n + sum(n - 1)
+
+print(sum(5))
+```
+
+```error
+calls itself nowhere the jump can replace
+```
+
+It changes nothing about what is emitted — write it on the functions where losing the jump silently
+would be a bug, and leave it off the rest.
+
 ### Several results
 
 A signature may declare more than one result, and the trailing expression or `return` supplies them
@@ -437,12 +497,58 @@ changed together.
 `invariant` is a contextual word — an ordinary identifier everywhere else. See
 [errors and contracts](/reference/errors/) for what happens when one is broken.
 
+### A struct with no fields
+
+A struct may declare no fields at all. Its emptiness has to be *written* — the `end` marker, optional
+everywhere else, is what says so — because a struct whose body the author forgot to indent looks
+exactly like one that has no body, and that is much the likelier mistake.
+
+```sysl
+struct Stdout
+end Stdout
+
+impl Fallible for Stdout
+
+impl Writer for Stdout
+    write(*self, bytes: []const u8) = putbytes(bytes)
+end Stdout
+
+show[T: Display](x: T)
+    var out = Stdout()
+
+    x.display(&out, FormatSpec(0, -1, false))
+    printc('\n')
+end show
+
+show(42)
+show("through a sink of one's own")
+
+print(sizeof(Stdout))
+```
+
+```output
+42
+through a sink of one's own
+0
+```
+
+What wants one is a **sink**: a value standing for a destination fixed at compile time — the console,
+a serial port — which has nothing to keep and so has no field to keep it in. Being a value rather
+than a global is what lets it be passed to a function, held in a struct, and chosen by a caller.
+
+Such a type occupies no bytes, so embedding one costs the struct holding it nothing. The cost of that
+is that two of them have nothing to tell their storage apart, and `&a == &b` on two such locals may
+well be true. There is no state behind either address for the answer to be about.
+
 ### `opaque`
 
 `opaque struct Name` withholds the layout from every module but the one declaring it. Outside, the
 type is *incomplete*: only `*Name` may be said, so a value cannot be built, copied, or have a field
 read. This is a **different axis from visibility** — `private` decides who may say the name, `opaque`
 decides who may know the shape. See [modules](/reference/modules/).
+
+An opaque struct with no body at all is C's incomplete type, `struct sqlite3;` — nothing in sysl lays
+one out, and the declaration exists so that `*Session` is a type a `*u8` cannot be mistaken for.
 
 ## Enums
 
@@ -544,6 +650,9 @@ The details — what a module is, how the reach is computed, and how visibility 
 
 Every block-shaped declaration may be closed with `end Name`, naming what it closes. It is optional
 everywhere and checked when written, so it cannot drift from the thing it claims to close.
+
+The one place it is **required** is a struct with no fields, where it is the only thing distinguishing
+a body that is deliberately empty from one that was meant to be there.
 
 `end` is a **soft** word: it is an ordinary identifier everywhere except immediately before a name or
 a construct keyword, so `end` stays usable as a variable.

@@ -237,6 +237,25 @@ neither are the root module's, which have no path to be reached by at all.
 **Resolution is innermost-first.** A local binding shadows an imported name; the fully-qualified path
 is always available to break a tie or reach a name deliberately not imported.
 
+**The three steps rank a name by where it was written, not by what kind of thing it is.** A function,
+a `const`, a module-level `val`, an `extern` variable and an enum variant are different kinds of
+declaration, and a bare name may be any of them — a program's own answers before an import's, and an
+import's before the library's, whichever kind each one is. The library declares a `stdout()`; a
+program that declares storage of that name reaches its own, and the library's is still there under
+the path that names it.
+
+```sysl
+val stdout: int = 7
+
+sysl.stdout().write("the library's\n".bytes)
+print(stdout + 1)
+```
+
+```output
+the library's
+8
+```
+
 | situation | result |
 |---|---|
 | a wildcard offers a name that is also defined locally or imported selectively | the more specific one wins |
@@ -328,21 +347,27 @@ reference.
 
 ## Capabilities are a module property
 
-A **capability clause narrows the module**, and it is written in the file header beside `module`, each
-clause on a line of its own:
+A **capability annotation narrows the module**, and it is written in the file header below `module`,
+each on a line of its own:
 
 ```sysl
 module oskit.arch
-no alloc
+@no_alloc
 ```
 
-Because the module is the directory and the clause is a property of the module, **a narrowing clause
+Because the module is the directory and the capability is a property of the module, **a narrowing
 must appear consistently in every file of the module** — a module whose files disagree is rejected.
-The redundancy buys local legibility: you can never open a file in a `no alloc` module and fail to
-see that it is `no alloc`. A file that declares no module may still carry a clause, since the
-anonymous root module is a module like any other.
+The redundancy buys local legibility: you can never open a file in a `@no_alloc` module and fail to
+see that it is one. A file that declares no module may still carry one, since the anonymous root
+module is a module like any other.
 
-**`link` is the header's other inhabitant and is deliberately not held to agreeing.** `link "z"` names
+The other direction is `@requires(...)`, which takes a **list** because a module often needs more
+than one capability at once — `sysl.thread` is `@requires(threads, posix)`.
+
+**They are annotations rather than grammar**, which is what keeps `alloc`, `no` and `requires`
+available as ordinary names; see [attributes](/reference/attributes/).
+
+**`@link` is the header's other inhabitant and is deliberately not held to agreeing.** `@link("z")` names
 a library the file's `extern`s need, and the files of a module may each name their own — because what
 is being described differs. A capability is a property of the whole module, so files that disagreed
 would describe different modules, while a link requirement is a property of the `extern`s in *one*
@@ -350,7 +375,7 @@ file.
 
 **Propagation is over the module graph.** A module's effective requirement is its own uses plus the
 requirements of every module it imports, transitively, and the whole graph must fit the target. A
-`no alloc` module importing a `requires alloc` module is an error **at the import**, not deep in
+`@no_alloc` module importing a `@requires(alloc)` module is an error **at the import**, not deep in
 codegen. Because the graph is acyclic, propagation is a **single sweep in reverse topological order**
 — each module's requirement set is final before any importer of it is visited — rather than an
 iterated fixpoint.
@@ -758,9 +783,21 @@ compiled against is a *parameter* of it rather than an ambient fact — which is
 handed to two compilations and compared — but the parameter has a default, and the default is found
 rather than named. **A compilation that finds no standard module at the default path builds one**, in
 well under a second, announcing it on stderr. That is not the silent substitution a compiler must
-never make: a rebuild compiles against *this* library, from the sources the compiler carries, held to
-the same fingerprint on the way back in. Nothing is substituted, so there is nothing to be misled
-about.
+never make: a rebuild compiles against *this* library, from its own source, held to the same
+fingerprint on the way back in. Nothing is substituted, so there is nothing to be misled about.
+
+**The standard module's source ships with the compiler and is read off disk** — `share/sysl/lib`
+under the install prefix, found from the binary's own location the way `rustc` finds its sysroot.
+Running out of a checkout, it is `lib/` in the tree. You can read it, and you can edit it: a changed
+file changes the library's fingerprint, so the next compilation builds an artifact of its own rather
+than picking up a stale one. `SYSL_LIB` names a library root outright, which is what a broken install
+needs and nothing else does. A compiler that cannot find its library names every path it tried.
+
+The default path is keyed by a fingerprint of the library, so every compilation of the same library
+on the machine finds the same artifact — and a rebuild therefore **publishes by rename**: it is
+assembled beside its destination and moved onto it. Two builds may run at once; a reader gets the
+whole of one artifact or the whole of the other, and a rebuild that fails leaves the one that was
+already there.
 
 An artifact **named** on the command line is never rebuilt, and one that cannot be read stops the
 compilation — corrupt, truncated, built by another sysl, or built from other sources. Someone who

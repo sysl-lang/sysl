@@ -1,0 +1,309 @@
+module sysl.time
+
+// The calendar: a date and a time of day with no zone attached, and the arithmetic that turns one
+// into the other.
+//
+// A **local** date-time is a reading on a wall clock. It is not a point on the timeline and it does
+// not become one until somebody says where the wall is. Kept apart from `Instant` it is an ordinary,
+// boring value: a day number and a count of microseconds since midnight, both plain integers with no
+// calendar hidden inside.
+//
+// **A day number, not packed civil fields.** The alternative — year, month, day, hour and minute as
+// bit fields inside one word — is the design most people reach for, and the arithmetic says no.
+// Packing to the nanosecond needs 30 bits for the nanosecond, 17 for the time of day and 9 for the
+// day and month, which is 56, leaving 8 bits of year: a range of ±128 years, which is not a
+// calendar. Dropping to microseconds leaves 18 bits of year and does fit. But a *count* fits more
+// comfortably at the same width — microseconds within a day need 37 bits, leaving 27 for the day
+// number and a range of ±183,000 years — and it costs nothing to compute with, because comparing,
+// subtracting and adding a length of time are one instruction each on a count and an
+// unpack-recompute-repack on packed fields. Only "what month is it" wants the fields, and that is
+// the rare question, paid for below where it is asked.
+
+// Proleptic Gregorian, which means the Gregorian rules run backwards through the years before
+// anybody agreed to them. That is a decision and not an oversight: the alternative is a calendar
+// with a ten-day hole in it whose position depends on which country you ask.
+struct Civil
+    year: int
+    month: int
+    day: int
+end Civil
+
+// Days since 1970-01-01. Signed, so dates before the epoch are ordinary values rather than a special
+// case — the algorithm below never branches on the sign.
+struct LocalDate
+    day: int
+end LocalDate
+
+// Microseconds since midnight, from zero up to but not including a whole day.
+struct LocalTime
+    us: long
+end LocalTime
+
+// A wall clock reading. Two independent counts rather than one, because they are added to and
+// compared far more often than they are combined.
+struct LocalDateTime
+    date: LocalDate
+    time: LocalTime
+end LocalDateTime
+
+enum Weekday
+    Sunday
+    Monday
+    Tuesday
+    Wednesday
+    Thursday
+    Friday
+    Saturday
+end Weekday
+
+// Division that rounds toward minus infinity, which is the only kind a calendar can use: the day
+// containing an instant is `floor(us / us_per_day)`, and a `/` that truncates toward zero puts every
+// moment of the day before the epoch into the day after it.
+floor_div(a: long, b: long) -> long
+    var q = a / b
+
+    if a % b != 0i64 && (a < 0i64) != (b < 0i64) then q - 1i64 else q
+end floor_div
+
+floor_mod(a: long, b: long) -> long = a - floor_div(a, b) * b
+
+// Howard Hinnant's civil-from-days pair, which is the standard way to do this and is worth using
+// rather than rediscovering. It works by shifting the epoch to the start of a 400-year era, after
+// which every quantity in it is non-negative and the leap rules become one exact division apiece.
+//
+// `days_from_civil` is its own inverse over the whole `int` range, which is the property to assert
+// rather than any particular date.
+days_from_civil(c: Civil) -> LocalDate
+    var y = if c.month <= 2 then c.year - 1 else c.year
+    var era = floor_div(long(y), 400i64)
+    var yoe = long(y) - era * 400i64
+    var mp = if c.month > 2 then c.month - 3 else c.month + 9
+    var doy = long(153 * mp + 2) / 5i64 + long(c.day) - 1i64
+    var doe = yoe * 365i64 + yoe / 4i64 - yoe / 100i64 + doy
+
+    LocalDate(int(era * 146097i64 + doe - 719468i64))
+end days_from_civil
+
+civil_from_days(d: LocalDate) -> Civil
+    var z = long(d.day) + 719468i64
+    var era = floor_div(z, 146097i64)
+    var doe = z - era * 146097i64
+    var yoe = (doe - doe / 1460i64 + doe / 36524i64 - doe / 146096i64) / 365i64
+    var doy = doe - (365i64 * yoe + yoe / 4i64 - yoe / 100i64)
+    var mp = (5i64 * doy + 2i64) / 153i64
+    var day = doy - (153i64 * mp + 2i64) / 5i64 + 1i64
+    var month = if mp < 10i64 then mp + 3i64 else mp - 9i64
+    var year = yoe + era * 400i64 + (if month <= 2i64 then 1i64 else 0i64)
+
+    Civil(int(year), int(month), int(day))
+end civil_from_days
+
+// Whether a year has a 29th of February, by the rule the proleptic Gregorian calendar states: every
+// fourth year, except every hundredth, except every four-hundredth.
+leap_year(y: int) -> bool = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+
+// How many days a month has, which is the one calendar question that cannot be answered by counting.
+days_in_month(y: int, m: int) -> int
+    if m == 2 then return if leap_year(y) then 29 else 28
+    if m == 4 || m == 6 || m == 9 || m == 11 then 30 else 31
+end days_in_month
+
+// The day of the year, from 1 on the first of January. It is a subtraction rather than a sum over
+// the months, because the day numbers are already what the subtraction needs.
+day_of_year(d: LocalDate) -> int
+    var c = civil_from_days(d)
+
+    d.day - date_at(c.year, 1, 1).day + 1
+end day_of_year
+
+// 1970-01-01 was a Thursday, so shifting by four puts Sunday at zero. Nothing here needs to know
+// which day a week starts on; it only needs the seven in the order the world uses them.
+//
+// A weekday is a **simple** enum, so it converts to its number and back, and both directions are
+// used: the arithmetic wants a number to take a remainder of, and everything else wants a name. The
+// remainder is in range by construction, which is what makes the conversion back total rather than
+// something that has to be checked.
+weekday(d: LocalDate) -> Weekday = Weekday(int(floor_mod(long(d.day) + 4i64, 7i64)))
+
+weekday_name(w: Weekday) -> string = w match
+    Sunday -> "Sunday"
+    Monday -> "Monday"
+    Tuesday -> "Tuesday"
+    Wednesday -> "Wednesday"
+    Thursday -> "Thursday"
+    Friday -> "Friday"
+    Saturday -> "Saturday"
+
+month_name(m: int) -> string = m match
+    1 -> "January"
+    2 -> "February"
+    3 -> "March"
+    4 -> "April"
+    5 -> "May"
+    6 -> "June"
+    7 -> "July"
+    8 -> "August"
+    9 -> "September"
+    10 -> "October"
+    11 -> "November"
+    12 -> "December"
+    else "?"
+
+// The first date on or after `d` falling on the given weekday, which is what "every Tuesday" means
+// once a rule has been given a starting point.
+on_or_after(d: LocalDate, w: Weekday) -> LocalDate =
+    LocalDate(d.day + int(floor_mod(long(int(w) - int(weekday(d))), 7i64)))
+
+date_at(y: int, m: int, d: int) -> LocalDate = days_from_civil(Civil(y, m, d))
+
+time_at(h: int, m: int, s: int) -> LocalTime =
+    LocalTime(long(h) * us_per_hour + long(m) * us_per_minute + long(s) * us_per_second)
+
+datetime_at(y: int, mo: int, d: int, h: int, mi: int, s: int) -> LocalDateTime =
+    LocalDateTime(date_at(y, mo, d), time_at(h, mi, s))
+
+year_of(d: LocalDate) -> int = civil_from_days(d).year
+month_of(d: LocalDate) -> int = civil_from_days(d).month
+day_of(d: LocalDate) -> int = civil_from_days(d).day
+
+hour_of(t: LocalTime) -> int = int(t.us / us_per_hour)
+minute_of(t: LocalTime) -> int = int(t.us % us_per_hour / us_per_minute)
+second_of(t: LocalTime) -> int = int(t.us % us_per_minute / us_per_second)
+us_of(t: LocalTime) -> long = t.us % us_per_second
+
+// A wall clock reading as a single count, measured from the same origin as an `Instant` but **not**
+// an instant: it is what the count would be if the zone's offset happened to be zero. A conversion
+// through a zone starts here and then asks what the offset actually is.
+wall_us(ldt: LocalDateTime) -> long = long(ldt.date.day) * us_per_day + ldt.time.us
+
+wall_of(us: long) -> LocalDateTime =
+    LocalDateTime(LocalDate(int(floor_div(us, us_per_day))), LocalTime(floor_mod(us, us_per_day)))
+
+// An instant read against a wall set a fixed distance from UTC, and back. **Both directions are
+// total**, which is what separates a fixed offset from a zone: a zone whose clocks move answers the
+// second question with none or two, and this pair never does, because an offset is a number rather
+// than a rule with a history.
+//
+// That is also why they are here and a zone is not. A timestamp on a wire, in a log or in a database
+// column carries the offset that was in force when it was written — the sender resolved the zone
+// already, and what arrived is the record of that decision. Reading one back needs no table, no
+// update cadence and no filesystem, which is the whole of what makes it the library's business.
+at_offset(t: Instant, o: Offset) -> LocalDateTime = wall_of(t.us + long(o.minutes) * us_per_minute)
+
+from_offset(ldt: LocalDateTime, o: Offset) -> Instant =
+    Instant(wall_us(ldt) - long(o.minutes) * us_per_minute)
+
+// Adding days to a wall clock reading is **not** adding a length of time to it. Seven days later is
+// the same clock face seven rows down the calendar, whatever the timeline did in between — and
+// across a change of a zone's clocks the two answers differ by an hour. Both are right; they answer
+// different questions, which is why they are spelled differently.
+plus_days(ldt: LocalDateTime, n: int) -> LocalDateTime =
+    LocalDateTime(LocalDate(ldt.date.day + n), ldt.time)
+
+// Months are added by the calendar rather than by counting days, so the day of the month is clamped
+// where the target month is shorter: the 31st of January plus one month is the 28th or 29th of
+// February. Every library that offers this makes that choice, and clamping is the one that keeps
+// "the last day of the month" landing on a last day.
+plus_months(d: LocalDate, n: int) -> LocalDate
+    var c = civil_from_days(d)
+    var total = c.year * 12 + (c.month - 1) + n
+    var y = int(floor_div(long(total), 12i64))
+    var m = int(floor_mod(long(total), 12i64)) + 1
+    var last = days_in_month(y, m)
+
+    date_at(y, m, if c.day < last then c.day else last)
+end plus_months
+
+plus_years(d: LocalDate, n: int) -> LocalDate = plus_months(d, n * 12)
+
+impl Eq for LocalDate
+    eq(self, rhs: LocalDate) -> bool = self.day == rhs.day
+end LocalDate
+
+impl Ord for LocalDate
+    lt(self, rhs: LocalDate) -> bool = self.day < rhs.day
+end LocalDate
+
+impl Eq for LocalTime
+    eq(self, rhs: LocalTime) -> bool = self.us == rhs.us
+end LocalTime
+
+impl Ord for LocalTime
+    lt(self, rhs: LocalTime) -> bool = self.us < rhs.us
+end LocalTime
+
+impl Eq for LocalDateTime
+    eq(self, rhs: LocalDateTime) -> bool = self.date == rhs.date && self.time == rhs.time
+end LocalDateTime
+
+impl Ord for LocalDateTime
+    lt(self, rhs: LocalDateTime) -> bool =
+        self.date < rhs.date || (self.date == rhs.date && self.time < rhs.time)
+end LocalDateTime
+
+date_text(d: LocalDate) -> string
+    var c = civil_from_days(d)
+
+    f"${c.year}%04d-${c.month}%02d-${c.day}%02d"
+end date_text
+
+// Seconds appear only when there are any. A meeting at half past nine is written `09:30` by every
+// human being who has ever written one down, and a renderer insisting on `09:30:00` is reporting its
+// representation rather than its value. The microseconds appear on the same terms, because a
+// renderer that shows a value to the second and drops what is below it is reporting something the
+// value does not say.
+time_text(t: LocalTime) -> string
+    var base = f"${hour_of(t)}%02d:${minute_of(t)}%02d"
+
+    if t.us % us_per_minute == 0i64 then return base
+
+    var withsec = f"$base%s:${second_of(t)}%02d"
+
+    if t.us % us_per_second == 0i64 then withsec else f"$withsec%s.${us_of(t)}%06d"
+end time_text
+
+datetime_text(ldt: LocalDateTime) -> string = f"${date_text(ldt.date)}%s ${time_text(ldt.time)}%s"
+
+impl Display for LocalDate
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(date_text(self), out, fmt)
+end LocalDate
+
+impl Display for LocalTime
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(time_text(self), out, fmt)
+end LocalTime
+
+impl Display for LocalDateTime
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(datetime_text(self), out, fmt)
+end LocalDateTime
+
+// An instant written down, which is the one rendering here that needs no zone: an offset of zero is
+// what the count is measured from rather than a conversion applied to it, so this reports the value
+// rather than interpreting it. `Z` says which, in the spelling ISO 8601 gives that offset.
+//
+// It is the module's because coherence makes it the module's alone. `Display` belongs to the library
+// and so does `Instant`, so no program naming neither of them may write an `impl` for the pair — and
+// a type nothing may render is a type that renders nowhere at all.
+instant_text(t: Instant) -> string = f"${datetime_text(wall_of(t.us))}%s Z"
+
+impl Display for Instant
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(instant_text(self), out, fmt)
+end Instant
+
+// A timestamp as a machine reads it: `2026-03-08T09:30:00-05:00`, or `…Z` where the offset is zero.
+//
+// **This one is written for RFC 3339 and the renderers above are written for people**, which is why
+// the shapes differ where it would have been easy to share one. The seconds are always present, even
+// at zero, because RFC 3339 requires them — so `datetime_text`'s rule of dropping what a value does
+// not say is exactly wrong here, where the reader is a parser with a grammar rather than somebody
+// glancing at a meeting time. The date and the time are joined by `T` rather than a space for the
+// same reason, and the offset is written flush against the time rather than after a space.
+//
+// The fraction still appears only when there is one, because RFC 3339 makes it optional and a
+// `.000000` on every timestamp is six characters of noise on the wire.
+timestamp_text(t: Instant, o: Offset) -> string
+    var l = at_offset(t, o)
+    var hms = f"${hour_of(l.time)}%02d:${minute_of(l.time)}%02d:${second_of(l.time)}%02d"
+    var frac = if us_of(l.time) == 0i64 then "" else f".${us_of(l.time)}%06d"
+
+    date_text(l.date) + "T" + hms + frac + offset_text(o)
+end timestamp_text

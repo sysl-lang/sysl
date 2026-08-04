@@ -282,21 +282,24 @@ That is contracts at their most useful — on a mutating method, saying the thin
 Contracts are checked in **every** build. There is no release mode that drops them, and adding one
 would make a program's meaning depend on how it was compiled.
 
-## What this is not
+## What this is, and where the rest of it is
 
-It is not verification. Nothing here is proved while compiling: a `require` is a branch and a trap, an
-invariant is a call to a synthesized predicate, a `within` is two comparisons. The compiler will not
-tell you that a call site cannot satisfy a precondition, and it will not eliminate a check it could
-have proved redundant.
+Nothing on this page is proved while compiling: a `require` is a branch and a trap, an invariant is a
+call to a synthesized predicate, a `within` is two comparisons. What the feature buys is that the
+rule is written **once, where the thing is declared**, instead of being re-checked by hand at every
+call — and that when it is broken, the program stops at the write that broke it rather than somewhere
+downstream where the wrong value finally mattered.
 
-That is a scope decision rather than a limitation waiting to be fixed. What the feature buys is that
-the rule is written **once, where the thing is declared**, instead of being re-checked by hand at
-every call — and that when it is broken, the program stops at the write that broke it rather than
-somewhere downstream where the wrong value finally mattered.
+**The proving is a page of its own.** [Verification](/reference/verification/) adds the vocabulary a
+specification needs — quantifiers, loop invariants, termination measures, `@pure` and `@ghost` — and
+`sysl prove`, which discharges the obligations with Why3. The two fit together the way they do
+because **a clause means one thing**: the prover and the running program read the same sentence, and
+a check the prover proves redundant is still compiled. So nothing above changes when you start
+proving, which is the point.
 
 ## Tests live beside the code
 
-The third checking tool, and the one that runs on examples rather than on rules. A `#test` attribute
+The third checking tool, and the one that runs on examples rather than on rules. A `@test` annotation
 on an ordinary function marks it as a test, and `assert` is what a test uses to state what it
 expects:
 
@@ -306,12 +309,12 @@ clamp(n: int, lo: int, hi: int) -> int
     elif n > hi then hi
     else n
 
-#test
+@test
 clamps_both_ends()
     assert(clamp(5, 0, 3) == 3, "above the ceiling")
     assert(clamp(-2, 0, 3) == 0, "below the floor")
 
-#test("a value already inside is left alone")
+@test("a value already inside is left alone")
 leaves_the_middle()
     assert(clamp(2, 0, 3) == 2, "untouched")
 
@@ -338,14 +341,14 @@ clamp.sysl
 
 A test is an ordinary function with **no parameters, no result, and no type parameters** — all three
 being the same requirement seen from different sides, since the runner calls it with nothing and
-reads the answer off whether it returned. Each is checked at the attribute rather than at the
-function, because the function is a perfectly good function and it is `#test` that made a promise
+reads the answer off whether it returned. Each is checked at the annotation rather than at the
+function, because the function is a perfectly good function and it is `@test` that made a promise
 about it.
 
-The attribute has four forms. Bare `#test` names the test after the function; `#test("a sentence")`
+The annotation has four forms. Bare `@test` names the test after the function; `@test("a sentence")`
 names it by the sentence, which is what the second one above does and why the runner prints prose
-for it. The other two are for the channel this chapter has been about: `#test(should_trap)` **passes
-by stopping the program**, and `#test(should_trap: "past the end")` additionally requires that text
+for it. The other two are for the channel this chapter has been about: `@test(should_trap)` **passes
+by stopping the program**, and `@test(should_trap: "past the end")` additionally requires that text
 in what the run printed. That is how a trap gets tested at all — there is no catching it, so the
 runner is the thing that survives it.
 

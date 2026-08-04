@@ -88,8 +88,8 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     "rebinds to the caller's own Source, so a decoded declaration is still the library's" in {
       val back = roundTrip(List(one), Map(one.source.name -> one.source))
 
-      // `Core.owns` is identity on the Source, and it is what decides whether an unreached
-      // declaration may be dropped — so a decoded tree handed the embedded core's own `Source` has
+      // `Stdlib.owns` is identity on the Source, and it is what decides whether an unreached
+      // declaration may be dropped — so a decoded tree handed the embedded std's own `Source` has
       // to land on that object rather than on a copy of it.
       back.head.source should be theSameInstanceAs one.source
       back.head.body.forall(Library.carried.owns) shouldBe true
@@ -126,6 +126,22 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // `defer` in it is how this reaches an artifact, and a codec that dropped the payload would
     // decode to a body that releases nothing and says so nowhere.
     check("a defer carrying a statement", "f()\n    defer print(\"out\")\n    print(\"in\")")
+    // Assembly is the one statement whose payload is neither a statement nor an expression — three
+    // lists of strings, an operand list, and two arm shapes told apart by a tag. An artifact
+    // carrying an inline function with an arch layer in it is how this arrives at a library, and
+    // every part of an arm has to come back or the arm answers for the wrong processor.
+    check(
+      "assembly with every arm shape",
+      "f(n: int)\n" +
+        "    asm\n" +
+        "        [x86_64]\n" +
+        "            \"nop {n}\"\n" +
+        "            in n : reg\n" +
+        "            out n : \"rax\"\n" +
+        "            clobbers \"rdx\"\n" +
+        "        [aarch64]\n" +
+        "        [riscv64] unavailable \"nothing to say here\"\n",
+    )
     check("a variadic extern under a link name", "extern \"snprintf\" fmt(f: *u8, ...) -> int")
     // The two `extern` forms together, since the tag is what tells them apart and a codec that wrote
     // one where the other belonged would still round-trip every field either of them has.
@@ -187,16 +203,16 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // The codec's promise is that a tree reads back as the tree that was written, and a field only
     // ever seen holding `None` is one that could be dropped with nothing noticing.
     check("a test in each form its attribute takes",
-      """#test
+      """@test
         |plain() = 0
         |
-        |#test("a sentence about what holds")
+        |@test("a sentence about what holds")
         |named() = 0
         |
-        |#test(should_trap)
+        |@test(should_trap)
         |trapping() = 0
         |
-        |#test("both at once", should_trap: "past the end")
+        |@test("both at once", should_trap: "past the end")
         |both() = 0
         |""".stripMargin)
   }
@@ -223,6 +239,15 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     check("a try, a unit, a null and a c-string", "var q = ()\n    var n: *u8 = null\n    var cs = c\"hi\"")
     check("a 128-bit literal with a suffix", "var w = 170141183460469231731687303715884105727i128")
     check("a multi-assignment and a multi-declaration", "var a = 1\n    var b = 2\n    a, b = b, a\n    val p, q = 3, 4")
+    // Both quantifiers, both range forms, and a predicate that is itself a conjunction — so the
+    // greedy body has to survive the trip as the body rather than as a sibling of it.
+    check("both quantifiers, over both range forms",
+      "var u = for all i in 0..<3 do i >= 0 && i < 3\n    var e = for some j in 1..4 do j == 2")
+    // A loop's clauses are statements at the head of its body, so what has to survive is their
+    // *position* as much as their contents — a message on one and none on the other.
+    check("a loop carrying an invariant with a message and a variant",
+      "var i = 0\n    while i < 3\n        invariant i >= 0, \"never backwards\"\n" +
+        "        variant 3 - i\n        i += 1")
   }
 
   "the format refuses" - {

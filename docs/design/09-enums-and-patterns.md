@@ -246,6 +246,24 @@ The pattern forms the implementation accepts, each a decision this chapter ratif
 | Nested | `Wrap(Val(v))` | a variant whose payload itself matches a sub-pattern |
 | Struct, positional | `Point(a, b)` | a struct, binding every field by position |
 | Struct, named | `Point{x, y}`, `Point{x: a}` | a struct, binding fields by name; unlisted fields are unconstrained |
+| Named | `c @ Circle(r)` | what the sub-pattern matches, binding the **whole** value besides |
+
+**`n @ pat` — matching and naming at once (settled).** Destructuring leaves the arm with the parts
+and not the value, so an arm wanting both had to test the shape twice or give the destructuring up.
+The `@` form is both at once, and it is the spelling Scala, Rust, OCaml and Haskell all settled on.
+
+A binding is **not a test**, which is what keeps this a small rule rather than a second matching
+mechanism: a named arm covers what its sub-pattern covers, so exhaustiveness sees straight through
+it and every analysis that asks what a pattern *tests for* strips the name first. It nests, since
+what follows the `@` is an ordinary pattern; the name has to be one a program could declare, so a
+qualified name is refused for the reason the bare-name rule refuses one.
+
+**A name is bound once per pattern (settled).** Two arms may reuse a name — each arm is a scope —
+but a repeat *inside* one pattern is refused. `Point(v, v)` used to compile and quietly bind the
+second, which reads like a test that the two fields are equal and is not one; no pattern here
+compares two parts of a value, and a guard is what does. The rule is the same one Scala, Rust, OCaml
+and Haskell apply, and it is a property of the whole pattern rather than of a scope, since a pattern
+binds once however deeply it nests.
 
 **The bare-name rule (settled).** A bare identifier in pattern position is a **nullary-variant
 pattern** when it names a nullary variant of the scrutinee's enum, and a **binding** otherwise.
@@ -267,7 +285,7 @@ variant was the one form with nowhere to put a qualifier, since it is spelled li
 literals; but `Some(x) | none-arm` binding `x` is rejected, because the body cannot know which
 alternative matched and therefore cannot know a binding's origin. This is stricter than Rust
 (which permits `A(x) | B(x)` when every alternative binds the same names at the same types) and
-is worth revisiting once there is a motivating case (§ Open d); for now the rule is simple and
+is worth revisiting once there is a motivating case (§ Open c); for now the rule is simple and
 unambiguous: an arm with `|` binds nothing.
 
 **Literal patterns match any type with equality; range patterns need a contiguous order.** The
@@ -533,8 +551,13 @@ Recorded so they are not lost; each needs a decision before the relevant feature
 - **c. Bindings in `|`-alternatives.** Currently forbidden. Reconsider allowing `A(x) | B(x)`
   when every alternative binds the same names at the same types (the Rust rule), if a real case
   motivates it.
-- **d. `@` bindings.** Binding the whole value while also destructuring it (`p @ Circle(r)`) is
-  not implemented; decide whether it earns its place.
+- ~~**d. `@` bindings.**~~ **Closed: built**, and §6 has the rule. It earned its place on the case
+  the question could not see from here — an arm that destructures has the parts and not the value,
+  so handing the value on meant testing its shape a second time inside the body. What settled the
+  *spelling* was elsewhere: annotations moved to `@` (`attributes.md`), and the two forms turn out
+  not to compete, an annotation's being a prefix above a declaration and this one infix inside a
+  pattern. Building it also found an older bug — a name bound twice in one pattern silently bound
+  the second — which §6 now refuses.
 - **e. Unreachable-arm and redundant-pattern lints.** An arm made unreachable by an earlier
   catch-all, or a literal already covered by an earlier arm, is currently accepted silently; a
   lint would catch dead arms.

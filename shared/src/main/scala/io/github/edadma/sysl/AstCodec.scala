@@ -46,8 +46,16 @@ object AstCodec {
   /** The format's version, stamped into the header and checked on the way back in. Bump it whenever
    * the shape of any node changes, so an artifact from an older compiler is rejected rather than
    * read as something it is not.
+   *
+   * **Two branches bumping to the same number is the one way this check can be defeated**, and it
+   * has happened once: a post-test loop and a function attribute were built in parallel, each moved
+   * 15 to 16 against a tree the other had not touched, and the merge kept one 16 standing for a
+   * format neither branch alone could read. An artifact stamped by either would have passed the
+   * check and then been decoded as something it was not. The merge takes the next number for that
+   * reason — the value has to be later than every version any compiler has ever stamped, not merely
+   * later than the one this branch started from.
    */
-  val Version: Int = 15
+  val Version: Int = 20
 
   private val Magic = "sysl-ast"
 
@@ -160,6 +168,22 @@ object AstCodec {
     // that was written, and a field left out silently is how that stops being true.
     private def testAttr(a: TestAttr): Unit = { pos(a); opt(a.display)(sref); bool(a.shouldTrap); opt(a.expected)(sref) }
 
+    private def asmArm(a: AsmArm): Unit = {
+      pos(a); list(a.archs)(sref)
+
+      a.body match
+        case AsmUnavailable(r)      => tok("0"); sref(r)
+        case AsmCode(ls, ops, clbs) => tok("1"); list(ls)(sref); list(ops)(asmOperand); list(clbs)(sref)
+    }
+
+    private def asmOperand(o: AsmOperand): Unit = {
+      pos(o)
+      o.dir match
+        case AsmDir.In  => tok("0")
+        case AsmDir.Out => tok("1")
+      sref(o.name); opt(o.reg)(sref)
+    }
+
     private def recv(r: RecvMode): Unit = r match
       case RecvMode.ByValue   => tok("0")
       case RecvMode.ByPtr     => tok("1")
@@ -222,6 +246,7 @@ object AstCodec {
       case VariantPattern(n, as)  => tok("pvar"); sref(n); list(as)(pattern)
       case StructPattern(n, fs)   => tok("pstr"); sref(n); list(fs) { (f, sub) => sref(f); pattern(sub) }
       case TuplePattern(as)       => tok("ptup"); list(as)(pattern)
+      case BindPattern(n, inner)  => tok("pat"); sref(n); pattern(inner)
 
     // --------------------------------------------------------- expressions
 
@@ -261,11 +286,13 @@ object AstCodec {
         case IsPattern(s, ps, neg)   => tok("is"); expr(s); list(ps)(pattern); bool(neg)
         case ResultList(vs)          => tok("rl"); list(vs)(expr)
         case While(l, c, b, e2)      => tok("whl"); opt(l)(sref); expr(c); list(b)(stmt); opt(e2)(x => list(x)(stmt))
+        case DoWhile(l, b, c, e2)    => tok("dwl"); opt(l)(sref); list(b)(stmt); expr(c); opt(e2)(x => list(x)(stmt))
         case Loop(l, b)              => tok("lop"); opt(l)(sref); list(b)(stmt)
         case For(l, n, it, b, e2)    => tok("for"); opt(l)(sref); sref(n); expr(it); list(b)(stmt); opt(e2)(x => list(x)(stmt))
         case CFor(l, i, c, s, b, e2) =>
           tok("cfor"); opt(l)(sref); opt(i)(stmt); opt(c)(expr); opt(s)(stmt); list(b)(stmt)
           opt(e2)(x => list(x)(stmt))
+        case Quantifier(u, n, it, p) => tok("qnt"); bool(u); sref(n); expr(it); expr(p)
     }
 
     // ---------------------------------------------------------- statements
@@ -287,13 +314,16 @@ object AstCodec {
         case Break(l, v)                  => tok("brk"); opt(l)(sref); opt(v)(expr)
         case Continue(l)                  => tok("cnt"); opt(l)(sref)
         case Defer(s)                     => tok("dfr"); stmt(s)
+        case AsmStmt(arms)                => tok("asm"); list(arms)(asmArm)
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
+        case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
+        case Variant(e)                   => tok("vnt"); expr(e)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv, tr, pu, gh) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); opt(t)(testAttr)
-          opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) })
+          opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) }); bool(tr); bool(pu); bool(gh)
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -533,6 +563,24 @@ object AstCodec {
 
     private def testAttr(): TestAttr = at(TestAttr(opt(sref()), bool(), opt(sref())))
 
+    private def asmArm(): AsmArm = at {
+      val archs = list(sref())
+
+      AsmArm(archs, tok() match
+        case "0"   => AsmUnavailable(sref())
+        case "1"   => AsmCode(list(sref()), list(asmOperand()), list(sref()))
+        case other => fail(s"'$other' is not an assembly arm"))
+    }
+
+    private def asmOperand(): AsmOperand = at {
+      val dir = tok() match
+        case "0"   => AsmDir.In
+        case "1"   => AsmDir.Out
+        case other => fail(s"'$other' is not an assembly operand direction")
+
+      AsmOperand(dir, sref(), opt(sref()))
+    }
+
     private def recv(): RecvMode = tok() match
       case "0"   => RecvMode.ByValue
       case "1"   => RecvMode.ByPtr
@@ -580,6 +628,7 @@ object AstCodec {
       case "pvar" => VariantPattern(sref(), list(pattern()))
       case "pstr" => StructPattern(sref(), list { val f = sref(); (f, pattern()) })
       case "ptup" => TuplePattern(list(pattern()))
+      case "pat"  => BindPattern(sref(), pattern())
       case other  => fail(s"'$other' is not a pattern tag")
 
     // --------------------------------------------------------- expressions
@@ -619,9 +668,11 @@ object AstCodec {
         case "is"   => IsPattern(expr(), list(pattern()), bool())
         case "rl"   => ResultList(list(expr()))
         case "whl"  => While(opt(sref()), expr(), list(stmt()), opt(list(stmt())))
+        case "dwl"  => DoWhile(opt(sref()), list(stmt()), expr(), opt(list(stmt())))
         case "lop"  => Loop(opt(sref()), list(stmt()))
         case "for"  => For(opt(sref()), sref(), expr(), list(stmt()), opt(list(stmt())))
         case "cfor" => CFor(opt(sref()), opt(stmt()), opt(expr()), opt(stmt()), list(stmt()), opt(list(stmt())))
+        case "qnt"  => Quantifier(bool(), sref(), expr(), expr())
         case other  => fail(s"'$other' is not an expression tag")
     }
 
@@ -642,12 +693,15 @@ object AstCodec {
         case "brk"  => Break(opt(sref()), opt(expr()))
         case "cnt"  => Continue(opt(sref()))
         case "dfr"  => Defer(stmt())
+        case "asm"  => AsmStmt(list(asmArm()))
         case "req"  => Require(expr(), opt(sref()))
         case "ens"  => Ensure(expr(), opt(sref()))
+        case "inv"  => Invariant(expr(), opt(sref()))
+        case "vnt"  => Variant(expr())
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
             bounds(), bool(), vis(), tdefaults(), opt(testAttr()),
-            opt(at(CallConv(sref(), opt(sref())))))
+            opt(at(CallConv(sref(), opt(sref())))), bool(), bool(), bool())
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "extv" =>

@@ -267,6 +267,11 @@ private class Escape(program: TProgram) {
       // those do — a `break` of a frame-backed slice out of the loop is the same escape route as
       // returning one.
       case w: TWhile            => loopViews(w.body, w.elseBlock)
+      case d: TDoWhile          => loopViews(d.body, d.elseBlock)
+      // `loop` and the three-clause `for` are the same escape route as the four beside them: what
+      // their `break`s carry is the loop's value. `loop` has no `else` to add to it.
+      case l: TLoop             => loopViews(l.body, None)
+      case c: TCFor             => loopViews(c.body, c.elseBlock)
       case f: TFor              => loopViews(f.body, f.elseBlock)
       case e: TForEach          => loopViews(e.body, e.elseBlock)
       case i: TIterate          => loopViews(i.body, i.elseBlock)
@@ -466,7 +471,7 @@ private class Escape(program: TProgram) {
       w.sites.toList.map((name, pos, how) =>
         Diagnostic.render(
           s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
-            "and this module declared 'no alloc', so there is nothing to move it into. Keep the view " +
+            "and this module declared '@no_alloc', so there is nothing to move it into. Keep the view " +
             "inside the frame, or take the storage from a caller as a '[]T' parameter, which is " +
             "already wherever its owner put it",
           pos,

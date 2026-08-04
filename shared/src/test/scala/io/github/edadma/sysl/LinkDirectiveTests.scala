@@ -31,40 +31,40 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
   "the directive is read in the file's header" - {
 
     "beside a module header" in {
-      linksOf("thing/a.sysl" -> "module thing\nlink \"z\"\n\nextern zlibVersion() -> *u8\n",
+      linksOf("thing/a.sysl" -> "module thing\n@link(\"z\")\n\nextern zlibVersion() -> *u8\n",
         "main.sysl" -> "print(1)") should contain("z")
     }
 
     "a file with no module header may name one, since the root module is a module" in {
-      linksIn("link \"z\"\n\nextern zlibVersion() -> *u8\n\nprint(1)\n") should contain("z")
+      linksIn("@link(\"z\")\n\nextern zlibVersion() -> *u8\n\nprint(1)\n") should contain("z")
     }
 
     // The two headers are about different things — what the module may do, and what its externs
     // need — so demanding one group before the other would be a rule with nothing behind it.
     "interleaved with capability clauses, in whatever order they were written" in {
-      val src = "module thing\nrequires os\nlink \"z\"\nno alloc\nlink \"png\"\n\nf() -> int = 1\n"
+      val src = "module thing\n@requires(os)\n@link(\"z\")\n@no_alloc\n@link(\"png\")\n\nf() -> int = 1\n"
 
       linksOf("thing/a.sysl" -> src, "main.sysl" -> "print(thing.f())")
         .filterNot(fromTheLibrary.contains) shouldBe List("z", "png")
     }
 
     "several on their own lines, each naming one library" in {
-      linksIn("link \"png\"\nlink \"z\"\n\nprint(1)\n")
+      linksIn("@link(\"png\")\n@link(\"z\")\n\nprint(1)\n")
         .filterNot(fromTheLibrary.contains) shouldBe List("png", "z")
     }
 
     "and one written below the statements says where it belongs" in {
-      val e = err("f() -> int = 1\nlink \"z\"\n")
+      val e = err("f() -> int = 1\n@link(\"z\")\n")
 
       e should include("belongs in the file's header")
       e should include("directly after 'module'")
       e shouldNot include("newline expected")
     }
 
-    // Each clause takes a line, exactly as a capability does, so that `module m no alloc link "z"`
-    // is never a line anyone has to read.
+    // Each attribute takes a line, exactly as a capability's does, so that
+    // `module m @no_alloc @link("z")` is never a line anyone has to read.
     "one on the header's own line is refused" in {
-      err("module m link \"z\"\n\nf() -> int = 1\n") should include("belongs in the file's header")
+      err("module m @link(\"z\")\n\nf() -> int = 1\n") should include("belongs in the file's header")
     }
   }
 
@@ -73,7 +73,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
   // library is named differently on different platforms often enough (`ws2_32` for the sockets that
   // are in libc elsewhere) that a binding needs to be able to say so.
   "a directive can be gated on the target, like any other line" - {
-    val src = "#if macos\nlink \"framework-ish\"\n#endif\n\nprint(1)\n"
+    val src = "#if macos\n@link(\"framework-ish\")\n#endif\n\nprint(1)\n"
 
     def linksFor(target: Target): List[String] =
       Compiler.compiled(List(Source("t.sysl", src)), target) match
@@ -120,24 +120,24 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
   "a directive that names no library is refused" - {
 
     "the empty name" in {
-      err("link \"\"\n\nprint(1)\n") should include("names a library")
+      err("@link(\"\")\n\nprint(1)\n") should include("names a library")
     }
 
     // A name is pasted onto a `-l`, so one beginning with a dash would arrive at the linker as a
     // flag this compiler never meant to pass.
     "a linker flag written where the library goes" in {
-      val e = err("link \"-lz\"\n\nprint(1)\n")
+      val e = err("@link(\"-lz\")\n\nprint(1)\n")
 
       e should include("begins with a dash")
       e should include("names the library itself")
     }
 
     "two libraries in one directive" in {
-      err("link \"png z\"\n\nprint(1)\n") should include("holds a space")
+      err("@link(\"png z\")\n\nprint(1)\n") should include("holds a space")
     }
 
     "and asking one file for the same library twice, which links it once" in {
-      err("link \"z\"\nlink \"z\"\n\nprint(1)\n") should include("already linked by this file")
+      err("@link(\"z\")\n@link(\"z\")\n\nprint(1)\n") should include("already linked by this file")
     }
   }
 
@@ -148,14 +148,14 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
   "the files of a module need not agree, unlike a capability" - {
 
     "one file may name a library the others do not" in {
-      linksOf("thing/a.sysl" -> "module thing\nlink \"z\"\n\nextern zlibVersion() -> *u8\n",
+      linksOf("thing/a.sysl" -> "module thing\n@link(\"z\")\n\nextern zlibVersion() -> *u8\n",
         "thing/b.sysl" -> "module thing\n\ng() -> int = 2\n",
         "main.sysl" -> "print(thing.g())") should contain("z")
     }
 
     "and two files naming the same one ask for it once" in {
-      linksOf("thing/a.sysl" -> "module thing\nlink \"z\"\n\nf() -> int = 1\n",
-        "thing/b.sysl" -> "module thing\nlink \"z\"\n\ng() -> int = 2\n",
+      linksOf("thing/a.sysl" -> "module thing\n@link(\"z\")\n\nf() -> int = 1\n",
+        "thing/b.sysl" -> "module thing\n@link(\"z\")\n\ng() -> int = 2\n",
         "main.sysl" -> "print(thing.g())").count(_ == "z") shouldBe 1
     }
   }
@@ -176,7 +176,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
     // A program's own directive and the library's both arrive, since an `extern` in a program is as
     // much a binding as one in a library.
     "a program's own directive arrives beside the library's" in {
-      val links = linksIn("link \"z\"\n\nextern zlibVersion() -> *u8\n\nprint(1)\n")
+      val links = linksIn("@link(\"z\")\n\nextern zlibVersion() -> *u8\n\nprint(1)\n")
 
       links should contain("z")
       links should contain("m")
@@ -185,7 +185,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
     // A test build is a different compilation from a program build rather than a variant of it, so
     // it collects its own — and a `sysl test` that linked without libm would fail on ELF only.
     "a test build asks for the same libraries a program build does" in {
-      Compiler.compileTests(files("t.sysl" -> "link \"z\"\n\n#test\nt() = ()\n"), Nil) match
+      Compiler.compileTests(files("t.sysl" -> "@link(\"z\")\n\n@test\nt() = ()\n"), Nil) match
         case Right((built, _)) =>
           built.links should contain("z")
           built.links should contain("m")
@@ -199,7 +199,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
   "the flag reaches the linker, not just the command list" in {
     assume(Toolchain.clangAvailable, "clang not available")
 
-    val built = Compiler.compiled(files("t.sysl" -> "link \"sysl-no-such-library\"\n\nprint(1)\n")) match
+    val built = Compiler.compiled(files("t.sysl" -> "@link(\"sysl-no-such-library\")\n\nprint(1)\n")) match
       case Right(c) => c
       case Left(e)  => fail(s"did not compile:\n$e")
 
@@ -219,7 +219,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
     // Without this a binding works from source and stops working the moment it ships, which is the
     // worst shape the bug could take: the build that breaks is one nobody here ran.
     "the clause is carried by the codec, with its position" in {
-      val parsed = SyslParser.parse("module thing\nlink \"z\"\n\nf() -> int = 1\n", "a.sysl") match
+      val parsed = SyslParser.parse("module thing\n@link(\"z\")\n\nf() -> int = 1\n", "a.sysl") match
         case Right(p)  => p
         case Left(err) => fail(err)
 
@@ -235,7 +235,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
     // through the container a consumer actually reads, and not only through the encoding inside it.
     "a real artifact carries it to the program that links against it" in {
       val lib = List(Source("demo/net.sysl",
-        "module demo\nlink \"z\"\n\nzipped(n: int) -> int = n + 1\n", List("demo")))
+        "module demo\n@link(\"z\")\n\nzipped(n: int) -> int = n + 1\n", List("demo")))
 
       val meta = LibraryArtifact.build(lib) match
         case Right((_, m)) => m
@@ -251,7 +251,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
     }
 
     "and a library decoded from one still asks for it" in {
-      val lib = SyslParser.parse("module thing\nlink \"z\"\n\nf() -> int = 1\n", "a.sysl") match
+      val lib = SyslParser.parse("module thing\n@link(\"z\")\n\nf() -> int = 1\n", "a.sysl") match
         case Right(p)  => p
         case Left(err) => fail(err)
 

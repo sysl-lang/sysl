@@ -97,7 +97,6 @@ trait Hoisting extends HoistMembers {
       // was asked about a trait's member, a type's, or a type's field.
       for m <- t.methods do recordMemberAccess(key, m.name, Visibility.Public, s"${t.name}.${m.name}")
       if libraryOffers(t, currentModule) then libraryNames(t.name) = key
-      checkBoundNames(t.name, t.bounds)
       for m <- t.methods do
         // A property carries its receiver without writing one, so the reading below — no receiver
         // and a body, which for a method means a default with nothing to work on — is not what a
@@ -253,7 +252,7 @@ trait Hoisting extends HoistMembers {
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkBoundNames(f.name, f.bounds)
       checkSolvedDefaults("the function", f.name, f.tdefaults)
-      // A `#test` is registered here with everything else a declaration says about itself, so that
+      // A `@test` is registered here with everything else a declaration says about itself, so that
       // the runner's list is in declaration order without anything having to sort it afterwards.
       // The checks run at the attribute, which is the part a diagnostic is about (`Tests`).
       for a <- f.test do
@@ -377,6 +376,12 @@ trait Hoisting extends HoistMembers {
   protected def checkTraitSupers(): Unit =
     for (key, decl) <- traitDecls do
       currentPos = decl.pos
+      // A bound on the trait's own parameter is held to naming a trait here rather than where the
+      // trait was registered, and for the reason every other declaration form's bounds are: the
+      // trait it names may be declared below it, or in a file the walk had not reached yet, and
+      // being registered is what this pass waits for. Its own recovery region, so a bound that names
+      // nothing does not carry off the requirement check below it.
+      inScope(declScope(key))(recover(())(checkBoundNames(qn(key), decl.bounds)))
       inScope(declScope(key))(recover(()) {
         val declares = mutable.LinkedHashMap.empty[String, String]
         val visited  = mutable.LinkedHashMap(key -> Type.Bound(key, Nil))
@@ -389,7 +394,10 @@ trait Hoisting extends HoistMembers {
         // colliding with themselves.
         def walk(name: String, path: List[String]): Unit =
           for tr <- traitDecls.get(name); s <- tr.supers do
-            at(s.pos) {
+            // A requirement is read in the terms of the trait that **wrote** it, not of the one the
+            // walk started at: the chain may run through any number of modules, and which trait a
+            // short name reaches is what the requiring trait's own file imported.
+            inScope(declScope(name))(at(s.pos) {
               traitKey(s.name) match
                 case None => err(s"trait '${qn(name)}' requires '${s.name}', which is not a trait")
                 case Some(skey) =>
@@ -422,7 +430,7 @@ trait Hoisting extends HoistMembers {
                               s"members become the implementing type's — so '${qn(key)}' cannot require both")
                           declares(m.name) = qn(skey)
                         walk(skey, skey :: path)
-            }
+            })
 
         walk(key, List(key))
       })

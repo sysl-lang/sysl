@@ -147,10 +147,6 @@ object Reachability {
       case e: TEntry =>
         calls += e.func
         e.argsFn.foreach(calls += _)
-      // Standard output holds no state, so there is no value the library could have declared for it
-      // and its table is laid out by codegen rather than analyzed. The one function in that table is
-      // therefore named here, where nothing in the tree names it.
-      case _: TStdout => calls += Library.key("putbytes")
       case s: TVSlot  => calls += s.target
       case r: TRender =>
         r.slot match

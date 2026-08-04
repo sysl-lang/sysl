@@ -1,12 +1,12 @@
 ---
 title: Guide Programs
-summary: Thirteen real programs written to force a language decision — what each one owns, and what writing it found.
+summary: Fourteen real programs written to force a language decision — what each one owns, and what writing it found.
 weight: 50
 ---
 
 The [tour](/tour/) teaches the language, the [reference](/reference/) says what the rules are, and
 the [library](/library/) says what ships beside them. This section is about something else: the
-thirteen programs in [`guide/`](https://github.com/edadma/sysl/tree/dev/guide) that were written to
+fourteen programs in [`guide/`](https://github.com/edadma/sysl/tree/dev/guide) that were written to
 **force a language decision**.
 
 They are not demonstrations of a finished language. That distinction is the whole of why they exist,
@@ -31,7 +31,7 @@ own file records what it found in the place the code that provoked it lives, whi
 somebody reading the program and useless for somebody wondering **why the language is shaped this
 way**. These pages pull each finding out and link it to the rule it produced.
 
-## The thirteen, and the axis each owns
+## The fourteen, and the axis each owns
 
 In the order they were written, which matters — a finding must be discharged before the next program
 starts, so each one is written on top of what the last one settled.
@@ -42,7 +42,7 @@ starts, so each one is written on top of what the last one settled.
 | [hashmap](/guides/hashmap/) | the trait system under load — bounds, what they promise, and ownership at once |
 | [bytecode](/guides/bytecode/) | the module system, and the set's one end-to-end assertion |
 | [png](/guides/png/) | the byte level — endianness, bit streams, checksums, somebody else's format |
-| [fft](/guides/fft/) | arithmetic on a type the program defined, and floating point |
+| [fft](/guides/fft/) | an algorithm checked against its own definition |
 | [sha2](/guides/sha2/) | generic arithmetic — one algorithm at two widths — and static tables |
 | [shapes](/guides/shapes/) | dynamic dispatch — a collection whose element types are forgotten |
 | [scheduler](/guides/scheduler/) | OS shapes — a run queue, blocking and waking, `&T` graphs mutated through references |
@@ -51,6 +51,7 @@ starts, so each one is written on top of what the last one settled.
 | [matrix](/guides/matrix/) | an operator whose result is neither operand's type |
 | [ring](/guides/ring/) | the constrained-subtype surface — ranges, `::` attributes, contracts, invariants |
 | [slab](/guides/slab/) | raw storage — reinterpreting bytes, `sizeof`/`alignof`, an intrusive free list |
+| [lisp](/guides/lisp/) | the reference cycle — the shape a count cannot reclaim, and `weak T` as the instrument that measures it |
 
 **Two pairs are written to be compared**, and the comparison is the measurement:
 [scheduler](/guides/scheduler/) against [kernel](/guides/kernel/) is what reference counting was
@@ -80,7 +81,7 @@ A violated `require`, a broken `invariant` and a failed range check all
 run would look truncated rather than failed. A run therefore asserts a refusal only through a
 **total** operation that answers instead of trapping.
 
-The traps are asserted separately, in [`#test(should_trap)`](/reference/attributes/) functions that
+The traps are asserted separately, in [`@test(should_trap)`](/reference/attributes/) functions that
 live in the program's own directory. Each runs in a process of its own and passes by not coming
 back, so a trap is an observation there rather than the end of the run — which is what lets a refusal
 be stated in sysl, beside the code it is about. `guide/ring` was the first to need this.

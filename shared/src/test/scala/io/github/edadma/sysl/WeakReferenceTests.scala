@@ -120,6 +120,21 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
         "a weak reference does not keep Node alive, and nothing else here holds this one")
     }
 
+    /** The advice that message gives has to be **writable**, which is the whole of what advice is.
+     * `weak T` already means a weak edge to a counted `T`, so someone who wrote the `&` as well has
+     * written the mode twice — and telling them to hold it in a `&&Node` would be sending them to a
+     * spelling the parser does not take. The reply is what they meant instead.
+     */
+    "a doubled mode is told what it already means, not sent to a spelling that does not parse" in {
+      val out = err(node + "var r: &Node = Node(1)\nvar w: weak &Node = r")
+
+      out should include("'weak Node' is already a weak edge to a counted Node")
+      out should not include "'&&Node'"
+
+      // The parser is why: the advice that used to be given cannot be typed.
+      err(node + "var r: &&Node = Node(1)") should include("newline expected")
+    }
+
     "'null' is not the empty weak reference, and the message says what is" in {
       err(node + "var w: weak Node = null") should include(
         "'null' is a raw pointer, and an empty weak Node is written 'None'")
@@ -253,6 +268,39 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
                    |    i += 1
                    |print("ok")
                    |""".stripMargin) shouldBe "ok\n"
+    }
+
+    // The other half of that pair, and the half a program can *use*: with the back-edge strong the
+    // objects are unreachable and still alive, and a weak reference is the only thing that can say
+    // so. sysl has no user-facing destructor to hang a live-object count on (`03`'s open list), so
+    // this is what makes a leak an observation rather than a suspicion — `guide/lisp` counts an
+    // interpreter's environments with nothing else.
+    //
+    // The chain is what makes the cycle mean something. Both build two objects the same way and drop
+    // every reference from outside; only the back-edge differs, so a `weak` that answered `true` for
+    // both would be reporting on nothing.
+    "and stands, observably, when it is not — which is how a leak is counted at all" in {
+      run(node + """    next: Option[&Node]
+                   |cycle() -> weak Node
+                   |    var a: &Node = Node(1, None)
+                   |    var b: &Node = Node(2, None)
+                   |    a.next = Some(b)
+                   |    b.next = Some(a)
+                   |    var w: weak Node = a
+                   |    w
+                   |end cycle
+                   |chain() -> weak Node
+                   |    var a: &Node = Node(1, None)
+                   |    var b: &Node = Node(2, None)
+                   |    a.next = Some(b)
+                   |    var w: weak Node = a
+                   |    w
+                   |end chain
+                   |var leaked: weak Node = cycle()
+                   |var freed: weak Node = chain()
+                   |print(leaked.get().is_some(), freed.get().is_none())
+                   |print(leaked.get().unwrap().value)
+                   |""".stripMargin) shouldBe "true true\n1\n"
     }
   }
 

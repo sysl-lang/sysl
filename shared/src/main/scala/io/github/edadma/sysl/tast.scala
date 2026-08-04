@@ -287,22 +287,13 @@ case class TConstView(arg: TExpr) extends TExpr { def ty: Type = Type.constView(
  */
 case class TFormat(arg: TExpr, spec: String) extends TExpr { def ty: Type = Type.Str }
 
-/** Standard output as a `*Writer` — the sink a value renders itself into when `print` is given one
- * that is not a built-in (`14 §6`).
- *
- * It carries no state at all, and that is why it is a node rather than a value the library could
- * have declared: a writer over standard output has nothing to keep, and there is no struct with no
- * fields for it to be one of. Its data word is therefore null, and the `write` in its table is the
- * library's own `putbytes` — so the one function a freestanding target replaces is still that one.
- */
-case class TStdout() extends TExpr { def ty: Type = Type.Ptr(Type.Trait(Library.key("Writer"))) }
-
 /** `str(x)` and an `f"…"` hole on a value that renders itself: `method` is the `display` its type
  * reaches, and it writes into a growable buffer whose bytes this yields as a fresh `string`.
  *
- * That buffer is the second sink the compiler provides, for the sibling of `TStdout`'s reason — a
- * growable byte buffer is not something sysl can express yet (`07`, *Not yet*), so the library
- * could no more declare this writer than the other one.
+ * That buffer is the one sink the compiler still provides. Standard output is no longer one of them:
+ * a fieldless struct with an `impl Writer` says the whole of what that sink is, and the library
+ * declares it. What keeps this one here is the *buffer*, whose growth and handover are written by
+ * hand in `WriterEmitter`.
  *
  * `slot` is set where the value is a **trait object** whose trait requires `Display`: the renderer is
  * then a word read out of the object's own table rather than a function named here, and `method`
@@ -499,6 +490,15 @@ case class TWildPattern(ty: Type) extends TPattern
 /** A binding: matches anything and stores the value in a fresh local. */
 case class TBindPattern(name: String, ty: Type) extends TPattern
 
+/** `n @ pat` — whatever `inner` matches, with the **whole** value bound to `name` besides.
+ *
+ * The type is the inner pattern's, since both are tests of the same value. Everything that reads a
+ * pattern reads this one by reading `inner` and adding the binding: the test is the inner test, the
+ * exhaustiveness is the inner coverage, and the refutability is the inner refutability — a binding
+ * never rules anything in or out, which is exactly why the wrapper can be transparent.
+ */
+case class TAtPattern(name: String, inner: TPattern) extends TPattern { def ty: Type = inner.ty }
+
 /** A scalar literal: matches a value equal to it. */
 case class TLitPattern(value: TExpr) extends TPattern { def ty: Type = value.ty }
 
@@ -530,6 +530,23 @@ sealed trait TStmt
 
 case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
+
+/** A loop's `invariant`, at the head of its body (`17 §3`) — a condition that traps on false, which
+ * is what every other clause in `16` already is. It carries no machinery of its own for that reason.
+ */
+case class TInvariant(cond: TExpr, msg: Option[String]) extends TStmt
+
+/** A loop's `variant`, at the head of its body (`17 §3`): the measure is evaluated, compared against
+ * the previous iteration's, and stored.
+ *
+ * `slot` names the pair of allocas the enclosing `TCheckedLoop` set up — `%<slot>.prev` holding the
+ * last value and `%<slot>.armed` saying whether there has been one. The armed flag is what makes the
+ * first iteration pass with nothing to compare against, and it is stored **at loop entry** rather
+ * than in the function's prologue, which is the whole reason this statement cannot stand alone: a
+ * loop inside another loop is entered many times, and a flag armed once per call would compare the
+ * second entry's first measure against the first entry's last.
+ */
+case class TVariantCheck(slot: String, varTy: Type, expr: TExpr) extends TStmt
 
 /** `ref name = place` (`03 § ref`) — a name bound to the storage `place` found, rather than to a
  * copy of what was in it.
@@ -578,6 +595,12 @@ case class TMultiAssign(writes: List[TWrite]) extends TStmt
  */
 case class TWhile(cond: List[TCondTerm], body: List[TStmt], elseBlock: Option[TBlock], ty: Type) extends TExpr
 
+/** `do body while cond [else …]` — `TWhile`'s shape entered at the body instead of at the test, so
+ * the body runs once before `cond` is asked. `continue` targets the test, which is what the `loop` +
+ * `if !cond then break` rewrite cannot say.
+ */
+case class TDoWhile(body: List[TStmt], cond: TExpr, elseBlock: Option[TBlock], ty: Type) extends TExpr
+
 /** `loop body` — the same shape with the condition removed, so the only way out is a `break`.
  * `ty` is the type its `break`s meet at, and `never` where it has none: nothing arrives after a
  * loop that cannot end.
@@ -595,6 +618,27 @@ case class TFor(name: String, varTy: Type, lo: TExpr, hi: TExpr, inclusive: Bool
  */
 case class TCFor(init: List[TStmt], cond: Option[TExpr], step: List[TStmt], body: List[TStmt],
                  elseBlock: Option[TBlock], ty: Type) extends TExpr
+
+/** `for all name in lo..hi do pred` / `for some …` — a quantifier over an integer range (`17 §2`),
+ * which is an **expression** yielding a `bool` and not a loop: it carries no `break`, no `else`, and
+ * no label, so its type is settled rather than met.
+ *
+ * The bounds share `TFor`'s shape because they are the same range. What differs is the body: a
+ * single `TExpr` rather than a statement list, since a predicate is a condition and not a block.
+ */
+case class TQuantifier(universal: Boolean, name: String, varTy: Type, lo: TExpr, hi: TExpr,
+                       inclusive: Boolean, pred: TExpr) extends TExpr { def ty: Type = Type.Bool }
+
+/** A loop whose body carries a `variant`, wrapped so the measure's slots are set up **once per
+ * entry** to the loop rather than once per call to the function (`17 §3`).
+ *
+ * It wraps rather than adding a field to each of the seven loop nodes, and what it holds is only
+ * what has to happen outside the body: the two allocas and the store that disarms the comparison.
+ * The check itself is a `TVariantCheck` among the body's statements, where it was written.
+ *
+ * A loop with only `invariant` clauses is not wrapped — those need nothing outside the body.
+ */
+case class TCheckedLoop(slot: String, varTy: Type, loop: TExpr) extends TExpr { def ty: Type = loop.ty }
 
 /** `for name in seq [else …]` over an array or a slice. The loop variable is a *copy* of each
  * element, and the sequence is evaluated once.
@@ -630,6 +674,25 @@ case class TContinue(depth: Int)                    extends TStmt
  */
 case class TDefer(stmts: List[TStmt]) extends TStmt
 
+/** The one assembly arm that answered for the processor being built for (`inline-assembly.md`).
+ *
+ * The other arms are gone by the time this exists — an architecture is chosen once, in the
+ * analyzer, so nothing downstream carries a branch that was never going to be taken. The
+ * instructions are text nothing here reads; the operands are the whole of what the compiler knows
+ * about the block, and they are what the constraint string is built from.
+ */
+case class TAsm(lines: List[String], operands: List[TAsmOperand], clobbers: List[String]) extends TStmt
+
+/** An operand bound to the local it names.
+ *
+ * `name` is what the template says, and `slot` is the local's unique name — the storage an `in` is
+ * loaded from and an `out` is stored to. Both are kept because they are two different jobs: the
+ * template is the text a person wrote, and the slot is where the value lives after a scope has
+ * renamed it. `reg` is the machine register the operand must occupy, or `None` for any
+ * general-purpose one.
+ */
+case class TAsmOperand(dir: AsmDir, name: String, slot: String, ty: Type, reg: Option[String])
+
 /** A user function. Parameters carry their unique names (the codegen allocates a slot for
  * each so the body can read and mutate them uniformly). `requires`/`ensures` are the
  * design-by-contract clauses: each precondition is checked on entry, each postcondition before
@@ -650,6 +713,40 @@ case class TFunc(
     olds: List[TExpr] = Nil,
     internal: Boolean = false,
     conv: Option[CallConv] = None,
+    /** `@tailrec` was written above it: an assertion that its self-call is the last thing it does,
+     * and a demand to be told at the compile rather than at the stack overflow when an edit stops
+     * that being true (`12 § Tail calls`). The jump itself does not wait on this — it applies
+     * wherever it applies — so what the flag reaches is `TailCalls.check` and nothing in codegen.
+     */
+    tailrec: Boolean = false,
+    /** The `variant` its contract block declared: an integer measure over the **parameters** that
+     * must strictly decrease at every direct recursive call (`17 §4`).
+     *
+     * That it reads only parameters is what makes the check local, and it is what this field is
+     * enough for on its own. At a self-call the emitter has both the current parameter values and
+     * the argument values about to replace them, so it evaluates this expression twice — once as it
+     * stands, once with the arguments stored into the parameters' own slots — and needs neither a
+     * substitution pass nor a hidden argument travelling with the call.
+     */
+    variant: Option[TExpr] = None,
+    /** `@pure` was written above it: an assertion that a caller can observe nothing about this call
+     * but its result (`17 §6`).
+     *
+     * It is checked rather than believed, and what it excludes is written out in `Purity`. It is not
+     * inferred: a function is pure because it says so, which is what keeps an edit to a leaf from
+     * breaking a caller three levels up with no annotation anywhere naming the promise it broke.
+     */
+    pure: Boolean = false,
+    /** `@ghost` was written above it: the function exists for the specification and is erased before
+     * codegen (`17 §8`).
+     *
+     * Its body is ordinary code and may read real state freely — that is the whole point of an
+     * `is_sorted` — and what the mark buys is the pair of rules that make erasing it sound: nothing
+     * executable may call it, and a clause that does is a clause that does not run. So a loop
+     * invariant costing O(n) inside an O(n) loop costs nothing at all, without a switch that would
+     * give one program two meanings.
+     */
+    ghost: Boolean = false,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones
@@ -705,7 +802,7 @@ case class TVal(symbol: String, ty: Type, init: TExpr, computed: Boolean)
  */
 case class TEntry(func: String, argsFn: Option[String])
 
-/** One `#test` function, as the runner needs it (`testing.md`).
+/** One `@test` function, as the runner needs it (`testing.md`).
  *
  * `func` is the key the function is filed under, which is what makes it reachable and what the
  * dispatcher matches an argument against. Everything else is for the report: what to call the test,
@@ -765,7 +862,7 @@ case class TProgram(
      * key; these have no key, so the answer is carried here.
      */
     mainModule: String = Modules.root,
-    /** The `#test` functions the sources declared, in the order they were written (`testing.md`).
+    /** The `@test` functions the sources declared, in the order they were written (`testing.md`).
      *
      * They are carried on the program rather than looked up from `funcs` because what a test *is* —
      * its reported name, what it expects — lives in the attribute, and the typed function is the

@@ -1,0 +1,66 @@
+// Counting what a run left behind, out of nothing but weak references.
+//
+// sysl has no user-facing destructor — `03`'s open list still has one as a want — so a program
+// cannot be told when an object dies. It can *ask*, though, and that is enough: a `weak T` does not
+// hold its referent alive, so a buffer of one witness per environment created is a live-object
+// counter with no runtime support behind it and no effect on what it is counting.
+//
+// The interpreter is a local of each function here, so it and everything it owns are released before
+// the witnesses are read. That release is the measurement. What still answers afterwards is what the
+// run could not get back.
+
+import sysl.buf.{Buf, buf}
+
+// One witness per environment the run created, read after the interpreter is gone.
+after_run(src: string, owning: bool) -> &Buf[weak Env]
+    var ws: &Buf[weak Env] = buf()
+    var i: &Interp = interp(owning, ws)
+
+    finish(i, src)
+
+    ws
+end after_run
+
+// The same count taken while the interpreter is still standing — the peak rather than the residue.
+during_run(src: string, owning: bool) -> int
+    var ws: &Buf[weak Env] = buf()
+    var i: &Interp = interp(owning, ws)
+
+    finish(i, src)
+
+    alive(ws)
+end during_run
+
+// How many environments a set of witnesses still finds.
+alive(ws: &Buf[weak Env]) -> int
+    var n = 0
+    var k = 0usize
+
+    while k < ws.len()
+        var w = ws.at(k)
+
+        if w.get().is_some() then n += 1
+        k += 1usize
+
+    n
+end alive
+
+// How many there ever were. The pair of numbers is what makes either one mean something.
+made(ws: &Buf[weak Env]) -> int = int(ws.len())
+
+// What a program evaluated to, with a malformed text reported rather than trapped — reading is the
+// one failure here that comes from outside the program, so it is the one that answers.
+answer(src: string, owning: bool) -> string
+    var ws: &Buf[weak Env] = buf()
+    var i: &Interp = interp(owning, ws)
+
+    run(i, src) match
+        Ok(s) -> s
+        Err(e) -> s"error: ${describe(e)}"
+end answer
+
+private finish(i: &Interp, src: string)
+    run(i, src) match
+        Ok(_) -> return
+        Err(e) -> panic(describe(e))
+end finish

@@ -208,7 +208,7 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
     // `03 § defer` claims it allocates nothing and takes no count, which is what keeps it usable
     // under `no alloc`. Asserted at the capability, which is the surface that would refuse it.
     "nothing that 'no alloc' forbids" in {
-      run("""no alloc
+      run("""@no_alloc
             |
             |f() -> i32
             |    defer print("released")
@@ -461,11 +461,11 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
             |""".stripMargin) shouldBe "after the check\n1\n"
     }
 
-    // `#test` functions are ordinary bodies that `sysl test` calls, so a defer in one runs the same.
+    // `@test` functions are ordinary bodies that `sysl test` calls, so a defer in one runs the same.
     // The inner block is what makes it observable: a defer at the top of the test would run after
     // the assertion that would have to check it.
-    "a '#test' function's body is a block like any other" in {
-      verdicts("""#test
+    "a '@test' function's body is a block like any other" in {
+      verdicts("""@test
                  |t() =
                  |    var log = ""
                  |    if true

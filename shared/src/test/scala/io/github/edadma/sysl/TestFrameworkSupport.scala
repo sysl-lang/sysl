@@ -5,7 +5,7 @@ import io.github.edadma.cross_platform.*
 import org.scalatest.Assertions
 import org.scalatest.matchers.should.Matchers
 
-/** Shared helpers for the suites that exercise `#test` and `sysl test` (`testing.md`).
+/** Shared helpers for the suites that exercise `@test` and `sysl test` (`testing.md`).
  *
  * These drive the **same** three steps the CLI drives — compile as a test build, link, run one
  * process per test — through the same functions, so what a suite asserts about is what a user gets.
@@ -36,7 +36,7 @@ trait TestFrameworkSupport extends Matchers { this: Assertions =>
   }
 
   /** The verdict for each test, keyed by the name a report would show it under — which is what a
-   * reader of a failing suite has in their hand, and what `#test("…")` changes.
+   * reader of a failing suite has in their hand, and what `@test("…")` changes.
    */
   protected def verdicts(src: String): Map[String, Option[String]] =
     outcomes(src).map(o => o.test.display -> o.detail).toMap

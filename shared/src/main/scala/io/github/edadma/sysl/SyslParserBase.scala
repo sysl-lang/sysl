@@ -156,12 +156,18 @@ trait SyslParserBase extends PackratParsers {
    */
   protected def resultValue: PackratParser[Expr]
 
-  // The five expression forms that are written like statements. `expression` admits them directly,
+  // The six expression forms that are written like statements. `expression` admits them directly,
   // which is what makes `var x = if c then a else b` a binding rather than a special case.
 
   protected def ifExpr: PackratParser[Expr]
   protected def whileExpr: PackratParser[Expr]
+  protected def doWhileExpr: PackratParser[Expr]
   protected def loopExpr: PackratParser[Expr]
   protected def forExpr: PackratParser[Expr]
   protected def matchExpr: PackratParser[Expr]
+
+  /** `for all i in r do P` / `for some i in r do P` (`17 §2`), which is not one of the six above:
+   * it is written like an operand rather than like a statement, and it yields a `bool`.
+   */
+  protected def quantifier: PackratParser[Expr]
 }

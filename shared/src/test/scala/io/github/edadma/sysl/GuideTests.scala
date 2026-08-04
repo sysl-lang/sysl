@@ -1,5 +1,6 @@
 package io.github.edadma.sysl
 
+import org.scalatest.{ParallelTestExecution, Suite}
 import org.scalatest.freespec.AnyFreeSpec
 
 /** The guide programs, compiled from `guide/` and run (see `guide/README.md`).
@@ -15,7 +16,18 @@ import org.scalatest.freespec.AnyFreeSpec
  * file, where the code that produced them is not — and the round-trips in particular are only
  * legible next to the documents they are about.
  */
-class GuideTests extends AnyFreeSpec with GuideSupport {
+/** **Each guide is its own test, and they run at the same time.** A guide program is a real compile,
+ * link and run of a few hundred lines, and there are fourteen of them; sequentially that was the
+ * larger half of this suite's time with one std busy. Nothing is shared between them — each
+ * compiles from its own directory into its own temporary files — so the only thing that had made
+ * them sequential was the runner taking one test at a time.
+ */
+class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecution {
+
+  /** Only the JVM can supply this by reflection; on JS and Native it is abstract, so a suite that
+   * runs its tests in parallel has to say how one of itself is made.
+   */
+  override def newInstance: Suite & ParallelTestExecution = new GuideTests
 
   private def checks(out: String): Int = out.linesIterator.count(_.startsWith("ok"))
 
@@ -98,11 +110,11 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
     )
   }
 
-  // The one program in the set that defines what `+` and `*` mean and then leans on the answer a
-  // few hundred thousand times. Nothing it checks was computed by itself: the transforms of an
-  // impulse, a constant and a cosine are known in closed form, four bins can be done on paper, and
-  // the rest came out of numpy.
-  "fft — arithmetic on a type of the program's own, and floats" in {
+  // The one program in the set that carries the definition its fast version is a rearrangement of
+  // and runs both. Nothing it checks was computed by itself either: the transforms of an impulse, a
+  // constant and a cosine are known in closed form, four bins can be done on paper, and the rest
+  // came out of numpy.
+  "fft — an algorithm checked against its own definition" in {
     val out = guide("fft")
 
     out should not include "FAIL"
@@ -152,7 +164,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
     val out = guide("shapes")
 
     out should not include "FAIL"
-    checks(out) shouldBe 90
+    checks(out) shouldBe 92
     sections(out) shouldBe List(
       "-- each shape answers for itself",
       "-- one call site, many implementations",
@@ -259,7 +271,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
   // the same buffer, one keeping where the elements end and one computing it, driven through every
   // scenario side by side and required to agree. What this run cannot do is break a contract — a
   // violated `require` traps, so the program would end rather than report — and those claims are
-  // the `#test` functions the case below runs.
+  // the `@test` functions the case below runs.
   "ring — bounded indices, and an invariant that found a redundant field" in {
     val out = guide("ring")
 
@@ -282,7 +294,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
   // traps, and a trap ends the run rather than reporting into it. Each of these passes by not
   // coming back (`testing.md`). This was `RingClaimTests`, asserting the same claims from Scala
   // against cut-down copies of the ring's shapes; it is now stated in sysl against the shapes
-  // themselves, which is what `#test(should_trap)` bought.
+  // themselves, which is what `@test(should_trap)` bought.
   //
   // The count is asserted for the reason the check counts above are: a `should_trap` test that
   // stopped being compiled would look exactly like one that passed, since there would be no failing
@@ -329,5 +341,39 @@ class GuideTests extends AnyFreeSpec with GuideSupport {
       "-- a system big enough that the walk is the point",
       "-- sharing, and the copy that ends it",
     )
+  }
+
+  // The one program whose subject is what ARC *cannot* do. A closure has to see the environment it
+  // was written in and a recursive definition puts it back into that environment, so the cycle is
+  // the semantics rather than an artefact of the encoding — and the program is built twice over, once
+  // with that edge strong and once with it `weak`, to price both answers.
+  //
+  // The counts in the last three sections are the assertion that matters and they are exact: they
+  // come from a `Buf[weak Env]` holding one witness per environment ever made, read *after* the
+  // interpreter that owned them is gone. sysl has no user-facing destructor, so a weak reference
+  // being asked whether it still answers is the only live-object counter available — and it needs no
+  // runtime support and perturbs nothing it counts.
+  "lisp — the reference cycle, and a live-object count built out of weak references" in {
+    val out = guide("lisp")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 68
+    sections(out) shouldBe List(
+      "-- reading and writing",
+      "-- arithmetic, and the values it works on",
+      "-- lists",
+      "-- functions, and recursion",
+      "-- what the reader refuses",
+      "-- the cycle a reference count cannot reclaim",
+      "-- the same interpreter with the edge weakened",
+      "-- scale",
+    )
+  }
+
+  // The interpreter's refusals, which its own run cannot state for the same reason `ring`'s cannot.
+  // The split is itself a claim: a malformed *text* arrives from outside and answers with a
+  // `Result`, a malformed *program* is a bug in the thing being run and stops the way sysl stops.
+  "lisp — what the interpreter refuses, which its own run cannot assert" in {
+    guideTests("lisp") should have length 17
   }
 }

@@ -24,7 +24,8 @@ trait ExprParser extends SyslParserBase {
    * value they are written after. An operand with no `match` behind it is that operand, so this
    * alternative is also the ordinary fall-through to `assignment`.
    */
-  lazy val expression: PackratParser[Expr] = at(lambda | ifExpr | whileExpr | loopExpr | forExpr | matchExpr)
+  lazy val expression: PackratParser[Expr] =
+    at(lambda | quantifier | ifExpr | whileExpr | doWhileExpr | loopExpr | forExpr | matchExpr)
 
   /** `x -> x + 1` — a closure literal (`12 §5`).
    *

@@ -10,7 +10,7 @@ package io.github.edadma.sysl
  * The other thread here is that a block is an **expression**: it has a type, taken from its
  * trailing expression, or `never` where it ends in a jump and control does not arrive at all.
  */
-trait StmtAnalysis extends TypeResolution {
+trait StmtAnalysis extends TypeResolution with AsmAnalysis {
 
   /** A block whose trailing expression (if any) is its value — a function body or an if/match
    * branch. Statements share one lexical scope with the result expression.
@@ -88,10 +88,56 @@ trait StmtAnalysis extends TypeResolution {
   /** A statement sequence used only for its effects (a loop body): a fresh scope, no value. */
   protected def analyzeStmts(stmts: List[Stmt]): List[TStmt] = {
     pushScope()
-    val r = inBlock(stmts)(stmts.flatMap(recoverStmt))
+    val r = loopStmts(stmts)
     popScope()
     r
   }
+
+  /** A loop body: the `invariant` and `variant` clauses at its head (`17 §3`), then the rest.
+   *
+   * The clauses are analyzed **in the loop's own scope**, before anything the body declares, which
+   * is what lets one read the loop variable and stops one reading a local declared under it. The
+   * split is by position, exactly as a function's `require`/`ensure` block is split — a clause that
+   * reaches `recoverStmt` is therefore one written somewhere it may not be, and says so there.
+   */
+  protected def loopStmts(stmts: List[Stmt]): List[TStmt] = {
+    val (clauses, rest) = stmts.span { case _: Invariant | _: Variant => true; case _ => false }
+    val tclauses        = clauses.map(loopClause)
+    // The rest is analyzed BEFORE the variant is handed up, so a loop nested inside this one has
+    // already taken its own and put it back to `None`.
+    val slot            = pendingVariant
+    pendingVariant = None
+    val trest = inBlock(rest)(rest.flatMap(recoverStmt))
+
+    pendingVariant = slot
+    tclauses ::: trest
+  }
+
+  /** One `invariant` or `variant` at the head of a loop body. */
+  private def loopClause(c: Stmt): TStmt = at(c.pos) {
+    c match
+      case Invariant(cond, msg) => TInvariant(analyzeBool(cond), msg)
+      case Variant(e) =>
+        if pendingVariant.isDefined then
+          err("a loop declares one 'variant' — a measure is the thing that decreases, and two of " +
+            "them say nothing about which")
+        val te = analyzeExpr(e)
+        val ty = te.ty match
+          case i: Type.Integer => i
+          case other           => err(s"a 'variant' is an integer measure, not ${show(other)}")
+        variantSeq += 1
+        val slot = s"variant$variantSeq"
+
+        pendingVariant = Some((slot, ty))
+        TVariantCheck(slot, ty, te)
+      case _ => sys.error("unreachable loop clause")
+  }
+
+  /** Wraps a loop that declared a `variant` so its slots are set up once per entry (`17 §3`). */
+  protected def checkedLoop(ctx: LoopCtx, loop: TExpr): TExpr =
+    ctx.variant match
+      case Some((slot, ty)) => TCheckedLoop(slot, ty, loop)
+      case None             => loop
 
   /** Analyzes a loop body with a fresh loop context on the stack, so `break`/`continue` inside it
    * resolve to this loop and each `break` value is collected for the loop's result type. Returns
@@ -107,6 +153,8 @@ trait StmtAnalysis extends TypeResolution {
     loops = ctx :: loops
     val tb = body
     loops = loops.tail
+    ctx.variant = pendingVariant
+    pendingVariant = None
     (tb, ctx)
   }
 
@@ -355,6 +403,9 @@ trait StmtAnalysis extends TypeResolution {
    */
   private def patternNames(p: Pattern): List[String] = p match
     case IdentPattern(n)        => List(n)
+    // The outer name first, which is the order it is written in — so `v @ (v, w)` reports the
+    // second `v` as the repeat rather than the first.
+    case BindPattern(n, inner)  => n :: patternNames(inner)
     case TuplePattern(ps)       => ps.flatMap(patternNames)
     case StructPattern(_, fps)  => fps.flatMap((_, sub) => patternNames(sub))
     case WildcardPattern        => Nil
@@ -395,6 +446,12 @@ trait StmtAnalysis extends TypeResolution {
    */
   private def bindPattern(p: Pattern, subject: TExpr, mutable: Boolean): List[TStmt] = p match
     case WildcardPattern => Nil
+
+    // `var whole @ (a, b) = pair` — the value under its own name, and its parts under theirs. The
+    // subject is already the held temporary rather than the value expression, so naming it twice
+    // reads that temporary twice and runs nothing a second time.
+    case BindPattern(n, inner) =>
+      bindPattern(IdentPattern(n), subject, mutable) ++ bindPattern(inner, subject, mutable)
 
     case IdentPattern(n) =>
       List(TVarDecl(if mutable then declare(n, subject.ty) else declareReadOnly(n, subject.ty),
@@ -598,6 +655,10 @@ trait StmtAnalysis extends TypeResolution {
 
       List(TDefer(body))
 
+    // `asm` (`inline-assembly.md`). The arms are chosen between here, so what reaches the emitter is
+    // one architecture's instructions and no record that there were others.
+    case a: AsmStmt => List(analyzeAsm(a))
+
     // A constant is a declaration that was hoisted and folded into its uses (`13 §7`), so where the
     // walk meets one among the entry point's statements there is nothing left to run.
     case _: ConstDecl => List(TExprStmt(TUnitLit()))
@@ -621,5 +682,19 @@ trait StmtAnalysis extends TypeResolution {
     // that reach here sit after another statement or inside an inner block — both disallowed.
     case _: Require | _: Ensure =>
       err("'require'/'ensure' clauses must come before any other statement in a function body")
+
+    // Split off at the head of a loop body and at the head of a function's, so one reaching here was
+    // written after a statement or in a block that is neither. The two get different sentences
+    // because the mistakes are different: an `invariant` has one place and a `variant` has two.
+    case _: Invariant =>
+      err("an 'invariant' belongs at the head of a loop's body — it is a condition that holds on " +
+        "every entry to that body, and one written after some of the work has already been done " +
+        "is not that. A condition over a struct's fields is written in the struct, and one over a " +
+        "function's arguments is a 'require'")
+
+    case _: Variant =>
+      err("a 'variant' belongs at the head of a loop's body, where it is what decreases from one " +
+        "iteration to the next, or in a function's contract block, where it is what decreases at " +
+        "each recursive call")
 
 }

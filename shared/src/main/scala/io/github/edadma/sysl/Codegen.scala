@@ -25,13 +25,24 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
                        protected val target: Target)
     extends ExprEmitter {
 
+  /** The ghost functions of this program, which nothing emitted may name (`17 §8`). */
+  private val ghostFuncs: Set[String] = program.funcs.filter(_.ghost).map(_.name).toSet
+
+  /** Whether a clause is a proof obligation rather than something to lay down: it names a ghost
+   * function, which will not be there.
+   */
+  private def ghostly(x: Any): Boolean = ghostFuncs.nonEmpty && Ghost.mentions(x, ghostFuncs)
+
   // --- module --------------------------------------------------------------------------
 
   private def gen(): String = {
     // A function a library already compiled is declared, not defined: its body is in the object file
     // the library shipped, and emitting it again would be a duplicate symbol at the link.
     val (imported, own) = program.funcs.partition(f => program.precompiled(f.name))
-    val funcTexts       = own.map(genFunction)
+    // A `@ghost` function is not emitted at all (`17 §8`). Nothing executable may call one — that is
+    // checked in the analyzer — and the clauses that may are the ones skipped below, so there is no
+    // call left to resolve.
+    val funcTexts       = own.filterNot(_.ghost).map(genFunction)
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
     val mainText =
@@ -138,8 +149,10 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // sysl's convention and not C's — getting that wrong passes arguments the other way, which is a
     // corrupt run rather than a link error.
     for f <- imported do
-      val params = (Type.stored(f.params).map(_._2.llvm) ++ Option.when(f.variadic)("...")).mkString(", ")
-      out ++= s"declare ${f.retTy.llvm} @${symbolOf(f.name)}($params)\n"
+      val params =
+        (syslSret(f.retTy).toList ++ Type.stored(f.params).map(p => syslParam(p._2)) ++
+          Option.when(f.variadic)("...")).mkString(", ")
+      out ++= s"declare ${syslResult(f.retTy)} @${symbolOf(f.name)}($params)\n"
     if imported.nonEmpty then out ++= "\n"
 
     if boolStrs then
@@ -295,17 +308,47 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     promoted = promotions(Some(f.name))
     pushTemps()
     pushOwned()
-    ensures = f.ensures
+    ensures = f.ensures.filterNot((c, _) => ghostly(c))
+    selfName = f.name
+    selfParams = f.params
+    selfVariant = f.variant
 
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep,
     // so it takes no slot and the emitted signature below does not mention it.
     for (name, ty) <- f.params if !Type.zeroSized(ty) do
       emitAlloca(s"%$name.addr", ty.llvm)
-      emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
-      retainValue(ty, s"%$name.param")
+      // A large one arrived as an address, so the copy the callee makes for itself is a copy of
+      // bytes and the count it takes is taken at the slot rather than off a value it never had.
+      if Layout.indirect(ty) then
+        usesMemcpy = true
+        emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(ty)} %$name.addr, " +
+          s"ptr align ${Layout.align(ty)} %$name.param, i64 ${Layout.size(ty)}, i1 false)")
+        retainAt(ty, s"%$name.addr")
+      else
+        emit(s"store ${ty.llvm} %$name.param, ptr %$name.addr")
+        retainValue(ty, s"%$name.param")
       ownSlot(name, ty)
 
-    for (cond, _) <- f.requires do emitContract(cond, "require")
+    // Where the function calls itself as the last thing it does, that call is a jump to here rather
+    // than a second frame (`TailCalls`). The target sits *after* the parameter slots are written and
+    // *before* everything below, so a jump arrives where a fresh call would: the arguments are in the
+    // slots the body reads, and the preconditions and `old(e)` snapshots that follow belong to the
+    // invocation rather than to the frame, so they are taken again.
+    //
+    // The slots themselves are the entry block's and are not re-entered, which is what makes the jump
+    // free: `emitAlloca` hoists every one of them, including a block's, so going round again reuses
+    // the frame instead of growing it.
+    tailCalls = TailCalls.of(f)
+
+    if tailCalls.nonEmpty then
+      val l = freshLabel("tailrec")
+
+      tailParams = f.params
+      tailTarget = Some(l)
+      emitTerm(s"br label %$l")
+      emitLabel(l)
+
+    for (cond, _) <- f.requires if !ghostly(cond) do emitContract(cond, "require")
 
     // Each `old(e)` snapshots the entry value into a hidden owned slot, exactly as a `var` would,
     // so a postcondition can compare the returned state against the state on entry. The slot is
@@ -324,6 +367,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
     // already terminated the block and the `ret` emitted here is dropped.
     f.body.result match
+      case Some(r) if Layout.indirect(f.retTy) => genIndirectReturn(r)
       case Some(r) if !Type.noValue(f.retTy) =>
         val v = genExpr(r)
         retainValue(f.retTy, v)
@@ -334,12 +378,17 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
         genExpr(r); emitEnsures(None); releaseAll(); emitTerm("ret void")
       case None if Type.noValue(f.retTy) =>
         emitEnsures(None); releaseAll(); emitTerm("ret void")
+      case None if Layout.indirect(f.retTy) =>
+        emit(s"store ${f.retTy.llvm} zeroinitializer, ptr $sretParam")
+        releaseAll(); emitTerm("ret void")
       case None =>
         releaseAll(); emitTerm(s"ret ${f.retTy.llvm} ${zero(f.retTy)}")
 
     val stored   = Type.stored(f.params)
-    val declared = stored.map { case (name, ty) => s"${ty.llvm}${frameOf(f, ty, name)} %$name.param" }
-    val params   = (declared ++ Option.when(f.variadic)("...")).mkString(", ")
+    val declared = stored.map { case (name, ty) => s"${syslParam(ty)}${frameOf(f, ty, name)} %$name.param" }
+    val params   =
+      (syslSret(f.retTy).map(_ + s" $sretParam").toList ++ declared ++
+        Option.when(f.variadic)("...")).mkString(", ")
     // A file-private declaration has every caller in the module that defines it (`13 §2`), so its
     // symbol is `internal`: nothing outside may resolve it, and the linker is free to discard it
     // when nothing inside calls it either — which is what an exported helper in a library artifact
@@ -347,7 +396,27 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     val linkage = if f.internal then "internal " else ""
 
     finishFunction(
-      s"define $linkage${convention(f)}${f.retTy.llvm} @${symbolOf(f.name)}($params)${attribute(f)}")
+      s"define $linkage${convention(f)}${syslResult(f.retTy)} @${symbolOf(f.name)}($params)${attribute(f)}")
+  }
+
+  /** The `return` of a **large** result: it is written into the caller's storage rather than handed
+   * back in registers, so what would have been the returned value is built where it is going.
+   *
+   * A postcondition still gets the value it is written about. Reading it back out of the slot is a
+   * whole-aggregate load of the kind this lowering exists to avoid — but only on a function that
+   * *has* an `ensures`, and only once at each of its returns, which is a price a contract already
+   * announces it is willing to pay.
+   */
+  private def genIndirectReturn(r: TExpr): Unit = {
+    genOwnedInto(sretParam, r)
+
+    if ensures.nonEmpty then
+      val v = freshTemp(); emit(s"$v = load ${r.ty.llvm}, ptr $sretParam")
+      emitEnsures(Some(v))
+    else emitEnsures(None)
+
+    releaseAll()
+    emitTerm("ret void")
   }
 
   /** What a calling convention becomes on the `define` line for **this** machine (`15 §10`).
@@ -415,11 +484,11 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       emit(s"store ${ty.llvm} $v, ptr %$name.addr")
       ownBox(name, box, elem)
 
+    // The slot is laid down **before** the initializer runs, because a large one is written into it
+    // rather than handed to it: the callee of `val k = kernel()` needs somewhere to write.
     case TVarDecl(name, ty, init) =>
-      val v = genExpr(init)
       emitAlloca(s"%$name.addr", ty.llvm)
-      retainValue(ty, v)
-      emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+      genOwnedInto(s"%$name.addr", init)
       ownSlot(name, ty)
 
     // `ref name = place` (`03 § ref`). The walk to the place is made **once**, here, and its result
@@ -449,6 +518,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
 
     case TReturn(opt) =>
       opt match
+        case Some(t) if Layout.indirect(t.ty) => genIndirectReturn(t)
         case Some(t) =>
           val v = genExpr(t)
           retainValue(t.ty, v)
@@ -484,6 +554,76 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     case TDefer(stmts) =>
       deferStmts(stmts)
 
+    // `asm` (`inline-assembly.md`). One architecture's instructions arrived here; the arms that
+    // answered for the others were chosen between in the analyzer and are not represented.
+    case TAsm(lines, operands, clobbers) =>
+      if lines.nonEmpty then genAsm(lines, operands, clobbers)
+
+    // A loop's `invariant` (`17 §3`) is a condition that traps on false, which is every other clause
+    // in `16` — so it is the shared check and nothing more, unless it mentions ghost state, in which
+    // case it is a proof obligation and nothing runs (`17 §8`).
+    case TInvariant(cond, _) =>
+      if !ghostly(cond) then emitContract(cond, "invariant")
+
+    case v: TVariantCheck =>
+      if !ghostly(v.expr) then genVariantCheck(v)
+
+  /** Lowers the selected arm to LLVM's inline assembly.
+   *
+   * Every input is loaded before the call and every output stored after it, which is what makes an
+   * operand a *value* rather than a register the programmer had to find: LLVM is told what has to be
+   * where, and satisfying it is the allocator's problem. The template and the constraint string are
+   * built together from one list, because an operand's position in the second is the number its name
+   * becomes in the first, and the two disagreeing is exactly the failure this construct removes.
+   */
+  private def genAsm(lines: List[String], operands: List[TAsmOperand], clobbers: List[String]): Unit = {
+    val ins  = operands.filter(_.dir == AsmDir.In)
+    val outs = operands.filter(_.dir == AsmDir.Out)
+    val slot = Asm.numbering(operands)
+
+    val loaded = ins.map { o =>
+      val r = freshTemp()
+
+      emit(s"$r = load ${o.ty.llvm}, ptr %${o.slot}.addr")
+      s"${o.ty.llvm} $r"
+    }
+
+    asmSite += 1
+
+    val text = Asm.uniquifyLabels(lines, asmSite).map(Asm.render(_, slot.get)).mkString("\\0A")
+    val cons = Asm.constraints(operands, clobbers)
+    val args = loaded.mkString(", ")
+
+    // `sideeffect` says the block matters even where nothing reads its result, which is true of every
+    // assembly sysl can express: the instructions worth reaching for here are the ones whose whole
+    // purpose is what they do to the machine rather than what they hand back.
+    outs match
+      case Nil =>
+        emit(s"""call void asm sideeffect "$text", "$cons"($args)""")
+
+      case List(o) =>
+        val r = freshTemp()
+
+        emit(s"""$r = call ${o.ty.llvm} asm sideeffect "$text", "$cons"($args)""")
+        emit(s"store ${o.ty.llvm} $r, ptr %${o.slot}.addr")
+
+      // Several outputs come back as one anonymous structure, which is LLVM's shape rather than
+      // anything the language says — so it is taken apart here and never seen above this line.
+      case many =>
+        val r     = freshTemp()
+        val shape = many.map(_.ty.llvm).mkString("{ ", ", ", " }")
+
+        emit(s"""$r = call $shape asm sideeffect "$text", "$cons"($args)""")
+
+        for (o, i) <- many.zipWithIndex do
+          val part = freshTemp()
+
+          emit(s"$part = extractvalue $shape $r, $i")
+          emit(s"store ${o.ty.llvm} $part, ptr %${o.slot}.addr")
+  }
+
+  /** Counts the assembly blocks emitted in this module, so each one's labels can be its own. */
+  private var asmSite = 0
 }
 
 object Codegen {

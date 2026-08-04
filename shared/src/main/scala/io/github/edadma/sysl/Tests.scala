@@ -1,6 +1,6 @@
 package io.github.edadma.sysl
 
-/** The `#test` functions a program declares, and what separates a test build from every other one
+/** The `@test` functions a program declares, and what separates a test build from every other one
  * (`testing.md`).
  *
  * A test is an ordinary function with an attribute on it. That is the whole of the language part:
@@ -17,7 +17,7 @@ package io.github.edadma.sysl
  */
 object Tests {
 
-  /** The requirements a `#test` function meets, checked at the declaration.
+  /** The requirements a `@test` function meets, checked at the declaration.
    *
    * They say the same thing from different sides: **the runner must be able to call it with nothing
    * and learn the answer from whether it returned.** A parameter is something the runner has no value
@@ -28,16 +28,16 @@ object Tests {
    * one, so a function that could take a tail has taken a parameter and is refused by that.
    *
    * Each is reported where the attribute is rather than where the signature is, because the attribute
-   * is the part that is wrong: the function is a perfectly good function, and it is `#test` that made
+   * is the part that is wrong: the function is a perfectly good function, and it is `@test` that made
    * a promise about it that it cannot keep.
    */
   def problem(f: FuncDecl): Option[String] =
     if f.params.nonEmpty then
-      Some(s"a '#test' function takes no parameters, and '${Modules.bare(f.name)}' takes " +
+      Some(s"a '@test' function takes no parameters, and '${Modules.bare(f.name)}' takes " +
         (if f.params.length == 1 then "one" else s"${f.params.length}") +
         " — 'sysl test' calls it with nothing, so there is nowhere for an argument to come from")
     else if f.tparams.nonEmpty then
-      Some(s"a '#test' function has no type parameters, and '${Modules.bare(f.name)}' declares " +
+      Some(s"a '@test' function has no type parameters, and '${Modules.bare(f.name)}' declares " +
         s"'${f.tparams.mkString(", ")}' — a generic is compiled for the arguments a caller fixes, and " +
         "the runner supplies none")
     else None
@@ -53,7 +53,7 @@ object Tests {
    */
   def resultProblem(f: FuncDecl, retTy: Type): Option[String] =
     Option.when(!Type.noValue(retTy))(
-      s"a '#test' function returns nothing, and '${Modules.bare(f.name)}' returns " +
+      s"a '@test' function returns nothing, and '${Modules.bare(f.name)}' returns " +
         s"'${Type.show(retTy)}' — a test's result is whether it came back, so there is nothing to read a " +
         "value with")
 
@@ -61,7 +61,7 @@ object Tests {
    * where the attribute was written.
    *
    * The reported name defaults to the function's own **bare** name — the module is already the file
-   * the report groups under, so repeating it in every line would be noise. A `#test("…")` string
+   * the report groups under, so repeating it in every line would be noise. A `@test("…")` string
    * replaces it outright rather than decorating it, which is the point of writing one.
    */
   def describe(key: String, attr: TestAttr): TTest =

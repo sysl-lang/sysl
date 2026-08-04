@@ -1,0 +1,144 @@
+module sysl.time
+
+// Points on the timeline and lengths of it, which are the two quantities every other type here is
+// built out of.
+//
+// An **instant** is a point on the timeline, the same point for everybody. A **duration** is a
+// length of timeline with no place on it. The whole discipline of a date-time library is in keeping
+// those apart, because almost every operation is legal for one and nonsense for the other: two
+// instants may be compared and subtracted but never added, while a duration may be added to itself,
+// negated, and scaled.
+//
+// Both are counts of **microseconds**, which is the one representation choice worth arguing about. A
+// `long` of nanoseconds runs out in 1678–2262 — close enough to today to look fine in every test and
+// fail on a birth date. A `long` of microseconds reaches ±292,000 years. Nothing here needs to
+// resolve a nanosecond, and a range that quietly ends is a worse defect than a precision that never
+// begins.
+//
+// **What is not here is the zone**, and that is the module's boundary rather than an omission. A
+// wall clock reading becomes an instant only once somebody says where the wall is, and answering
+// that needs the IANA time zone database: a table that changes several times a year, which a
+// language's standard library either ships and lets go stale or reads from the host and thereby
+// needs a filesystem. Both are decisions with costs, and neither belongs in a module whose whole
+// claim is that it is arithmetic.
+
+const us_per_second: long = 1000000
+const us_per_minute: long = 60000000
+const us_per_hour: long = 3600000000
+const us_per_day: long = 86400000000
+
+// A point on the timeline, counted from 1970-01-01T00:00:00Z. It names no place and no calendar:
+// the same `Instant` is a different wall clock reading in every zone, which is the entire reason it
+// is a separate type from the civil ones.
+struct Instant
+    us: long
+end Instant
+
+// A length of timeline. It is **not** a number of days, because a day is not a fixed length of
+// timeline — a day that a zone's clocks move through is 23 or 25 hours long.
+struct Duration
+    us: long
+end Duration
+
+// How far a zone's wall clock is set from UTC, in whole minutes. Minutes rather than hours because
+// India is at +05:30 and Nepal at +05:45, and a library that assumes whole hours works everywhere
+// its author has lived.
+struct Offset
+    minutes: int
+end Offset
+
+seconds(n: long) -> Duration = Duration(n * us_per_second)
+minutes(n: long) -> Duration = Duration(n * us_per_minute)
+hours(n: long) -> Duration = Duration(n * us_per_hour)
+days(n: long) -> Duration = Duration(n * us_per_day)
+
+// An instant moved by a length of time. This is the **absolute** answer: it lands exactly that many
+// microseconds along the timeline whatever any calendar does in between.
+impl Add[Duration] for Instant
+    add(self, rhs: Duration) -> Instant = Instant(self.us + rhs.us)
+end Instant
+
+impl Sub[Duration] for Instant
+    sub(self, rhs: Duration) -> Instant = Instant(self.us - rhs.us)
+end Instant
+
+// The difference of two instants is a duration, and **it cannot be written `-`**. `Sub`'s method is
+// `sub(self, rhs: Rhs) -> Self`, so the result is fixed to the type on the left: an
+// `impl Sub[Instant] for Instant` may only produce another `Instant`, which is the one thing the
+// difference of two points on a timeline is not. The operator is available and the meaning is not,
+// so the most-asked-for operation in the library is a named function.
+since(later: Instant, earlier: Instant) -> Duration = Duration(later.us - earlier.us)
+
+impl Add for Duration
+    add(self, rhs: Duration) -> Duration = Duration(self.us + rhs.us)
+end Duration
+
+impl Sub for Duration
+    sub(self, rhs: Duration) -> Duration = Duration(self.us - rhs.us)
+end Duration
+
+impl Neg for Duration
+    neg(self) -> Duration = Duration(-self.us)
+end Duration
+
+// Scaling reads one way round only: `d * 2` is writable and `2 * d` is not, because an operator's
+// implementation is written for the type on its left and nothing may be written for `long`.
+impl Mul[long] for Duration
+    mul(self, rhs: long) -> Duration = Duration(self.us * rhs)
+end Duration
+
+impl Eq for Instant
+    eq(self, rhs: Instant) -> bool = self.us == rhs.us
+end Instant
+
+impl Ord for Instant
+    lt(self, rhs: Instant) -> bool = self.us < rhs.us
+end Instant
+
+impl Eq for Duration
+    eq(self, rhs: Duration) -> bool = self.us == rhs.us
+end Duration
+
+impl Ord for Duration
+    lt(self, rhs: Duration) -> bool = self.us < rhs.us
+end Duration
+
+impl Eq for Offset
+    eq(self, rhs: Offset) -> bool = self.minutes == rhs.minutes
+end Offset
+
+impl Ord for Offset
+    lt(self, rhs: Offset) -> bool = self.minutes < rhs.minutes
+end Offset
+
+// The parts a duration is read back in, each truncated toward zero. They are how a length of time is
+// stated to somebody who has to check it: "167 hours" is a sentence a reader can hold against a
+// calendar, and 601200000000 is not.
+whole_days(d: Duration) -> long = d.us / us_per_day
+whole_hours(d: Duration) -> long = d.us / us_per_hour
+whole_minutes(d: Duration) -> long = d.us / us_per_minute
+whole_seconds(d: Duration) -> long = d.us / us_per_second
+
+// …and the remainders, which are what the parts above leave. `odd_minutes` of three and a half hours
+// is thirty, not two hundred and ten.
+odd_hours(d: Duration) -> long = d.us % us_per_day / us_per_hour
+odd_minutes(d: Duration) -> long = d.us % us_per_hour / us_per_minute
+odd_seconds(d: Duration) -> long = d.us % us_per_minute / us_per_second
+odd_us(d: Duration) -> long = d.us % us_per_second
+
+// `+05:30`, the way an offset is written everywhere one is written down — a sign, then a width the
+// reader can rely on, which is what makes a rendered timestamp sortable as text. `Z` is UTC, and it
+// is a spelling rather than a special case: an offset of zero is written that way by ISO 8601 and
+// read back as zero by `offset_of` below.
+offset_text(o: Offset) -> string
+    if o.minutes == 0 then return "Z"
+
+    var sign = if o.minutes < 0 then "-" else "+"
+    var m = if o.minutes < 0 then -o.minutes else o.minutes
+
+    f"$sign%s${m / 60}%02d:${m % 60}%02d"
+end offset_text
+
+impl Display for Offset
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(offset_text(self), out, fmt)
+end Offset

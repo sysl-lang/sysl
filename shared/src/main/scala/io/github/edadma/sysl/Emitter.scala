@@ -120,6 +120,29 @@ trait Emitter {
                                ownedDepth: Int, tempDepth: Int)
   protected var genLoops: List[GenLoop] = Nil
 
+  /** Where a tail self-call jumps, and which calls are the ones that jump (`TailCalls`).
+   *
+   * `tailTarget` is the label sitting just after the parameter slots are written, so the jump lands
+   * where a fresh call would have landed: the preconditions are checked again and each `old(e)` is
+   * snapshotted again, because a tail call *is* a call and those belong to the invocation rather
+   * than to the frame. It is `None` in a function with no tail call, which is what keeps a label
+   * out of every other function in the module.
+   *
+   * `tailCalls` is compared by identity, since two calls written alike are equal case classes
+   * standing in different positions — only one of which the walk may have named.
+   */
+  protected var tailTarget: Option[String] = None
+  protected var tailCalls: List[TCall]     = Nil
+
+  /** The parameters a jump rebinds, in declaration order — every one of them, so that they line up
+   * with the arguments a call was written with. A zero-sized one has no slot to write and is
+   * skipped where the writing happens, not here.
+   */
+  protected var tailParams: List[(String, Type)] = Nil
+
+  /** Whether this call is the one the walk named, rather than merely equal to it. */
+  protected def isTailCall(c: TCall): Boolean = tailCalls.exists(_ eq c)
+
   /** Folding `and` / `or` over `i1`s, with the constant cases collapsed rather than emitted — a
    * pattern test that cannot fail contributes `"true"`, and ANDing that in would be an instruction
    * saying nothing. Both halves of codegen build conditions this way, so they live here.
@@ -140,6 +163,36 @@ trait Emitter {
     if a == "true" then "false"
     else { val r = freshTemp(); emit(s"$r = xor i1 $a, true"); r }
 
+  // --- how a sysl signature is spelled --------------------------------------------------
+  //
+  // Six places write down what a sysl function looks like to LLVM — its definition, a declaration
+  // of one linked in from a library, a call, the whole function type a variadic call has to name,
+  // a method table's adapter, and the `ret` itself. They agree because they all ask here.
+
+  /** The out-pointer a **large** result comes back through, in front of every declared parameter.
+   *
+   * A result that fits in registers is returned as itself, as it always was. One that does not is
+   * written straight into storage the caller supplies, so it is never a first-class LLVM value at
+   * either end — which is the whole of what `Layout.indirect` buys. It is the same `sret` the
+   * foreign boundary has always used (`ForeignEmitter`), asked for the same reason on a call that
+   * happens to have this compiler on both sides.
+   */
+  protected def syslSret(retTy: Type): Option[String] =
+    Option.when(Layout.indirect(retTy))(s"ptr noalias sret(${retTy.llvm}) align ${Layout.align(retTy)}")
+
+  /** What a sysl `define`, `declare` and `call` name as the result type. */
+  protected def syslResult(retTy: Type): String =
+    if Type.noValue(retTy) || Layout.indirect(retTy) then "void" else retTy.llvm
+
+  /** How a parameter is declared. A **large** one arrives as the address of storage the caller
+   * holds; the callee makes its own copy at entry, which is the copy it always made — the only
+   * difference is that the value crosses the boundary in memory rather than in registers.
+   */
+  protected def syslParam(ty: Type): String = if Layout.indirect(ty) then "ptr" else ty.llvm
+
+  /** The name the out-pointer takes inside a function that has one. */
+  protected val sretParam = "%sret.out"
+
   // --- hooks provided by the Codegen class ---------------------------------------------
   //
   // The recursive entry points live in the class that walks the tree; the emitting traits call
@@ -147,6 +200,16 @@ trait Emitter {
 
   /** Lowers an expression, returning the register or immediate holding its value. */
   protected def genExpr(expr: TExpr): String
+
+  /** Lowers an expression into the storage at `dest`, leaving the destination owning what lands
+   * there — a count taken for every reference inside (`ExprEmitter`).
+   */
+  protected def genOwnedInto(dest: String, e: TExpr): Unit
+
+  /** The same, taking no counts: what lands at `dest` is borrowed, exactly as the register
+   * `genExpr` hands back is (`ExprEmitter`).
+   */
+  protected def genBorrowedInto(dest: String, e: TExpr): Unit
 
   /** Lowers one statement for its effects. */
   protected def genStmt(stmt: TStmt): Unit
@@ -175,6 +238,9 @@ trait Emitter {
     owned = Nil
     deferrals = Nil
     genLoops = Nil
+    tailTarget = None
+    tailCalls = Nil
+    tailParams = Nil
     scratch = mutable.HashMap.empty
     promoted = Set.empty
     promotedBoxes = mutable.HashMap.empty
@@ -284,6 +350,11 @@ trait Emitter {
   protected def inFunction(header: String)(gen: => Unit): String = {
     val saved =
       (prologue, body, temp, label, terminated, tempStack, owned, scratch, promoted, promotedBoxes, deferrals)
+    // A helper is emitted in the middle of whatever asked for it, and the asking function may be one
+    // with a jump in it — so what says where that jump goes is put back too. Without this the helper's
+    // reset would leave the interrupted function with no target and its remaining tail calls would be
+    // emitted as ordinary ones, which is a miscompile only a body long enough to need a helper shows.
+    val savedTail = (tailTarget, tailCalls, tailParams)
 
     startFunction()
     gen
@@ -292,6 +363,7 @@ trait Emitter {
     prologue = saved._1; body = saved._2; temp = saved._3; label = saved._4
     terminated = saved._5; tempStack = saved._6; owned = saved._7; scratch = saved._8
     promoted = saved._9; promotedBoxes = saved._10; deferrals = saved._11
+    tailTarget = savedTail._1; tailCalls = savedTail._2; tailParams = savedTail._3
     text
   }
 

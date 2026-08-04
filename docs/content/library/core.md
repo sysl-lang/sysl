@@ -30,8 +30,8 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | area | names | where it is written up |
 |---|---|---|
 | absence and failure | `Option`, `Result`, `Fallible` | [errors and contracts](/reference/errors/) |
-| stopping | `panic`, `assert`, `exit` | below, and [attributes](/reference/attributes/) for `#test` |
-| rendering to standard output | `print`-family: `prints`, `printi`, `printu`, `printr`, `printb`, `printc`, `putbytes` | below |
+| stopping | `panic`, `assert`, `exit` | below, and [attributes](/reference/attributes/) for `@test` |
+| rendering to standard output | `print`-family: `prints`, `printi`, `printu`, `printr`, `printb`, `printc`, `putbytes`; the sink itself, `Stdout` and `stdout` | below |
 | rendering to a sink | `Display`, `FormatSpec`, `Writer`, the `display_*` family | below |
 | hashing | `Hash`, `hash_u64`, `hash_u128`, `hash_bool`, `hash_str` | below |
 | operators | `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Neg`, `Not`, `Eq`, `Ord` | [expressions](/reference/expressions/) |
@@ -210,6 +210,42 @@ separate mechanism — it is this same rendering aimed at a buffer.
 
 **The sink is `*Writer`, a trait object.** So a rendering is written once against any sink, and a
 kernel that has a UART and no standard output supplies one with an ordinary `impl`.
+
+Standard output itself is one of those ordinary impls, and the library declares it — `Stdout`, a
+struct with no fields, because a destination fixed at compile time keeps nothing. `stdout()` hands
+one out, and it is what `print` writes a value's own rendering into:
+
+```sysl
+struct Marked
+    n: int
+
+impl Display for Marked
+    display(self, out: *Writer, fmt: FormatSpec)
+        display_str("<", out, fmt)
+        display_int(long(self.n), out, fmt)
+        display_str(">", out, fmt)
+
+show(where: *Writer, m: Marked)
+    m.display(where, FormatSpec(0, -1, false))
+    where.write("\n".bytes)
+
+var mine = Stdout()
+
+show(stdout(), Marked(1))
+show(&mine, Marked(2))
+
+print(Marked(3))
+```
+
+```output
+<1>
+<2>
+<3>
+```
+
+That the destination is a **value** rather than a fixed global is what lets `show` take it as a
+parameter. Nothing above is privileged: a program pointing `show` at a UART writes another
+`impl Writer` and passes that instead.
 
 **`Writer` requires `Fallible`** rather than declaring a `failed` of its own, because
 [`Reader`](/library/io/) needs the same question answered and an open file is both. Two traits may
@@ -520,6 +556,35 @@ for x in c do print(x)
 is untouched by the walk. That matters for a cursor meaning to report something *after* the walk — a
 reader's failure latch, say — which is why such a cursor has to borrow what it reports on rather than
 own it. [`sysl.io`](/library/io/)'s `lines()` is built that way for exactly this reason.
+
+**A `for` also walks an erased cursor**, since `next` takes `*self` and mentions no `Self` elsewhere
+— so `Iterate` has an object, and the loop calls its member through the table. The element type is
+whatever the object was erased to, which is why there is nothing to annotate:
+
+```sysl
+struct Countdown
+    n: int
+
+impl Iterate[int] for Countdown
+    next(*self) -> Option[int]
+        if self.n <= 0 then return None
+        self.n -= 1
+        Some(self.n + 1)
+
+var it: &Iterate[int] = Countdown(3)
+
+for x in it do print(x)
+```
+
+```output
+3
+2
+1
+```
+
+That is the same rule that lets a trait object satisfy a bound — a `for` asks what may be *called* on
+the value, and a table is an answer to that. It means a function may hand back a cursor without
+saying which one it built.
 
 ## Calling a value
 

@@ -238,12 +238,12 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       // What replaced a `lazy val` when the library became a per-target question. Parsing the whole
       // standard module is on the path of every compilation with no artifact to read instead, so a
       // memo that missed would be a real cost and not only an inelegance.
-      Core.embedded(macos) should be theSameInstanceAs Core.embedded(macos)
+      Stdlib.fromSource(macos) should be theSameInstanceAs Stdlib.fromSource(macos)
       Std.parsed(linux) should be theSameInstanceAs Std.parsed(linux)
     }
 
     "two targets get two" in {
-      Core.embedded(macos) should not be theSameInstanceAs(Core.embedded(linux))
+      Stdlib.fromSource(macos) should not be theSameInstanceAs(Stdlib.fromSource(linux))
     }
 
     "every target in the registry parses at all" in {
@@ -447,10 +447,10 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       out should not include "never closed"
     }
 
-    "a declaration's '#test' attribute at the margin is untouched" in {
+    "a declaration's '@test' attribute at the margin is untouched" in {
       // `#` opens an attribute too (`testing.md`), and this pass has no business with one. The words
       // are what tell them apart, and `test` is not one of them.
-      ir("""#test
+      ir("""@test
            |proves_nothing()
            |    1
            |
@@ -468,7 +468,7 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
   "a file with no directives in it" - {
 
     "comes back as the very same Source, not a copy" in {
-      // A `Source` compares by identity (`Diagnostics`), and `Core.owns` is that identity — so a
+      // A `Source` compares by identity (`Diagnostics`), and `Stdlib.owns` is that identity — so a
       // compilation that gated nothing has to be the compilation it was before any of this existed.
       val src = Source("<input>", "print(1)\n")
 
@@ -556,11 +556,11 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       irFor(linux, src.stripMargin) should include("1")
     }
 
-    "a gated '#test' is a test the other target does not run" in {
+    "a gated '@test' is a test the other target does not run" in {
       // The attribute and the directive both start with `#` and are read by different things, so a
       // file holding both is worth pinning.
       val src = """#if macos
-                  |#test
+                  |@test
                   |only_here()
                   |    1
                   |#endif
@@ -622,15 +622,15 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
     }
   }
 
-  "a '#test' is gated like any other declaration" in {
+  "a '@test' is gated like any other declaration" in {
     // `#` opens both an attribute and a directive, and this is the one place the two meet in earnest:
     // the test build has to discover the tests the target actually has.
-    discovered("""#test
+    discovered("""@test
                  |everywhere()
                  |    1
                  |
                  |#if windows
-                 |#test
+                 |@test
                  |only_on_windows()
                  |    1
                  |#endif

@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** `sysl test` — builds the `#test` functions of a source tree and runs them (`testing.md`).
+/** `sysl test` — builds the `@test` functions of a source tree and runs them (`testing.md`).
  *
  * **One build, one process per test.** The whole tree is compiled once, into a binary whose entry
  * point takes a test's name and runs that test alone (`Codegen.genTestMain`); the runner then starts
@@ -14,7 +14,7 @@ import io.github.edadma.cross_platform.*
  * **The verdict is the exit status, and nothing else.** A test passes by returning. That is the whole
  * protocol, and it is what lets a test assert with the language it is testing rather than with a
  * framework: a broken `require`, a bounds violation, an `unwrap` of `None` — each ends the process,
- * and none of them needed to know it was running under a test. `#test(should_trap)` inverts the
+ * and none of them needed to know it was running under a test. `@test(should_trap)` inverts the
  * reading for a test whose subject *is* the check.
  */
 object TestRunner {
@@ -42,11 +42,11 @@ object TestRunner {
    * to be unrunnable.
    */
   def run(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
-          precompiled: Set[String], core: Core, archives: List[String]): Int = {
+          precompiled: Set[String], std: Stdlib, archives: List[String]): Int = {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
-    val (built, tests) = Compiler.compileTests(sources, libraries, target, precompiled, Some(core)) match
+    val (built, tests) = Compiler.compileTests(sources, libraries, target, precompiled, Some(std)) match
       case Left(err)     => return report(err)
       case Right(result) => result
 
@@ -57,7 +57,7 @@ object TestRunner {
     // none of the tests there are lead to the same empty report and are different mistakes, so each
     // is named. Neither is a failure: a program is allowed to have no tests.
     if tests.isEmpty then
-      Console.err.println(s"no '#test' functions in ${cfg.file}")
+      Console.err.println(s"no '@test' functions in ${cfg.file}")
       return 0
 
     if selected.isEmpty then
@@ -67,11 +67,11 @@ object TestRunner {
     val exe = createTempFile("sysl-test-", "")
 
     Toolchain.build(built.ir, exe, target, archives, cfg.optimize, built.links) match
-      case Left(err) => discard(exe); fail(err)
+      case Left(err) => Project.discard(exe); fail(err)
       case Right(_) =>
         val outcomes = execute(exe, selected, opts)
 
-        discard(exe)
+        Project.discard(exe)
         stdout(rendered(outcomes, tests.length - selected.length))
         if outcomes.forall(_.passed) then 0 else 1
   }
@@ -155,10 +155,6 @@ object TestRunner {
     out ++= s"\n${outcomes.length - failed} passed, $failed failed — ${total}ms\n"
     out.toString
   }
-
-  private def discard(path: String): Unit =
-    try deleteFile(path)
-    catch case _: Exception => ()
 
   private def fail(msg: String): Int = {
     Console.err.println(s"sysl: error: $msg")

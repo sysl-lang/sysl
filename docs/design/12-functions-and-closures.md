@@ -2,7 +2,8 @@
 
 **Status:** the top-level function surface is written against the implementation that already
 exists — keyword-less declarations, expression and block bodies, `return`, forward reference,
-recursion, and `extern` including its variadic `...` — and ratifies it. **Closures and the nested
+recursion including the tail-call rule of §3a, and `extern` including its variadic `...` — and
+ratifies it. **Closures and the nested
 functions of §5a are built too**, so every section here describes something that exists; the rest of
 the docs lean on them — `05-escape-analysis.md` heap-boxes an escaping closure, and
 `capabilities.md` gates escaping closures behind `alloc` and inlines the non-escaping ones. Where a
@@ -322,7 +323,7 @@ same kind of promise, made in the same place, and read by the same callers.
 - **A closure takes none.** An arrow's parameters are matched through the `Fn` trait (§6), which
   carries types and no names; there is nothing at that call to read a default out of, which is the
   same absence that stops a closure being called by name.
-- **A `#test` function takes none, because it takes no parameters at all** (`testing.md`). A default
+- **A `@test` function takes none, because it takes no parameters at all** (`testing.md`). A default
   looks as though it should rescue that — every parameter would have a value, so the runner's call
   could be written with none — and it does not, because that call is *emitted* rather than analyzed.
   Nothing fills a default there, and a signature the runner cannot satisfy is refused whether or not
@@ -394,6 +395,95 @@ is wanted. A block ending in a jump has type `never` (`00 §11`), so `var h = if
 return -1` type-checks as an `int`: the branch that leaves contributes no type of its own, and the
 one that arrives decides. The distinction is worth keeping straight — the jump has no type, the
 block containing it does.
+
+## 3a. Tail calls — a self-call that reuses the frame
+
+**A function whose last act is a call to itself does not open a second frame.** The call becomes a
+branch back to the function's own entry, so the recursion runs at any depth the arithmetic reaches
+rather than at whatever depth the stack holds:
+
+```
+count(n: int, acc: int) -> int =
+    if n == 0 then acc else count(n - 1, acc + 1)   // a jump, not a call
+
+print(count(1000000, 0))
+```
+
+This is **automatic and unconditional** where it applies. There is nothing to write, and §10's
+objection to unfashionable absences applies here too: a systems language whose natural recursive
+shape overflows at ten thousand elements is one that has to be worked around, and the workaround is
+always the same loop the compiler can write itself.
+
+**What is in tail position.** The last thing the function does, reached through the forms that end
+it: the body's trailing expression, the operand of a `return`, and — recursively — the arms of the
+`if` and `match` those reach through. Nothing may wait on the result. `n + count(n - 1)` is not a
+tail call, because the addition happens after the call comes back; that is a different function and
+turning it into this one is a rewrite the compiler does not attempt.
+
+**A tail call is a call, and the jump lands where a call would.** It arrives after the parameters
+are bound and *before* the preconditions, so:
+
+- **every `require` is checked again**, on the arguments the jump just wrote. A recursion that
+  violates its own precondition at depth four traps at depth four, exactly as it would have with
+  four frames. A jump that skipped the check would be an optimization that quietly stopped
+  enforcing a contract, and there is no version of that trade worth taking.
+- **every `old(e)` is snapshotted again**, because `old` names the state on entry to *this*
+  invocation, and the jump is an invocation.
+
+**The order the arguments move in is the order a `return` already uses.** Each is computed while the
+frame is still whole — it may well read the very parameters about to be overwritten — and takes its
+own count there; only then does the frame let go of everything, and only then do the new values
+land. `flip(b, a)` is the case that pins it: written the other way round, the first argument's
+landing would free the string the second one was about to read.
+
+**Two things end a tail position rather than being optimized around it.**
+
+- **A `defer` in scope.** It runs on the way *out* of the scope, which for an ordinary call is after
+  the callee has returned and for a jump would be before the callee is even entered. A `defer`
+  closing something the recursive call still reads through can tell the difference, so the call
+  stays a call and the frames stay.
+- **An `ensures` on the function.** A postcondition is checked when a call **returns**, and a tail
+  call never returns — the frame that would have checked it is the frame being replaced. Optimizing
+  anyway would leave only the last invocation's `ensures` running, so a contract violated at every
+  depth but the last would go unreported. Between a guarantee and a speed, `16` decides for the
+  guarantee.
+
+Both are refusals to *transform*, not refusals to compile: the function is compiled as it was
+written, which is what it did before this section existed.
+
+**What this is not.** It is self-recursion only. Mutual recursion — `even` ending in a call to
+`odd` — is a tail call in the same sense and is **not** optimized, and the reason is sysl's own
+calling convention rather than a gap in the walk: a large argument crosses as the address of the
+caller's storage (`15`), and a frame that is being replaced cannot be the frame an argument still
+points into. Making those tail calls work needs the convention to change, so it is not a matter of
+recognizing more shapes. Calls through a `Fn` or a `*extern` are out for the same reason and one
+more: nothing at the call knows the callee is the caller.
+
+**"Not optimized" is a statement about sysl, and it is not a prediction about the stack.** The
+back end is free to do what sysl declined to, and at the default `-O1` it does: LLVM's sibling-call
+pass turns `even`/`odd` into jumps, and ten million of them return an answer. The same source built
+`--optimize 0` dies of a stack overflow. Both are correct — sysl promised nothing either way — but
+the difference decides whether a program needs a trampoline, so it is worth saying which claim is
+being made. **A mutual recursion whose depth is bounded by its input needs the trampoline**, because
+the thing that made it work is a pass, not a guarantee, and the first argument too large for a
+register takes it away again. `guide/lisp` carries the loop inside `eval` for exactly this reason:
+eval-and-apply is the mutual kind, and a Lisp cannot make its tail calls proper by hoping for one.
+
+**`@tailrec` asserts it, and buys the refusal.** The attribute changes nothing about what is
+emitted — the jump applies written or not — so what it is for is the compile that tells you the
+jump has gone:
+
+```
+@tailrec
+count(n: int, acc: int) -> int =
+    if n == 0 then acc else n + count(n - 1, acc)   // refused: something waits on the result
+```
+
+A function recursing deeply enough to care is one whose author needs to hear about an edit that cost
+it the jump, and needs to hear it at the compile rather than at the stack overflow six months later.
+It is optional because the optimization is not: marking every such function would be ceremony for a
+guarantee the language already gives, and the attribute is for the ones where losing it silently
+would be a bug.
 
 ## 4. Declaration order does not matter
 
@@ -796,6 +886,13 @@ position can afford the static side because it introduces the type parameter; th
 must take the dynamic side because a field has one fixed layout. The language routes you to the
 cheaper representation wherever it is possible and to the visible box exactly where it is not.
 
+**And the two sides meet at the parameter, because a bound takes an object** (`10 §5`). A `&Fn` is
+passed to a bare-arrow parameter and called there, so a callable that had to be boxed to be *stored*
+does not have to be unboxed to be *handed on*. That closes what would otherwise be the split's one
+sharp edge: a struct holding an `on_click: &Fn() -> unit` could not pass it to anything written the
+ordinary way, and every such function would have needed a `&Fn` twin. What is monomorphized is the
+receiving function, once per shape of argument, and the erased one is one of those shapes.
+
 ## 6a. A function's address — `*extern(A, B) -> R`
 
 `Fn` is sysl's answer to "what is the type of a callable", and it is the right one for sysl: a bound
@@ -870,7 +967,7 @@ nothing downstream could notice:
   to travel beside the address is that frame.
 - **A closure.** The same reason with the name taken off: a closure is a struct and an
   implementation (§8), and one word has nowhere to put the struct.
-- **A `#test` function.** Every build but `sysl test` drops it (`testing.md`), so its address would
+- **A `@test` function.** Every build but `sysl test` drops it (`testing.md`), so its address would
   be of a definition the program does not have.
 - **Any signature carrying an aggregate** — a struct, a tuple, a data enum, a view, a `string`. An
   aggregate crosses to C in whichever registers that machine's convention names (`targets.md`), and

@@ -555,7 +555,7 @@ line means something after all, and the point of continuing is that it does not.
 
 ## 10. Control flow is expression-oriented — `if`, `match`, and loops yield values
 
-`if`, `match`, `while`, `loop`, and `for` are **expressions**, not statements. Each yields a value, so
+`if`, `match`, `while`, `do … while`, `loop`, and `for` are **expressions**, not statements. Each yields a value, so
 it can initialize a binding, be a function's body, or feed a branch of another:
 
 ```
@@ -617,6 +617,52 @@ way looks like one that might finish, and the code after it looks reachable. Rus
 its type for the same reason.
 
 `continue` starts the next iteration as it does in any loop, and a label works unchanged.
+
+**A loop whose body must run before anything is asked is written `do … while`.** The test goes at
+the foot, so the first pass is not conditional on anything:
+
+```
+do
+    s = str(n % 10) + s
+    n /= 10
+while n > 0
+```
+
+Written as a `while`, that program prints nothing for `n = 0`, and the fix everybody reaches for is
+to special-case zero above the loop. The one-line form is `do n /= 10 while n > 0`, and the value
+rules are `while`'s exactly: a `break` carries the loop's value, and an `else` runs when the test at
+the foot finally fails.
+
+**It is not sugar, and the reason is the one the three-clause form has.** The shape a program writes
+instead is `loop` with the test inverted at the bottom:
+
+```
+loop
+    body
+    if !cond then break        // NOT the same loop
+```
+
+That rewrite has no test for a `continue` to reach, so the first `continue` anybody adds to it jumps
+straight over the exit and the loop never leaves. In a `do … while`, `continue` runs the **test** —
+an iteration that is skipped still asks whether to stop. The two differ on exactly the point the
+three-clause `for` differs from its own `while` rewrite, and it is the same bug wearing the other
+hat: there, `continue` skips the step; here, it skips the exit.
+
+**`do` is unambiguous by position, so it does both jobs.** Everywhere else it is a body
+*introducer* — `while c do …`, `loop do …`, `for x in xs do …` — and it only ever appears there
+after a loop header **on the same line**, so it is never the first token of a statement. A `do` that
+starts a line can therefore only open this form. The tail needs no rule of its own either: this loop
+is *incomplete* without its `while`, and there is no bare `do` block in the language for that `while`
+to have belonged to instead, so a `while` found where the body ends is this loop's test and nothing
+else can want it. Nothing is written with an `end` marker, because the tail already names where the
+body stopped.
+
+**The test is an ordinary condition and takes no `is` binding.** `while p is Some(x)` binds `x` for
+the body it guards; a test at the foot guards nothing, because the body it belongs to has already
+run — so an `is` there would bind a name with no branch to be read from. The body's scope has closed
+by the time the test is reached for the same reason: a `var` declared in the body is remade every
+round, and a test reading one would be reading the round that has just ended. That is C's rule, and
+it is the only one the form can have.
 
 **A counted loop that a range cannot describe is written with three clauses.** `for init; cond;
 step` is C's loop without the parentheses, as Go writes it — every other header in the language is
@@ -782,10 +828,14 @@ print(1) == print(2)        // no — a type with one value has no question to a
 printf(fmt, ())             // no — a C variadic counts what it was handed
 ```
 
-The array case is the one worth spelling out: an array *is* its elements, and an array of nothing
-would put every element at one address, leaving a bounds check as the whole of what `a[i]` did. A
-read-only view of one would be no better. So an array and a slice ask for something to point at,
+The array case is the one worth spelling out: an array *is* its elements, and `unit` is the type that
+gets **dropped** wherever it is stored, so an array of it would have nothing left to be an array of.
+A read-only view of one would be no better. So an array and a slice ask for something to point at,
 exactly as `&T` and `*T` do.
+
+That is a rule about `unit` in particular and not about zero-sizedness, which matters because the two
+come apart: an array of a *fieldless struct* is admitted, and its elements do all sit at one address.
+The paragraph on that at the end of this section says why the two answers differ.
 
 **Inference is held to the same split.** A generic parameter accepts whatever its argument turns
 out to be, so `f[T](x: T)` handed `print(1)` instantiates at `unit` — and that is fine, because the
@@ -811,6 +861,31 @@ across the two programs now say what they mean.
 zero-sized is emitted as an empty aggregate, and it is still a type with an address that a `&T` may
 point at. Making *that* zero-sized as well would be a second rule with its own consequences for
 identity and for `&T`'s non-null guarantee, and nothing has asked for it.
+
+**A struct may have no fields at all, and that is the limiting case of the paragraph above rather
+than a new rule.** It is written `struct Name` closed by `end Name` — emptiness is stated rather than
+inferred, since a body the author forgot to indent is indistinguishable from one that was never
+meant to exist and is by far the likelier of the two. What such a type *is* is unchanged by having
+nothing in it: an ordinary named type, constructed, given methods and `impl` blocks, embedded,
+pointed at, held behind `&`, and passed as a type argument. None of `unit`'s dropping rules reach it;
+`sizeof` is `0` and `alignof` is `1`.
+
+The reason to want one is that a **sink** has no state. A writer standing for a destination fixed at
+compile time — the console, a serial port — keeps nothing, so every field it could have would be a
+field it did not need, and until it could have none it could not be written in sysl at all. The gain
+is not that such a destination becomes reachable but that it becomes a *value*: passed to a function,
+held in a struct, chosen by a caller, where a fixed global is none of those things.
+
+Two consequences follow and neither is a defect. Embedding one costs the enclosing struct nothing,
+which is the point. And two of them have nothing to separate their storage, so `*T`s taken to two
+such locals may compare equal — the same answer C gives for the same declaration, and one that can be
+observed only by asking a question about identity that an empty value has no state to answer. A `&T`
+to one is still distinct, since the reference header is real whatever it is a header for.
+
+This is also why `[4]unit` stays refused (above) while `[4]Marker` does not. The refusal there is
+about `unit` — the type the compiler *drops*, so an array of it would have no elements to speak of
+rather than empty ones. A fieldless struct is an ordinary type all the way down, and an array of them
+is a real array of a real type whose stride happens to be zero.
 
 ## 13. Tuples — a product type with no name
 
@@ -939,7 +1014,10 @@ work:
   `for`), `->` (a `match` arm), and `=` (a function's or member's body, where the short form is one
   expression rather than a statement); `else` takes a body directly, with no introducer of its own to
   need. So `if c then x = 1` and `if c` + an indented block are both written, and `while c do …`
-  likewise. The *lexing* mechanics were settled earlier by adopting `IndentationLexical` (see
+  likewise. `do … while`'s leading `do` is the one place the word is a **head** rather than an
+  introducer, and the two never meet: an introducer only ever follows a loop header on the same line,
+  so it is never a statement's first token. The *lexing* mechanics were settled earlier by adopting
+  `IndentationLexical` (see
   `front-end.md`), and the trailing-continuation operator set that was also filed here is settled in
   § *Continuing a line* below.
 - ~~Zero-sized types~~ — **done**, see §12. A `unit` field is skipped in the layout with the

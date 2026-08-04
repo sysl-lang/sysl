@@ -244,7 +244,7 @@ class ExternVarTests
     // followed. Naming C's storage allocates nothing either, and a `no alloc` module may do it.
     "a 'no alloc' module may name one, because reading C's storage allocates nothing" in {
       irOf(
-        "drv/a.sysl" -> "module drv\nno alloc\n\nextern optind: i32\n\nstep()\n    optind = 1i32\n",
+        "drv/a.sysl" -> "module drv\n@no_alloc\n\nextern optind: i32\n\nstep()\n    optind = 1i32\n",
         "main.sysl"  -> "drv.step()\nprint(1)",
       ) should include("@optind = external global i32")
     }
@@ -364,7 +364,7 @@ class ExternVarTests
     // a symbol — `sysl.io$lines` against a bare `environ`.
     "a symbol carries no module even where the key is a library one" in {
       val out = irAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nextern environ: **u8\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nextern environ: **u8\nmark(n: int) -> int = n + 1"),
       )("main.sysl" -> "mark(if environ == null then 0 else 1)")
 
       out should include("@environ = external global ptr")
@@ -376,7 +376,7 @@ class ExternVarTests
     // nothing at all — so a `no alloc` module writing one is not a narrowing it broke.
     "a 'no alloc' module writing one is not a narrowing it broke" in {
       irOf(
-        "drv/a.sysl" -> "module drv\nno alloc\n\nextern optind: i32\n\nreset()\n    optind = 1i32\n",
+        "drv/a.sysl" -> "module drv\n@no_alloc\n\nextern optind: i32\n\nreset()\n    optind = 1i32\n",
         "main.sysl"  -> "drv.reset()\nprint(1)",
       ) should include("store i32 1, ptr @optind")
     }
@@ -390,14 +390,14 @@ class ExternVarTests
       run("extern optind: i32\nval start: i32 = optind\nprint(start)") shouldBe "1\n"
     }
 
-    // `testing.md`: a test build drops the entry point and dispatches to the `#test` functions
+    // `testing.md`: a test build drops the entry point and dispatches to the `@test` functions
     // instead, so what a test reaches is reached from a different root. An extern variable read only
     // from a test still has to be declared, and the storage read is still C's.
-    "a '#test' build declares one that only a test reads" in {
+    "a '@test' build declares one that only a test reads" in {
       val src =
         """extern optind: i32
           |
-          |#test("a write to C's storage is read back from it")
+          |@test("a write to C's storage is read back from it")
           |round_trips() =
           |    optind = 7i32
           |    assert(optind == 7i32, "optind")

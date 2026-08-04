@@ -13,14 +13,14 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
 
   "a test passes by returning and fails by not" - {
     "a test that returns passes" in {
-      verdicts("""#test
+      verdicts("""@test
                  |t() =
                  |    assert(1 + 1 == 2, "arithmetic")
                  |""".stripMargin) shouldBe Map("t" -> None)
     }
 
     "a failed assertion fails the test, and the status says so" in {
-      verdicts("""#test
+      verdicts("""@test
                  |t() =
                  |    assert(1 + 1 == 3, "arithmetic")
                  |""".stripMargin) shouldBe Map("t" -> Some("did not return — exit status 1"))
@@ -34,7 +34,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
                            |    require n % 2 == 0, "even"
                            |    n / 2
                            |
-                           |#test
+                           |@test
                            |t() =
                            |    print(halve(3))
                            |""".stripMargin)
@@ -44,7 +44,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     }
 
     "a bounds violation fails the test the same way" in {
-      val ran = outcomes("""#test
+      val ran = outcomes("""@test
                            |t() =
                            |    val a = [1, 2, 3]
                            |    var i = 5
@@ -57,7 +57,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
 
   "'should_trap' inverts the verdict" - {
     "a test that traps passes" in {
-      verdicts("""#test(should_trap)
+      verdicts("""@test(should_trap)
                  |t() =
                  |    assert(false, "this must fire")
                  |""".stripMargin) shouldBe Map("t" -> None)
@@ -66,21 +66,21 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     // The failure that would otherwise go unnoticed: a check that stopped firing turns its test
     // green unless returning is itself the failure.
     "a test that returns fails, which is what makes the form worth having" in {
-      verdicts("""#test(should_trap)
+      verdicts("""@test(should_trap)
                  |t() =
                  |    assert(true, "this does not fire")
                  |""".stripMargin) shouldBe Map("t" -> Some("returned, and was expected to trap"))
     }
 
     "with a substring, the run must have printed it" in {
-      verdicts("""#test(should_trap: "past the end")
+      verdicts("""@test(should_trap: "past the end")
                  |t() =
                  |    assert(false, "index past the end")
                  |""".stripMargin) shouldBe Map("t" -> None)
     }
 
     "a trap that printed something else is not the trap that was asked for" in {
-      verdicts("""#test(should_trap: "past the end")
+      verdicts("""@test(should_trap: "past the end")
                  |t() =
                  |    assert(false, "some other complaint")
                  |""".stripMargin) shouldBe
@@ -95,11 +95,11 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
                   |    require n % 2 == 0, "even"
                   |    n / 2
                   |
-                  |#test(should_trap)
+                  |@test(should_trap)
                   |silent() =
                   |    print(halve(3))
                   |
-                  |#test(should_trap: "even")
+                  |@test(should_trap: "even")
                   |wanting_words() =
                   |    print(halve(3))
                   |""".stripMargin
@@ -113,15 +113,15 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     // The reason the runner does not call them in a loop: the first trap would end the run, and
     // every test after it would have no verdict rather than a failing one.
     "a test that traps does not stop the ones after it" in {
-      verdicts("""#test
+      verdicts("""@test
                  |first() =
                  |    assert(false, "down")
                  |
-                 |#test
+                 |@test
                  |second() =
                  |    assert(true, "up")
                  |
-                 |#test
+                 |@test
                  |third() =
                  |    assert(true, "up")
                  |""".stripMargin) shouldBe
@@ -144,11 +144,11 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
                  |
                  |val start: int = twice(7)
                  |
-                 |#test
+                 |@test
                  |reads_it() =
                  |    assert(start == 14, "as computed")
                  |
-                 |#test
+                 |@test
                  |reads_it_again() =
                  |    assert(start == 14, "still as computed")
                  |""".stripMargin) shouldBe Map("reads_it" -> None, "reads_it_again" -> None)
@@ -157,10 +157,10 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
 
   "a run can be narrowed" - {
     "a filter selects by the name a report shows" in {
-      val src = """#test
+      val src = """@test
                   |alpha() = 0
                   |
-                  |#test
+                  |@test
                   |beta() = 0
                   |""".stripMargin
 
@@ -177,7 +177,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     }
 
     "a display name is what the filter sees, not the function's own" in {
-      val src = """#test("the sum of an empty list is zero")
+      val src = """@test("the sum of an empty list is zero")
                   |sum_empty() = 0
                   |""".stripMargin
 
@@ -186,11 +186,11 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     }
 
     "fail-fast stops at the first failure and reports what ran" in {
-      val ran = outcomes("""#test
+      val ran = outcomes("""@test
                            |first() =
                            |    assert(false, "down")
                            |
-                           |#test
+                           |@test
                            |second() =
                            |    assert(true, "up")
                            |""".stripMargin, TestRunner.Options(failFast = true))
@@ -199,10 +199,10 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     }
 
     "fail-fast runs everything when nothing fails" in {
-      val ran = outcomes("""#test
+      val ran = outcomes("""@test
                            |first() = 0
                            |
-                           |#test
+                           |@test
                            |second() = 0
                            |""".stripMargin, TestRunner.Options(failFast = true))
 
@@ -264,24 +264,24 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     // would let a `no alloc` module hold an allocation that its own tests exercised every day.
     "a module's 'no alloc' clause reaches its tests" in {
       errIn(("m", "m.sysl", """module m
-                              |no alloc
+                              |@no_alloc
                               |
                               |add(a: int, b: int) -> int = a + b
                               |
-                              |#test
+                              |@test
                               |adding() =
                               |    val s = str(add(2, 2))
                               |    assert(s == "4", "adding")
-                              |""".stripMargin)) should include("declared 'no alloc'")
+                              |""".stripMargin)) should include("declared '@no_alloc'")
     }
 
     "a test that allocates nothing is fine in the same module" in {
       irIn(("m", "m.sysl", """module m
-                             |no alloc
+                             |@no_alloc
                              |
                              |add(a: int, b: int) -> int = a + b
                              |
-                             |#test
+                             |@test
                              |adding() =
                              |    assert(add(2, 2) == 4, "adding")
                              |""".stripMargin)) should not be empty
@@ -293,7 +293,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     // naming a symbol nothing in the source explained — because the ordinary build had dropped the
     // definition and kept the call.
     "calling a test is refused where the call is written" in {
-      err("""#test
+      err("""@test
             |t() =
             |    assert(true, "up")
             |
@@ -302,11 +302,11 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     }
 
     "a test calling another test is the same refusal" in {
-      err("""#test
+      err("""@test
             |helper() =
             |    assert(true, "up")
             |
-            |#test
+            |@test
             |t() =
             |    helper()
             |""".stripMargin) should include("'sysl test' calls and nothing else does")
@@ -315,11 +315,11 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     "work two tests share goes in an ordinary function, which both may call" in {
       allPass("""shared() -> int = 21
                 |
-                |#test
+                |@test
                 |first() =
                 |    assert(shared() == 21, "shared")
                 |
-                |#test
+                |@test
                 |second() =
                 |    assert(shared() * 2 == 42, "shared again")
                 |""".stripMargin)
@@ -332,7 +332,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
       // dispatcher, which calls one test and nothing else.
       outcomes("""print("the program ran")
                  |
-                 |#test
+                 |@test
                  |t() = 0
                  |""".stripMargin).head.output shouldBe ""
     }
@@ -341,13 +341,13 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
       outcomes("""main()
                  |    print("main ran")
                  |
-                 |#test
+                 |@test
                  |t() = 0
                  |""".stripMargin).head.output shouldBe ""
     }
 
     "the dispatcher compares the name it was given against each test" in {
-      val out = testIr("""#test
+      val out = testIr("""@test
                          |t() = 0
                          |""".stripMargin)
 
@@ -359,7 +359,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     "a name the binary has no test for is neither a pass nor a failure" in {
       // Status 2 rather than 0 or a trap: a runner and a binary that disagree is not a test result,
       // and reading it as one would turn a stale build into a green run.
-      val out = testIr("""#test
+      val out = testIr("""@test
                          |t() = 0
                          |""".stripMargin)
 
@@ -371,7 +371,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     "a test function is not emitted" in {
       val out = ir("""double(n: int) -> int = n * 2
                      |
-                     |#test
+                     |@test
                      |doubling() =
                      |    assert(double(2) == 4, "doubling")
                      |
@@ -384,7 +384,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     "nor is a helper only a test calls" in {
       val out = ir("""only_a_test_calls_this() -> int = 42
                      |
-                     |#test
+                     |@test
                      |t() =
                      |    assert(only_a_test_calls_this() == 42, "helper")
                      |
@@ -399,7 +399,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     "a helper the program also calls stays" in {
       val out = ir("""shared() -> int = 42
                      |
-                     |#test
+                     |@test
                      |t() =
                      |    assert(shared() == 42, "helper")
                      |
@@ -417,7 +417,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
                                                       |
                                                       |double(n: int) -> int = n * 2
                                                       |
-                                                      |#test
+                                                      |@test
                                                       |doubling() =
                                                       |    assert(double(2) == 4, "doubling")
                                                       |""".stripMargin, List("demo"))) match {
@@ -437,7 +437,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     "the program still runs, and runs what it always did" in {
       val src = """double(n: int) -> int = n * 2
                   |
-                  |#test
+                  |@test
                   |doubling() =
                   |    assert(double(2) == 4, "doubling")
                   |

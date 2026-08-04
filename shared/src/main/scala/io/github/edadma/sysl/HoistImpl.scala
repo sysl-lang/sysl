@@ -172,7 +172,8 @@ trait HoistImpl extends ImplConformance {
 
     traitImpls((impl.traitName, home.key)) =
       already :+ TraitImpl(impl, written, wkey, home.alt, home.tparams,
-        Option.when(home.tparams.nonEmpty && home.bounds.nonEmpty)((home.tparams, home.bounds)))
+        Option.when(home.tparams.nonEmpty && home.bounds.nonEmpty)((home.tparams, home.bounds)),
+        currentScope)
 
     // What the trait **requires** is asked of the implementing type here, at the block that makes
     // the promise, rather than at each bound that relies on it. Two reasons, and the second decides
@@ -465,7 +466,7 @@ trait HoistImpl extends ImplConformance {
    *
    * The library is a module of its own for this purpose even though its declarations are keyed under
    * the root like a rootless program's, so which file a declaration came from is what decides rather
-   * than the key — `Core.owns`. A program at the project root is therefore as foreign to `Eq` as
+   * than the key — `Stdlib.owns`. A program at the project root is therefore as foreign to `Eq` as
    * any named module is.
    */
   protected def checkCoherence(impl: ImplDecl, label: String): Unit = {

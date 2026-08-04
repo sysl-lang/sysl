@@ -241,6 +241,9 @@ trait ControlFlowEmitter extends PlaceEmitter {
    */
   private def patternTest(p: TPattern, value: String): String = p match
     case _: TWildPattern | _: TBindPattern => "true"
+    // The binding is established later, in `patternBind`; what decides the arm is the inner test
+    // alone, since naming a value says nothing about whether it matched.
+    case a: TAtPattern                     => patternTest(a.inner, value)
     case TLitPattern(v)                    => compareValue("==", v.ty, value, genExpr(v))
     case TRangePattern(lo, hi, inclusive) =>
       val loOk = compareValue(">=", lo.ty, value, genExpr(lo))
@@ -279,6 +282,13 @@ trait ControlFlowEmitter extends PlaceEmitter {
       retainValue(bty, value)
       emit(s"store ${bty.llvm} $value, ptr %$name.addr")
       ownSlot(name, bty)
+
+    // `n @ pat` binds the whole value and then whatever the inner pattern binds, both off the same
+    // `value` — so a `&T` matched this way is retained once for the outer name and once for each
+    // inner one, which is what every other pattern that names a value more than once already does.
+    case TAtPattern(name, inner) =>
+      patternBind(TBindPattern(name, inner.ty), value)
+      patternBind(inner, value)
     case TVariantPattern(en, variant, args) if args.exists(bindsAny) =>
       val payload = enumPayload(en, variant, value)
       for (arg, i) <- args.zipWithIndex do patternBind(arg, payloadField(en, variant, payload, i))
@@ -305,6 +315,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
   private def bindsAny(p: TPattern): Boolean = p match
     case _: TBindPattern    => true
+    case _: TAtPattern      => true
     case v: TVariantPattern => v.args.exists(bindsAny)
     case s: TStructPattern  => s.args.exists(bindsAny)
     case _                  => false
@@ -314,6 +325,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
    */
   private def refutable(p: TPattern): Boolean = p match
     case _: TWildPattern | _: TBindPattern => false
+    case a: TAtPattern                     => refutable(a.inner)
     case s: TStructPattern                 => s.args.exists(refutable)
     case _                                 => true
 
@@ -351,6 +363,40 @@ trait ControlFlowEmitter extends PlaceEmitter {
     paths.release()
     emitTerm(s"br label %$condL")
     paths.emitCleanups()
+
+    genLoops = genLoops.tail
+    genLoopResult(slot, ty, elseL, endL, elseBlock)
+  }
+
+  /** The post-test loop. It is `genWhile`'s shape entered one label later — the entry branch goes to
+   * the body rather than to the test — so the body runs before anything is asked.
+   *
+   * `continue` targets the **test**, which is what the form exists for: the `loop` with `if !cond
+   * then break` at its foot that a program writes instead has no test for a `continue` to reach, so
+   * the first one added to it jumps over the exit and never leaves.
+   */
+  protected def genDoWhile(d: TDoWhile): String = {
+    val TDoWhile(body, cond, elseBlock, ty) = d
+    val bodyL = freshLabel("dowhile.body")
+    val condL = freshLabel("dowhile.cond")
+    val endL  = freshLabel("dowhile.end")
+    val elseL = if elseBlock.isDefined then freshLabel("dowhile.else") else endL
+    val slot  = if Type.noValue(ty) then "" else emitAlloca(freshTemp(), ty.llvm)
+    genLoops = GenLoop(endL, condL, slot, ty, owned.length, tempStack.length) :: genLoops
+
+    emitTerm(s"br label %$bodyL")
+    emitLabel(bodyL)
+    pushOwned()
+    body.foreach(genStmt)
+    popOwned()
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    // Re-evaluated every round, so what the test borrows is let go before the branch rather than
+    // piling up in the enclosing statement's region — as the three-clause loop's test does.
+    pushTemps()
+    val v = genExpr(cond)
+    popTemps()
+    emitTerm(s"br i1 $v, label %$bodyL, label %$elseL")
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)
@@ -413,6 +459,68 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
     genLoops = genLoops.tail
     genLoopResult(slot, ty, elseL, endL, elseBlock)
+  }
+
+  /** `for all i in lo..hi do pred` and `for some …` — a counted loop over an accumulator slot,
+   * yielding the `i1` the slot holds when it stops (`17 §2`).
+   *
+   * **The slot starts at the quantifier's identity and is written exactly once, by the iteration
+   * that decides the answer.** A conjunction over nothing is true and a disjunction over nothing is
+   * false, so an empty range falls out of the initial store with no case for it: the loop simply
+   * never runs. The store on the deciding iteration is the opposite value, and the branch after it
+   * leaves — which is what makes both forms short-circuit, `for all` at the first counterexample and
+   * `for some` at the first witness.
+   *
+   * The predicate opens its own temporary region because it is re-evaluated every iteration: a
+   * condition that allocates on its way to a `bool` would otherwise accumulate one allocation per
+   * element in the enclosing statement's region, and the region is not the loop's to keep.
+   *
+   * This is not `genFor` with a different body. A quantifier carries no `break`, no `else` and no
+   * label, so it registers no `GenLoop` — a `break` written inside a predicate belongs to whatever
+   * loop encloses the quantifier, which is what the reader of that line means.
+   */
+  protected def genQuantifier(q: TQuantifier): String = {
+    val TQuantifier(universal, name, varTy, lo, hi, inclusive, pred) = q
+    val w     = varTy.llvm
+    val loV   = genExpr(lo)
+    val hiV   = genExpr(hi)
+    val condL = freshLabel("quant.cond")
+    val bodyL = freshLabel("quant.body")
+    val stepL = freshLabel("quant.step")
+    val doneL = freshLabel("quant.done")
+    val endL  = freshLabel("quant.end")
+    val acc   = emitAlloca(freshTemp(), "i1")
+
+    emit(s"store i1 ${if universal then 1 else 0}, ptr $acc")
+    emitAlloca(s"%$name.addr", w)
+    emit(s"store $w $loV, ptr %$name.addr")
+
+    emitTerm(s"br label %$condL")
+    emitLabel(condL)
+    val iv  = freshTemp(); emit(s"$iv = load $w, ptr %$name.addr")
+    val cmp = freshTemp(); emit(s"$cmp = icmp ${predicate(if inclusive then "<=" else "<", varTy)} $w $iv, $hiV")
+    emitTerm(s"br i1 $cmp, label %$bodyL, label %$endL")
+
+    emitLabel(bodyL)
+    pushTemps()
+    val p = genExpr(pred)
+    popTemps()
+    // A true predicate continues a `for all` and settles a `for some`; a false one does the reverse.
+    if universal then emitTerm(s"br i1 $p, label %$stepL, label %$doneL")
+    else emitTerm(s"br i1 $p, label %$doneL, label %$stepL")
+
+    emitLabel(doneL)
+    emit(s"store i1 ${if universal then 0 else 1}, ptr $acc")
+    emitTerm(s"br label %$endL")
+
+    emitLabel(stepL)
+    val cur = freshTemp(); emit(s"$cur = load $w, ptr %$name.addr")
+    val nxt = freshTemp(); emit(s"$nxt = add $w $cur, 1")
+    emit(s"store $w $nxt, ptr %$name.addr")
+    emitTerm(s"br label %$condL")
+
+    emitLabel(endL)
+    val res = freshTemp(); emit(s"$res = load i1, ptr $acc"); res
   }
 
   /** The three-clause loop. It is `genFor`'s shape with both fixed parts opened up: the test is

@@ -1,18 +1,20 @@
 package io.github.edadma.sysl
 
-/** The two sinks a rendering ends in (`14 §6`): standard output, which `print` hands a `Display`,
- * and a growable buffer, whose bytes `str` and an `f"…"` hole turn into a fresh `string`.
+/** The growable buffer a rendering can end in (`14 §6`): the sink whose bytes `str` and an `f"…"`
+ * hole turn into a fresh `string`.
  *
- * Both are `*Writer` trait objects, and both are the compiler's rather than the library's — not
- * because either does anything a sysl body could not, but because neither has a *type* sysl can
- * give it. A writer over standard output holds no state, and there is no struct with no fields; a
- * growable byte buffer is `07`'s *Not yet*. What a program writes for itself is an ordinary
- * `impl Writer for MyThing`, and that is the case the trait exists for.
+ * It is a `*Writer` trait object, and it is the compiler's rather than the library's — not because
+ * it does anything a sysl body could not, but because it has no *type* sysl can give it: a growable
+ * byte buffer is `07`'s *Not yet*. The other sink used to be here for a reason of the same shape and
+ * is not any more — a writer over standard output holds no state, and a struct may now have no
+ * fields, so the library declares it as `Stdout` and this file has nothing to say about it. What a
+ * program writes for itself is an ordinary `impl Writer for MyThing`, which is the case the trait
+ * exists for and is now also the case the library's own sink is.
  *
- * Each table is laid out by hand in the order `Writer` **offers** its methods — which is not the
+ * The table is laid out by hand in the order `Writer` **offers** its methods — which is not the
  * order it declares them, because a trait offers what it requires first: `Writer: Fallible` puts
  * `failed` in slot 0 and `write` in slot 1. The analyzer checks that order against the flattened
- * list every call site indexes into, before it emits a node that reaches one of these.
+ * list every call site indexes into, before it emits a node that reaches this.
  */
 trait WriterEmitter extends Emitter {
 
@@ -20,9 +22,6 @@ trait WriterEmitter extends Emitter {
    * rather than declared as a named type because nothing outside this file ever names it.
    */
   protected val bufferLayout = "{ ptr, i64, i64 }"
-
-  /** The table for standard output, whose data word is null since there is nothing to point at. */
-  protected def stdoutTable(): String = request("sysl.vt.out")(WriterEmitter.stdout)
 
   /** The table for a fresh buffer, whose data word is the caller's stack slot. */
   protected def bufferTable(): String = request("sysl.vt.buf")(WriterEmitter.buffer)
@@ -34,8 +33,8 @@ object WriterEmitter {
    * trait offers what it requires first and `Writer: Fallible`.
    *
    * It is written down once because three things depend on it and none of them can see the other
-   * two: the two tables below are laid out by hand in this order, `Escape` reaches into a program's
-   * own `Writer` tables by slot, and every call through a `*Writer` indexes by whatever the analyzer
+   * two: the table below is laid out by hand in this order, `Escape` reaches into a program's own
+   * `Writer` tables by slot, and every call through a `*Writer` indexes by whatever the analyzer
    * computed. `SpecialForms.checkWriterShape` compares this list against the flattened member list
    * the analyzer builds, so a library edit that reorders them fails the build here rather than
    * calling the wrong function with the right arguments.
@@ -44,28 +43,6 @@ object WriterEmitter {
 
   /** Which slot of a `Writer`'s table holds the writing. */
   val writeSlot: Int = members.indexOf("write")
-
-  /** Writing to standard output. It goes through the library's own `putbytes` rather than straight
-   * to the byte loop, so the one function a freestanding target replaces is still that one — the
-   * sink moved, not the seam.
-   *
-   * The symbol is the **key** `putbytes` is filed under and not the spelling, because a key is what
-   * an emitted name is (`Modules`) — so this table names whichever module the library declares it in.
-   */
-  val stdout: String =
-    s"""define private void @sysl.w.out.write(ptr %self, { ptr, ptr, i64 } %b) {
-      |entry:
-      |  call void @${Library.key("putbytes")}({ ptr, ptr, i64 } %b)
-      |  ret void
-      |}
-      |
-      |define private i1 @sysl.w.out.failed(ptr %self) {
-      |entry:
-      |  ret i1 false
-      |}
-      |
-      |@sysl.vt.out = private constant [2 x ptr] [ptr @sysl.w.out.failed, ptr @sysl.w.out.write]
-      |""".stripMargin
 
   /** Writing into a growable buffer, and finishing with one.
    *

@@ -21,7 +21,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
   // ask for. `flag` and `mark` differ so that which one a name reached is visible in the IR.
   private val tree =
     Seq(
-      ("sysl", "core.sysl",
+      ("sysl", "std.sysl",
        """module sysl
          |mark(n: int) -> int = n + 1
          |""".stripMargin),
@@ -35,35 +35,23 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
   // reaches.
   private val both =
     Seq(
-      ("sysl", "core.sysl", "module sysl\npick(n: int) -> int = n + 1"),
+      ("sysl", "std.sysl", "module sysl\npick(n: int) -> int = n + 1"),
       ("sysl.sys", "sys.sysl", "module sysl.sys\npick(n: int) -> int = n * 2"),
     )
 
   // A submodule holding something only the rest of the library may name.
   private val kept =
     Seq(
-      ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
+      ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
       ("sysl.sys", "sys.sysl", "module sysl.sys\nprivate[sysl] hold(n: int) -> int = n * 2"),
     )
 
   private def sysKey(name: String): String = Modules.qualify("sysl.sys", name)
 
-  "where a carried file sits" - {
-    // The generator writes each file's name as the path below `lib`, and the directory it says the
-    // file is in is what its header is held to. Deriving it is the whole of what lets the library be
-    // a tree, and it is a string question, so it is asked as one.
-    "is the directory between the library root and it" in {
-      Std.directoryOf("lib/sysl/print.sysl") shouldBe List("sysl")
-    }
-
-    "which for a submodule's file is the path down to it" in {
-      Std.directoryOf("lib/sysl/sys/args.sysl") shouldBe List("sysl", "sys")
-    }
-
-    "however deep it goes" in {
-      Std.directoryOf("lib/sysl/text/utf8/decode.sysl") shouldBe List("sysl", "text", "utf8")
-    }
-  }
+  // Where a library file sits used to be asked here, of a string helper that turned a generated
+  // name back into the directories above it. The compiler reads the library off disk now, so the
+  // walk that finds a file is what says which module it is in — and the claim is asked of the real
+  // library rather than of a spelling, in `StdLibraryTests`.
 
   "a submodule of the library" - {
     "does not put its names in scope for nothing" in {
@@ -138,7 +126,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // any other file would.
     "reach the standard module's names with no import, wherever in the tree they are" in {
       irAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nflag(n: int) -> int = mark(n) * 2"),
       )(
         "main.sysl" -> "sysl.sys.flag(21)",
@@ -147,7 +135,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
 
     "reach a sibling submodule's by importing it" in {
       irAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
         ("sysl.text", "t.sysl", "module sysl.text\nwiden(n: int) -> int = n + 7"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nimport sysl.text.widen\nflag(n: int) -> int = widen(n)"),
       )(
@@ -157,7 +145,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
 
     "and not without one" in {
       errAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
         ("sysl.text", "t.sysl", "module sysl.text\nwiden(n: int) -> int = n + 7"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nflag(n: int) -> int = widen(n)"),
       )(
@@ -171,7 +159,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // holds only what needs nothing.
     "and a submodule the standard module reaches may not reach back, even through a free name" in {
       errAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nimport sysl.sys.flag\nmark(n: int) -> int = flag(n)"),
+        ("sysl", "std.sysl", "module sysl\nimport sysl.sys.flag\nmark(n: int) -> int = flag(n)"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nflag(n: int) -> int = mark(n) * 2"),
       )(
         "main.sysl" -> "mark(21)",
@@ -203,7 +191,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // one segment.
     "a submodule of a submodule is reached the same way" in {
       irAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
         ("sysl.text.utf8", "d.sysl", "module sysl.text.utf8\ndecode(n: int) -> int = n * 3"),
       )(
         "main.sysl" -> "sysl.text.utf8.decode(7)",
@@ -245,7 +233,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // something from the standard module as well as the other way round.
     "a submodule may keep something from the standard module too" in {
       errAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nprivate[sys] hold(n: int) -> int = n * 2"),
       )(
         "main.sysl" -> "mark(21)",

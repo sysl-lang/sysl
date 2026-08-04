@@ -229,7 +229,10 @@ class UnitErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err("f(x: &unit) -> int = 1\nprint(1)") should include("nothing for '&' to point at")
     }
 
-    // Every element would be at the same address, so a bounds check would be all `a[i]` did.
+    // Not because the elements would share an address — a fieldless struct's do, and an array of
+    // *those* is admitted (`FieldlessStructTests`). It is that `unit` is the type the compiler
+    // **drops**: an array of it would have nothing to be an array of, where an array of an ordinary
+    // type whose stride happens to be zero is still a row of real elements with a real length.
     "an array or a slice of it, however deep" in {
       err("f(a: [4]unit) -> int = 1\nprint(1)") should include("nothing for an array to point at")
       err("f(a: []unit) -> int = 1\nprint(1)") should include("nothing for a slice to point at")

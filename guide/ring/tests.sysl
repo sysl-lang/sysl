@@ -2,7 +2,7 @@
 //
 // The run in `main.sysl` can only assert what the ring *permits*: a violated `require` traps and
 // takes the process with it, so a check that broke one would end the run instead of reporting a
-// failure. `#test(should_trap)` is the form that can — each one runs in a process of its own and
+// failure. `@test(should_trap)` is the form that can — each one runs in a process of its own and
 // passes by **not** coming back, so the contract that ends it is the thing being measured.
 //
 // **Every refusal is written next to the call that is not refused.** A `should_trap` test passes for
@@ -12,53 +12,61 @@
 
 // A ring filled to capacity, built the only way there is -- the operations themselves, so no fixture
 // can construct a state the type system would not have allowed.
+//
+// The `variant` is the one clause on this page that is about the *loop* rather than about the ring.
+// What it says is that each round leaves fewer free slots than the last, which is the whole reason
+// this terminates: nothing in `is_full` promises that `push` makes progress towards it. A run that
+// stopped making progress would trap here rather than spin, and the measure is what a prover reads
+// to discharge termination.
 filled_ring() -> Ring
     var r = fresh_ring()
 
-    while !r.is_full() do r.push(1)
+    while !r.is_full()
+        variant capacity - usize(r.count)
+        r.push(1)
 
     r
 end filled_ring
 
 // -- what the bounds refuse --------------------------------------------------------------------
 
-#test(should_trap)
+@test(should_trap)
 a_slot_past_the_last_is_not_a_slot() =
     print(int(Slot(8u8)))
 
-#test(should_trap)
+@test(should_trap)
 a_count_past_capacity_is_not_a_count() =
     print(int(Count(9u8)))
 
 // The asymmetry the two declarations were written for: a full ring has `capacity` elements, so
 // `Count` reaches it, and there is no slot with that number, so `Slot` does not. One value, legal as
 // one type and not as the other, is the whole of what `new` buys here.
-#test
+@test
 capacity_itself_is_a_count_and_not_a_slot() =
     assert(int(Count(8u8)) == 8, "a full ring's count")
     assert(!Slot::Valid(8u8), "and no such slot")
 
 // -- what the contracts refuse, and what they let through -------------------------------------
 
-#test(should_trap)
+@test(should_trap)
 pushing_past_a_full_ring_traps() =
     var r = filled_ring()
 
     r.push(99)
 
-#test
+@test
 but_filling_it_exactly_is_not_refused() =
     var r = filled_ring()
 
     assert(r.len() == int(capacity), "a whole capacity goes in")
 
-#test(should_trap)
+@test(should_trap)
 popping_an_empty_ring_traps() =
     var r = fresh_ring()
 
     print(r.pop())
 
-#test
+@test
 but_popping_one_that_holds_something_is_not() =
     var r = fresh_ring()
 
@@ -70,7 +78,7 @@ but_popping_one_that_holds_something_is_not() =
 // `at`'s precondition is about the elements that are *there*, not about the buffer -- which is the
 // distinction a ring buffer exists to keep, since every slot is a real slot whether or not anything
 // has been put in it. Slot 2 exists; element 2 does not.
-#test(should_trap)
+@test(should_trap)
 reading_past_the_last_element_traps_although_the_slot_exists() =
     var r = fresh_ring()
 
@@ -79,7 +87,7 @@ reading_past_the_last_element_traps_although_the_slot_exists() =
 
     print(r.at(2))
 
-#test
+@test
 but_reading_the_last_one_is_not_refused() =
     var r = fresh_ring()
 
@@ -90,7 +98,7 @@ but_reading_the_last_one_is_not_refused() =
     assert(r.at(1) == 2, "and the newest")
 
 // The other end of the same contract, which a bare `i < len` would let through.
-#test(should_trap)
+@test(should_trap)
 a_negative_index_traps() =
     var r = fresh_ring()
 
@@ -101,7 +109,7 @@ a_negative_index_traps() =
 // The total forms are what the program's own run uses, and they answer where these trap. Pinned
 // beside them because the pair is the point: a ring offers both, and which one a caller wants is
 // which one it can afford to be wrong about.
-#test
+@test
 the_total_forms_answer_where_the_checked_ones_trap() =
     var empty = fresh_ring()
 
@@ -120,14 +128,14 @@ the_total_forms_answer_where_the_checked_ones_trap() =
 // **Neither order escapes it**, which is what rules out reordering as the fix here and leaves the
 // whole-struct write as the only way through. The two tests below are the naive push written both
 // ways round; the guide's own `push` is the third.
-#test(should_trap)
+@test(should_trap)
 moving_a_tracked_ring_s_end_before_its_length_traps() =
     var t = fresh_tracked()
 
     t.tail = wrap(t.tail)
     t.count = Count(u8(usize(t.count) + 1))
 
-#test(should_trap)
+@test(should_trap)
 and_moving_its_length_before_its_end_traps_too() =
     var t = fresh_tracked()
 
@@ -136,7 +144,7 @@ and_moving_its_length_before_its_end_traps_too() =
 
 // The form the program actually uses: the same two fields, one write, so there is no moment between
 // them for the clause to be asked about.
-#test
+@test
 while_assigning_the_whole_struct_moves_both_at_once() =
     var t = fresh_tracked()
 
@@ -148,7 +156,7 @@ while_assigning_the_whole_struct_moves_both_at_once() =
 
 // The ring the invariant argued for. With the end computed rather than stored there is no clause
 // relating two fields, so the same push is one ordinary write and there is nothing to break.
-#test
+@test
 a_ring_that_computes_its_end_has_no_invariant_to_break() =
     var r = fresh_ring()
 
@@ -164,7 +172,7 @@ a_ring_that_computes_its_end_has_no_invariant_to_break() =
 // raising the ceiling before the floor keeps every intermediate state legal. The pair is the point:
 // the same clause holds under one order and traps under the other, so "reorder the writes" is a real
 // answer here and not a hope.
-#test
+@test
 raising_the_ceiling_before_the_floor_keeps_every_state_legal() =
     var w = Watermark(Count(0), Count(0))
 
@@ -174,7 +182,7 @@ raising_the_ceiling_before_the_floor_keeps_every_state_legal() =
     assert(int(w.count) == 2, "the floor")
     assert(int(w.high) == 2, "and the ceiling it pushed up")
 
-#test(should_trap)
+@test(should_trap)
 raising_the_floor_first_does_not() =
     var w = Watermark(Count(0), Count(0))
 
@@ -182,7 +190,7 @@ raising_the_floor_first_does_not() =
 
 // Giving one back lowers the floor and leaves the ceiling where it was, which is what a watermark
 // is for -- and is legal in any order, there being only one field to write.
-#test
+@test
 giving_one_back_leaves_the_ceiling_where_it_was() =
     var w = Watermark(Count(0), Count(0))
 

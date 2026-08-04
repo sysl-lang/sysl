@@ -83,8 +83,20 @@ object Exhaustiveness {
       Some(List((Con.Bool(true), "true", Nil), (Con.Bool(false), "false", Nil)))
     case _ => None
 
+  /** A pattern with its bindings taken off — what it *tests for*, which is the only thing coverage
+   * is about.
+   *
+   * `n @ Circle(r)` covers exactly what `Circle(r)` covers, so an arm written either way leaves the
+   * same rows uncovered and produces the same witness. Stripping here rather than adding a case to
+   * each function below is what keeps that true by construction: a binding is invisible to this
+   * whole analysis, which is the claim, and there is one place it could stop being.
+   */
+  private def unbound(p: TPattern): TPattern = p match
+    case a: TAtPattern => unbound(a.inner)
+    case other         => other
+
   /** The constructor a pattern tests for, or `None` when it matches whatever is there. */
-  private def head(p: TPattern): Option[Con] = p match
+  private def head(p: TPattern): Option[Con] = unbound(p) match
     case _: TWildPattern | _: TBindPattern => None
     case v: TVariantPattern                => Some(Con.Variant(v.variant.name, v.variant.tag))
     case _: TStructPattern                 => Some(Con.Whole)
@@ -95,7 +107,7 @@ object Exhaustiveness {
    * one. A wildcard fits every constructor and passes its fields on unconstrained.
    */
   private def specialize(c: Con, argTys: List[Type], row: List[TPattern]): Option[List[TPattern]] =
-    row.head match
+    unbound(row.head) match
       case _: TWildPattern | _: TBindPattern              => Some(argTys.map(TWildPattern.apply) ++ row.tail)
       case v: TVariantPattern if head(v).contains(c)      => Some(v.args ++ row.tail)
       case s: TStructPattern if c == Con.Whole            => Some(s.args ++ row.tail)

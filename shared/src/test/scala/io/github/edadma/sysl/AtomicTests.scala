@@ -264,8 +264,8 @@ class AtomicTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       val out = irOf(
         "spin/lock.sysl" ->
           """module spin
-            |no alloc
-            |no os
+            |@no_alloc
+            |@no_os
             |
             |import sysl.sync.*
             |
@@ -289,8 +289,8 @@ class AtomicTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       val out = runOf(
         "spin/lock.sysl" ->
           """module spin
-            |no alloc
-            |no os
+            |@no_alloc
+            |@no_os
             |
             |import sysl.sync.*
             |

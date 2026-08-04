@@ -18,8 +18,14 @@ class OptimizeCliTests extends AnyFreeSpec with Matchers {
   /** Through the driver's own entry, so what is asked here is what a shell asks. */
   private def parse(args: String*): Option[Config] = parseArgs(args)
 
-  /** The driver under a name of its own — `Suite` has an `execute` too, and it wins unqualified. */
-  private def cli(cfg: Config): Int = io.github.edadma.sysl.execute(cfg)
+  /** The driver under a name of its own — `Suite` has an `execute` too, and it wins unqualified.
+   *
+   * Stdout is thrown away unless a test captured it for itself (see `Discarded`): a `run` here
+   * prints whatever the program printed, into the middle of some other suite's output.
+   */
+  private def cli(cfg: Config): Int = Console.withOut(Discarded)(driver(cfg))
+
+  private def driver(cfg: Config): Int = io.github.edadma.sysl.execute(cfg)
 
   private val program =
     """import sysl.math.Bits
@@ -108,7 +114,7 @@ class OptimizeCliTests extends AnyFreeSpec with Matchers {
           yield
             val out = new java.io.ByteArrayOutputStream
             val status = Console.withOut(out)(
-              cli(Config(command = "run", file = path, noCoreLib = true, optimize = level)))
+              driver(Config(command = "run", file = path, noStdLib = true, optimize = level)))
 
             withClue(s"-O$level") { status.shouldBe(0) }
             out.toString
@@ -128,7 +134,7 @@ class OptimizeCliTests extends AnyFreeSpec with Matchers {
       try
         val errs = new java.io.ByteArrayOutputStream
         val status = Console.withErr(errs)(
-          cli(Config(command = "run", file = path, noCoreLib = true, optimize = "nonsense")))
+          cli(Config(command = "run", file = path, noStdLib = true, optimize = "nonsense")))
 
         status.should(not).be(0)
         errs.toString should include("clang")

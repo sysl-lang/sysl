@@ -1,11 +1,17 @@
 # Capabilities
 
-**Status:** core mechanism decided, and the **module half is built** — `no alloc` and `requires`
-are read from a file's header, the files of a module are held to agreeing, and `no alloc` is
-enforced both against the module's own constructions and against what its calls arrive at. The
-**target half is not**: nothing declares what a target offers, so a module's effective set is
-everything it did not narrow away, and `requires` against a *target* is documentation until there is
-one that could fail to satisfy it.
+**Status:** core mechanism decided and **both halves built**. `@no_alloc` and `@requires(...)` are
+read from a file's header, the files of a module are held to agreeing, and the narrowing is enforced
+against the module's own constructions and against what its calls arrive at. The **target half** is
+built too: `package.hocon` declares what each target provides (`packages.md § 2`), a module's
+effective set is that intersected with its own narrowing, and `@requires` is finally answered against
+a machine rather than being documentation.
+
+**The clauses are written as attributes**, in the notation `@test` and `@tailrec` already used. They
+were once grammar — `no alloc`, `requires alloc` — which reserved `no`, `alloc` and `requires` and
+took the most natural name in an allocator away from the code that provides one. Nothing about the
+model changed with the spelling; what changed is that a capability is now said *about* a module
+rather than being a construct the language executes, which is what it always was.
 
 **The three environment capabilities are enforced too, and against the module graph rather than
 against a target.** Each became checkable the day the library grew a module declaring it — `sysl.fs`
@@ -21,9 +27,12 @@ that lets one language span safe application code and allocator-free kernel/driv
 mechanism spans three layers — project config (targets declare capabilities), the module
 system (propagation, per-module restriction), and the type system (`alloc` gates the memory
 modes). **The target registry is now its own doc and is built — `targets.md`** — so what a
-target *is* and how one is named are settled; what is still to be written is the project-config
-and module-resolution half around it (the HOCON `sysl.conf` schema, per-target capability sets,
-and filename-axis platform selection). This one is the capability model.
+target *is* and how one is named are settled, and the project-config half around it is now
+`packages.md`: the `package.hocon` schema, per-target capability sets, and the dependency model
+that lets a *package* carry a capability requirement the way a module does. `packages.md` is
+**built for exactly the capability half** — the file is parsed and its per-target sets are what
+the two-level rule below is now measured against — and unbuilt for everything about dependencies.
+This one is the capability model.
 
 ## Two kinds of capability
 
@@ -80,7 +89,7 @@ nothing at all while `sysl.thread` requires two.
 3. **A module may narrow below the target**, in source — the enforcement lever:
    ```
    module oskit.arch
-   no alloc            // allocator-free, enforced: &T in this module is a compile error
+   @no_alloc           // allocator-free, enforced: &T in this module is a compile error
    ```
    This lets you write provably allocator-free kernel/driver code **even on a hosted target
    that has an allocator**. The boundary is compiler-checked, not a naming convention.
@@ -91,7 +100,7 @@ nothing at all while `sysl.thread` requires two.
 The optional other direction — a module that fundamentally needs a capability — is `requires`:
 ```
 module std.heap
-requires alloc      // one clean error if built for a no-alloc target,
+@requires(alloc)    // one clean error if built for a no-alloc target,
                     // instead of one error at every &T
 ```
 `requires` is documentation plus an early, precise diagnostic; it is not needed for
@@ -170,17 +179,19 @@ allocator-free everywhere.
   `no posix`, and the assertion is enforced against the module graph. What settled it was not a
   decision but an arrival: the question was academic while nothing required `os`, and `sysl.fs` is
   what gave the clause something to refuse.
-- **Config / module-resolution details** — the HOCON `sysl.conf` schema, per-target capability
-  sets, and filename-axis platform selection are still to be written. **The target registry
-  itself is done (`targets.md`)**: a target is a value with a name, a triple, and the ABI facts
-  codegen reads, and `--target` selects one. What it deliberately does *not* carry is
-  capabilities — that is exactly the part a project has an opinion about, so it belongs to the
-  config rather than to the fixed table.
-  **Expect the project config to be revisited repeatedly** as the language grows, and
-  especially once external libraries and dependency management arrive. Design only the minimum
-  that unblocks the work at hand (root, active target, capabilities, build flags, platform-file
-  selection); let real needs drive versioning, dependency resolution, workspaces, and
-  publishing rather than guessing at them upfront.
+- **Config / module-resolution details** — **now written, in `packages.md`**: the `package.hocon`
+  schema, per-target capability sets, and a package-level `requires` block. Filename-axis platform
+  selection is the one piece still unwritten. **The target registry itself is done (`targets.md`)**:
+  a target is a value with a name, a triple, and the ABI facts codegen reads, and `--target` selects
+  one. What it deliberately does *not* carry is capabilities — that is exactly the part a project
+  has an opinion about, so it belongs to the config rather than to the fixed table, and
+  `packages.md § 2` fixes the line: **capabilities are policy and ABI is not**, so a config may add
+  capabilities to a registry target but may not overrule a measured fact.
+  **Expect the project config to be revisited repeatedly** as the language grows. That advice stands
+  and `packages.md` deliberately went past it — it designs versioning, resolution and vendoring
+  ahead of anything needing them, at the user's direction and with the risk recorded in its own
+  status header. Nothing there is built, so it is a design to be checked against a first
+  implementation rather than a constraint on one.
 - **`requires` granularity** — module-level only, or also finer? Module-level is the unit a
   *declaration* is written at, and that has not changed. What did change is that the **question**
   turned out to be finer than the declaration: `alloc` is checked against what a module calls, for
@@ -201,12 +212,17 @@ allocator-free everywhere.
   `sysl.fs` was written, `threads` when `sysl.thread` was. The refusal that carried them until then
   refuses nothing today and stays for the next capability, which will arrive declared before it is
   gated.
-- **The clause spends two ordinary words, and one of them is wanted.** `no alloc` and `requires
-  alloc` are read by the lexer, so `no`, `alloc` and `requires` are all reserved and none of them may
-  name anything. `guide/slab` ran into it immediately: an allocator's central function is called
-  `alloc` in every language that has one, and that is the one name it cannot have — it is spelled
-  `take` there. The cost is small and the shape of it is not, because it falls hardest on exactly the
-  code that *provides* the capability the word gates. Neither the clause nor the word is wrong; what
-  is worth deciding is whether a capability's name has to be a keyword at all, or whether the clause
-  can read an ordinary identifier in that position the way `import` reads a module path — which
-  would give `alloc`, `os` and `posix` back to programs and keep the clause reading the same.
+- ~~**The clause spends two ordinary words, and one of them is wanted.**~~ — **CLOSED. The clauses
+  are attributes**, `@no_alloc` and `@requires(...)`, and an attribute's name arrives as an ordinary
+  identifier rather than through the lexer's reserved list. `no`, `alloc`, `requires` and `link` are
+  all names a program may use again.
+
+  The answer went further than this bullet proposed. It suggested keeping the clause and reading an
+  ordinary identifier in the capability's *position*, which would have freed `alloc` and left `no`
+  and `requires` spent. Moving the whole family into the notation sysl already had for saying
+  something *about* a declaration frees all of them, and it makes the header one notation rather than
+  two: `@test` and `@tailrec` were already written that way.
+
+  `guide/slab` is the file that reports it, because it is the one that paid — an allocator's central
+  function is called `alloc` in every language that has one, and that guide had to call it `take`.
+  It is called `alloc` now.

@@ -317,6 +317,87 @@ declaration — and what a body may then do with that parameter is what *its* bo
 does not run backwards through a bound: a parameter appearing only there is solved from the result type
 or annotated.
 
+### A trait object satisfies a bound on the trait it dispatches through
+
+A bound asks whether the members it names can be called on the value. A `*Trait` or a `&Trait` has
+forgotten which type it holds, but it carries a **table** of exactly those members — so it answers
+yes, and one generic function takes both a concrete type and the object erased from it:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Rect
+    w: int
+    h: int
+
+impl Shape for Rect
+    area(self) -> int = self.w * self.h
+
+total[T: Shape](x: T) -> int = x.area()
+
+var o: &Shape = Rect(3, 4)
+
+print(total(Rect(3, 4)))
+print(total(o))
+```
+
+```output
+12
+12
+```
+
+**Nothing about [monomorphization](#monomorphization) is bent to allow it.** An object type is a
+concrete type — a pair of words — so the body is instantiated at `&Shape` exactly as it is at `Rect`,
+once each. What differs between the two instantiations is what `x.area()` compiles to: a direct call
+in one, an indirect call through the table in the other. That is the same difference the two
+instantiations would have had anyway, and it is decided the same way — by looking at the type the
+parameter was bound to.
+
+**It is total, and that is a property of object safety rather than a promise made here.** A trait
+with a member that cannot be dispatched — one mentioning `Self` away from its receiver, say — has no
+object *at all* in sysl, rather than an object missing that member. So a `&Shape` existing is already
+the proof that every member of `Shape` is reachable through it, and there is no "this method is
+unavailable on the object" case for a bound to trip over.
+
+It follows for **required** traits with no rule of its own. `trait Shape: Display` puts `Display`'s
+slots in the object's table, and a bound on a trait is already satisfied wherever a bound on one that
+requires it is — so a `show[T: Display](x: T)` takes the same `o`.
+
+What an object still does not satisfy is a bound on any *other* trait: the table is what answers, and
+a trait with no slots in it has nothing to answer with.
+
+```sysl
+trait Shape
+    area(self) -> int
+
+trait Weighed
+    weight(self) -> int
+
+struct Rect
+    w: int
+    h: int
+
+impl Shape for Rect
+    area(self) -> int = self.w * self.h
+
+heft[T: Weighed](x: T) -> int = x.weight()
+
+var o: &Shape = Rect(3, 4)
+
+print(heft(o))
+```
+
+```error
+'heft' requires its type parameter 'T' to implement 'Weighed', but &Shape does not
+```
+
+**Satisfying a bound is not the same as being erasable again.** A bound asks what may be *called*
+through a value; forming an object asks what may be *assembled* from its type, and a table is laid
+out from a type's implementations. An object has none, so a `&Shape` cannot be turned into a
+`&Display` even though `Display`'s slots are sitting inside its table — a run of slots in one table
+is not a table of its own ([traits]({{< ref "traits" >}})).
+
 ### A type's own parameters carry bounds too
 
 The same bracketed list, in the same place, means the same thing on a struct or an enum — and that is

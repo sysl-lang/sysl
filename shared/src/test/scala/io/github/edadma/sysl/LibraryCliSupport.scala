@@ -20,19 +20,24 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
    * unqualified.
    *
    * **A compilation that finds no standard module is an error**, and these tests run in a tree where
-   * none has been built — so one that says nothing about the core gets `--no-core-lib`, which is what
+   * none has been built — so one that says nothing about the standard module gets `--no-std-lib`, which is what
    * it means: *this test is about `--lib`, or about the driver, and not about which standard module a
    * compilation gets.* Spelled once here rather than at twenty call sites.
    *
-   * A test that mentions the core **in any way** — names one, refuses one, redirects the search path,
+   * A test that mentions the standard module **in any way** — names one, refuses one, redirects the search path,
    * or builds one — opts out of this entirely and is run exactly as it was written. Otherwise this
    * default would quietly rewrite the premise of the very tests that exist to pin it.
    */
-  protected def cli(cfg: Config): Int =
-    io.github.edadma.sysl.execute(if mentionsCore(cfg) then cfg else cfg.copy(noCoreLib = true))
+  protected def cli(cfg: Config): Int = Console.withOut(Discarded)(driver(cfg))
+
+  /** The same run with stdout left where it was, for the three helpers below that capture it. Every
+   * other call goes through `cli`, which throws it away — see `Discarded`.
+   */
+  private def driver(cfg: Config): Int =
+    io.github.edadma.sysl.execute(if mentionsCore(cfg) then cfg else cfg.copy(noStdLib = true))
 
   protected def mentionsCore(cfg: Config): Boolean =
-    cfg.core || cfg.noCoreLib || cfg.coreLib.isDefined || cfg.coreSearch != LibraryArtifact.coreDefault
+    cfg.std || cfg.noStdLib || cfg.stdLib.isDefined || cfg.stdSearch.isDefined
 
   protected val library =
     """module demo
@@ -78,21 +83,21 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
   protected def artifactOf(root: String): String = {
     val out = createTempFile("sysl-cli-", LibraryArtifact.extension)
 
-    cli(Config(command = "build-lib", file = root, output = Some(out))) shouldBe 0
+    succeeds(Config(command = "build-lib", file = root, output = Some(out)))
     out
   }
 
-  /** The standard module built into an artifact, which is what `--core-lib` consumes. Built once —
+  /** The standard module built into an artifact, which is what `--std-lib` consumes. Built once —
    * it is the slowest thing in this file, and every test below wants the same one.
    */
-  protected lazy val core: String = {
-    val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
+  protected lazy val std: String = {
+    val out = createTempFile("sysl-cli-std-", LibraryArtifact.extension)
 
-    cli(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true)) shouldBe 0
+    succeeds(Config(command = "build-lib", file = StdRoot.root.get, output = Some(out), std = true))
     out
   }
 
-  /** A driver run with its diagnostics captured, since for `--core-lib` the warning *is* the
+  /** A driver run with its diagnostics captured, since for `--std-lib` the warning *is* the
    * observation: falling back and linking both exit 0, and only stderr tells them apart.
    */
   protected def diagnostics(cfg: Config): (Int, String) = {
@@ -101,6 +106,26 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
     val status = Console.withErr(captured)(cli(cfg))
 
     (status, captured.toString)
+  }
+
+  /** A run asserted to have succeeded, and one asserted to have been refused — both with the
+   * driver's diagnostics caught rather than let out onto the console.
+   *
+   * `build-lib` announces the artifact it wrote, and a refusal prints the reason it was refused; a
+   * suite made largely of those two says a great deal on stderr and none of it about the tests that
+   * ran. Nothing is lost by catching them, because it is the *failing* assertion that wants them:
+   * what was captured becomes the failure message, which is more than a bare status ever said.
+   */
+  protected def succeeds(cfg: Config): Unit = {
+    val (status, notes) = diagnostics(cfg)
+
+    withClue(notes)(status shouldBe 0)
+  }
+
+  protected def refused(cfg: Config): Unit = {
+    val (status, notes) = diagnostics(cfg)
+
+    withClue(notes)(status should not be 0)
   }
 
   /** A driver run with the program's own output captured — `run` prints what the child wrote, so
@@ -116,7 +141,7 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
   protected def ran(cfg: Config): String = {
     val out    = new java.io.ByteArrayOutputStream
     val notes  = new java.io.ByteArrayOutputStream
-    val status = Console.withOut(out)(Console.withErr(notes)(cli(cfg)))
+    val status = Console.withOut(out)(Console.withErr(notes)(driver(cfg)))
 
     if status != 0 then fail(s"the driver exited with $status:\n${out.toString}${notes.toString}")
 
@@ -142,8 +167,10 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
    */
   protected def emitted(cfg: Config): String = {
     val captured = new java.io.ByteArrayOutputStream
+    val notes    = new java.io.ByteArrayOutputStream
+    val status   = Console.withOut(captured)(Console.withErr(notes)(driver(cfg)))
 
-    Console.withOut(captured)(cli(cfg)) shouldBe 0
+    withClue(notes.toString)(status shouldBe 0)
     captured.toString
   }
 
@@ -185,11 +212,11 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
     FakeAr(LibraryArtifact.metadataMember ->
       LibraryArtifact.framed(s"syslib ${LibraryArtifact.Version} 900", "short"))
 
-  /** The real core's metadata wearing somebody else's fingerprint — a readable, decodable artifact
+  /** The real std's metadata wearing somebody else's fingerprint — a readable, decodable artifact
    * that is simply not the standard module this compiler carries.
    */
   protected def stale: String = {
-    val meta = LibraryArtifact.metadataOf(core, readBytes(core)) match
+    val meta = LibraryArtifact.metadataOf(std, readBytes(std)) match
       case Right(m)  => m
       case Left(err) => fail(err)
 

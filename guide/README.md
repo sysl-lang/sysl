@@ -28,7 +28,7 @@ that quietly stopped running would otherwise look like a check that passed.
 die rather than report it, and the run would look truncated instead of failing. The run therefore
 asserts a refusal only through a total operation that answers instead of trapping.
 
-**The traps are asserted in `#test(should_trap)` functions** (`testing.md`), which live in the
+**The traps are asserted in `@test(should_trap)` functions** (`testing.md`), which live in the
 program's own directory and are run by `sysl test <directory>`. Each runs in a process of its own
 and passes by not coming back, so a trap is an observation there rather than the end of the run —
 which is what lets a refusal be stated in sysl, beside the code it is about. `guide/ring` was the
@@ -45,25 +45,32 @@ contract.
 | `hashmap` | the trait system under load — bounds, the behaviour they promise, and ownership at once |
 | `bytecode` | the module system, and the set's one end-to-end assertion — source in, bytecode out, run it |
 | `png` | the byte level — endianness, bit streams, checksums, a format someone else defined |
-| `fft` | arithmetic on a type the program defined, and floating point |
+| `fft` | an algorithm checked against its own definition |
 | `sha2` | generic arithmetic — one algorithm at two widths — and static tables |
 | `shapes` | dynamic dispatch — a heterogeneous collection whose element types are forgotten |
 | `scheduler` | OS shapes — a run queue, blocking and waking, and `&T` graphs mutated through references |
 | `kernel` | the same scheduler with no heap — a fixed table, indices for identity, intrusive lists |
 | `datetime` | a conversion that can succeed twice — wall clocks, timelines, and daylight saving |
 | `matrix` | an operator whose result is neither operand's type — a vector space, then Gaussian elimination |
-| `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts and struct invariants |
+| `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts, struct invariants, and a loop's termination measure |
 | `slab` | raw storage — reinterpreting bytes as a typed pointer, `sizeof`/`alignof`, and a free list threaded through the free blocks themselves |
+| `lisp` | the reference cycle — the one shape a count cannot reclaim, `weak T` as both the cure and the instrument that measures it |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is
 a variation, and belongs in the test suite instead.
 
-**`slab` is written as a literate file** (`15 §11`), and it is the one program here that is. Its
-findings ran to sixty lines of header comment before anything executable appeared, which is the
-length at which a comment stops being one — so `slab.lsysl` is a document with the program indented
-inside it, and the essay that was fighting the `//` is prose. Nothing about the program changed; the
+**`slab` and `lisp` are written as literate files** (`15 §11`). Both crossed the same line: their
+findings ran past sixty lines of header comment before anything executable appeared, which is the
+length at which a comment stops being one — so each is a document with the program indented inside
+it, and the essay that was fighting the `//` is prose. Nothing about either program changed; a
 directory holds a `.lsysl` beside `.sysl` files and `Project.collect` reads both.
+
+**The threshold is worth stating, because it is the whole of when to reach for the format.** It is
+not comment *volume* — it is an argument that has to sit between two declarations rather than above
+one. `lisp` has four paragraphs inside the body of `eval`, each explaining the arm under it; as
+`//` they were a wall above the function that nobody would read at the point it mattered. Consecutive
+indented blocks are one block, so prose costs the program nothing to split.
 
 ## What each program found
 

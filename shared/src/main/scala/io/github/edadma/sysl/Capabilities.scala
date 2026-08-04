@@ -3,10 +3,12 @@ package io.github.edadma.sysl
 /** The named environment facts a module may narrow away or declare it needs (`capabilities.md`).
  *
  * The set is a property of the **project**, not of the grammar: a capability's name arrives from
- * the parser as whatever was written, and this is what says which spellings mean something. It is
- * fixed here rather than read from configuration because the configuration half — per-target
- * capability sets in `sysl.conf` — is not written yet, and the four below are what
- * `capabilities.md` calls the core set.
+ * the parser as whatever was written, and this is what says which spellings mean something.
+ *
+ * The **names** are fixed here and the **answers** are not: `package.hocon` says which of them each
+ * target provides (`PackageConfig`), and a name it uses that is not one of these is refused there
+ * for the same reason a clause naming one is refused here. Adding a capability is therefore still an
+ * edit to this file — what the config decides is what a machine offers, never what a capability is.
  */
 object Capability {
 
@@ -77,6 +79,7 @@ trait Capabilities extends AnalyzerBase {
 
     for (module, files) <- units.groupBy(declaredModule) do
       checkAgreement(module, files)
+      checkAgainstTarget(module, files.head)
       record(module, files.head)
 
     // The library's own headers, read but **not checked**. They were checked when the library was
@@ -87,7 +90,7 @@ trait Capabilities extends AnalyzerBase {
     // Reading them is what makes an environment capability answerable at all: `no os` is refused
     // where it reaches `sysl.fs`, and there is no such thing as reaching `sysl.fs` unless
     // `sysl.fs`'s own `requires os` has been read off the library this compilation was handed.
-    for (module, files) <- core.contributed(building).groupBy(declaredModule) do
+    for (module, files) <- std.contributed(building).groupBy(declaredModule) do
       record(module, files.head)
   }
 
@@ -104,6 +107,36 @@ trait Capabilities extends AnalyzerBase {
     if narrows.nonEmpty then moduleNarrows(module) = spread(narrows)
     if requires.nonEmpty then moduleRequires(module) = spread(requires)
   }
+
+  /** Refuses a module that requires something the target does not provide (`capabilities.md
+   * § Two levels`).
+   *
+   * This is the whole point of writing `requires` rather than relying on use sites: the chapter's
+   * own words are *"one clean error if built for a no-alloc target, instead of one error at every
+   * `&T`"*, and this is that error. It is reported per **module** rather than per file, since the
+   * clause is a property of the module and its files have already been held to agreeing.
+   *
+   * Only the modules this compilation contributes are asked. A library module requiring `os` is not
+   * a mistake on a target without one — it is a module that program cannot reach, which is a
+   * different diagnostic in a different pass.
+   */
+  private def checkAgainstTarget(module: String, first: Program): Unit =
+    for
+      c <- first.capabilities if c.direction == CapabilityDirection.Requires && enforceable(c)
+      // The least by name, so a clause whose implications are both absent reports one thing rather
+      // than a pair whose order came out of a set.
+      cap <- Capability.closure(c.name).filterNot(provides).toList.sorted.headOption
+    do
+      recover(())(at(c.pos)(err(s"${moduleLabel(module)} requires '$cap', and '${target.name}' does " +
+        s"not provide it — a target's capabilities are what '${PackageConfig.FileName}' declares, so " +
+        "either the module cannot be built for this machine or the config is understating it")))
+
+  /** How a module refers to itself in a diagnostic. The root module has no name to print, and a
+   * program's own files are in it, so the common case reads as a sentence rather than as an empty
+   * pair of quotes.
+   */
+  private def moduleLabel(module: String): String =
+    if module.isEmpty then "this module" else s"'$module'"
 
   /** Whether a clause is one `checkClause` let through. */
   private def enforceable(c: CapabilityClause): Boolean =
@@ -197,6 +230,7 @@ trait Capabilities extends AnalyzerBase {
     if u.capabilities.isEmpty then "none"
     else
       u.capabilities
-        .map(c => if c.direction == CapabilityDirection.Narrows then s"'no ${c.name}'" else s"'requires ${c.name}'")
+        .map(c =>
+          if c.direction == CapabilityDirection.Narrows then s"'@no_${c.name}'" else s"'@requires(${c.name})'")
         .mkString(", ")
 }

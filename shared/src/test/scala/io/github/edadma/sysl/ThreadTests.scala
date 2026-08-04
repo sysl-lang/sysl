@@ -390,7 +390,7 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val out = errOf(
         "quiet/work.sysl" ->
           """module quiet
-            |no threads
+            |@no_threads
             |
             |import sysl.thread.Mutex
             |
@@ -410,7 +410,7 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val out = errOf(
         "bare/work.sysl" ->
           """module bare
-            |no os
+            |@no_os
             |
             |import sysl.thread.yield_now
             |
@@ -426,7 +426,7 @@ class ThreadTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // The narrowing is now accepted where it used to be refused outright, and a module that gave
     // threads up goes on compiling — it just cannot reach the one module that needs them.
     "while giving them up on its own is an ordinary clause" in {
-      super.run("no threads\n\nprint(1 + 1)") shouldBe "2\n"
+      super.run("@no_threads\n\nprint(1 + 1)") shouldBe "2\n"
     }
   }
 

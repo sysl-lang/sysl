@@ -74,7 +74,10 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
     // this only ever happens on the way to a read.
     case other =>
       val slot = emitAlloca(freshTemp(), other.ty.llvm)
-      emit(s"store ${other.ty.llvm} ${genExpr(other)}, ptr $slot")
+      // A large one is written into the slot rather than produced and then stored into it — the
+      // slot is what it was going to end up in either way.
+      if Layout.indirect(other.ty) then genBorrowedInto(slot, other)
+      else emit(s"store ${other.ty.llvm} ${genExpr(other)}, ptr $slot")
       slot
 
   /** Writes `v` into the place at `p`. A slot that holds a count takes one for the value arriving
@@ -82,12 +85,20 @@ trait PlaceEmitter extends ArcEmitter with ScalarEmitter {
    * drops the last count.
    */
   protected def storeInto(ty: Type, p: String, v: String, q: String = ""): Unit =
-    if containsRef(ty) then
+    if !containsRef(ty) then emit(s"store$q ${ty.llvm} $v, ptr $p")
+    // A large aggregate gives its old contents back at the address rather than out of a value read
+    // for the purpose. The order is the same one the value form keeps and for the same reason: the
+    // count for the arriving value is taken first, so assigning something to itself never briefly
+    // drops the last one.
+    else if Layout.indirect(ty) && q.isEmpty then
+      retainValue(ty, v)
+      releaseAt(ty, p)
+      emit(s"store ${ty.llvm} $v, ptr $p")
+    else
       val old = freshTemp(); emit(s"$old = load$q ${ty.llvm}, ptr $p")
       retainValue(ty, v)
       emit(s"store$q ${ty.llvm} $v, ptr $p")
       releaseValue(ty, old)
-    else emit(s"store$q ${ty.llvm} $v, ptr $p")
 
   /** `a, b = b, a` (`00 §2`), in the phases the form promises.
    *

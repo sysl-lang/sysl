@@ -126,11 +126,27 @@ trait AnalyzerBase extends Scoping {
    */
   protected class LoopCtx(val expected: Option[Type], val label: Option[String]):
     val breakTys = mutable.ListBuffer.empty[Type]
+
+    /** The slot name and integer type of this loop's `variant`, where it declared one (`17 §3`).
+     * Filled in once the body has been analyzed, and read by whichever loop form built the context
+     * so it can wrap itself in a `TCheckedLoop`.
+     */
+    var variant: Option[(String, Type)] = None
   protected var loops: List[LoopCtx] = Nil
+
+  /** A loop body's `variant` on its way out to the context above, set after the body's own
+   * statements are analyzed so that a nested loop has already taken and cleared its own.
+   */
+  protected var pendingVariant: Option[(String, Type)] = None
+
+  /** Numbers the variant slots so two loops in one function cannot share storage. */
+  protected var variantSeq: Int = 0
 
   protected def resetFunction(): Unit = {
     resetLocals()
     loops = Nil
+    pendingVariant = None
+    variantSeq = 0
     ensureResultTy = None
     oldBuf = None
     multiOk = false

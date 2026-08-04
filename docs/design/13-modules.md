@@ -12,12 +12,13 @@ as it does, and the graph those references make held to being acyclic. The capab
 clause does not currently parse at all. What it is *not* waiting for any more is the target — that
 used to be the stated blocker, and it is stale: `Target` is a real value with a registry of ten
 targets, a `--target` flag and a `targets` command. What is genuinely missing from open item (a) is
-the `sysl.conf` schema and platform-file selection, neither of which a `no alloc` check needs. Two written docs already lean on modules: `capabilities.md` attaches
+the `package.hocon` schema and platform-file selection, neither of which a `no alloc` check needs. Two written docs already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
 `cross-platform.md` fixes that "module names follow the directory tree relative to the project
 root." This chapter defines what a module **is** so those have something to name, and consolidates
 the module-side of the capability machinery `capabilities.md` specifies. Where it commits a
-spelling it says so; the *open* list records what waits for the project-config doc.
+spelling it says so; the *open* list records what waits for the project-config doc, which is now
+written as `packages.md`.
 
 This chapter rests on `capabilities.md` (capabilities are a per-module property that propagates
 through imports — this chapter is the module half of that contract), `cross-platform.md` (the
@@ -244,9 +245,17 @@ library's is not.
 
 This is what keeps an `impl` for a built-in from spending names. `sysl.math`'s `Float` declares some
 forty-one members on `real` and `f32`, and a program that never imports the module may still declare
-a trait of its own with any of those names and implement it for either width. `guide/fft` does: its
-`Zero` is implemented for `real` alongside the library's, and the bound on `sum` says which one the
-body means.
+a trait of its own with any of those names and implement it for either width. Where the program does
+import the module, both members are in scope at once and a **bound** is what says which one a body
+means.
+
+**The escape stops exactly where `08` does, and `guide/fft` is where that showed up.** A trait's
+members become the implementing type's, so a name is free only if the type does not already declare
+one — the rule two paragraphs down, seen from the other side. That program wanted a `trait Zero` with
+a `zero() -> Self` and implements it for `real` and for `sysl.math.complex`'s `Complex`; the first is
+fine, and the second is refused, because `Complex` declares a `zero` in its own body. It names the
+member `identity` instead. A trait a program writes for types it did not write has to find a name
+still free on **all** of them, and the more ordinary the concept the likelier that it is not.
 
 **Two traits may therefore give one type a member of one name, and three things tell them apart, in
 this order.** A **bound** answers first, because inside a generic body the signature already said
@@ -356,6 +365,16 @@ is reachable two ways and they agree: it is auto-imported into every file, so it
 import step and takes part in the wildcard rules above, and it is also the last step on its own, so
 a name it declares resolves even where a file's imports say nothing.
 
+**The three steps rank a name by where it was written, not by what kind of thing it is.** A
+function, a `const`, a module-level `val`, an `extern` variable and an enum variant are five tables,
+and a bare name may be any of them — but a program's own declaration answers before an import's and
+an import's before the library's *whichever* table each is in. So a program that declares `extern
+"__stdoutp" stdout: *u8` reaches C's stream, though the library declares a `stdout()` of its own, and
+the library's is still there under `sysl.stdout`. The rule is worth stating because the tables can
+only be asked one at a time, and asking them in a fixed order is precisely how a nearer declaration
+loses to a further one — the reader is looking at a declaration on their own screen, and nothing
+about a name says which table will claim it.
+
 **The library's own files take the same three steps.** They are files of modules, and the module each
 is in is one of the library's, so "this module first" can only ever hand a library file the library's
 own declaration — there is nothing for a special order to protect it from. A file of the library may
@@ -435,25 +454,32 @@ with separate costs. What the build driver does with this belongs to open item (
 computed; this section states only how they attach to the module model of §1, which is the piece
 that doc left to here.
 
-- **A capability clause narrows the module**, and it is written in the **file header** beside
-  `module`. Because the module is the directory (§1) and the clause is a property of the module,
-  a narrowing clause **must appear consistently in every file of the module** — the compiler
+- **A capability attribute narrows the module**, and it is written in the **file header** below
+  `module`. Because the module is the directory (§1) and the capability is a property of the module,
+  a narrowing **must appear consistently in every file of the module** — the compiler
   rejects a module whose files disagree. The redundancy buys local legibility: you can never open
-  a file in a `no alloc` module and fail to see that it is `no alloc`.
-- **Each clause takes a line of its own**, below the header rather than beside it, which is what
-  keeps `module oskit.arch no alloc requires os` from being a line anyone has to read. A file that
+  a file in a `@no_alloc` module and fail to see that it is one.
+- **They are attributes rather than grammar, and that is what keeps the words.** `@no_alloc` and
+  `@requires(...)` are written in the notation `@test` and `@tailrec` already used, and an
+  attribute's name is an ordinary identifier — so `no`, `alloc`, `requires` and `link` all remain
+  available to a program. Spelled as keywords they were reserved, and `guide/slab` had to call its
+  allocator's central function `take` because `alloc` was taken.
+- **Each takes a line of its own**, below the header rather than beside it, which is what
+  keeps `module oskit.arch @no_alloc @requires(os)` from being a line anyone has to read. A file that
   declares **no** module may still carry one, since the anonymous root module of §1 is a module like
   any other and a one-file program is exactly that case.
 
 ```
 // oskit/arch/cpu.sysl          // oskit/arch/mmu.sysl
 module oskit.arch               module oskit.arch
-no alloc                        no alloc            // same clause, enforced identical
+@no_alloc                       @no_alloc           // same attribute, enforced identical
 ```
 
-- **`requires alloc`** (and the other direction) is likewise a module-header clause, documenting
-  and early-diagnosing a hard dependency, per `capabilities.md`.
-- **The header has one other inhabitant, and it is deliberately not held to agreeing.** `link "z"`
+- **`@requires(alloc)`** (and the other direction) is likewise a module-header attribute, documenting
+  and early-diagnosing a hard dependency, per `capabilities.md`. It takes a **list**, because a
+  module often needs more than one at once — `sysl.thread` is `@requires(threads, posix)` — where a
+  narrowing gives up one at a time.
+- **The header has one other inhabitant, and it is deliberately not held to agreeing.** `@link("z")`
   (`15 §8`) names a library the file's `extern`s need, and the files of a module may each name their
   own. The rule differs because what is being described does: a capability is a property of the whole
   module, so files that disagreed would describe different modules, while a link requirement is a
@@ -495,8 +521,9 @@ for (`cross-platform.md`, and the pattern the old compiler reached for with its 
 relaxation).
 
 The **exact suffix grammar and the resolution rule** — which filename shapes mark a platform, how
-the active target is chosen, and the `sysl.conf` schema that ties it together — belong to the
-**project-config doc**, which `capabilities.md` already flags as unwritten. This chapter fixes
+the active target is chosen, and the `package.hocon` schema that ties it together — belong to
+**`packages.md`**, which now carries the schema; the suffix grammar itself is the one part of that
+promise still unwritten. This chapter fixes
 only that the *module identity* is invariant under platform selection; the file axis lives below
 the module name, not beside it.
 
@@ -1010,12 +1037,32 @@ Five consequences worth stating, because each is a thing a reader would otherwis
   supplied is keyed outside the library's own modules.
 
 **The standard module is built the same way.** `sysl`'s own source is ordinary sysl files under
-`lib/sysl`, and `sysl build-lib lib --core` compiles them — `--core` being the one thing that lets a
+`lib/sysl`, and `sysl build-lib lib --std` compiles them — `--std` being the one thing that lets a
 compilation declare a module the compiler otherwise supplies. It is written down rather than inferred
 from the module names in the tree, because a build that guessed would turn a clear refusal — *you
 cannot add to the module every program is compiled against* — into an artifact that builds and then
-collides with the built-in copy at whatever link tried to use it. What a shipped compiler carries is
-generated from those files, so the files are the fact and the carrier cannot disagree with them.
+collides with the library at whatever link tried to use it.
+
+**Those files are what a compiler is installed with, and it reads them off disk.** An installed sysl
+finds them at `<prefix>/share/sysl/lib`, reached from its own resolved path — the ordinary Unix
+prefix layout, and exactly what Homebrew's `pkgshare` is. A sysl run out of a checkout finds `lib/`
+in the tree. `SYSL_LIB` names a root outright and is an escape hatch rather than the mechanism: a
+toolchain that had to be told where its own library was is one nobody could install.
+
+The source was **generated into the binary** for the whole of the language's first year, as a
+`StdSource` object written by the build. That guaranteed something real — a compilation could not
+fail to find its library — and it was bootstrap scaffolding rather than the design, for two reasons
+that both got heavier as the library grew. A library nobody can open is not one anybody can learn
+from, and the library is meant to be the worked example of what sysl is for. And a compiler that
+cannot be pointed at an edited copy is one whose library cannot be worked on at all except by
+rebuilding the compiler.
+
+`rustc` computes a sysroot from its own location, `clang` finds its resource directory the same way,
+`zig` its `lib/`. None of them carries a standard library inside the executable and none of them asks
+for a variable to be set. What replaces the guarantee is the **diagnostic**: a compiler that cannot
+find its library names every path it tried, in the order it tried them, and says how to name one.
+That is the whole of the trade, and it is why the message is specified rather than left to whatever
+the failure happened to be.
 
 A library is **analyzed before anything is written**. A library that does not check is broken once,
 by whoever built it; without that check the artifact ships anyway and every program that links
@@ -1059,23 +1106,33 @@ happens. Lifting that needs a library initializer the program calls before `main
 
 **And the standard module is linked by default, once it has been built.** Which library a compilation
 is compiled against is a **parameter** of it rather than an ambient fact — which is what lets two
-cores be handed to two compilations and compared — but the parameter has a default, and the default
+standard modules be handed to two compilations and compared — but the parameter has a default, and the default
 is found rather than named:
 
 ```
-sysl run prog.sysl                 # builds .sysl/core.syslib if it is not there, then finds it
-sysl build-lib lib --core          # the same artifact, written on demand
+sysl run prog.sysl                 # builds the artifact if it is not there, then finds it
+sysl build-lib lib --std          # the same artifact, written on demand
 ```
 
-One path at both ends. `build-lib --core` with no `-o` writes to `.sysl/core.syslib`, and a
-compilation with no `--core-lib` looks there; naming the path is for the cases where it is somewhere
-else. Handed one, a compilation does the whole of the above: it declares what the artifact compiled,
-monomorphizes the generics here, and links — rather than re-deriving every signature in the standard
-module before checking its own first line.
+One path at both ends. `build-lib --std` with no `-o` writes to it and a compilation with no
+`--std-lib` looks there; naming the path is for the cases where it is somewhere else. Handed one, a
+compilation does the whole of the above: it declares what the artifact compiled, monomorphizes the
+generics here, and links — rather than re-deriving every signature in the standard module before
+checking its own first line.
+
+**That path is in the user's cache, keyed by the library's fingerprint** — on this author's macOS,
+`~/Library/Caches/sysl/<fingerprint>/std.syslib`. It was once `./.sysl/std.syslib`, and the change is
+what an *installed* compiler forces: a clone has its own `lib/sysl`, so a per-tree artifact was right,
+but a compiler carrying the library inside itself would otherwise rebuild the same 900KB once per
+directory anyone ran it in, and leave a `.sysl/` wherever `sysl run` was typed. Keying on the
+fingerprint rather than a release number is what makes an upgrade need no invalidation: an edited
+`lib/sysl` hashes differently and therefore *is* a different path, so a stale hit cannot occur rather
+than being caught. Where a machine has no cache directory at all — a container with no home — the
+project-local path is still the answer.
 
 **The artifact is not committed.** It is object code for one machine, and building it takes under a
 second, so a clone or a fresh worktree builds its own. That makes drift the thing to guard against
-rather than staleness in the repository: the artifact carries a **fingerprint of the core sources it
+rather than staleness in the repository: the artifact carries a **fingerprint of the standard module sources it
 was built from** — a 64-bit FNV-1a over each file's basename and contents in sorted order, run
 through `fmix64` — and a compilation refuses one whose fingerprint is not the one the compiler
 carries. Sorting by basename rather than by path is what lets the artifact built from `lib/sysl` on
@@ -1089,6 +1146,17 @@ a fresh worktree and stale after a change to the tree encoding or the container,
 each, the same answer every time, and it takes well under a second to produce. Putting that to
 whoever ran the compiler buys nothing: there is no second option for them to choose.
 
+**A rebuild publishes by rename**, which is what keying the path on the library rather than on the
+directory costs. One key means one file for every compilation of that library on the machine, and
+nothing holds two of them apart: separate worktrees at one commit carry identical sources and so
+hash to identical paths, and so do two runs of the same suite. `ar` truncates its output before it
+writes, so a build that assembled in place would leave every concurrent reader a file that is
+briefly absent and then briefly half an archive — a failure with no diagnostic, since half an
+archive is simply an artifact that will not read. Assembled beside its destination and renamed onto
+it, a reader sees the whole of the previous artifact or the whole of the new one, and a rebuild that
+fails leaves the working artifact it was replacing rather than taking it down on the way to not
+producing one.
+
 **This is not the silent substitution the rule above forbids, and the difference is exact.** What a
 compiler must never do is answer *I could not find the library you meant* by compiling against a
 different one — which is why no C compiler that cannot find libc carries a spare. A rebuild compiles
@@ -1098,12 +1166,12 @@ been had the artifact been there. Nothing is substituted, so there is nothing to
 is announced on stderr rather than done invisibly, because a first build that pauses to do work
 should say what the work was.
 
-**An artifact named with `--core-lib` is not rebuilt, and one that cannot be read stops the
+**An artifact named with `--std-lib` is not rebuilt, and one that cannot be read stops the
 compilation** — corrupt, truncated, built by another sysl, or built from other sources than these.
 Someone who wrote down which standard module to compile against is owed the truth about that one
 rather than a different one built underneath them; it is the rule a named `--ar` already takes.
 
-**`--no-core-lib` is the one route to the copy the compiler carries.** That copy is there for the
+**`--no-std-lib` is the one route to the copy the compiler carries.** That copy is there for the
 compiler's own unit tests, which have to run in a tree where nothing has been built — and, once, for
 the bootstrap, since there was no released sysl to build the first artifact with. It is reached by
 asking for it, never by a lookup coming up empty. The distinction is what keeps it honest. A fallback taken silently would be a
@@ -1115,7 +1183,7 @@ since the two modules deliberately do not hold the same symbols — the standard
 ARC runtime beside them, are defined in place when the copy is carried and come from the artifact's
 object when it is linked, which is the difference the flag exists to make.
 
-**`build-lib --core` is exempt**, and must be: it is the command that produces the artifact, so
+**`build-lib --std` is exempt**, and must be: it is the command that produces the artifact, so
 requiring one would be a deadlock with nothing to break it.
 
 **The copy the compiler carries is a choice, not a necessity.** No other toolchain embeds its
@@ -1164,14 +1232,17 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
 
 ## Open (not yet decided)
 
-- **a. The project-config doc.** The `sysl.conf` (HOCON) schema, the target registry, and the
-  platform-file suffix grammar and resolution (§5) are a separate doc `capabilities.md` already
-  defers. **The project root is no longer part of it**: the driver takes one, as the path it is
-  given — `sysl run <dir>` makes that directory the root and compiles the tree beneath it. That is
-  the minimum that unblocks multi-module builds, and it costs nothing to keep when a config file
-  arrives, since a file only ever *names* a root the driver would otherwise be told. What is left
-  is the active target, the capability declarations, and platform-file selection; let real needs
-  drive dependency resolution, workspaces, and publishing rather than guessing them now.
+- **a. The project-config doc — mostly CLOSED, by `packages.md`.** The `package.hocon` schema, the
+  active target, the capability declarations and the dependency model are written there, along with
+  the namespacing rule this chapter's §1 forces (a module name is local and relative, so a fetched
+  `json` and your own `json` are one name — resolved by an optional per-consumer *mount*, with a
+  collision an error rather than a silent winner, and canonical identity taken from the coordinate so
+  `15 § 2`'s mangling never sees a mount). **The project root was already out of it**: the driver
+  takes one, as the path it is given — `sysl run <dir>` makes that directory the root and compiles
+  the tree beneath it, and a config file only ever *names* a root the driver would otherwise be told.
+  **What is left of this item is the platform-file suffix grammar and resolution (§5)**, which
+  `packages.md` does not attempt. Of `packages.md` itself, the file and its capability sets are
+  built; the dependency model is not.
 - **b. Re-export / facade modules.** Whether a module can re-export another's names (a `pub
   import`-style forwarding, so `std` can surface `std.fs.read`) is a real ergonomic want for
   building a curated public surface over sub-modules, and is left until the standard library's
@@ -1213,7 +1284,7 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
 - **h. What is in the standard library — the *where* is settled, the *what* is not.** A library now
   has somewhere to live and a way to be reached: §8 is the mechanism, `sysl` is the module name every
   program is compiled against, and its source is real sysl files under `lib/sysl` that the compiler's
-  own `build-lib --core` compiles. What that module should *contain* is the open half, and it is the
+  own `build-lib --std` compiles. What that module should *contain* is the open half, and it is the
   question the whole exercise was for.
 
   **The prelude is gone.** What a program starts with is a module, not a set of declarations threaded
