@@ -84,6 +84,24 @@ class SyslLibraryTests extends AnyFreeSpec with Matchers {
       assume(Sysl.canRun, "clang not available")
       Sysl.runBody("double(n: int) -> int = n * 2") shouldBe Right(Sysl.Run(0, ""))
     }
+
+    "and neither does an empty string, which is a body with nothing in it" in {
+      assume(Sysl.canRun, "clang not available")
+      Sysl.runBody("") shouldBe Right(Sysl.Run(0, ""))
+    }
+
+    // The statements land at the front of the declared `main`'s body, so they precede it whatever
+    // its shape — a `main` that reads the program's arguments is the shape most likely to have
+    // something written above it.
+    "the statements still run first where the declared 'main' takes the arguments" in {
+      assume(Sysl.canRun, "clang not available")
+      Sysl.runBody(
+        """print("first")
+          |main(args: []string)
+          |    print(args[1])""".stripMargin,
+        args = List("second"),
+      ) shouldBe Right(Sysl.Run(0, "first\nsecond\n"))
+    }
   }
 
   "a program of several files is compiled from strings" - {
@@ -93,6 +111,22 @@ class SyslLibraryTests extends AnyFreeSpec with Matchers {
         Sysl.File("t.sysl", "module tables\nval k: [2]int = [5, 6]", List("tables")),
         Sysl.File("main.sysl", "print(tables.k[1])"),
       )) shouldBe Right(Sysl.Run(0, "6\n"))
+    }
+
+    // Each file is wrapped on its own, so two files carrying statements become two `main`s rather
+    // than an order somebody has to guess at. The scaladoc says at most one file may carry them;
+    // this is what happens to a caller who does not.
+    "and a second file carrying statements is refused, since each is wrapped on its own" in {
+      Sysl.compileBodyFiles(List(
+        Sysl.File("a.sysl", "print(1)"),
+        Sysl.File("b.sysl", "print(2)"),
+      )) match
+        case Left(e)  => e should include("main")
+        case Right(_) => fail("expected a diagnostic")
+    }
+
+    "a program of no files at all is the empty program" in {
+      Sysl.compileBodyFiles(Nil).map(_.contains("define")) shouldBe Right(true)
     }
   }
 
