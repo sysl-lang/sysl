@@ -164,6 +164,10 @@ private[sysl] val parser = {
       cmd("targets")
         .action((_, c) => c.copy(command = "targets"))
         .text("list the machines sysl can build for"),
+      // A heading, because everything below belongs to no command and the usage would otherwise
+      // print it flush against the last one — where an option renders exactly as that command's own
+      // children do, so `--target` read as an option of `targets`.
+      note("\nOptions, which any command takes:"),
       // Flags rather than subcommands, because they are what somebody types before they know there
       // are subcommands — and each satisfies `checkConfig` below by naming a command of its own, so
       // `sysl --version` and `sysl --help` stand alone rather than being options to something else.

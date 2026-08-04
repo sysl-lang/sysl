@@ -98,7 +98,7 @@ class VersionCliTests extends AnyFreeSpec with Matchers {
       // it having been replaced by a hand-maintained string.
       val out = ran(Config(command = "help"))._2
 
-      for command <- List("run", "build", "build-lib", "test", "emit-llvm", "targets") do
+      for command <- List("run", "build", "build-lib", "test", "emit-llvm", "prove", "targets") do
         withClue(s"'$command' missing from the usage: ") { out should include(command) }
     }
 
@@ -107,6 +107,26 @@ class VersionCliTests extends AnyFreeSpec with Matchers {
 
       out should include("--version")
       out should include("--help")
+    }
+
+    "and puts the options that belong to no command under a heading of their own" in {
+      // An option renders exactly as a command's own children do — same indent, same shape — so
+      // printed flush against the last command they read as *its* options, and `sysl --target`
+      // looked like something `sysl targets` took. The heading is the separation, and each of these
+      // is asserted to fall on the far side of it rather than merely to be present.
+      val lines = ran(Config(command = "help"))._2.linesIterator.toList
+      val where = lines.indexWhere(_.startsWith("Options, which any command takes:"))
+
+      where should be > 0
+
+      // The line an option is *declared* on, which is the one that matters: `--lib` is also named in
+      // the prose of `build-lib`, above the heading, and a search for the text alone would find that
+      // and call it a pass.
+      for flag <- List("--version", "--help", "--explain-escapes", "--target", "--lib",
+                       "--std-lib", "--no-std-lib", "--ar", "--optimize")
+      do withClue(s"'$flag' is not declared under the heading: ") {
+        lines.indexWhere(l => l.startsWith("  -") && l.contains(flag)) should be > where
+      }
     }
 
     "while an invocation naming nothing still fails rather than helpfully succeeding" in {
