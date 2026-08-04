@@ -51,9 +51,6 @@ trait OperatorCalls extends MethodCalls {
 
       val rty  = m.retType.map(resolveReturn(_, self)).getOrElse(Type.Unit)
       val args = rhs.toList
-
-      funcsUsed += d.name
-
       val call = TCall(d.name, if d.swap then args :+ recv else recv :: args, rty)
 
       if d.negate then TUnary("!", call, Type.Bool) else call
@@ -134,6 +131,13 @@ trait OperatorCalls extends MethodCalls {
     val trName         = Library.key(spelling)
     val (swap, negate) = CoreTraits.derivation.getOrElse(op, (false, false))
     val method         = CoreTraits.required(spelling)._1
+    // Naming a function is reaching it, and the record is kept **here** rather than at the three
+    // callers because this is the one place a name is produced. A library's declaration is analyzed
+    // and emitted only once something has reached it, so a name resolved and not recorded is a call
+    // to a function the program never compiled — which the linker reports and no test does. Two of
+    // the callers hand the name over as data instead of building a call around it (`TDispatch`), and
+    // a record kept per caller is one each of them has to remember to keep.
+    def reached(d: TDispatch): TDispatch = { funcsUsed += d.name; d }
     // The right operand as the diagnostics below name it — the selector argument, which is every
     // argument but the result the implementation supplies.
     val rhs            = tr.args.take(math.max(0, tr.args.length - 1)).headOption
@@ -143,12 +147,12 @@ trait OperatorCalls extends MethodCalls {
       ty match
         case a: Type.Abstract =>
           if !satisfies(tr, a) then boundErr(s"'$op' needs '${a.name}: ${showBound(tr, a)}'")
-          Some(TDispatch(s"$trName.$method", swap, negate))
+          Some(reached(TDispatch(s"$trName.$method", swap, negate)))
         // The implementation is named by the rule a method call uses, which for a generic type is
         // the instantiation the receiver's own arguments make — `a + b` on a `Box[int]` reaches the
         // same function `a.add(b)` would. Where the type implements the trait more than once it is
         // the operand pair that says which, and the pair is what this bound was built from.
-        case _ if satisfies(tr, ty) => Some(TDispatch(traitMemberName(ty, tr, method), swap, negate))
+        case _ if satisfies(tr, ty) => Some(reached(TDispatch(traitMemberName(ty, tr, method), swap, negate)))
         // A type that implements the operator's trait, but not at *this* pair of operands, is worth
         // saying so about here. Falling through would leave the scalar path's "operands must match",
         // which is advice to change the operands when the answer is to implement the trait for them.
