@@ -1158,4 +1158,5 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case f: TFor     => genFor(f)
     case e: TForEach => genForEach(e)
     case i: TIterate => genIterate(i)
+    case q: TQuantifier => genQuantifier(q)
 }

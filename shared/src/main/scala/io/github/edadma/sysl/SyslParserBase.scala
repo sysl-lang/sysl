@@ -165,4 +165,9 @@ trait SyslParserBase extends PackratParsers {
   protected def loopExpr: PackratParser[Expr]
   protected def forExpr: PackratParser[Expr]
   protected def matchExpr: PackratParser[Expr]
+
+  /** `for all i in r do P` / `for some i in r do P` (`17 §2`), which is not one of the six above:
+   * it is written like an operand rather than like a statement, and it yields a `bool`.
+   */
+  protected def quantifier: PackratParser[Expr]
 }

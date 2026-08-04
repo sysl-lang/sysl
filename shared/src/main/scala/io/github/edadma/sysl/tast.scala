@@ -602,6 +602,16 @@ case class TFor(name: String, varTy: Type, lo: TExpr, hi: TExpr, inclusive: Bool
 case class TCFor(init: List[TStmt], cond: Option[TExpr], step: List[TStmt], body: List[TStmt],
                  elseBlock: Option[TBlock], ty: Type) extends TExpr
 
+/** `for all name in lo..hi do pred` / `for some …` — a quantifier over an integer range (`17 §2`),
+ * which is an **expression** yielding a `bool` and not a loop: it carries no `break`, no `else`, and
+ * no label, so its type is settled rather than met.
+ *
+ * The bounds share `TFor`'s shape because they are the same range. What differs is the body: a
+ * single `TExpr` rather than a statement list, since a predicate is a condition and not a block.
+ */
+case class TQuantifier(universal: Boolean, name: String, varTy: Type, lo: TExpr, hi: TExpr,
+                       inclusive: Boolean, pred: TExpr) extends TExpr { def ty: Type = Type.Bool }
+
 /** `for name in seq [else …]` over an array or a slice. The loop variable is a *copy* of each
  * element, and the sequence is evaluated once.
  */

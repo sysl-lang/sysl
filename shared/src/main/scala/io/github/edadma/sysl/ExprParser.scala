@@ -25,7 +25,7 @@ trait ExprParser extends SyslParserBase {
    * alternative is also the ordinary fall-through to `assignment`.
    */
   lazy val expression: PackratParser[Expr] =
-    at(lambda | ifExpr | whileExpr | doWhileExpr | loopExpr | forExpr | matchExpr)
+    at(lambda | quantifier | ifExpr | whileExpr | doWhileExpr | loopExpr | forExpr | matchExpr)
 
   /** `x -> x + 1` — a closure literal (`12 §5`).
    *

@@ -239,6 +239,10 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     check("a try, a unit, a null and a c-string", "var q = ()\n    var n: *u8 = null\n    var cs = c\"hi\"")
     check("a 128-bit literal with a suffix", "var w = 170141183460469231731687303715884105727i128")
     check("a multi-assignment and a multi-declaration", "var a = 1\n    var b = 2\n    a, b = b, a\n    val p, q = 3, 4")
+    // Both quantifiers, both range forms, and a predicate that is itself a conjunction — so the
+    // greedy body has to survive the trip as the body rather than as a sibling of it.
+    check("both quantifiers, over both range forms",
+      "var u = for all i in 0..<3 do i >= 0 && i < 3\n    var e = for some j in 1..4 do j == 2")
   }
 
   "the format refuses" - {

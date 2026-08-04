@@ -46,12 +46,17 @@ for all i in 0..<n do a[i] > 0
 for some k in 0..<n do a[k] == target
 ```
 
-It is an ordinary `bool`-typed expression. It may be written anywhere a `bool` may be written — a
-`require`, an `ensure`, a loop `invariant`, an `if` condition, an arm of an `&&` chain — and it is
-not a contract construct that happens to be usable elsewhere. There is nothing to be gained by
-restricting it: it computes a boolean from a range and a predicate, which is a thing programs want
-outside contracts too, and a rule confining it to clauses would have to be remembered by every reader
-for no benefit.
+It is an ordinary `bool`-typed expression — a `require`, an `ensure`, a loop `invariant`, an `if`
+condition, the right side of a binding — and not a contract construct that happens to be usable
+elsewhere. There is nothing to be gained by restricting it: it computes a boolean from a range and a
+predicate, which is a thing programs want outside contracts too, and a rule confining it to clauses
+would have to be remembered by every reader for no benefit.
+
+**It sits at the top of the expression grammar, where a closure literal sits, and for the same
+reason**: its body extends as far to the right as an expression can, so it cannot also be an operand
+of something looser. `for all i in r do P(i) && Q(i)` quantifies over the conjunction. Written the
+other way round — a quantifier as the second arm of a chain — it is parenthesized, `ok && (for all i
+in r do P(i))`, exactly as a closure in that position would be.
 
 **Spelling.** `all` and `some` are contextual and stay ordinary identifiers everywhere else, which
 costs the program's namespace nothing. The separator is `do`, the word a `for` loop already uses to
@@ -67,9 +72,6 @@ nothing a program already writes changes meaning.
 
 - The bound name is visible only inside the predicate and shadows an outer name of the same spelling,
   as any other binding does.
-- The body extends as far as the expression does: `for all i in r do P(i) && Q(i)` quantifies over the
-  conjunction, not over `P(i)` alone. This is the reading a specification wants nine times in ten,
-  and the other one is written with parentheses.
 - The bounds are integral, evaluated once, in the range forms `00` already has: `..<` excludes the
   upper bound, `..` includes it.
 - **An empty range makes `for all` true and `for some` false.** These are the identities of the two
@@ -158,6 +160,16 @@ it survives the jump intact and a `@tailrec` function may carry one.
 
 ## 5. Module invariants
 
+**This section and `§7` are specified and not built, and they wait on the same thing: `13 § Why
+there is no module-level var` — sysl has no mutable module state for either of them to be about.** A
+top-level `var` is a local of the entry point that no function can see, a module-level `val` is
+written once, and `13` records the spelling as open with three candidate forms and one named
+customer (`guide/slab`'s arena). An invariant over a module's variables and a frame naming which of
+them a function touches are both predicates over a set that is empty today, so building either would
+be building a check with no subject. They are written out here so that the design lands with the
+decision rather than after it — when `13`'s word is chosen, this is what attaches to it. `§ Open f`
+carries the dependency.
+
 An `invariant` written at the top level of a file is a predicate over the module's own state:
 
 ```
@@ -211,9 +223,14 @@ square(x: int) -> int = x * x
 **What a pure function may do:** read its parameters and any `const` or `val`; declare and mutate its
 own locals; call other pure functions; recurse; use every control-flow form; trap.
 
-**What it may not do:** call a function that is not pure, including any `extern`; write to a module
-`var`; write through a `*T`, into a `&T`'s field, or into any storage it did not create; perform I/O;
-contain an `asm` block; call through a value rather than a name, or dispatch through a trait object.
+**What it may not do:** call a function that is not pure, including any `extern`; write through a
+`*T`, into a `&T`'s field, or into any storage it did not create; perform I/O; contain an `asm`
+block; call through a value rather than a name, or dispatch through a trait object.
+
+The one ban this list does *not* carry is the one every other language's purity check leads with —
+no writing a global — and its absence is `§5`'s again rather than a decision: there is nothing to
+write. It arrives with `13`'s module state and needs no further thought when it does, since a write
+to a module variable is a write to storage the function did not create, which the list already says.
 
 The last one is the rule the others rest on. Purity is a property of a *named* callee that the
 compiler can look up. A call through a `&Fn` or a trait object names nothing at compile time, so
@@ -240,6 +257,13 @@ promise that was broken, which is the failure mode that makes inferred effect sy
 live with. The annotation is where the promise is written down and where the error is reported.
 
 ## 7. `@reads` and `@writes`
+
+**Specified and not built, for `§5`'s reason and by the same dependency** — a frame names module-level
+mutable variables and sysl has none. The one thing that comes close is an `extern` variable (`12 §1`),
+which really is module-level storage a function can reach; a frame over `errno` and `optind` alone
+would be a real feature and a very small one, and it would not be the feature this section describes,
+because what a prover needs a frame *for* is reasoning about the module's own state across a call.
+So this waits with `§5`.
 
 The looser sibling: a function that is not pure, but that says which module-level variables it
 touches.
@@ -367,7 +391,15 @@ code is wrong.
 
 **Module invariants** become a `predicate` over the module's variables, with `requires` and `ensures`
 attached to every public function — which is where `§5`'s "assumed on entry, established on exit"
-becomes something a prover can use, and where it does more than the runtime check can.
+becomes something a prover can use, and where it does more than the runtime check can. This arrives
+with `§5` and not before.
+
+**What the backend can be honest about today is therefore the function-local fragment**, and that is
+not a consolation: a function over integers with a precondition, a postcondition, loops carrying
+invariants and variants, quantifiers over its arrays, and ghost predicates to say what "sorted" means
+is the whole of what `§10` says the model covers anyway. The frame condition is what a *call* needs,
+and a translated call into a function whose body is also translated needs no frame — the translation
+has the body.
 
 **A proof is not a build.** `sysl prove` neither emits code nor changes what `sysl build` emits, per
 `§1`. A module that fails to prove still compiles and still runs, with every check `16` and this
@@ -412,6 +444,14 @@ codegen one, and it is the shape `15 §6`'s incremental build would want.
 allocates allocates nothing in the emitted program. Whether `no alloc` should therefore ignore it is
 undecided, and the two answers are defensible: ignoring it is what erasure implies, and refusing it
 keeps one rule about what a module's source may contain.
+
+**f. `§5` and `§7` wait on `13`'s module-state spelling, and that is the biggest single dependency in
+this chapter.** Both are predicates over a set the language cannot yet name. It is worth saying which
+way the dependency runs: this chapter does not need a *particular* spelling, only that one exists —
+whichever of `13`'s three candidates is taken, an invariant reads the names and a frame lists them.
+So nothing here should be used as an argument for one form over another. What this chapter does add
+to `13`'s case is a second customer beside `guide/slab`: an allocator wants module state, and a
+verifier wants to say what a function does to it.
 
 **e. A quantifier over something other than an integer range.** `for all x in a do P(x)` over a `[]T`
 is the form most specifications want, and it is not offered — the range form is, and an index has to

@@ -437,6 +437,12 @@ trait Closures extends CallAnalysis {
         scoped(b, bound + n)
         e.foreach(scoped(_, bound))
         bound
+      // A quantifier binds its name over the predicate and nowhere else, so an outer name of the
+      // same spelling is not captured by a clause that only shadows it (`17 §2`).
+      case Quantifier(_, n, it, p) =>
+        walk(it, bound)
+        walk(p, bound + n)
+        bound
       case MatchArm(ps, guard, b) =>
         val inArm = bound ++ ps.flatMap(patternNames)
 

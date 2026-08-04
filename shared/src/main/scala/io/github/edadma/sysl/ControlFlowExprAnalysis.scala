@@ -17,8 +17,8 @@ trait ControlFlowExprAnalysis extends ExprSupport {
    * that the match below is exhaustive over exactly what the dispatch sends here.
    */
   protected def controlExpr(
-      expr: IfExpr | MatchExpr | While | DoWhile | Loop | CFor | For | TryExpr | RangeExpr |
-        ResultList | Lambda | Tuple,
+      expr: IfExpr | MatchExpr | While | DoWhile | Loop | CFor | For | Quantifier | TryExpr |
+        RangeExpr | ResultList | Lambda | Tuple,
       expected: Option[Type],
       discarded: Boolean,
   ): TExpr = expr match
@@ -153,6 +153,30 @@ trait ControlFlowExprAnalysis extends ExprSupport {
             case other =>
               err(s"'for' iterates an integer range, an array, a slice, or a type that implements " +
                 s"'${qn(Library.key("Iterate"))}', and ${show(other)} is none of those")
+
+    // `for all i in lo..hi do pred` (`17 §2`). The range is read exactly as a counted `for`'s is —
+    // same node, same two diagnostics — so the two forms cannot come to disagree about what a range
+    // is. What it does not share is the loop machinery: a quantifier has no `break` to meet a type
+    // at, so nothing here consults the loop context.
+    case Quantifier(universal, name, iter, pred) =>
+      val word = if universal then "for all" else "for some"
+
+      iter match
+        case RangeExpr(Some(lo), Some(hi), inclusive) =>
+          val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
+          if tlo.ty != thi.ty then
+            err(s"a '$word' range needs matching bounds, got ${show(tlo.ty)} and ${show(thi.ty)}")
+          val vty = tlo.ty match
+            case i: Type.Integer => i
+            case other           => err(s"a '$word' range iterates integer bounds, not ${show(other)}")
+          pushScope()
+          val u  = declare(name, vty)
+          val tp = analyzeBool(pred)
+          popScope()
+          TQuantifier(universal, u, vty, tlo, thi, inclusive, tp)
+
+        case _ =>
+          err(s"'$word' quantifies over an integer range, written 'lo..<hi' or 'lo..hi'")
 
     case TryExpr(e) =>
       analyzeTry(analyzeExpr(e))

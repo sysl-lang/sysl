@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 19
+  val Version: Int = 20
 
   private val Magic = "sysl-ast"
 
@@ -292,6 +292,7 @@ object AstCodec {
         case CFor(l, i, c, s, b, e2) =>
           tok("cfor"); opt(l)(sref); opt(i)(stmt); opt(c)(expr); opt(s)(stmt); list(b)(stmt)
           opt(e2)(x => list(x)(stmt))
+        case Quantifier(u, n, it, p) => tok("qnt"); bool(u); sref(n); expr(it); expr(p)
     }
 
     // ---------------------------------------------------------- statements
@@ -669,6 +670,7 @@ object AstCodec {
         case "lop"  => Loop(opt(sref()), list(stmt()))
         case "for"  => For(opt(sref()), sref(), expr(), list(stmt()), opt(list(stmt())))
         case "cfor" => CFor(opt(sref()), opt(stmt()), opt(expr()), opt(stmt()), list(stmt()), opt(list(stmt())))
+        case "qnt"  => Quantifier(bool(), sref(), expr(), expr())
         case other  => fail(s"'$other' is not an expression tag")
     }
 

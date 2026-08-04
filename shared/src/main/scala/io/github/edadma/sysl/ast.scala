@@ -689,6 +689,15 @@ enum AsmItem {
 case class Require(cond: Expr, msg: Option[String]) extends Stmt
 case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
 
+/** `for all i in 0..<n do P(i)` / `for some i in 0..<n do P(i)` — a quantifier over an integer
+ * range, yielding a `bool` (`17 §2`).
+ *
+ * `universal` tells the two apart. The bound name is visible only inside `pred`, and `iter` is a
+ * range expression — the same `RangeExpr` a counted `for` takes, so the two forms cannot drift
+ * apart over what a range is.
+ */
+case class Quantifier(universal: Boolean, name: String, iter: Expr, pred: Expr) extends Expr
+
 /** A function declaration. The body is a statement list whose trailing expression is the
  * implicit return value; an `= expr` short body is stored as a single-element list. A
  * missing `retType` means the function returns `unit`. `tparams` names the type parameters of

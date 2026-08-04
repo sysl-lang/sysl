@@ -802,6 +802,29 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val loopExpr: PackratParser[Expr] =
     opt(labelRef) ~ (op("loop") ~> body("do")) ~ opt(endMarker("loop")) ^^ { case lbl ~ b ~ _ => Loop(lbl, b) }
 
+  /** `for all i in 0..<n do a[i] > 0`, `for some k in 0..n do a[k] == t` — a quantifier over an
+   * integer range (`17 §2`).
+   *
+   * **`all` and `some` stay ordinary identifiers**, matched here as soft words, so nothing a program
+   * already names is spent on this. Telling the form from a counted loop takes one token: a
+   * quantifier is `for` `all`/`some` `name` `in`, and a loop is `for` `name` `in`, so `for all in
+   * 0..<n do …` is still a loop over a variable called `all`. This rule is tried before `forExpr` in
+   * `expression` and backtracks into it when the name is missing.
+   *
+   * The separator is `do` — the word every loop header already uses to introduce what it does with
+   * each element — rather than Ada's `=>`, which is not in the operator set and would have been
+   * added for this one form. The predicate is a full `expression`, so the body extends as far to the
+   * right as one can: `for all i in r do P(i) && Q(i)` quantifies over the conjunction, which is the
+   * reading a specification wants and the one a reader of the line already expects from `->`.
+   */
+  protected lazy val quantifier: PackratParser[Expr] =
+    (op("for") ~> quantifierKind) ~ ident ~ (op("in") ~> expression) ~ (op("do") ~> expression) ^^ {
+      case univ ~ n ~ it ~ p => Quantifier(univ, n, it, p)
+    }
+
+  private lazy val quantifierKind: Parser[Boolean] =
+    softWord("all") ^^^ true | softWord("some") ^^^ false
+
   protected lazy val forExpr: PackratParser[Expr] = cForExpr | forInExpr
 
   protected lazy val forInExpr: PackratParser[Expr] =
