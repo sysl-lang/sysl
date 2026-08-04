@@ -400,7 +400,7 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         """@inline
           |double(n: int) -> int = n * 2
           |print(double(5))""".stripMargin
-      ) should include("'inline' is not an annotation sysl knows")
+      ) should include("'inline' is not an annotation a declaration takes")
     }
 
     "the same attribute twice is refused" in {
