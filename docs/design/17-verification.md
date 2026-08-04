@@ -375,12 +375,30 @@ emitting SMT-LIB directly because the goals a program generates are not one prov
 splits a verification condition into goals, transforms them, and tries several provers on each, and
 reproducing that is a project rather than a backend.
 
-**What is translated.** Functions whose parameters and result are integers, booleans, and structs
-over those; integer and boolean arithmetic; comparisons; `if`; `while` and the counted loops;
+**What is translated is the scalar fragment**: functions whose parameters, locals and result are
+integers and booleans; arithmetic and comparison; `if`; `while`; local variables and assignment;
 `require`, `ensure`, `result`, `old`, both quantifiers, loop `invariant` and `variant`, function
-`variant`, struct invariants, module invariants, and ghost declarations. Anything else is refused by
-name — *"the proof backend does not translate X"* — so that a gap in the translator reads as a gap in
-the translator, and not as a program the prover disliked.
+`variant`, and `@ghost` declarations. Anything else is refused by name — *"the proof backend does not
+translate X"* — so that a gap in the translator reads as a gap in the translator, and not as a program
+the prover disliked. Arrays are the big absence and are `§ Open j`.
+
+**WhyML separates terms from programs, and `@ghost` is what decides which one a function lands in.**
+A term is mathematics and may appear in a `requires`; a program has state and may not. So a `@ghost`
+function becomes a `predicate` (or a `function`, where it answers something other than a `bool`) and
+every other function becomes a `let`, and a contract that calls a non-ghost function is refused with
+the sentence that says to mark it.
+
+That rule replaced a first cut that asked whether a body *could* be read as a term — one expression,
+nothing declared — and the way it was wrong is the part worth keeping. It pulled ordinary code into
+the term world, and a term keeps plain arithmetic, so `gcd` written as one expression was proved
+against unbounded integers while the same function written with a local got its overflow obligations.
+**Two spellings of one function, two models.** The mark decides now, which is what `§8` was already
+saying: a specification is what `@ghost` marks, and mathematics is what a specification is written in.
+
+**A `@ghost` function that answers `bool` is a `predicate` and not a `bool`-valued function**, and the
+case that forces it is the one this chapter cares most about: `forall i. …` is a *formula*, which has
+no type at all, so `let function small (n: int) : bool = forall …` is a syntax error rather than a
+translation that proves something else. `predicate` is the form whose body is a formula.
 
 **Integer overflow is a proof obligation, and this is the decision with the most consequence in the
 section.** `01` defines sysl's plain integer arithmetic to wrap. WhyML's `int` is the mathematical
@@ -397,22 +415,33 @@ let add64 (a b: int) : int
 ```
 
 A program that stays in range gets the mathematical model, which is exact for it, and a program that
-might not gets a failed goal naming the operation. `--overflow=ignore` drops the preconditions for
+might not gets a failed goal naming the operation. `--overflow ignore` drops the preconditions for
 someone who wants to reason about the rest of a function first; it is off by default, because the
 honest reading of "this program is proved" should not quietly exclude the most common way integer
 code is wrong.
+
+**Every integer parameter carries its own range as a precondition, and this is not an extra demand on
+the caller** — it is the fact that the argument had the type it was declared with. Without it, WhyML's
+unbounded `int` makes even `half(x) = x / 2` with `x >= 0` fail to prove that its own division stays
+in range, which is not a fact about `half`. The result carries the same range as a postcondition,
+which is what a *call* needs. Both go when `--overflow ignore` does, and have to: keeping the ranges
+while dropping the obligations would leave a function promising a result nothing makes it stay inside.
+
+**A term keeps plain arithmetic.** A term has nowhere to discharge an obligation, and the
+specification is the mathematics the code is measured against rather than a second account of what the
+machine does — `ensure result == old(n) * 2` says what doubling means.
 
 **Module invariants** become a `predicate` over the module's variables, with `requires` and `ensures`
 attached to every public function — which is where `§5`'s "assumed on entry, established on exit"
 becomes something a prover can use, and where it does more than the runtime check can. This arrives
 with `§5` and not before.
 
-**What the backend can be honest about today is therefore the function-local fragment**, and that is
-not a consolation: a function over integers with a precondition, a postcondition, loops carrying
-invariants and variants, quantifiers over its arrays, and ghost predicates to say what "sorted" means
-is the whole of what `§10` says the model covers anyway. The frame condition is what a *call* needs,
-and a translated call into a function whose body is also translated needs no frame — the translation
-has the body.
+**What the backend can be honest about today is therefore the function-local scalar fragment**, and
+that is less of a consolation than it sounds: `gcd`'s termination and its postcondition, a counting
+loop's invariant, a division's divisor, and every arithmetic operation's range are all discharged, and
+each of them is a thing that goes wrong in real code. The frame condition is what a *call* needs, and
+a translated call into a function whose body is also translated needs no frame — the translation has
+the body.
 
 **A proof is not a build.** `sysl prove` neither emits code nor changes what `sysl build` emits, per
 `§1`. A module that fails to prove still compiles and still runs, with every check `16` and this
@@ -457,6 +486,13 @@ codegen one, and it is the shape `15 §6`'s incremental build would want.
 allocates allocates nothing in the emitted program. Whether `no alloc` should therefore ignore it is
 undecided, and the two answers are defensible: ignoring it is what erasure implies, and refusing it
 keeps one rule about what a module's source may contain.
+
+**j. Arrays, and therefore most of what a specification wants to say.** The fragment `§9` translates
+is scalars, so `is_sorted(a, n)` — the example `§8` is written around — is refused at the signature.
+Modelling a sysl slice needs a map theory, a length, and an answer for aliasing between two views of
+one buffer, and the last of those is the one that makes it a project: `05`'s escape analysis knows
+what a view roots at, and whether that is enough to give the prover a frame is not obvious. It is the
+single largest thing between this backend and being useful on the programs `guide/` holds.
 
 **i. A ghost *variable*, and therefore `§8`'s rule 2.** A ghost function needs no new position for the
 annotation — `@ghost` sits above a declaration exactly as `@test` does — and a ghost local needs
