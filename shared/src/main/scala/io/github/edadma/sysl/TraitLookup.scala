@@ -126,11 +126,30 @@ trait TraitLookup extends MemberVisibility {
    */
   protected var implsHoisted: Boolean = false
 
-  /** Type applications whose bounds could not be answered where they were written, each with the
-   * position to report it against. Drained once, as soon as the answer is available.
+  /** One type application whose bounds could not be answered where it was written: what was applied,
+   * to what, the bounds to hold it to, the position to report against — and **the terms the bounds
+   * were written in**.
+   *
+   * The scope is carried because the check is run later, from a walk that is nowhere near the file
+   * that wrote the bound. A bound names a trait the way anything else does, so resolving `[T: Scale]`
+   * from wherever the drain happens to be reaches whatever *that* module can see, which for an
+   * imported name is nothing at all — and a bound that resolved to nothing is compared against the
+   * same bound that resolved properly, so the type is told its own parameter is not bounded by the
+   * trait it is bounded by.
    */
-  protected val boundChecks =
-    mutable.ListBuffer.empty[(String, List[String], Map[String, List[BoundRef]], List[Type], Option[Pos])]
+  protected case class DeferredBound(
+      what: String,
+      tparams: List[String],
+      bounds: Map[String, List[BoundRef]],
+      targs: List[Type],
+      pos: Option[Pos],
+      scope: Scope,
+  )
+
+  /** Type applications whose bounds could not be answered where they were written. Drained once, as
+   * soon as the answer is available.
+   */
+  protected val boundChecks = mutable.ListBuffer.empty[DeferredBound]
 
   /** `impl` blocks whose trait requires other traits, each with the type it was written for and the
    * position to report against. Held for the same reason a bound is: the implementation that
@@ -156,7 +175,7 @@ trait TraitLookup extends MemberVisibility {
   ): Unit =
     if bounds.nonEmpty && tparams.length == targs.length then
       if implsHoisted then checkParamBounds(what, tparams, bounds, targs)
-      else boundChecks += ((what, tparams, bounds, targs, currentPos))
+      else boundChecks += DeferredBound(what, tparams, bounds, targs, currentPos, currentScope)
 
   /** Whether the type arguments a generic declaration was applied to implement what it asked of its
    * parameters — the one rule, wherever the parameters came from: a function's, an `impl` block's,
