@@ -185,7 +185,7 @@ class LinkDirectiveTests extends AnyFreeSpec with Matchers with RunSupport with 
     // A test build is a different compilation from a program build rather than a variant of it, so
     // it collects its own — and a `sysl test` that linked without libm would fail on ELF only.
     "a test build asks for the same libraries a program build does" in {
-      Compiler.compileTests(files("t.sysl" -> "link \"z\"\n\n#test\nt() = ()\n"), Nil) match
+      Compiler.compileTests(files("t.sysl" -> "link \"z\"\n\n@test\nt() = ()\n"), Nil) match
         case Right((built, _)) =>
           built.links should contain("z")
           built.links should contain("m")

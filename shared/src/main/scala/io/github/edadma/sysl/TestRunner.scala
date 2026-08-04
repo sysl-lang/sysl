@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** `sysl test` — builds the `#test` functions of a source tree and runs them (`testing.md`).
+/** `sysl test` — builds the `@test` functions of a source tree and runs them (`testing.md`).
  *
  * **One build, one process per test.** The whole tree is compiled once, into a binary whose entry
  * point takes a test's name and runs that test alone (`Codegen.genTestMain`); the runner then starts
@@ -14,7 +14,7 @@ import io.github.edadma.cross_platform.*
  * **The verdict is the exit status, and nothing else.** A test passes by returning. That is the whole
  * protocol, and it is what lets a test assert with the language it is testing rather than with a
  * framework: a broken `require`, a bounds violation, an `unwrap` of `None` — each ends the process,
- * and none of them needed to know it was running under a test. `#test(should_trap)` inverts the
+ * and none of them needed to know it was running under a test. `@test(should_trap)` inverts the
  * reading for a test whose subject *is* the check.
  */
 object TestRunner {
@@ -57,7 +57,7 @@ object TestRunner {
     // none of the tests there are lead to the same empty report and are different mistakes, so each
     // is named. Neither is a failure: a program is allowed to have no tests.
     if tests.isEmpty then
-      Console.err.println(s"no '#test' functions in ${cfg.file}")
+      Console.err.println(s"no '@test' functions in ${cfg.file}")
       return 0
 
     if selected.isEmpty then

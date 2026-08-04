@@ -461,11 +461,11 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
             |""".stripMargin) shouldBe "after the check\n1\n"
     }
 
-    // `#test` functions are ordinary bodies that `sysl test` calls, so a defer in one runs the same.
+    // `@test` functions are ordinary bodies that `sysl test` calls, so a defer in one runs the same.
     // The inner block is what makes it observable: a defer at the top of the test would run after
     // the assertion that would have to check it.
-    "a '#test' function's body is a block like any other" in {
-      verdicts("""#test
+    "a '@test' function's body is a block like any other" in {
+      verdicts("""@test
                  |t() =
                  |    var log = ""
                  |    if true

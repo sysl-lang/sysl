@@ -30,7 +30,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | area | names | where it is written up |
 |---|---|---|
 | absence and failure | `Option`, `Result`, `Fallible` | [errors and contracts](/reference/errors/) |
-| stopping | `panic`, `assert`, `exit` | below, and [attributes](/reference/attributes/) for `#test` |
+| stopping | `panic`, `assert`, `exit` | below, and [attributes](/reference/attributes/) for `@test` |
 | rendering to standard output | `print`-family: `prints`, `printi`, `printu`, `printr`, `printb`, `printc`, `putbytes`; the sink itself, `Stdout` and `stdout` | below |
 | rendering to a sink | `Display`, `FormatSpec`, `Writer`, the `display_*` family | below |
 | hashing | `Hash`, `hash_u64`, `hash_u128`, `hash_bool`, `hash_str` | below |

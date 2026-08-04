@@ -280,15 +280,15 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     // A test is dropped from every build but `sysl test`, so its address would be of a definition
     // the program does not have — the same refusal a call to one gets, for the same reason.
-    "a '#test' function, which no ordinary build contains" in {
-      val e = err("""#test
+    "a '@test' function, which no ordinary build contains" in {
+      val e = err("""@test
                     |t()
                     |    print(1)
                     |
                     |var f: *extern() -> unit = &t
                     |""".stripMargin)
 
-      e should include("'t' is a '#test' function")
+      e should include("'t' is a '@test' function")
       e should include("its address would be of a definition the program does not have")
     }
 

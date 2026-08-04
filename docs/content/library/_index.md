@@ -60,7 +60,7 @@ machinery that only makes sense beside them:
 - **`Option`, `Result` and the `Fallible` latch** are on [errors and
   contracts](/reference/errors/), because `?` is a language form and it is what those types are for.
 - **`assert` and `panic`** are on [attributes and compile time](/reference/attributes/), beside the
-  `#test` protocol they exist to serve.
+  `@test` protocol they exist to serve.
 - **The operator traits** — which trait a `+` or a `<` reaches — are on
   [expressions](/reference/expressions/), because dispatch is a rule about the operator rather than
   about the trait.

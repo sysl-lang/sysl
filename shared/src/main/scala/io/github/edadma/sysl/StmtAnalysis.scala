@@ -355,6 +355,9 @@ trait StmtAnalysis extends TypeResolution {
    */
   private def patternNames(p: Pattern): List[String] = p match
     case IdentPattern(n)        => List(n)
+    // The outer name first, which is the order it is written in — so `v @ (v, w)` reports the
+    // second `v` as the repeat rather than the first.
+    case BindPattern(n, inner)  => n :: patternNames(inner)
     case TuplePattern(ps)       => ps.flatMap(patternNames)
     case StructPattern(_, fps)  => fps.flatMap((_, sub) => patternNames(sub))
     case WildcardPattern        => Nil
@@ -395,6 +398,12 @@ trait StmtAnalysis extends TypeResolution {
    */
   private def bindPattern(p: Pattern, subject: TExpr, mutable: Boolean): List[TStmt] = p match
     case WildcardPattern => Nil
+
+    // `var whole @ (a, b) = pair` — the value under its own name, and its parts under theirs. The
+    // subject is already the held temporary rather than the value expression, so naming it twice
+    // reads that temporary twice and runs nothing a second time.
+    case BindPattern(n, inner) =>
+      bindPattern(IdentPattern(n), subject, mutable) ++ bindPattern(inner, subject, mutable)
 
     case IdentPattern(n) =>
       List(TVarDecl(if mutable then declare(n, subject.ty) else declareReadOnly(n, subject.ty),

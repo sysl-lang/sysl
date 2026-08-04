@@ -51,7 +51,7 @@ emitted textual LLVM IR, handed that to `clang` to assemble and link against the
 archive, and ran the binary that came out. The binary is real — there is no interpreter and no VM
 underneath it.
 
-`build` stops after producing that binary instead of running it, and `test` runs the `#test`
+`build` stops after producing that binary instead of running it, and `test` runs the `@test`
 functions in a directory. The tour uses `run` throughout.
 
 ## Where to go next

@@ -288,10 +288,10 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
-  "#tailrec" - {
+  "@tailrec" - {
     "a function whose self-call is a tail call is accepted" in {
       run(
-        s"""#tailrec
+        s"""@tailrec
            |count(n: int, acc: int) -> int =
            |    if n == 0 then acc else count(n - 1, acc + 1)
            |print(count($deep, 0))""".stripMargin
@@ -300,7 +300,7 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "it does not change what is emitted — the jump applies either way" in {
       val marked = defineOf(
-        ir("""#tailrec
+        ir("""@tailrec
              |count(n: int, acc: int) -> int =
              |    if n == 0 then acc else count(n - 1, acc + 1)
              |print(count(5, 0))""".stripMargin),
@@ -318,7 +318,7 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "a recursion the jump cannot replace is refused" in {
       err(
-        """#tailrec
+        """@tailrec
           |sum(n: int) -> int =
           |    if n == 0 then 0 else n + sum(n - 1)
           |print(sum(5))""".stripMargin
@@ -327,7 +327,7 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "a function that does not recurse at all is refused" in {
       err(
-        """#tailrec
+        """@tailrec
           |double(n: int) -> int = n * 2
           |print(double(5))""".stripMargin
       ) should include("calls itself nowhere the jump can replace")
@@ -335,7 +335,7 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "an 'ensures' is named as the reason rather than reported as an absence" in {
       err(
-        """#tailrec
+        """@tailrec
           |count(n: int, acc: int) -> int
           |    ensure result >= acc
           |    if n == 0 then acc else count(n - 1, acc + 1)
@@ -345,7 +345,7 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "a 'defer' in scope is refused, since it is what ends the tail position" in {
       err(
-        """#tailrec
+        """@tailrec
           |count(n: int, acc: int) -> int
           |    defer print("out")
           |    if n == 0 then acc else count(n - 1, acc + 1)
@@ -354,14 +354,14 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "it is checked on a function the build goes on to strip" in {
-      // A `#test` function is left out of an ordinary build, and the check still runs on it: the
-      // whole tree is read before anything is dropped from it, so a `#tailrec` that has stopped
+      // A `@test` function is left out of an ordinary build, and the check still runs on it: the
+      // whole tree is read before anything is dropped from it, so a `@tailrec` that has stopped
       // holding is reported in the build that would never have called it. It cannot *satisfy* the
       // attribute — a test takes no parameters and nothing may call it, itself included — so what
       // this pins is that the refusal arrives rather than being skipped.
       err(
-        """#test
-          |#tailrec
+        """@test
+          |@tailrec
           |counts_down() -> unit =
           |    print("ran")
           |print("main")""".stripMargin
@@ -372,16 +372,16 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "the attribute grammar" - {
     "an attribute sysl does not know is named in the refusal" in {
       err(
-        """#inline
+        """@inline
           |double(n: int) -> int = n * 2
           |print(double(5))""".stripMargin
-      ) should include("'#test' and '#tailrec' are the two")
+      ) should include("'@test' and '@tailrec' are the two")
     }
 
     "the same attribute twice is refused" in {
       err(
-        """#tailrec
-          |#tailrec
+        """@tailrec
+          |@tailrec
           |count(n: int, acc: int) -> int =
           |    if n == 0 then acc else count(n - 1, acc + 1)
           |print(count(3, 0))""".stripMargin
@@ -390,11 +390,11 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     "an attribute above something that is not a function is refused" in {
       err(
-        """#tailrec
+        """@tailrec
           |struct Point
           |    x: int
           |print(1)""".stripMargin
-      ) should include("an attribute marks a function, and only a function")
+      ) should include("an annotation marks a function, and only a function")
     }
   }
 }

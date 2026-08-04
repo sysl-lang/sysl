@@ -323,7 +323,7 @@ same kind of promise, made in the same place, and read by the same callers.
 - **A closure takes none.** An arrow's parameters are matched through the `Fn` trait (§6), which
   carries types and no names; there is nothing at that call to read a default out of, which is the
   same absence that stops a closure being called by name.
-- **A `#test` function takes none, because it takes no parameters at all** (`testing.md`). A default
+- **A `@test` function takes none, because it takes no parameters at all** (`testing.md`). A default
   looks as though it should rescue that — every parameter would have a value, so the runner's call
   could be written with none — and it does not, because that call is *emitted* rather than analyzed.
   Nothing fills a default there, and a signature the runner cannot satisfy is refused whether or not
@@ -459,12 +459,12 @@ points into. Making those tail calls work needs the convention to change, so it 
 recognizing more shapes. Calls through a `Fn` or a `*extern` are out for the same reason and one
 more: nothing at the call knows the callee is the caller.
 
-**`#tailrec` asserts it, and buys the refusal.** The attribute changes nothing about what is
+**`@tailrec` asserts it, and buys the refusal.** The attribute changes nothing about what is
 emitted — the jump applies written or not — so what it is for is the compile that tells you the
 jump has gone:
 
 ```
-#tailrec
+@tailrec
 count(n: int, acc: int) -> int =
     if n == 0 then acc else n + count(n - 1, acc)   // refused: something waits on the result
 ```
@@ -957,7 +957,7 @@ nothing downstream could notice:
   to travel beside the address is that frame.
 - **A closure.** The same reason with the name taken off: a closure is a struct and an
   implementation (§8), and one word has nowhere to put the struct.
-- **A `#test` function.** Every build but `sysl test` drops it (`testing.md`), so its address would
+- **A `@test` function.** Every build but `sysl test` drops it (`testing.md`), so its address would
   be of a definition the program does not have.
 - **Any signature carrying an aggregate** — a struct, a tuple, a data enum, a view, a `string`. An
   aggregate crosses to C in whichever registers that machine's convention names (`targets.md`), and

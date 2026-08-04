@@ -490,6 +490,15 @@ case class TWildPattern(ty: Type) extends TPattern
 /** A binding: matches anything and stores the value in a fresh local. */
 case class TBindPattern(name: String, ty: Type) extends TPattern
 
+/** `n @ pat` — whatever `inner` matches, with the **whole** value bound to `name` besides.
+ *
+ * The type is the inner pattern's, since both are tests of the same value. Everything that reads a
+ * pattern reads this one by reading `inner` and adding the binding: the test is the inner test, the
+ * exhaustiveness is the inner coverage, and the refutability is the inner refutability — a binding
+ * never rules anything in or out, which is exactly why the wrapper can be transparent.
+ */
+case class TAtPattern(name: String, inner: TPattern) extends TPattern { def ty: Type = inner.ty }
+
 /** A scalar literal: matches a value equal to it. */
 case class TLitPattern(value: TExpr) extends TPattern { def ty: Type = value.ty }
 
@@ -647,7 +656,7 @@ case class TFunc(
     olds: List[TExpr] = Nil,
     internal: Boolean = false,
     conv: Option[CallConv] = None,
-    /** `#tailrec` was written above it: an assertion that its self-call is the last thing it does,
+    /** `@tailrec` was written above it: an assertion that its self-call is the last thing it does,
      * and a demand to be told at the compile rather than at the stack overflow when an edit stops
      * that being true (`12 § Tail calls`). The jump itself does not wait on this — it applies
      * wherever it applies — so what the flag reaches is `TailCalls.check` and nothing in codegen.
@@ -708,7 +717,7 @@ case class TVal(symbol: String, ty: Type, init: TExpr, computed: Boolean)
  */
 case class TEntry(func: String, argsFn: Option[String])
 
-/** One `#test` function, as the runner needs it (`testing.md`).
+/** One `@test` function, as the runner needs it (`testing.md`).
  *
  * `func` is the key the function is filed under, which is what makes it reachable and what the
  * dispatcher matches an argument against. Everything else is for the report: what to call the test,
@@ -768,7 +777,7 @@ case class TProgram(
      * key; these have no key, so the answer is carried here.
      */
     mainModule: String = Modules.root,
-    /** The `#test` functions the sources declared, in the order they were written (`testing.md`).
+    /** The `@test` functions the sources declared, in the order they were written (`testing.md`).
      *
      * They are carried on the program rather than looked up from `funcs` because what a test *is* —
      * its reported name, what it expects — lives in the attribute, and the typed function is the

@@ -253,7 +253,7 @@ trait Hoisting extends HoistMembers {
       checkSignatureRules(f.name, f.params, f.retType, f.variadic)
       checkBoundNames(f.name, f.bounds)
       checkSolvedDefaults("the function", f.name, f.tdefaults)
-      // A `#test` is registered here with everything else a declaration says about itself, so that
+      // A `@test` is registered here with everything else a declaration says about itself, so that
       // the runner's list is in declaration order without anything having to sort it afterwards.
       // The checks run at the attribute, which is the part a diagnostic is about (`Tests`).
       for a <- f.test do

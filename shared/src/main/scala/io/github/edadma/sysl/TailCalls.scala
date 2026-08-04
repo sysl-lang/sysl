@@ -14,7 +14,7 @@ package io.github.edadma.sysl
  * function is actually written in — the body's trailing expression, a `return`, and the arms of the
  * `if` and `match` those reach through — and says no to anything it has not thought about. A
  * self-call it fails to recognize is compiled as an ordinary call, which is what it was before this
- * pass existed. That is also why `#tailrec` exists: it turns a silent miss into a diagnostic for
+ * pass existed. That is also why `@tailrec` exists: it turns a silent miss into a diagnostic for
  * the one reader who was counting on the jump.
  */
 object TailCalls {
@@ -29,7 +29,7 @@ object TailCalls {
     if disqualified(f).isDefined then Nil
     else block(f, f.body, deferred = false)
 
-  /** Why a function is not a candidate at all, as the sentence `#tailrec` reports — `None` where it
+  /** Why a function is not a candidate at all, as the sentence `@tailrec` reports — `None` where it
    * is one. These are properties of the *declaration*, so they are answered once rather than at
    * each call, and they are the cases where a jump would change what the program does rather than
    * only what it costs.
@@ -147,7 +147,7 @@ object TailCalls {
   private def isSelf(f: TFunc, c: TCall): Boolean =
     c.name == f.name && c.ty == f.retTy && c.args.length == f.params.length
 
-  /** The refusals `#tailrec` earns across a whole program: one sentence per function that asked for
+  /** The refusals `@tailrec` earns across a whole program: one sentence per function that asked for
    * the jump and did not get it.
    *
    * The attribute is an assertion rather than a request — the optimization applies wherever it
@@ -160,10 +160,10 @@ object TailCalls {
       program.funcs.filter(_.tailrec).flatMap { f =>
         disqualified(f) match
           case Some(why) =>
-            Some(Diagnostic.render(s"'${Modules.show(f.name)}' is marked '#tailrec' but $why", None))
+            Some(Diagnostic.render(s"'${Modules.show(f.name)}' is marked '@tailrec' but $why", None))
           case None if of(f).isEmpty =>
             Some(Diagnostic.render(
-              s"'${Modules.show(f.name)}' is marked '#tailrec' but calls itself nowhere the jump " +
+              s"'${Modules.show(f.name)}' is marked '@tailrec' but calls itself nowhere the jump " +
                 "can replace — a tail call is the last thing the function does, so nothing may " +
                 "wait on its result and no 'defer' may be in scope where it stands",
               None))

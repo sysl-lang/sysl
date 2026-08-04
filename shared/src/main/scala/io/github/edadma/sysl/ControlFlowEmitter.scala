@@ -241,6 +241,9 @@ trait ControlFlowEmitter extends PlaceEmitter {
    */
   private def patternTest(p: TPattern, value: String): String = p match
     case _: TWildPattern | _: TBindPattern => "true"
+    // The binding is established later, in `patternBind`; what decides the arm is the inner test
+    // alone, since naming a value says nothing about whether it matched.
+    case a: TAtPattern                     => patternTest(a.inner, value)
     case TLitPattern(v)                    => compareValue("==", v.ty, value, genExpr(v))
     case TRangePattern(lo, hi, inclusive) =>
       val loOk = compareValue(">=", lo.ty, value, genExpr(lo))
@@ -279,6 +282,13 @@ trait ControlFlowEmitter extends PlaceEmitter {
       retainValue(bty, value)
       emit(s"store ${bty.llvm} $value, ptr %$name.addr")
       ownSlot(name, bty)
+
+    // `n @ pat` binds the whole value and then whatever the inner pattern binds, both off the same
+    // `value` — so a `&T` matched this way is retained once for the outer name and once for each
+    // inner one, which is what every other pattern that names a value more than once already does.
+    case TAtPattern(name, inner) =>
+      patternBind(TBindPattern(name, inner.ty), value)
+      patternBind(inner, value)
     case TVariantPattern(en, variant, args) if args.exists(bindsAny) =>
       val payload = enumPayload(en, variant, value)
       for (arg, i) <- args.zipWithIndex do patternBind(arg, payloadField(en, variant, payload, i))
@@ -305,6 +315,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
 
   private def bindsAny(p: TPattern): Boolean = p match
     case _: TBindPattern    => true
+    case _: TAtPattern      => true
     case v: TVariantPattern => v.args.exists(bindsAny)
     case s: TStructPattern  => s.args.exists(bindsAny)
     case _                  => false
@@ -314,6 +325,7 @@ trait ControlFlowEmitter extends PlaceEmitter {
    */
   private def refutable(p: TPattern): Boolean = p match
     case _: TWildPattern | _: TBindPattern => false
+    case a: TAtPattern                     => refutable(a.inner)
     case s: TStructPattern                 => s.args.exists(refutable)
     case _                                 => true
 

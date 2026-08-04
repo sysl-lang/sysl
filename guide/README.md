@@ -28,7 +28,7 @@ that quietly stopped running would otherwise look like a check that passed.
 die rather than report it, and the run would look truncated instead of failing. The run therefore
 asserts a refusal only through a total operation that answers instead of trapping.
 
-**The traps are asserted in `#test(should_trap)` functions** (`testing.md`), which live in the
+**The traps are asserted in `@test(should_trap)` functions** (`testing.md`), which live in the
 program's own directory and are run by `sysl test <directory>`. Each runs in a process of its own
 and passes by not coming back, so a trap is an observation there rather than the end of the run —
 which is what lets a refusal be stated in sysl, beside the code it is about. `guide/ring` was the

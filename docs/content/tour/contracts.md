@@ -296,7 +296,7 @@ somewhere downstream where the wrong value finally mattered.
 
 ## Tests live beside the code
 
-The third checking tool, and the one that runs on examples rather than on rules. A `#test` attribute
+The third checking tool, and the one that runs on examples rather than on rules. A `@test` annotation
 on an ordinary function marks it as a test, and `assert` is what a test uses to state what it
 expects:
 
@@ -306,12 +306,12 @@ clamp(n: int, lo: int, hi: int) -> int
     elif n > hi then hi
     else n
 
-#test
+@test
 clamps_both_ends()
     assert(clamp(5, 0, 3) == 3, "above the ceiling")
     assert(clamp(-2, 0, 3) == 0, "below the floor")
 
-#test("a value already inside is left alone")
+@test("a value already inside is left alone")
 leaves_the_middle()
     assert(clamp(2, 0, 3) == 2, "untouched")
 
@@ -338,14 +338,14 @@ clamp.sysl
 
 A test is an ordinary function with **no parameters, no result, and no type parameters** — all three
 being the same requirement seen from different sides, since the runner calls it with nothing and
-reads the answer off whether it returned. Each is checked at the attribute rather than at the
-function, because the function is a perfectly good function and it is `#test` that made a promise
+reads the answer off whether it returned. Each is checked at the annotation rather than at the
+function, because the function is a perfectly good function and it is `@test` that made a promise
 about it.
 
-The attribute has four forms. Bare `#test` names the test after the function; `#test("a sentence")`
+The annotation has four forms. Bare `@test` names the test after the function; `@test("a sentence")`
 names it by the sentence, which is what the second one above does and why the runner prints prose
-for it. The other two are for the channel this chapter has been about: `#test(should_trap)` **passes
-by stopping the program**, and `#test(should_trap: "past the end")` additionally requires that text
+for it. The other two are for the channel this chapter has been about: `@test(should_trap)` **passes
+by stopping the program**, and `@test(should_trap: "past the end")` additionally requires that text
 in what the run printed. That is how a trap gets tested at all — there is no catching it, so the
 runner is the thing that survives it.
 

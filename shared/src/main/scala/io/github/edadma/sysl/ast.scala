@@ -171,6 +171,21 @@ case class StructPattern(name: String, fields: List[(String, Pattern)]) extends 
  */
 case class TuplePattern(args: List[Pattern]) extends Pattern
 
+/** `n @ Circle(r)` — matches what the inner pattern matches, and binds the **whole** value to `n`
+ * besides.
+ *
+ * It answers the one thing destructuring cannot: a pattern that takes a value apart has, by the time
+ * the arm runs, only the parts. Where the arm wants the value back — to hand it on, to store it, to
+ * return it — the alternative is a wildcard arm that tests the shape a second time, or a binding
+ * that gives up the destructuring. This is both at once, which is why Scala, Rust, OCaml and Haskell
+ * all carry it.
+ *
+ * The `@` is the same character an annotation opens with and the two never compete: an annotation's
+ * is a **prefix**, at the start of a line above a declaration, and this one is **infix**, between a
+ * name and a pattern, inside a pattern. Nothing reads a pattern where a declaration may stand.
+ */
+case class BindPattern(name: String, inner: Pattern) extends Pattern
+
 /** `pat, pat, … [if guard] -> body`. Alternatives share one body; the optional guard is a
  * boolean the scrutinee value must additionally satisfy. Each body is a statement list whose
  * trailing expression is the arm's value.
@@ -667,18 +682,18 @@ case class FuncDecl(
     tdefaults: Map[String, TypeRef] = Map.empty,
     test: Option[TestAttr] = None,
     conv: Option[CallConv] = None,
-    /** `#tailrec` — see `TFunc.tailrec`. */
+    /** `@tailrec` — see `TFunc.tailrec`. */
     tailrec: Boolean = false,
 ) extends Stmt
 
-/** What `#test` says about the function it is written above (`testing.md`).
+/** What `@test` says about the function it is written above (`testing.md`).
  *
  * A test is a function the program does not call: `sysl test` calls it, and whether it *returned* is
  * the whole of the result. So the attribute carries only what the runner cannot work out for itself
  * — what to call the test in its report, and whether returning is the outcome it was after.
  *
  * `display` is the name a report shows, defaulting to the function's own. It exists because a
- * function name is a name and a test's subject is a sentence: `#test("an empty slice has no first
+ * function name is a name and a test's subject is a sentence: `@test("an empty slice has no first
  * element")` says something `first_of_empty` only gestures at.
  *
  * `shouldTrap` inverts the verdict: the test passes exactly when the process does *not* come back.

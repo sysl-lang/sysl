@@ -80,7 +80,7 @@ A violated `require`, a broken `invariant` and a failed range check all
 run would look truncated rather than failed. A run therefore asserts a refusal only through a
 **total** operation that answers instead of trapping.
 
-The traps are asserted separately, in [`#test(should_trap)`](/reference/attributes/) functions that
+The traps are asserted separately, in [`@test(should_trap)`](/reference/attributes/) functions that
 live in the program's own directory. Each runs in a process of its own and passes by not coming
 back, so a trap is an observation there rather than the end of the run — which is what lets a refusal
 be stated in sysl, beside the code it is about. `guide/ring` was the first to need this.

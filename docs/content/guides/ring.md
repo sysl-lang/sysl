@@ -71,7 +71,7 @@ die rather than report, and the run would look truncated instead of failed. Ever
 asserts therefore comes from a total operation that answers instead of trapping.
 
 What the trap itself needs is somewhere that outlives the process it ends, and that is a
-[`#test(should_trap)`](/reference/attributes/) function: it runs in a process of its own and passes by
+[`@test(should_trap)`](/reference/attributes/) function: it runs in a process of its own and passes by
 not coming back. This is the program that first needed them, and they live beside the code they are
 about rather than being restated in a language the ring is not written in.
 

@@ -148,9 +148,20 @@ class SyslLexical
     // really the end of a statement.
     ".*",
     ",", "::", ":", "->",
-    // Opens an attribute, which is a declaration's only prefix that is not a word (`testing.md`).
-    // It is deliberately not an operator: nothing in the expression grammar spells `#`, so a line
-    // beginning with one can only be an attribute and the reading needs no lookahead.
+    // Opens an **annotation**, which is a declaration's only prefix that is not a word
+    // (`testing.md`). It is deliberately not an operator: nothing in the expression grammar spells
+    // `@`, so a line beginning with one can only be an annotation and the reading needs no
+    // lookahead.
+    //
+    // A **directive** keeps `#`, and the two are told apart by the sigil rather than by the margin.
+    // That is what lets an annotation sit at column 1 — which one on a `module` line has to, since
+    // the declaration it is on is there — where a rule about indentation would have had the two
+    // forms competing for the same position.
+    "@",
+    // Kept a token although no declaration form reads one, so that a `#` reaching the grammar is
+    // answered by a sentence naming `@` rather than by the lexer's complaint about a character it
+    // does not know. Someone arriving from Rust or C will write `#` for an annotation, and that is
+    // a reading worth answering rather than a typo.
     "#",
     // Only ever a separator inside a three-clause `for` header (`00` §10). It is deliberately not a
     // statement terminator: a line ends a statement, and a token that could also end one would give

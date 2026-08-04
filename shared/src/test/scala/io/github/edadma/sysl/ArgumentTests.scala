@@ -627,12 +627,12 @@ class ArgumentTests
              |""".stripMargin) shouldBe "6\n15\n"
     }
 
-    // `testing.md`: a `#test` function takes no parameters, because `sysl test` calls it with
+    // `testing.md`: a `@test` function takes no parameters, because `sysl test` calls it with
     // nothing. A default looks like it should rescue that — every parameter has a value, so the
     // call could be written with none — and it does not, which is right: the runner's call is
     // emitted rather than analyzed, so there is nothing there to fill it.
-    "a '#test' function's parameter is refused even carrying a default" in {
-      err("""|#test
+    "a '@test' function's parameter is refused even carrying a default" in {
+      err("""|@test
              |works(n: int = 7) -> unit
              |    assert(n == 7, "n")
              |""".stripMargin) should include("takes no parameters")

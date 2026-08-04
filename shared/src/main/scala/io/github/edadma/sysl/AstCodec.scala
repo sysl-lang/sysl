@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 17
+  val Version: Int = 18
 
   private val Magic = "sysl-ast"
 
@@ -230,6 +230,7 @@ object AstCodec {
       case VariantPattern(n, as)  => tok("pvar"); sref(n); list(as)(pattern)
       case StructPattern(n, fs)   => tok("pstr"); sref(n); list(fs) { (f, sub) => sref(f); pattern(sub) }
       case TuplePattern(as)       => tok("ptup"); list(as)(pattern)
+      case BindPattern(n, inner)  => tok("pat"); sref(n); pattern(inner)
 
     // --------------------------------------------------------- expressions
 
@@ -589,6 +590,7 @@ object AstCodec {
       case "pvar" => VariantPattern(sref(), list(pattern()))
       case "pstr" => StructPattern(sref(), list { val f = sref(); (f, pattern()) })
       case "ptup" => TuplePattern(list(pattern()))
+      case "pat"  => BindPattern(sref(), pattern())
       case other  => fail(s"'$other' is not a pattern tag")
 
     // --------------------------------------------------------- expressions

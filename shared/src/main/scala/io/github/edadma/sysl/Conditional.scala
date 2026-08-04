@@ -211,17 +211,21 @@ object Conditional {
    * what keeps the gate out of the channel the language reads block structure from: an indented
    * `#if` would look like it takes part in an indentation it has nothing to do with, and a reader
    * would have to know that the line disappears before anything counts columns. It is also how C is
-   * written. And it is what makes a declaration's `#test` attribute (`testing.md`) — indented with
-   * the declaration it is on — something this can never mistake for one of these.
+   * written.
+   *
+   * What it is **not** is the thing that tells a directive from an annotation. That is the sigil:
+   * `#` gates lines, `@` says something about a declaration. The margin could not do the job, since
+   * an annotation on a `module` header sits at column 1 too — the declaration it is on is there.
    */
   private def directiveOf(text: String): Option[(String, Int)] =
     if !text.startsWith("#") then None
     else {
       val word = text.drop(1).takeWhile(_.isLetter)
 
-      // A word this does not know is left alone rather than refused: `#` also opens a declaration's
-      // attribute, which is none of this pass's business. Something that reads as a name carrying on
-      // past the word is left alone for the same reason.
+      // A word this does not know is left alone rather than refused, and is answered further in —
+      // by the grammar, which has the `#` as a token and a sentence to say about it. Refusing here
+      // would be refusing before the lexer has run, so the report would have a line and no column.
+      // Something that reads as a name carrying on past the word is left alone for the same reason.
       if (Words(word) || notWords.contains(word)) &&
         !text.drop(1 + word.length).headOption.exists(c => c.isDigit || c == '_')
       then Some((word, 2 + word.length))

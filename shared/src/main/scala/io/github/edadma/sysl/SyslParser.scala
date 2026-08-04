@@ -110,16 +110,16 @@ class SyslParser(val source: Source) extends DeclParser {
         case v ~ d                 => restrict(v, d)
       }
 
-  /** A function carrying attributes, which is a declaration with a line or more in front of it.
+  /** A function carrying annotations, which is a declaration with a line or more in front of it.
    *
-   * Each attribute is its own line and the declaration follows the last of them, which is why the
+   * Each annotation is its own line and the declaration follows the last of them, which is why the
    * newlines between them are consumed here: the statement separator would otherwise end the
-   * statement at an attribute, leaving a prefix with nothing to attach to. Everything about the
-   * declaration itself is still `declaration`'s — an attributed function may be `private`, and is
+   * statement at an annotation, leaving a prefix with nothing to attach to. Everything about the
+   * declaration itself is still `declaration`'s — an annotated function may be `private`, and is
    * written exactly as any other.
    *
    * Only a function may carry one, and the refusal below is what says so. A struct or a `val` with
-   * `#test` above it is a mistake about what a test *is* rather than a syntax error, so it is
+   * `@test` above it is a mistake about what a test *is* rather than a syntax error, so it is
    * answered with the sentence rather than with the list of forms the grammar could still have read.
    */
   protected lazy val attributedDecl: PackratParser[Stmt] =
@@ -130,43 +130,56 @@ class SyslParser(val source: Source) extends DeclParser {
       // grammar's complaint about whichever alternative it went on to try.
       duplicated(as) match
         case Some(dup) =>
-          err(s"'#$dup' is written twice above one declaration, and it says nothing the once does not")
+          err(s"'@$dup' is written twice above one declaration, and it says nothing the once does not")
         case None =>
           (visibility ~ funcDecl) ^^ {
             case Visibility.Public ~ (f: FuncDecl) => attributed(f, as)
             case v ~ (f: FuncDecl)                 => restrict(v, attributed(f, as))
             case _ ~ other                         => other
           } | err(
-            "an attribute marks a function, and only a function — neither what 'sysl test' calls " +
+            "an annotation marks a function, and only a function — neither what 'sysl test' calls " +
               "nor what recurses is anything a declaration of another kind supplies",
           )
     }
 
-  /** One attribute: what it says about the function under it. Each alternative reads the `#` for
-   * itself so that the attribute's own position is the `#`, which is the line a test report names.
+  /** One annotation: what it says about the function under it. Each alternative reads the `@` for
+   * itself so that the annotation's own position is the `@`, which is the line a test report names.
    */
   private lazy val attribute: PackratParser[Attr] =
-    testAttr ^^ Attr.Test.apply | tailrecAttr | unknownAttr
+    testAttr ^^ Attr.Test.apply | tailrecAttr | unknownAttr | hashAttr
 
-  /** `#test`, and the three things it may say about the test: the name a report gives it, that it is
+  /** `@test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
    */
   protected lazy val testAttr: PackratParser[TestAttr] =
-    at(op("#") ~> attrWord("test") ~> opt(op("(") ~> testArgs <~ op(")"))
+    at(op("@") ~> attrWord("test") ~> opt(op("(") ~> testArgs <~ op(")"))
       ^^ (_.getOrElse(TestAttr(None, false, None))))
 
-  /** `#tailrec` — the assertion that this function's call to itself is the last thing it does
+  /** `@tailrec` — the assertion that this function's call to itself is the last thing it does
    * (`12 § Tail calls`). It takes no arguments: there is nothing to configure about a jump, and
-   * what the attribute buys is the refusal when there is no jump to make.
+   * what the annotation buys is the refusal when there is no jump to make.
    */
   protected lazy val tailrecAttr: PackratParser[Attr] =
-    op("#") ~> attrWord("tailrec") ^^ (_ => Attr.TailRec)
+    op("@") ~> attrWord("tailrec") ^^ (_ => Attr.TailRec)
 
   private lazy val unknownAttr: PackratParser[Attr] =
-    op("#") ~> ident >> (n =>
-      err(s"'$n' is not an attribute sysl knows — '#test' and '#tailrec' are the two"))
+    op("@") ~> ident >> (n =>
+      err(s"'$n' is not an annotation sysl knows — '@test' and '@tailrec' are the two"))
 
-  /** An attribute's name. Each stays an ordinary identifier — reserving them would spend the words
+  /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
+   *
+   * It is answered here rather than left to the lexer because the two sigils mark two different
+   * kinds of thing, and saying which is which is the whole of what the reader is missing: `#` gates
+   * lines before the lexer sees them and sits at the margin, `@` says something about the
+   * declaration under it. A directive word is *not* named here, since `#if` at the margin never
+   * reaches the grammar at all.
+   */
+  private lazy val hashAttr: PackratParser[Attr] =
+    op("#") ~> ident >> (n =>
+      err(s"an annotation is written '@$n' — '#' opens a directive, which gates lines before the " +
+        "lexer sees them and sits at the margin"))
+
+  /** An annotation's name. Each stays an ordinary identifier — reserving them would spend the words
    * out of every program's namespace for the sake of one line apiece, which is the trade `alloc`
    * made and the one `capabilities.md § Open` is still paying for.
    */
@@ -519,8 +532,21 @@ class SyslParser(val source: Source) extends DeclParser {
    * nowhere to carry a type, and inference covers what the form is for.
    */
   protected def patternDecl(keyword: String, mutable: Boolean): PackratParser[Stmt] =
-    (op(keyword) ~> (structPattern | variantPattern | tuplePattern)) ~ (op("=") ~> expression) ^^ {
+    (op(keyword) ~> destructuring) ~ (op("=") ~> expression) ^^ {
       case p ~ v => PatternDecl(p, mutable, Placeholders.lift(v))
+    }
+
+  /** The patterns a **binding** may be written with: the two that cannot fail, the variant one that
+   * is parsed to be refused, and any of those three named with `n @`.
+   *
+   * The name is optional rather than a fourth alternative so that `var whole @ Point{x, y} = p`
+   * reads as the same form with a name on it, which is what it is. It commits on the `@`, so a plain
+   * `var x = e` — which is not this production at all — is unaffected.
+   */
+  private lazy val destructuring: Parser[Pattern] =
+    opt(ident <~ op("@")) ~ (structPattern | variantPattern | tuplePattern) ^^ {
+      case Some(n) ~ p => BindPattern(n, p)
+      case None ~ p    => p
     }
 
   /** `ref name = place` (`03 § ref`).
@@ -777,7 +803,27 @@ class SyslParser(val source: Source) extends DeclParser {
    * the scrutinee's enum, and as a binding otherwise. A name may be qualified wherever a variant
    * may be, which is every form: a nullary variant is spelled like a name and reached like one.
    */
+  /** A pattern, with the **binding** form read first so that the name before an `@` is not taken as
+   * a pattern in its own right. Everything after the `@` is an ordinary pattern, which is what makes
+   * the form nest: `outer @ Wrap(inner @ Val(v))` is two of these.
+   */
   override protected lazy val pattern: Parser[Pattern] =
+    bindPattern | unboundPattern
+
+  /** `n @ pat` — the value bound whole, and taken apart, in one pattern.
+   *
+   * The name is an `ident` rather than a `qualifiedName`: what a binding introduces is a local, and
+   * a name with a dot in it is not a name a program can declare. A qualified one before an `@` is
+   * therefore a mistake about what is being bound rather than a pattern the grammar could go on to
+   * read, and it is answered as one.
+   */
+  protected lazy val bindPattern: Parser[Pattern] =
+    (ident <~ op("@")) ~ unboundPattern ^^ { case n ~ p => BindPattern(n, p) } |
+      (qualifiedName <~ guard(op("@"))) >> (n =>
+        err(s"'$n' has a dot in it, and what a binding introduces is a local — write a name a " +
+          "program can declare"))
+
+  private lazy val unboundPattern: Parser[Pattern] =
     patternLit ~ (rangeOp ~ patternLit) ^^ { case lo ~ (inc ~ hi) => RangePattern(lo, hi, inc) } |
       structPattern |
       variantPattern |

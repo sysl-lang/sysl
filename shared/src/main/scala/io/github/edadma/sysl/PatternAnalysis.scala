@@ -1,5 +1,7 @@
 package io.github.edadma.sysl
 
+import scala.collection.mutable
+
 /** Match arms and patterns: turning each arm and pattern into its typed form, and checking that
  * a match is exhaustive. Pattern tests are pure value reads, so the exhaustiveness rule is the
  * only semantic subtlety — an enum match must cover every variant or carry a catch-all, while a
@@ -24,12 +26,54 @@ trait PatternAnalysis extends TypeResolution {
     TArm(tpats, tguard, tbody)
   }
 
+  /** The names **this** pattern has bound so far, and whether one is already being walked.
+   *
+   * A pattern is one binding form however deeply it nests, so a name written twice inside it is a
+   * name written twice — not a shadow, which is what an inner scope would have made of it. The
+   * ordinary scope machinery cannot see that on its own: every binding declares into the arm's one
+   * scope, and a second `declare` of a name is how shadowing legitimately works everywhere else.
+   *
+   * `Rect(v, v)` compiled before this and quietly bound the second, which reads like a test that the
+   * two fields are equal — and is not one. Scala, Rust, OCaml and Haskell all refuse it for that
+   * reason; a pattern that wants two things equal says so in a guard.
+   */
+  private val boundInPattern = mutable.Set.empty[String]
+  private var walkingPattern = false
+
   /** Turns one pattern into its typed form, declaring any bindings into the current scope. A
    * bare name is a nullary-variant pattern when it names a variant of the scrutinee's enum, and
    * a binding otherwise.
+   *
+   * The outermost call is where a pattern's own set of bound names starts, and every call inside it
+   * goes straight through — which is what makes "twice in one pattern" a question this can answer,
+   * and keeps each alternative of an `a | b` arm its own pattern.
    */
-  protected def analyzePattern(p: Pattern, ty: Type): TPattern = p match
+  protected def analyzePattern(p: Pattern, ty: Type): TPattern =
+    if walkingPattern then analyzePatternIn(p, ty)
+    else
+      walkingPattern = true
+      boundInPattern.clear()
+      try analyzePatternIn(p, ty)
+      finally walkingPattern = false
+
+  /** The name a binding introduces, refused where this pattern has already introduced it. */
+  private def bindOnce(name: String, ty: Type): String =
+    if !boundInPattern.add(name) then
+      err(s"'$name' is bound twice in one pattern, and the second would quietly stand for a " +
+        "different part of the value — rename it, or compare the two in a guard")
+    else declare(name, ty)
+
+  private def analyzePatternIn(p: Pattern, ty: Type): TPattern = p match
     case WildcardPattern => TWildPattern(ty)
+
+    /* `n @ pat` — the inner pattern against the same value, and the name bound to the whole of it.
+     *
+     * The outer name is declared **before** the inner pattern is walked, which is the order a reader
+     * meets them in: in `v @ Some(v)` the second `v` is the one that repeats, and declaring in
+     * writing order is what makes the ordinary duplicate rule say so about that one. A binding is
+     * not a test, so nothing about the arm's coverage changes.
+     */
+    case BindPattern(name, inner) => TAtPattern(bindOnce(name, ty), analyzePattern(inner, ty))
 
     case LitPattern(v) =>
       val t = analyzeExpr(v, Some(ty))
@@ -85,7 +129,7 @@ trait PatternAnalysis extends TypeResolution {
             case None if written != name =>
               err(s"'$written' names no variant of ${show(ty)} and no constant, and a qualified " +
                 s"name cannot bind — write the name a program can declare")
-            case None => TBindPattern(declare(name, ty), ty)
+            case None => TBindPattern(bindOnce(name, ty), ty)
 
     // A variant is named within the scrutinee's own enum, so a module prefix on the pattern is
     // repeating what the value already settled — it is dropped, and the type is what decides.
@@ -190,12 +234,16 @@ trait PatternAnalysis extends TypeResolution {
    */
   protected def refutable(p: TPattern): Boolean = p match
     case _: TWildPattern | _: TBindPattern => false
+    // A binding never rules a value in or out, so `n @ pat` can fail exactly where `pat` can. That
+    // is what makes `var n @ Point{x, y} = p` an irrefutable binding rather than a refused test.
+    case a: TAtPattern                     => refutable(a.inner)
     case s: TStructPattern                 => s.args.exists(refutable)
     case _                                 => true
 
   /** Whether a pattern binds any name (directly or inside a variant's or struct's sub-patterns). */
   protected def binds(p: TPattern): Boolean = p match
     case _: TBindPattern    => true
+    case _: TAtPattern      => true
     case v: TVariantPattern => v.args.exists(binds)
     case s: TStructPattern  => s.args.exists(binds)
     case _                  => false

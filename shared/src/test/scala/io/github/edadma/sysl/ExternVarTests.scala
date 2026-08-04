@@ -390,14 +390,14 @@ class ExternVarTests
       run("extern optind: i32\nval start: i32 = optind\nprint(start)") shouldBe "1\n"
     }
 
-    // `testing.md`: a test build drops the entry point and dispatches to the `#test` functions
+    // `testing.md`: a test build drops the entry point and dispatches to the `@test` functions
     // instead, so what a test reaches is reached from a different root. An extern variable read only
     // from a test still has to be declared, and the storage read is still C's.
-    "a '#test' build declares one that only a test reads" in {
+    "a '@test' build declares one that only a test reads" in {
       val src =
         """extern optind: i32
           |
-          |#test("a write to C's storage is read back from it")
+          |@test("a write to C's storage is read back from it")
           |round_trips() =
           |    optind = 7i32
           |    assert(optind == 7i32, "optind")

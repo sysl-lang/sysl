@@ -459,6 +459,7 @@ trait Closures extends CallAnalysis {
   /** Every name a pattern binds, which shadows inside the arm it introduces. */
   private def patternNames(p: Pattern): List[String] = p match
     case IdentPattern(n)       => List(n)
+    case BindPattern(n, inner) => n :: patternNames(inner)
     case VariantPattern(_, ps) => ps.flatMap(patternNames)
     case TuplePattern(ps)      => ps.flatMap(patternNames)
     case StructPattern(_, fs)  => fs.flatMap((_, sub) => patternNames(sub))

@@ -447,10 +447,10 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       out should not include "never closed"
     }
 
-    "a declaration's '#test' attribute at the margin is untouched" in {
+    "a declaration's '@test' attribute at the margin is untouched" in {
       // `#` opens an attribute too (`testing.md`), and this pass has no business with one. The words
       // are what tell them apart, and `test` is not one of them.
-      ir("""#test
+      ir("""@test
            |proves_nothing()
            |    1
            |
@@ -556,11 +556,11 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       irFor(linux, src.stripMargin) should include("1")
     }
 
-    "a gated '#test' is a test the other target does not run" in {
+    "a gated '@test' is a test the other target does not run" in {
       // The attribute and the directive both start with `#` and are read by different things, so a
       // file holding both is worth pinning.
       val src = """#if macos
-                  |#test
+                  |@test
                   |only_here()
                   |    1
                   |#endif
@@ -622,15 +622,15 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
     }
   }
 
-  "a '#test' is gated like any other declaration" in {
+  "a '@test' is gated like any other declaration" in {
     // `#` opens both an attribute and a directive, and this is the one place the two meet in earnest:
     // the test build has to discover the tests the target actually has.
-    discovered("""#test
+    discovered("""@test
                  |everywhere()
                  |    1
                  |
                  |#if windows
-                 |#test
+                 |@test
                  |only_on_windows()
                  |    1
                  |#endif

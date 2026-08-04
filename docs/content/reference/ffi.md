@@ -404,7 +404,7 @@ print(1)
 
 **A nested function** — its environment is the frame it was declared in, and what would have to
 travel beside the address is that frame. **A closure** is the same reason with the name taken off. A
-**`#test` function** is dropped by every build but `sysl test`, so its address would be of a
+**`@test` function** is dropped by every build but `sysl test`, so its address would be of a
 definition the program does not have:
 
 ```sysl

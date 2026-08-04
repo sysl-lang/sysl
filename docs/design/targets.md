@@ -209,7 +209,7 @@ indentation-sensitive, and indentation is how the language reads block structure
 written *in* that channel would look like it takes part in a nesting it has nothing to do with,
 when in fact the line is gone before anything counts a column. At the margin it is visibly not
 part of the code's shape, which is what it is. It is also how C is written, and it is what keeps a
-declaration's `#test` attribute — indented with its declaration — from ever being mistaken for one
+declaration's `@test` attribute — indented with its declaration — from ever being mistaken for one
 of these.
 
 **Why lines and not a construct wrapping declarations.** Rust spells this `#[cfg]`, an attribute on

@@ -2,15 +2,15 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `#test` as the grammar and the analyzer see it (`testing.md`).
+/** `@test` as the grammar and the analyzer see it (`testing.md`).
  *
  * The attribute is the language's first, so half of what is pinned here is about the *mechanism*
  * rather than about tests: that `#` opens one, that the word after it is checked rather than
  * swallowed, that the attribute and its declaration are one statement across the newline between
- * them. The other half is what a `#test` function may be, which is everything needed for the runner
+ * them. The other half is what a `@test` function may be, which is everything needed for the runner
  * to call it with nothing and read the answer off whether it returned.
  */
-class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFrameworkSupport {
+class TestAttributeTests extends AnyFreeSpec with CodegenSupport with RunSupport with TestFrameworkSupport {
 
   private def parsed(src: String): List[Stmt] =
     SyslParser.parse(Source("<input>", src)) match {
@@ -21,30 +21,30 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
   private def attrOf(src: String): TestAttr =
     parsed(src).collectFirst { case f: FuncDecl if f.test.isDefined => f.test.get } match {
       case Some(a) => a
-      case None    => fail(s"no '#test' function was parsed from:\n$src")
+      case None    => fail(s"no '@test' function was parsed from:\n$src")
     }
 
   "the attribute parses in each form it offers" - {
-    "a bare '#test' says only that the function is one" in {
-      attrOf("""#test
+    "a bare '@test' says only that the function is one" in {
+      attrOf("""@test
                |t() = 0
                |""".stripMargin) shouldBe TestAttr(None, false, None)
     }
 
     "a string is the name a report shows" in {
-      attrOf("""#test("a sentence about what holds")
+      attrOf("""@test("a sentence about what holds")
                |t() = 0
                |""".stripMargin) shouldBe TestAttr(Some("a sentence about what holds"), false, None)
     }
 
     "'should_trap' inverts the verdict" in {
-      attrOf("""#test(should_trap)
+      attrOf("""@test(should_trap)
                |t() = 0
                |""".stripMargin) shouldBe TestAttr(None, true, None)
     }
 
     "'should_trap' may name what the run must have printed" in {
-      attrOf("""#test(should_trap: "past the end")
+      attrOf("""@test(should_trap: "past the end")
                |t() = 0
                |""".stripMargin) shouldBe TestAttr(None, true, Some("past the end"))
     }
@@ -53,14 +53,14 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     // fires — so they compose rather than being alternatives, which is the one combination a grammar
     // written as a flat choice would have left out.
     "a name and an expectation may be written together" in {
-      attrOf("""#test("an index past the end is refused", should_trap: "past the end")
+      attrOf("""@test("an index past the end is refused", should_trap: "past the end")
                |t() = 0
                |""".stripMargin) shouldBe
         TestAttr(Some("an index past the end is refused"), true, Some("past the end"))
     }
 
     "a test may be private, which is what tests of a module's own internals need" in {
-      val decls = parsed("""#test
+      val decls = parsed("""@test
                            |private t() = 0
                            |""".stripMargin)
 
@@ -73,7 +73,7 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     // is a statement of its own — and the failure is about whatever the *next* line is, which says
     // nothing about the line that was wrong.
     "an ordinary declaration after a test is not swept into it" in {
-      val decls = parsed("""#test
+      val decls = parsed("""@test
                            |t() = 0
                            |
                            |plain() = 1
@@ -84,9 +84,9 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     }
 
     "two tests in a row each keep their own attribute" in {
-      val decls = parsed("""#test("first")
+      val decls = parsed("""@test("first")
                            |a() = 0
-                           |#test("second")
+                           |@test("second")
                            |b() = 0
                            |""".stripMargin)
 
@@ -95,7 +95,7 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     }
 
     "blank lines between the attribute and the function do not separate them" in {
-      attrOf("""#test("still attached")
+      attrOf("""@test("still attached")
                |
                |
                |t() = 0
@@ -104,31 +104,57 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
   }
 
   "an attribute the language does not have is refused by name" - {
-    // The point of naming it: a mechanism with one member should say which member it has, rather
+    // The point of naming it: a mechanism with two members should say which two it has, rather
     // than reporting the grammar's own confusion about a token it could not place.
-    "an unknown word after '#' says what the attributes are" in {
-      err("""#packed
+    "an unknown word after '@' says what the annotations are" in {
+      err("""@packed
             |t() = 0
-            |""".stripMargin) should include("'#test' and '#tailrec' are the two")
+            |""".stripMargin) should include("'@test' and '@tailrec' are the two")
+    }
+
+    /** `#` where `@` was meant — the sigil someone arriving from Rust or C reaches for, and the one
+     * spelling this rename made wrong in every program that had it. It is answered with the
+     * difference between the two rather than with the annotation list, because the reader has the
+     * right word and the wrong mark.
+     */
+    "the other sigil is answered with what each of the two is for" in {
+      val out = err("""#test
+                      |t() = 0
+                      |""".stripMargin)
+
+      out should include("an annotation is written '@test'")
+      out should include("'#' opens a directive, which gates lines before the lexer sees them")
+    }
+
+    // …and the directive it names is untouched, which is the half of the split that had to keep
+    // working: `#if` never reaches the grammar at all, so nothing above can be about one.
+    "while a directive at the margin is read as a directive" in {
+      run("""#if posix
+            |t() -> int = 1
+            |#else
+            |t() -> int = 2
+            |#endif
+            |print(t())
+            |""".stripMargin) shouldBe "1\n"
     }
 
     "a declaration that is not a function cannot be a test" in {
-      err("""#test
+      err("""@test
             |struct Point
             |    x: int
             |""".stripMargin) should include("only a function")
     }
 
     "an extern has no body to run" in {
-      err("""#test
+      err("""@test
             |extern side_effect()
             |""".stripMargin) should include("only a function")
     }
   }
 
-  "what a '#test' function may be is what the runner can call" - {
+  "what a '@test' function may be is what the runner can call" - {
     "a parameter has nowhere to come from" in {
-      err("""#test
+      err("""@test
             |t(n: int) =
             |    print(n)
             |""".stripMargin) should include("takes no parameters")
@@ -138,26 +164,26 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     // rule above and needs no case of its own — and a tail with *no* named parameter never reaches
     // this rule at all, being refused where every other signature like it is.
     "a variadic tail is refused for the parameter it has to have" in {
-      err("""#test
+      err("""@test
             |t(n: int, ...) =
             |    print(n)
             |""".stripMargin) should include("takes no parameters")
     }
 
     "a tail with nothing in front of it is refused where any other signature would be" in {
-      err("""#test
+      err("""@test
             |t(...) = 0
             |""".stripMargin) should include("at least one named parameter")
     }
 
     "a generic has no compiled form until a caller fixes its arguments" in {
-      err("""#test
+      err("""@test
             |t[T]() = 0
             |""".stripMargin) should include("no type parameters")
     }
 
     "a result is a value nothing is going to read" in {
-      err("""#test
+      err("""@test
             |t() -> int = 3
             |""".stripMargin) should include("returns nothing")
     }
@@ -166,7 +192,7 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     // that says it out loud is as good as one that does not — and a rule checking the *syntax*
     // rather than the resolved type would have refused this one.
     "an explicit '-> unit' is the same as writing none" in {
-      discovered("""#test
+      discovered("""@test
                    |t() -> unit = 0
                    |""".stripMargin) shouldBe List("t")
     }
@@ -174,7 +200,7 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
 
   "a test is reported under the name it was given" - {
     "with no string, that is the function's own bare name" in {
-      discovered("""#test
+      discovered("""@test
                    |adds_two() = 0
                    |""".stripMargin) shouldBe List("adds_two")
     }
@@ -182,7 +208,7 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     "a module does not decorate it — the report groups by file already" in {
       Compiler.compileTests(List(Source("m.sysl", """module m
                                                     |
-                                                    |#test
+                                                    |@test
                                                     |adds_two() = 0
                                                     |""".stripMargin, List("m"))), Nil) match {
         case Right((_, tests)) =>
@@ -195,7 +221,7 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     "the position a report points at is the attribute's, not the function's" in {
       Compiler.compileTests(List(Source("m.sysl", """double(n: int) -> int = n * 2
                                                     |
-                                                    |#test
+                                                    |@test
                                                     |t() = 0
                                                     |""".stripMargin)), Nil) match {
         case Right((_, tests)) => tests.map(t => (t.file, t.line)) shouldBe List(("m.sysl", 3))
@@ -204,13 +230,13 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     }
 
     "tests are listed in the order the source declared them" in {
-      discovered("""#test
+      discovered("""@test
                    |third() = 0
                    |
-                   |#test
+                   |@test
                    |first() = 0
                    |
-                   |#test
+                   |@test
                    |second() = 0
                    |""".stripMargin) shouldBe List("third", "first", "second")
     }
@@ -218,27 +244,27 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
 
   "the shapes the grammar has to say no to" - {
     // A member is not a declaration statement — it parses under the rule that reads a struct's,
-    // an enum's, a trait's and an `impl`'s alike — so `#test` has no place there. The refusal comes
+    // an enum's, a trait's and an `impl`'s alike — so `@test` has no place there. The refusal comes
     // from the member grammar rather than from the attribute rule, which is why it is pinned: the
     // message a reader gets is the one that rule gives, and this says which rule that is.
     "a method cannot be a test" in {
       err("""struct Point
             |    x: int
             |
-            |    #test
+            |    @test
             |    t(self) = 0
             |""".stripMargin) should not be empty
     }
 
     "an attribute with empty parentheses says nothing, and is not a form" in {
-      err("""#test()
+      err("""@test()
             |t() = 0
             |""".stripMargin) should not be empty
     }
 
     "one attribute to a declaration" in {
-      err("""#test
-            |#test
+      err("""@test
+            |@test
             |t() = 0
             |""".stripMargin) should not be empty
     }
@@ -248,7 +274,7 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     // against and at the end of a file there is none — every case where something *is* written
     // below gets the better message, which is the one a reader will meet.
     "an attribute at the end of a file has nothing to attach to" in {
-      err("#test\n") should not be empty
+      err("@test\n") should not be empty
     }
   }
 
@@ -257,14 +283,14 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with TestFramew
     // decision, taken after every check has run. A test that stopped being checked the moment it
     // stopped being emitted would rot in place, and nobody would find out until they ran it.
     "a broken test is an error in an ordinary build" in {
-      err("""#test
+      err("""@test
             |t() =
             |    print(undefined_name)
             |""".stripMargin) should include("undefined name 'undefined_name'")
     }
 
     "a broken test is an error in a test build too" in {
-      Compiler.compileTests(List(Source("<input>", """#test
+      Compiler.compileTests(List(Source("<input>", """@test
                                                      |t() =
                                                      |    print(undefined_name)
                                                      |""".stripMargin)), Nil) match {

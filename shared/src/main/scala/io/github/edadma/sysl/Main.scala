@@ -128,7 +128,7 @@ private[sysl] val parser = {
         ),
       cmd("test")
         .action((_, c) => c.copy(command = "test"))
-        .text("run the '#test' functions of a sysl module")
+        .text("run the '@test' functions of a sysl module")
         .children(
           arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
           opt[String]("filter")
@@ -303,7 +303,7 @@ private[sysl] def execute(cfg: Config): Int = {
   val archives = artifacts ::: coreArchive.toList
 
   // A test build is its own compilation and branches before the one below, rather than sharing it:
-  // it keeps the `#test` functions every other build drops, and it lowers a different entry point
+  // it keeps the `@test` functions every other build drops, and it lowers a different entry point
   // (`Tests`). Everything up to here — the libraries, the standard module, the target — is the same,
   // which is why the branch is here and not at the top.
   if cfg.command == "test" then

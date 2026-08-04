@@ -1,25 +1,35 @@
 ---
-title: Attributes and compile time
-summary: `::` attributes a type answers, the `#test` and `#tailrec` attributes, and the `#if` directive that gates lines before the lexer sees them.
+title: Attributes, annotations, and compile time
+summary: `::` attributes a type answers, the `@test` and `@tailrec` annotations, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
-Three kinds of form in sysl reach into the *compilation* rather than into the running program, and
-they are easy to confuse because two of them start with `#`:
+Three kinds of form in sysl reach into the *compilation* rather than into the running program. Each
+has a name and a spelling of its own:
 
 | written | is | read by |
 |---|---|---|
-| `T::Attr` | a question a **type's own name** answers | the analyzer, at the use |
-| `#test`, `#tailrec` | an **attribute** on a declaration, indented with it | the grammar |
-| `#if` | a **directive** at the left margin | a pass before the lexer |
+| `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
+| `@test`, `@tailrec` | an **annotation** — a fact about the declaration under it | the grammar |
+| `#if` | a **directive** — a gate on lines | a pass before the lexer |
 
-The last two never meet, and the margin is why. A directive sits at column 1 and is gone before
-anything counts a column; an attribute is indented with the declaration it is on and arrives at the
-grammar as part of it. The words tell them apart in any case — neither `test` nor `tailrec` is one of
-`if` / `elif` / `else` / `endif`.
+**The last two are told apart by the sigil, and that is the whole rule.** An annotation is `@` and
+belongs to the declaration under it; a directive is `#` and belongs to the file. Nothing about
+indentation is involved, which matters because a declaration at the margin — a `module` header — has
+its annotation at the margin too, so a rule about columns would have had the two forms competing for
+one position.
 
-There are two attributes, both on functions and both written on their own line above the
+A directive is still written at column 1, and for its own reason: it is gone before anything counts a
+column, so an indented one would look like it takes part in a block structure it has nothing to do
+with. That is a rule about directives, not the thing that distinguishes them.
+
+There are two annotations, both on functions and both written on their own line above the
 declaration. More than one may be stacked, and writing the same one twice is refused.
+
+The `@` is also read **inside a pattern**, where it binds a name to what a sub-pattern matched
+([patterns](/reference/patterns/)). The two never compete: an annotation's `@` is a prefix at the
+start of a line above a declaration, and a pattern's is infix between a name and a pattern, in a
+position no declaration may stand.
 
 ## `::` — what a type's own name answers
 
@@ -127,22 +137,23 @@ print(Color::Nonesuch)
 'Color' has no attribute 'Nonesuch'
 ```
 
-## `#test` — a function with a caller nothing else has
+## `@test` — a function with a caller nothing else has
 
-`#` is the language's first attribute and, for now, its only one. A word after it that is not `test`
-is answered by name rather than as grammar. It is deliberately *not* a general mechanism yet.
+A word after `@` that is neither `test` nor `tailrec` is answered by name rather than as grammar. The
+set is closed, which is what makes a misspelling an error instead of a marker that quietly does
+nothing — annotations are deliberately *not* a general mechanism yet.
 
-The attribute goes on its own line above an ordinary function declaration, which may still be
+The annotation goes on its own line above an ordinary function declaration, which may still be
 `private`:
 
 ```sysl
 add(a: int, b: int) -> int = a + b
 
-#test
+@test
 adds_two()
     assert(add(1, 1) == 2, "one and one")
 
-#test("an empty slice has no first element")
+@test("an empty slice has no first element")
 private first_of_empty()
     assert(true, "nothing to see")
 
@@ -156,49 +167,49 @@ print(add(2, 3))
 That program prints `5` and runs neither test, which is the whole of the arrangement: `sysl run`
 builds the program, and the tests are for `sysl test`.
 
-Four forms of the attribute:
+Four forms of the annotation:
 
 | written | means |
 |---|---|
-| `#test` | an ordinary test, named after the function |
-| `#test("a sentence")` | named by the sentence instead |
-| `#test(should_trap)` | the test **passes** by stopping the program |
-| `#test(should_trap: "past the end")` | …and the run must have printed that text |
+| `@test` | an ordinary test, named after the function |
+| `@test("a sentence")` | named by the sentence instead |
+| `@test(should_trap)` | the test **passes** by stopping the program |
+| `@test(should_trap: "past the end")` | …and the run must have printed that text |
 
 ### What a test may be
 
 **A test is an ordinary function with a caller nothing else has**: no parameters, no result, not
 generic. All three are the same requirement from different sides, since the runner calls it with
-nothing and reads the answer off whether it returned. They are checked **at the attribute**, because
-the function is a perfectly good function and it is `#test` that made a promise about it:
+nothing and reads the answer off whether it returned. They are checked **at the annotation**, because
+the function is a perfectly good function and it is `@test` that made a promise about it:
 
 ```sysl
-#test
+@test
 takes_one(n: int)
     assert(n > 0, "positive")
 ```
 
 ```error
-a '#test' function takes no parameters, and 'takes_one' takes one — 'sysl test' calls it with nothing, so there is nowhere for an argument to come from
+a '@test' function takes no parameters, and 'takes_one' takes one — 'sysl test' calls it with nothing, so there is nowhere for an argument to come from
 ```
 
 ```sysl
-#test
+@test
 generic_one[T]()
     assert(true, "yes")
 ```
 
 ```error
-a '#test' function has no type parameters, and 'generic_one' declares 'T' — a generic is compiled for the arguments a caller fixes, and the runner supplies none
+a '@test' function has no type parameters, and 'generic_one' declares 'T' — a generic is compiled for the arguments a caller fixes, and the runner supplies none
 ```
 
 ```sysl
-#test
+@test
 gives_back() -> int = 1
 ```
 
 ```error
-a '#test' function returns nothing, and 'gives_back' returns 'int' — a test's result is whether it came back, so there is nothing to read a value with
+a '@test' function returns nothing, and 'gives_back' returns 'int' — a test's result is whether it came back, so there is nothing to read a value with
 ```
 
 ### A test passes by returning
@@ -218,19 +229,19 @@ raises a signal and says nothing — see [what stopping looks like](/reference/e
 run_it()
     adds_two()
 
-#test
+@test
 adds_two()
     assert(true, "yes")
 ```
 
 ```error
-'adds_two' is a '#test' function, which 'sysl test' calls and nothing else does — every other build leaves it out, so this call would have no definition to reach. Work two tests share belongs in an ordinary function they both call
+'adds_two' is a '@test' function, which 'sysl test' calls and nothing else does — every other build leaves it out, so this call would have no definition to reach. Work two tests share belongs in an ordinary function they both call
 ```
 
 ### What is dropped, and when
 
 `sysl run`, `sysl build`, `sysl emit-llvm` and `sysl build-lib` all drop the tests — and drop them
-**after** analysis. So a `#test` that does not compile is an error in a build that would never have
+**after** analysis. So a `@test` that does not compile is an error in a build that would never have
 run it, and a module's capability clause reaches its tests like any other member.
 
 That ordering is what lets a test sit beside what it tests: a library's tests do not travel in the
@@ -282,7 +293,7 @@ cannot see, and the message is the whole point of it.** The message is required 
 defaulted, because the condition's source is not available to print and a failure saying only
 "assertion failed" sends its reader looking for which one.
 
-## `#tailrec` — an assertion that the frame is reused
+## `@tailrec` — an assertion that the frame is reused
 
 A function whose last act is a call to itself compiles to a branch back to its own entry rather than
 a second frame, so the recursion is bounded by the arithmetic and not by the stack. That happens
@@ -290,10 +301,10 @@ whether or not anything is written — see
 [tail calls](/reference/declarations/#tail-calls) for what counts as the last act, and for the two
 things that end a tail position.
 
-`#tailrec` asserts the jump is there:
+`@tailrec` asserts the jump is there:
 
 ```sysl
-#tailrec
+@tailrec
 count(n: int, acc: int) -> int =
     if n == 0 then acc else count(n - 1, acc + 1)
 
@@ -308,7 +319,7 @@ What it buys is the refusal. The optimization is silent, so an edit that costs i
 until the day the recursion is deep enough to matter:
 
 ```sysl
-#tailrec
+@tailrec
 count(n: int, acc: int) -> int =
     if n == 0 then acc else 1 + count(n - 1, acc)
 
@@ -389,8 +400,9 @@ be if the four gated lines had been dropped.
 indentation-sensitive, and indentation is how the language reads block structure — so a gate written
 *in* that channel would look like it takes part in a nesting it has nothing to do with, when in fact
 the line is gone before anything counts a column. At the margin it is visibly not part of the code's
-shape, which is what it is. It is also how C is written, and it is what keeps a declaration's `#test`
-attribute from ever being mistaken for one of these.
+shape, which is what it is. It is also how C is written. What keeps a declaration's `@test` from ever
+being mistaken for one of these is the **sigil**, not the margin — an annotation on a `module` header
+sits at column 1 too.
 
 **Why lines and not a construct wrapping declarations.** Rust spells this `#[cfg]`, an attribute on
 an item, and can because Rust is brace-delimited: the attribute attaches without moving anything.
@@ -510,7 +522,7 @@ because the trees a library ships are now a per-target answer.
 
 | absent | why |
 |---|---|
-| a general attribute mechanism | `#test` is the only one. The two that would make it general — a `packed` struct layout and an alignment attribute — are not designed |
+| a general annotation mechanism | `@test` and `@tailrec` are the two, and the set is closed. What would make it general — a `packed` struct layout, an alignment annotation — is not designed |
 | `#define`, or any project-supplied symbol | the `#if` vocabulary is derived from the target and closed, which is what makes an unknown symbol an error rather than a false |
 | a `#if` that asks about a capability | a condition asks what the *target* says; what a project permits is a different question, left with the config that would define it |
 | a test framework in the library | a test asserts in the language it is testing, and passes by returning |

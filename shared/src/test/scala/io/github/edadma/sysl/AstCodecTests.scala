@@ -187,16 +187,16 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // The codec's promise is that a tree reads back as the tree that was written, and a field only
     // ever seen holding `None` is one that could be dropped with nothing noticing.
     check("a test in each form its attribute takes",
-      """#test
+      """@test
         |plain() = 0
         |
-        |#test("a sentence about what holds")
+        |@test("a sentence about what holds")
         |named() = 0
         |
-        |#test(should_trap)
+        |@test(should_trap)
         |trapping() = 0
         |
-        |#test("both at once", should_trap: "past the end")
+        |@test("both at once", should_trap: "past the end")
         |both() = 0
         |""".stripMargin)
   }

@@ -117,7 +117,7 @@ trait DeclTables extends Reporting {
   protected val enumDecls   = mutable.LinkedHashMap.empty[String, EnumDecl]
   protected val funcDecls   = mutable.LinkedHashMap.empty[String, FuncDecl]
 
-  /** The `#test` functions the sources declared, in the order hoisting met them (`testing.md`). A
+  /** The `@test` functions the sources declared, in the order hoisting met them (`testing.md`). A
    * report lists tests in the order they were written, and this is where that order comes from —
    * the typed functions are grouped by what reaches them and say nothing about where they sat.
    */

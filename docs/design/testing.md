@@ -30,9 +30,9 @@ End-to-end tests that run the full pipeline on a sysl snippet and check runtime 
 specific codegen feature, authored in Scala (as fixtures or inline source), compiled, run,
 asserted.
 
-## Tier 3 — sysl `#test` functions, compiled + executed (sysl-authored)
+## Tier 3 — sysl `@test` functions, compiled + executed (sysl-authored)
 
-sysl's **own test framework**: `#test`-annotated functions written *in sysl*, discovered and
+sysl's **own test framework**: `@test`-annotated functions written *in sysl*, discovered and
 run by a `sysl test` CLI command. **These test *sysl code*** — the standard library and
 language behavior — and are the executable-spec / conformance corpus.
 
@@ -41,17 +41,17 @@ language behavior — and are the executable-spec / conformance corpus.
 ### The attribute
 
 ```
-#test
+@test
 adds_two() =
     assert(add(1, 1) == 2, "one and one")
 
-#test("an empty slice has no first element")
+@test("an empty slice has no first element")
 first_of_empty() = …
 
-#test(should_trap)
+@test(should_trap)
 a_broken_promise() = …
 
-#test(should_trap: "past the end")
+@test(should_trap: "past the end")
 an_index_past_the_end() = …
 ```
 
@@ -65,12 +65,12 @@ an ordinary function declaration, which may still be `private`.
 compilation`), and the two never meet: a directive sits at the margin and is gone before the lexer
 runs, while an attribute is indented with the declaration it is on and reaches the grammar as one.
 The words tell them apart in any case — `test` is not one of `if` / `elif` / `else` / `endif`. A
-`#test` inside a gated-out branch is simply not there, so a test build has the tests its target has.
+`@test` inside a gated-out branch is simply not there, so a test build has the tests its target has.
 
 **A test is an ordinary function with a caller nothing else has.** No parameters, no result,
 not generic — all three are the same requirement from different sides, since the runner calls
 it with nothing and reads the answer off whether it returned. They are checked at the
-attribute, because the function is a perfectly good function and it is `#test` that made a
+attribute, because the function is a perfectly good function and it is `@test` that made a
 promise about it.
 
 **A test passes by returning.** That is the whole protocol, and it is what lets a test assert
@@ -88,7 +88,7 @@ at the link; work two tests share belongs in an ordinary function they both call
 ### What is dropped, and when
 
 `sysl run`, `sysl build`, `sysl emit-llvm` and `sysl build-lib` all drop the tests, and drop
-them **after** analysis — so a `#test` that does not compile is an error in a build that would
+them **after** analysis — so a `@test` that does not compile is an error in a build that would
 never have run it, and a module's capability clause (`13 §4`) reaches its tests like any other
 member. That ordering is what lets a test sit beside what it tests: a library's tests do not
 travel in the library, a program's do not run when it runs, and neither stops being checked.
@@ -132,7 +132,7 @@ own run-it tests (Scala-authored); Tier 3 = the language's test framework (sysl-
 Tests accrete stage by stage down the pipeline:
 
 ```
-lexer → parser (AST) → analyzer (typed AST) → LLVM codegen → sysl #test runner
+lexer → parser (AST) → analyzer (typed AST) → LLVM codegen → sysl @test runner
   T1        T1               T1                  T1 + T2            T3
 ```
 

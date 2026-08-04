@@ -246,6 +246,24 @@ The pattern forms the implementation accepts, each a decision this chapter ratif
 | Nested | `Wrap(Val(v))` | a variant whose payload itself matches a sub-pattern |
 | Struct, positional | `Point(a, b)` | a struct, binding every field by position |
 | Struct, named | `Point{x, y}`, `Point{x: a}` | a struct, binding fields by name; unlisted fields are unconstrained |
+| Named | `c @ Circle(r)` | what the sub-pattern matches, binding the **whole** value besides |
+
+**`n @ pat` — matching and naming at once (settled).** Destructuring leaves the arm with the parts
+and not the value, so an arm wanting both had to test the shape twice or give the destructuring up.
+The `@` form is both at once, and it is the spelling Scala, Rust, OCaml and Haskell all settled on.
+
+A binding is **not a test**, which is what keeps this a small rule rather than a second matching
+mechanism: a named arm covers what its sub-pattern covers, so exhaustiveness sees straight through
+it and every analysis that asks what a pattern *tests for* strips the name first. It nests, since
+what follows the `@` is an ordinary pattern; the name has to be one a program could declare, so a
+qualified name is refused for the reason the bare-name rule refuses one.
+
+**A name is bound once per pattern (settled).** Two arms may reuse a name — each arm is a scope —
+but a repeat *inside* one pattern is refused. `Point(v, v)` used to compile and quietly bind the
+second, which reads like a test that the two fields are equal and is not one; no pattern here
+compares two parts of a value, and a guard is what does. The rule is the same one Scala, Rust, OCaml
+and Haskell apply, and it is a property of the whole pattern rather than of a scope, since a pattern
+binds once however deeply it nests.
 
 **The bare-name rule (settled).** A bare identifier in pattern position is a **nullary-variant
 pattern** when it names a nullary variant of the scrutinee's enum, and a **binding** otherwise.

@@ -47,11 +47,11 @@ class TestCliTests extends AnyFreeSpec with Matchers {
   }
 
   private val passing =
-    """#test
+    """@test
       |arithmetic_holds() =
       |    assert(1 + 1 == 2, "two")
       |
-      |#test("a trap is what a broken promise leaves")
+      |@test("a trap is what a broken promise leaves")
       |a_broken_promise() =
       |    assert(false, "down")
       |""".stripMargin
@@ -60,7 +60,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
     "a run where everything passes exits 0" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      cli(Config(command = "test", file = program("""#test
+      cli(Config(command = "test", file = program("""@test
                                                     |t() =
                                                     |    assert(true, "up")
                                                     |""".stripMargin))) shouldBe 0
@@ -79,7 +79,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
     "a file-private test is still one the runner reaches" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      cli(Config(command = "test", file = program("""#test
+      cli(Config(command = "test", file = program("""@test
                                                     |private t() =
                                                     |    assert(true, "up")
                                                     |""".stripMargin))) shouldBe 0
@@ -91,7 +91,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
       val (status, _, errs) = ran(Config(command = "test", file = program("""print("nothing to test")""")))
 
       status shouldBe 0
-      errs should include("no '#test' functions")
+      errs should include("no '@test' functions")
     }
 
     "a filter that matches nothing says how many there were" in {
@@ -129,7 +129,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
   "a test build is a build, and is refused for the same reasons" - {
     "a program that does not compile is reported rather than run" in {
       val (status, _, errs) =
-        ran(Config(command = "test", file = program("""#test
+        ran(Config(command = "test", file = program("""@test
                                                       |t() =
                                                       |    print(undefined_name)
                                                       |""".stripMargin)))

@@ -322,13 +322,13 @@ Either one leaves the function compiled exactly as written.
 It is **self-recursion only**. Mutual recursion and calls through a `Fn` or a `*extern` are ordinary
 calls, however they are written.
 
-### `#tailrec`
+### `@tailrec`
 
-The jump is silent, which is what you want until an edit takes it away. `#tailrec` asserts it is
+The jump is silent, which is what you want until an edit takes it away. `@tailrec` asserts it is
 there and is refused when it is not:
 
 ```sysl
-#tailrec
+@tailrec
 sum(n: int) -> int =
     if n == 0 then 0 else n + sum(n - 1)
 

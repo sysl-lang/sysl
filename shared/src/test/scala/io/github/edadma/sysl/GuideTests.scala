@@ -271,7 +271,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   // the same buffer, one keeping where the elements end and one computing it, driven through every
   // scenario side by side and required to agree. What this run cannot do is break a contract — a
   // violated `require` traps, so the program would end rather than report — and those claims are
-  // the `#test` functions the case below runs.
+  // the `@test` functions the case below runs.
   "ring — bounded indices, and an invariant that found a redundant field" in {
     val out = guide("ring")
 
@@ -294,7 +294,7 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   // traps, and a trap ends the run rather than reporting into it. Each of these passes by not
   // coming back (`testing.md`). This was `RingClaimTests`, asserting the same claims from Scala
   // against cut-down copies of the ring's shapes; it is now stated in sysl against the shapes
-  // themselves, which is what `#test(should_trap)` bought.
+  // themselves, which is what `@test(should_trap)` bought.
   //
   // The count is asserted for the reason the check counts above are: a `should_trap` test that
   // stopped being compiled would look exactly like one that passed, since there would be no failing
