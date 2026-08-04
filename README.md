@@ -117,6 +117,38 @@ silently drops the rest. On a Mac, Homebrew's LLVM is deliberately off the `PATH
 The JS and Native cross-targets exist in the build but the JVM target is the working one during
 development.
 
+## Using the compiler as a library
+
+The command line takes paths, because a program on disk is what it is for. A tool that *generated*
+the source it wants compiled — a documentation harness holding a page's code block, an editor with an
+unsaved buffer, a test with an inline program — has no file and no reason to make one. The same
+compiler is on Maven Central and takes a string:
+
+```scala
+libraryDependencies += "io.github.edadma" %% "sysl" % "0.0.4"   // %%% in a cross-project
+```
+
+```scala
+import io.github.edadma.sysl.api.Sysl
+
+Sysl.run("main()\n    print(1 + 2)")     // Right(Sysl.Run(0, "3\n"))
+Sysl.runBody("print(1 + 2)")             // the same, with the `main` supplied
+Sysl.compile("main()\n    print(x)")     // Left("… undefined name 'x' …")
+```
+
+`compile` and `run` take a whole program. `compileBody` and `runBody` take a **body** — the statements
+a program runs, with no `main` written around them, which is what a documentation page shows and what
+a test writes inline. Supplying that wrapper is structural rather than textual, which is why it lives
+in the compiler rather than in each caller: at a file's top level `f()` is a call and `f() -> int = x`
+is a declaration, and nothing about the characters separates them.
+
+Each has a `…Files` form taking several `Sysl.File(name, text, dir)`, where `dir` names the module a
+file belongs to when there is no filesystem to read it from.
+
+**No signature here mentions a syntax tree.** Everything is `String`, `Int`, `List` and `Either`, so a
+node added to the AST is not a breaking change to anything compiled against this. `Sysl.canRun` says
+whether this machine has the clang that linking needs; compiling to LLVM IR needs nothing installed.
+
 ## License
 
 ISC — see [LICENSE](LICENSE).
