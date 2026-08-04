@@ -320,10 +320,10 @@ object AstCodec {
         case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
         case Variant(e)                   => tok("vnt"); expr(e)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv, tr) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv, tr, pu) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); opt(t)(testAttr)
-          opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) }); bool(tr)
+          opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) }); bool(tr); bool(pu)
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -701,7 +701,7 @@ object AstCodec {
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
             bounds(), bool(), vis(), tdefaults(), opt(testAttr()),
-            opt(at(CallConv(sref(), opt(sref())))), bool())
+            opt(at(CallConv(sref(), opt(sref())))), bool(), bool())
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "extv" =>

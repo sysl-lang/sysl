@@ -396,7 +396,7 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         """@inline
           |double(n: int) -> int = n * 2
           |print(double(5))""".stripMargin
-      ) should include("'@test' and '@tailrec' are the two")
+      ) should include("'@test', '@tailrec' and '@pure' are the three")
     }
 
     "the same attribute twice is refused" in {

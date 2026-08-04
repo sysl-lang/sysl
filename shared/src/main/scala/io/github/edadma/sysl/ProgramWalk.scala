@@ -23,6 +23,7 @@ trait ProgramWalk
     with LinkRequirements
     with ConventionCheck
     with NoAlloc
+    with Purity
     with GatedModules
     with InitOrder
     with DefaultParams {
@@ -317,6 +318,9 @@ trait ProgramWalk
     // analyzer — and asked here rather than after `analyze` returns, so that a module doing what it
     // declared it would not is one of this walk's diagnostics like any other.
     checkNoAlloc(allFuncs, tvals.toList, vtables.values.toList, tmain, mainScope.module)
+
+    // And what a `@pure` function promised, asked of the same tree for the same reason (`17 §6`).
+    checkPurity(allFuncs, externs)
 
     TProgram(
       structInsts.values.filterNot(abstracted).toList,
@@ -936,7 +940,7 @@ trait ProgramWalk
     // function, and only the second answers for an instantiation; a symbol is file-private if either
     // says so, since both name the one declaration.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
-      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant)
+      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure)
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

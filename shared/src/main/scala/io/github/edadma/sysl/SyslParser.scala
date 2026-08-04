@@ -165,7 +165,7 @@ class SyslParser(val source: Source) extends DeclParser {
    * itself so that the annotation's own position is the `@`, which is the line a test report names.
    */
   private lazy val attribute: PackratParser[Attr] =
-    testAttr ^^ Attr.Test.apply | tailrecAttr | unknownAttr | hashAttr
+    testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | unknownAttr | hashAttr
 
   /** `@test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
@@ -181,9 +181,16 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val tailrecAttr: PackratParser[Attr] =
     op("@") ~> attrWord("tailrec") ^^ (_ => Attr.TailRec)
 
+  /** `@pure` — the assertion that a caller can observe nothing about this call but its result
+   * (`17 §6`). Like `@tailrec` it takes no arguments: purity is not a thing to configure, and what
+   * the annotation buys is the refusal when the body does something a caller could observe.
+   */
+  protected lazy val pureAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("pure") ^^ (_ => Attr.Pure)
+
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
-      err(s"'$n' is not an annotation sysl knows — '@test' and '@tailrec' are the two"))
+      err(s"'$n' is not an annotation sysl knows — '@test', '@tailrec' and '@pure' are the three"))
 
   /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
    *
@@ -213,6 +220,7 @@ class SyslParser(val source: Source) extends DeclParser {
     as.foldLeft(f) {
       case (d, Attr.Test(t)) => d.copy(test = Some(t))
       case (d, Attr.TailRec) => d.copy(tailrec = true)
+      case (d, Attr.Pure)    => d.copy(pure = true)
     }
 
   private lazy val testArgs: Parser[TestAttr] =

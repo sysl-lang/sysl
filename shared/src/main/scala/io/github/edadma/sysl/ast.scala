@@ -759,6 +759,8 @@ case class FuncDecl(
     conv: Option[CallConv] = None,
     /** `@tailrec` — see `TFunc.tailrec`. */
     tailrec: Boolean = false,
+    /** `@pure` — see `TFunc.pure`. */
+    pure: Boolean = false,
 ) extends Stmt
 
 /** What `@test` says about the function it is written above (`testing.md`).
@@ -786,6 +788,7 @@ case class TestAttr(display: Option[String], shouldTrap: Boolean, expected: Opti
 enum Attr(val word: String) {
   case Test(attr: TestAttr) extends Attr("test")
   case TailRec              extends Attr("tailrec")
+  case Pure                 extends Attr("pure")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved

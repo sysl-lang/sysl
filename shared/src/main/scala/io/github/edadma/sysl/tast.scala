@@ -729,6 +729,14 @@ case class TFunc(
      * substitution pass nor a hidden argument travelling with the call.
      */
     variant: Option[TExpr] = None,
+    /** `@pure` was written above it: an assertion that a caller can observe nothing about this call
+     * but its result (`17 §6`).
+     *
+     * It is checked rather than believed, and what it excludes is written out in `Purity`. It is not
+     * inferred: a function is pure because it says so, which is what keeps an edit to a leaf from
+     * breaking a caller three levels up with no annotation anywhere naming the promise it broke.
+     */
+    pure: Boolean = false,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones

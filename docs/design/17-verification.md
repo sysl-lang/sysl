@@ -256,6 +256,12 @@ edit to a leaf function break a caller three levels up with no annotation anywhe
 promise that was broken, which is the failure mode that makes inferred effect systems unpleasant to
 live with. The annotation is where the promise is written down and where the error is reported.
 
+**Nothing in the library is annotated yet, so a pure function today reaches only the language and
+other pure functions the program wrote.** That is adoption from the leaves up working exactly as
+`§7` describes it, and it is not a defect — but it does mean the annotation is narrower in practice
+than the list above suggests, until somebody works up `lib/sysl/math`. `§ Open h` records what makes
+that less mechanical than it looks.
+
 ## 7. `@reads` and `@writes`
 
 **Specified and not built, for `§5`'s reason and by the same dependency** — a frame names module-level
@@ -444,6 +450,14 @@ codegen one, and it is the shape `15 §6`'s incremental build would want.
 allocates allocates nothing in the emitted program. Whether `no alloc` should therefore ignore it is
 undecided, and the two answers are defensible: ignoring it is what erasure implies, and refusing it
 keeps one rule about what a module's source may contain.
+
+**h. Annotating the library, and what a generic function's purity even means.** `pow[T: Mul]` is pure
+at `int`, where `Mul` is an instruction, and its purity at some other `T` is a question about that
+`T`'s `mul` — so `@pure` on a generic declaration is either a promise about every instantiation
+(which needs the bound to carry it) or a claim checked per instantiation (which reports a mistake at
+whoever wrote the call rather than at whoever wrote the function). Neither is obviously right, and it
+is why `lib/sysl/math`'s generic functions are unannotated rather than annotated in passing. Related
+to `§ Open a`, which is the same question asked of a callback.
 
 **g. A `variant` on a nested function.** `§4`'s check is made at the call, and the two callable forms
 that are not top-level functions are not reached by a call of that shape: a closure goes through `Fn`,

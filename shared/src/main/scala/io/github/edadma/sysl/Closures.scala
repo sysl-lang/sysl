@@ -60,6 +60,12 @@ object Closures {
   def literal(t: Type): Boolean = t match
     case s: Type.Struct => s.base.startsWith(prefix)
     case _              => false
+
+  /** Whether a symbol is one of the functions a closure literal lowered to — its `call` body, or one
+   * of the hooks the struct carries. Asked where a diagnostic would otherwise name it: the compiler's
+   * own filing is not something a reader wrote and not something they can go and look at.
+   */
+  def symbol(name: String): Boolean = name.startsWith(prefix)
 }
 
 trait Closures extends CallAnalysis {
