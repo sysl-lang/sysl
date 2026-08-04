@@ -193,8 +193,8 @@ This is the single most valuable property in the chapter and it is available alm
 because the reason other ecosystems need build scripts mostly does not apply. Cargo's `build.rs`
 exists in large part to compile vendored C, and **sysl already compiles a library's C
 declaratively**: `15 § 7` establishes that a library may carry C source inside its module tree, and
-`bindings/sqlite3` does exactly that. The linker inputs a package needs are `link` directives in the
-source (`13 §`), not a program that computes them.
+`bindings/regex` and the SQLite package both do exactly that. The linker inputs a package needs are
+`link` directives in the source (`13 §`), not a program that computes them.
 
 What that buys is most of the supply-chain story: **a package that cannot execute during
 installation cannot exfiltrate anything during installation.** `sysl add` reads and writes files and
@@ -348,3 +348,22 @@ code reaches.
   and the question is only which of them the fetcher inherits.
 - **g. `requires` granularity**, carried over from `capabilities.md`: whether a package or module
   is the right unit, or whether an individual declaration should be able to state a requirement.
+- **h. A package has no way to carry an example program.** Found by moving the SQLite binding out to
+  [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), and **verified rather than reasoned**:
+  `build-lib` on a tree holding `examples/demo.sysl` refuses it, because `13 §1` puts a file with no
+  `module` header in the anonymous root module wherever it sits, and `13 §8` says a library may not
+  be there. Everything under a package root is compiled *into* the library, so there is no "outside"
+  the way `bindings/<name>/lib` had one. The demo went into that repository's README, which works and
+  is not the same as being compiled. The options look like a directory the build ignores by
+  convention, a manifest key naming what is not part of the library, or deciding a package simply
+  does not carry programs — and the third is the one that needs an argument, since an example that is
+  never compiled is an example that rots.
+
+## The first package
+
+[sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3) is the first sysl package outside this
+repository, and it exists to keep this chapter honest: it has a real `package.hocon`, a module under
+the package root, C compiled as part of the library, and a `link` directive that travels in the
+artifact so nothing on the consuming side names `-lsqlite3`. It is consumed today the way any library
+is — `build-lib` then `--lib` — because §3–§6 are unbuilt and there is nothing yet that could fetch
+it. It is what `sysl add` should be pointed at first.

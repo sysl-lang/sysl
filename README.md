@@ -72,8 +72,14 @@ sbt "syslJVM/run run bindings/regex/match.sysl --lib /tmp/rx.syslib"
 ```
 
 `bindings/regex` binds POSIX regular expressions and needs nothing installed, since they are part of
-libc. `bindings/sqlite3` binds SQLite and needs its header and library; the program says nothing
-about linking, because `link "sqlite3"` is written once in the binding and travels in the artifact.
+libc. A program built against it says nothing about linking, because `link "regex"` is written once
+in the binding and travels in the artifact.
+
+**The SQLite binding used to live here and now has a repository of its own** —
+[sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package outside this tree
+(`docs/design/packages.md`). It moved because a binding to a library nobody is obliged to have
+installed is a *package*, not an example, and keeping it here made the compiler's own suite depend on
+SQLite being present.
 
 A program's own unit tests are `@test` functions written beside what they test, and `sysl test` is
 what runs them (`docs/design/testing.md`):

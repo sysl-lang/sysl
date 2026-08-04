@@ -5,8 +5,13 @@ import io.github.edadma.cross_platform.*
 /** Where a binding's library root sits, as seen from wherever the suite was started.
  *
  * `bindings/<name>/lib` is a **library project root**, so a module's name is the path below it —
- * `bindings/sqlite3/lib/sqlite` holds `sqlite`. The demo program beside the root is deliberately
- * outside it, since anything under the root is compiled *into* the library.
+ * `bindings/regex/lib/rx` holds `rx`. The demo program beside the root is deliberately outside it,
+ * since anything under the root is compiled *into* the library.
+ *
+ * That the root is a directory *inside* the binding rather than the binding itself is what gives the
+ * demo somewhere to live, and it is the one thing a package published on its own does not have:
+ * there the repository root is the package root, so a program cannot sit beside the library
+ * (`packages.md § Open h`).
  */
 object Bindings {
 
@@ -35,7 +40,7 @@ object Bindings {
 trait BindingSupport extends LibraryCliSupport {
 
   /** The directory under `bindings/`, which is named for the C library rather than for the module:
-   * `sqlite3` holds the module `sqlite`.
+   * `regex` holds the module `rx`.
    */
   protected def binding: String
 
