@@ -9,7 +9,7 @@ with two lines rather than one:
 
 ```sysl
 module sysl.fs
-requires os
+@requires(os)
 ```
 
 Nothing here is language, and nothing here can be given a body on a target with no filesystem under
@@ -17,7 +17,7 @@ it: a freestanding image has no `fopen` to call and no `errno` to read. So the c
 warning — it is a fact about which module exists, and it is checked at the **import**:
 
 ```sysl
-no os
+@no_os
 
 import sysl.fs.exists
 

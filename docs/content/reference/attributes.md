@@ -1,6 +1,6 @@
 ---
 title: Attributes, annotations, and compile time
-summary: `::` attributes a type answers, the `@test` and `@tailrec` annotations, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the `@test` and `@tailrec` annotations, the file-header annotations, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
@@ -23,8 +23,21 @@ A directive is still written at column 1, and for its own reason: it is gone bef
 column, so an indented one would look like it takes part in a block structure it has nothing to do
 with. That is a rule about directives, not the thing that distinguishes them.
 
-There are two annotations, both on functions and both written on their own line above the
-declaration. More than one may be stacked, and writing the same one twice is refused.
+Annotations come in two groups by what they attach to.
+
+**On a function**, `@test` and `@tailrec`, each written on its own line above the declaration. More
+than one may be stacked, and writing the same one twice is refused.
+
+**On the file**, in its header directly below `module` and before everything else: `@no_alloc` and
+its siblings, `@requires(...)`, and `@link("...")`. These say what the whole module may do and what
+its `extern`s need, so they attach to the file rather than to any declaration in it — and writing one
+further down is refused with a message saying where it belongs. They are covered under
+[modules](/reference/modules/) and [FFI](/reference/ffi/), where what they *mean* is.
+
+**An annotation's name is an ordinary identifier**, which is the point of writing these as
+annotations at all: nothing here is reserved, so a program may still call something `test`, `link`,
+`alloc`, `no` or `requires`. `guide/slab`'s allocator calls its central function `alloc` and threads
+its free list through a field called `link`.
 
 The `@` is also read **inside a pattern**, where it binds a name to what a sub-pattern matched
 ([patterns](/reference/patterns/)). The two never compete: an annotation's `@` is a prefix at the
@@ -522,7 +535,7 @@ because the trees a library ships are now a per-target answer.
 
 | absent | why |
 |---|---|
-| a general annotation mechanism | `@test` and `@tailrec` are the two, and the set is closed. What would make it general — a `packed` struct layout, an alignment annotation — is not designed |
+| a general annotation mechanism | the set is closed: `@test` and `@tailrec` on a function, `@no_<capability>`, `@requires` and `@link` on a file. What would make it general — a `packed` struct layout, an alignment annotation — is not designed |
 | `#define`, or any project-supplied symbol | the `#if` vocabulary is derived from the target and closed, which is what makes an unknown symbol an error rather than a false |
 | a `#if` that asks about a capability | a condition asks what the *target* says; what a project permits is a different question, left with the config that would define it |
 | a test framework in the library | a test asserts in the language it is testing, and passes by returning |

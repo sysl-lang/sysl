@@ -9,8 +9,8 @@ weight: 70
 its allocator and its operating system can still reach every name in it:
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 
@@ -76,8 +76,8 @@ any of them. `Ordering` answers the question directly, which is what lets a wrap
 ordering as a *value* check it:
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 
@@ -187,8 +187,8 @@ program reaches for lives in the library where a reader can open it, rather than
 where they cannot.
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 
@@ -216,8 +216,8 @@ That is the property, and it is what makes an atomic increment usable as a **tic
 gets a different number and none of them is skipped.
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 
@@ -237,8 +237,8 @@ The same shape covers the bitwise members. `or` is how a flag is set in a word o
 setting their own flags in, and the answer tells the caller whether it was the one that set it:
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 
@@ -261,8 +261,8 @@ against what it expected — one comparison it was going to make anyway — and 
 is the value to retry against**, so the whole retry loop is one line:
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 
@@ -289,8 +289,8 @@ An ordering on the surface is a parameter with a default, and this is the one pl
 where the ordering is not written at the raw call — it is written at *this* call, one level up:
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 
@@ -413,8 +413,8 @@ not what the author asked for, which is the more useful thing to find out.
 `Atomic[T].v` is **not hidden**, and that is deliberate rather than an oversight:
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 
@@ -441,8 +441,8 @@ else, which means there is something else to hand it to — and the allocator, t
 queue, and an interrupt handler are all code that has to take a lock before any of that exists.
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.sync.*
 

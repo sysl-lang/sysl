@@ -245,8 +245,8 @@ class SyncTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val out = runOf(
         "kern/counter.sysl" ->
           """module kern
-            |no alloc
-            |no os
+            |@no_alloc
+            |@no_os
             |
             |import sysl.sync.*
             |

@@ -11,8 +11,8 @@ need. It requires no capability at all: every name here is reachable under `no a
 with no operating system.
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.math.{Float, Bits, min, pi}
 
@@ -547,8 +547,8 @@ divmod(a, b) -> T, T         is_power_of_two(x)       next_power_of_two(x) -> Op
 ```
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.math.{pow, gcd, lcm, is_power_of_two, next_power_of_two}
 
@@ -619,8 +619,8 @@ undefined function 'gcd'
 ### `pow`
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.math.pow
 
@@ -673,8 +673,8 @@ one is not the same operation.
 ### `gcd` and `lcm`
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.math.{gcd, lcm}
 
@@ -711,8 +711,8 @@ zero and reaching the division would be a division by it.
 ### `divmod`
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.math.divmod
 
@@ -758,8 +758,8 @@ a module-level 'val' states its type, and a binding that names several things ha
 ### `is_power_of_two` and `next_power_of_two`
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 import sysl.math.{is_power_of_two, next_power_of_two}
 

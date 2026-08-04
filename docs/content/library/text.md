@@ -472,7 +472,7 @@ multi-byte characters apart, and the character-level reading is what `s.chars` a
 A module that has given up its allocator can search and trim all it likes:
 
 ```sysl
-no alloc
+@no_alloc
 
 import sysl.text.Search
 
@@ -492,7 +492,7 @@ key = value
 …and reaching into the other file is refused at compile time, naming the allocating call it found:
 
 ```sysl
-no alloc
+@no_alloc
 
 import sysl.text.join
 
@@ -502,7 +502,7 @@ print(join(words[..], "-"))
 ```
 
 ```error
-this reaches 'sysl.buf.Buf.extend.byte', which makes heap storage, and this module declared 'no alloc'
+this reaches 'sysl.buf.Buf.extend.byte', which makes heap storage, and this module declared '@no_alloc'
 ```
 
 That diagnostic names `sysl.buf`, three calls down, because [`alloc` is checked on what a module

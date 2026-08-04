@@ -496,7 +496,7 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // And the module allocates — it renders to `string` — so it is not in the `no alloc` tier. Said
     // here rather than discovered, since the auto-imported root deliberately is.
     "it is a module a 'no alloc' program may not render with" in {
-      err("module m\nno alloc\n\nimport sysl.time.*\n\nfn() -> string = date_text(LocalDate(0))\n") should
+      err("module m\n@no_alloc\n\nimport sysl.time.*\n\nfn() -> string = date_text(LocalDate(0))\n") should
         not be empty
     }
   }

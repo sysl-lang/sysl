@@ -241,15 +241,15 @@ class FieldlessStructTests extends AnyFreeSpec with RunSupport with CodegenSuppo
      * stands in for the UART write; what is being checked is everything around it.
      */
     "and the whole path holds inside a module that has given up the allocator" in {
-      run("no alloc\n\n" + stdout + "show(42)\nshow(\"uart\")\n") shouldBe "42\nuart\n"
+      run("@no_alloc\n\n" + stdout + "show(42)\nshow(\"uart\")\n") shouldBe "42\nuart\n"
     }
 
     /* Without this the test above proves nothing: a `no alloc` clause that was not being enforced
      * would let it pass for the wrong reason. This is the same module with one allocating line.
      */
     "which means something only because that clause is enforced" in {
-      err("no alloc\n\n" + stdout + "var boxed: &int = 1\n\nshow(*boxed)\n") should
-        include("declared 'no alloc'")
+      err("@no_alloc\n\n" + stdout + "var boxed: &int = 1\n\nshow(*boxed)\n") should
+        include("declared '@no_alloc'")
     }
   }
 

@@ -62,7 +62,7 @@ C symbol:
 
 ```sysl
 module sysl.sys
-link "m"
+@link("m")
 
 private[sysl] extern "putchar"   sysl_putchar(c: int) -> int
 private[sysl] extern "llvm.sqrt" sysl_sqrt(x: f64) -> f64

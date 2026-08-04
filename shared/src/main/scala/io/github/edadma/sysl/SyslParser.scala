@@ -53,7 +53,7 @@ class SyslParser(val source: Source) extends DeclParser {
 
   lazy val statement: PackratParser[Stmt] =
     at(
-      misplacedCapability | misplacedLink | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
+      misplacedHeaderAttr | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
         breakStmt | continueStmt | deferStmt | asmStmt | requireStmt | ensureStmt | multiAssign |
         resultListStmt | exprStmt,
     )
@@ -164,7 +164,8 @@ class SyslParser(val source: Source) extends DeclParser {
 
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
-      err(s"'$n' is not an annotation sysl knows — '@test' and '@tailrec' are the two"))
+      err(s"'$n' is not an annotation a declaration takes — '@test' and '@tailrec' are the two. " +
+        "'@no_<capability>', '@requires(...)' and '@link(\"...\")' belong in the file's header"))
 
   /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
    *
@@ -185,6 +186,21 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   private def attrWord(w: String): Parser[Unit] =
     accept(s"'$w'", { case t: lexical.Identifier if t.chars == w => () })
+
+  /** An annotation whose name *carries* its argument — `@no_alloc` is `no_` and then the capability.
+   * What comes back is the part after the prefix, so the caller never sees the joint.
+   *
+   * The prefix alone is not one of these: `@no_` names no capability, and matching it would hand the
+   * analyzer an empty name to complain about instead of the parser refusing a word that is visibly
+   * unfinished.
+   */
+  private def attrWordPrefixed(prefix: String): Parser[String] =
+    accept(
+      s"'$prefix…'",
+      { case t: lexical.Identifier if t.chars.startsWith(prefix) && t.chars.length > prefix.length =>
+        t.chars.drop(prefix.length)
+      },
+    )
 
   /** The attribute written twice, where one is, for the refusal above. */
   private def duplicated(as: List[Attr]): Option[String] =
@@ -259,70 +275,68 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val moduleHeader: Parser[ModuleName] =
     at(op("module") ~> dottedName ^^ ModuleName.apply)
 
-  /** A capability clause: `no alloc` narrowing the module below what its target offers, or
-   * `requires alloc` declaring what it cannot be built without (`13 §4`, `capabilities.md`).
+  /** A file-header attribute: `@no_alloc`, `@requires(os, posix)`, `@link("z")` (`13 §4`,
+   * `15 §8`, `capabilities.md`).
    *
-   * `no` and `alloc` are **reserved**, not contextual, so they are matched with `op` — a `softWord`
-   * matches an identifier and these never lex as one. Every other capability's name is an ordinary
-   * identifier, which is why the name is read either way and left to the analyzer to recognize: the
-   * set is a property of the project rather than of the grammar.
+   * **These are attributes rather than grammar, and that is the point of the spelling.** A capability
+   * and a library name are things said *about* a module, not constructs the language executes, so
+   * they take the notation sysl already uses for that — the one `@test` and `@tailrec` are written
+   * in. What it buys is the whole reason to prefer it: **no word is spent.** `alloc` was a reserved
+   * word, which took the most natural name in an allocator away from the code that provides one, and
+   * `guide/slab` had to call its function `take`. Every name here arrives through `attrWord`, which
+   * matches an ordinary identifier, so `alloc`, `no`, `requires` and `link` are all available to a
+   * program again.
+   *
+   * One attribute may yield several clauses, because `@requires` takes a list.
    */
-  protected lazy val capabilityClause: Parser[CapabilityClause] =
-    at(
-      op("no") ~> capabilityName ^^ (CapabilityClause(CapabilityDirection.Narrows, _)) |
-        op("requires") ~> capabilityName ^^ (CapabilityClause(CapabilityDirection.Requires, _)),
-    )
+  private lazy val headerAttr: Parser[List[CapabilityClause | LinkClause]] =
+    op("@") ~> (noAttr | requiresAttr | linkAttr)
 
-  /** The name in a capability clause. `alloc` is a reserved word, because the clause reads it, so it
-   * would never arrive as an identifier; the rest of the set is spelled the ordinary way.
+  /** `@no_alloc` and its siblings — the module narrowing itself below what the target offers.
+   *
+   * The capability is the part after `no_`, and it is **not checked here**: the set is a property of
+   * the project rather than of the grammar (`Capability`), so `@no_sockets` parses and the analyzer
+   * is what says there is no such capability. That keeps one message about an unknown capability
+   * instead of two that differ by where it was written.
+   *
+   * One word per capability rather than `@no(alloc)` follows Rust's `#![no_std]`, which is the
+   * nearest precedent and reads the way the thing is spoken.
    */
-  protected lazy val capabilityName: Parser[String] = op("alloc") ^^^ "alloc" | ident
+  private lazy val noAttr: Parser[List[CapabilityClause | LinkClause]] =
+    at(attrWordPrefixed("no_") ^^ (CapabilityClause(CapabilityDirection.Narrows, _))) ^^ (List(_))
 
-  /** A capability clause written where a statement goes, which is refused for the reason
-   * `noVisibility` is: the clause has a place, and a reader who writes it in the wrong one should be
-   * told which place that is rather than answered with "newline expected".
+  /** `@requires(os)`, `@requires(threads, posix)` — what the module cannot be built without.
    *
-   * It is a *header*, not a statement, because it is a property of the module and the module is
-   * settled before anything in the file runs — and because a clause part-way down a file would read
-   * as though the statements above it were outside its reach.
+   * Parenthesised and plural where the narrowing form is neither, because that is how each is used:
+   * a module gives up one capability at a time and needs several at once. `sysl.thread` requires
+   * both `threads` and `posix`, and writing that as two attributes would be two lines saying one
+   * thing.
    */
-  protected lazy val misplacedCapability: Parser[Nothing] =
-    capabilityClause ~> err(
-      "a capability clause belongs in the file's header, on the lines directly after 'module' and " +
-        "before everything else — it is a property of the whole module, not of the statements below it")
+  private lazy val requiresAttr: Parser[List[CapabilityClause | LinkClause]] =
+    attrWord("requires") ~> op("(") ~>
+      rep1sep(at(ident ^^ (CapabilityClause(CapabilityDirection.Requires, _))), op(",")) <~ op(")")
 
-  /** A link directive: `link "z"`, naming a library the linker must be given for this file's
-   * `extern`s to resolve (`15 §8`).
+  /** `@link("z")` — a library the linker must be given for this file's `extern`s to resolve.
    *
-   * **`link` is a soft keyword and cannot be anything else.** `guide/slab` declares a function called
-   * `link` — the pointer into a free block — and reserving the word would break it, which is exactly
-   * the kind of name a systems language must not spend. Nothing is lost by it: a directive is `link`
-   * followed by a *string*, and no statement has that shape, so the grammar tells them apart with no
-   * lookahead.
-   *
-   * The library is named by a string rather than by an identifier because it is a name from outside
-   * sysl, exactly as an `extern`'s symbol is — and because plenty of real ones are not identifiers at
+   * The library is named by a **string** rather than an identifier because it is a name from outside
+   * sysl, exactly as an `extern`'s symbol is, and because plenty of real ones are not identifiers at
    * all. `stdc++` is the everyday example.
    */
-  protected lazy val linkClause: Parser[LinkClause] = at(softWord("link") ~> linkName ^^ LinkClause.apply)
+  private lazy val linkAttr: Parser[List[CapabilityClause | LinkClause]] =
+    at(attrWord("link") ~> op("(") ~> linkName <~ op(")") ^^ LinkClause.apply) ^^ (List(_))
 
-  /** One line of a file's header: either kind of clause, read in whatever order they were written.
+  /** A header attribute written where a statement goes, which is refused for the reason
+   * `noVisibility` is: it has a place, and a reader who writes it in the wrong one should be told
+   * which place that is rather than answered with "newline expected".
    *
-   * They interleave freely because they are about different things — what the module may do, and what
-   * its `extern`s need — and demanding one group before the other would be a rule with nothing behind
-   * it that every author would have to remember.
+   * It is a *header*, not a statement, because it is a property of the module and the module is
+   * settled before anything in the file runs — and because one part-way down a file would read as
+   * though the statements above it were outside its reach.
    */
-  private lazy val headerClause: Parser[CapabilityClause | LinkClause] = capabilityClause | linkClause
-
-  /** A link directive written where a statement goes, refused for the reason `misplacedCapability`
-   * is: the clause has a place, and a reader who wrote it in the wrong one should be told which place
-   * that is rather than answered with "newline expected".
-   */
-  protected lazy val misplacedLink: Parser[Nothing] =
-    linkClause ~> err(
-      "a link directive belongs in the file's header, on the lines directly after 'module' and " +
-        "before everything else — the linker is given its libraries once for the whole build, not " +
-        "at the point in the file where the directive is written")
+  protected lazy val misplacedHeaderAttr: Parser[Nothing] =
+    guard(op("@") ~ (attrWordPrefixed("no_") | attrWord("requires") | attrWord("link"))) ~> err(
+      "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
+        "everything else — it is a property of the whole module, not of the statements below it")
 
   /** `import a.b.c`, `import a.b.{c, d as e}`, `import a.b.*` — the Scala forms (`13 §3`).
    *
@@ -941,16 +955,16 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val program: PackratParser[Program] =
     opt(newlines) ~> opt(moduleHeader) >> { m =>
-      // A clause goes on a line of its own, which is what both `13 §4` and `capabilities.md` show
-      // and what keeps `module m no alloc requires os` from being a line anyone has to read. The
-      // exception is a file that declares no module: the root module is a module like any other, and
-      // there is no header for its clause to sit below, so there the clause may open the file.
+      // An attribute goes on a line of its own, which is what both `13 §4` and `capabilities.md`
+      // show and what keeps `module m @no_alloc @requires(os)` from being a line anyone has to read.
+      // The exception is a file that declares no module: the root module is a module like any other,
+      // and there is no header for its attributes to sit below, so there they may open the file.
       val lead = if m.isDefined then success(List.empty[CapabilityClause | LinkClause])
-                 else opt(headerClause) ^^ (_.toList)
+                 else opt(headerAttr) ^^ (_.toList.flatten)
 
-      lead ~ rep(newlines ~> headerClause) ~ statements ^^ {
+      lead ~ rep(newlines ~> headerAttr) ~ statements ^^ {
         case first ~ rest ~ body =>
-          val clauses = first ::: rest
+          val clauses = first ::: rest.flatten
 
           Program(body, m,
                   clauses.collect { case c: CapabilityClause => c },

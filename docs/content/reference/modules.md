@@ -347,21 +347,27 @@ reference.
 
 ## Capabilities are a module property
 
-A **capability clause narrows the module**, and it is written in the file header beside `module`, each
-clause on a line of its own:
+A **capability annotation narrows the module**, and it is written in the file header below `module`,
+each on a line of its own:
 
 ```sysl
 module oskit.arch
-no alloc
+@no_alloc
 ```
 
-Because the module is the directory and the clause is a property of the module, **a narrowing clause
+Because the module is the directory and the capability is a property of the module, **a narrowing
 must appear consistently in every file of the module** — a module whose files disagree is rejected.
-The redundancy buys local legibility: you can never open a file in a `no alloc` module and fail to
-see that it is `no alloc`. A file that declares no module may still carry a clause, since the
-anonymous root module is a module like any other.
+The redundancy buys local legibility: you can never open a file in a `@no_alloc` module and fail to
+see that it is one. A file that declares no module may still carry one, since the anonymous root
+module is a module like any other.
 
-**`link` is the header's other inhabitant and is deliberately not held to agreeing.** `link "z"` names
+The other direction is `@requires(...)`, which takes a **list** because a module often needs more
+than one capability at once — `sysl.thread` is `@requires(threads, posix)`.
+
+**They are annotations rather than grammar**, which is what keeps `alloc`, `no` and `requires`
+available as ordinary names; see [attributes](/reference/attributes/).
+
+**`@link` is the header's other inhabitant and is deliberately not held to agreeing.** `@link("z")` names
 a library the file's `extern`s need, and the files of a module may each name their own — because what
 is being described differs. A capability is a property of the whole module, so files that disagreed
 would describe different modules, while a link requirement is a property of the `extern`s in *one*
@@ -369,7 +375,7 @@ file.
 
 **Propagation is over the module graph.** A module's effective requirement is its own uses plus the
 requirements of every module it imports, transitively, and the whole graph must fit the target. A
-`no alloc` module importing a `requires alloc` module is an error **at the import**, not deep in
+`@no_alloc` module importing a `@requires(alloc)` module is an error **at the import**, not deep in
 codegen. Because the graph is acyclic, propagation is a **single sweep in reverse topological order**
 — each module's requirement set is final before any importer of it is visited — rather than an
 iterated fixpoint.

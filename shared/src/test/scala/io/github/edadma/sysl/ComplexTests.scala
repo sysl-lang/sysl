@@ -441,8 +441,8 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // operating system, which is what makes the module usable on a freestanding target.
     "and the arithmetic needs no capability, which is what a freestanding target has to have" in {
       super.run(
-        """no alloc
-          |no os
+        """@no_alloc
+          |@no_os
           |
           |import sysl.math.complex.Complex
           |
@@ -459,12 +459,12 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // An allocator-free program computes with `Complex` and prints its parts.
     "while rendering one is refused there, because a field applies to the whole value" in {
       err(
-        """no alloc
+        """@no_alloc
           |
           |import sysl.math.complex.Complex
           |
           |print(Complex(3.0, 4.0))""".stripMargin
-      ) should include("which makes heap storage, and this module declared 'no alloc'")
+      ) should include("which makes heap storage, and this module declared '@no_alloc'")
     }
 
     "a program that did not import it cannot spell the type" in {

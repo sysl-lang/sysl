@@ -264,7 +264,7 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
     // would let a `no alloc` module hold an allocation that its own tests exercised every day.
     "a module's 'no alloc' clause reaches its tests" in {
       errIn(("m", "m.sysl", """module m
-                              |no alloc
+                              |@no_alloc
                               |
                               |add(a: int, b: int) -> int = a + b
                               |
@@ -272,12 +272,12 @@ class TestRunnerTests extends AnyFreeSpec with CodegenSupport with TestFramework
                               |adding() =
                               |    val s = str(add(2, 2))
                               |    assert(s == "4", "adding")
-                              |""".stripMargin)) should include("declared 'no alloc'")
+                              |""".stripMargin)) should include("declared '@no_alloc'")
     }
 
     "a test that allocates nothing is fine in the same module" in {
       irIn(("m", "m.sysl", """module m
-                             |no alloc
+                             |@no_alloc
                              |
                              |add(a: int, b: int) -> int = a + b
                              |

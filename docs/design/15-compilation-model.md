@@ -255,15 +255,18 @@ property of what that library happens to need rather than a rule about where C m
 
 ## 8. A module says which library resolves its externs
 
-**`link "z"` in a file's header names a library the linker must be given**, and it sits beside the
-`extern`s it supports because that is the only place that knows. An `extern` states the symbol it
+**`@link("z")` in a file's header names a library the linker must be given**, and it sits beside the
+`extern`s it supports because that is the only place that knows. It is an attribute for the reason
+the capability clauses are (`13 §4`): it says something *about* the file rather than being a
+construct the language executes, and written as grammar it would spend the word `link` — which
+`guide/slab` uses for the pointer that threads its free list. An `extern` states the symbol it
 wants and never where the symbol lives; a binding to `libpng` is written by whoever writes the
 module, and the driver cannot carry a list of libraries it has never heard of.
 
 ```
 module image.png
-link "png"
-link "z"
+@link("png")
+@link("z")
 
 extern "png_create_read_struct" create(ver: *u8, err: *u8, fn: *u8) -> *u8
 ```

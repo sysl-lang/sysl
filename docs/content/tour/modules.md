@@ -211,7 +211,7 @@ A capability clause narrows a module, and it is written in the header on a line 
 
 ```sysl
 module oskit.arch
-no alloc
+@no_alloc
 
 halt()
     print("halted")
@@ -243,8 +243,8 @@ symbol lives, so a module binding a C library says it with `link`:
 
 ```sysl
 module image.png
-link "png"
-link "z"
+@link("png")
+@link("z")
 
 extern "png_create_read_struct" create(ver: *u8, err: *u8, fn: *u8) -> *u8
 ```
