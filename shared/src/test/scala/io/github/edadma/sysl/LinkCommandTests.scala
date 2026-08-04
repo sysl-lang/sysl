@@ -20,7 +20,7 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
    * directive makes of every build compiled against the standard module.
    */
   private def commandFor(target: Target): List[String] =
-    Toolchain.linkCommand("prog.ll", List("core.syslib"), "prog", target,
+    Toolchain.linkCommand("prog.ll", List("std.syslib"), "prog", target,
                           Toolchain.defaultOptimization, List("m"))
 
   "the mathematics library" - {
@@ -97,7 +97,7 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     "puts the module first, then the archives, then the system libraries" in {
       val cmd  = commandFor(Target.x86_64Linux)
       val ll   = cmd.indexOf("prog.ll")
-      val arch = cmd.indexOf("core.syslib")
+      val arch = cmd.indexOf("std.syslib")
       val libm = cmd.indexOf("-lm")
 
       ll should be > 0

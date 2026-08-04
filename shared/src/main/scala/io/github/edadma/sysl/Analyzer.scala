@@ -33,7 +33,7 @@ package io.github.edadma.sysl
 class Analyzer private (
     protected val units: List[Program],
     protected val building: Set[String],
-    protected val core: Core,
+    protected val std: Stdlib,
     protected val target: Target,
 ) extends ProgramWalk with ExprAnalysis {
 
@@ -64,9 +64,9 @@ object Analyzer {
    * at all, and what signature it demands, differ per processor.
    */
   def analyze(units: List[Program], building: Set[String] = Set.empty,
-              core: Core = Core.embedded(Target.default), target: Target = Target.default)
+              std: Stdlib = Stdlib.embedded(Target.default), target: Target = Target.default)
       : Either[String, TProgram] = {
-    val analyzer = new Analyzer(units, building, core, target)
+    val analyzer = new Analyzer(units, building, std, target)
 
     val outcome =
       try Right(analyzer.analyze())

@@ -63,7 +63,7 @@ trait Scoping extends DeclTables {
    * among them — it is a module's declaration like any other, and not visible from a named module
    * that did not name it.
    *
-   * Filled during hoisting from `Core.owns`, which is the one question about where a declaration
+   * Filled during hoisting from `Stdlib.owns`, which is the one question about where a declaration
    * came from; this is that answer indexed by what a program writes, for the lookups that have a
    * name and no declaration to ask about.
    */

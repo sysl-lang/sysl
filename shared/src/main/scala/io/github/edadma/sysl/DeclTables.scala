@@ -23,7 +23,7 @@ trait DeclTables extends Reporting {
    *
    * Empty for every ordinary compilation, which is what makes the library something a program never
    * has to think about. It is non-empty only where the library's own source is what is being
-   * compiled — `sysl build-lib lib --core` — and there it does two things: it stops the compiler
+   * compiled — `sysl build-lib lib --std` — and there it does two things: it stops the compiler
    * from handing those files a second copy of themselves, and it makes what they declare count as
    * the library's, which is `libraryOwns` below.
    */
@@ -33,18 +33,18 @@ trait DeclTables extends Reporting {
   protected def units: List[Program]
 
   /** Whether a declaration came from one of *those* files — asked by identity, for the reason
-   * `Core.owns` is: a copy of a library file, however faithful, is not that file.
+   * `Stdlib.owns` is: a copy of a library file, however faithful, is not that file.
    */
   protected def producedHere(d: Positioned): Boolean = d.pos.exists(p => producing(p.source))
 
   private lazy val producing: Set[Source] = units.map(_.source).toSet
 
   /** The standard module this compilation is compiled against, and where its trees came from
-   * (`Core`). It is carried rather than looked up because a compilation may be handed a library
+   * (`Stdlib`). It is carried rather than looked up because a compilation may be handed a library
    * artifact instead of the copy the compiler embeds, and every question about *which* declarations
    * are the library's has to be answered over the one it actually got.
    */
-  protected def core: Core
+  protected def std: Stdlib
 
   /** The machine this compilation is **for**. A handful of rules are the processor's rather than the
    * language's — `15 §10`'s calling conventions are the case — and asking here is what lets those be
@@ -54,7 +54,7 @@ trait DeclTables extends Reporting {
 
   /** Whether a declaration written in `module` is one the **library** supplies.
    *
-   * Normally that is a question about which file it came from and nothing else (`Core.owns`), and
+   * Normally that is a question about which file it came from and nothing else (`Stdlib.owns`), and
    * it is asked of the `Source` rather than of the module because a `Source` is the stronger answer:
    * a user file that happened to sit at `lib/sysl/render.sysl` is not one of the library's. The
    * compilation that *builds* a library module is the one
@@ -64,7 +64,7 @@ trait DeclTables extends Reporting {
    * `lib/sysl/render.sysl` is being compiled that is the file in front of it.
    */
   protected def libraryOwns(d: Positioned, module: String): Boolean =
-    core.owns(d) || building(module)
+    std.owns(d) || building(module)
 
   /** Whether a declaration written in `module` is one the library **offers unqualified** — that is,
    * one of the names in scope everywhere with no import (`13 §8`, `libraryNames`).
@@ -74,20 +74,20 @@ trait DeclTables extends Reporting {
    * (`Library.autoImported`). Without the second half, splitting the library into submodules would
    * put every name back into every file by another route and change nothing at all.
    *
-   * A module the core does not carry is left alone, which is what keeps this about the *library*: a
+   * A module the standard module does not carry is left alone, which is what keeps this about the *library*: a
    * compilation building some other library is also one whose declarations `libraryOwns` counts,
    * and what that library offers unqualified is its own affair (`AutoImport.including`).
    */
   protected def libraryOffers(d: Positioned, module: String): Boolean =
-    libraryOwns(d, module) && (Library.autoImported.contains(module) || !core.carries(module))
+    libraryOwns(d, module) && (Library.autoImported.contains(module) || !std.carries(module))
 
   /** Whether a declaration was **supplied** to this compilation by the library, rather
    * than being one this compilation is producing. It is what decides whether a body is analyzed only
    * once something reaches it, so that a program that never prints carries no printing surface.
    *
-   * The second half is not a detail. `core.owns` asks which `Source` a declaration came from, and a
+   * The second half is not a detail. `std.owns` asks which `Source` a declaration came from, and a
    * compilation *building* the library can be handed the very `Source` objects the compiler embeds —
-   * the sbt task that builds the core artifact has them in memory and no reason to go to disk for a
+   * the sbt task that builds the standard module artifact has them in memory and no reason to go to disk for a
    * second copy. Asking ownership alone there holds back every function in the library, nothing
    * reaches any of them, and the artifact comes out with an **empty object half**: it still carries
    * every tree, so every program that used it would compile and run, and the whole point of
@@ -109,7 +109,7 @@ trait DeclTables extends Reporting {
    * it declares.
    */
   protected def suppliedByLibrary(d: Positioned): Boolean =
-    core.owns(d) && !producedHere(d)
+    std.owns(d) && !producedHere(d)
 
   // --- what the sources declared ---------------------------------------------------------
 

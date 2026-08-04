@@ -339,7 +339,7 @@ target substitutes one body.
 ## Separate compilation
 
 A module is compiled once and linked, which is what the acyclic import graph buys. The standard
-library itself is an artifact — `.sysl/core.syslib`, a real `ar` archive — and the compiler builds it
+library itself is an artifact — `.sysl/std.syslib`, a real `ar` archive — and the compiler builds it
 for you when nothing usable is at the default path, announced on stderr and in well under a second.
 There is no bootstrap step to run and none to remember.
 

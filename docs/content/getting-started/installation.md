@@ -63,9 +63,9 @@ Every program is compiled against the standard module. You do not have to build 
 usable is at the default path, the compiler builds the artifact itself out of the library source it
 carries, says so on stderr, and gets on with the compilation. A fresh clone just works.
 
-Two flags matter when you want something other than that. `--core-lib <path>` names an artifact
+Two flags matter when you want something other than that. `--std-lib <path>` names an artifact
 explicitly, and an artifact you named is never rebuilt behind your back — if it will not read, the
-compilation stops and says so. `--no-core-lib` compiles against the copy built into the compiler
+compilation stops and says so. `--no-std-lib` compiles against the copy built into the compiler
 with no toolchain involved at all, which is the path the compiler's own test suite takes.
 
 ## Optimization

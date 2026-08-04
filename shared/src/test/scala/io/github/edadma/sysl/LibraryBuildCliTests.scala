@@ -413,7 +413,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     "and editing only the C changes what the artifact fingerprints as" in {
       // A library's shims are as much its source as its modules are. An artifact that did not change
       // when one of them was edited is a stale artifact nothing would notice was stale — which is
-      // exactly the failure `Core.read`'s fingerprint check exists to catch for the sysl half.
+      // exactly the failure `Stdlib.read`'s fingerprint check exists to catch for the sysl half.
       val before = fingerprintOf(artifactOf(rootWithC("demo", usingShim, "shim.c" -> shim)))
       val after =
         fingerprintOf(artifactOf(rootWithC("demo", usingShim,
@@ -422,19 +422,19 @@ class LibraryBuildCliTests extends LibraryCliSupport {
       before should not be after
     }
   }
-  "build-lib --core" - {
+  "build-lib --std" - {
 
     "builds the standard module, which nothing else may declare" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
-      val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
+      val out = createTempFile("sysl-cli-std-", LibraryArtifact.extension)
 
-      succeeds(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out), core = true))
+      succeeds(Config(command = "build-lib", file = StdRoot.root.get, output = Some(out), std = true))
 
       LibraryArtifact.metadataOf(out, readBytes(out)).flatMap(LibraryArtifact.read(out, _, Target.default)) match
         case Right((trees, syms, fingerprint)) =>
           // Every symbol is one of the library's own modules'. A library defines its own
-          // declarations and nobody else's, and the core library is the one place that rule is under
+          // declarations and nobody else's, and the standard module library is the one place that rule is under
           // the most pressure, since the whole of the rest of the library is what it was compiled
           // against. `sysl.args` is in here as well as `sysl`, which is the point of building the
           // whole tree rather than the standard module alone.
@@ -446,7 +446,7 @@ class LibraryBuildCliTests extends LibraryCliSupport {
           // And it fingerprints as the library the compiler carries, though this one was walked off
           // disk and named by where it was found while the carried copy is named by where the
           // generator read it. If the fingerprint were over paths rather than contents, the guard in
-          // `Core.read` would reject every artifact the documented command produces.
+          // `Stdlib.read` would reject every artifact the documented command produces.
           fingerprint shouldBe Std.fingerprint
         case Left(err) => fail(err)
 
@@ -454,25 +454,25 @@ class LibraryBuildCliTests extends LibraryCliSupport {
     }
 
     "refuses to build the standard module against a prebuilt copy of itself" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
       // The one combination that cannot mean anything: the declarations being compiled are the ones
       // the artifact holds. Refused before the artifact is even read — ignoring it would leave a
       // command line reading as though it were used, which is the failure worth preventing.
-      refused(Config(command = "build-lib", file = CoreLib.root.get, core = true,
-        coreLib = Some(s"${createTempDirectory("sysl-cli-core-")}/any${LibraryArtifact.extension}")))
+      refused(Config(command = "build-lib", file = StdRoot.root.get, std = true,
+        stdLib = Some(s"${createTempDirectory("sysl-cli-std-")}/any${LibraryArtifact.extension}")))
     }
 
     "and without it the same root is refused, because the module is the library's" in {
       // The refusal is the ordinary one every program gets, and keeping it is the point: inferring
       // the mode from the module names in the tree would turn a clear diagnostic into an artifact
       // that builds and then collides with the built-in copy at whatever link tried to use it.
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
-      val out = createTempFile("sysl-cli-core-", LibraryArtifact.extension)
+      val out = createTempFile("sysl-cli-std-", LibraryArtifact.extension)
 
       deleteFile(out)
-      refused(Config(command = "build-lib", file = CoreLib.root.get, output = Some(out)))
+      refused(Config(command = "build-lib", file = StdRoot.root.get, output = Some(out)))
       isFile(out) shouldBe false
     }
   }

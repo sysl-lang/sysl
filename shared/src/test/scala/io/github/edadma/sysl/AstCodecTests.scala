@@ -88,8 +88,8 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     "rebinds to the caller's own Source, so a decoded declaration is still the library's" in {
       val back = roundTrip(List(one), Map(one.source.name -> one.source))
 
-      // `Core.owns` is identity on the Source, and it is what decides whether an unreached
-      // declaration may be dropped — so a decoded tree handed the embedded core's own `Source` has
+      // `Stdlib.owns` is identity on the Source, and it is what decides whether an unreached
+      // declaration may be dropped — so a decoded tree handed the embedded std's own `Source` has
       // to land on that object rather than on a copy of it.
       back.head.source should be theSameInstanceAs one.source
       back.head.body.forall(Library.carried.owns) shouldBe true

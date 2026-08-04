@@ -21,7 +21,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
   // ask for. `flag` and `mark` differ so that which one a name reached is visible in the IR.
   private val tree =
     Seq(
-      ("sysl", "core.sysl",
+      ("sysl", "std.sysl",
        """module sysl
          |mark(n: int) -> int = n + 1
          |""".stripMargin),
@@ -35,14 +35,14 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
   // reaches.
   private val both =
     Seq(
-      ("sysl", "core.sysl", "module sysl\npick(n: int) -> int = n + 1"),
+      ("sysl", "std.sysl", "module sysl\npick(n: int) -> int = n + 1"),
       ("sysl.sys", "sys.sysl", "module sysl.sys\npick(n: int) -> int = n * 2"),
     )
 
   // A submodule holding something only the rest of the library may name.
   private val kept =
     Seq(
-      ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
+      ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
       ("sysl.sys", "sys.sysl", "module sysl.sys\nprivate[sysl] hold(n: int) -> int = n * 2"),
     )
 
@@ -138,7 +138,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // any other file would.
     "reach the standard module's names with no import, wherever in the tree they are" in {
       irAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nflag(n: int) -> int = mark(n) * 2"),
       )(
         "main.sysl" -> "sysl.sys.flag(21)",
@@ -147,7 +147,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
 
     "reach a sibling submodule's by importing it" in {
       irAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
         ("sysl.text", "t.sysl", "module sysl.text\nwiden(n: int) -> int = n + 7"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nimport sysl.text.widen\nflag(n: int) -> int = widen(n)"),
       )(
@@ -157,7 +157,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
 
     "and not without one" in {
       errAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
         ("sysl.text", "t.sysl", "module sysl.text\nwiden(n: int) -> int = n + 7"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nflag(n: int) -> int = widen(n)"),
       )(
@@ -171,7 +171,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // holds only what needs nothing.
     "and a submodule the standard module reaches may not reach back, even through a free name" in {
       errAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nimport sysl.sys.flag\nmark(n: int) -> int = flag(n)"),
+        ("sysl", "std.sysl", "module sysl\nimport sysl.sys.flag\nmark(n: int) -> int = flag(n)"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nflag(n: int) -> int = mark(n) * 2"),
       )(
         "main.sysl" -> "mark(21)",
@@ -203,7 +203,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // one segment.
     "a submodule of a submodule is reached the same way" in {
       irAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1"),
         ("sysl.text.utf8", "d.sysl", "module sysl.text.utf8\ndecode(n: int) -> int = n * 3"),
       )(
         "main.sysl" -> "sysl.text.utf8.decode(7)",
@@ -245,7 +245,7 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
     // something from the standard module as well as the other way round.
     "a submodule may keep something from the standard module too" in {
       errAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
+        ("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = sysl.sys.hold(n)"),
         ("sysl.sys", "sys.sysl", "module sysl.sys\nprivate[sys] hold(n: int) -> int = n * 2"),
       )(
         "main.sysl" -> "mark(21)",

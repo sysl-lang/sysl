@@ -465,7 +465,7 @@ trait HoistImpl extends ImplConformance {
    *
    * The library is a module of its own for this purpose even though its declarations are keyed under
    * the root like a rootless program's, so which file a declaration came from is what decides rather
-   * than the key — `Core.owns`. A program at the project root is therefore as foreign to `Eq` as
+   * than the key — `Stdlib.owns`. A program at the project root is therefore as foreign to `Eq` as
    * any named module is.
    */
   protected def checkCoherence(impl: ImplDecl, label: String): Unit = {

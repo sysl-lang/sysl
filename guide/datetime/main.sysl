@@ -1,3 +1,86 @@
+import sysl.time.*
+
+// Wall clocks, timelines, and the conversion between them.
+//
+// The axis this owns is **a conversion that can succeed twice**. Every other program in the set
+// converts things that either work or do not, and `Option` and `Result` are the two shapes that
+// covers. A wall clock reading turned into a moment is neither: it usually has one answer, in one
+// hour of the year it has none, and in one other hour it has two — and both of the two are correct,
+// for different questions. Nothing in the set had asked for that before.
+//
+// The program is a recurring-meeting expander, because that is where the distinction cannot be
+// avoided. A meeting is a rule about a wall clock — every Tuesday at half past nine, in New York —
+// and the answer a participant elsewhere needs is a point on the timeline. Expanding the rule puts
+// the conversion in the middle of the program rather than in a corner of it.
+//
+// **The assertion the whole thing is for**: across a daylight-saving change, "next week's meeting"
+// and "one hundred and sixty-eight hours from now" are different moments, and *both are right*.
+// One is 167 hours later and reads as half past nine; the other is 168 hours later and reads as
+// half past ten. A single type for both could only ever have been wrong about one of them.
+//
+// Every expected value came from outside: the transitions, the offsets and each meeting time were
+// computed with Python's `zoneinfo` against the real tz database. That was worth doing for its own
+// sake — Python subtracts two aware date-times in one zone by *wall clock*, so the first attempt at
+// the reference values reported the week across the spring change as 168 hours. The confusion this
+// program is about is not a hypothetical one.
+//
+// What it found, in the order it bit:
+//
+//   * **Two thirds of this program became a library module, and what is left is the third that is
+//     actually about zones.** It was written as five files: the two quantities, the civil calendar,
+//     the zone table, the meeting, and these checks. The first two were a date-time library wearing
+//     a guide's clothes — nothing in them is about *this* problem, and every program that ever
+//     wanted a date would have had to write them again. They are `sysl.time` now, imported at the
+//     top of each file here, and the three that remain are the ones a tz database does not answer
+//     for you. The rule this followed is the one `guide/fft` followed when `sysl.math` landed: a
+//     guide that hand-rolls what the library supplies is teaching a workaround.
+//   * **A program cannot render a type the library owns, and moving a type into the library is
+//     therefore a decision about who may print it.** `zone.sysl` used to carry an
+//     `impl Display for Instant`. Once `Instant` moved, that block had no home: coherence
+//     (`02 § Coherence`) wants a type of the writing module named in the block, and `Display` and
+//     `Instant` are both the library's. This is the orphan rule doing its job rather than a defect —
+//     two programs each rendering `Instant` their own way is exactly what it prevents — but the
+//     consequence is worth stating, because it is one-way. A type that ships must arrive with the
+//     renderings it will ever have. `sysl.time` renders one now, in the same words this file
+//     checked before.
+//   * **The difference of two moments cannot be spelled `-`.** Every operator row is
+//     `op(self, rhs: Rhs) -> Self`, so an implementation says what it *takes* and never what it
+//     *produces*. `Instant + Duration`, `Instant - Duration` and `Duration ± Duration` all write
+//     themselves; `Instant - Instant -> Duration` is refused, because `Sub`'s result is fixed to
+//     the type on the left. Three quarters of an algebra is spellable and the quarter that is not
+//     is the operation the library exists to provide, so it is a named function called `since`.
+//     Dispatching on the pair does not rescue it: the two implementations would differ in what
+//     they produce, which no row can say. Moving the types into `sysl.time` moved this finding
+//     with them rather than answering it — the shipped module carries the same named function, for
+//     the same reason, which makes the gap a public one instead of one program's.
+//   * **A derived scalar and a one-field struct are exactly complementary, and neither is what a
+//     quantity wants.** `type Instant = new i64` inherits its base's whole catalog for free — `==`,
+//     `<`, `+`, `str` — and may replace none of it, so it arrives with `Instant + Instant`, which
+//     is nonsense, and cannot be given `Instant + Duration`, which is not. A struct of one field
+//     gets the algebra exactly right and arrives with nothing at all: five `impl` blocks per type
+//     before anything can be compared or printed. So a quantity type chooses between the catalog
+//     and the meaning. What changed is who pays: the price is now paid once, in the library, by
+//     everybody rather than by each program that wants a date.
+//   * **The three-way answer needed nothing new**, and that is a result rather than an absence. A
+//     data enum already spells "one answer, or none, or two, and here they are"; `Resolution` is an
+//     ordinary enum and the compiler's coverage checking is what makes a caller handle all three.
+//     The axis the problem was chosen for turns out to be covered by the machinery that was already
+//     there — which is the useful thing to know before designing a library around it.
+//   * **An enum still cannot render its own variant names**, third program to report it. `ZoneId`
+//     and `Resolution` each carry a hand-written map from variant to word, and so does the
+//     library's `Weekday` — the move did not make that go away, it only moved one of the three
+//     tables behind an import.
+//   * **A `val` could not be sliced**, third program to report that, and the report was acted on:
+//     a view of read-only storage is a `[]const T`, which carries the property rather than losing
+//     it. The two transition tables are still reached through a function whose whole body is an
+//     index, which is now a choice rather than the only way to reach them.
+//   * **A built-in is on nobody's left.** `Duration * 2` is writable and `2 * Duration` is not, so
+//     the scaling in a date-time library only ever reads one way round.
+//
+// Deliberately not modelled, so that what is left stays a guide problem rather than a second
+// standard library: the tz database, leap seconds, calendars other than the proleptic Gregorian,
+// and any zone rule more elaborate than one yearly pair of transitions.
+
 check(name: string, got: string, want: string)
     if got == want then print(s"ok    $name = $got")
     else print(s"FAIL  $name = $got, wanted $want")

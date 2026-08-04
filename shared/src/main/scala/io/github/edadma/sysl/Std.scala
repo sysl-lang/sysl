@@ -20,14 +20,14 @@ package io.github.edadma.sysl
  * literal has no other form, while these are ordinary sysl files a driver reads exactly as it reads
  * a user's library — which is what `sysl build-lib` is pointed at, and what makes the library's own
  * source something a reader can open. What the compiler carries is **generated from them**
- * (`CoreSource`, written by `build.sbt`), so the files are the fact and the carrier cannot disagree
+ * (`StdSource`, written by `build.sbt`), so the files are the fact and the carrier cannot disagree
  * with them.
  *
  * It has to carry *something*, and that is not a packaging accident. The standard module is what
  * every program is compiled against, so it cannot be a thing a compilation goes looking for on disk
- * and may not find. This is that guarantee, and `Core.embedded` is it seen as a library.
+ * and may not find. This is that guarantee, and `Stdlib.embedded` is it seen as a library.
  *
- * **What a given compilation was handed is a different question**, and it is `Core` that answers it:
+ * **What a given compilation was handed is a different question**, and it is `Stdlib` that answers it:
  * a program may be compiled against a `.syslib` whose trees never went through the parser, and every
  * question about which declarations are the library's has to be answered over the one it actually
  * got. This file is only the copy that is always available.
@@ -52,7 +52,7 @@ object Std {
    * with (`13 §1`), so these are the same `Source` values the driver would build from disk.
    */
   val sources: List[Source] =
-    CoreSource.files.map((name, text) => Source(name, text, directoryOf(name)))
+    StdSource.files.map((name, text) => Source(name, text, directoryOf(name)))
 
   /** Where a carried file sits, as the directory segments between the library root and it — the
    * `dir` a driver would have put on the `Source` had it read the file off disk.
@@ -72,11 +72,11 @@ object Std {
    * fall out of step: build one, edit `lib/sysl`, and every compilation after that would be against
    * a standard module that is not the one in the tree. Nothing else would notice — a stale artifact
    * decodes perfectly and links perfectly, it is just the wrong library. This is what an artifact is
-   * held to on the way in ([[Core.read]]).
+   * held to on the way in ([[Stdlib.read]]).
    *
    * It composes with the other guard rather than duplicating it: edit `lib/sysl` and rebuild the
    * compiler, and this moves, so a stale artifact is caught here; edit and *don't* rebuild, and
-   * `CoreSource` is the stale thing, which is what `CoreLibraryTests` is for. Between them there is
+   * `StdSource` is the stale thing, which is what `StdLibraryTests` is for. Between them there is
    * no gap.
    */
   lazy val fingerprint: String = LibraryArtifact.fingerprint(sources)

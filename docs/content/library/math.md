@@ -763,4 +763,4 @@ the sign bit comes back negative** and an unsigned one never does.
 
 ---
 
-Next: [`sysl.sync`](/library/sync/) — atomics and the spinlock, which require nothing at all.
+Next: [`sysl.time`](/library/time/) — instants, durations, and the calendar between them.

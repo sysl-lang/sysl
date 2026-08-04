@@ -78,7 +78,7 @@ trait LinkRequirements extends AnalyzerBase {
    * The library's own headers are **not** read here, matching `readCapabilities`: they were checked
    * when the library was built, and a complaint about one would point at a file the program's author
    * did not write and could not change. They still reach the *command line* — `Compiler.analyzed`
-   * collects from the core as well — which is the whole point of an artifact carrying its directives.
+   * collects from the standard module as well — which is the whole point of an artifact carrying its directives.
    */
   protected def readLinkDirectives(): Unit =
     for u <- units do

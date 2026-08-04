@@ -87,7 +87,7 @@ trait Capabilities extends AnalyzerBase {
     // Reading them is what makes an environment capability answerable at all: `no os` is refused
     // where it reaches `sysl.fs`, and there is no such thing as reaching `sysl.fs` unless
     // `sysl.fs`'s own `requires os` has been read off the library this compilation was handed.
-    for (module, files) <- core.contributed(building).groupBy(declaredModule) do
+    for (module, files) <- std.contributed(building).groupBy(declaredModule) do
       record(module, files.head)
   }
 

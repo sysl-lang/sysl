@@ -114,7 +114,7 @@ class OptimizeCliTests extends AnyFreeSpec with Matchers {
           yield
             val out = new java.io.ByteArrayOutputStream
             val status = Console.withOut(out)(
-              driver(Config(command = "run", file = path, noCoreLib = true, optimize = level)))
+              driver(Config(command = "run", file = path, noStdLib = true, optimize = level)))
 
             withClue(s"-O$level") { status.shouldBe(0) }
             out.toString
@@ -134,7 +134,7 @@ class OptimizeCliTests extends AnyFreeSpec with Matchers {
       try
         val errs = new java.io.ByteArrayOutputStream
         val status = Console.withErr(errs)(
-          cli(Config(command = "run", file = path, noCoreLib = true, optimize = "nonsense")))
+          cli(Config(command = "run", file = path, noStdLib = true, optimize = "nonsense")))
 
         status.should(not).be(0)
         errs.toString should include("clang")

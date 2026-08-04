@@ -5,7 +5,7 @@ package io.github.edadma.sysl
  *
  * Every program is compiled against the library (`13 §8`), and there has been one way to be handed
  * it: `Std.parsed` — the files under `lib/sysl` as the compiler carries them, parsed. That is what a
- * *source* dependence on the core is, and it is what the artifact exists to end: every program
+ * *source* dependence on the standard module is, and it is what the artifact exists to end: every program
  * re-derives every signature in the standard module from text before it can check its own first
  * line.
  *
@@ -19,17 +19,17 @@ package io.github.edadma.sysl
  * results compared, which is the only way to establish the thing the artifact has to be true for —
  * that it *means* what the source means.
  *
- * **Only three questions turn on which core it is**, which is why this is a small type. What trees
+ * **Only three questions turn on which standard module it is**, which is why this is a small type. What trees
  * the library contributes, which sources are its rather than the program's, and which declarations
  * are its. Everything else the compiler knows about the library — the module's name, the key a
  * declaration is filed under, the spelling a key renders as — is true of the standard module however
  * it arrived, and lives in `Library`.
  */
-final class Core(val units: List[Program]) {
+final class Stdlib(val units: List[Program]) {
 
   /** The files these trees came from. A `Source` compares by identity (`Diagnostics`), so this is
    * an identity set: a user file that happened to be called `lib/sysl/display.sysl` is not one of
-   * these, and neither is the *embedded* copy of a file a decoded core carries under the same name.
+   * these, and neither is the *embedded* copy of a file a decoded standard module carries under the same name.
    */
   private val own: Set[Source] = units.map(_.source).toSet
 
@@ -73,7 +73,7 @@ final class Core(val units: List[Program]) {
   def decls: List[Stmt] = units.flatMap(_.body)
 }
 
-object Core {
+object Stdlib {
 
   /** The copy the compiler carries, as **a given target** sees it — which is what an ordinary
    * compilation is compiled against.
@@ -81,22 +81,22 @@ object Core {
    * It has to carry *something*: the standard module is what every program is compiled against, so
    * it cannot be a thing a compilation goes looking for on disk and may not find. This is that
    * guarantee — and it is what an unusable artifact at the default path is rebuilt *from*, rather
-   * than a library compiled against in its place (`Main.foundCore`). Reached directly only by
-   * `--no-core-lib`.
+   * than a library compiled against in its place (`Main.foundStd`). Reached directly only by
+   * `--no-std-lib`.
    *
    * The target is a parameter for the reason it is one everywhere else, and here it is not merely
    * consistency: the library may gate on the machine (`Conditional`), so a copy parsed for one
    * target is not the library another target has.
    */
-  def embedded(target: Target): Core =
-    cache.synchronized(cache.getOrElseUpdate(target, new Core(Std.parsed(target))))
+  def embedded(target: Target): Stdlib =
+    cache.synchronized(cache.getOrElseUpdate(target, new Stdlib(Std.parsed(target))))
 
   /** Locked for the reason `Std.parsed`'s is: this was a `lazy val`, which is initialized once
    * however many threads reach it, and a bare mutable `Map` is not.
    */
-  private val cache = collection.mutable.Map.empty[Target, Core]
+  private val cache = collection.mutable.Map.empty[Target, Stdlib]
 
-  /** A core read out of the metadata half of an artifact (`LibraryArtifact`).
+  /** A standard module read out of the metadata half of an artifact (`LibraryArtifact`).
    *
    * The trees arrive already decoded, which is the whole point, and nothing downstream can tell
    * them from parsed ones — that is what `AstCodec` is for, and what the equivalence test holds it
@@ -110,12 +110,12 @@ object Core {
    * (`Std.fingerprint`). Without it the artifact is built separately and can drift — and a stale one
    * decodes and links perfectly well, it is simply the wrong library, which is the worst way for
    * this to fail. Refusing puts it on the path a corrupt one already takes: at the default path it is
-   * rebuilt from the source the compiler carries, and where `--core-lib` named it the refusal stands.
+   * rebuilt from the source the compiler carries, and where `--std-lib` named it the refusal stands.
    */
-  def read(name: String, metadata: String, target: Target): Either[String, (Core, Set[String])] =
+  def read(name: String, metadata: String, target: Target): Either[String, (Stdlib, Set[String])] =
     LibraryArtifact.read(name, metadata, target).flatMap((units, precompiled, source) =>
-      if source == Std.fingerprint then Right((new Core(units), precompiled))
+      if source == Std.fingerprint then Right((new Stdlib(units), precompiled))
       else
         Left(s"$name was built from a different standard module than this compiler carries — " +
-          "rebuild it with 'sysl build-lib lib --core'"))
+          "rebuild it with 'sysl build-lib lib --std'"))
 }

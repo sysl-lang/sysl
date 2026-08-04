@@ -28,6 +28,22 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       |val squares: [4]int = [0, 1, 4, 9]
       |
       |lookup(i: int) -> int = squares[i]
+      |
+      |struct Money
+      |    cents: int
+      |end Money
+      |
+      |impl Eq for Money
+      |    eq(self, rhs: Money) -> bool = self.cents == rhs.cents
+      |end Money
+      |
+      |impl Ord for Money
+      |    lt(self, rhs: Money) -> bool = self.cents < rhs.cents
+      |end Money
+      |
+      |impl Add for Money
+      |    add(self, rhs: Money) -> Money = Money(self.cents + rhs.cents)
+      |end Money
       |""".stripMargin
 
   private def sources: List[Source] = List(Source("demo/lib.sysl", library, List("demo")))
@@ -362,6 +378,45 @@ class LibraryArtifactTests extends AnyFreeSpec with Matchers {
       assume(Toolchain.clangAvailable, "clang not available")
 
       linked("print(demo.double(21))\nprint(demo.larger(3, 7))")._2 shouldBe Right((0, "42\n7\n"))
+    }
+
+    /** An operator on a library's own type reaches a member of that library, and reaching one is
+     * what brings it into the program at all: a library declaration nothing names is neither
+     * analyzed nor emitted, so a name resolved without being recorded leaves a call to a function
+     * the program never compiled. The three spellings below are three separate resolutions —
+     * a comparison chain and a compound assignment hand the method over as a name rather than
+     * building a call around it — and only the middle one used to keep the record.
+     */
+    "reaches the member an operator on a library type dispatches to" in {
+      val (ir, _) = linked(
+        """var a = demo.Money(5)
+          |var b = demo.Money(7)
+          |
+          |print(a < b)
+          |print(a + b == demo.Money(12))
+          |
+          |a += b
+          |
+          |print(a == demo.Money(12))
+          |""".stripMargin)
+
+      ir should include("declare i1 @demo$Money.lt(")
+      ir should include("declare i1 @demo$Money.eq(")
+      ir should include regex """declare %struct\.demo\$Money @demo\$Money\.add\("""
+    }
+
+    "and runs, with those bodies coming from the library's object file too" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+
+      linked(
+        """var a = demo.Money(5)
+          |
+          |print(a < demo.Money(7))
+          |
+          |a += demo.Money(7)
+          |
+          |print(a == demo.Money(12))
+          |""".stripMargin)._2 shouldBe Right((0, "true\ntrue\n"))
     }
 
     "and the library carries no entry point of its own to collide with the program's" in {

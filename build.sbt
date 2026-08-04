@@ -61,7 +61,7 @@ def syslLiteral(s: String): String =
 
 lazy val embedCoreLibrary = Def.task {
   val utf8 = java.nio.charset.StandardCharsets.UTF_8
-  val out  = (Compile / sourceManaged).value / "io" / "github" / "edadma" / "sysl" / "CoreSource.scala"
+  val out  = (Compile / sourceManaged).value / "io" / "github" / "edadma" / "sysl" / "StdSource.scala"
   val dir  = (ThisBuild / baseDirectory).value / "lib" / "sysl"
 
   // Sorted by the path below `lib/sysl` rather than by the bare file name, so that what a
@@ -88,7 +88,7 @@ lazy val embedCoreLibrary = Def.task {
     s"""package io.github.edadma.sysl
        |
        |/** Generated from the sysl files under `lib/sysl` by `build.sbt` -- do not edit. See `Std`. */
-       |private[sysl] object CoreSource {
+       |private[sysl] object StdSource {
        |  val files: List[(String, String)] = List(
        |$entries
        |  )

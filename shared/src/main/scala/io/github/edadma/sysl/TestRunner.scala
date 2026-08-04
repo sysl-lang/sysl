@@ -42,11 +42,11 @@ object TestRunner {
    * to be unrunnable.
    */
   def run(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
-          precompiled: Set[String], core: Core, archives: List[String]): Int = {
+          precompiled: Set[String], std: Stdlib, archives: List[String]): Int = {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
-    val (built, tests) = Compiler.compileTests(sources, libraries, target, precompiled, Some(core)) match
+    val (built, tests) = Compiler.compileTests(sources, libraries, target, precompiled, Some(std)) match
       case Left(err)     => return report(err)
       case Right(result) => result
 
