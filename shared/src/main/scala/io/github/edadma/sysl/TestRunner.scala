@@ -67,11 +67,11 @@ object TestRunner {
     val exe = createTempFile("sysl-test-", "")
 
     Toolchain.build(built.ir, exe, target, archives, cfg.optimize, built.links) match
-      case Left(err) => discard(exe); fail(err)
+      case Left(err) => Project.discard(exe); fail(err)
       case Right(_) =>
         val outcomes = execute(exe, selected, opts)
 
-        discard(exe)
+        Project.discard(exe)
         stdout(rendered(outcomes, tests.length - selected.length))
         if outcomes.forall(_.passed) then 0 else 1
   }
@@ -155,10 +155,6 @@ object TestRunner {
     out ++= s"\n${outcomes.length - failed} passed, $failed failed — ${total}ms\n"
     out.toString
   }
-
-  private def discard(path: String): Unit =
-    try deleteFile(path)
-    catch case _: Exception => ()
 
   private def fail(msg: String): Int = {
     Console.err.println(s"sysl: error: $msg")

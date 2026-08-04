@@ -521,4 +521,68 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       kept.length should be < 12
     }
   }
+
+  /* Everything above builds the artifact in memory, which is the half that can be checked without a
+   * toolchain. `Stdlib.writeArtifact` is the other half: the same build, assembled and archived onto
+   * disk at a named path. It is what a compilation finding nothing usable at the default path calls
+   * (`Main.foundStd`) and what the suite's own `PrebuiltStd` calls, so the two cannot drift — and
+   * nothing pinned it while it was a private routine of the driver's. */
+
+  "the standard module written to disk as an artifact" - {
+
+    "reads back as the standard module this compiler carries" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+      assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
+
+      val out = s"${createTempDirectory("sysl-write-")}/std${LibraryArtifact.extension}"
+
+      Stdlib.writeArtifact(out, Target.default) shouldBe Right(())
+
+      val back =
+        for
+          m <- LibraryArtifact.metadataOf(out, readBytes(out))
+          r <- Stdlib.read(out, m, Target.default)
+        yield r
+
+      // The exact symbol set and the exact module list, not merely that something decoded: an
+      // artifact built from other sources than the compiler carries decodes perfectly well and is
+      // the wrong library, which is the failure `Stdlib.read`'s fingerprint check exists to catch.
+      back.map(_._2) shouldBe Right(precompiled)
+      back.map(_._1.modules) shouldBe Right(decoded.modules)
+
+      deleteFile(out)
+    }
+
+    "makes the directory it is asked to write into, which a fresh clone has never had" in {
+      assume(Toolchain.clangAvailable, "clang not available")
+      assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
+
+      // The default path is `.sysl/std.syslib` — a directory that is not committed, because the
+      // artifact is derived. Writing there on a tree that has never built one is the ordinary case
+      // rather than an unusual one, so the parent has to be made rather than assumed.
+      val dir = s"${createTempDirectory("sysl-write-")}/.sysl"
+      val out = s"$dir/std${LibraryArtifact.extension}"
+
+      isDirectory(dir) shouldBe false
+      Stdlib.writeArtifact(out, Target.default) shouldBe Right(())
+      isFile(out) shouldBe true
+
+      deleteFile(out)
+    }
+
+    "and says which flag names the archiver when it cannot run the one it was given" in {
+      // The archiver is looked for first, so a build that has nowhere to put its members fails
+      // before it compiles any — and the message names `--ar`, since a caller who passed one is
+      // being told about the path they passed rather than about a search that never ran.
+      val out = s"${createTempDirectory("sysl-write-")}/std${LibraryArtifact.extension}"
+
+      Stdlib.writeArtifact(out, Target.default, Some("/nonexistent/llvm-ar")) match
+        case Right(_)  => fail("an archiver that cannot run should not have produced an artifact")
+        case Left(err) =>
+          err should include("/nonexistent/llvm-ar")
+          err should include("--ar")
+
+      exists(out) shouldBe false
+    }
+  }
 }
