@@ -71,4 +71,48 @@ class VersionCliTests extends AnyFreeSpec with Matchers {
       ran(Config(command = "version"))._1 shouldBe 0
     }
   }
+
+  /* `--help` is the same shape and shipped later, because 0.0.1 went out without it: `sysl --help`
+   * answered `Error: Unknown option --help`. The usage text was always reachable — an invocation
+   * naming no subcommand prints it — but only by failing, which is not the same thing as answering. */
+
+  "--help" - {
+
+    "stands on its own, like --version" in {
+      parse("--help").map(_.command) shouldBe Some("help")
+    }
+
+    "prints the usage, on stdout and with a zero status" in {
+      // The distinction worth pinning. The same text reaches stderr with a 2 when an invocation is
+      // wrong, and that is right — but somebody who *asked* has not made a mistake, so
+      // `sysl --help | less` gets the text and a script checking the status is not told otherwise.
+      val (status, out) = ran(Config(command = "help"))
+
+      status shouldBe 0
+      out should include("Usage: sysl")
+    }
+
+    "and the usage it prints lists every subcommand, being generated rather than written out" in {
+      // Not a copy kept in step with the parser by hand: `OParser.usage` renders the parser itself,
+      // so a subcommand added above cannot go missing here. Asserting the list is what would catch
+      // it having been replaced by a hand-maintained string.
+      val out = ran(Config(command = "help"))._2
+
+      for command <- List("run", "build", "build-lib", "test", "emit-llvm", "targets") do
+        withClue(s"'$command' missing from the usage: ") { out should include(command) }
+    }
+
+    "and it names the two flags that stand alone" in {
+      val out = ran(Config(command = "help"))._2
+
+      out should include("--version")
+      out should include("--help")
+    }
+
+    "while an invocation naming nothing still fails rather than helpfully succeeding" in {
+      // The neighbour that keeps the above from being a statement about `checkConfig` having
+      // quietly stopped applying. A bare `sysl` is a mistake and is still reported as one.
+      parse() shouldBe None
+    }
+  }
 }
