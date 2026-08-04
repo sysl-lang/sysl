@@ -32,10 +32,10 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       progError("module a\nprint(1)\nmodule b") should include("module")
     }
 
-    // A capability clause is a line of the header rather than part of this one (`13 §4`), and the
-    // refusal says so rather than reporting a token it did not expect (`CapabilityClauseTests`).
-    "does not carry the capability clause on its own line" in {
-      progError("module m no alloc\nprint(1)") should include("belongs in the file's header")
+    // A capability annotation is a line of the header rather than part of this one (`13 §4`), and
+    // the refusal says so rather than reporting a token it did not expect (`CapabilityClauseTests`).
+    "does not carry the capability annotation on its own line" in {
+      progError("module m @no_alloc\nprint(1)") should include("belongs in the file's header")
     }
 
     "may be preceded by blank lines" in {
