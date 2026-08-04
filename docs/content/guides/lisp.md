@@ -8,6 +8,10 @@ A Lisp small enough to read in one sitting: seven kinds of value, three special 
 and a reader that knows integers, symbols and parentheses. It is not here to be a Lisp. It is here
 because a Lisp **cannot avoid** the one thing reference counting cannot do.
 
+**The second literate program in the set**, after [slab](/guides/slab/): a `.lsysl` file is Markdown
+whose four-column-indented part is the program, so the argument for each arm of `eval` sits beside
+that arm. As a comment above the function, nobody would read it where it mattered.
+
 **The axis: the reference cycle.** sysl's headline memory claim is that it counts references rather
 than checking borrows, and the honest cost of that choice is a cycle — an island of objects that all
 point at each other, that nothing outside can reach, and whose counts therefore never reach zero.

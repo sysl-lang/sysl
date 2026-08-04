@@ -5,7 +5,7 @@ weight: 130
 ---
 
 One region of bytes carved into fixed blocks, with the free list threaded through the free blocks'
-own storage. **The one literate program in the set** — its findings ran to sixty lines of header
+own storage. **The first literate program in the set** — its findings ran to sixty lines of header
 comment before anything executable appeared, which is the length at which a comment stops being one,
 so `slab.lsysl` is a document with the program indented inside it.
 

@@ -60,11 +60,17 @@ The rest of the set, and the coverage map that justifies each entry, is recorded
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is
 a variation, and belongs in the test suite instead.
 
-**`slab` is written as a literate file** (`15 §11`), and it is the one program here that is. Its
-findings ran to sixty lines of header comment before anything executable appeared, which is the
-length at which a comment stops being one — so `slab.lsysl` is a document with the program indented
-inside it, and the essay that was fighting the `//` is prose. Nothing about the program changed; the
+**`slab` and `lisp` are written as literate files** (`15 §11`). Both crossed the same line: their
+findings ran past sixty lines of header comment before anything executable appeared, which is the
+length at which a comment stops being one — so each is a document with the program indented inside
+it, and the essay that was fighting the `//` is prose. Nothing about either program changed; a
 directory holds a `.lsysl` beside `.sysl` files and `Project.collect` reads both.
+
+**The threshold is worth stating, because it is the whole of when to reach for the format.** It is
+not comment *volume* — it is an argument that has to sit between two declarations rather than above
+one. `lisp` has four paragraphs inside the body of `eval`, each explaining the arm under it; as
+`//` they were a wall above the function that nobody would read at the point it mattered. Consecutive
+indented blocks are one block, so prose costs the program nothing to split.
 
 ## What each program found
 

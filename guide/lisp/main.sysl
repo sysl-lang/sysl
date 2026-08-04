@@ -12,11 +12,37 @@ value(src: string) -> string = answer(src, false)
 // The two programs the memory checks are about, and the reason there are two: the first defines one
 // function and calls it eleven times, the second defines two and calls them five hundred more. If
 // what leaks were proportional to the calls, they would not agree.
-fact() -> string = "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 10)"
+fact() -> string =
+    """
+    (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))
+    (fact 10)
+    """
 
 repeated() -> string =
-    "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))" +
-        " (define (rep k) (if (= k 0) (fact 10) (rep (- k 1)))) (rep 500)"
+    """
+    (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))
+    (define (rep k) (if (= k 0) (fact 10) (rep (- k 1))))
+    (rep 500)
+    """
+
+// A definition that lands in a *call's* frame rather than in the globals, which is the case that
+// turns "one leak per program" into one per call. Written once because both interpreters are asked
+// the same question about it, and a difference in the text would be a difference in the answer.
+inner_define() -> string =
+    """
+    (define (outer) (define (inner) (inner)))
+    (outer)
+    (outer)
+    (outer)
+    """
+
+// The closure the two interpreters must agree on: one made inside a call, escaping the frame it was
+// written in, and applied after that frame has returned.
+adder() -> string =
+    """
+    (define (adder n) (lambda (x) (+ x n)))
+    ((adder 3) 4)
+    """
 
 // `n` opening parens, an atom, and `n` closing ones — the deepest thing the reader will be asked
 // for, built rather than typed so the limit and the check cannot drift apart.
@@ -90,8 +116,12 @@ check("recursion", value(fact()), "3628800")
 check("a closure sees where it was written",
       value("(define (adder n) (lambda (x) (+ x n))) (define add3 (adder 3)) (add3 4)"), "7")
 check("and keeps seeing it after the call returns",
-      value("(define (adder n) (lambda (x) (+ x n))) (define a2 (adder 2)) (define a9 (adder 9))" +
-                " (+ (a2 1) (a9 1))"), "13")
+      value("""
+            (define (adder n) (lambda (x) (+ x n)))
+            (define a2 (adder 2))
+            (define a9 (adder 9))
+            (+ (a2 1) (a9 1))
+            """), "13")
 check("a parameter shadows a global",
       value("(define n 1) (define (f n) n) (f 99)"), "99")
 check("and the global is still there", value("(define n 1) (define (f n) n) (f 99) n"), "1")
@@ -149,13 +179,12 @@ check("nor does one whose lambda is never bound where it can see itself",
 // function and the same rule reads the other way: each call makes a frame and each frame gets its
 // own closure pointing back at it. Three calls, three frames, and not one of the four environments
 // this run made comes back.
-var nested = after_run("(define (outer) (define (inner) (inner))) (outer) (outer) (outer)", false)
+var nested = after_run(inner_define(), false)
 
 check("a definition inside a function is a definition per call", str(made(nested)), "4")
 check("and every one of those frames is trapped with it", str(alive(nested)), "4")
 check("which the owning interpreter reclaims like any other",
-      str(alive(after_run("(define (outer) (define (inner) (inner))) (outer) (outer) (outer)", true))),
-      "0")
+      str(alive(after_run(inner_define(), true))), "0")
 
 print("-- the same interpreter with the edge weakened")
 
@@ -166,9 +195,7 @@ check("and none of them outlives the interpreter", str(alive(weakened)), "0")
 check("because the interpreter owned every one of them until it went",
       str(during_run(fact(), true)), "12")
 check("the answers are the same either way", answer(fact(), true), answer(fact(), false))
-check("and so is the closure that made the trouble",
-      answer("(define (adder n) (lambda (x) (+ x n))) ((adder 3) 4)", true),
-      answer("(define (adder n) (lambda (x) (+ x n))) ((adder 3) 4)", false))
+check("and so is the closure that made the trouble", answer(adder(), true), answer(adder(), false))
 
 print("-- scale")
 
@@ -176,10 +203,14 @@ print("-- scale")
 // pairs built and taken apart in between. `eval` loops rather than recursing, so this runs in one
 // sysl frame; the list comes apart on a worklist rather than on the stack.
 check("a hundred thousand tail calls, and the list they build",
-      value("(define (build n acc) (if (= n 0) acc (build (- n 1) (cons n acc))))" +
-                " (define (count xs n) (if (null? xs) n (count (cdr xs) (+ n 1))))" +
-                " (count (build 100000 ()) 0)"), "100000")
+      value("""
+            (define (build n acc) (if (= n 0) acc (build (- n 1) (cons n acc))))
+            (define (count xs n) (if (null? xs) n (count (cdr xs) (+ n 1))))
+            (count (build 100000 ()) 0)
+            """), "100000")
 check("and the sum of it, which is what says the cells were right",
-      value("(define (build n acc) (if (= n 0) acc (build (- n 1) (cons n acc))))" +
-                " (define (total xs acc) (if (null? xs) acc (total (cdr xs) (+ acc (car xs)))))" +
-                " (total (build 100000 ()) 0)"), "5000050000")
+      value("""
+            (define (build n acc) (if (= n 0) acc (build (- n 1) (cons n acc))))
+            (define (total xs acc) (if (null? xs) acc (total (cdr xs) (+ acc (car xs)))))
+            (total (build 100000 ()) 0)
+            """), "5000050000")
