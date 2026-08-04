@@ -102,21 +102,32 @@ sbt "syslJVM/run run examples/hello.sysl"
 
 ## The standard library
 
-Every program is compiled against the standard module. You do not have to build it: when nothing
-usable is at the default path, the compiler builds the artifact itself out of the library source it
-carries, says so on stderr, and gets on with the compilation. A fresh install just works.
+Every program is compiled against the standard module, and **its source ships with the compiler**.
+An install puts it at `share/sysl/lib` under the install prefix — on a Homebrew Mac that is
+`$(brew --prefix)/share/sysl/lib` — and the compiler finds it from its own location, the way `rustc`
+finds its sysroot. Running out of a checkout, it is the `lib/` directory in the tree. Nothing has to
+be configured, and there is no variable to set.
+
+It is meant to be read. The library is ordinary sysl, laid out as an ordinary sysl library, and
+every function in it is one a program could have written; `sysl build-lib <root> --std` is the same
+command that builds anybody else's.
+
+You do not have to build the artifact, either: when nothing usable is at the default path, the
+compiler builds it out of that source, says so on stderr, and gets on with the compilation. A fresh
+install just works.
 
 It goes in your cache directory — `~/Library/Caches/sysl/` on macOS, `~/.cache/sysl/` on Linux, or
 wherever `XDG_CACHE_HOME` points — under a fingerprint of the library it was built from. So it is
 built once per machine rather than once per project, nothing is written into your source tree, and
-installing a compiler that carries a different library gets its own entry instead of a stale hit.
+installing a compiler with a different library gets its own entry instead of a stale hit.
 Nothing there is ever evicted, and everything in it is derived: deleting the directory costs one
 rebuild.
 
 Two flags matter when you want something other than that. `--std-lib <path>` names an artifact
 explicitly, and an artifact you named is never rebuilt behind your back — if it will not read, the
-compilation stops and says so. `--no-std-lib` compiles against the copy built into the compiler
-with no toolchain involved at all, which is the path the compiler's own test suite takes.
+compilation stops and says so. `--no-std-lib` compiles the standard module from its source instead
+of linking a prebuilt one, with no toolchain involved at all, which is the path the compiler's own
+test suite takes.
 
 ## Optimization
 
@@ -137,6 +148,12 @@ built-from-source problem.
 
 **`llvm-ar` complaints when building a library** — you have the platform archiver, not LLVM's.
 Point at LLVM's with `--ar /path/to/llvm-ar`.
+
+**`cannot find the standard module's source`** — the compiler could not find the library it ships
+with, and the message lists every path it tried. From a package install that means the install is
+incomplete: reinstall it. From a checkout it usually means the working directory is not in the tree.
+Either way `SYSL_LIB=/path/to/lib` names the library root outright, where the root is the directory
+holding `sysl` — that is, the `lib` above `lib/sysl`, not `lib/sysl` itself.
 
 **sbt is slow on the first run** — it is downloading Scala and the dependency tree. This happens
 once.

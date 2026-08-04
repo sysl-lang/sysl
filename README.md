@@ -94,18 +94,20 @@ should fire, and passes only if the run does not come back. Every other build dr
 they cost a program nothing.
 
 Every program is compiled against the standard module, and **there is no step to run for it**. The
-artifact is a derived file — object code for one machine, computed from library source the compiler
-already carries — so a clone, a fresh worktree, or a stale container after the encoding moved all
-have the same answer, and the compiler gives it in well under a second, announced on stderr. It goes
-in your cache directory, keyed by a fingerprint of the library it was built from, so every project on
-the machine shares one and an upgrade needs no invalidating. `sysl build-lib lib --std` writes one
-explicitly if you want to.
+library's own source ships with the compiler and is read off disk — `share/sysl/lib` under the
+install prefix, found from the binary's own location, or `lib/` in a checkout. The artifact built
+from it is a derived file — object code for one machine — so a clone, a fresh worktree, or a stale
+container after the encoding moved all have the same answer, and the compiler gives it in well under
+a second, announced on stderr. It goes in your cache directory, keyed by a fingerprint of the library
+it was built from, so every project on the machine shares one and an upgrade needs no invalidating.
+`sysl build-lib lib --std` writes one explicitly if you want to.
 
 That rebuild is not a silent fallback. What the design refuses is compiling against a *different*
 standard module than the one asked for, so an artifact named with `--std-lib` is never rebuilt and a
 compilation stops when it will not read: somebody who wrote down which artifact to use is owed the
-truth about that one. `--no-std-lib` is the third way — it compiles against the carried source with
-no toolchain at all, which is what the test suite takes and what makes the first build possible.
+truth about that one. `--no-std-lib` is the third way — it compiles the library's source into the
+program with no toolchain at all, which is what the test suite takes and what makes the first build
+possible.
 
 Building a library also needs an **`llvm-ar`**, because a `.syslib` is an `ar` archive whose members
 are objects for the machine it was built *for*: a platform archiver indexes only its own format and

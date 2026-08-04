@@ -241,11 +241,11 @@ class LibraryCliTests extends LibraryCliSupport {
 
         val where = s"${createTempDirectory("sysl-cli-found-")}/std${LibraryArtifact.extension}"
 
-        succeeds(Config(command = "build-lib", file = StdRoot.root.get, std = true, stdSearch = where))
+        succeeds(Config(command = "build-lib", file = StdRoot.root.get, std = true, stdSearch = Some(where)))
         isFile(where) shouldBe true
 
         val (status, notes) =
-          diagnostics(Config(command = "run", file = program("print(21 * 2)"), stdSearch = where))
+          diagnostics(Config(command = "run", file = program("print(21 * 2)"), stdSearch = Some(where)))
 
         status shouldBe 0
         notes should not include "warning"
@@ -258,7 +258,7 @@ class LibraryCliTests extends LibraryCliSupport {
         val where = s"${createTempDirectory("sysl-cli-none-")}/std${LibraryArtifact.extension}"
 
         val (status, notes) =
-          diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = where))
+          diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = Some(where)))
 
         status shouldBe 0
         isFile(where) shouldBe true
@@ -274,7 +274,7 @@ class LibraryCliTests extends LibraryCliSupport {
 
         val where = corrupt("not a library\n".getBytes)
 
-        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = where))._1 shouldBe 0
+        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = Some(where)))._1 shouldBe 0
 
         // Replaced, not merely worked around: what is at the path afterwards is a standard module
         // this compiler will read, which is the whole of what the rebuild is for.
@@ -293,7 +293,7 @@ class LibraryCliTests extends LibraryCliSupport {
         // It is not corrupt and would decode as far as its own header — only the compiler has moved.
         val where = corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)
 
-        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = where))._1 shouldBe 0
+        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = Some(where)))._1 shouldBe 0
       }
 
       "and the program is compiled against the rebuilt one, not against the carried copy" in {
@@ -306,8 +306,8 @@ class LibraryCliTests extends LibraryCliSupport {
         // The discriminating half. A rebuild that produced an artifact and then went on compiling
         // against the copy the compiler carries would pass every assertion above, and the library's
         // symbols are what tell the two apart: linked, they are declarations.
-        val rebuilt = emitted(Config(command = "emit-llvm", file = src, stdSearch = where))
-        val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = where))
+        val rebuilt = emitted(Config(command = "emit-llvm", file = src, stdSearch = Some(where)))
+        val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = Some(where)))
 
         libraryOwn(rebuilt, "define") shouldBe empty
         libraryOwn(rebuilt, "declare") should not be empty
@@ -331,7 +331,7 @@ class LibraryCliTests extends LibraryCliSupport {
         // the named one is not ours at all, the one at the default path claims a later format.
         val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
           stdLib = Some(corrupt("not a library\n".getBytes)),
-          stdSearch = corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)))
+          stdSearch = Some(corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes))))
 
         status should not be 0
         notes should include("is not a sysl library")
@@ -341,7 +341,13 @@ class LibraryCliTests extends LibraryCliSupport {
       "and the place both ends agree on is the documented one" in {
         // The tests above route around the real default so they cannot collide; this is what says
         // the real default is what they were standing in for.
-        Config().stdSearch shouldBe LibraryArtifact.stdDefault
+        //
+        // A config that names nothing gets the default *when it is used* rather than when it is
+        // built. That is not a detail: the path holds a fingerprint of the library, so computing it
+        // up front read the library's source during argument parsing — where a compiler that could
+        // not find its library had no way to report it but an exception.
+        Config().stdSearch shouldBe None
+        stdSearchOf(Config()) shouldBe LibraryArtifact.stdDefault
         LibraryArtifact.stdDefault should endWith(LibraryArtifact.extension)
       }
 
@@ -387,7 +393,7 @@ class LibraryCliTests extends LibraryCliSupport {
       // without the flag (the discovery section above), so succeeding here is the artifact going
       // unread rather than a corruption that happens not to matter.
       val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
-        noStdLib = true, stdSearch = corrupt("not a library\n".getBytes)))
+        noStdLib = true, stdSearch = Some(corrupt("not a library\n".getBytes))))
 
       status shouldBe 0
       notes should not include "error"
@@ -400,7 +406,7 @@ class LibraryCliTests extends LibraryCliSupport {
       val nowhere = s"${createTempDirectory("sysl-cli-bare-")}/std${LibraryArtifact.extension}"
 
       succeeds(Config(command = "emit-llvm", file = program("print(1)"), noStdLib = true,
-        stdSearch = nowhere))
+        stdSearch = Some(nowhere)))
 
       // Nothing was written, where the same run without the flag would have built one there.
       isFile(nowhere) shouldBe false
@@ -414,8 +420,8 @@ class LibraryCliTests extends LibraryCliSupport {
       // nothing, so the assertion is on the seam the flag moves — what the artifact already holds
       // is declared when it is linked and defined when it is not.
       val src    = program("print(21 * 2)")
-      val linked = emitted(Config(command = "emit-llvm", file = src, stdSearch = std))
-      val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = std))
+      val linked = emitted(Config(command = "emit-llvm", file = src, stdSearch = Some(std)))
+      val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = Some(std)))
 
       libraryOwn(linked, "define") shouldBe empty
       libraryOwn(linked, "declare") should not be empty
@@ -431,8 +437,8 @@ class LibraryCliTests extends LibraryCliSupport {
       assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
       val src = program("f(n: int) -> int = n * 2\nprint(f(21))\n")
-      val linked  = emitted(Config(command = "emit-llvm", file = src, stdSearch = std))
-      val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = std))
+      val linked  = emitted(Config(command = "emit-llvm", file = src, stdSearch = Some(std)))
+      val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = Some(std)))
 
       // The two modules do *not* hold the same symbols, and should not: the standard module's own
       // and the ARC runtime beside them are defined here only when the copy is carried, and come
@@ -450,7 +456,7 @@ class LibraryCliTests extends LibraryCliSupport {
       // Linking is the assertion. The artifact's object half is not handed to the linker here, so
       // every std symbol this program calls has to have been emitted into it.
       val (status, notes) = diagnostics(Config(command = "run", file = program("print(21 * 2)"),
-        noStdLib = true, stdSearch = std))
+        noStdLib = true, stdSearch = Some(std)))
 
       status shouldBe 0
       notes should not include "warning"

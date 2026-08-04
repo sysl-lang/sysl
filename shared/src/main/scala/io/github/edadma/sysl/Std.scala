@@ -1,7 +1,9 @@
 package io.github.edadma.sysl
 
-/** The library the compiler carries: the standard module `sysl` that every program is compiled
- * against, and the submodules beneath it (`13 § Open h`).
+import io.github.edadma.cross_platform.*
+
+/** The library the compiler is installed with: the standard module `sysl` that every program is
+ * compiled against, and the submodules beneath it (`13 § Open h`).
  *
  * **`sysl` is the auto-imported part and not the whole of it.** `lib/sysl` is a tree, so a directory
  * under it is a submodule by `13 §1`'s ordinary rule, and only the standard module's names are the
@@ -16,16 +18,22 @@ package io.github.edadma.sysl
  * single hole fails every test at once with nothing to bisect; a move put **one** declaration onto
  * that path, so what broke named what was wrong.
  *
- * **The source is real files, under `lib/sysl`.** That is what a prelude could never be: a string
- * literal has no other form, while these are ordinary sysl files a driver reads exactly as it reads
- * a user's library — which is what `sysl build-lib` is pointed at, and what makes the library's own
- * source something a reader can open. What the compiler carries is **generated from them**
- * (`StdSource`, written by `build.sbt`), so the files are the fact and the carrier cannot disagree
- * with them.
+ * **The source is real files, under `lib/sysl`, and the compiler reads them off disk.** That is what
+ * a prelude could never be: a string literal has no other form, while these are ordinary sysl files
+ * a driver reads exactly as it reads a user's library — which is what `sysl build-lib` is pointed
+ * at, and what makes the library's own source something a reader can open, edit, and rebuild
+ * against.
  *
- * It has to carry *something*, and that is not a packaging accident. The standard module is what
- * every program is compiled against, so it cannot be a thing a compilation goes looking for on disk
- * and may not find. This is that guarantee, and `Stdlib.embedded` is it seen as a library.
+ * They were carried *inside* the binary once, generated into a `StdSource` object by `build.sbt`.
+ * That bought a guarantee — a compilation could not fail to find its library — and it was bootstrap
+ * scaffolding rather than the design: a library nobody can open is not one anybody can learn from,
+ * and a compiler that cannot be pointed at an edited one cannot have its library worked on at all.
+ * What replaces the guarantee is `root` below, and above all the diagnostic it fails with, which
+ * names every place it looked.
+ *
+ * **Every real toolchain resolves this way.** `rustc` computes a sysroot from its own location,
+ * `clang` finds its resource directory from its own, `zig` its `lib/`. None of them carries its
+ * standard library in the executable, and none of them asks the user to set a variable.
  *
  * **What a given compilation was handed is a different question**, and it is `Stdlib` that answers it:
  * a program may be compiled against a `.syslib` whose trees never went through the parser, and every
@@ -45,25 +53,107 @@ object Std {
    */
   val module: String = "sysl"
 
-  /** The library's files, in the order the generator found them — that is, sorted by name, so that
-   * what a compilation sees does not depend on a directory listing.
+  /** Where the library's source is, or why it could not be found — resolved once, and the one thing
+   * about the installation the rest of the compiler asks.
    *
-   * Each carries the directory it sits in below `lib/`, which is the module its header has to agree
-   * with (`13 §1`), so these are the same `Source` values the driver would build from disk.
+   * The order is the order the answers are *trusted* in. An explicit `SYSL_LIB` is the user
+   * overriding everything and is taken at its word; the compiler's own location is the installed
+   * case and is what makes an install self-contained; the working directory is the development one,
+   * where the compiler is being run out of a checkout.
+   *
+   * `SYSL_LIB` is an escape hatch and not the mechanism. A toolchain that needed a variable set
+   * before it would work would be one nobody could install, so nothing on the ordinary path reads
+   * it — it is here for a broken install and for working on the library itself, and it is the only
+   * one of the three that reports its own failure rather than falling through, because someone who
+   * set it is owed the truth about what they set.
    */
-  val sources: List[Source] =
-    StdSource.files.map((name, text) => Source(name, text, directoryOf(name)))
+  lazy val root: Either[String, String] = rootOf(envVar("SYSL_LIB"), executablePath, isDirectory)
 
-  /** Where a carried file sits, as the directory segments between the library root and it — the
-   * `dir` a driver would have put on the `Source` had it read the file off disk.
+  /** The resolution itself, over its three inputs rather than over the machine it is running on —
+   * the variable, this compiler's own location, and what counts as a directory.
    *
-   * The generator writes each name as the path below `lib`, so the segments are simply what is left
-   * after dropping that root and the file itself: `lib/sysl/print.sysl` is in `sysl`, and
-   * `lib/sysl/sys/args.sysl` is in `sysl.sys`. Deriving it is what lets the library be a tree —
-   * naming the module here instead, as this once did, is a claim every file is in the same one, and
-   * a submodule's files would have been checked against the wrong header.
+   * **Taking them as parameters is what makes every branch testable.** Read ambiently, the only case
+   * a suite could reach is whichever one happens to hold on the machine it is running on, and the
+   * others would be asserted by reading. That is the mistake `cross_platform.cacheRoot` was written
+   * to undo, where the one test for a named root was cancelled on every run.
    */
-  private[sysl] def directoryOf(name: String): List[String] = name.split('/').toList.drop(1).init
+  private[sysl] def rootOf(named: Option[String], exe: Option[String],
+                           isDir: String => Boolean): Either[String, String] = {
+    // A root is one that **holds the standard module**, not merely one that exists. `lib` is an
+    // ordinary directory name — a C project has one, and so does half of everything else — so an
+    // installed compiler standing in someone's source tree would otherwise take theirs for its own
+    // and fail somewhere far from the cause. Asking for `<root>/sysl` is one `isDirectory` and it
+    // makes the search skip what it should skip.
+    def holdsLibrary(root: String): Boolean = isDir(s"$root/$module")
+
+    named match
+      case Some(path) =>
+        Either.cond(holdsLibrary(path), path,
+          s"SYSL_LIB names '$path', which does not hold a '$module' directory — it should be the " +
+            s"library root, which is the directory *above* '$module' rather than '$module' itself")
+      case None => candidates(exe).map(_._1).find(holdsLibrary).toRight(missing(exe))
+  }
+
+  /** The places a library root is looked for, in order, each with the reason it is a candidate — the
+   * reasons being what the diagnostic below is made of.
+   *
+   * The installed answer is `<prefix>/share/sysl/lib`, reached from the binary's own resolved path
+   * by going up out of `bin`. That is a plain Unix prefix layout and is exactly what Homebrew's
+   * `pkgshare` is, so an installed sysl finds its library with nothing configured and two installs
+   * of different versions each find their own.
+   *
+   * The relative ones are the development tree. `../` and `../../` are there because the compiler's
+   * own tests do not all run from the repository root, and because a developer running the driver
+   * from a subdirectory of a checkout is the same case.
+   */
+  private[sysl] def candidates(exe: Option[String]): List[(String, String)] =
+    exe.flatMap(path => Project.parentOf(path).flatMap(Project.parentOf)).toList
+      .map(prefix => s"$prefix/share/sysl/lib" -> "beside this compiler") :::
+      List("lib", "../lib", "../../lib").map(_ -> "from the working directory")
+
+  /** What a compilation with no library to compile against says.
+   *
+   * **This is what replaces a guarantee**, so it is written as the thing a reader can act on rather
+   * than as a report that something failed: every path that was tried, in the order they were tried,
+   * with what each one was — followed by the two ways out. A compiler that cannot find its standard
+   * library is broken, and the difference between a broken installation and a mystery is this list.
+   */
+  private def missing(exe: Option[String]): String =
+    s"cannot find the standard module's source, which every program is compiled against. Looked " +
+      s"for a library root holding '$module' at:\n" +
+      candidates(exe).map((path, why) => s"  $path ($why)").mkString("\n") +
+      "\n\nA sysl installed from a package has it beside the binary; one run out of a checkout " +
+      "finds it in the tree. Set SYSL_LIB to the library root to name it outright."
+
+  /** The library's files, sorted by their place in it rather than by where they were found — so that
+   * what a compilation sees depends on the library and not on the order a directory listed, or on
+   * which of the paths above the root was reached by.
+   *
+   * Each carries the directory it sits in below the root, which is the module its header has to
+   * agree with (`13 §1`). They are read by the same walk that reads a user's library, because they
+   * *are* a library: `sysl build-lib lib --std` is pointed at this same tree and gets these same
+   * values.
+   */
+  lazy val sources: List[Source] = root match
+    case Right(dir) =>
+      val found = Project.collect(dir).sortBy(place)
+
+      // A directory that answers the search and holds nothing readable is a *different* failure from
+      // not finding one, and it has to say so: every program would otherwise fail at its first free
+      // name — `undefined function 'print'` — which points at the program rather than at the empty
+      // library that caused it. Reachable through a truncated install, or a `SYSL_LIB` aimed one
+      // level too high.
+      if found.isEmpty then sys.error(s"the library at $dir holds no sysl source files")
+
+      found
+    case Left(err) => sys.error(err)
+
+  /** A file's place in the library: the module directories it sits under, then its own name. The
+   * same key the fingerprint sorts and hashes by, and for the same reason — it is what is true of a
+   * file wherever the library was found, while its path is not.
+   */
+  private def place(s: Source): String =
+    (s.dir.getOrElse(Nil) :+ Project.basename(s.name)).mkString("/")
 
   /** What the library's source amounts to, for telling a prebuilt artifact built from *this* library
    * from one built from a different version of it.
@@ -74,10 +164,12 @@ object Std {
    * decodes perfectly and links perfectly, it is just the wrong library. This is what an artifact is
    * held to on the way in ([[Stdlib.read]]).
    *
-   * It composes with the other guard rather than duplicating it: edit `lib/sysl` and rebuild the
-   * compiler, and this moves, so a stale artifact is caught here; edit and *don't* rebuild, and
-   * `StdSource` is the stale thing, which is what `StdLibraryTests` is for. Between them there is
-   * no gap.
+   * **Rebuilding the compiler has nothing to do with it, and that is what reading the library off
+   * disk bought.** While the source was generated into the binary there were two copies and two
+   * ways to be stale — an artifact behind the carried source, and carried source behind the tree —
+   * and the second needed a test of its own to catch. Now an edit to `lib/sysl` moves this the next
+   * time the compiler runs, the artifact keyed by it is a different file, and the drift the second
+   * copy made possible cannot occur.
    */
   lazy val fingerprint: String = LibraryArtifact.fingerprint(sources)
 

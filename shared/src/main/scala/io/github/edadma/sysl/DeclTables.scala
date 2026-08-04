@@ -41,8 +41,8 @@ trait DeclTables extends Reporting {
 
   /** The standard module this compilation is compiled against, and where its trees came from
    * (`Stdlib`). It is carried rather than looked up because a compilation may be handed a library
-   * artifact instead of the copy the compiler embeds, and every question about *which* declarations
-   * are the library's has to be answered over the one it actually got.
+   * artifact instead of the library's source, and every question about *which* declarations are the
+   * library's has to be answered over the one it actually got.
    */
   protected def std: Stdlib
 
@@ -71,7 +71,7 @@ trait DeclTables extends Reporting {
    * it is asked of the `Source` rather than of the module because a `Source` is the stronger answer:
    * a user file that happened to sit at `lib/sysl/render.sysl` is not one of the library's. The
    * compilation that *builds* a library module is the one
-   * case where the source is the library's without being the copy the compiler carries, and it has
+   * case where the source is the library's without being what this compilation was handed, and it has
    * to be, or the rest of the library could not name what it declares: the library's
    * `impl Display for (A, B)` calls `display_pad` and resolves it among the library's own, and while
    * `lib/sysl/render.sysl` is being compiled that is the file in front of it.

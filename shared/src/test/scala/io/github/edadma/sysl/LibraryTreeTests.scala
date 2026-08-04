@@ -48,22 +48,10 @@ class LibraryTreeTests extends AnyFreeSpec with Matchers with CodegenSupport {
 
   private def sysKey(name: String): String = Modules.qualify("sysl.sys", name)
 
-  "where a carried file sits" - {
-    // The generator writes each file's name as the path below `lib`, and the directory it says the
-    // file is in is what its header is held to. Deriving it is the whole of what lets the library be
-    // a tree, and it is a string question, so it is asked as one.
-    "is the directory between the library root and it" in {
-      Std.directoryOf("lib/sysl/print.sysl") shouldBe List("sysl")
-    }
-
-    "which for a submodule's file is the path down to it" in {
-      Std.directoryOf("lib/sysl/sys/args.sysl") shouldBe List("sysl", "sys")
-    }
-
-    "however deep it goes" in {
-      Std.directoryOf("lib/sysl/text/utf8/decode.sysl") shouldBe List("sysl", "text", "utf8")
-    }
-  }
+  // Where a library file sits used to be asked here, of a string helper that turned a generated
+  // name back into the directories above it. The compiler reads the library off disk now, so the
+  // walk that finds a file is what says which module it is in — and the claim is asked of the real
+  // library rather than of a spelling, in `StdLibraryTests`.
 
   "a submodule of the library" - {
     "does not put its names in scope for nothing" in {

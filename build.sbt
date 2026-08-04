@@ -37,72 +37,10 @@ ThisBuild / description := "A modern, ref-counted, OS-level systems language —
 
 ThisBuild / publishTo := sonatypePublishToBundle.value
 
-// The core library's own source, embedded into the compiler that ships it.
-//
-// `lib/sysl` is where the standard module is *written* -- ordinary sysl files, read by the same
-// driver a user's library goes through. But a compiler has to carry it: the standard module is what
-// every program is compiled against, so it cannot be something a compilation goes looking for on
-// disk and may not find. Generating the carrier from the files rather than hand-keeping a copy
-// beside them is what makes the files the fact.
-//
-// It is a **tree** and not a flat directory. A module is a directory (`13 s1`), so a submodule of
-// `sysl` is a directory under `lib/sysl`, and a listing one level deep would leave the files that
-// declare it out of the compiler while they sat in plain sight in the tree -- the exact failure the
-// generator exists to prevent, arrived at from the other side.
-def syslLiteral(s: String): String =
-  s.flatMap {
-    case '"'  => "\\\""
-    case '\\' => "\\\\"
-    case '\n' => "\\n"
-    case '\r' => "\\r"
-    case '\t' => "\\t"
-    case c    => c.toString
-  }.mkString("\"", "", "\"")
-
-lazy val embedCoreLibrary = Def.task {
-  val utf8 = java.nio.charset.StandardCharsets.UTF_8
-  val out  = (Compile / sourceManaged).value / "io" / "github" / "edadma" / "sysl" / "StdSource.scala"
-  val dir  = (ThisBuild / baseDirectory).value / "lib" / "sysl"
-
-  // Sorted by the path below `lib/sysl` rather than by the bare file name, so that what a
-  // compilation sees does not depend on the order a directory happened to list, and two files of
-  // different submodules that share a name stay apart. Separators are normalised because the name
-  // is a diagnostic's file name and half of a module's, neither of which is the build host's
-  // business.
-  // Both spellings, because a library file may be literate (`Literate`) and the walk that reads the
-  // library off disk takes both. A generator that took only one would leave a file out of the
-  // embedded copy while it sat in plain sight in the tree -- which is the failure this generator
-  // exists to prevent, arrived at from a third side.
-  val files =
-    ((dir ** "*.sysl").get ++ (dir ** "*.lsysl").get)
-      .map(f => IO.relativize(dir, f).getOrElse(sys.error(s"$f is not under $dir")).replace('\\', '/') -> f)
-      .sortBy(_._1)
-
-  if (files.isEmpty) sys.error(s"the core library has no source files at $dir")
-
-  val entries =
-    files.map { case (path, f) =>
-      s"""    ("lib/sysl/$path", ${syslLiteral(IO.read(f, utf8))}),"""
-    }.mkString("\n")
-  val text =
-    s"""package io.github.edadma.sysl
-       |
-       |/** Generated from the sysl files under `lib/sysl` by `build.sbt` -- do not edit. See `Std`. */
-       |private[sysl] object StdSource {
-       |  val files: List[(String, String)] = List(
-       |$entries
-       |  )
-       |}
-       |""".stripMargin
-
-  if (!out.exists || IO.read(out, utf8) != text) IO.write(out, text, utf8)
-  Seq(out)
-}
-
 // The version, carried into the compiler so that `sysl --version` can answer with it.
 //
-// Generated rather than hand-kept beside `ThisBuild / version`, for the reason the core library is:
-// two places holding one fact drift, and this one drifts *silently* — a binary that reports the
+// Generated rather than hand-kept beside `ThisBuild / version`, because two places holding one fact
+// drift, and this one drifts *silently* — a binary that reports the
 // version before last is worse than one that reports none, since the whole use of the flag is telling
 // which build somebody has when they report something.
 lazy val embedVersion = Def.task {
@@ -141,7 +79,6 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
         "-language:existentials",
         "-language:dynamics",
       ),
-    Compile / sourceGenerators += embedCoreLibrary.taskValue,
     Compile / sourceGenerators += embedVersion.taskValue,
     libraryDependencies += "org.scalatest" %%% "scalatest" % "3.2.20" % "test",
     libraryDependencies ++= Seq(

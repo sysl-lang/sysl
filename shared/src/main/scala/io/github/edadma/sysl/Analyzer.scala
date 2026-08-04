@@ -65,7 +65,7 @@ object Analyzer {
    * at all, and what signature it demands, differ per processor.
    */
   def analyze(units: List[Program], building: Set[String] = Set.empty,
-              std: Stdlib = Stdlib.embedded(Target.default), target: Target = Target.default,
+              std: Stdlib = Stdlib.fromSource(Target.default), target: Target = Target.default,
               provides: Set[String] = Capability.core.toSet)
       : Either[String, TProgram] = {
     val analyzer = new Analyzer(units, building, std, target, provides)

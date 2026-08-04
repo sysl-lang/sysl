@@ -82,11 +82,12 @@ object LibraryArtifact {
    * consumer can tell one built from *these* files from one built from different ones.
    *
    * **It is over the files' contents and their places in the library, never the paths they were
-   * found at.** The same library is built from wherever its root happens to be — `sysl build-lib lib
-   * --std` walks `lib/sysl` off disk and names each file by the path it was found at, while the copy
-   * the compiler carries names them by where the generator read them. Those two are the same library
-   * and have to fingerprint the same, or the guard this exists for would fire on every artifact ever
-   * built. Sorting is for the same reason: a directory listing decides nothing.
+   * found at.** The same library is read from wherever it is installed — an installed compiler finds
+   * it under its own prefix, a checkout finds it at `lib/`, and `build-lib --std` is pointed at
+   * whichever root the person running it typed. Those are all the same library and have to
+   * fingerprint the same, or the guard this exists for would fire on every artifact ever built and
+   * no two machines could share one. Sorting is for the same reason: a directory listing decides
+   * nothing.
    *
    * A file's place is its **directory below the root** and its name, and not the name alone. A
    * library is a tree, so two of its modules may each hold a `read.sysl` — and keying by the name
@@ -155,14 +156,15 @@ object LibraryArtifact {
    *
    * **In the user's cache, keyed by the library it was built from.** This was `./.sysl/std.syslib`,
    * which is right for someone working *in a clone* — a worktree has its own `lib/sysl` and therefore
-   * its own artifact — and wrong for an installed compiler, which carries the library inside itself.
-   * There the same 900KB artifact would be rebuilt and stored once per directory anyone ever ran
-   * `sysl` in, and `sysl run notes.sysl` would leave a `.sysl/` in whatever folder it was typed in.
+   * its own artifact — and wrong for an installed compiler, whose library sits beside it in one place
+   * however many directories it is run from. There the same 900KB artifact would be rebuilt and
+   * stored once per directory anyone ever ran `sysl` in, and `sysl run notes.sysl` would leave a
+   * `.sysl/` in whatever folder it was typed in.
    *
    * The key is `Std.fingerprint` rather than a release number, because the fingerprint *is* the
    * question being asked — it is over the library's file contents and their places in the tree, so
-   * two compilers carrying the same library share one artifact and two carrying different libraries
-   * cannot collide whatever their versions say. A build with an edited `lib/sysl` gets a different
+   * two compilers installed with the same library share one artifact and two with different
+   * libraries cannot collide whatever their versions say. A build with an edited `lib/sysl` gets a different
    * path rather than a stale hit, which is what makes an upgrade need no cache invalidation at all.
    * `Stdlib.read`'s fingerprint check still stands behind it; this only means it is not relied on.
    *

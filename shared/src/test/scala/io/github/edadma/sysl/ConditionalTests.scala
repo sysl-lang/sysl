@@ -238,12 +238,12 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       // What replaced a `lazy val` when the library became a per-target question. Parsing the whole
       // standard module is on the path of every compilation with no artifact to read instead, so a
       // memo that missed would be a real cost and not only an inelegance.
-      Stdlib.embedded(macos) should be theSameInstanceAs Stdlib.embedded(macos)
+      Stdlib.fromSource(macos) should be theSameInstanceAs Stdlib.fromSource(macos)
       Std.parsed(linux) should be theSameInstanceAs Std.parsed(linux)
     }
 
     "two targets get two" in {
-      Stdlib.embedded(macos) should not be theSameInstanceAs(Stdlib.embedded(linux))
+      Stdlib.fromSource(macos) should not be theSameInstanceAs(Stdlib.fromSource(linux))
     }
 
     "every target in the registry parses at all" in {

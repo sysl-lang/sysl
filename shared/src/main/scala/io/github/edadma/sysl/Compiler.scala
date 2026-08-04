@@ -45,7 +45,7 @@ object Compiler {
    * whether a declaration was read from source or from an artifact.
    */
   def compileTrees(units: List[Program], target: Target = Target.default): Either[String, String] =
-    analyzed(units, target, Set.empty, Stdlib.embedded(target)).map(_._1)
+    analyzed(units, target, Set.empty, Stdlib.fromSource(target)).map(_._1)
 
   /** Compiles a program **against a library**: the library's modules are compiled alongside it, and
    * the program reaches them by the ordinary module rules (`13 §3`) — a full path, or an `import`.
@@ -113,7 +113,7 @@ object Compiler {
    * honest shape anyway: "none was given" and "this particular one was" are different facts, and
    * only the first has an answer that varies with the machine.
    */
-  private def carried(std: Option[Stdlib], target: Target): Stdlib = std.getOrElse(Stdlib.embedded(target))
+  private def carried(std: Option[Stdlib], target: Target): Stdlib = std.getOrElse(Stdlib.fromSource(target))
 
   /** The same compilation, keeping the notes the driver may want to show — currently the heap
    * promotions, for `--explain-escapes` (`05`). Separate from `compile` so that the ordinary path
@@ -126,7 +126,7 @@ object Compiler {
     // Every file is parsed before any is rejected, so a syntax error in one does not hide the
     // syntax errors in the rest — the same reason the analyzer reports every mistake it finds.
     parsed.collect { case Left(e) => e } match
-      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target, Set.empty, Stdlib.embedded(target))
+      case Nil  => analyzed(parsed.collect { case Right(p) => p }, target, Set.empty, Stdlib.fromSource(target))
       case errs => Left(errs.mkString("\n"))
   }
 

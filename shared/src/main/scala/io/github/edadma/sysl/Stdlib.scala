@@ -6,7 +6,7 @@ import io.github.edadma.cross_platform.*
  * its trees came from.
  *
  * Every program is compiled against the library (`13 §8`), and there has been one way to be handed
- * it: `Std.parsed` — the files under `lib/sysl` as the compiler carries them, parsed. That is what a
+ * it: `Std.parsed` — the files under `lib/sysl`, read off disk and parsed. That is what a
  * *source* dependence on the standard module is, and it is what the artifact exists to end: every program
  * re-derives every signature in the standard module from text before it can check its own first
  * line.
@@ -15,9 +15,9 @@ import io.github.edadma.cross_platform.*
  * monomorphize — the object code to link against rather than emit a second copy of. Which of the two
  * a compilation gets is this value.
  *
- * **It is a parameter rather than an ambient fact**, for the reason a `Target` is: that the compiler
- * happens to carry a copy of the library is not the same claim as this compilation being compiled
- * against that copy. Making it a parameter is also what lets the two be run side by side and their
+ * **It is a parameter rather than an ambient fact**, for the reason a `Target` is: that a library is
+ * installed beside the compiler is not the same claim as this compilation being compiled against
+ * it. Making it a parameter is also what lets the two be run side by side and their
  * results compared, which is the only way to establish the thing the artifact has to be true for —
  * that it *means* what the source means.
  *
@@ -31,7 +31,7 @@ final class Stdlib(val units: List[Program]) {
 
   /** The files these trees came from. A `Source` compares by identity (`Diagnostics`), so this is
    * an identity set: a user file that happened to be called `lib/sysl/display.sysl` is not one of
-   * these, and neither is the *embedded* copy of a file a decoded standard module carries under the same name.
+   * these, and neither is the decoded copy of a file an artifact carries under the same name.
    */
   private val own: Set[Source] = units.map(_.source).toSet
 
@@ -77,20 +77,20 @@ final class Stdlib(val units: List[Program]) {
 
 object Stdlib {
 
-  /** The copy the compiler carries, as **a given target** sees it — which is what an ordinary
-   * compilation is compiled against.
+  /** The library **parsed from its source**, as a given target sees it — the standard module the
+   * long way round, and what an unusable artifact at the default path is rebuilt *from* rather than
+   * replaced by (`Main.foundStd`). Reached directly only by `--no-std-lib`.
    *
-   * It has to carry *something*: the standard module is what every program is compiled against, so
-   * it cannot be a thing a compilation goes looking for on disk and may not find. This is that
-   * guarantee — and it is what an unusable artifact at the default path is rebuilt *from*, rather
-   * than a library compiled against in its place (`Main.foundStd`). Reached directly only by
-   * `--no-std-lib`.
+   * The source is `Std.sources`, read off disk from wherever this compiler's library is installed
+   * (`Std.root`). It was generated into the binary once and this was called `embedded`; the name
+   * went with the mechanism, because a compilation that reads files can fail to find them and one
+   * that unpacked a string could not.
    *
    * The target is a parameter for the reason it is one everywhere else, and here it is not merely
    * consistency: the library may gate on the machine (`Conditional`), so a copy parsed for one
    * target is not the library another target has.
    */
-  def embedded(target: Target): Stdlib =
+  def fromSource(target: Target): Stdlib =
     cache.synchronized(cache.getOrElseUpdate(target, new Stdlib(Std.parsed(target))))
 
   /** Locked for the reason `Std.parsed`'s is: this was a `lazy val`, which is initialized once
@@ -108,33 +108,33 @@ object Stdlib {
    *
    * **An artifact built from a different `lib/sysl` is refused here**, which is the one check a
    * consumer of the *standard* module can make and a consumer of any other library cannot: the
-   * compiler carries the source this was supposed to be built from, so it can say whether it was
+   * compiler has the source this was supposed to be built from, so it can say whether it was
    * (`Std.fingerprint`). Without it the artifact is built separately and can drift — and a stale one
    * decodes and links perfectly well, it is simply the wrong library, which is the worst way for
    * this to fail. Refusing puts it on the path a corrupt one already takes: at the default path it is
-   * rebuilt from the source the compiler carries, and where `--std-lib` named it the refusal stands.
+   * rebuilt from the library's own source, and where `--std-lib` named it the refusal stands.
    */
   def read(name: String, metadata: String, target: Target): Either[String, (Stdlib, Set[String])] =
     LibraryArtifact.read(name, metadata, target).flatMap((units, precompiled, source) =>
       if source == Std.fingerprint then Right((new Stdlib(units), precompiled))
       else
-        Left(s"$name was built from a different standard module than this compiler carries — " +
-          "rebuild it with 'sysl build-lib lib --std'"))
+        Left(s"$name was built from a different standard module than this compiler's — " +
+          "rebuild it with 'sysl build-lib <library root> --std'"))
 
-  /** The standard module compiled to an artifact at `out`, from the library source the compiler
-   * carries — the other end of `read`, and what an unusable artifact at the default path is rebuilt
-   * by.
+  /** The standard module compiled to an artifact at `out`, from **this** compiler's library source —
+   * the other end of `read`, and what an unusable artifact at the default path is rebuilt by.
    *
-   * The sources are `Std.sources` and not the `lib/` in some tree, which is what makes this usable at
-   * all: an installed compiler has no repository beside it, and `read` checks a decoded artifact
-   * against `Std.fingerprint` — the fingerprint of exactly these files — so building from them is the
-   * one thing guaranteed to produce an artifact this compiler will accept.
+   * The sources are `Std.sources` and not the `lib/` in whatever tree the command was run from,
+   * which is what makes this dependable: `read` checks a decoded artifact against `Std.fingerprint`,
+   * the fingerprint of exactly these files, so building from them is the one thing guaranteed to
+   * produce an artifact this compiler will accept. Point it at another library and you get an
+   * artifact it refuses, which is `build-lib --std`'s business rather than this routine's.
    *
    * No C files are gathered, and none can be missed: `15 §7` lets a library carry `.c` beside its
-   * modules, and the standard module carries none. It could not — the fingerprint an artifact is held
-   * to covers a library's C sources with its sysl ones, while the one the compiler carries covers only
-   * what `StdSource` embeds, so a `.c` under `lib/sysl` would make every artifact built from the tree
-   * fail the check it is read back through.
+   * modules, and the standard module carries none. It could not — a `.c` under `lib/sysl` would be
+   * hashed into the fingerprint of an artifact built by `build-lib`, while `Std.sources` collects
+   * only sysl files, so every artifact built from the tree would fail the check it is read back
+   * through.
    *
    * `ar` names the archiver where it is somewhere a search would not look, exactly as `--ar` does;
    * given none, the search runs.
@@ -151,7 +151,7 @@ object Stdlib {
   def writeArtifact(out: String, target: Target, ar: Option[String] = None): Either[String, Unit] =
     for
       archiver <- Toolchain.findAr(ar)
-      built    <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.std, Some(embedded(target)))
+      built    <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.std, Some(fromSource(target)))
       _        <- {
                     val staging  = createTempDirectory("sysl-std-")
                     val code     = s"$staging/${LibraryArtifact.codeMember}"

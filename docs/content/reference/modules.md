@@ -777,9 +777,15 @@ compiled against is a *parameter* of it rather than an ambient fact — which is
 handed to two compilations and compared — but the parameter has a default, and the default is found
 rather than named. **A compilation that finds no standard module at the default path builds one**, in
 well under a second, announcing it on stderr. That is not the silent substitution a compiler must
-never make: a rebuild compiles against *this* library, from the sources the compiler carries, held to
-the same fingerprint on the way back in. Nothing is substituted, so there is nothing to be misled
-about.
+never make: a rebuild compiles against *this* library, from its own source, held to the same
+fingerprint on the way back in. Nothing is substituted, so there is nothing to be misled about.
+
+**The standard module's source ships with the compiler and is read off disk** — `share/sysl/lib`
+under the install prefix, found from the binary's own location the way `rustc` finds its sysroot.
+Running out of a checkout, it is `lib/` in the tree. You can read it, and you can edit it: a changed
+file changes the library's fingerprint, so the next compilation builds an artifact of its own rather
+than picking up a stale one. `SYSL_LIB` names a library root outright, which is what a broken install
+needs and nothing else does. A compiler that cannot find its library names every path it tried.
 
 The default path is keyed by a fingerprint of the library, so every compilation of the same library
 on the machine finds the same artifact — and a rebuild therefore **publishes by rename**: it is

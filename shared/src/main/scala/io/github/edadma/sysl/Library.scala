@@ -56,16 +56,16 @@ object Library {
    */
   val autoImported: List[String] = List(Std.module)
 
-  /** Every declaration the library carries, as the compiler carries it.
+  /** Every declaration the library declares, read from its **source**.
    *
-   * The **embedded** copy specifically, and that is the right one for the questions asked of this:
-   * what the library declares, which the compiler-known names are held to, is a claim about the
-   * source under `lib/sysl` rather than about whatever a given compilation was handed. A
-   * compilation's own std is `Stdlib`, which it is given rather than looks up.
+   * From the source specifically, and that is the right one for the questions asked of this: what
+   * the library declares, which the compiler-known names are held to, is a claim about the files
+   * under `lib/sysl` rather than about whatever a given compilation was handed. A compilation's own
+   * std is `Stdlib`, which it is given rather than looks up.
    */
   def decls: List[Stmt] = carried.decls
 
-  /** The copy of the library the compiler carries, read for the machine sysl is **running** on.
+  /** The library as this compiler is installed with it, read for the machine sysl is **running** on.
    *
    * **Every question on this object is about the standard module as such** — which modules it
    * declares, which key a name is filed under, which names the compiler is allowed to spell for
@@ -79,7 +79,7 @@ object Library {
    * What a given *compilation* was handed is `Stdlib`, which it is given rather than looks up. This is
    * the copy in the tree, and it is the one a test asking about the library itself wants.
    */
-  def carried: Stdlib = Stdlib.embedded(Target.default)
+  def carried: Stdlib = Stdlib.fromSource(Target.default)
 
   /** The key the library's declaration named `name` is filed under — what the compiler names one
    * by, wherever it names one rather than reading a name out of source.

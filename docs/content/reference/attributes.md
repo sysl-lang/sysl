@@ -510,7 +510,7 @@ to be.
 ### The library is subject to it too
 
 `lib/sysl` is sysl source, so it may gate on the machine like any other — which makes "the standard
-module" a question with a target in it, and the compiler's carried copy is parsed per target
+module" a question with a target in it, and the library's source is parsed once per target
 accordingly.
 
 The one thing held fixed is that **a name the compiler spells for itself is declared on every

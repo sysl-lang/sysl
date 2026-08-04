@@ -31,20 +31,25 @@ import scopt.OParser
  * only the members that resolve something are pulled in. Building one therefore needs an `llvm-ar`
  * as well as a `clang`; `--ar` names it where it is somewhere a search would not look.
  *
- * **`--std-lib` is the same thing for the standard module**, which every program is compiled against
- * whether or not it names one. Built by `build-lib --std` and given back here, it replaces the copy
- * of the library the compiler carries: the signatures arrive decoded instead of parsed, and the half
- * that was already compiled is linked rather than emitted a second time into every program.
+ * **The standard module's own source is read off disk**, from the library installed with this
+ * compiler — `<prefix>/share/sysl/lib` beside the binary, or `lib/` in a checkout (`Std.root`).
+ * There is no copy inside the executable: a library nobody can open is not one anybody can learn
+ * from or edit, which is what every other toolchain concluded too.
+ *
+ * **`--std-lib` is the same thing for the standard module** as `--lib` is for any other, and every
+ * program is compiled against it whether or not one is named. Built by `build-lib --std` and given
+ * back here, it replaces the parse of that source: the signatures arrive decoded, and the half that
+ * was already compiled is linked rather than emitted a second time into every program.
  *
  * **It need not be given, and it need not already exist.** `build-lib --std` with no `-o` writes to
  * `LibraryArtifact.stdDefault`, and a compilation with no `--std-lib` looks there — one path at both
- * ends. Where nothing usable is at that path the compiler **builds one**, from the library source it
- * carries, and says so on stderr. The artifact is derived rather than authored: not committed, object
- * code for one machine, and computed entirely from sources the compiler already has, so being absent
- * after a clone or stale after a format change has one answer and it is not a question for whoever
- * ran the command. It sits in the user's cache under a fingerprint of the library it was built from,
- * so every project on a machine shares one and a compiler carrying a different library gets a path of
- * its own rather than a stale hit.
+ * ends. Where nothing usable is at that path the compiler **builds one**, from the library source,
+ * and says so on stderr. The artifact is derived rather than authored: not committed, object code
+ * for one machine, and computed entirely from the source beside the compiler, so being absent after
+ * a clone or stale after a format change has one answer and it is not a question for whoever ran the
+ * command. It sits in the user's cache under a fingerprint of the library it was built from, so
+ * every project on a machine shares one and a compiler installed with a different library gets a
+ * path of its own rather than a stale hit.
  *
  * **Which is not the same as substituting a library.** What a compiler must never do is answer *I
  * could not find the library you meant* by quietly using a different one — and a rebuild uses **this**
@@ -52,11 +57,11 @@ import scopt.OParser
  * still stops the compilation, because there the reader asked for a particular artifact and is owed
  * the truth about it.
  *
- * **`--no-std-lib` is the one route to the copy the compiler carries**, ignoring whatever is on
- * disk. That copy is what makes bootstrap possible — there is no released sysl to build the first
- * artifact with — so it is reached deliberately rather than by a lookup coming up empty. Taken
- * silently it would be taken always, because then nobody would have any reason to build an artifact
- * at all.
+ * **`--no-std-lib` is the one route to the library as source**, ignoring whatever artifact is on
+ * disk. Compiling it rather than linking it is what makes bootstrap possible — there is no released
+ * sysl to build the first artifact with — so it is reached deliberately rather than by a lookup
+ * coming up empty. Taken silently it would be taken always, because then nobody would have any
+ * reason to build an artifact at all.
  *
  * **Everything after a bare `--` belongs to the program being run**, not to sysl: it is passed
  * straight through to the executable, which is what lets `sysl run prog.sysl -- -v file` reach a
@@ -87,7 +92,15 @@ case class Config(
     std: Boolean = false,
     stdLib: Option[String] = None,
     noStdLib: Boolean = false,
-    stdSearch: String = LibraryArtifact.stdDefault,
+    /** Where to look for a prebuilt standard module, when somewhere other than the default.
+      *
+      * **An `Option` so that the default is worked out when it is wanted rather than when a `Config`
+      * is built.** The default path holds a fingerprint of the library, so naming it here would have
+      * read the library's source during argument parsing — before the driver had a chance to report
+      * not finding it, and from a place where the failure could only be an exception. A compiler
+      * that cannot find its library has to say so on stderr like anything else (`Std.root`).
+      */
+    stdSearch: Option[String] = None,
     ar: Option[String] = None,
     programArgs: List[String] = Nil,
     filter: Option[String] = None,
@@ -199,8 +212,8 @@ private[sysl] val parser = {
           "one that cannot be read stops the compilation, being the one that was asked for"),
       opt[Unit]("no-std-lib")
         .action((_, c) => c.copy(noStdLib = true))
-        .text("compile against the copy of the standard module built into the compiler, " +
-          "ignoring any prebuilt one"),
+        .text("compile the standard module from its source rather than linking a prebuilt one, " +
+          "ignoring whatever artifact is on disk"),
       opt[String]("ar")
         .action((a, c) => c.copy(ar = Some(a)))
         .text("the llvm-ar to build a library with; defaults to searching for one"),
@@ -489,7 +502,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
       // is named after the root it was built from, there being nowhere in particular it belongs.
       val out =
         cfg.output.getOrElse(
-          if cfg.std then cfg.stdSearch else defaultOutputName(cfg.file) + LibraryArtifact.extension)
+          if cfg.std then stdSearchOf(cfg) else defaultOutputName(cfg.file) + LibraryArtifact.extension)
 
       Project.parentOf(out).foreach(createDirectories)
 
@@ -528,21 +541,36 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
  *
  * **The one at the default path is a cache, and is rebuilt when it is not usable.** See `foundStd`.
  *
- * `--no-std-lib` is the one way to the copy the compiler carries *as source*. That copy exists for
- * bootstrap — there is no released sysl to build the first artifact with — and for the compiler's own
- * unit tests, which run in a tree where nothing has been built. Reaching it is a deliberate act, and
- * that is worth keeping distinct from the rebuild below: this one compiles the library's source into
- * the program, where the rebuild produces the artifact and links it.
+ * `--no-std-lib` is the one way to the library **as source**, with no artifact in between. It is
+ * what bootstrap needs — there is no released sysl to build the first artifact with — and what the
+ * compiler's own unit tests take, running as they do in a tree where nothing has been built.
+ * Reaching it is a deliberate act, and that is worth keeping distinct from the rebuild below: this
+ * one compiles the library's source into the program, where the rebuild produces the artifact and
+ * links it. Both read the same files off disk (`Std.root`); what differs is what they do with them.
  *
  * **`build-lib --std` is exempt, and has to be.** It is the command that produces the artifact, so
  * consulting one would be a deadlock with nothing to break it.
  */
+/** Where this compilation looks for a prebuilt standard module: wherever the config points, or the
+ * path both ends agree on.
+ *
+ * Resolved here rather than in `Config`, because the default is keyed by a fingerprint of the
+ * library and so cannot be computed until the library has been found. Every caller is downstream of
+ * `chooseCore`'s check, so by the time this runs there is a library to fingerprint.
+ */
+private def stdSearchOf(cfg: Config): String = cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault)
+
 private def chooseCore(cfg: Config, target: Target): Either[String, (Stdlib, Set[String], Option[String])] =
-  if cfg.noStdLib || cfg.std then Right((Stdlib.embedded(target), Set.empty, None))
-  else
-    cfg.stdLib match
-      case Some(named) => loadCore(named, target)
-      case None        => foundStd(cfg.stdSearch, target)
+  // Every branch below reads the library's source: two of them compile it, and the third checks a
+  // prebuilt artifact against a fingerprint of it. So a compiler that cannot find its library fails
+  // here, once, with the diagnostic that names where it looked — rather than at whichever of the
+  // three happened to touch `Std.sources` first, where it would arrive as an exception.
+  Std.root.flatMap: _ =>
+    if cfg.noStdLib || cfg.std then Right((Stdlib.fromSource(target), Set.empty, None))
+    else
+      cfg.stdLib match
+        case Some(named) => loadCore(named, target)
+        case None        => foundStd(stdSearchOf(cfg), target)
 
 /** The standard module at the path both ends agree on, **built there when what is there is not one.**
  *

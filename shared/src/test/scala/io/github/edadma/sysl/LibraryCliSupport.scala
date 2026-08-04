@@ -37,7 +37,7 @@ trait LibraryCliSupport extends AnyFreeSpec with Matchers {
     io.github.edadma.sysl.execute(if mentionsCore(cfg) then cfg else cfg.copy(noStdLib = true))
 
   protected def mentionsCore(cfg: Config): Boolean =
-    cfg.std || cfg.noStdLib || cfg.stdLib.isDefined || cfg.stdSearch != LibraryArtifact.stdDefault
+    cfg.std || cfg.noStdLib || cfg.stdLib.isDefined || cfg.stdSearch.isDefined
 
   protected val library =
     """module demo

@@ -68,7 +68,7 @@ class PackageConfigCliTests extends AnyFreeSpec with Matchers {
 
     try
       project("main()\n    print(1)\n", None) { dir =>
-        cli(Config(command = "build", file = dir, output = Some(s"$dir/out"), stdSearch = unused)) shouldBe 0
+        cli(Config(command = "build", file = dir, output = Some(s"$dir/out"), stdSearch = Some(unused))) shouldBe 0
       }
 
       exists(unused) shouldBe false

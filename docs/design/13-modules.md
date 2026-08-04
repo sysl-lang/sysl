@@ -1034,8 +1034,28 @@ Five consequences worth stating, because each is a thing a reader would otherwis
 compilation declare a module the compiler otherwise supplies. It is written down rather than inferred
 from the module names in the tree, because a build that guessed would turn a clear refusal — *you
 cannot add to the module every program is compiled against* — into an artifact that builds and then
-collides with the built-in copy at whatever link tried to use it. What a shipped compiler carries is
-generated from those files, so the files are the fact and the carrier cannot disagree with them.
+collides with the library at whatever link tried to use it.
+
+**Those files are what a compiler is installed with, and it reads them off disk.** An installed sysl
+finds them at `<prefix>/share/sysl/lib`, reached from its own resolved path — the ordinary Unix
+prefix layout, and exactly what Homebrew's `pkgshare` is. A sysl run out of a checkout finds `lib/`
+in the tree. `SYSL_LIB` names a root outright and is an escape hatch rather than the mechanism: a
+toolchain that had to be told where its own library was is one nobody could install.
+
+The source was **generated into the binary** for the whole of the language's first year, as a
+`StdSource` object written by the build. That guaranteed something real — a compilation could not
+fail to find its library — and it was bootstrap scaffolding rather than the design, for two reasons
+that both got heavier as the library grew. A library nobody can open is not one anybody can learn
+from, and the library is meant to be the worked example of what sysl is for. And a compiler that
+cannot be pointed at an edited copy is one whose library cannot be worked on at all except by
+rebuilding the compiler.
+
+`rustc` computes a sysroot from its own location, `clang` finds its resource directory the same way,
+`zig` its `lib/`. None of them carries a standard library inside the executable and none of them asks
+for a variable to be set. What replaces the guarantee is the **diagnostic**: a compiler that cannot
+find its library names every path it tried, in the order it tried them, and says how to name one.
+That is the whole of the trade, and it is why the message is specified rather than left to whatever
+the failure happened to be.
 
 A library is **analyzed before anything is written**. A library that does not check is broken once,
 by whoever built it; without that check the artifact ships anyway and every program that links
