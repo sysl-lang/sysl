@@ -9,8 +9,10 @@ weight: 62
 and because `sysl.math` is mathematics *on* the floating-point types — which is not a sentence a type
 belongs in.
 
-It requires no capability: every name here is reachable under `no alloc` and on a target with no
-operating system.
+It requires no capability, so a freestanding target has it. **The arithmetic is reachable under
+`no alloc`; rendering one is not** — a specifier describes the field the *whole* value lands in, so
+the three pieces have to be gathered before the padding is applied, and gathering means a string. An
+allocator-free program computes with a `Complex` and prints its parts.
 
 ```sysl
 import sysl.math.complex.Complex

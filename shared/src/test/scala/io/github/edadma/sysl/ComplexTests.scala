@@ -372,7 +372,101 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
   }
 
+  // The cases a formula written for the middle of its domain does not have in mind.
+  "the edges" - {
+    // Smith's algorithm branches on which part of the divisor is the larger, so a divisor with a
+    // zero part exercises the arm the ordinary tests do not — `1 / i` is `-i` and reaches it.
+    "a divisor with one zero part takes the other arm and is still exact" in {
+      run(
+        """print(Complex(1.0, 0.0) / Complex(0.0, 1.0), Complex(1.0, 0.0) / Complex(2.0, 0.0))
+          |print(Complex(3.0, 4.0) / Complex(0.0, 2.0))""".stripMargin
+      ) shouldBe "0-1i 0.5+0i\n2-1.5i\n"
+    }
+
+    // A divisor whose parts are three hundred orders of magnitude apart, which is the case the
+    // scaling exists for at the other end from the overflow: the ratio underflows to zero and the
+    // answer is still the one the larger part alone gives.
+    "a divisor whose two parts are nothing like each other" in {
+      run(
+        """var q = Complex(2.0, 0.0) / Complex(1.0e300, 1.0)
+          |print(q.re.is_finite(), (q.re - 2.0e-300).abs() < 1.0e-315)""".stripMargin
+      ) shouldBe "true true\n"
+    }
+
+    // At zero there is no direction to point in, and both parts say so rather than one of them
+    // answering a number.
+    "the unit vector of zero is not a number" in {
+      run(
+        """var u = Complex(0.0, 0.0).unit()
+          |print(u.is_nan(), Complex(0.0, 0.0).arg())""".stripMargin
+      ) shouldBe "true 0\n"
+    }
+
+    // A base of one has no logarithm to divide by, so the general `log` runs off the way the real
+    // one does rather than answering something.
+    "a logarithm in base one is infinite, as it is among the reals" in {
+      run("print(Complex(3.0, 4.0).log(1.0).re.is_infinite())") shouldBe "true\n"
+    }
+
+    // `near` is a comparison, and a NaN fails every comparison — so a value that is not a number is
+    // near nothing, including itself. That is the arithmetic and it is worth pinning, because the
+    // opposite convention would make a poisoned value quietly pass a tolerance check.
+    "a NaN is near nothing, not even itself" in {
+      run(
+        """var n = Complex(real.nan(), 0.0)
+          |print(n.near(n, 1.0), n.near(Complex(0.0, 0.0), 1.0e300))""".stripMargin
+      ) shouldBe "false false\n"
+    }
+
+    "a large integer power stays exact where the polar form would not" in {
+      run(
+        """var i: Complex[real] = Complex.i()
+          |print(i.powi(100), i.powi(-100), Complex(2.0, 0.0).powi(30))""".stripMargin
+      ) shouldBe "1+0i 1+0i 1.07374e+09+0i\n"
+    }
+
+    // `powc` is written over `ln`, so its cut is `ln`'s — and the principal square root of `-1` is
+    // `i` rather than `-i` for exactly that reason.
+    "powc inherits the logarithm's cut, so a half power is the principal root" in {
+      run(
+        """var half = Complex(0.5, 0.0)
+          |print(Complex(-1.0, 0.0).powc(half).near(Complex(0.0, 1.0), 1.0e-15),
+          |      Complex(-4.0, 0.0).powc(half).near(Complex(-4.0, 0.0).sqrt(), 1.0e-14))""".stripMargin
+      ) shouldBe "true true\n"
+    }
+  }
+
   "the module is asked for by name" - {
+    // The arithmetic is reachable from a module that has given up both the allocator and the
+    // operating system, which is what makes the module usable on a freestanding target.
+    "and the arithmetic needs no capability, which is what a freestanding target has to have" in {
+      super.run(
+        """no alloc
+          |no os
+          |
+          |import sysl.math.complex.Complex
+          |
+          |var a = Complex(3.0, 4.0)
+          |var q = a.sqrt()
+          |
+          |print(a.abs(), (a * a).re, q.re, q.im, a.exp().ln().re)""".stripMargin
+      ) shouldBe "5 -7 2 1 3\n"
+    }
+
+    // **Rendering one is the exception, and it is `14 §2`'s rule about the field rather than a
+    // choice this module made.** A specifier describes the field the *whole* value lands in, so the
+    // three pieces have to be gathered before the padding is applied — and gathering means a string.
+    // An allocator-free program computes with `Complex` and prints its parts.
+    "while rendering one is refused there, because a field applies to the whole value" in {
+      err(
+        """no alloc
+          |
+          |import sysl.math.complex.Complex
+          |
+          |print(Complex(3.0, 4.0))""".stripMargin
+      ) should include("which makes heap storage, and this module declared 'no alloc'")
+    }
+
     "a program that did not import it cannot spell the type" in {
       err("var a = Complex(1.0, 2.0)") should include("undefined")
     }
