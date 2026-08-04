@@ -160,14 +160,14 @@ it survives the jump intact and a `@tailrec` function may carry one.
 
 ## 5. Module invariants
 
-**This section and `§7` are specified and not built, and they wait on the same thing: `13 § Why
-there is no module-level var` — sysl has no mutable module state for either of them to be about.** A
-top-level `var` is a local of the entry point that no function can see, a module-level `val` is
-written once, and `13` records the spelling as open with three candidate forms and one named
-customer (`guide/slab`'s arena). An invariant over a module's variables and a frame naming which of
-them a function touches are both predicates over a set that is empty today, so building either would
-be building a check with no subject. They are written out here so that the design lands with the
-decision rather than after it — when `13`'s word is chosen, this is what attaches to it. `§ Open f`
+**This section and `§7` are specified and not built, and they wait on the same thing: sysl has no
+mutable module state for either of them to be about.** `13 §7` settles the spelling — `static var` —
+and records that the storage behind it is not built: whether it may hold a value that owes a release,
+what `&` of it means, and what a `@pure` function may do with it are open, and `guide/slab`'s arena is
+the named customer. An invariant over a module's variables and a frame naming which of them a function
+touches are both predicates over a set that is empty today, so building either would be building a
+check with no subject. They are written out here so that the design lands with the decision rather
+than after it — when the storage arrives, this is what attaches to it. `§ Open f`
 carries the dependency.
 
 An `invariant` written at the top level of a file is a predicate over the module's own state:

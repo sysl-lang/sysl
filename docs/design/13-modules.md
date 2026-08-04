@@ -614,44 +614,80 @@ module may be split across as many files as it likes, a program across as many m
 the executable part is pinned to one file. Those statements are a body like any other in one
 respect — an unqualified name in them is read in the module of the file that wrote them.
 
-A top-level `var` counts as a statement, because it is exactly that — a local of the entry point,
-scoped to it and initialized in its order, not a member of the module. (A module-level binding
-*visible to other files* is a different thing, and it is what §2's "anything visible outside its
-file states its types" is written about.)
+That file is the program's **entry file**, and the rest of this section is about what its top level
+means, because the answer is not the same as it is anywhere else.
 
-**Why there is no module-level `var`, when there is a module-level `val`.** The reason above is
-about *initialization order*, and it does not by itself rule one out: a mutable global with a
-**constant** initializer runs nothing, so it has no order to have. The real answer is that the
-keyword is taken. Every program that writes statements at the top of a file already uses `var`
-there to mean "a local of the entry point", and redefining it as a module member would not fail to
-compile — it would silently change name resolution, those bindings becoming visible to every
-function in the module. That is a breaking change that still builds, which is the worst kind. So
-mutable module-level state waits for a customer that asks for it by name. What programs wanted up to
-now was a **table**, which is read-only, and that is `val`.
+### The entry file is a body
 
-**A customer has arrived, and it is an allocator.** `guide/slab` needs a static arena — one region,
-at one address, for the life of the program, which is what a file-scope array is in C — and there is
-no way to declare one. A module-level `val` is written once, so `&` of one is refused outright and
-nothing can be carved out of it; a top-level `var` is a local of the entry point that no function
-can see. So the region is declared where the program starts and threaded as a `*u8` through every
-function that touches it. That is tolerable in a program of seven sections and it does not stay
-tolerable: an allocator is what every other part of a no-heap program asks for storage, so "pass the
-arena in" ends up a parameter on every function that might ever allocate — which is the argument a
+**What the entry file declares is local to it.** Its top level is a body: a `val` or `var` there is a
+stack local, initialized where it is written and in the order the statements around it run, and a
+function there is a nested function (`12 §5a`), which reads and writes the bindings above it because
+its environment holds their addresses.
+
+That is one rule where there were two, and the seam it closes had been visible for a long time: a
+top-level `var` was a local of the entry point that no function could see, while a top-level `val`
+beside it was a module member that every function could — a distinction with a reason nobody could
+give, because there was none. **Which file the program starts in is decided by statements; what that
+file's declarations mean is decided by which file it is.** Those two questions had one answer and
+needed two.
+
+It is also what makes a sequence a sequence. A script that binds a value, sets it up with a
+statement, and binds something derived from it used to run the second binding *first* — the `val`s
+were module members, filled before any statement ran, with nothing in the source suggesting an order
+was involved. Written as locals they run where they stand, which is what the program looks like it
+does.
+
+**A helper pays nothing for this unless it uses it.** Whether a function at the top of the entry file
+belongs to the body is settled by whether it reads one of the body's bindings, or calls something
+that does — capture is transitive, since the nested functions of a block share one environment. One
+that reads none is an ordinary module function, with everything that goes with it: it may be generic,
+its address may be taken, it may be passed as a value, and another file may call it. `12 §5a` says
+why that has to be so — "one that captures nothing and does not escape is an ordinary static function
+with a private name" — so the three things a nested function cannot be are what holding a frame
+costs, not what being written in the entry file costs. A comparison handed to C's `qsort` is the case
+that makes it concrete: it reads nothing, and refusing its address for the frame it reads would name
+a frame that does not exist.
+
+**`main` is never one of the body's, however it is written.** It is not a name the program calls but
+the one the *platform* calls, so there is no caller inside the body to have formed an environment for
+it.
+
+### `static` — asking for the module instead
+
+A `val` in the entry file that should belong to the **module** says so:
+
+```
+static val table: [3]int = [1, 2, 3]
+```
+
+It is then hoisted, laid into the object file, visible under §2's ordinary rules, and initialized
+before any statement runs — which is also why its initializer may not call a helper that reads the
+body: at that moment there is no body yet.
+
+**It is meaningful in exactly one file per program**, since only the entry file has a body for a
+declaration to *not* belong to. In a file with a `module` header, or a headerless file carrying no
+statements, everything is the module's already, and the modifier is refused rather than accepted as a
+no-op. A function never takes it either: settled by what it reads, the modifier would be redundant on
+one that reads nothing and impossible on one that reads a binding, since a frame is the one thing a
+module member cannot have.
+
+**Module storage that may be *written* — `static var` — is not built.** Its questions are its own and
+are not this section's: whether it may hold a value that owes a release, what `&` of it means, and
+what a `@pure` function may do with it. `guide/slab` is the customer waiting on it — a static arena
+is one region at one address for the life of the program, which is what a file-scope array is in C,
+and until there is one the region is declared where the program starts and threaded as a `*u8`
+through every function that touches it. That is tolerable in a program of seven sections and does not
+stay tolerable: an allocator is what every other part of a no-heap program asks for storage, so "pass
+the arena in" ends up a parameter on every function that might ever allocate — the argument a
 capability system makes for itself, arrived at from the wrong direction.
-
-What is *not* settled is the spelling, and the paragraph above says why it is the hard part: `var`
-means "a local of the entry point" in every program that writes statements at the top of a file, and
-redefining it would silently change name resolution rather than fail to compile. So the customer is
-recorded here and the word is still open — a distinct keyword, a `static` modifier on a `val`, or an
-attribute are all forms that would not collide.
 
 A program in which no file carries a statement is a complete program that does nothing: the entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,
 which is what it should compile to — a library is not an error.
 
-### `main` — the named half of the entry point
+### `main` — the named form of the entry point
 
-A program may also declare a function called `main`, and it runs after the statements above:
+A program may instead declare a function called `main`:
 
 ```
 main(args: []string)
@@ -659,11 +695,14 @@ main(args: []string)
         print(a)
 ```
 
-Both halves are real and neither replaces the other. The top-level statements are the program's
-**initialization**: they are where a top-level `var` lives, they are what the `val` order below is
-settled against, and an unqualified name in them is read in their own file's module. `main` is what
-runs once that is done. A program may write either, both, or neither, and one that writes both runs
-them in that order — statements first, `main` after.
+**A program starts in one place, and these are two ways of writing it, so a program writes one or the
+other.** Writing both is an error naming the file that already carries the statements: it would be
+two entry points with an order between them to remember, which is what it reads as to anybody who
+opens it, and whichever of the two the program means, the other belongs inside it.
+
+What `main` has that statements do not is a **parameter list**, which is the whole reason the form
+exists — so a program that wants its arguments writes `main` and puts inside it what it would
+otherwise have written above.
 
 **What `main` gets at that a statement cannot is the arguments.** A statement at the top of a file
 has nowhere to receive them: it is not a call, so it has no parameter list, and a program's arguments
@@ -720,11 +759,11 @@ const max_slots: usize = 32
 private const window: int = 1 << 15
 ```
 
-It is a declaration, not a statement — hoisted, order-free, visible to the whole module and beyond
-it under the ordinary rules — and it is what a top-level `var` is not. The three are told apart by
-the keyword rather than by immutability: a `var` at the top of a file is a local of the entry point
-(above), a `const` never runs at all, and a `val` (below) is storage that is filled before any of
-those statements do.
+It is a declaration wherever it is written, including the entry file, since it is folded into its
+uses before anything runs and so has nothing a body could make it local to. The three are told apart
+by what they are rather than by immutability: a `const` never runs at all, a `val` is storage, and a
+`var` is storage the program writes. Which of the last two belong to the module and which to the
+entry file's body is what the section above settles.
 
 **Why it exists at all**, when a nullary function already serves every use in an expression. Three
 of the guide programs wanted a name for a number and could only get one that a *type* cannot read.

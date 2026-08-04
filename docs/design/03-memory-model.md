@@ -479,8 +479,9 @@ or slice, a part of a tuple, a generic argument and a parameter of a callable ty
 way. **A default parameter value is the one position that asks and cannot be answered.** A default
 is produced afresh at each call that omits it, in a scope holding none of the caller's locals, so
 what it names has to outlive every frame — and every candidate is closed. A construction is refused
-by the paragraph above; a top-level `var` is a local of the entry point, so naming one is naming the
-caller's locals; and a module-level `val` counts nothing (`13 §7`), which a reference does.
+by the paragraph above; a binding at the top of the file the program starts in is a local of that
+file's body (`13 §7`), so naming one is naming the caller's locals; and a module-level `val` counts
+nothing, which a reference does.
 So **the only default a `weak T` parameter can have is `None`**, and nothing is special-cased to make
 that so — it falls out of what a default may name meeting the one thing a weak reference may not be
 made from. `None` is reached by none of the argument above: it is the type's own empty state (below),
