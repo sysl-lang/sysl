@@ -64,15 +64,15 @@ sbt "syslJVM/run run bindings/regex/match.sysl --lib /tmp/rx.syslib"
 libc. `bindings/sqlite3` binds SQLite and needs its header and library; the program says nothing
 about linking, because `link "sqlite3"` is written once in the binding and travels in the artifact.
 
-A program's own unit tests are `#test` functions written beside what they test, and `sysl test` is
+A program's own unit tests are `@test` functions written beside what they test, and `sysl test` is
 what runs them (`docs/design/testing.md`):
 
 ```bash
-sbt "syslJVM/run test guide/ring"                  # every #test under a directory
+sbt "syslJVM/run test guide/ring"                  # every @test under a directory
 sbt "syslJVM/run test guide/ring --filter empty"   # the ones whose name holds this
 ```
 
-A test passes by returning; `#test(should_trap)` is for the ones whose subject is a check that
+A test passes by returning; `@test(should_trap)` is for the ones whose subject is a check that
 should fire, and passes only if the run does not come back. Every other build drops the tests, so
 they cost a program nothing.
 
