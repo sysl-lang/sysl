@@ -347,6 +347,13 @@ Three rules give it a meaning that does not break `§1`:
 3. **A clause that mentions a ghost name is a clause that does not run.** It is a proof obligation and
    nothing else.
 
+**Of the two declarations `@ghost` may mark, the function is built and the variable is not.** Rules 1
+and 3 hold as written for a ghost *function*: it is called from a clause or from other ghost code and
+from nowhere else, it is not emitted, and a clause that calls one is not laid down. Rule 2 is entirely
+about a ghost *variable*, which is `§ Open i`. The function is the half that carries the motivating
+case — `is_sorted` in a loop invariant, which is where the asymptotic cost is — and the variable is
+the half that lets a specification talk about history.
+
 Rule 3 is the exception to `§1`, and the reason it is an acceptable one is that **it is visible in the
 source**. A reader asking whether a clause executes reads the names in it; they do not consult a build
 flag, a command line, or a compilation mode. The distinction sysl refuses to make is the one a
@@ -450,6 +457,15 @@ codegen one, and it is the shape `15 §6`'s incremental build would want.
 allocates allocates nothing in the emitted program. Whether `no alloc` should therefore ignore it is
 undecided, and the two answers are defensible: ignoring it is what erasure implies, and refusing it
 keeps one rule about what a module's source may contain.
+
+**i. A ghost *variable*, and therefore `§8`'s rule 2.** A ghost function needs no new position for the
+annotation — `@ghost` sits above a declaration exactly as `@test` does — and a ghost local needs
+`@ghost` above a `var`, which is a place the grammar does not currently admit an annotation. Beyond
+the spelling, the erasure is wider: a declaration to drop, every assignment into it to drop, and a
+read from executable code to refuse. What it buys is a specification that can talk about *history* —
+how many times something happened, what the input looked like before the loop started — which no
+predicate over the current state can say. A module-level ghost variable additionally waits on
+`§ Open f` like everything else module-scoped.
 
 **h. Annotating the library, and what a generic function's purity even means.** `pow[T: Mul]` is pure
 at `int`, where `Mul` is an instruction, and its purity at some other `T` is a question about that

@@ -737,6 +737,16 @@ case class TFunc(
      * breaking a caller three levels up with no annotation anywhere naming the promise it broke.
      */
     pure: Boolean = false,
+    /** `@ghost` was written above it: the function exists for the specification and is erased before
+     * codegen (`17 §8`).
+     *
+     * Its body is ordinary code and may read real state freely — that is the whole point of an
+     * `is_sorted` — and what the mark buys is the pair of rules that make erasing it sound: nothing
+     * executable may call it, and a clause that does is a clause that does not run. So a loop
+     * invariant costing O(n) inside an O(n) loop costs nothing at all, without a switch that would
+     * give one program two meanings.
+     */
+    ghost: Boolean = false,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones

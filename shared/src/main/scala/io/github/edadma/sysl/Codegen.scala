@@ -25,13 +25,24 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
                        protected val target: Target)
     extends ExprEmitter {
 
+  /** The ghost functions of this program, which nothing emitted may name (`17 §8`). */
+  private val ghostFuncs: Set[String] = program.funcs.filter(_.ghost).map(_.name).toSet
+
+  /** Whether a clause is a proof obligation rather than something to lay down: it names a ghost
+   * function, which will not be there.
+   */
+  private def ghostly(x: Any): Boolean = ghostFuncs.nonEmpty && Ghost.mentions(x, ghostFuncs)
+
   // --- module --------------------------------------------------------------------------
 
   private def gen(): String = {
     // A function a library already compiled is declared, not defined: its body is in the object file
     // the library shipped, and emitting it again would be a duplicate symbol at the link.
     val (imported, own) = program.funcs.partition(f => program.precompiled(f.name))
-    val funcTexts       = own.map(genFunction)
+    // A `@ghost` function is not emitted at all (`17 §8`). Nothing executable may call one — that is
+    // checked in the analyzer — and the clauses that may are the ones skipped below, so there is no
+    // call left to resolve.
+    val funcTexts       = own.filterNot(_.ghost).map(genFunction)
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
     val mainText =
@@ -297,7 +308,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     promoted = promotions(Some(f.name))
     pushTemps()
     pushOwned()
-    ensures = f.ensures
+    ensures = f.ensures.filterNot((c, _) => ghostly(c))
     selfName = f.name
     selfParams = f.params
     selfVariant = f.variant
@@ -337,7 +348,7 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       emitTerm(s"br label %$l")
       emitLabel(l)
 
-    for (cond, _) <- f.requires do emitContract(cond, "require")
+    for (cond, _) <- f.requires if !ghostly(cond) do emitContract(cond, "require")
 
     // Each `old(e)` snapshots the entry value into a hidden owned slot, exactly as a `var` would,
     // so a postcondition can compare the returned state against the state on entry. The slot is
@@ -549,12 +560,13 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
       if lines.nonEmpty then genAsm(lines, operands, clobbers)
 
     // A loop's `invariant` (`17 §3`) is a condition that traps on false, which is every other clause
-    // in `16` — so it is the shared check and nothing more.
+    // in `16` — so it is the shared check and nothing more, unless it mentions ghost state, in which
+    // case it is a proof obligation and nothing runs (`17 §8`).
     case TInvariant(cond, _) =>
-      emitContract(cond, "invariant")
+      if !ghostly(cond) then emitContract(cond, "invariant")
 
     case v: TVariantCheck =>
-      genVariantCheck(v)
+      if !ghostly(v.expr) then genVariantCheck(v)
 
   /** Lowers the selected arm to LLVM's inline assembly.
    *

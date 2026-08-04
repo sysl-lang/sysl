@@ -24,6 +24,7 @@ trait ProgramWalk
     with ConventionCheck
     with NoAlloc
     with Purity
+    with Ghost
     with GatedModules
     with InitOrder
     with DefaultParams {
@@ -321,6 +322,10 @@ trait ProgramWalk
 
     // And what a `@pure` function promised, asked of the same tree for the same reason (`17 §6`).
     checkPurity(allFuncs, externs)
+
+    // And where a `@ghost` function may be called from (`17 §8`), which is the rule that makes
+    // erasing one sound.
+    checkGhost(allFuncs, tmain)
 
     TProgram(
       structInsts.values.filterNot(abstracted).toList,
@@ -940,7 +945,7 @@ trait ProgramWalk
     // function, and only the second answers for an instantiation; a symbol is file-private if either
     // says so, since both name the one declaration.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
-      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure)
+      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant, f.pure, f.ghost)
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`

@@ -165,7 +165,7 @@ class SyslParser(val source: Source) extends DeclParser {
    * itself so that the annotation's own position is the `@`, which is the line a test report names.
    */
   private lazy val attribute: PackratParser[Attr] =
-    testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | unknownAttr | hashAttr
+    testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | unknownAttr | hashAttr
 
   /** `@test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
@@ -188,9 +188,16 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val pureAttr: PackratParser[Attr] =
     op("@") ~> attrWord("pure") ^^ (_ => Attr.Pure)
 
+  /** `@ghost` — the function exists for the specification alone and is erased before codegen
+   * (`17 §8`).
+   */
+  protected lazy val ghostAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("ghost") ^^ (_ => Attr.Ghost)
+
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
-      err(s"'$n' is not an annotation sysl knows — '@test', '@tailrec' and '@pure' are the three"))
+      err(s"'$n' is not an annotation sysl knows — '@test', '@tailrec', '@pure' and '@ghost' are " +
+        "the four"))
 
   /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
    *
@@ -221,6 +228,7 @@ class SyslParser(val source: Source) extends DeclParser {
       case (d, Attr.Test(t)) => d.copy(test = Some(t))
       case (d, Attr.TailRec) => d.copy(tailrec = true)
       case (d, Attr.Pure)    => d.copy(pure = true)
+      case (d, Attr.Ghost)   => d.copy(ghost = true)
     }
 
   private lazy val testArgs: Parser[TestAttr] =

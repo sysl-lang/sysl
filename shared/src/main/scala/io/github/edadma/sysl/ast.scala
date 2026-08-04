@@ -761,6 +761,8 @@ case class FuncDecl(
     tailrec: Boolean = false,
     /** `@pure` — see `TFunc.pure`. */
     pure: Boolean = false,
+    /** `@ghost` — see `TFunc.ghost`. */
+    ghost: Boolean = false,
 ) extends Stmt
 
 /** What `@test` says about the function it is written above (`testing.md`).
@@ -789,6 +791,7 @@ enum Attr(val word: String) {
   case Test(attr: TestAttr) extends Attr("test")
   case TailRec              extends Attr("tailrec")
   case Pure                 extends Attr("pure")
+  case Ghost                extends Attr("ghost")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved
