@@ -5,25 +5,25 @@ import io.github.edadma.cross_platform.*
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Where the core library sits, as seen from wherever the suite was started.
+/** Where the standard module library sits, as seen from wherever the suite was started.
  *
  * `lib/` is a **library project root** holding the single module `sysl`, so a module's name is the
  * path below it exactly as it is for a program (`13 §1`) — which is why the root is what is found
  * here and `lib/sysl` is not.
  */
-object CoreLib {
+object StdRoot {
 
   def root: Option[String] = List("lib", "../lib", "../../lib").find(isDirectory)
 }
 
-/** The core library on disk, and what the compiler carries of it (`Std`, `CoreSource`).
+/** The standard library on disk, and what the compiler carries of it (`Std`, `StdSource`).
  *
  * **This is the test that says the files are the fact.** What a compilation reads is generated from
  * them at build time, and a generator that stopped running — or ran over the wrong directory —
  * leaves a compiler that goes on working while the source a reader opens says something else. That
  * is exactly the failure a second copy is for, and nothing else here would notice it.
  */
-class CoreLibraryTests extends AnyFreeSpec with Matchers {
+class StdLibraryTests extends AnyFreeSpec with Matchers {
 
   /** A file's place in the library: its path from the standard module's own directory down, which
    * is the one thing the two copies have in common — the compiler carries `lib/sysl/print.sysl`
@@ -41,14 +41,14 @@ class CoreLibraryTests extends AnyFreeSpec with Matchers {
   }
 
   private def onDisk: Map[String, Source] =
-    Project.collect(CoreLib.root.get).map(s => place(s) -> s).toMap
+    Project.collect(StdRoot.root.get).map(s => place(s) -> s).toMap
 
   private def carried: Map[String, Source] = Std.sources.map(s => place(s) -> s).toMap
 
   "the source the compiler carries" - {
 
     "is what `lib/sysl` holds, file for file" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
       carried.keySet shouldBe onDisk.keySet
       for (name, source) <- onDisk do carried(name).text shouldBe source.text
@@ -65,7 +65,7 @@ class CoreLibraryTests extends AnyFreeSpec with Matchers {
     // a directory added there would be relying on, and a carrier that named the standard module for
     // every file would go on passing every other test here.
     "and says which module each is in, as the walk that found it would have" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
       for (name, source) <- onDisk do carried(name).dir shouldBe source.dir
       Std.sources.foreach(_.dir.get.head shouldBe Std.module)
@@ -75,7 +75,7 @@ class CoreLibraryTests extends AnyFreeSpec with Matchers {
   "the library as the driver reads it" - {
 
     "puts every file in the module its own header names" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
       // The header and the directory both say it, and the driver is what checks they agree — so
       // this is the same question `build-lib lib` would ask, asked without building anything.
@@ -86,7 +86,7 @@ class CoreLibraryTests extends AnyFreeSpec with Matchers {
     }
 
     "and every module those headers name is one the library says it declares" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
       onDisk.values.map(_.dir.get.mkString(".")).toSet shouldBe Library.modules.toSet
     }

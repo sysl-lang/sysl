@@ -10,7 +10,7 @@ trait CodegenSupport extends Matchers { this: Assertions =>
 
   /** How a diagnostic spells a library declaration — the key it resolves to, rendered.
    *
-   * A diagnostic names a moved declaration by the path that reaches it, so a bound on the core
+   * A diagnostic names a moved declaration by the path that reaches it, so a bound on the standard module
    * catalog reads `T: sysl.Add`. Reading the spelling off `Library` rather than writing it out is
    * what keeps these assertions honest across a move: the library is being drained into the
    * standard module a surface at a time, and an expectation with the name baked in either fails for
@@ -104,14 +104,14 @@ trait CodegenSupport extends Matchers { this: Assertions =>
    * at all: nothing in `lib/sysl` is private, so nothing there can show what a private member of the
    * library does.
    *
-   * The trees go in as the `Core` and **not** as units of the compilation, which is the same way the
-   * embedded library arrives: a `Core` contributes its own declarations to the walk, and a file that
+   * The trees go in as the `Stdlib` and **not** as units of the compilation, which is the same way the
+   * embedded library arrives: a `Stdlib` contributes its own declarations to the walk, and a file that
    * were also a unit would be a program declaring `module sysl` — which is refused, and rightly.
    *
    * A program compiled this way has **only** what the stand-in declares, `print` included, so these
    * fixtures state everything they use.
    */
-  protected def standIn(fs: (String, String)*): (List[Program], Core) =
+  protected def standIn(fs: (String, String)*): (List[Program], Stdlib) =
     standInTree(fs.map { case (name, text) => (Std.module, name, text) }*)
 
   /** The same, for a library that is a **tree**: each file paired with the module it sits in,
@@ -122,7 +122,7 @@ trait CodegenSupport extends Matchers { this: Assertions =>
    * its names do not arrive unasked-for, that a program may reach it by naming it, that what it
    * keeps to itself it keeps from the rest of the library too.
    */
-  protected def standInTree(fs: (String, String, String)*): (List[Program], Core) = {
+  protected def standInTree(fs: (String, String, String)*): (List[Program], Stdlib) = {
     val units = fs.toList.map { case (module, name, text) =>
       SyslParser.parse(Source(name, text, module.split('.').toList)) match {
         case Right(p) => p
@@ -130,7 +130,7 @@ trait CodegenSupport extends Matchers { this: Assertions =>
       }
     }
 
-    (units, new Core(units))
+    (units, new Stdlib(units))
   }
 
   /** The IR for a program compiled against a stand-in standard module, which must compile. */
@@ -161,8 +161,8 @@ trait CodegenSupport extends Matchers { this: Assertions =>
       case Left(e)    => e
     }
 
-  private def resultOf(core: Core, fs: Seq[(String, String)]): Either[String, String] =
-    Compiler.compiledWith(files(fs*), Nil, Target.default, Set.empty, Some(core)).map(_._1)
+  private def resultOf(std: Stdlib, fs: Seq[(String, String)]): Either[String, String] =
+    Compiler.compiledWith(files(fs*), Nil, Target.default, Set.empty, Some(std)).map(_._1)
 
   private def compiled(sources: List[Source]): String =
     Compiler.compile(sources) match {

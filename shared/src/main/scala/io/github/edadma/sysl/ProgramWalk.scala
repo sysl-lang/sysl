@@ -49,10 +49,10 @@ trait ProgramWalk
     moduleNames ++= units.map(moduleOf)
     // The library's own modules are modules like any other, and are known for the same reason a
     // file's header is: what they are called is settled before a single name is resolved. They are
-    // read off the core this compilation was handed rather than off the source in the tree, because
+    // read off the standard module this compilation was handed rather than off the source in the tree, because
     // naming one is reaching declarations, and the declarations that are there are the ones that
     // arrived.
-    moduleNames ++= core.modules
+    moduleNames ++= std.modules
 
     // Every declaration is read in the terms its file set up — the module it contributes to and
     // what it imported — so each one is carried alongside those rather than flattened into one
@@ -72,7 +72,7 @@ trait ProgramWalk
     // The library's files go through the same construction, because they are files of modules like
     // any other — one of them may import a sibling module of the library, and until there was more
     // than one library module there was nothing for such an import to name.
-    val library = core.contributed(building).map(u => u -> scopeOf(u))
+    val library = std.contributed(building).map(u => u -> scopeOf(u))
     val body    = (library ::: files).flatMap((u, s) => u.body.map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
@@ -443,7 +443,7 @@ trait ProgramWalk
    * because a build that guessed would turn this crisp refusal into a link-time collision.
    */
   private def checkLibraryModules(): Unit =
-    for u <- units; name = moduleOf(u) if core.carries(name) && !building.contains(name) do
+    for u <- units; name = moduleOf(u) if std.carries(name) && !building.contains(name) do
       recover(())(at(u.module.flatMap(_.pos).orElse(u.body.headOption.flatMap(_.pos))) {
         err(s"'$name' is the module every program is compiled against, so ${u.source.name} cannot " +
           "declare it — its declarations would join the library's rather than sit beside them")

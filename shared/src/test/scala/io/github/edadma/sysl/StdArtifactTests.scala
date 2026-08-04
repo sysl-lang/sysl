@@ -15,7 +15,7 @@ import org.scalatest.matchers.should.Matchers
  *
  * **"It links" would prove nothing on its own.** A compilation that reached a *different* library
  * and still produced a program that linked would be exactly as green. So what is pinned here is the
- * emitted IR, compared **byte for byte** between a compilation against the embedded core and one
+ * emitted IR, compared **byte for byte** between a compilation against the embedded std and one
  * against the decoded artifact, over programs chosen to reach as much of the library as they can.
  * That is a stronger statement than any behavioural test could make, and it is cheap: the IR is a
  * string, so nothing here needs a toolchain.
@@ -25,9 +25,9 @@ import org.scalatest.matchers.should.Matchers
  * Writing it first is what keeps the move from being a switch: a switch would put every program onto
  * a path nothing had exercised, where one hole fails everything at once with nothing to bisect.
  */
-class CoreArtifactTests extends AnyFreeSpec with Matchers {
+class StdArtifactTests extends AnyFreeSpec with Matchers {
 
-  /** The core built exactly as `sysl build-lib lib --core` builds it. This is the production path
+  /** The std built exactly as `sysl build-lib lib --std` builds it. This is the production path
    * rather than a hand-rolled `AstCodec.encode`, so what is compared below is what a program would
    * actually be handed.
    *
@@ -35,36 +35,36 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
    * assemble the first into an object file.
    */
   private lazy val artifact: (String, String) =
-    LibraryArtifact.build(Std.sources, Target.default, LibraryArtifact.core) match
+    LibraryArtifact.build(Std.sources, Target.default, LibraryArtifact.std) match
       case Right(r)  => r
-      case Left(err) => fail(s"the core library did not build: $err")
+      case Left(err) => fail(s"the standard module library did not build: $err")
 
-  private lazy val read: (Core, Set[String]) =
-    Core.read("sysl.syslib", artifact._2, Target.default) match
+  private lazy val read: (Stdlib, Set[String]) =
+    Stdlib.read("sysl.syslib", artifact._2, Target.default) match
       case Right(r)  => r
-      case Left(err) => fail(s"the core metadata did not read back: $err")
+      case Left(err) => fail(s"the standard module metadata did not read back: $err")
 
-  private def decoded: Core       = read._1
+  private def decoded: Stdlib       = read._1
   private def precompiled: Set[String] = read._2
 
-  /** One program compiled against one core, through the entry point the driver itself uses — so the
-   * two sides below differ in the core and in nothing else.
+  /** One program compiled against one std, through the entry point the driver itself uses — so the
+   * two sides below differ in the standard module and in nothing else.
    *
-   * `linked` is what the core's object half already defines, which the program declares rather than
+   * `linked` is what the standard module's object half already defines, which the program declares rather than
    * emits a second time. Empty is the compilation every program gets today.
    */
-  private def against(core: Core, program: String, linked: Set[String] = Set.empty): String =
-    Compiler.compiledWith(List(Source("<input>", program)), Nil, Target.default, linked, Some(core)) match
+  private def against(std: Stdlib, program: String, linked: Set[String] = Set.empty): String =
+    Compiler.compiledWith(List(Source("<input>", program)), Nil, Target.default, linked, Some(std)) match
       case Right(built) => built.ir
       case Left(err)    => fail(s"the program did not compile:\n$err")
 
   private def sameBothWays(program: String): Unit =
     against(decoded, program) shouldBe against(Library.carried, program)
 
-  /** The same program with the core's object half linked rather than emitted. */
+  /** The same program with the standard module's object half linked rather than emitted. */
   private def linked(program: String): String = against(decoded, program, precompiled)
 
-  /** The core's metadata with one of its files changed, which is what an edit to `lib/sysl` after an
+  /** The std's metadata with one of its files changed, which is what an edit to `lib/sysl` after an
    * artifact was built amounts to.
    */
   private lazy val drifted: String = {
@@ -72,9 +72,9 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
 
     LibraryArtifact.build(
       new Source(edited.name, edited.text + "\nunreachable() -> int = 1\n", edited.dir) :: Std.sources.tail,
-      Target.default, LibraryArtifact.core) match
+      Target.default, LibraryArtifact.std) match
       case Right((_, meta)) => meta
-      case Left(err)        => fail(s"the altered core did not build: $err")
+      case Left(err)        => fail(s"the altered std did not build: $err")
   }
 
   /** The symbols a module defines, and the ones it leaves to the linker. */
@@ -102,7 +102,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       // A `Source` compares by identity, so a decoded file named `lib/sysl/print.sysl` is a
       // different source from the embedded file of the same name — which is exactly what makes the
       // IR match below a result rather than a tautology.
-      val one = decoded.decls.find(_.pos.isDefined).getOrElse(fail("the decoded core carries no positions"))
+      val one = decoded.decls.find(_.pos.isDefined).getOrElse(fail("the decoded std carries no positions"))
 
       decoded.owns(one) shouldBe true
       Library.carried.owns(one) shouldBe false
@@ -116,7 +116,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
 
   "what the library costs a program that does not use it" - {
 
-    // The hold-back is decided over whichever core a compilation was handed, so it is already in
+    // The hold-back is decided over whichever std a compilation was handed, so it is already in
     // force against the embedded one — a library declaration is analyzed and emitted only once
     // something reaches it. That is worth pinning on its own: it is the reason an artifact's object
     // half is the only thing linking can save, the rest having never been emitted in the first
@@ -143,15 +143,15 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     // decodes and links perfectly — it is simply the wrong library, and nothing else would notice.
 
     "is refused, rather than compiled against" in {
-      Core.read("stale.syslib", drifted, Target.default) match
+      Stdlib.read("stale.syslib", drifted, Target.default) match
         case Left(err) => err should include("different standard module")
-        case Right(_)  => fail("a core built from other source was accepted")
+        case Right(_)  => fail("a standard module built from other source was accepted")
     }
 
     "while the one built from what the compiler carries is accepted" in {
       // Discriminating against the above: without this the refusal could be unconditional, which
       // would reject every artifact and look exactly as green.
-      Core.read("sysl.syslib", artifact._2, Target.default) shouldBe a[Right[?, ?]]
+      Stdlib.read("sysl.syslib", artifact._2, Target.default) shouldBe a[Right[?, ?]]
     }
 
     "and the fingerprint is what tells them apart" in {
@@ -177,11 +177,11 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     }
   }
 
-  "a program compiled against the decoded core emits exactly what one compiled against the source does" - {
+  "a program compiled against the decoded std emits exactly what one compiled against the source does" - {
 
     "for a program that reaches nothing of the library at all" in {
       // The floor of the claim: with nothing of the library reached, the two compilations may still
-      // differ, since which declarations are held back is decided over the core either way.
+      // differ, since which declarations are held back is decided over the standard module either way.
       sameBothWays("var x = 2 + 3\nvar y = x * 2\n")
     }
 
@@ -276,7 +276,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
 
     "for one that hashes, which reaches the mixers a built-in's membership renders through" in {
       // A built-in has no lowered `int.hash` to call; the trait resolves to a mixer chosen by type.
-      // Which mixer is a decision made over the core, so it is one the two paths could differ on.
+      // Which mixer is a decision made over the standard module, so it is one the two paths could differ on.
       sameBothWays(
         """h[T: Hash](x: T) -> u64 = x.hash()
           |print(h(7), h("x"), h(true))
@@ -366,32 +366,32 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
 
     "and one library built two ways has one object half, whichever `Source` objects carried it" in {
       // A regression test, and the failure it guards is a silent one. Which declarations are held
-      // back until something reaches them was decided by `Core.owns` alone, which is identity on the
-      // `Source` — so building the core from `Std.sources`, the copy already in memory, held back
+      // back until something reaches them was decided by `Stdlib.owns` alone, which is identity on the
+      // `Source` — so building the standard module from `Std.sources`, the copy already in memory, held back
       // *every* function in it. Nothing reached any of them, and the artifact came out with an empty
       // object half: it still carried every tree, so every program compiled and ran, and the whole
       // point of precompiling was gone with nothing failing to say so. Read off disk the same files
       // answered the other way. The fix is that a compilation **building** a module does not treat
       // that module as supplied to it (`AnalyzerBase.suppliedByLibrary`).
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
-      val fromDisk = LibraryArtifact.build(Project.collect(CoreLib.root.get), Target.default, LibraryArtifact.core)
+      val fromDisk = LibraryArtifact.build(Project.collect(StdRoot.root.get), Target.default, LibraryArtifact.std)
 
       fromDisk match
         case Right((_, meta)) =>
           LibraryArtifact.read("disk.syslib", meta, Target.default) match
             case Right((_, syms, _)) => syms shouldBe precompiled
             case Left(err)           => fail(err)
-        case Left(err) => fail(s"the core library did not build from disk: $err")
+        case Left(err) => fail(s"the standard module library did not build from disk: $err")
     }
   }
 
-  "a program that LINKS the core's object half rather than emitting it" - {
+  "a program that LINKS the standard module's object half rather than emitting it" - {
 
     // This is what the whole exercise is for, and it is the half nothing consumes yet: the trees
     // above establish that an artifact *means* what the source means, and these establish what is
     // gained by taking it — a program that reaches the printing surface no longer carries a copy of
-    // it. Nothing routes an ordinary compilation here; the core is still handed over as source.
+    // it. Nothing routes an ordinary compilation here; the standard module is still handed over as source.
 
     "declares the printing surface instead of defining it" in {
       val ir = linked("print(1)\n")
@@ -453,11 +453,11 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
       assume(Toolchain.clangAvailable, "clang not available")
 
       val program = "print(1)\nprint(\"two\")\nprint(3.5)\nprint(true)\n"
-      val obj     = createTempFile("sysl-core-", ".o")
-      val exe     = createTempFile("sysl-core-", "")
+      val obj     = createTempFile("sysl-std-", ".o")
+      val exe     = createTempFile("sysl-std-", "")
 
       Toolchain.compileObject(artifact._1, obj, Target.default) match
-        case Left(err) => fail(s"the core library did not assemble: $err")
+        case Left(err) => fail(s"the standard module library did not assemble: $err")
         case Right(_)  => ()
 
       val ran = Toolchain.build(linked(program), exe, Target.default, List(obj)).map { _ =>
@@ -480,11 +480,11 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
     "and carries only the library it reaches, the rest being dropped at the link" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      val obj = createTempFile("sysl-core-", ".o")
-      val exe = createTempFile("sysl-core-", "")
+      val obj = createTempFile("sysl-std-", ".o")
+      val exe = createTempFile("sysl-std-", "")
 
       Toolchain.compileObject(artifact._1, obj, Target.default) match
-        case Left(err) => fail(s"the core library did not assemble: $err")
+        case Left(err) => fail(s"the standard module library did not assemble: $err")
         case Right(_)  => ()
 
       Toolchain.build(linked("print(1)\n"), exe, Target.default, List(obj)) match
@@ -493,7 +493,7 @@ class CoreArtifactTests extends AnyFreeSpec with Matchers {
 
       // `nm` rather than a byte count: the size is a consequence and would drift with every change
       // to the library, while *which* symbols survive is the claim itself. Reading it needs no
-      // parsing beyond a substring, since every core symbol carries the module in its name.
+      // parsing beyond a substring, since every std symbol carries the module in its name.
       val listed = exec(List("nm", exe))
       val kept   = listed.stdout.linesIterator.filter(_.contains(Library.key(""))).toList
 

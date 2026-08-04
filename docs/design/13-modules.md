@@ -1020,7 +1020,7 @@ Five consequences worth stating, because each is a thing a reader would otherwis
   supplied is keyed outside the library's own modules.
 
 **The standard module is built the same way.** `sysl`'s own source is ordinary sysl files under
-`lib/sysl`, and `sysl build-lib lib --core` compiles them — `--core` being the one thing that lets a
+`lib/sysl`, and `sysl build-lib lib --std` compiles them — `--std` being the one thing that lets a
 compilation declare a module the compiler otherwise supplies. It is written down rather than inferred
 from the module names in the tree, because a build that guessed would turn a clear refusal — *you
 cannot add to the module every program is compiled against* — into an artifact that builds and then
@@ -1069,23 +1069,23 @@ happens. Lifting that needs a library initializer the program calls before `main
 
 **And the standard module is linked by default, once it has been built.** Which library a compilation
 is compiled against is a **parameter** of it rather than an ambient fact — which is what lets two
-cores be handed to two compilations and compared — but the parameter has a default, and the default
+standard modules be handed to two compilations and compared — but the parameter has a default, and the default
 is found rather than named:
 
 ```
-sysl run prog.sysl                 # builds .sysl/core.syslib if it is not there, then finds it
-sysl build-lib lib --core          # the same artifact, written on demand
+sysl run prog.sysl                 # builds .sysl/std.syslib if it is not there, then finds it
+sysl build-lib lib --std          # the same artifact, written on demand
 ```
 
-One path at both ends. `build-lib --core` with no `-o` writes to `.sysl/core.syslib`, and a
-compilation with no `--core-lib` looks there; naming the path is for the cases where it is somewhere
+One path at both ends. `build-lib --std` with no `-o` writes to `.sysl/std.syslib`, and a
+compilation with no `--std-lib` looks there; naming the path is for the cases where it is somewhere
 else. Handed one, a compilation does the whole of the above: it declares what the artifact compiled,
 monomorphizes the generics here, and links — rather than re-deriving every signature in the standard
 module before checking its own first line.
 
 **The artifact is not committed.** It is object code for one machine, and building it takes under a
 second, so a clone or a fresh worktree builds its own. That makes drift the thing to guard against
-rather than staleness in the repository: the artifact carries a **fingerprint of the core sources it
+rather than staleness in the repository: the artifact carries a **fingerprint of the standard module sources it
 was built from** — a 64-bit FNV-1a over each file's basename and contents in sorted order, run
 through `fmix64` — and a compilation refuses one whose fingerprint is not the one the compiler
 carries. Sorting by basename rather than by path is what lets the artifact built from `lib/sysl` on
@@ -1108,12 +1108,12 @@ been had the artifact been there. Nothing is substituted, so there is nothing to
 is announced on stderr rather than done invisibly, because a first build that pauses to do work
 should say what the work was.
 
-**An artifact named with `--core-lib` is not rebuilt, and one that cannot be read stops the
+**An artifact named with `--std-lib` is not rebuilt, and one that cannot be read stops the
 compilation** — corrupt, truncated, built by another sysl, or built from other sources than these.
 Someone who wrote down which standard module to compile against is owed the truth about that one
 rather than a different one built underneath them; it is the rule a named `--ar` already takes.
 
-**`--no-core-lib` is the one route to the copy the compiler carries.** That copy is there for the
+**`--no-std-lib` is the one route to the copy the compiler carries.** That copy is there for the
 compiler's own unit tests, which have to run in a tree where nothing has been built — and, once, for
 the bootstrap, since there was no released sysl to build the first artifact with. It is reached by
 asking for it, never by a lookup coming up empty. The distinction is what keeps it honest. A fallback taken silently would be a
@@ -1125,7 +1125,7 @@ since the two modules deliberately do not hold the same symbols — the standard
 ARC runtime beside them, are defined in place when the copy is carried and come from the artifact's
 object when it is linked, which is the difference the flag exists to make.
 
-**`build-lib --core` is exempt**, and must be: it is the command that produces the artifact, so
+**`build-lib --std` is exempt**, and must be: it is the command that produces the artifact, so
 requiring one would be a deadlock with nothing to break it.
 
 **The copy the compiler carries is a choice, not a necessity.** No other toolchain embeds its
@@ -1223,7 +1223,7 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
 - **h. What is in the standard library — the *where* is settled, the *what* is not.** A library now
   has somewhere to live and a way to be reached: §8 is the mechanism, `sysl` is the module name every
   program is compiled against, and its source is real sysl files under `lib/sysl` that the compiler's
-  own `build-lib --core` compiles. What that module should *contain* is the open half, and it is the
+  own `build-lib --std` compiles. What that module should *contain* is the open half, and it is the
   question the whole exercise was for.
 
   **The prelude is gone.** What a program starts with is a module, not a set of declarations threaded

@@ -12,7 +12,7 @@ import org.scalatest.matchers.should.Matchers
 trait RunSupport extends Matchers { this: Assertions =>
 
   /** Every run-tier compilation, in one place, against the **prebuilt** standard module
-   * (`PrebuiltCore`) where the toolchain can build one.
+   * (`PrebuiltStd`) where the toolchain can build one.
    *
    * That is the compilation an ordinary `sysl build` performs: the library's determined half is
    * linked from the artifact rather than emitted into this program and handed to clang again. Absent
@@ -20,9 +20,9 @@ trait RunSupport extends Matchers { this: Assertions =>
    * the case the `assume` above each helper has already cancelled for.
    */
   private def compiled(sources: List[Source], args: List[String]): Either[String, (Int, String)] =
-    PrebuiltCore.forHost match {
-      case Some((core, precompiled, archive)) =>
-        Toolchain.compileAndRun(sources, Nil, args, Some(core), precompiled, List(archive))
+    PrebuiltStd.forHost match {
+      case Some((std, precompiled, archive)) =>
+        Toolchain.compileAndRun(sources, Nil, args, Some(std), precompiled, List(archive))
       case None =>
         Toolchain.compileAndRun(sources, Nil, args, None, Set.empty, Nil)
     }

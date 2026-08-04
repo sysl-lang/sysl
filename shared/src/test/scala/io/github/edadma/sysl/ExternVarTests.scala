@@ -364,7 +364,7 @@ class ExternVarTests
     // a symbol — `sysl.io$lines` against a bare `environ`.
     "a symbol carries no module even where the key is a library one" in {
       val out = irAgainstTree(
-        ("sysl", "core.sysl", "module sysl\nextern environ: **u8\nmark(n: int) -> int = n + 1"),
+        ("sysl", "std.sysl", "module sysl\nextern environ: **u8\nmark(n: int) -> int = n + 1"),
       )("main.sysl" -> "mark(if environ == null then 0 else 1)")
 
       out should include("@environ = external global ptr")

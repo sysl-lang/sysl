@@ -17,7 +17,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
   /** The driver, under a name of its own — `Suite` has an `execute` too, and it wins unqualified.
    *
    * These run in a tree where no standard module has been built, so everything here says
-   * `--no-core-lib`: *this test is about the test command, not about which standard module a
+   * `--no-std-lib`: *this test is about the test command, not about which standard module a
    * compilation gets.*
    */
   private def cli(cfg: Config): Int = Console.withOut(Discarded)(driver(cfg))
@@ -26,7 +26,7 @@ class TestCliTests extends AnyFreeSpec with Matchers {
    * the report `sysl test` prints is this suite's subject, not something to read off the console.
    */
   private def driver(cfg: Config): Int =
-    io.github.edadma.sysl.execute(cfg.copy(noCoreLib = true))
+    io.github.edadma.sysl.execute(cfg.copy(noStdLib = true))
 
   private def program(text: String): String = {
     val path = createTempFile("sysl-test-cli-", ".sysl")

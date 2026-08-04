@@ -2,7 +2,7 @@ package io.github.edadma.sysl
 
 import io.github.edadma.cross_platform.*
 
-/** `--lib`, `--core-lib` and `--no-core-lib` — which libraries a compilation is given, driven
+/** `--lib`, `--std-lib` and `--no-std-lib` — which libraries a compilation is given, driven
  * through the driver itself.
  *
  * The compiler's own API cannot reach any of this. Which of two shapes a `--lib` path names, what a
@@ -160,30 +160,30 @@ class LibraryCliTests extends LibraryCliSupport {
     }
   }
 
-  "--core-lib" - {
+  "--std-lib" - {
 
     "runs a program whose share of the standard module came from the artifact" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")
 
-      // Exiting 0 is the whole assertion, and it is a strong one. Every core symbol the artifact
+      // Exiting 0 is the whole assertion, and it is a strong one. Every std symbol the artifact
       // defines is one this program only *declares* — so if the object half were not handed to the
       // linker, or held different symbols than its metadata says, this would not link at all.
       val (status, notes) = diagnostics(Config(command = "run", file = program("print(21 * 2)"),
-        coreLib = Some(core)))
+        stdLib = Some(std)))
 
       status shouldBe 0
       notes should not include "warning"
     }
 
     "builds a library against one too, which is the other thing that gets compiled" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")
 
-      val out = createTempFile("sysl-cli-against-core-", LibraryArtifact.extension)
+      val out = createTempFile("sysl-cli-against-std-", LibraryArtifact.extension)
 
       val (status, notes) =
-        diagnostics(Config(command = "build-lib", file = libraryRoot(), output = Some(out), coreLib = Some(core)))
+        diagnostics(Config(command = "build-lib", file = libraryRoot(), output = Some(out), stdLib = Some(std)))
 
       status shouldBe 0
       notes should not include "warning"
@@ -198,7 +198,7 @@ class LibraryCliTests extends LibraryCliSupport {
       def refuses(what: String, path: String): Unit =
         what in {
           val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
-            coreLib = Some(path)))
+            stdLib = Some(path)))
 
           status should not be 0
           notes should include("error")
@@ -228,24 +228,24 @@ class LibraryCliTests extends LibraryCliSupport {
       refuses("when it was built from a different lib/sysl", corrupt(artifactOfMeta(stale)))
     }
 
-    "is not needed by name, the artifact being looked for where build-lib --core puts it" - {
+    "is not needed by name, the artifact being looked for where build-lib --std puts it" - {
 
-      // Every case here routes the default path through `coreSearch` to a temporary file rather than
+      // Every case here routes the default path through `stdSearch` to a temporary file rather than
       // using the real one. Suites run in parallel, and an artifact left at the true default would be
       // found by every other test in the run — which is the environment-dependence this feature
       // introduces, arriving first in our own suite. The real default is pinned separately, below.
 
-      "so building it with no -o and compiling with no --core-lib is the whole workflow" in {
-        assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      "so building it with no -o and compiling with no --std-lib is the whole workflow" in {
+        assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
         assume(Toolchain.clangAvailable, "clang not available")
 
-        val where = s"${createTempDirectory("sysl-cli-found-")}/core${LibraryArtifact.extension}"
+        val where = s"${createTempDirectory("sysl-cli-found-")}/std${LibraryArtifact.extension}"
 
-        succeeds(Config(command = "build-lib", file = CoreLib.root.get, core = true, coreSearch = where))
+        succeeds(Config(command = "build-lib", file = StdRoot.root.get, std = true, stdSearch = where))
         isFile(where) shouldBe true
 
         val (status, notes) =
-          diagnostics(Config(command = "run", file = program("print(21 * 2)"), coreSearch = where))
+          diagnostics(Config(command = "run", file = program("print(21 * 2)"), stdSearch = where))
 
         status shouldBe 0
         notes should not include "warning"
@@ -255,10 +255,10 @@ class LibraryCliTests extends LibraryCliSupport {
         assume(Toolchain.clangAvailable, "clang not available")
         assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
 
-        val where = s"${createTempDirectory("sysl-cli-none-")}/core${LibraryArtifact.extension}"
+        val where = s"${createTempDirectory("sysl-cli-none-")}/std${LibraryArtifact.extension}"
 
         val (status, notes) =
-          diagnostics(Config(command = "emit-llvm", file = program("print(1)"), coreSearch = where))
+          diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = where))
 
         status shouldBe 0
         isFile(where) shouldBe true
@@ -274,7 +274,7 @@ class LibraryCliTests extends LibraryCliSupport {
 
         val where = corrupt("not a library\n".getBytes)
 
-        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), coreSearch = where))._1 shouldBe 0
+        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = where))._1 shouldBe 0
 
         // Replaced, not merely worked around: what is at the path afterwards is a standard module
         // this compiler will read, which is the whole of what the rebuild is for.
@@ -282,7 +282,7 @@ class LibraryCliTests extends LibraryCliSupport {
         // answered by reflection, which the JVM has and no other platform does — there it silently
         // becomes an equality against the symbol itself, and fails whatever the value is.
         LibraryArtifact.metadataOf(where, readBytes(where))
-          .flatMap(Core.read(where, _, Target.default)) should matchPattern { case Right(_) => }
+          .flatMap(Stdlib.read(where, _, Target.default)) should matchPattern { case Right(_) => }
       }
 
       "and a stale one is replaced too, which is the state it is actually found in" in {
@@ -293,45 +293,45 @@ class LibraryCliTests extends LibraryCliSupport {
         // It is not corrupt and would decode as far as its own header — only the compiler has moved.
         val where = corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)
 
-        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), coreSearch = where))._1 shouldBe 0
+        diagnostics(Config(command = "emit-llvm", file = program("print(1)"), stdSearch = where))._1 shouldBe 0
       }
 
       "and the program is compiled against the rebuilt one, not against the carried copy" in {
         assume(Toolchain.clangAvailable, "clang not available")
         assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
 
-        val where = s"${createTempDirectory("sysl-cli-rebuilt-")}/core${LibraryArtifact.extension}"
+        val where = s"${createTempDirectory("sysl-cli-rebuilt-")}/std${LibraryArtifact.extension}"
         val src   = program("print(1)")
 
         // The discriminating half. A rebuild that produced an artifact and then went on compiling
         // against the copy the compiler carries would pass every assertion above, and the library's
         // symbols are what tell the two apart: linked, they are declarations.
-        val rebuilt = emitted(Config(command = "emit-llvm", file = src, coreSearch = where))
-        val carried = emitted(Config(command = "emit-llvm", file = src, noCoreLib = true, coreSearch = where))
+        val rebuilt = emitted(Config(command = "emit-llvm", file = src, stdSearch = where))
+        val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = where))
 
         libraryOwn(rebuilt, "define") shouldBe empty
         libraryOwn(rebuilt, "declare") should not be empty
         libraryOwn(carried, "define") should not be empty
       }
 
-      "but one named with --core-lib is not rebuilt, being the one that was asked for" in {
+      "but one named with --std-lib is not rebuilt, being the one that was asked for" in {
         // The rule the rebuild does *not* reach, and the reason it does not: someone who wrote down
         // which artifact to compile against is owed the truth about that one rather than a different
         // one built underneath them.
         val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
-          coreLib = Some(corrupt("not a library\n".getBytes))))
+          stdLib = Some(corrupt("not a library\n".getBytes))))
 
         status should not be 0
         notes should include("is not a sysl library")
         notes should not include "building the standard module"
       }
 
-      "and --core-lib is the one consulted, being the one someone actually asked for" in {
+      "and --std-lib is the one consulted, being the one someone actually asked for" in {
         // Both are unreadable, so both refuse — what says which was read is *how* each is broken:
         // the named one is not ours at all, the one at the default path claims a later format.
         val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
-          coreLib = Some(corrupt("not a library\n".getBytes)),
-          coreSearch = corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)))
+          stdLib = Some(corrupt("not a library\n".getBytes)),
+          stdSearch = corrupt(s"syslib ${LibraryArtifact.Version + 1} 0\n".getBytes)))
 
         status should not be 0
         notes should include("is not a sysl library")
@@ -341,13 +341,13 @@ class LibraryCliTests extends LibraryCliSupport {
       "and the place both ends agree on is the documented one" in {
         // The tests above route around the real default so they cannot collide; this is what says
         // the real default is what they were standing in for.
-        Config().coreSearch shouldBe LibraryArtifact.coreDefault
-        LibraryArtifact.coreDefault should endWith(LibraryArtifact.extension)
+        Config().stdSearch shouldBe LibraryArtifact.stdDefault
+        LibraryArtifact.stdDefault should endWith(LibraryArtifact.extension)
       }
     }
   }
 
-  "--no-core-lib" - {
+  "--no-std-lib" - {
 
     /* The compiler keeps its own copy of the standard module, and discovery means that copy is
      * normally reached only by an artifact being absent — which is a fact about the filesystem, not
@@ -358,7 +358,7 @@ class LibraryCliTests extends LibraryCliSupport {
       // without the flag (the discovery section above), so succeeding here is the artifact going
       // unread rather than a corruption that happens not to matter.
       val (status, notes) = diagnostics(Config(command = "emit-llvm", file = program("print(1)"),
-        noCoreLib = true, coreSearch = corrupt("not a library\n".getBytes)))
+        noStdLib = true, stdSearch = corrupt("not a library\n".getBytes)))
 
       status shouldBe 0
       notes should not include "error"
@@ -368,25 +368,25 @@ class LibraryCliTests extends LibraryCliSupport {
       // The flag's reason for existing, and what separates it from the rebuild. Both compile in a
       // tree where nothing has been built; only one of them needs a toolchain to do it, which is why
       // this is the path the compiler's own unit tests take and the bootstrap took.
-      val nowhere = s"${createTempDirectory("sysl-cli-bare-")}/core${LibraryArtifact.extension}"
+      val nowhere = s"${createTempDirectory("sysl-cli-bare-")}/std${LibraryArtifact.extension}"
 
-      succeeds(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
-        coreSearch = nowhere))
+      succeeds(Config(command = "emit-llvm", file = program("print(1)"), noStdLib = true,
+        stdSearch = nowhere))
 
       // Nothing was written, where the same run without the flag would have built one there.
       isFile(nowhere) shouldBe false
     }
 
     "and takes the built-in copy with a good artifact sitting right there" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
       // Which module was used, not merely that one was: the same program at the same path, told to
       // use the artifact and told not to. Exiting 0 both ways would hold for a flag that did
       // nothing, so the assertion is on the seam the flag moves — what the artifact already holds
       // is declared when it is linked and defined when it is not.
       val src    = program("print(21 * 2)")
-      val linked = emitted(Config(command = "emit-llvm", file = src, coreSearch = core))
-      val carried = emitted(Config(command = "emit-llvm", file = src, noCoreLib = true, coreSearch = core))
+      val linked = emitted(Config(command = "emit-llvm", file = src, stdSearch = std))
+      val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = std))
 
       libraryOwn(linked, "define") shouldBe empty
       libraryOwn(linked, "declare") should not be empty
@@ -399,11 +399,11 @@ class LibraryCliTests extends LibraryCliSupport {
     // own symbols — declared when linked, defined when carried — so what must agree is the code the
     // **program** lowers to, which the way its library arrived has no business changing.
     "and one program compiled both ways lowers to the same program" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
 
       val src = program("f(n: int) -> int = n * 2\nprint(f(21))\n")
-      val linked  = emitted(Config(command = "emit-llvm", file = src, coreSearch = core))
-      val carried = emitted(Config(command = "emit-llvm", file = src, noCoreLib = true, coreSearch = core))
+      val linked  = emitted(Config(command = "emit-llvm", file = src, stdSearch = std))
+      val carried = emitted(Config(command = "emit-llvm", file = src, noStdLib = true, stdSearch = std))
 
       // The two modules do *not* hold the same symbols, and should not: the standard module's own
       // and the ARC runtime beside them are defined here only when the copy is carried, and come
@@ -415,24 +415,24 @@ class LibraryCliTests extends LibraryCliSupport {
     }
 
     "and what it compiles is whole, not a program relying on the artifact anyway" in {
-      assume(CoreLib.root.isDefined, "lib/ not found from the test working directory")
+      assume(StdRoot.root.isDefined, "lib/ not found from the test working directory")
       assume(Toolchain.clangAvailable, "clang not available")
 
       // Linking is the assertion. The artifact's object half is not handed to the linker here, so
-      // every core symbol this program calls has to have been emitted into it.
+      // every std symbol this program calls has to have been emitted into it.
       val (status, notes) = diagnostics(Config(command = "run", file = program("print(21 * 2)"),
-        noCoreLib = true, coreSearch = core))
+        noStdLib = true, stdSearch = std))
 
       status shouldBe 0
       notes should not include "warning"
     }
 
-    "but is refused beside --core-lib, which asks for the other one" in {
+    "but is refused beside --std-lib, which asks for the other one" in {
       // Two spellings a character apart, so a typo lands here. Refused rather than resolved by
       // precedence: either precedence discards half of what the command line asked for, silently.
       // The path names nothing, which says the refusal comes before the artifact is read.
-      refused(Config(command = "emit-llvm", file = program("print(1)"), noCoreLib = true,
-        coreLib = Some(s"${createTempDirectory("sysl-cli-both-")}/any${LibraryArtifact.extension}")))
+      refused(Config(command = "emit-llvm", file = program("print(1)"), noStdLib = true,
+        stdLib = Some(s"${createTempDirectory("sysl-cli-both-")}/any${LibraryArtifact.extension}")))
     }
   }
 
@@ -531,15 +531,15 @@ class LibraryCliTests extends LibraryCliSupport {
       succeeds(Config(command = "run", file = prog, libs = List(lib)))
     }
 
-    // The neighbouring determinism, which is the weaker half of `CoreArtifactTests`' "one library
+    // The neighbouring determinism, which is the weaker half of `StdArtifactTests`' "one library
     // built two ways": the same files read the same way twice say the same thing. What that one adds
-    // is the case only the core can pose — the same files arriving as the `Source` objects the
+    // is the case only the standard module can pose — the same files arriving as the `Source` objects the
     // compiler embeds rather than as a second read of them.
     "and the same library built twice from disk agrees with itself" in {
       val root = rootOf("demo", withDefault.replace("private tripled", "tripled"))
 
       def symbols(): Set[String] =
-        LibraryArtifact.build(Project.collect(root), Target.default, LibraryArtifact.core) match
+        LibraryArtifact.build(Project.collect(root), Target.default, LibraryArtifact.std) match
           case Right((_, meta)) =>
             LibraryArtifact.read("twice.syslib", meta, Target.default) match
               case Right((_, syms, _)) => syms

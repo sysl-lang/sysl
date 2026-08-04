@@ -107,7 +107,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport with ParallelTestExecution 
    * **The cost here is not the checking, it is the toolchain.** A page's `output` block makes its
    * program a whole compile, link and run: a clang invocation, a linker invocation and a process,
    * for a program of six lines. There are close to four hundred of those across the site, and as one
-   * test they were four hundred of them in a row on one core while the rest of the machine idled.
+   * test they were four hundred of them in a row on one std while the rest of the machine idled.
    * They are completely independent — separate temporary files, separate processes, nothing shared —
    * so the only thing that made them sequential was being written inside a single `in`.
    *

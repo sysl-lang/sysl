@@ -18,7 +18,7 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 /** **Each guide is its own test, and they run at the same time.** A guide program is a real compile,
  * link and run of a few hundred lines, and there are fourteen of them; sequentially that was the
- * larger half of this suite's time with one core busy. Nothing is shared between them — each
+ * larger half of this suite's time with one std busy. Nothing is shared between them — each
  * compiles from its own directory into its own temporary files — so the only thing that had made
  * them sequential was the runner taking one test at a time.
  */

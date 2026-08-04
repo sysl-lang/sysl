@@ -79,11 +79,11 @@ they cost a program nothing.
 Every program is compiled against the standard module, which is built once after a clone:
 
 ```bash
-sbt "syslJVM/run build-lib lib --core"   # writes .sysl/core.syslib
+sbt "syslJVM/run build-lib lib --std"   # writes .sysl/std.syslib
 ```
 
-A compilation with no `--core-lib` looks there and stops if it finds nothing, the same as a C
-compiler that cannot find its libc. `--no-core-lib` compiles against the copy built into the
+A compilation with no `--std-lib` looks there and stops if it finds nothing, the same as a C
+compiler that cannot find its libc. `--no-std-lib` compiles against the copy built into the
 compiler, which is what the test suite uses and what makes the first build possible.
 
 Building a library also needs an **`llvm-ar`**, because a `.syslib` is an `ar` archive whose members

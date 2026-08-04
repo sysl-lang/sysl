@@ -1,4 +1,4 @@
-# Core Traits, Operators, and Definition-Checked Bounds
+# Stdlib Traits, Operators, and Definition-Checked Bounds
 
 **Status:** decided, and **§1–§6 are implemented** — `Self`, the whole catalog, the one dispatch
 rule, definition-checked bounds on both method calls and operators, the compiler-provided scalar

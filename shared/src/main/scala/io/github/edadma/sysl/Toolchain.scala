@@ -292,14 +292,14 @@ object Toolchain {
    * carries: the trees arrive decoded, the symbols its object half already defines are declared
    * instead of emitted a second time, and the archive holding them is handed to the linker.
    *
-   * This is the shape an ordinary `sysl build` has — it is what `.sysl/core.syslib` is *for* — and
+   * This is the shape an ordinary `sysl build` has — it is what `.sysl/std.syslib` is *for* — and
    * the caller supplies the artifact because building one belongs to whoever can decide how often it
    * is worth doing. Given none, this is the compilation the other overloads perform.
    */
   def compileAndRun(sources: List[Source], libraries: List[Program], args: List[String],
-                    core: Option[Core], precompiled: Set[String], archives: List[String])
+                    std: Option[Stdlib], precompiled: Set[String], archives: List[String])
       : Either[String, (Int, String)] =
-    runIr(Compiler.compiledWith(sources, libraries, Target.default, precompiled, core), args, archives)
+    runIr(Compiler.compiledWith(sources, libraries, Target.default, precompiled, std), args, archives)
 
   /** `args` are the words the program is started with, which reach it exactly as they would from a
    * shell: the executable's own path arrives ahead of them as the zeroth, since that is what the

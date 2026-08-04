@@ -238,12 +238,12 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
       // What replaced a `lazy val` when the library became a per-target question. Parsing the whole
       // standard module is on the path of every compilation with no artifact to read instead, so a
       // memo that missed would be a real cost and not only an inelegance.
-      Core.embedded(macos) should be theSameInstanceAs Core.embedded(macos)
+      Stdlib.embedded(macos) should be theSameInstanceAs Stdlib.embedded(macos)
       Std.parsed(linux) should be theSameInstanceAs Std.parsed(linux)
     }
 
     "two targets get two" in {
-      Core.embedded(macos) should not be theSameInstanceAs(Core.embedded(linux))
+      Stdlib.embedded(macos) should not be theSameInstanceAs(Stdlib.embedded(linux))
     }
 
     "every target in the registry parses at all" in {
@@ -468,7 +468,7 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
   "a file with no directives in it" - {
 
     "comes back as the very same Source, not a copy" in {
-      // A `Source` compares by identity (`Diagnostics`), and `Core.owns` is that identity — so a
+      // A `Source` compares by identity (`Diagnostics`), and `Stdlib.owns` is that identity — so a
       // compilation that gated nothing has to be the compilation it was before any of this existed.
       val src = Source("<input>", "print(1)\n")
 
