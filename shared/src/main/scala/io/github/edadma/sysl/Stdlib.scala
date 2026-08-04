@@ -1,5 +1,7 @@
 package io.github.edadma.sysl
 
+import io.github.edadma.cross_platform.*
+
 /** The standard module **this** compilation is compiled against, and the one place that says where
  * its trees came from.
  *
@@ -118,4 +120,45 @@ object Stdlib {
       else
         Left(s"$name was built from a different standard module than this compiler carries — " +
           "rebuild it with 'sysl build-lib lib --std'"))
+
+  /** The standard module compiled to an artifact at `out`, from the library source the compiler
+   * carries — the other end of `read`, and what an unusable artifact at the default path is rebuilt
+   * by.
+   *
+   * The sources are `Std.sources` and not the `lib/` in some tree, which is what makes this usable at
+   * all: an installed compiler has no repository beside it, and `read` checks a decoded artifact
+   * against `Std.fingerprint` — the fingerprint of exactly these files — so building from them is the
+   * one thing guaranteed to produce an artifact this compiler will accept.
+   *
+   * No C files are gathered, and none can be missed: `15 §7` lets a library carry `.c` beside its
+   * modules, and the standard module carries none. It could not — the fingerprint an artifact is held
+   * to covers a library's C sources with its sysl ones, while the one the compiler carries covers only
+   * what `StdSource` embeds, so a `.c` under `lib/sysl` would make every artifact built from the tree
+   * fail the check it is read back through.
+   *
+   * `ar` names the archiver where it is somewhere a search would not look, exactly as `--ar` does;
+   * given none, the search runs.
+   */
+  def writeArtifact(out: String, target: Target, ar: Option[String] = None): Either[String, Unit] =
+    for
+      archiver <- Toolchain.findAr(ar)
+      built    <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.std, Some(embedded(target)))
+      _        <- {
+                    val staging  = createTempDirectory("sysl-std-")
+                    val code     = s"$staging/${LibraryArtifact.codeMember}"
+                    val metadata = s"$staging/${LibraryArtifact.metadataMember}"
+
+                    Project.parentOf(out).foreach(createDirectories)
+
+                    val outcome =
+                      for
+                        _ <- Toolchain.compileObject(built._1, code, target)
+                        _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(built._2, target), metadata, target)
+                        _ <- Toolchain.archive(List(code, metadata), out, archiver)
+                      yield ()
+
+                    List(code, metadata, staging).foreach(Project.discard)
+                    outcome
+                  }
+    yield ()
 }

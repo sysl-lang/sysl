@@ -99,6 +99,28 @@ lazy val embedCoreLibrary = Def.task {
   Seq(out)
 }
 
+// The version, carried into the compiler so that `sysl --version` can answer with it.
+//
+// Generated rather than hand-kept beside `ThisBuild / version`, for the reason the core library is:
+// two places holding one fact drift, and this one drifts *silently* — a binary that reports the
+// version before last is worse than one that reports none, since the whole use of the flag is telling
+// which build somebody has when they report something.
+lazy val embedVersion = Def.task {
+  val utf8 = java.nio.charset.StandardCharsets.UTF_8
+  val out  = (Compile / sourceManaged).value / "io" / "github" / "edadma" / "sysl" / "BuildInfo.scala"
+  val text =
+    s"""package io.github.edadma.sysl
+       |
+       |/** Generated from `version` by `build.sbt` -- do not edit. */
+       |private[sysl] object BuildInfo {
+       |  val version: String = "${version.value}"
+       |}
+       |""".stripMargin
+
+  if (!out.exists || IO.read(out, utf8) != text) IO.write(out, text, utf8)
+  Seq(out)
+}
+
 lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .in(file("."))
   .settings(
@@ -120,6 +142,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
         "-language:dynamics",
       ),
     Compile / sourceGenerators += embedCoreLibrary.taskValue,
+    Compile / sourceGenerators += embedVersion.taskValue,
     libraryDependencies += "org.scalatest" %%% "scalatest" % "3.2.20" % "test",
     libraryDependencies ++= Seq(
       "com.github.scopt"         %%% "scopt"                    % "4.1.0",
@@ -128,7 +151,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       "io.github.edadma"         %%% "indentation"              % "0.0.5",
       // Cross-platform I/O boundary (see docs/design/cross-platform.md).
       "io.github.edadma"         %%% "path"                     % "0.0.7",
-      "io.github.edadma"         %%% "cross_platform"           % "0.1.8",
+      "io.github.edadma"         %%% "cross_platform"           % "0.1.9",
       // The project config's format (see docs/design/packages.md §1).
       "io.github.edadma"         %%% "hocon"                    % "0.1.1",
 //      "com.lihaoyi" %%% "pprint" % "0.9.6" % "test",
@@ -155,6 +178,22 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .nativeSettings(
 //    libraryDependencies += "io.github.cquiroz" %%% "scala-java-time" % "2.7.0",
     libraryDependencies += "org.scala-js" %% "scalajs-stubs" % "1.1.0" % "provided",
+    // The binary that gets installed is built in release mode; the one built while developing is
+    // not. Scala Native defaults to debug, and that default is the right one here — a link is
+    // seconds rather than minutes, and nothing about this project is iterated on from Native
+    // anyway (the JVM build is the development loop). But an installed compiler is run by people
+    // who did not build it, and shipping the unoptimized link would make sysl look slow for a
+    // reason that has nothing to do with sysl.
+    //
+    // Gated on the environment rather than made the default, so that asking for the slow, careful
+    // link is a deliberate act performed when cutting a release: `SYSL_RELEASE=1 sbt
+    // syslNative/nativeLink`.
+    nativeConfig ~= { c =>
+      if (sys.env.get("SYSL_RELEASE").contains("1"))
+        c.withMode(scala.scalanative.build.Mode.releaseFast)
+          .withLTO(scala.scalanative.build.LTO.thin)
+      else c
+    },
   )
   .jsSettings(
     jsEnv := new org.scalajs.jsenv.nodejs.NodeJSEnv(),
