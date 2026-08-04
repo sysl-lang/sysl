@@ -14,10 +14,11 @@ That is a native binary — there is no JVM under it and nothing to start up. It
 which sysl needs at runtime: the compiler emits textual LLVM IR and hands it to `clang` to assemble
 and link, and `llvm-ar` is what builds a library into a `.syslib`.
 
-Check it:
+Check it, and see what it offers:
 
 ```bash
 sysl --version
+sysl --help
 ```
 
 **macOS on Apple silicon only, for now.** Other platforms build from source, below; a Linux binary

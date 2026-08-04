@@ -164,12 +164,20 @@ private[sysl] val parser = {
       cmd("targets")
         .action((_, c) => c.copy(command = "targets"))
         .text("list the machines sysl can build for"),
-      // A flag rather than a subcommand, because it is what somebody types before they know there
-      // are subcommands — and it satisfies `checkConfig` below by naming a command of its own, so
-      // `sysl --version` stands alone rather than being an option to something else.
+      // Flags rather than subcommands, because they are what somebody types before they know there
+      // are subcommands — and each satisfies `checkConfig` below by naming a command of its own, so
+      // `sysl --version` and `sysl --help` stand alone rather than being options to something else.
       opt[Unit]("version")
         .action((_, c) => c.copy(command = "version"))
         .text("print which build of sysl this is"),
+      // Not scopt's own `help("help")`, though it exists and would render the same text. That one is
+      // a *terminating* option: it reaches `OEffect.Terminate`, which the default setup answers with
+      // `sys.exit`, so a test that asked what `--help` does would take the test runner down with it.
+      // Naming a command instead keeps it on the same footing as every other one — driven through
+      // `execute`, answerable in a test, and printing the usage that `OParser` generates anyway.
+      opt[Unit]("help")
+        .action((_, c) => c.copy(command = "help"))
+        .text("print this usage text"),
       opt[Unit]("explain-escapes")
         .action((_, c) => c.copy(explainEscapes = true))
         .text("report every local array promoted to the heap, and the view that forced it"),
@@ -238,6 +246,7 @@ private[sysl] def parseArgs(own: Seq[String]): Option[Config] =
  */
 private[sysl] def execute(cfg: Config): Int = {
   if cfg.command == "version" then return printVersion()
+  if cfg.command == "help" then return printUsage()
   if cfg.command == "targets" then return listTargets()
 
   val sources =
@@ -642,6 +651,25 @@ private def readPackageConfig(file: String): Either[String, PackageConfig] = {
  */
 private def printVersion(): Int = {
   stdout(s"sysl ${BuildInfo.version}\n")
+  0
+}
+
+/** The usage text, for someone who asked for it.
+ *
+ * It was already reachable — an invocation naming no subcommand prints it, because `checkConfig`
+ * refuses one — but only by *failing*, on stderr and with a non-zero status. `--help` is the first
+ * thing anyone types at an unfamiliar command, and answering it with `Error: Unknown option --help`
+ * is the worst first impression a compiler can make.
+ *
+ * Asked for, it is not an error: stdout, and a zero status, so `sysl --help | less` works and a
+ * script that checks the status is not told something went wrong. That is the whole difference
+ * between this and the failure path, which keeps stderr and its 2.
+ *
+ * `OParser.usage` renders it, so this is scopt's own text rather than a second copy to keep in step
+ * with the parser above.
+ */
+private def printUsage(): Int = {
+  stdout(OParser.usage(parser) + "\n")
   0
 }
 
