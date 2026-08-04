@@ -96,7 +96,7 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // of the places the program starts from.
     "a function reached only from a 'val' initializer is emitted" in {
       val out = defined("""build() -> int = 7
-                          |val seed: int = build()
+                          |static val seed: int = build()
                           |print(seed)
                           |""".stripMargin)
 
@@ -400,7 +400,7 @@ class DeadCodeTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // question from dropping a function nobody can arrive at.
     "a 'val' nothing reads is still laid down" in {
       val out = ir("""build() -> int = 7
-                     |val seed: int = build()
+                     |static val seed: int = build()
                      |print(1)
                      |""".stripMargin)
 

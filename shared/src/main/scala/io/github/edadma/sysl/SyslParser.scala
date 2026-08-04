@@ -121,25 +121,33 @@ class SyslParser(val source: Source) extends DeclParser {
    * rather than threaded through five rules that would each have to remember it. An `impl` is not
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
-  /** `static val`, `static var`, `static f() -> …` — the three declarations of the entry file that
-   * would otherwise be local to its body, asking to be the module's instead (`13 §7`).
+  /** `static val`, `static var` — a binding in the file the program starts in asking to be the
+   * module's rather than that file's body's (`13 §7`).
    *
    * The modifier follows the visibility rather than preceding it, so `private static var ticks: u64`
    * reads in the order the two questions are asked: how far it reaches, then whose it is.
    *
-   * Only these three take it. A type, a `const`, an `extern` and an `import` are module members
-   * wherever they are written — a body has nothing to make them local *to* — so `static` on one says
-   * nothing, and the sentence below says that rather than leaving the grammar to complain that a
-   * declaration form was not among the three.
+   * **A function never takes it**, which is worth saying because it is the one form a reader expects
+   * to. Whether a function at the top of the entry file belongs to the body is settled by whether it
+   * reads one of the body's bindings (`Bodies.capturing`) — one that reads none is the module's
+   * already and has nothing to ask for, and one that reads any is holding a frame, which is precisely
+   * what a module member cannot do. So the modifier would be either redundant or impossible, and
+   * neither is worth a keyword.
+   *
+   * A type, a `const`, an `extern` and an `import` are module members wherever they are written, so
+   * `static` on one says nothing either. The sentence below covers all of them, rather than leaving
+   * the grammar to complain that a declaration form was not among the two.
    */
   protected lazy val staticDecl: PackratParser[Stmt] =
-    visibility ~ (op("static") ~> (valDecl | varDecl | funcDecl)) ^^ {
+    visibility ~ (op("static") ~> (valDecl | varDecl)) ^^ {
       case Visibility.Public ~ d => StaticDecl(d)
       case v ~ d                 => StaticDecl(restrict(v, d))
     } | (visibility <~ op("static")) ~> err(
-      "'static' marks a 'val', a 'var' or a function — the declarations of the file a program starts " +
-        "in that would otherwise belong to its body. A type, a constant, an 'extern' and an 'import' " +
-        "belong to the module wherever they are written, so there is nothing for this to change",
+      "'static' marks a 'val' or a 'var' in the file a program starts in, saying it belongs to the " +
+        "module rather than to that file's body. Everything else there is the module's already: a " +
+        "type, a constant, an 'extern' and an 'import' are wherever they are written, and a function " +
+        "is one unless it reads a binding of the body — which is a frame to carry, and the one thing " +
+        "a module member cannot have",
     )
 
   protected lazy val declaration: PackratParser[Stmt] =

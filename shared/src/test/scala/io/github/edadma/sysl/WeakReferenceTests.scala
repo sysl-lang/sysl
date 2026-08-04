@@ -102,7 +102,7 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
       // And the declaration that does outlive every frame cannot hold a reference in the first
       // place, which closes the other half.
       "and not a module-level 'val', which outlives every frame and so counts nothing" in {
-        err(node + """val fallback: &Node = Node(4)
+        err(node + """static val fallback: &Node = Node(4)
                      |peek(w: weak Node = fallback) -> int = w.get().unwrap().value
                      |print(peek())
                      |""".stripMargin) should include("a count with nowhere to write the release")
@@ -155,7 +155,7 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
   "a weak reference is counted too, so a module-level 'val' refuses one" - {
     "directly" in {
       err(node + """weaken(r: &Node) -> weak Node = r
-                   |val w: weak Node = weaken(Node(1))
+                   |static val w: weak Node = weaken(Node(1))
                    |""".stripMargin) should include("a count with nowhere to write the release")
     }
 
@@ -164,7 +164,7 @@ class WeakReferenceTests extends AnyFreeSpec with CodegenSupport with RunSupport
                    |    back: weak Node
                    |end Slot
                    |mk(r: &Node) -> Slot = Slot(r)
-                   |val s: Slot = mk(Node(1))
+                   |static val s: Slot = mk(Node(1))
                    |""".stripMargin) should include("a count with nowhere to write the release")
     }
   }

@@ -1,5 +1,7 @@
 package io.github.edadma.sysl
 
+import scala.collection.mutable
+
 /** Turning a program **body** into a program.
  *
  * A caller holding sysl source as a *string* rather than as a file — a documentation page's code
@@ -55,6 +57,110 @@ object Bodies {
       true
     case _ => false
 
+  /** Which of the entry file's functions belong to its **body** rather than to its module — the ones
+   * that read something the body binds, and the ones that call those.
+   *
+   * A function written at the top of the entry file is a nested function only if it has an
+   * environment to be nested *in*. `12 §5a` says as much outright: one that captures nothing and does
+   * not escape "is an ordinary static function with a private name". So the three things a nested
+   * function cannot be — generic, addressable, a value — are consequences of holding a frame, not of
+   * where the declaration was written, and charging them to a function that holds no frame would be
+   * charging the common case for the rare one. A comparison handed to `qsort` is the shape that makes
+   * this concrete: it reads nothing, and refusing its address on the ground that "what would have to
+   * travel beside the address is the frame it reads" names a frame that does not exist.
+   *
+   * **Capture is transitive through a sibling call**, which is what the fixpoint is for: the nested
+   * functions of a block share one environment (`12 §5a`), so a function calling one that captures
+   * needs that environment too and is part of the group whether or not it reads anything itself.
+   *
+   * This is purely syntactic, and has to be: it decides what the hoisting passes are *given*, so it
+   * runs before any scope exists to resolve a name against. Over-approximating is therefore the safe
+   * direction, and shadowing is honoured so that a helper whose own parameter is spelled like one of
+   * the body's bindings is not dragged in by the spelling.
+   */
+  def capturing(body: List[Stmt]): Set[String] = {
+    // What the body binds is what a function could be reading. A `static` one is the module's, so it
+    // is not among them — which is the whole of what the modifier does.
+    val bindings = body.flatMap {
+      case VarDecl(n, _, _)     => List(n)
+      case ValDecl(n, _, _, _)  => List(n)
+      case RefDecl(n, _)        => List(n)
+      case MultiDecl(ns, _, _)  => ns
+      case PatternDecl(p, _, _) => patternNames(p)
+      case _                    => Nil
+    }.toSet
+
+    // `main` is never one of them, however it is written. It is not a name the program calls but the
+    // one the *platform* calls, so it has no caller inside the body to have formed an environment for
+    // it — and a `main` that read one of the body's bindings would have quietly stopped being the
+    // program's entry point rather than being told it could not have them.
+    val funcs = body.collect { case f: FuncDecl if f.name != "main" => f }
+    val free  = funcs.map(f => f.name -> freeNames(f)).toMap
+    var group = funcs.filter(f => free(f.name).exists(bindings)).map(_.name).toSet
+    var more  = true
+
+    while more do
+      val next = group ++ funcs.filter(f => free(f.name).exists(group)).map(_.name)
+
+      more = next.size > group.size
+      group = next
+
+    group
+  }
+
+  /** Every name `f` reads that `f` does not bind — its parameters, its locals, and everything a
+   * nested block of its own introduces are all shadows, exactly as they are anywhere else.
+   *
+   * A binding is in scope for what comes *after* it, so a declaration's initializer is walked outside
+   * the shadow it casts: `var n = n` reads the outer `n`.
+   */
+  private def freeNames(f: FuncDecl): Set[String] = {
+    val found = mutable.LinkedHashSet.empty[String]
+
+    def walk(node: Any, bound: Set[String]): Set[String] = node match
+      case Ident(n) =>
+        if !bound(n) then found += n
+        bound
+      case VarDecl(n, _, init)   => init.foreach(walk(_, bound)); bound + n
+      case ValDecl(n, _, v, _)   => walk(v, bound); bound + n
+      case RefDecl(n, p)         => walk(p, bound); bound + n
+      case ConstDecl(n, _, v, _) => walk(v, bound); bound + n
+      case MultiDecl(ns, _, vs)  => vs.foreach(walk(_, bound)); bound ++ ns
+      case PatternDecl(p, _, v)  => walk(v, bound); bound ++ patternNames(p)
+      case g: FuncDecl           => walk(g.body, bound ++ g.params.map(_.name)); bound
+      case Lambda(ps, b)         => walk(b, bound ++ ps.map(_.name)); bound
+      case For(_, n, it, b, e) =>
+        walk(it, bound)
+        walk(b, bound + n)
+        e.foreach(walk(_, bound))
+        bound
+      case Quantifier(_, n, it, p) =>
+        walk(it, bound)
+        walk(p, bound + n)
+        bound
+      case MatchArm(ps, guard, b) =>
+        val inArm = bound ++ ps.flatMap(patternNames)
+
+        guard.foreach(walk(_, inArm))
+        walk(b, inArm)
+        bound
+      case stmts: List[?] => stmts.foldLeft(bound)((b, s) => walk(s, b))
+      case p: Product     => p.productIterator.foreach(walk(_, bound)); bound
+      case _              => bound
+
+    walk(f.body, f.params.map(_.name).toSet)
+    found.toSet
+  }
+
+  /** Every name a pattern binds, which shadows for the arm it introduces. */
+  private def patternNames(p: Pattern): List[String] = p match
+    case IdentPattern(n)       => List(n)
+    case BindPattern(n, inner) => n :: patternNames(inner)
+    case VariantPattern(_, ps) => ps.flatMap(patternNames)
+    case TuplePattern(ps)      => ps.flatMap(patternNames)
+    case StructPattern(_, fs)  => fs.flatMap((_, sub) => patternNames(sub))
+    case _                     => Nil
+
   /** The declarations of `u`, plus a `main` holding whatever else it carried.
    *
    * A unit that carries no statements is returned as it stands, so this is safe to apply to a whole
@@ -66,19 +172,40 @@ object Bodies {
    * the two keeps its meaning rather than becoming a duplicate-`main` error.
    */
   def wrapBody(u: Program): Program = {
-    val (decls, stmts) = u.body.partition(isDeclaration)
+    // The same split `ProgramWalk` makes, because a body *is* the top level of a file the program
+    // starts in and wrapping it must not change what it means. So a plain `val` moves into the `main`
+    // as the local it was, a helper that reads one moves with it, and only what belongs to the module
+    // stays outside.
+    //
+    // Where a declaration said `static`, the modifier has done its work by being read here and the
+    // wrapper leaves the plain declaration behind: once the statements are inside a `main`, the file
+    // has no body for anything to belong to instead, and the modifier would then be refused for
+    // saying nothing.
+    val captures       = capturing(u.body)
+    val (decls, stmts) = u.body.partition {
+      case f: FuncDecl => !captures(f.name)
+      case other       => isModuleMember(other)
+    }
+    val plain = decls.map {
+      case StaticDecl(inner) => inner
+      case other             => other
+    }
 
-    if stmts.isEmpty then u
+    // A unit carrying no statements is **not** a body, and is returned exactly as it stands. That
+    // guard is what makes this safe to apply file by file: only one file of a program is its body, so
+    // a sibling holding a table and the functions that read it must not have its `val` read as a
+    // local and carried into a `main` of its own.
+    if u.body.forall(isDeclaration) then u
     else
-      decls.indexWhere { case f: FuncDecl => f.name == "main"; case _ => false } match
+      plain.indexWhere { case f: FuncDecl => f.name == "main"; case _ => false } match
         case -1 =>
           val main = FuncDecl("main", Nil, Nil, None, stmts).setPos(stmts.head.pos)
 
-          u.copy(body = decls :+ main)
+          u.copy(body = plain :+ main)
         case i =>
-          val existing = decls(i).asInstanceOf[FuncDecl]
+          val existing = plain(i).asInstanceOf[FuncDecl]
 
-          u.copy(body = decls.updated(i, existing.copy(body = stmts ::: existing.body).setPos(existing.pos)))
+          u.copy(body = plain.updated(i, existing.copy(body = stmts ::: existing.body).setPos(existing.pos)))
   }
 
   /** Parses one body and wraps it, which is the whole of what a caller holding a string needs. */

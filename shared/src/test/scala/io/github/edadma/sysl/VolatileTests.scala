@@ -23,7 +23,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       |    data:   volatile u32
       |    baud:   u32
       |const UART: usize = 0x10000000
-      |val regs: *Uart = ptr_cast(UART)
+      |static val regs: *Uart = ptr_cast(UART)
       |""".stripMargin
 
   "a register block is a struct whose registers are qualified" - {
@@ -177,7 +177,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val src =
         """struct Gpio
           |    bank: [4]volatile u32
-          |val gpio: *Gpio = ptr_cast(usize(0x40000000))
+          |static val gpio: *Gpio = ptr_cast(usize(0x40000000))
           |read(i: usize) -> u32 = gpio.bank[i]
           |print(read(0))""".stripMargin
 
@@ -190,7 +190,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val src =
         """struct Gpio
           |    bank: [4]volatile u32
-          |val gpio: *Gpio = ptr_cast(usize(0x40000000))
+          |static val gpio: *Gpio = ptr_cast(usize(0x40000000))
           |read(i: usize) -> u32 = gpio.bank[i]
           |print(read(0))""".stripMargin
 
@@ -203,7 +203,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val src =
         """struct Gpio
           |    bank: [4]volatile u32
-          |val gpio: *Gpio = ptr_cast(usize(0x40000000))
+          |static val gpio: *Gpio = ptr_cast(usize(0x40000000))
           |read(xs: []volatile u32) -> u32 = xs[0]
           |print(read(gpio.bank[0..4]))""".stripMargin
 
@@ -216,7 +216,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val src =
         """struct Gpio
           |    bank: [4]volatile u32
-          |val gpio: *Gpio = ptr_cast(usize(0x40000000))
+          |static val gpio: *Gpio = ptr_cast(usize(0x40000000))
           |peek(xs: []const volatile u32) -> u32 = xs[0]
           |print(peek(gpio.bank[0..4]))""".stripMargin
 
@@ -252,7 +252,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err("f() -> volatile u32 = 1u32\nprint(f())") should include("the type of *storage*")
     }
     "a 'val', whose storage is this program's own" in {
-      err("val v: volatile u32 = 1u32\nprint(v)") should include("the type of *storage*")
+      err("static val v: volatile u32 = 1u32\nprint(v)") should include("the type of *storage*")
     }
     // An enum's payload is lifted out of a loaded aggregate rather than reached at an address, so
     // there is no single access for the qualifier to describe.
@@ -324,7 +324,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         """type Raw = new u32
           |struct Ctl
           |    raw: volatile Raw
-          |val c: *Ctl = ptr_cast(usize(4096))
+          |static val c: *Ctl = ptr_cast(usize(4096))
           |get() -> Raw = c.raw
           |print(u32(get()))""".stripMargin
 
@@ -343,7 +343,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val src =
         """struct S
           |    p: volatile *u32
-          |val s: *S = ptr_cast(usize(4096))
+          |static val s: *S = ptr_cast(usize(4096))
           |read() -> *u32 = s.p
           |print(*read())""".stripMargin
 
@@ -354,7 +354,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       val src =
         """struct S
           |    hook: volatile *extern() -> unit
-          |val s: *S = ptr_cast(usize(4096))
+          |static val s: *S = ptr_cast(usize(4096))
           |fire() -> unit = s.hook()
           |fire()""".stripMargin
 
@@ -505,7 +505,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |""".stripMargin,
       "main.sysl" ->
         """import dev
-          |val regs: *dev.Uart = ptr_cast(usize(0x10000000))
+          |static val regs: *dev.Uart = ptr_cast(usize(0x10000000))
           |read() -> u32 = regs.status
           |set() -> unit = regs.baud = 1u32
           |print(read())
@@ -606,7 +606,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |    nothing: unit
           |    reg:     volatile u32
           |    plain:   u32
-          |val p: *Pair = ptr_cast(usize(4096))
+          |static val p: *Pair = ptr_cast(usize(4096))
           |peek() -> u32 = p.reg
           |poke() -> unit = p.plain = 1u32
           |print(peek())

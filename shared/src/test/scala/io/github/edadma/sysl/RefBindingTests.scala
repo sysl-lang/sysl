@@ -25,7 +25,7 @@ class RefBindingTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       |    data:   volatile u32
       |    baud:   u32
       |const UART: usize = 0x10000000
-      |val regs: *Uart = ptr_cast(UART)
+      |static val regs: *Uart = ptr_cast(UART)
       |""".stripMargin
 
   "what the chapter claims" - {

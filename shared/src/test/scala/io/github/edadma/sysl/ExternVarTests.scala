@@ -64,7 +64,7 @@ class ExternVarTests
     }
 
     "not one a 'val' holds" in {
-      err("val n: int = 1\nextern n: i32\nprint(1)") should include("'n' is already used by a 'val'")
+      err("static val n: int = 1\nextern n: i32\nprint(1)") should include("'n' is already used by a 'val'")
     }
 
     "not one a constant holds" in {
@@ -113,7 +113,7 @@ class ExternVarTests
       val node = "struct Node\n    v: int\nend Node\n"
 
       ir(node + "extern r: &Node\nprint(str(r.v))") should include("@r = external global ptr")
-      err(node + "mk() -> &Node = Node(1)\nval r: &Node = mk()") should
+      err(node + "mk() -> &Node = Node(1)\nstatic val r: &Node = mk()") should
         include("a count with nowhere to write the release")
     }
 
@@ -179,12 +179,12 @@ class ExternVarTests
     */
   "it is a place, unlike a 'val'" - {
     "assignment reaches it, where a 'val' refuses" in {
-      err("val n: int = 1\nn = 2\nprint(n)") should include("a 'val' is written once")
+      err("static val n: int = 1\nn = 2\nprint(n)") should include("a 'val' is written once")
       ir("extern optind: i32\noptind = 3i32\nprint(optind)") should include("define")
     }
 
     "and so does its address, where a 'val' refuses that too" in {
-      err("val n: int = 1\nvar p = &n\nprint(*p)") should include("a 'val' is written once")
+      err("static val n: int = 1\nvar p = &n\nprint(*p)") should include("a 'val' is written once")
       ir("extern optind: i32\nvar p = &optind\nprint(*p)") should include("define")
     }
 
@@ -312,7 +312,7 @@ class ExternVarTests
     // view. There is no such promise here, so the view is the ordinary writable one — asserted by
     // *writing through it*, since that is the whole difference between the two types.
     "slicing yields a view that may be written, where a 'val's yields one that may not" in {
-      err("val t: [4]i32 = [0i32, 0i32, 0i32, 0i32]\nvar v = t[0..<2]\nv[0] = 1i32\nprint(v[0])") should
+      err("static val t: [4]i32 = [0i32, 0i32, 0i32, 0i32]\nvar v = t[0..<2]\nv[0] = 1i32\nprint(v[0])") should
         include("views elements it may not write")
       ir("extern tab: [4]i32\nvar v = tab[0..<2]\nv[0] = 1i32\nprint(v[0])") should include("define")
     }
@@ -387,7 +387,7 @@ class ExternVarTests
       * program's first instruction, so the read is ordered by the platform rather than by `13 §7`.
       */
     "a computed 'val' may be filled from one, and the loader has already filled it" in {
-      run("extern optind: i32\nval start: i32 = optind\nprint(start)") shouldBe "1\n"
+      run("extern optind: i32\nstatic val start: i32 = optind\nprint(start)") shouldBe "1\n"
     }
 
     // `testing.md`: a test build drops the entry point and dispatches to the `@test` functions

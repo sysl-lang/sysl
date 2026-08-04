@@ -2,12 +2,13 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** `main` — the named half of the entry point, and the arguments it is handed (`13 §7`).
+/** `main` — the named form of the entry point, and the arguments it is handed (`13 §7`).
  *
- * A program's top-level statements go on being its entry point; what a declared `main` adds is a
- * parameter list, which is the one thing a statement has no way to receive. So the two compose in a
- * fixed order — statements first, `main` after — and the only signatures are `main()` and
- * `main(args: []string)`.
+ * A program starts in **one** place. Statements at the top of a file and a `main` are two ways of
+ * writing that place, and a program writing both is refused: what a declared `main` adds is a
+ * parameter list, which is the one thing a statement has no way to receive, so a program that wants
+ * the arguments writes `main` and puts inside it what it would otherwise have written above. The only
+ * signatures are `main()` and `main(args: []string)`.
  *
  * The arguments arrive as a slice of `string` and never as C's pair: the library's `args_of` walks
  * the vector, finds each run's terminator, validates its bytes and copies them into strings the
@@ -16,13 +17,15 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
-  "a program runs its statements and then its main" - {
-    "the statements go first" in {
-      run("""main()
+  "a program starts in one place" - {
+    // Two entry points is what a reader sees, because it is what it is — and the order between them
+    // would be a rule to remember for a program that could have written one of them inside the other.
+    "so statements above a main are refused, naming the file that already carries them" in {
+      err("""main()
             |    print("main")
             |
             |print("statements")
-            |""".stripMargin) shouldBe "statements\nmain\n"
+            |""".stripMargin) should include("already carries the statements this one starts with")
     }
 
     "a main with nothing above it still runs" in {
@@ -35,38 +38,35 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       run("""print("no main here")""") shouldBe "no main here\n"
     }
 
-    // Three things run, in this order, and each is a different mechanism: a `val` is storage filled
-    // before anything else (`13 §7`), the statements are the entry point, and `main` is a call the
-    // entry point makes on its way out.
-    "a val is filled before the statements, which are before main" in {
+    // A `val` beside a `main` is a declaration, so the file carries no statements and there is no
+    // second entry point: it is storage filled before anything runs (`13 §7`), which is the one
+    // ordering left now that there is one place to start.
+    "a val beside it is filled before it runs" in {
       run("""val table: [3]int = [1, 2, 3]
             |
             |main()
-            |    print("main", table[0])
-            |
-            |print("statements", table[2])
-            |""".stripMargin) shouldBe "statements 3\nmain 1\n"
+            |    print("main", table[0], table[2])
+            |""".stripMargin) shouldBe "main 1 3\n"
     }
 
-    // A top-level `var` is a local of the entry point (`13 §7`), and `main` is an ordinary function:
-    // it reaches the module's members and none of the statements' own state.
-    "main does not reach a local of the statements" in {
+    // A `var` is not a declaration — it is storage the program fills as it runs — so a file holding
+    // one is the file the program starts in, and a `main` beside it is the second entry point above.
+    "while a var beside it makes its file the one the program starts in" in {
       err("""var count = 0
             |
             |main()
             |    print(count)
-            |""".stripMargin) should include("undefined name 'count'")
+            |""".stripMargin) should include("already carries the statements this one starts with")
     }
 
     // `main` is renamed on the way out, because the symbol it is written as is the one the platform
     // starts the program at. Calling it from the program too is what shows the definition and the
     // call site agree about that rename.
     "a program may call its own main, which then runs twice" in {
-      run("""main()
-            |    print("ran")
-            |
-            |main()
-            |""".stripMargin) shouldBe "ran\nran\n"
+      runWith("""main(args: []string)
+                |    print("ran")
+                |    if args.len > 0 then main([])
+                |""".stripMargin, "once") shouldBe "ran\nran\n"
     }
 
     "and a main declared in another module is still the program's" in {
@@ -74,11 +74,13 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         "app.sysl" -> """module app
                         |
                         |main()
-                        |    print("app's main")
+                        |    print("app's main", app.tag)
+                        |
+                        |val tag: int = 7
                         |""".stripMargin,
-        "start.sysl" -> """print("statements")
+        "start.sysl" -> """import app.*
                           |""".stripMargin,
-      ) shouldBe "statements\napp's main\n"
+      ) shouldBe "app's main 7\n"
     }
 
     // With no statements anywhere, the file the entry point is *read* in is the root (`13 §7`) while
@@ -328,16 +330,16 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
     // The rename has to hold at three places at once — the definition, a direct call, and the `call`
     // a closure's wrapper struct emits — and a callable is the one that reaches the third.
+    // The `main(args)` form, because the argument-free one passed to itself would not terminate:
+    // the recursion stops on the empty vector this hands it the second time round.
     "it may be passed as a callable" in {
-      run("""twice(f: () -> unit)
-            |    f()
-            |    f()
-            |
-            |main()
-            |    print("ran")
-            |
-            |twice(main)
-            |""".stripMargin) shouldBe "ran\nran\nran\n"
+      runWith("""apply(f: []string -> unit, a: []string)
+                |    f(a)
+                |
+                |main(args: []string)
+                |    print("ran")
+                |    if args.len > 0 then apply(main, [])
+                |""".stripMargin, "once") shouldBe "ran\nran\n"
     }
 
     "it may recurse, on a slice of its own arguments" in {
@@ -419,16 +421,15 @@ class EntryPointTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |""".stripMargin) shouldBe "a nested main\nstatements\n"
     }
 
-    // The wrapper's own parameters are `%argc` and `%argv`; a top-level `var` of either name is a
+    // The wrapper's own parameters are `%argc` and `%argv`; a `var` of either name inside `main` is a
     // slot called `%argc.addr`, so the two cannot be confused — but only a test says so.
-    "a top-level var may be called argc or argv" in {
+    "a var inside main may be called argc or argv" in {
       runWith("""main(args: []string)
+                |    var argc = 99
+                |    var argv = "not the vector"
+                |
+                |    print(argc, argv)
                 |    print("main sees", args.len)
-                |
-                |var argc = 99
-                |var argv = "not the vector"
-                |
-                |print(argc, argv)
                 |""".stripMargin, "one") shouldBe "99 not the vector\nmain sees 2\n"
     }
 

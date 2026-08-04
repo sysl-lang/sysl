@@ -292,14 +292,25 @@ class MultiAssignTests extends AnyFreeSpec with ParseSupport with RunSupport wit
     }
   }
 
-  /** A module member states its type (`13 §2`), and this form has nowhere to write one for any of
-   * its parts (`12 §5b`) — so it is a local, and a `val` at the top of a file has to say so rather
-   * than quietly becoming a local of the entry point while every other `val` there is a member.
-   */
-  "a multiple 'val' is a local form" in {
-    err("""val a, b = 1, 2
-          |print(a, b)
-          |""".stripMargin) should include("nowhere to write one")
+  /** A module member states its type (`13 §2`), and this form has nowhere to write one for any of its
+    * parts (`12 §5b`) — so it is a local form, and the one place that could be in doubt is a file the
+    * program starts in, where `static` is what asks for the member.
+    *
+    * Written plain it needs no rule at all now: everything a body declares is local, so a multiple
+    * `val` there is exactly what it looks like. The refusal is what `static` gets.
+    */
+  "a multiple 'val' is a local form" - {
+    "so written plain at the top of a program it is simply a local" in {
+      run("""val a, b = 1, 2
+            |print(a, b)
+            |""".stripMargin) shouldBe "1 2\n"
+    }
+
+    "while asking for the module's is refused, since the parts have nowhere to state a type" in {
+      err("""static val a, b = 1, 2
+            |print(a, b)
+            |""".stripMargin) should include("nowhere to write one")
+    }
   }
 
   "a field write re-checks its struct's invariant" - {

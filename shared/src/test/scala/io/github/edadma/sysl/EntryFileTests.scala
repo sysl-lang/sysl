@@ -36,14 +36,23 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
       ) shouldBe "first\nsecond\n7\n"
     }
 
-    // The cost of the helpers being nested functions, and it is worth stating rather than
-    // discovering: a group's environment is formed where the first of them is written, so a call
-    // above that point has no environment to make (`12 §5a`). Declaration order stops being free in
-    // the one file where the declarations are part of what runs.
-    "though a call above the helpers is refused, since their environment is formed where they are" in {
-      err(
+    // A helper that reads nothing is the module's, so declaration order is free exactly as it is
+    // anywhere else (`12 §4`).
+    "while one that reads nothing may be called above where it is written" in {
+      run(
         """print(str(later()))
           |later() -> int = 1""".stripMargin,
+      ) shouldBe "1\n"
+    }
+
+    // The cost of being a nested function, and it is worth stating rather than discovering: a
+    // group's environment is formed where the first of them is written, so a call above that point
+    // has no environment to make (`12 §5a`). It is paid only by a helper that has an environment.
+    "but one that reads a binding may not, since its environment is formed where it is" in {
+      err(
+        """print(str(later()))
+          |val base = 1
+          |later() -> int = base""".stripMargin,
       ) should include("declared below this call")
     }
 
@@ -118,25 +127,78 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
   }
 
-  "'static' is what a declaration writes to belong to the module instead" - {
-    // The three things a nested function cannot be. Each is a real program someone writes, and each
-    // is why the modifier exists rather than being a tidiness rule.
-    "a generic helper, which a nested function may not be" in {
+  /** `12 §5a`'s three limits — no generic, no address, not a value — are what holding a frame costs,
+    * not what being written in the entry file costs. So a helper reading nothing keeps all three, and
+    * only one that reads a binding pays them. A comparison handed to `qsort` is the shape that makes
+    * this matter: it reads nothing, and refusing its address for the frame it reads would be naming a
+    * frame that does not exist.
+    */
+  "what a helper may be depends on whether it reads anything, not on where it is written" - {
+    "so a generic one is ordinary" in {
       run(
-        """static first[A, B](a: A, b: B) -> A = a
+        """first[A, B](a: A, b: B) -> A = a
           |print(str(first(1, "x")))""".stripMargin,
       ) shouldBe "1\n"
     }
 
-    "a function whose address is taken, which a nested one has none of" in {
+    "and its address may be taken" in {
       run(
-        """static twice(n: int) -> int = n * 2
+        """twice(n: int) -> int = n * 2
           |val f: *extern(int) -> int = &twice
           |print(str(f(21)))""".stripMargin,
       ) shouldBe "42\n"
     }
 
-    "and a name another file reads, which a local is not" in {
+    "and another file reads it, since it is the module's" in {
+      runIn(
+        ("", "main.sysl", "print(str(doubled(4)))"),
+        ("", "other.sysl", "doubled(n: int) -> int = n * 2"),
+      ) shouldBe "8\n"
+    }
+
+    "while one that reads a binding is nested, and has no address" in {
+      err(
+        """val base = 2
+          |scaled(n: int) -> int = n * base
+          |val f: *extern(int) -> int = &scaled
+          |print(str(f(21)))""".stripMargin,
+      ) should include("has no address to take")
+    }
+
+    "and may not be generic" in {
+      err(
+        """val base = 2
+          |scaled[T](n: T) -> int = base
+          |print(str(scaled(1)))""".stripMargin,
+      ) should include("cannot be generic")
+    }
+
+    // Capture reaches through a sibling call: the nested functions of a block share one environment
+    // (`12 §5a`), so calling one that reads a binding needs that environment too.
+    // `main` is the platform's symbol, not a name the program calls, so it can never be one of the
+    // body's — and a `main` reading a binding used to become one silently, leaving the program with
+    // no entry point at all and no complaint about it.
+    "while 'main' is never one of them, however it is written" in {
+      err(
+        """var count = 0
+          |main()
+          |    print(count)""".stripMargin,
+      ) should include("already carries the statements this one starts with")
+    }
+
+    "and neither may one that only calls such a helper" in {
+      err(
+        """val base = 2
+          |scaled(n: int) -> int = n * base
+          |twice(n: int) -> int = scaled(n)
+          |val f: *extern(int) -> int = &twice
+          |print(str(f(21)))""".stripMargin,
+      ) should include("has no address to take")
+    }
+  }
+
+  "'static' is what a binding writes to belong to the module instead" - {
+    "so another file reads it" in {
       runIn(
         ("", "main.sysl", "static val shared: int = 4\nprint(str(doubled()))"),
         ("", "other.sysl", "doubled() -> int = shared * 2"),
@@ -145,10 +207,11 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
 
     // The mirror of the first test in this file: a module member is bound before any statement runs,
     // so its initializer cannot call something that is part of the body.
-    "and its initializer is bound before the body, so it may not call a local helper" in {
+    "while its initializer is bound before the body, so it may not call a helper that reads one" in {
       err(
-        """static val n: int = helper()
-          |helper() -> int = 1
+        """var seed = 1
+          |helper() -> int = seed
+          |static val n: int = helper()
           |print(str(n))""".stripMargin,
       ) should include("undefined function 'helper'")
     }
@@ -181,7 +244,14 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
 
     "and on a declaration that is a module member wherever it is written" in {
       err("static const n: int = 1\nprint(str(n))") should
-        include("'static' marks a 'val', a 'var' or a function")
+        include("'static' marks a 'val' or a 'var'")
+    }
+
+    // A function is settled by what it reads, so the modifier would be either redundant or
+    // impossible — and a reader expecting it on one is told which.
+    "and on a function, which is settled by what it reads rather than by a modifier" in {
+      err("static f() -> int = 1\nprint(str(f()))") should
+        include("a function is one unless it reads a binding of the body")
     }
   }
 

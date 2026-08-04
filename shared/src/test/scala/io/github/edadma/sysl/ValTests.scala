@@ -112,7 +112,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |
           |print(str(n))
           |
-          |static noisy() -> int
+          |noisy() -> int
           |    print("initializer")
           |    7
           |end noisy""".stripMargin,
@@ -234,7 +234,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    a: int
           |    b: int
           |end Pair
-          |static n() -> int = 1
+          |n() -> int = 1
           |static val p: Pair = Pair(n(), 2)
           |print(str(p.a))""".stripMargin,
       )
@@ -505,7 +505,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       run(
         """static val greeting: string = "hello"
           |static val n: usize = twice()
-          |static twice() -> usize = greeting.len * 2
+          |twice() -> usize = greeting.len * 2
           |print(n)""".stripMargin,
       ) shouldBe "10\n"
     }
@@ -599,7 +599,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    base: *u32
           |    id:   int
           |end Dev
-          |static mk() -> Dev = Dev(ptr_cast(malloc(8)), 5)
+          |mk() -> Dev = Dev(ptr_cast(malloc(8)), 5)
           |static val d: Dev = mk()
           |print(str(d.id))""".stripMargin,
       ) shouldBe "5\n"
@@ -610,7 +610,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // test rather than by being meant, so it is pinned here now that the rule names it.
     "the address of a function, and a call through the one it holds" in {
       run(
-        """static g(x: int) -> int = x + 1
+        """g(x: int) -> int = x + 1
           |static val f: *extern(int) -> int = &g
           |print(str(f(3)))""".stripMargin,
       ) shouldBe "4\n"
@@ -636,7 +636,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    Empty
           |    At(p: *u8)
           |end Slot
-          |static mk() -> Slot = At(malloc(8))
+          |mk() -> Slot = At(malloc(8))
           |static val s: Slot = mk()
           |s match
           |    At(p) -> print(str(usize(p) != 0))
@@ -650,7 +650,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |struct Cell[T]
           |    p: *T
           |end Cell
-          |static mk() -> Cell[int] = Cell(ptr_cast(malloc(8)))
+          |mk() -> Cell[int] = Cell(ptr_cast(malloc(8)))
           |static val c: Cell[int] = mk()
           |c.p[0] = 6
           |print(str(c.p[0]))""".stripMargin,
@@ -662,7 +662,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "a tuple with one in it, where a tuple with a reference is still refused" in {
       run(
         """extern malloc(n: usize) -> *u8
-          |static mk() -> (int, *u8) = (1, malloc(8))
+          |mk() -> (int, *u8) = (1, malloc(8))
           |static val t: (int, *u8) = mk()
           |print(str(t.0))""".stripMargin,
       ) shouldBe "1\n"
@@ -671,7 +671,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
         """struct Node
           |    v: int
           |end Node
-          |static mk() -> (int, &Node) = (1, Node(2))
+          |mk() -> (int, &Node) = (1, Node(2))
           |static val t: (int, &Node) = mk()
           |print("ok")""".stripMargin,
       ) should include("a count with nowhere to write the release")
@@ -948,7 +948,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
 
     "a reference, which is the count itself" in {
-      err("struct P\n    x: int\nend P\nstatic mk() -> &P = P(1)\nstatic val r: &P = mk()") should
+      err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val r: &P = mk()") should
         include("a count with nowhere to write the release")
     }
 

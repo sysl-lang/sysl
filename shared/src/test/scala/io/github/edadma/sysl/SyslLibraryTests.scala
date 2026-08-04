@@ -53,7 +53,7 @@ class SyslLibraryTests extends AnyFreeSpec with Matchers {
       assume(Sysl.canRun, "clang not available")
       Sysl.runBody(
         """double(n: int) -> int = n * 2
-          |val base: int = 21
+          |static val base: int = 21
           |print(double(base))""".stripMargin,
       ) shouldBe Right(Sysl.Run(0, "42\n"))
     }
@@ -138,7 +138,7 @@ class SyslLibraryTests extends AnyFreeSpec with Matchers {
     }
 
     "for one the parser finds" in {
-      Sysl.compileBody("val n: int") match
+      Sysl.compileBody("static val n: int") match
         case Left(e)  => e should not be empty
         case Right(_) => fail("expected a diagnostic")
     }

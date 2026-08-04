@@ -30,7 +30,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |            c = if c & 1u32 != 0u32 then c >> 1u32 ^ 0xEDB88320u32 else c >> 1u32
           |        t[n] = c
           |    t
-          |val crc_table: [256]u32 = build()
+          |static val crc_table: [256]u32 = build()
           |print(crc_table[0], crc_table[1], crc_table[255])""".stripMargin
 
       run(src) shouldBe "0 1996959894 755167117\n"
@@ -39,7 +39,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // The declaration a constant initializer already accepted is unchanged — it is still laid into
     // the object file, and the way to see that from outside is that it is still a `constant`.
     "a constant initializer is still written into the object file" in {
-      val out = ir("val k: [4]int = [1, 2, 3, 4]\nprint(k[2])")
+      val out = ir("static val k: [4]int = [1, 2, 3, 4]\nprint(k[2])")
 
       out should include("@k = private constant [4 x i32] [i32 1, i32 2, i32 3, i32 4]")
       out should not include "@k = private global"
@@ -47,7 +47,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
     // …and a computed one is storage that gets written, which is a different LLVM declaration.
     "a computed one is storage that the program fills" in {
-      val out = ir("f() -> int = 7\nval n: int = f()\nprint(n)")
+      val out = ir("f() -> int = 7\nstatic val n: int = f()\nprint(n)")
 
       out should include("@n = private global i32 zeroinitializer")
       out should include("store i64")
@@ -58,7 +58,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         """report() -> int
           |    print("built")
           |    3
-          |val n: int = report()
+          |static val n: int = report()
           |print("running")
           |print(n)""".stripMargin
 
@@ -70,8 +70,8 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "one built out of another is filled after it" in {
       val src =
         """double(x: int) -> int = x * 2
-          |val b: int = double(a)
-          |val a: int = double(21)
+          |static val b: int = double(a)
+          |static val a: int = double(21)
           |print(a, b)""".stripMargin
 
       run(src) shouldBe "42 84\n"
@@ -82,9 +82,9 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "the read may be inside a function the initializer calls" in {
       val src =
         """base() -> int = 10
-          |val a: int = base()
+          |static val a: int = base()
           |from_a() -> int = a + 5
-          |val b: int = from_a()
+          |static val b: int = from_a()
           |print(a, b)""".stripMargin
 
       run(src) shouldBe "10 15\n"
@@ -94,8 +94,8 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       val e = err(
         """from_b() -> int = b + 1
           |from_a() -> int = a + 1
-          |val a: int = from_b()
-          |val b: int = from_a()""".stripMargin
+          |static val a: int = from_b()
+          |static val b: int = from_a()""".stripMargin
       )
 
       e should include("cannot be initialized")
@@ -104,33 +104,33 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
 
     "and so is an initializer that needs itself" in {
-      err("me() -> int = n\nval n: int = me()") should include("cannot be initialized")
+      err("me() -> int = n\nstatic val n: int = me()") should include("cannot be initialized")
     }
 
     // A **computed** `val` counts nothing, which is where the rule bites now that a constant one may
     // hold a literal string: the two forms are told apart by the initializer, and the release a
     // computed value owes is exactly the one there is no line to write.
     "a reference cannot be held in one" in {
-      val e = err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nval p: &P = mk()")
+      val e = err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val p: &P = mk()")
 
       e should include("cannot be a 'val'")
       e should include("a count with nowhere to write the release")
     }
 
     "nor a string a function returned, where the constant form may hold a literal" in {
-      err("val s: string = str(1)") should include("a count with nowhere to write the release")
+      err("static val s: string = str(1)") should include("a count with nowhere to write the release")
 
-      run("val s: string = \"hi\"\nprint(s)") shouldBe "hi\n"
+      run("static val s: string = \"hi\"\nprint(s)") shouldBe "hi\n"
     }
 
     "nor a slice" in {
-      err("val xs: []int = [1, 2, 3]") should include("a count with nowhere to write the release")
+      err("static val xs: []int = [1, 2, 3]") should include("a count with nowhere to write the release")
     }
 
     // The read-only rule is about the storage, not about how it was filled — a computed table is no
     // more writable than a written-down one.
     "a computed one is still read-only" in {
-      val src = "build() -> [2]int = [1, 2]\nval k: [2]int = build()\nk[0] = 9"
+      val src = "build() -> [2]int = [1, 2]\nstatic val k: [2]int = build()\nk[0] = 9"
 
       err(src) should include("a 'val' is written once")
     }
@@ -146,7 +146,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    y: int
           |end Point
           |origin() -> Point = Point(3, 4)
-          |val o: Point = origin()
+          |static val o: Point = origin()
           |print(o.x, o.y)""".stripMargin
 
       run(src) shouldBe "3 4\n"
@@ -159,7 +159,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    Round(r: int)
           |end Shape
           |pick() -> Shape = Round(5)
-          |val s: Shape = pick()
+          |static val s: Shape = pick()
           |s match
           |    Round(r) -> print(r)
           |    Dot -> print(0)""".stripMargin
@@ -175,7 +175,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    Node(next: &Tree)
           |end Tree
           |mk() -> Tree = Leaf
-          |val t: Tree = mk()""".stripMargin
+          |static val t: Tree = mk()""".stripMargin
 
       err(src) should include("a count with nowhere to write the release")
     }
@@ -191,7 +191,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    for i in 0usize..<3
           |        out[i] = Pair(int(i), int(i) * int(i))
           |    out
-          |val ps: [3]Pair = build()
+          |static val ps: [3]Pair = build()
           |print(ps[2].a, ps[2].b)""".stripMargin
 
       run(src) shouldBe "2 4\n"
@@ -201,9 +201,9 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "a chain of three is sorted whichever way it was written" in {
       val src =
         """plus(x: int, y: int) -> int = x + y
-          |val c: int = plus(b, 1)
-          |val b: int = plus(a, 1)
-          |val a: int = plus(0, 1)
+          |static val c: int = plus(b, 1)
+          |static val b: int = plus(a, 1)
+          |static val a: int = plus(0, 1)
           |print(a, b, c)""".stripMargin
 
       run(src) shouldBe "1 2 3\n"
@@ -215,11 +215,11 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         """count() -> int
           |    print("base")
           |    2
-          |val base: int = count()
+          |static val base: int = count()
           |left() -> int = base * 10
           |right() -> int = base * 100
-          |val l: int = left()
-          |val r: int = right()
+          |static val l: int = left()
+          |static val r: int = right()
           |print(l, r)""".stripMargin
 
       run(src) shouldBe "base\n20 200\n"
@@ -230,9 +230,9 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // started.
     "reading a constant 'val' needs no ordering" in {
       val src =
-        """val seed: [3]int = [4, 5, 6]
+        """static val seed: [3]int = [4, 5, 6]
           |sum() -> int = seed[0] + seed[1] + seed[2]
-          |val total: int = sum()
+          |static val total: int = sum()
           |print(total)""".stripMargin
 
       run(src) shouldBe "15\n"
@@ -275,9 +275,9 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     "an initializer that goes through a generic is ordered" in {
       val src =
         """twice[T: Add](x: T) -> T = x + x
-          |val a: int = twice(21)
+          |static val a: int = twice(21)
           |from_a() -> int = twice(a)
-          |val b: int = from_a()
+          |static val b: int = from_a()
           |print(a, b)""".stripMargin
 
       run(src) shouldBe "42 84\n"
@@ -289,9 +289,9 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         """fa() -> int = c
           |fb() -> int = a
           |fc() -> int = b
-          |val a: int = fa()
-          |val b: int = fb()
-          |val c: int = fc()""".stripMargin
+          |static val a: int = fa()
+          |static val b: int = fb()
+          |static val c: int = fc()""".stripMargin
       )
 
       e should include("its value needs")
@@ -305,7 +305,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         """even(n: int) -> bool = if n == 0 then true else odd(n - 1)
           |odd(n: int) -> bool = if n == 0 then false else even(n - 1)
           |start() -> int = if even(10) then 1 else 0
-          |val flag: int = start()
+          |static val flag: int = start()
           |print(flag)""".stripMargin
 
       run(src) shouldBe "1\n"
@@ -324,7 +324,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    for x in b.view()
           |        s += x
           |    s
-          |val n: int = total()
+          |static val n: int = total()
           |print(n)""".stripMargin
 
       run(src) shouldBe "10\n"
@@ -346,8 +346,8 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    var s: *Source = &f
           |    s.get()
           |seed() -> int = 6
-          |val answer: int = ask()
-          |val base: int = seed()
+          |static val answer: int = ask()
+          |static val base: int = seed()
           |print(base, answer)""".stripMargin
 
       run(src) shouldBe "6 42\n"
@@ -360,7 +360,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         """noisy() -> int
           |    print("filled")
           |    1
-          |val unread: int = noisy()
+          |static val unread: int = noisy()
           |print("done")""".stripMargin
 
       run(src) shouldBe "filled\ndone\n"
@@ -373,8 +373,8 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         """say(s: string) -> int
           |    print(s)
           |    0
-          |val first: int = say("one")
-          |val second: int = say("two")
+          |static val first: int = say("one")
+          |static val second: int = say("two")
           |print(first + second)""".stripMargin
 
       run(src) shouldBe "one\ntwo\n0\n"
@@ -399,7 +399,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // The value may be produced by an expression that is not a call at all — what decides is whether
     // the object file could have carried it, not what shape the source took.
     "an arithmetic initializer is computed, not folded" in {
-      val out = ir("const w: int = 3\nval n: int = w * w\nprint(n)")
+      val out = ir("const w: int = 3\nstatic val n: int = w * w\nprint(n)")
 
       out should include("@n = private global i32 zeroinitializer")
     }
@@ -413,7 +413,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    var xs: [2]int
           |    var i = 5
           |    xs[i]
-          |val n: int = boom()
+          |static val n: int = boom()
           |print("never")""".stripMargin
       )
     }
@@ -426,7 +426,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    it: &int
           |end Holder
           |mk() -> Holder = Holder(3)
-          |val h: Holder = mk()""".stripMargin
+          |static val h: Holder = mk()""".stripMargin
 
       err(src) should include("a count with nowhere to write the release")
     }
@@ -434,7 +434,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // A computed `val` slices exactly as a written-down one does, and the view it gives carries the
     // read-only property for the same reason: the property is the storage's, not the initializer's.
     "slicing a computed one gives a view that may not be written, as a written-down one's does" in {
-      err("build() -> [4]int = [1, 2, 3, 4]\nval k: [4]int = build()\nvar s = k[1..<3]\ns[0] = 9") should
+      err("build() -> [4]int = [1, 2, 3, 4]\nstatic val k: [4]int = build()\nvar s = k[1..<3]\ns[0] = 9") should
         include("views elements it may not write")
     }
 
@@ -449,8 +449,8 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    lt(self, o: Rank) -> bool = self.n + bias < o.n
           |pick() -> int = if Rank(1) < Rank(3) then 1 else 0
           |seed() -> int = 5
-          |val flag: int = pick()
-          |val bias: int = seed()
+          |static val flag: int = pick()
+          |static val bias: int = seed()
           |print(bias, flag)""".stripMargin
 
       run(src) shouldBe "5 0\n"
@@ -464,8 +464,8 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         """ten() -> int = 10
           |type Small = int within 0..100 where value < limit
           |make() -> Small = 3
-          |val flag: int = int(make())
-          |val limit: int = ten()
+          |static val flag: int = int(make())
+          |static val limit: int = ten()
           |print(limit, flag)""".stripMargin
 
       run(src) shouldBe "10 3\n"
@@ -480,8 +480,8 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    require x < limit
           |    x * 2
           |seed() -> int = 4
-          |val v: int = guarded(3)
-          |val limit: int = seed()
+          |static val v: int = guarded(3)
+          |static val limit: int = seed()
           |print(v)""".stripMargin
 
       run(src) shouldBe "6\n"
@@ -491,7 +491,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // having an address, and a value with no representation has nothing to put one on. Before
     // initializers could be computed this was unreachable, since no constant tree is a `unit`.
     "a 'val' of a type that occupies nothing is refused" in {
-      val e = err("noise() -> unit\n    print(\"hi\")\nval u: unit = noise()")
+      val e = err("noise() -> unit\n    print(\"hi\")\nstatic val u: unit = noise()")
 
       e should include("occupies nothing")
       e should include("no storage")
@@ -506,12 +506,12 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
         ("up", "up.sysl",
           """module up
             |from_down() -> int = down.b + 1
-            |val a: int = from_down()
+            |static val a: int = from_down()
             |""".stripMargin),
         ("down", "down.sysl",
           """module down
             |from_up() -> int = up.a + 1
-            |val b: int = from_up()
+            |static val b: int = from_up()
             |""".stripMargin),
       )
 
@@ -533,7 +533,7 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
           |    for i in 0usize..<4
           |        t[i] = int(i) * 3
           |    t
-          |val k: [4]int = build()
+          |static val k: [4]int = build()
           |var s = 0
           |for x in k
           |    s += x
@@ -555,33 +555,33 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     */
   "a val at a checked type is filled, because a check is code" - {
     "a constrained one is storage rather than a constant, though its initializer is a literal" in {
-      val out = ir("type Age = int within 0..150\nval a: Age = 30\nprint(a)")
+      val out = ir("type Age = int within 0..150\nstatic val a: Age = 30\nprint(a)")
 
       out should include("@a = private global i32 zeroinitializer")
       out should not include "@a = private constant"
     }
 
     "and the value it is out of range for stops the program" in {
-      exits("type Age = int within 0..150\nval a: Age = 200\nprint(a)")
+      exits("type Age = int within 0..150\nstatic val a: Age = 200\nprint(a)")
     }
 
     "while the one in range reads back" in {
-      run("type Age = int within 0..150\nval a: Age = 30\nprint(a)") shouldBe "30\n"
+      run("type Age = int within 0..150\nstatic val a: Age = 30\nprint(a)") shouldBe "30\n"
     }
 
     "a 'where' predicate is checked there too" in {
-      run("type Even = int where value % 2 == 0\nval e: Even = 30\nprint(e)") shouldBe "30\n"
-      exits("type Even = int where value % 2 == 0\nval e: Even = 7\nprint(e)")
+      run("type Even = int where value % 2 == 0\nstatic val e: Even = 30\nprint(e)") shouldBe "30\n"
+      exits("type Even = int where value % 2 == 0\nstatic val e: Even = 7\nprint(e)")
     }
 
     // An element of an array is a produce site of its own, so a table of a constrained type is
     // checked element by element — and the array is filled rather than laid down for that reason.
     "so is every element of a table of them" in {
-      val out = ir("type Age = int within 0..150\nval xs: [2]Age = [1, 2]\nprint(xs[1])")
+      val out = ir("type Age = int within 0..150\nstatic val xs: [2]Age = [1, 2]\nprint(xs[1])")
 
       out should include("@xs = private global [2 x i32] zeroinitializer")
-      run("type Age = int within 0..150\nval xs: [2]Age = [1, 2]\nprint(xs[1])") shouldBe "2\n"
-      exits("type Age = int within 0..150\nval xs: [2]Age = [1, 200]\nprint(xs[1])")
+      run("type Age = int within 0..150\nstatic val xs: [2]Age = [1, 2]\nprint(xs[1])") shouldBe "2\n"
+      exits("type Age = int within 0..150\nstatic val xs: [2]Age = [1, 200]\nprint(xs[1])")
     }
 
     // A struct invariant is the same question about a different check.
@@ -601,10 +601,10 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     // The derived case, which carries no check at all and is still filled: a conversion is not one
     // of the three things `13 §7` calls a constant tree, so it is code by that rule alone.
     "a derivation with nothing to check is code all the same" in {
-      val out = ir("type Meters = new int\nval m: Meters = Meters(30)\nprint(int(m))")
+      val out = ir("type Meters = new int\nstatic val m: Meters = Meters(30)\nprint(int(m))")
 
       out should include("@m = private global i32 zeroinitializer")
-      run("type Meters = new int\nval m: Meters = Meters(30)\nprint(int(m))") shouldBe "30\n"
+      run("type Meters = new int\nstatic val m: Meters = Meters(30)\nprint(int(m))") shouldBe "30\n"
     }
   }
 }

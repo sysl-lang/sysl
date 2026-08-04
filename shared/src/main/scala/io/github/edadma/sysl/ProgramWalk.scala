@@ -82,6 +82,8 @@ trait ProgramWalk
     // has.
     val entry = entryFile(files)
 
+    refuseTwoBeginnings(files, entry)
+
     // `static` is how a declaration in that body opts back into the module, so past this point
     // nothing else in the compiler has a case for one: the inner declaration is handed to the
     // hoisting passes exactly as another file's would be.
@@ -89,8 +91,17 @@ trait ProgramWalk
       case StaticDecl(inner) => inner
       case other             => other
 
+    // A function at the top of the entry file is the module's unless it reads something the body
+    // binds. `12 §5a`'s limits — no generic, no address, not a value — are what holding a frame
+    // costs, so a function holding none keeps everything an ordinary one has.
+    val captures = entry.map((u, _) => Bodies.capturing(u.body)).getOrElse(Set.empty)
+
+    def belongsToModule(s: Stmt) = s match
+      case f: FuncDecl => !captures(f.name)
+      case other       => Bodies.isModuleMember(other)
+
     def contributed(u: Program) =
-      if entry.exists(_._1 eq u) then u.body.filter(Bodies.isModuleMember).map(unstatic)
+      if entry.exists(_._1 eq u) then u.body.filter(belongsToModule).map(unstatic)
       else u.body.map(unstatic)
 
     // Everywhere else it says nothing, because everywhere else there is no body for a declaration to
@@ -271,7 +282,7 @@ trait ProgramWalk
     for f <- ourMembers do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
-    val (mainScope, mainStmts) = entryPoint(entry)
+    val (mainScope, mainStmts) = entryPoint(entry, captures)
 
     resetFunction()
     tsubst = Map.empty
@@ -284,7 +295,7 @@ trait ProgramWalk
     // The `main` the program runs after those statements, if it declared one. Read here rather than
     // during hoisting because the conversion it may want is a library function, and marking one as
     // reached has to happen before the loop below decides which of them are worth analyzing.
-    val tentry = recover(Option.empty[TEntry])(declaredEntry())
+    val tentry = recover(Option.empty[TEntry])(declaredEntry(entry))
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An
     // instantiation of a member the definition-time pass already reported is dropped rather than
@@ -393,13 +404,37 @@ trait ProgramWalk
    * exit status, which nothing in the language spells yet, and a parameter list of the platform's own
    * `argc`/`argv` is exactly what `args_of` exists so that no program has to write.
    */
-  private def declaredEntry(): Option[TEntry] = {
+  /** A program starts in **one** place, and statements at the top of a file and a `main` are two ways
+   * of writing that place (`13 §7`).
+   *
+   * A program writing both would have two entry points and an order between them to remember, which
+   * is what it reads as to anybody who opens it. Whichever of the two the program means, the other
+   * belongs inside it — and what a `main` has that statements do not is a parameter list, so a
+   * program wanting the arguments writes `main` and puts inside it what it would have written above.
+   *
+   * Reported here rather than where `main` is resolved, because it is the *cause* of whatever else
+   * goes wrong: a `main` written beside statements reaches for their bindings and is told about each
+   * one of them, and those complaints are consequences of a program having two beginnings.
+   */
+  private def refuseTwoBeginnings(files: List[(Program, Scope)], entry: Option[(Program, Scope)]): Unit =
+    for
+      (u, _) <- entry
+      (f, _) <- files
+      m      <- f.body.collectFirst { case d: FuncDecl if d.name == "main" => d }
+    do
+      currentPos = m.pos
+      recover(())(err(s"a program starts in one place, and ${u.source.name} already carries the " +
+        "statements this one starts with — so this 'main' is a second. Whichever of the two the " +
+        "program means, the other belongs inside it"))
+
+  private def declaredEntry(entry: Option[(Program, Scope)]): Option[TEntry] = {
     val declared = funcDecls.keys.filter(k => Modules.bare(k) == "main" && !externDecls.contains(k)).toList
 
     declared match
       case Nil => None
       case key :: rest =>
         val decl = funcDecls(key)
+
 
         for extra <- rest do
           at(funcDecls(extra).pos) {
@@ -529,10 +564,14 @@ trait ProgramWalk
    * makes a `val` there an ordinary local: it is initialized where it is written, rather than before
    * every statement in the file the way a module member's is.
    */
-  private def entryPoint(entry: Option[(Program, Scope)]): (Scope, List[Stmt]) =
+  private def entryPoint(entry: Option[(Program, Scope)], captures: Set[String]): (Scope, List[Stmt]) =
     entry match
-      case None         => (Scope.root, Nil)
-      case Some((u, s)) => (s, u.body.filterNot(Bodies.isModuleMember))
+      case None => (Scope.root, Nil)
+      case Some((u, s)) =>
+        (s, u.body.filterNot {
+          case f: FuncDecl => !captures(f.name)
+          case other       => Bodies.isModuleMember(other)
+        })
 
   // --- module-level `val`s --------------------------------------------------------------
 

@@ -792,7 +792,7 @@ class VisibilityTests extends AnyFreeSpec with CodegenSupport with RunSupport wi
       errIn(("", "main.sysl",
         """private struct Point
           |    x: int
-          |val here: Point = Point(1)
+          |static val here: Point = Point(1)
           |print(1)
           |""".stripMargin)) should include("'here' is public, but its type names 'Point'")
     }
