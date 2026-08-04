@@ -9,7 +9,7 @@ reachable from a module that has given up its allocator and its operating system
 because creating a thread needs a scheduler underneath it.
 
 ```sysl
-no threads
+@no_threads
 
 import sysl.sync.*
 import sysl.thread.spawn
@@ -32,8 +32,8 @@ The module declares **two** requirements, and both are written because neither i
 
 ```
 module sysl.thread
-requires threads
-requires posix
+@requires(threads)
+@requires(posix)
 ```
 
 `threads` because a scheduler is an environment capability. `posix` because **pthreads is what this

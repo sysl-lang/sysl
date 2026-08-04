@@ -617,12 +617,12 @@ class FuncAddressTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       */
     "an address in a 'no alloc' module reaches what the function reaches" in {
       irOf("thing/a.sysl" ->
-        ("module thing\nno alloc\n\nplain(n: i32) -> i32 = n * 2\n" +
+        ("module thing\n@no_alloc\n\nplain(n: i32) -> i32 = n * 2\n" +
           "addr() -> *extern(i32) -> i32 = &plain\n"),
         "main.sysl" -> "print(thing.addr()(21))") should include("define")
 
       errOf("thing/a.sysl" ->
-        ("module thing\nno alloc\n\nboxes(n: int) -> &int = n\n" +
+        ("module thing\n@no_alloc\n\nboxes(n: int) -> &int = n\n" +
           "addr() -> *extern(int) -> &int = &boxes\n"),
         "main.sysl" -> "print(*thing.addr()(1))") should
         include("an allocator-free module may only call what is allocator-free itself")

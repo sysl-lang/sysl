@@ -244,7 +244,7 @@ class ExternVarTests
     // followed. Naming C's storage allocates nothing either, and a `no alloc` module may do it.
     "a 'no alloc' module may name one, because reading C's storage allocates nothing" in {
       irOf(
-        "drv/a.sysl" -> "module drv\nno alloc\n\nextern optind: i32\n\nstep()\n    optind = 1i32\n",
+        "drv/a.sysl" -> "module drv\n@no_alloc\n\nextern optind: i32\n\nstep()\n    optind = 1i32\n",
         "main.sysl"  -> "drv.step()\nprint(1)",
       ) should include("@optind = external global i32")
     }
@@ -376,7 +376,7 @@ class ExternVarTests
     // nothing at all — so a `no alloc` module writing one is not a narrowing it broke.
     "a 'no alloc' module writing one is not a narrowing it broke" in {
       irOf(
-        "drv/a.sysl" -> "module drv\nno alloc\n\nextern optind: i32\n\nreset()\n    optind = 1i32\n",
+        "drv/a.sysl" -> "module drv\n@no_alloc\n\nextern optind: i32\n\nreset()\n    optind = 1i32\n",
         "main.sysl"  -> "drv.reset()\nprint(1)",
       ) should include("store i32 1, ptr @optind")
     }

@@ -114,9 +114,16 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with RunSupport
                           |t() = 0
                           |""".stripMargin)
 
-      message should include("'packed' is not an annotation sysl knows")
+      message should include("'packed' is not an annotation a declaration takes")
 
       for known <- List("@test", "@tailrec", "@pure", "@ghost") do message should include(known)
+
+      // The header's three are named too, and for the reason the four above are: a reader who wrote
+      // `@link` over a function has the right annotation in the wrong place, and the message that
+      // only listed what a *declaration* takes would leave them looking for a name that is not
+      // missing. Asserted one at a time for the same reason — the sentence may change, the set is
+      // what matters.
+      for known <- List("@no_", "@requires", "@link") do message should include(known)
     }
 
     /** `#` where `@` was meant — the sigil someone arriving from Rust or C reaches for, and the one

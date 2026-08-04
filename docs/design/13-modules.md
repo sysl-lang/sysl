@@ -454,25 +454,32 @@ with separate costs. What the build driver does with this belongs to open item (
 computed; this section states only how they attach to the module model of §1, which is the piece
 that doc left to here.
 
-- **A capability clause narrows the module**, and it is written in the **file header** beside
-  `module`. Because the module is the directory (§1) and the clause is a property of the module,
-  a narrowing clause **must appear consistently in every file of the module** — the compiler
+- **A capability attribute narrows the module**, and it is written in the **file header** below
+  `module`. Because the module is the directory (§1) and the capability is a property of the module,
+  a narrowing **must appear consistently in every file of the module** — the compiler
   rejects a module whose files disagree. The redundancy buys local legibility: you can never open
-  a file in a `no alloc` module and fail to see that it is `no alloc`.
-- **Each clause takes a line of its own**, below the header rather than beside it, which is what
-  keeps `module oskit.arch no alloc requires os` from being a line anyone has to read. A file that
+  a file in a `@no_alloc` module and fail to see that it is one.
+- **They are attributes rather than grammar, and that is what keeps the words.** `@no_alloc` and
+  `@requires(...)` are written in the notation `@test` and `@tailrec` already used, and an
+  attribute's name is an ordinary identifier — so `no`, `alloc`, `requires` and `link` all remain
+  available to a program. Spelled as keywords they were reserved, and `guide/slab` had to call its
+  allocator's central function `take` because `alloc` was taken.
+- **Each takes a line of its own**, below the header rather than beside it, which is what
+  keeps `module oskit.arch @no_alloc @requires(os)` from being a line anyone has to read. A file that
   declares **no** module may still carry one, since the anonymous root module of §1 is a module like
   any other and a one-file program is exactly that case.
 
 ```
 // oskit/arch/cpu.sysl          // oskit/arch/mmu.sysl
 module oskit.arch               module oskit.arch
-no alloc                        no alloc            // same clause, enforced identical
+@no_alloc                       @no_alloc           // same attribute, enforced identical
 ```
 
-- **`requires alloc`** (and the other direction) is likewise a module-header clause, documenting
-  and early-diagnosing a hard dependency, per `capabilities.md`.
-- **The header has one other inhabitant, and it is deliberately not held to agreeing.** `link "z"`
+- **`@requires(alloc)`** (and the other direction) is likewise a module-header attribute, documenting
+  and early-diagnosing a hard dependency, per `capabilities.md`. It takes a **list**, because a
+  module often needs more than one at once — `sysl.thread` is `@requires(threads, posix)` — where a
+  narrowing gives up one at a time.
+- **The header has one other inhabitant, and it is deliberately not held to agreeing.** `@link("z")`
   (`15 §8`) names a library the file's `extern`s need, and the files of a module may each name their
   own. The rule differs because what is being described does: a capability is a property of the whole
   module, so files that disagreed would describe different modules, while a link requirement is a

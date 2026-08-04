@@ -706,8 +706,8 @@ passing, comparing, indexing, slicing, iterating and releasing any string — in
 one handed in from outside, which frees itself through its own deallocation hook.
 
 ```sysl
-no alloc
-no os
+@no_alloc
+@no_os
 
 var name = "/dev/console"
 var tail = name[5..]
@@ -728,7 +728,7 @@ for the whole run is never let go of, so such a `val` normally holds nothing tha
 but a literal owes none, so the refusal does not reach it ([`13 §7`](/reference/declarations/)):
 
 ```sysl
-no alloc
+@no_alloc
 
 val messages: [3]string = ["out of range", "not permitted", "no such device"]
 
@@ -748,7 +748,7 @@ Requiring an allocator: `from_utf8`, `copy()`, concatenation, `string(c)`, `str_
 `cstring` — every operation that produces new bytes.
 
 ```sysl
-no alloc
+@no_alloc
 
 var greeting = "hello"
 var full = greeting + " world"
@@ -757,7 +757,7 @@ print(full)
 ```
 
 ```error
-the string two strings join into needs an allocator, and this module declared 'no alloc'
+the string two strings join into needs an allocator, and this module declared '@no_alloc'
 ```
 
 The diagnostic finishes with the rule that makes the subset usable: such a module **may hold and

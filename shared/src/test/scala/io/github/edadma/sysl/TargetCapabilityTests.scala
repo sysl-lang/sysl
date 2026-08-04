@@ -50,15 +50,15 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
 
     "and the message does NOT claim a clause the file never wrote" in {
       refused(everything - Capability.Alloc)(
-        "main.sysl" -> "f() -> &int = 1\n\nprint(*f())\n") shouldNot include("declared 'no alloc'")
+        "main.sysl" -> "f() -> &int = 1\n\nprint(*f())\n") shouldNot include("declared '@no_alloc'")
     }
 
     "a module that DID write the clause still hears about its own clause" in {
       val e = refused(everything)(
-        "thing/a.sysl" -> "module thing\nno alloc\n\nf() -> &int = 1\n",
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> &int = 1\n",
         "main.sysl"    -> "print(*thing.f())\n")
 
-      e should include("declared 'no alloc'")
+      e should include("declared '@no_alloc'")
       e shouldNot include("provides no allocator")
     }
 
@@ -84,7 +84,7 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
 
     "one clean error naming the module, the capability and the machine" in {
       val e = refused(everything - Capability.Alloc)(
-        "thing/a.sysl" -> "module thing\nrequires alloc\n\nf() -> int = 1\n",
+        "thing/a.sysl" -> "module thing\n@requires(alloc)\n\nf() -> int = 1\n",
         "main.sysl"    -> "print(thing.f())\n")
 
       e should include("'thing' requires 'alloc'")
@@ -94,19 +94,19 @@ class TargetCapabilityTests extends AnyFreeSpec with Matchers {
 
     "and what a requirement implies is answered too — posix needs an operating system" in {
       refused(everything - Capability.Os)(
-        "thing/a.sysl" -> "module thing\nrequires posix\n\nf() -> int = 1\n",
+        "thing/a.sysl" -> "module thing\n@requires(posix)\n\nf() -> int = 1\n",
         "main.sysl"    -> "print(thing.f())\n") should include("requires 'os'")
     }
 
     "a requirement the target meets says nothing at all" in {
       accepted(everything)(
-        "thing/a.sysl" -> "module thing\nrequires os\n\nf() -> int = 1\n",
+        "thing/a.sysl" -> "module thing\n@requires(os)\n\nf() -> int = 1\n",
         "main.sysl"    -> "print(thing.f())\n") should include("define")
     }
 
     "the root module has no name to print, and says so as a sentence" in {
       refused(everything - Capability.Alloc)(
-        "main.sysl" -> "requires alloc\n\nprint(1)\n") should include("this module requires 'alloc'")
+        "main.sysl" -> "@requires(alloc)\n\nprint(1)\n") should include("this module requires 'alloc'")
     }
   }
 }

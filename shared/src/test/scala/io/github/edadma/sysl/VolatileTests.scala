@@ -657,7 +657,7 @@ class VolatileTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       irOf(
         "dev.sysl" ->
           """module dev
-            |no alloc
+            |@no_alloc
             |struct Uart
             |    status: volatile u32
             |    data:   volatile u32

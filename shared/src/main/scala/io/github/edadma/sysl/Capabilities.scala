@@ -230,6 +230,7 @@ trait Capabilities extends AnalyzerBase {
     if u.capabilities.isEmpty then "none"
     else
       u.capabilities
-        .map(c => if c.direction == CapabilityDirection.Narrows then s"'no ${c.name}'" else s"'requires ${c.name}'")
+        .map(c =>
+          if c.direction == CapabilityDirection.Narrows then s"'@no_${c.name}'" else s"'@requires(${c.name})'")
         .mkString(", ")
 }

@@ -235,17 +235,17 @@ something else is a function the *processor* enters rather than a caller, and th
 a definition rather than of a foreign declaration — see `interrupt`
 below.
 
-## `link` — which library resolves the externs
+## `@link` — which library resolves the externs
 
-`link "z"` in a file's header names a library the linker must be given, and it sits beside the
+`@link("z")` in a file's header names a library the linker must be given, and it sits beside the
 `extern`s it supports because that is the only place that knows. An `extern` states the symbol it
 wants and never where the symbol lives; a binding to `libpng` is written by whoever writes the
 module, and the driver cannot carry a list of libraries it has never heard of.
 
 ```sysl
 module image.png
-link "png"
-link "z"
+@link("png")
+@link("z")
 
 extern "png_create_read_struct" create(ver: *u8, err: *u8, fn: *u8) -> *u8
 ```
@@ -289,9 +289,10 @@ Four more rules:
   member is pulled in only to resolve a symbol already undefined — so a library that calls into
   another has to come first: `-lpng -lz`, never the reverse. Sorting would decide it by spelling,
   which is right by accident for those two and wrong for the next pair.
-- **`link` is a soft keyword** — special only in a header, an ordinary identifier everywhere else, so
-  a program may still declare a function called `link`. A directive is `link` followed by a
-  *string*, and no statement has that shape.
+- **`@link` is an annotation, not grammar** — so `link` is an ordinary identifier and a program may
+  still declare a function or a field called it. That is the general rule for everything the file
+  header carries: an annotation's name is read as an identifier, which is what keeps `alloc`, `no`,
+  `requires` and `link` out of the reserved list. See [attributes](/reference/attributes/).
 
 ## A function's address — `*extern(A, B) -> R`
 
@@ -848,7 +849,7 @@ interrupt fault(f: *Frame)      // x86-64: the ABI requires the frame
 
 So the annotation names the **concept** and the back end decides what that becomes. A directive
 spelling `x86_intrcc` would put one machine's answer in a source file and be wrong on the other
-two — the same shape as `link` naming a library rather than a flag, and the same reason.
+two — the same shape as `@link` naming a library rather than a flag, and the same reason.
 
 **On a processor without it, the annotation is refused rather than ignored:**
 

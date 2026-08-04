@@ -2,46 +2,69 @@ package io.github.edadma.sysl
 
 import org.scalatest.freespec.AnyFreeSpec
 
-/** The capability clause of `13 §4` and `capabilities.md`: `no alloc` narrowing a module below what
- * its target offers, and `requires alloc` declaring what it cannot be built without.
+/** The capability annotations of `13 §4` and `capabilities.md`: `@no_alloc` narrowing a module below
+ * what its target offers, and `@requires(alloc)` declaring what it cannot be built without.
  *
- * The clause is a property of the **module** written on each of its **files**, which is where most
- * of the rules here come from: the files have to agree, the clause has a place in the file, and the
- * module's own set is what every construction in it is measured against.
+ * It is a property of the **module** written on each of its **files**, which is where most of the
+ * rules here come from: the files have to agree, it has a place in the file, and the module's own set
+ * is what every construction in it is measured against.
  *
- * What `no alloc` refuses is *making* heap storage, never holding it — a distinction the suite
+ * What `@no_alloc` refuses is *making* heap storage, never holding it — a distinction the suite
  * checks from both sides, since a capability that refused a reference it was handed would make the
  * allocator-free subset useless for the kernel code it exists for.
  */
 class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
+  // The whole reason the clauses are attributes rather than grammar. An attribute's name arrives as
+  // an ordinary identifier, so nothing here is reserved — and it is the code that *provides* a
+  // capability that wants the words most, which is why `guide/slab` is what reports the change.
+  "the words the clauses used to spend are ordinary names" - {
+
+    "a function may be called 'alloc', which is what an allocator calls its own" in {
+      run("alloc(n: int) -> int = n + 1\n\nprint(alloc(6))\n") shouldBe "7\n"
+    }
+
+    "'no', 'requires' and 'link' too" in {
+      run("no(x: int) -> int = x\nrequires(x: int) -> int = x * 2\nlink(x: int) -> int = x + 3\n\n" +
+        "print(no(1), requires(2), link(4))\n") shouldBe "1 4 7\n"
+    }
+
+    "a field may be called 'link', which is what the slab guide threads its free list through" in {
+      run("struct Block\n    link: *Block\n    alloc: int\n\nvar b = Block(null, 9)\nprint(b.alloc)\n") shouldBe "9\n"
+    }
+
+    "and a local, in a module that gave the capability up" in {
+      run("@no_alloc\n\nf() -> int\n    val alloc = 3\n    val requires = 4\n\n    alloc + requires\n\nprint(f())\n") shouldBe "7\n"
+    }
+  }
+
   "the clause is read in the file's header" - {
 
     "'no alloc' beside a module header" in {
-      irOf("thing/a.sysl" -> "module thing\nno alloc\n\nf(p: *int) -> int = *p\n",
+      irOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nf(p: *int) -> int = *p\n",
         "main.sysl" -> "var n = 7\nprint(thing.f(&n))") should include("define")
     }
 
     "'requires alloc', the other direction" in {
-      runOf("thing/a.sysl" -> "module thing\nrequires alloc\n\nf() -> &int = 1\n",
+      runOf("thing/a.sysl" -> "module thing\n@requires(alloc)\n\nf() -> &int = 1\n",
         "main.sysl" -> "print(*thing.f())") shouldBe "1\n"
     }
 
     "a file with no module header may narrow, since the root module is a module" in {
-      run("no alloc\n\nf(p: *int) -> int = *p\n\nvar n = 4\nprint(f(&n))\n") shouldBe "4\n"
+      run("@no_alloc\n\nf(p: *int) -> int = *p\n\nvar n = 4\nprint(f(&n))\n") shouldBe "4\n"
     }
 
     "several clauses on their own lines" in {
-      irOf("thing/a.sysl" -> "module thing\nno alloc\nrequires os\n\nf() -> int = 1\n",
+      irOf("thing/a.sysl" -> "module thing\n@no_alloc\n@requires(os)\n\nf() -> int = 1\n",
         "main.sysl" -> "print(thing.f())") should include("define")
     }
 
-    "a clause on the header's own line is refused, since each takes a line" in {
-      err("module m no alloc\n\nf() -> int = 1\n") should include("belongs in the file's header")
+    "an attribute on the header's own line is refused, since each takes a line" in {
+      err("module m @no_alloc\n\nf() -> int = 1\n") should include("belongs in the file's header")
     }
 
     "and a clause written below the statements says where it belongs" in {
-      val e = err("f() -> int = 1\nno alloc\n")
+      val e = err("f() -> int = 1\n@no_alloc\n")
 
       e should include("belongs in the file's header")
       e should include("directly after 'module'")
@@ -52,18 +75,25 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
   "a clause that names nothing, or claims something unchecked, is refused" - {
 
     "a name that is not a capability" in {
-      val e = err("requires sockets\n\nf() -> int = 1\n")
+      val e = err("@requires(sockets)\n\nf() -> int = 1\n")
 
       e should include("no capability is called 'sockets'")
       e should include("'alloc', 'os', 'posix', 'threads'")
     }
 
+    // The narrowing form carries the name in the attribute's own word, so an unknown one is a
+    // spelling the analyzer has to reject rather than a parse failure — which is what keeps one
+    // message about an unknown capability instead of two that differ by which form was written.
+    "and the same, spelled the narrowing way" in {
+      err("@no_sockets\n\nf() -> int = 1\n") should include("no capability is called 'sockets'")
+    }
+
     "the same capability declared twice" in {
-      err("no alloc\nno alloc\n\nf() -> int = 1\n") should include("'alloc' is declared twice")
+      err("@no_alloc\n@no_alloc\n\nf() -> int = 1\n") should include("'alloc' is declared twice")
     }
 
     "and a capability both given up and required" in {
-      err("no alloc\nrequires alloc\n\nf() -> int = 1\n") should
+      err("@no_alloc\n@requires(alloc)\n\nf() -> int = 1\n") should
         include("'alloc' is both given up and required here")
     }
 
@@ -73,7 +103,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
      * day `sysl.thread` did — so all four are narrowings today. What each of them then *means* is
      * checked against the module graph, in `ThreadTests` and `FsTests`. */
     "while every capability there is may now be given up, since each of them gates something" in {
-      run("no alloc\nno os\nno posix\nno threads\n\nprint(1 + 1)\n") shouldBe "2\n"
+      run("@no_alloc\n@no_os\n@no_posix\n@no_threads\n\nprint(1 + 1)\n") shouldBe "2\n"
     }
   }
 
@@ -81,20 +111,20 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
     "a file that dropped it is reported against one that kept it" in {
       val e = errOf(
-        "a.sysl" -> "module thing\nno alloc\n\nf() -> int = 1\n",
+        "a.sysl" -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
         "b.sysl" -> "module thing\n\ng() -> int = 2\n",
         "main.sysl" -> "print(thing.f())",
       )
 
       e should include("declare different capabilities")
-      e should include("'no alloc'")
+      e should include("'@no_alloc'")
       e should include("none")
     }
 
     "and two files stating it are not" in {
       runOf(
-        "a.sysl" -> "module thing\nno alloc\n\nf() -> int = 1\n",
-        "b.sysl" -> "module thing\nno alloc\n\ng() -> int = 2\n",
+        "a.sysl" -> "module thing\n@no_alloc\n\nf() -> int = 1\n",
+        "b.sysl" -> "module thing\n@no_alloc\n\ng() -> int = 2\n",
         "main.sysl" -> "print(thing.f() + thing.g())",
       ) shouldBe "3\n"
     }
@@ -103,16 +133,16 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
   "'no alloc' refuses every construction that makes heap storage" - {
 
     "a reference" in {
-      errOf("thing/a.sysl" -> "module thing\nno alloc\n\nf() -> &int = 1\n",
+      errOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> &int = 1\n",
         "main.sysl" -> "print(*thing.f())") should
-        include("a reference needs an allocator, and this module declared 'no alloc'")
+        include("a reference needs an allocator, and this module declared '@no_alloc'")
     }
 
     "a boxed trait object, which is a reference underneath" in {
       errOf(
         "thing/a.sysl" ->
           """module thing
-            |no alloc
+            |@no_alloc
             |
             |trait Shape
             |    sides(self) -> int
@@ -130,31 +160,31 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
 
     "a slice with storage of its own" in {
-      errOf("thing/a.sysl" -> "module thing\nno alloc\n\nf() -> []int\n    var xs: []int = [1, 2, 3]\n    xs\n",
+      errOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> []int\n    var xs: []int = [1, 2, 3]\n    xs\n",
         "main.sysl" -> "print(thing.f()[0])") should
         include("a slice with storage of its own needs an allocator")
     }
 
     "a repeated slice, the other way one is made" in {
-      errOf("thing/a.sysl" -> "module thing\nno alloc\n\nf(n: int) -> []int\n    var xs: []int = [0; n]\n    xs\n",
+      errOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nf(n: int) -> []int\n    var xs: []int = [0; n]\n    xs\n",
         "main.sysl" -> "print(thing.f(3)[0])") should
         include("a slice with storage of its own needs an allocator")
     }
 
     "two strings joined" in {
-      errOf("thing/a.sysl" -> "module thing\nno alloc\n\nf() -> string = \"a\" + \"b\"\n",
+      errOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> string = \"a\" + \"b\"\n",
         "main.sysl" -> "print(thing.f())") should
         include("the string two strings join into needs an allocator")
     }
 
     "a value rendered as a string" in {
-      errOf("thing/a.sysl" -> "module thing\nno alloc\n\nf(n: int) -> string = str(n)\n",
+      errOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nf(n: int) -> string = str(n)\n",
         "main.sysl" -> "print(thing.f(1))") should
         include("the string a value renders as needs an allocator")
     }
 
     "and an interpolation, which is the same thing spelled differently" in {
-      errOf("thing/a.sysl" -> "module thing\nno alloc\n\nf(n: int) -> string = s\"n=$n\"\n",
+      errOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nf(n: int) -> string = s\"n=$n\"\n",
         "main.sysl" -> "print(thing.f(1))") should include("needs an allocator")
     }
   }
@@ -165,7 +195,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       runOf(
         "thing/a.sysl" ->
           """module thing
-            |no alloc
+            |@no_alloc
             |
             |sum(xs: []int) -> int
             |    var total = 0
@@ -186,7 +216,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       runOf(
         "thing/a.sysl" ->
           """module thing
-            |no alloc
+            |@no_alloc
             |
             |struct Held
             |    r: &int
@@ -204,7 +234,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
 
     "and a string literal, which is static rather than made" in {
-      runOf("thing/a.sysl" -> "module thing\nno alloc\n\nname() -> string = \"kernel\"\n",
+      runOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nname() -> string = \"kernel\"\n",
         "main.sysl" -> "print(thing.name())") shouldBe "kernel\n"
     }
 
@@ -216,7 +246,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       irOf(
         "thing/a.sysl" ->
           """module thing
-            |no alloc
+            |@no_alloc
             |
             |extern malloc(n: usize) -> *u8
             |extern free(p: *u8)
@@ -234,7 +264,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       runOf(
         "thing/a.sysl" ->
           """module thing
-            |no alloc
+            |@no_alloc
             |
             |twice(f: int -> int, n: int) -> int = f(f(n))
             |
@@ -248,7 +278,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // somebody with an allocator, and reading it needs none.
     "a heap-backed slice made elsewhere and read here" in {
       runOf(
-        "thing/a.sysl" -> "module thing\nno alloc\n\nfirst(xs: []int) -> int = xs[0]\n",
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nfirst(xs: []int) -> int = xs[0]\n",
         "main.sysl" -> "var xs: []int = [7, 8, 9]\nprint(thing.first(xs))",
       ) shouldBe "7\n"
     }
@@ -259,7 +289,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // A `val` counts nothing, so it cannot *be* a string — but its initializer is code like any
     // other, and joining two strings to measure the result allocates just the same.
     "a module-level val's initializer" in {
-      errOf("thing/a.sysl" -> "module thing\nno alloc\n\nval width: usize = (\"a\" + \"b\").bytes.len\n",
+      errOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nval width: usize = (\"a\" + \"b\").bytes.len\n",
         "main.sysl" -> "print(thing.width)") should include("needs an allocator")
     }
 
@@ -269,7 +299,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     "but a register block named at file scope runs nothing, so it is admitted" in {
       irOf(
         "thing/a.sysl" ->
-          "module thing\nno alloc\n\nconst UART: usize = 0x1000\nval regs: *u32 = ptr_cast(UART)\n",
+          "module thing\n@no_alloc\n\nconst UART: usize = 0x1000\nval regs: *u32 = ptr_cast(UART)\n",
         "main.sysl" -> "print(usize(thing.regs))",
       ) should include("@thing$regs = private constant ptr inttoptr (i64 4096 to ptr)")
     }
@@ -278,7 +308,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       errOf(
         "thing/a.sysl" ->
           """module thing
-            |no alloc
+            |@no_alloc
             |
             |trait Named
             |    name(self) -> string
@@ -298,7 +328,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // that is the tree that would have been emitted.
     "and a generic, at the instantiation that would have allocated" in {
       val e = errOf(
-        "thing/a.sysl" -> "module thing\nno alloc\n\nhold[T](v: T) -> &T = v\n",
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nhold[T](v: T) -> &T = v\n",
         "main.sysl" -> "print(*thing.hold(5))",
       )
 
@@ -311,12 +341,12 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
     "a slice of a local array that outlives the frame" in {
       val e = errOf(
-        "thing/a.sysl" -> "module thing\nno alloc\n\nf() -> []int\n    var a: [3]int = [1, 2, 3]\n    a[0..<3]\n",
+        "thing/a.sysl" -> "module thing\n@no_alloc\n\nf() -> []int\n    var a: [3]int = [1, 2, 3]\n    a[0..<3]\n",
         "main.sysl" -> "print(thing.f()[0])",
       )
 
       e should include("would move to the heap")
-      e should include("this module declared 'no alloc'")
+      e should include("this module declared '@no_alloc'")
     }
 
     "and the same body in a module that kept its allocator is promoted with no diagnostic at all" in {
@@ -335,7 +365,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // takes storage that was made, and this program makes none.
     "no function of an allocator-free program calls the allocator" in {
       val out = ir(
-        """no alloc
+        """@no_alloc
           |
           |sum(p: *int, n: usize) -> int
           |    var total = 0
@@ -361,7 +391,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     "a call into a function that allocates is refused too" in {
       val e = errOf(
         "thing/a.sysl" ->
-          "module thing\nno alloc\n\nimport sysl.io.line_text\n\ntext(b: []const u8) -> string = line_text(b)\n",
+          "module thing\n@no_alloc\n\nimport sysl.io.line_text\n\ntext(b: []const u8) -> string = line_text(b)\n",
         "main.sysl" -> "var bytes: [2]u8 = [104u8, 105u8]\nprint(thing.text(bytes[0..<2]))\n",
       )
 
@@ -381,7 +411,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       val e = errOf(
         "thing/a.sysl" ->
           """module thing
-            |no alloc
+            |@no_alloc
             |
             |import sysl.io.line_text
             |
@@ -408,7 +438,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       val e = errOf(
         "thing/a.sysl" ->
           """module thing
-            |no alloc
+            |@no_alloc
             |
             |import sysl.io.line_text
             |
@@ -425,7 +455,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // not allocate, so it is not refused. A capability that refused `print` would be one no kernel
     // could carry.
     "and printing, which an allocator-free module does constantly, is not" in {
-      runOf("thing/a.sysl" -> "module thing\nno alloc\n\nsay(n: int)\n    print(\"n is\", n)\n",
+      runOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nsay(n: int)\n    print(\"n is\", n)\n",
         "main.sysl" -> "thing.say(3)") shouldBe "n is 3\n"
     }
 
@@ -460,7 +490,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
   "'no os' gives up the modules an operating system gates" - {
 
     "a module that gave it up may not reach one that requires it" in {
-      val e = err("no os\n\nimport sysl.fs.exists\n\nprint(exists(\"x\"))\n")
+      val e = err("@no_os\n\nimport sysl.fs.exists\n\nprint(exists(\"x\"))\n")
 
       e should include("which requires 'os'")
       e should include("this module declared 'no os'")
@@ -470,16 +500,16 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // A qualified path needs no import (`13 §3`), so a rule stated over imports would have missed
     // this entirely — which is why the graph is the reference graph and not the import graph.
     "nor by a qualified path, which needs no import at all" in {
-      err("no os\n\nprint(sysl.fs.exists(\"x\"))\n") should include("which requires 'os'")
+      err("@no_os\n\nprint(sysl.fs.exists(\"x\"))\n") should include("which requires 'os'")
     }
 
     "the import alone is enough, before anything is named through it" in {
-      err("no os\n\nimport sysl.fs.*\n\nprint(1)\n") should include("'sysl.fs', which requires 'os'")
+      err("@no_os\n\nimport sysl.fs.*\n\nprint(1)\n") should include("'sysl.fs', which requires 'os'")
     }
 
     "a named module is named in the message rather than called 'this module'" in {
       errOf(
-        "thing/a.sysl" -> "module thing\nno os\n\nf() -> bool = sysl.fs.exists(\"x\")\n",
+        "thing/a.sysl" -> "module thing\n@no_os\n\nf() -> bool = sysl.fs.exists(\"x\")\n",
         "main.sysl"    -> "print(thing.f())",
       ) should include("'thing' declared 'no os'")
     }
@@ -487,7 +517,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     // Giving up `os` gives up `posix` with it, since POSIX needs an operating system under it — the
     // implication runs the opposite way from the one `requires` follows.
     "and 'no posix' does not, since posix is what needs an os rather than the other way round" in {
-      runOf("thing/a.sysl" -> "module thing\nno posix\n\nf() -> int = 1\n",
+      runOf("thing/a.sysl" -> "module thing\n@no_posix\n\nf() -> int = 1\n",
         "main.sysl" -> "print(thing.f())") shouldBe "1\n"
     }
 
@@ -501,7 +531,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     "and may not reach one through a module that says nothing itself" in {
       val e = errOf(
         "helper/a.sysl" -> "module helper\n\nthere(p: string) -> bool = sysl.fs.exists(p)\n",
-        "main.sysl"     -> "no os\n\nprint(helper.there(\"x\"))\n",
+        "main.sysl"     -> "@no_os\n\nprint(helper.there(\"x\"))\n",
       )
 
       e should include("'helper'")
@@ -509,7 +539,7 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     }
 
     "the clause and the requirement may be written on the same module without contradiction" in {
-      irOf("thing/a.sysl" -> "module thing\nrequires os\n\nf() -> int = 1\n",
+      irOf("thing/a.sysl" -> "module thing\n@requires(os)\n\nf() -> int = 1\n",
         "main.sysl" -> "print(thing.f())") should include("define")
     }
   }

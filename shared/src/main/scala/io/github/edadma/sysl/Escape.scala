@@ -471,7 +471,7 @@ private class Escape(program: TProgram) {
       w.sites.toList.map((name, pos, how) =>
         Diagnostic.render(
           s"this view of '$name' $how, so the array would move to the heap to outlive the frame — " +
-            "and this module declared 'no alloc', so there is nothing to move it into. Keep the view " +
+            "and this module declared '@no_alloc', so there is nothing to move it into. Keep the view " +
             "inside the frame, or take the storage from a caller as a '[]T' parameter, which is " +
             "already wherever its owner put it",
           pos,

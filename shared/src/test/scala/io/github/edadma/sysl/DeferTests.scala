@@ -208,7 +208,7 @@ class DeferTests extends AnyFreeSpec with RunSupport with CodegenSupport with Te
     // `03 § defer` claims it allocates nothing and takes no count, which is what keeps it usable
     // under `no alloc`. Asserted at the capability, which is the surface that would refuse it.
     "nothing that 'no alloc' forbids" in {
-      run("""no alloc
+      run("""@no_alloc
             |
             |f() -> i32
             |    defer print("released")

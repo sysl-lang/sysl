@@ -59,11 +59,13 @@ bytes that hold no `T` yet; the caller writes one before reading one, and no rul
 is the [raw tier](/reference/memory/) behaving as specified — the same assertion an unchecked index
 already is — and it is why the whole file is greppable for the three operations that take on the risk.
 
-**An allocator may not call its function `alloc`.** The word is reserved, because `no alloc` is a
-declaration a module carries, so the most natural name in the whole program is the one name it cannot
-have. It is spelled `take`. The cost is small and the shape of it is not: **a capability written as
-two ordinary words takes both of them out of the namespace**, and `alloc` is the word the code that
-*provides* the capability wants most.
+**An allocator may call its function `alloc`, and this one does.** It could not always: the
+capability clause used to be written as the two ordinary words `no alloc`, which reserved both, so
+the most natural name in the whole program was the one name it could not have and this file called it
+`take`. **Capabilities are attributes now** — `@no_alloc`, `@requires(...)` — and an attribute's name
+is an ordinary identifier, so the words came back. The general lesson is the one the old note was
+groping at: **a capability written as grammar spends a word out of every program's namespace**, and
+`alloc` is the word the code that *provides* the capability wants most.
 
 **The one thing the compiler still refuses is a `&T`.** An early draft tried to hand back a counted
 reference, on the grounds that a slab block outlives its user. It cannot: ARC would have no count to

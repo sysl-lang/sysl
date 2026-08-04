@@ -333,7 +333,7 @@ known gap, not a solved problem.
 ## It needs an allocator, and says so
 
 ```sysl
-no alloc
+@no_alloc
 
 import sysl.buf.{Buf, buf}
 
@@ -345,7 +345,7 @@ print(b.len())
 ```
 
 ```error
-this reaches 'sysl.buf.buf.int', which makes heap storage, and this module declared 'no alloc'
+this reaches 'sysl.buf.buf.int', which makes heap storage, and this module declared '@no_alloc'
 ```
 
 Both `buf()` and the `push` are named, because [`alloc` is checked on what a module
