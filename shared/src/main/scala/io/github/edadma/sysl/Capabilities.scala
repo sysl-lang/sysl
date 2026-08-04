@@ -5,7 +5,7 @@ package io.github.edadma.sysl
  * The set is a property of the **project**, not of the grammar: a capability's name arrives from
  * the parser as whatever was written, and this is what says which spellings mean something. It is
  * fixed here rather than read from configuration because the configuration half — per-target
- * capability sets in `sysl.conf` — is not written yet, and the four below are what
+ * capability sets in `package.hocon` — is not written yet, and the four below are what
  * `capabilities.md` calls the core set.
  */
 object Capability {

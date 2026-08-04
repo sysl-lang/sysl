@@ -2,7 +2,7 @@
 
 **Status:** decided and built. This is the target half of the doc `capabilities.md` said was
 still to be written — what a machine is, how one is named, and what naming one changes. The
-project-config half of that promise — the `sysl.conf` schema, per-target capability sets, and
+project-config half of that promise — the `package.hocon` schema, per-target capability sets, and
 filename-axis platform selection — is still open, and is listed at the bottom.
 
 A systems language cannot be vague about the machine. Two of them differ in more than speed:
@@ -285,7 +285,7 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
 
 ## Open
 
-- **The project config.** `sysl.conf`, per-target capability sets (`capabilities.md`'s
+- **The project config.** `package.hocon`, per-target capability sets (`capabilities.md`'s
   `alloc` / `os` / `posix` / `threads`), and filename-axis platform selection. The registry here
   is the fixed table a config would eventually extend, and deliberately does not try to be one:
   a target's *capabilities* are exactly the part that a project has an opinion about.

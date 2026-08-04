@@ -12,7 +12,7 @@ as it does, and the graph those references make held to being acyclic. The capab
 clause does not currently parse at all. What it is *not* waiting for any more is the target — that
 used to be the stated blocker, and it is stale: `Target` is a real value with a registry of ten
 targets, a `--target` flag and a `targets` command. What is genuinely missing from open item (a) is
-the `sysl.conf` schema and platform-file selection, neither of which a `no alloc` check needs. Two written docs already lean on modules: `capabilities.md` attaches
+the `package.hocon` schema and platform-file selection, neither of which a `no alloc` check needs. Two written docs already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
 `cross-platform.md` fixes that "module names follow the directory tree relative to the project
 root." This chapter defines what a module **is** so those have something to name, and consolidates
@@ -505,7 +505,7 @@ for (`cross-platform.md`, and the pattern the old compiler reached for with its 
 relaxation).
 
 The **exact suffix grammar and the resolution rule** — which filename shapes mark a platform, how
-the active target is chosen, and the `sysl.conf` schema that ties it together — belong to the
+the active target is chosen, and the `package.hocon` schema that ties it together — belong to the
 **project-config doc**, which `capabilities.md` already flags as unwritten. This chapter fixes
 only that the *module identity* is invariant under platform selection; the file axis lives below
 the module name, not beside it.
@@ -1174,7 +1174,7 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
 
 ## Open (not yet decided)
 
-- **a. The project-config doc.** The `sysl.conf` (HOCON) schema, the target registry, and the
+- **a. The project-config doc.** The `package.hocon` (HOCON) schema, the target registry, and the
   platform-file suffix grammar and resolution (§5) are a separate doc `capabilities.md` already
   defers. **The project root is no longer part of it**: the driver takes one, as the path it is
   given — `sysl run <dir>` makes that directory the root and compiles the tree beneath it. That is

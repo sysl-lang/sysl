@@ -22,7 +22,7 @@ mechanism spans three layers — project config (targets declare capabilities), 
 system (propagation, per-module restriction), and the type system (`alloc` gates the memory
 modes). **The target registry is now its own doc and is built — `targets.md`** — so what a
 target *is* and how one is named are settled; what is still to be written is the project-config
-and module-resolution half around it (the HOCON `sysl.conf` schema, per-target capability sets,
+and module-resolution half around it (the HOCON `package.hocon` schema, per-target capability sets,
 and filename-axis platform selection). This one is the capability model.
 
 ## Two kinds of capability
@@ -170,7 +170,7 @@ allocator-free everywhere.
   `no posix`, and the assertion is enforced against the module graph. What settled it was not a
   decision but an arrival: the question was academic while nothing required `os`, and `sysl.fs` is
   what gave the clause something to refuse.
-- **Config / module-resolution details** — the HOCON `sysl.conf` schema, per-target capability
+- **Config / module-resolution details** — the HOCON `package.hocon` schema, per-target capability
   sets, and filename-axis platform selection are still to be written. **The target registry
   itself is done (`targets.md`)**: a target is a value with a name, a triple, and the ABI facts
   codegen reads, and `--target` selects one. What it deliberately does *not* carry is
