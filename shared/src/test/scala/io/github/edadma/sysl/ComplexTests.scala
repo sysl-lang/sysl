@@ -325,6 +325,19 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |print(left.acosh().re > 0.0, (left.acosh().im - real.pi()).abs() < 1.0e-12)""".stripMargin
       ) shouldBe "true true\n"
     }
+
+    // `atan` and `asinh` are cut on the *imaginary* axis outside `[-i, i]`, which is `asin`'s cut
+    // turned a quarter turn — so inside the segment each stays on its own axis, and outside it the
+    // other component appears. That appearance is the cut, and it is what the table on the library
+    // page is asserting.
+    "atan and asinh are cut on the imaginary axis outside [-i, i]" in {
+      run(
+        """var inside = Complex(0.0, 0.5)
+          |var outside = Complex(0.0, 2.0)
+          |print(inside.atan().re.abs() < 1.0e-15, outside.atan().re.abs() > 1.0)
+          |print(inside.asinh().re.abs() < 1.0e-15, outside.asinh().re.abs() > 1.0)""".stripMargin
+      ) shouldBe "true true\ntrue true\n"
+    }
   }
 
   // Every identity above is at `real`. These are the same claims at the other width, which is what
