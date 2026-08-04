@@ -33,17 +33,31 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
    * parameter to receive it. That keeps the two sides of the call agreeing with `genFunction`,
    * which drops the same parameters from the signature.
    */
-  private def argList(args: List[TExpr]): List[String] =
-    args.flatMap { a =>
-      // A large one is handed over as the address of storage the caller holds — its own where the
-      // argument is a place, a slot made here where it is not. The callee copies at entry either
-      // way, so the copy the by-value convention promises still happens; it just happens once, in
-      // memory, instead of as a multi-kilobyte value crossing the call.
-      if Layout.indirect(a.ty) then Some(s"ptr ${address(a)}")
-      else
-        val v = genExpr(a)
+  private def argList(args: List[TExpr]): List[String] = formatArgs(args.map(argValue))
 
-        Option.unless(Type.zeroSized(a.ty))(s"${a.ty.llvm} $v")
+  /** One argument, evaluated, in the form the callee receives it — or `None` where it is zero-sized
+   * and there is nothing to hand over.
+   *
+   * A large one is handed over as the address of storage the caller holds — its own where the
+   * argument is a place, a slot made here where it is not — which is the `Left`. The callee copies at
+   * entry either way, so the copy the by-value convention promises still happens; it just happens
+   * once, in memory, instead of as a multi-kilobyte value crossing the call.
+   *
+   * The value is kept beside its type rather than formatted straight away because a self-call needs
+   * the values themselves: `17 §4`'s measure is evaluated over the arguments, and reaching them by
+   * evaluating the arguments a second time would run whatever they do twice.
+   */
+  protected def argValue(a: TExpr): Option[(Type, Either[String, String])] =
+    if Layout.indirect(a.ty) then Some((a.ty, Left(address(a))))
+    else
+      val v = genExpr(a)
+
+      Option.unless(Type.zeroSized(a.ty))((a.ty, Right(v)))
+
+  protected def formatArgs(vals: List[Option[(Type, Either[String, String])]]): List[String] =
+    vals.flatten.map {
+      case (_, Left(addr)) => s"ptr $addr"
+      case (ty, Right(v))  => s"${ty.llvm} $v"
     }
 
   /** A call the function makes to itself as the last thing it does, lowered as a jump back to its
@@ -79,6 +93,17 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
           retainValue(ty, v)
           Some(Right(v))
       }
+
+    // The measure is checked while the frame is still whole, since it reads the parameters and the
+    // jump below is about to overwrite them. A tail call survives this where an `ensure` does not
+    // (`16 §7`): the check happens *before* the call, and a tail call's problem is that it never
+    // returns.
+    if checksVariant(selfName) then
+      genVariantAtCall(tailParams.zip(staged).map {
+        case ((_, ty), Some(Left(slot))) => Some((ty, Left(slot)))
+        case ((_, ty), Some(Right(v)))   => Some((ty, Right(v)))
+        case _                           => None
+      })
 
     releaseAll()
 
@@ -419,7 +444,10 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
         // This is the case the whole mechanism is for: `val k = kernel()` writes the callee's work
         // straight into `k`'s slot, and no `%struct.Kernel` is ever an LLVM value.
         case TCall(name, args, ty, _) if !foreigns.contains(name) =>
-          genSyslCall(calleeOf(name, ty), argList(args), ty, Some(dest))
+          val staged = args.map(argValue)
+
+          if checksVariant(name) then genVariantAtCall(staged)
+          genSyslCall(calleeOf(name, ty), formatArgs(staged), ty, Some(dest))
 
         case _ =>
           genBorrowedInto(dest, e)
@@ -1025,7 +1053,13 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     // follows in the same block is unreachable and `emit` drops it, which is exactly why a
     // diverging arm needs no special handling anywhere else.
     case TCall(name, args, ty, _) =>
-      genSyslCall(calleeOf(name, ty), argList(args), ty, None)
+      val staged = args.map(argValue)
+
+      // `17 §4`: a call the compiler can see is a call to the same body checks that the measure has
+      // gone down. It sits before the call rather than inside the callee, which is what lets it be
+      // made out of values already in hand.
+      if checksVariant(name) then genVariantAtCall(staged)
+      genSyslCall(calleeOf(name, ty), formatArgs(staged), ty, None)
 
     // Erasing costs one word: the value goes on pointing where it pointed, and the table for the
     // type it is losing is a constant beside it. Nothing is retained — a counted object holds the
@@ -1159,4 +1193,6 @@ trait ExprEmitter extends ControlFlowEmitter with VtableEmitter with WriterEmitt
     case e: TForEach => genForEach(e)
     case i: TIterate => genIterate(i)
     case q: TQuantifier => genQuantifier(q)
+
+    case TCheckedLoop(slot, varTy, loop) => genCheckedLoop(slot, varTy, loop)
 }

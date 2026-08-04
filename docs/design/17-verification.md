@@ -445,6 +445,15 @@ allocates allocates nothing in the emitted program. Whether `no alloc` should th
 undecided, and the two answers are defensible: ignoring it is what erasure implies, and refusing it
 keeps one rule about what a module's source may contain.
 
+**g. A `variant` on a nested function.** `§4`'s check is made at the call, and the two callable forms
+that are not top-level functions are not reached by a call of that shape: a closure goes through `Fn`,
+so nothing at the call site says which body, and a nested function's calls carry its captured
+environment as a receiver. The closure half is a real exclusion and is likely to stay one — there is
+nothing at the site to check *against*. The nested half is only unbuilt: `12 §5a` gives a nested
+function a name and recursion, which is exactly what this clause is for, and what it needs is for the
+environment argument to be skipped when the measure's parameters are matched to the call's arguments.
+Both are refused today with one message that names both.
+
 **f. `§5` and `§7` wait on `13`'s module-state spelling, and that is the biggest single dependency in
 this chapter.** Both are predicates over a set the language cannot yet name. It is worth saying which
 way the dependency runs: this chapter does not need a *particular* spelling, only that one exists —

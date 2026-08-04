@@ -63,7 +63,7 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       val (tbody, ctx)  = analyzeLoopBody(expected, label)(analyzeStmts(body))
       popScope()
       val telse         = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-      TWhile(tc, tbody, telse, loopResultType(ctx, telse))
+      checkedLoop(ctx, TWhile(tc, tbody, telse, loopResultType(ctx, telse)))
 
     // The body is analyzed first and in its own scope, which has closed by the time the test is
     // reached — so the foot's condition reads what the enclosing block holds and nothing the body
@@ -77,11 +77,11 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))
       val tcond        = analyzeBool(cond)
       val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-      TDoWhile(tbody, tcond, telse, loopResultType(ctx, telse))
+      checkedLoop(ctx, TDoWhile(tbody, tcond, telse, loopResultType(ctx, telse)))
 
     case Loop(label, body) =>
       val (tbody, ctx) = analyzeLoopBody(expected, label)(analyzeStmts(body))
-      TLoop(tbody, endlessResultType(ctx))
+      checkedLoop(ctx, TLoop(tbody, endlessResultType(ctx)))
 
     // The init's binding belongs to the loop and to nothing outside it, so the scope opens before
     // the condition — which reads that binding — and closes after the `else`, which may too.
@@ -89,7 +89,7 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       pushScope()
       val tinit        = init.toList.flatMap(recoverStmt)
       val tcond        = cond.map(analyzeBool)
-      val (tbody, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+      val (tbody, ctx) = analyzeLoopBody(expected, label)(loopStmts(body))
       val tstep        = step.toList.flatMap(recoverStmt)
       val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
       popScope()
@@ -97,8 +97,9 @@ trait ControlFlowExprAnalysis extends ExprSupport {
       // carry, exactly as `loop`'s is — and an `else` that can never run is a mistake worth saying.
       if tcond.isEmpty && telse.isDefined then
         err("this 'for' has no condition, so it never finishes on its own and its 'else' cannot run")
-      TCFor(tinit, tcond, tstep, tbody, telse,
-            if tcond.isEmpty then endlessResultType(ctx) else loopResultType(ctx, telse))
+      checkedLoop(ctx,
+                  TCFor(tinit, tcond, tstep, tbody, telse,
+                        if tcond.isEmpty then endlessResultType(ctx) else loopResultType(ctx, telse)))
 
     case For(label, name, iter, body, elseOpt) =>
       iter match
@@ -117,11 +118,12 @@ trait ControlFlowExprAnalysis extends ExprSupport {
           // The loop variable is a `T`, since what the range walks are the values of the subtype —
           // the bounds and the comparison stay at the base, which is what `T` is laid out as.
           val u         = declare(name, c)
-          val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+          val (tb, ctx) = analyzeLoopBody(expected, label)(loopStmts(body))
           popScope()
           val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-          TFor(u, i, TIntLit(lo.toBigInt, i), TIntLit(last.toBigInt, i), inclusive = true, tb, telse,
-               loopResultType(ctx, telse))
+          checkedLoop(ctx,
+                      TFor(u, i, TIntLit(lo.toBigInt, i), TIntLit(last.toBigInt, i), inclusive = true, tb,
+                           telse, loopResultType(ctx, telse)))
 
         case RangeExpr(Some(lo), Some(hi), inclusive) =>
           val List(tlo, thi) = analyzeOperands(List(lo, hi), None)
@@ -132,10 +134,10 @@ trait ControlFlowExprAnalysis extends ExprSupport {
             case other           => err(s"a 'for' range iterates integer bounds, not ${show(other)}")
           pushScope()
           val u            = declare(name, vty)
-          val (tb, ctx)    = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+          val (tb, ctx)    = analyzeLoopBody(expected, label)(loopStmts(body))
           popScope()
           val telse        = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-          TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse))
+          checkedLoop(ctx, TFor(u, vty, tlo, thi, inclusive, tb, telse, loopResultType(ctx, telse)))
 
         case _ =>
           val seq = autoDeref(analyzeExpr(iter))
@@ -301,10 +303,10 @@ trait ControlFlowExprAnalysis extends ExprSupport {
                       elseOpt: Option[List[Stmt]], expected: Option[Type], discarded: Boolean): TExpr = {
     pushScope()
     val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+    val (tb, ctx) = analyzeLoopBody(expected, label)(loopStmts(body))
     popScope()
     val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
-    TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse))
+    checkedLoop(ctx, TForEach(u, elem, seq, tb, telse, loopResultType(ctx, telse)))
   }
 
   /** `for name in cursor` over a sequence that has to be produced a value at a time (`14 §7`).
@@ -328,11 +330,11 @@ trait ControlFlowExprAnalysis extends ExprSupport {
 
     pushScope()
     val u         = declare(name, elem)
-    val (tb, ctx) = analyzeLoopBody(expected, label)(inBlock(body)(body.flatMap(recoverStmt)))
+    val (tb, ctx) = analyzeLoopBody(expected, label)(loopStmts(body))
     popScope()
     val telse     = elseOpt.map(analyzeValueBlock(_, expected, discarded))
     val bind      = TVariantPattern(opt, opt.variant("Some").get, List(TBindPattern(u, elem)))
-    TIterate(cursor, seq.ty, seq, step, bind, tb, telse, loopResultType(ctx, telse))
+    checkedLoop(ctx, TIterate(cursor, seq.ty, seq, step, bind, tb, telse, loopResultType(ctx, telse)))
   }
 
   /** What a type's `Iterate` implementation yields, or `None` where it has none.

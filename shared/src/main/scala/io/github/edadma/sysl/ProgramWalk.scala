@@ -826,6 +826,18 @@ trait ProgramWalk
       // declared function knows in advance and this does not.
       val (contracts, rest) = body.span { case _: Require | _: Ensure => true; case _ => false }
 
+      // Neither a closure nor a nested function takes a `variant` yet, and the two are refused
+      // together because this is the one path both are analyzed on. The measure is checked at the
+      // *call*, out of the arguments it supplies (`17 §4`), and neither of these is reached by a
+      // call of that shape: a closure goes through `Fn`, and a nested function's calls carry its
+      // captured environment as a receiver the check would have to account for. `17 § Open g`.
+      body.collectFirst { case v: Variant => v }.foreach { v =>
+        at(v.pos)(err("a 'variant' is a top-level function's — the measure is checked where a call " +
+          "to the same body is written, and neither a closure, which is reached through 'Fn', nor " +
+          "a function nested in another, whose calls carry a captured environment, is reached that " +
+          "way"))
+      }
+
       // A closure whose result the context did not fix is analyzed with nothing expected, so what
       // its body yields is what it yields — the only reading under which `x -> x * 2` has a result
       // at all.
@@ -838,7 +850,7 @@ trait ProgramWalk
       if declaredResult.exists(r => r != Type.Unit && tbody.result.isDefined && disagree(tbody.ty, r)) then
         err(s"this closure should yield ${show(declaredResult.get)}, but its body yields ${show(tbody.ty)}")
 
-      val (requires, ensures, olds) = analyzeContracts(result, contracts)
+      val (requires, ensures, olds, _) = analyzeContracts(result, contracts)
 
       (TFunc(name, tparams, result, tbody, variadic, requires, ensures, olds), result)
     finally
@@ -896,8 +908,9 @@ trait ProgramWalk
     retTy = rtype
     variadicFn = f.variadic
     val tparams = params.map { case (n, t) => (declare(n, t), t) }
-    val (contracts, rest)         = f.body.span { case _: Require | _: Ensure => true; case _ => false }
-    val (requires, ensures, olds) = analyzeContracts(rtype, contracts)
+    val (contracts, rest) =
+      f.body.span { case _: Require | _: Ensure | _: Variant => true; case _ => false }
+    val (requires, ensures, olds, variant) = analyzeContracts(rtype, contracts)
 
     // A function owing no value is where statement position starts: its body block is the outermost
     // one written for effect, and every `if` and `match` that ends it inherits that.
@@ -923,7 +936,7 @@ trait ProgramWalk
     // function, and only the second answers for an instantiation; a symbol is file-private if either
     // says so, since both name the one declaration.
     TFunc(name, tparams, rtype, tbody, f.variadic, requires, ensures, olds,
-      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec)
+      fileLocal(name) || fileLocal(f.name), f.conv, f.tailrec, variant)
   }
 
   /** Typechecks the leading `require`/`ensure` clauses. Both conditions must be `bool`. `result`
@@ -934,10 +947,11 @@ trait ProgramWalk
   private def analyzeContracts(
       rtype: Type,
       clauses: List[Stmt],
-  ): (List[(TExpr, Option[String])], List[(TExpr, Option[String])], List[TExpr]) = {
+  ): (List[(TExpr, Option[String])], List[(TExpr, Option[String])], List[TExpr], Option[TExpr]) = {
     val requires = mutable.ListBuffer.empty[(TExpr, Option[String])]
     val ensures  = mutable.ListBuffer.empty[(TExpr, Option[String])]
     val olds     = mutable.ListBuffer.empty[TExpr]
+    var variant  = Option.empty[TExpr]
 
     for c <- clauses do
       c match
@@ -950,8 +964,27 @@ trait ProgramWalk
           oldBuf = None
           ensureResultTy = None
           ensures += ((tc, msg))
-        case _ => // span guarantees only Require/Ensure reach here
-    (requires.toList, ensures.toList, olds.toList)
+        case Variant(e) =>
+          at(c.pos) {
+            if variant.isDefined then
+              err("a function declares one 'variant' — a measure is the thing that decreases, and " +
+                "two of them say nothing about which")
+            val te = analyzeExpr(e)
+
+            te.ty match
+              case _: Type.Integer =>
+              case other           => err(s"a 'variant' is an integer measure, not ${show(other)}")
+
+            // `17 §4` says the measure reads the parameters and nothing else, and **scoping is what
+            // enforces it** rather than a rule of this pass: the clause is analyzed before the body,
+            // in a scope holding the parameters alone, so a name from the body is undefined here and
+            // says so. That is what makes the check local — the arguments at a self-call are what
+            // the parameters are about to become, so the "next" measure is this expression over
+            // them and nothing has to travel with the call.
+            variant = Some(te)
+          }
+        case _ => // span guarantees only Require/Ensure/Variant reach here
+    (requires.toList, ensures.toList, olds.toList, variant)
   }
 
   protected def instantiateFunc(f: FuncDecl, targs: List[Type]): String = {

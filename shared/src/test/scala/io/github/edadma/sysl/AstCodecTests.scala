@@ -243,6 +243,11 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // greedy body has to survive the trip as the body rather than as a sibling of it.
     check("both quantifiers, over both range forms",
       "var u = for all i in 0..<3 do i >= 0 && i < 3\n    var e = for some j in 1..4 do j == 2")
+    // A loop's clauses are statements at the head of its body, so what has to survive is their
+    // *position* as much as their contents — a message on one and none on the other.
+    check("a loop carrying an invariant with a message and a variant",
+      "var i = 0\n    while i < 3\n        invariant i >= 0, \"never backwards\"\n" +
+        "        variant 3 - i\n        i += 1")
   }
 
   "the format refuses" - {

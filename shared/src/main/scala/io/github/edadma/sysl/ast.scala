@@ -689,6 +689,22 @@ enum AsmItem {
 case class Require(cond: Expr, msg: Option[String]) extends Stmt
 case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
 
+/** `invariant <bool> [, "message"]` at the head of a loop body — a condition that holds on every
+ * entry to the body (`17 §3`).
+ *
+ * It is a statement rather than a slot in each loop's header so that one rule serves all five loop
+ * forms. Where it may stand is the analyzer's: at the head of a loop's body and nowhere else.
+ */
+case class Invariant(cond: Expr, msg: Option[String]) extends Stmt
+
+/** `variant <int>` — a measure that strictly decreases (`17 §3`, `17 §4`).
+ *
+ * At the head of a loop body it decreases from one iteration to the next. In a function's contract
+ * block it decreases at each direct recursive call, and there it may read only the parameters, which
+ * is what lets the check be made entirely at the call site.
+ */
+case class Variant(expr: Expr) extends Stmt
+
 /** `for all i in 0..<n do P(i)` / `for some i in 0..<n do P(i)` — a quantifier over an integer
  * range, yielding a `bool` (`17 §2`).
  *

@@ -54,8 +54,8 @@ class SyslParser(val source: Source) extends DeclParser {
   lazy val statement: PackratParser[Stmt] =
     at(
       misplacedCapability | misplacedLink | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
-        breakStmt | continueStmt | deferStmt | asmStmt | requireStmt | ensureStmt | multiAssign |
-        resultListStmt | exprStmt,
+        breakStmt | continueStmt | deferStmt | asmStmt | requireStmt | ensureStmt | invariantStmt |
+        variantStmt | multiAssign | resultListStmt | exprStmt,
     )
 
   /** A statement written on the same line as the keyword that introduces it.
@@ -92,6 +92,25 @@ class SyslParser(val source: Source) extends DeclParser {
 
   protected lazy val ensureStmt: PackratParser[Stmt] =
     op("ensure") ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Ensure(c, m) }
+
+  /** `invariant <cond> [, "message"]` and `variant <expr>` — the loop clauses of `17 §3`, and, for
+   * `variant`, the recursion measure a function's contract block carries (`17 §4`).
+   *
+   * **Both words are contextual**, matched as soft words exactly as the struct `invariant` of
+   * `16 §6` is — which is also where `invariant` was already being read this way, so this spends no
+   * new word. The cost of that is the cost `is` and `not` already pay: a *bare statement* that calls
+   * a function of the same name, `invariant(x)`, reads as a clause over `(x)`. Anywhere that is not
+   * a bare statement — `val v = invariant(x)`, an argument, a condition — the call is unambiguous,
+   * and a value named `invariant` is untouched. That trade buys the clause its natural spelling in
+   * the position a reader writes it.
+   */
+  protected lazy val invariantStmt: PackratParser[Stmt] =
+    invariantKw ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Invariant(c, m) }
+
+  protected lazy val variantStmt: PackratParser[Stmt] =
+    variantKw ~> expression ^^ Variant.apply
+
+  protected lazy val variantKw: Parser[Unit] = softWord("variant")
 
   protected lazy val contractMsg: Parser[String] =
     accept("string literal", { case t: lexical.StrLit => t.value })

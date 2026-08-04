@@ -298,6 +298,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     pushTemps()
     pushOwned()
     ensures = f.ensures
+    selfName = f.name
+    selfParams = f.params
+    selfVariant = f.variant
 
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep,
     // so it takes no slot and the emitted signature below does not mention it.
@@ -544,6 +547,14 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     // answered for the others were chosen between in the analyzer and are not represented.
     case TAsm(lines, operands, clobbers) =>
       if lines.nonEmpty then genAsm(lines, operands, clobbers)
+
+    // A loop's `invariant` (`17 §3`) is a condition that traps on false, which is every other clause
+    // in `16` — so it is the shared check and nothing more.
+    case TInvariant(cond, _) =>
+      emitContract(cond, "invariant")
+
+    case v: TVariantCheck =>
+      genVariantCheck(v)
 
   /** Lowers the selected arm to LLVM's inline assembly.
    *

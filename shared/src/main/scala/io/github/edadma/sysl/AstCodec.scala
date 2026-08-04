@@ -317,6 +317,8 @@ object AstCodec {
         case AsmStmt(arms)                => tok("asm"); list(arms)(asmArm)
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
+        case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
+        case Variant(e)                   => tok("vnt"); expr(e)
 
         case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv, tr) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
@@ -694,6 +696,8 @@ object AstCodec {
         case "asm"  => AsmStmt(list(asmArm()))
         case "req"  => Require(expr(), opt(sref()))
         case "ens"  => Ensure(expr(), opt(sref()))
+        case "inv"  => Invariant(expr(), opt(sref()))
+        case "vnt"  => Variant(expr())
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
             bounds(), bool(), vis(), tdefaults(), opt(testAttr()),
