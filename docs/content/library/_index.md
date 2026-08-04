@@ -32,7 +32,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.io`](/library/io/) | `Reader`, `stdin()`, `lines()` | — |
 | [`sysl.fs`](/library/fs/) | files and paths — `read_text`, `write_bytes`, `exists`, `rename`, and `IoError` | `os` |
 | [`sysl.math`](/library/math/) | `max`, `min`, `pi`, the float functions, the integer traits `Signed` and `Bits`, and the integer arithmetic above them — `pow`, `gcd`, `lcm`, `divmod`, `is_power_of_two`, `next_power_of_two` | — |
-| [`sysl.time`](/library/time/) | `Instant` and `Duration`, the civil calendar — `LocalDate`, `LocalTime`, `LocalDateTime`, `Offset` — and the ISO 8601 renderers and parsers | — |
+| [`sysl.time`](/library/time/) | `Instant` and `Duration`, the civil calendar — `LocalDate`, `LocalTime`, `LocalDateTime`, `Offset` — the fixed-offset conversions, and the ISO 8601 renderers and parsers | — |
 | [`sysl.sync`](/library/sync/) | `Atomic[T]`, `SpinLock`, and the five memory orderings | — |
 | [`sysl.thread`](/library/thread/) | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` | `threads`, `posix` |
 | [`sysl.args`](/library/args/) | `args_of`, for reading a raw `argv` | — |

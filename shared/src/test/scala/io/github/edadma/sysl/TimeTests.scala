@@ -382,11 +382,106 @@ class TimeTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "an offset that is neither Z nor a signed pair" in {
+      // The second names byte 3, which is where the colon is missing rather than where the offset
+      // began. Reading the field left to right is what a timestamp needs anyway — one of these sits
+      // in the middle of a longer string — and it is the more useful of the two positions.
       run(
         imp +
           """print(str(parse_offset("05:30").unwrap_err()))
             |print(str(parse_offset("+0530").unwrap_err()))""".stripMargin) shouldBe
-        "not the expected shape at byte 0\nnot the expected shape at byte 0\n"
+        "not the expected shape at byte 0\nnot the expected shape at byte 3\n"
+    }
+  }
+
+  /** The fixed-offset conversions, which are the pair a zone is *not* needed for. Kept in a section
+    * of their own because what makes them the library's rather than a program's is that **both
+    * directions are total** — a zone whose clocks move answers the second question with none or two,
+    * and an offset is a number rather than a rule with a history, so it never can.
+    */
+  "a fixed offset" - {
+    "an instant reads against a wall set a fixed distance from UTC" in {
+      run(
+        imp +
+          """var t = Instant(1772548200000000i64)
+            |
+            |print(at_offset(t, Offset(-300)))
+            |print(at_offset(t, Offset(330)))
+            |print(at_offset(t, Offset(0)))""".stripMargin) shouldBe
+        "2026-03-03 09:30\n2026-03-03 20:00\n2026-03-03 14:30\n"
+    }
+
+    // The property rather than a number: the pair is inverse at every offset, including the two
+    // that cross a day boundary in opposite directions.
+    "and the two directions are inverse, at every offset a zone uses" in {
+      run(
+        imp +
+          """var t = Instant(1772548200000000i64)
+            |var bad = 0
+            |
+            |for m in -720..840
+            |    var o = Offset(m)
+            |    if from_offset(at_offset(t, o), o) != t then bad = bad + 1
+            |
+            |print(bad)""".stripMargin) shouldBe "0\n"
+    }
+
+    /** `timestamp_text` is written for RFC 3339 where `datetime_text` is written for people, so the
+      * seconds are present at zero and the join is a `T`. Pinned because the temptation to share one
+      * renderer between them is exactly what would break a consumer with a grammar.
+      */
+    "a timestamp renders in the machine-readable shape, seconds and all" in {
+      run(
+        imp +
+          """var t = Instant(1772548200000000i64)
+            |
+            |print(timestamp_text(t, Offset(-300)))
+            |print(timestamp_text(t, Offset(330)))
+            |print(timestamp_text(t, Offset(0)))
+            |print(timestamp_text(Instant(1772548200500000i64), Offset(-300)))""".stripMargin) shouldBe
+        "2026-03-03T09:30:00-05:00\n2026-03-03T20:00:00+05:30\n2026-03-03T14:30:00Z\n" +
+          "2026-03-03T09:30:00.500000-05:00\n"
+    }
+
+    "and what it writes is read back as the same instant" in {
+      run(
+        imp +
+          """var offs = [Offset(0), Offset(-300), Offset(330), Offset(-720), Offset(840)]
+            |var bad = 0
+            |
+            |for n in 0..2000
+            |    var t = Instant(long(n) * 3719000000i64 - 1000000000000i64)
+            |    for o in offs
+            |        parse_timestamp(timestamp_text(t, o)) match
+            |            Ok(back) -> if back != t then bad = bad + 1
+            |            Err(_) -> bad = bad + 1
+            |
+            |print(bad)""".stripMargin) shouldBe "0\n"
+    }
+
+    /** The parser takes more shapes than the renderer writes, on purpose — what arrives was written
+      * by somebody else. All four of these name the same point on the timeline.
+      */
+    "a parse is liberal in what it accepts, and lands on one instant" in {
+      run(
+        imp +
+          """var t = Instant(1772548200000000i64)
+            |
+            |print(parse_timestamp("2026-03-03T09:30:00-05:00").unwrap_or(Instant(0i64)) == t)
+            |print(parse_timestamp("2026-03-03 09:30-05:00").unwrap_or(Instant(0i64)) == t)
+            |print(parse_timestamp("2026-03-03T14:30:00Z").unwrap_or(Instant(0i64)) == t)
+            |print(parse_timestamp("2026-03-03T20:00:00+05:30").unwrap_or(Instant(0i64)) == t)""".stripMargin) shouldBe
+        "true\ntrue\ntrue\ntrue\n"
+    }
+
+    // An offset is not optional: a timestamp with no offset names no instant, and reading one as
+    // UTC would be inventing the fact the format exists to carry.
+    "a timestamp with no offset is refused rather than assumed to be UTC" in {
+      run(
+        imp +
+          """print(str(parse_timestamp("2026-03-03T09:30:00").unwrap_err()))
+            |print(str(parse_timestamp("2026-03-03T09:30:00-25:00").unwrap_err()))
+            |print(str(parse_timestamp("2026-03-03T09:30:00Z ").unwrap_err()))""".stripMargin) shouldBe
+        "not the expected shape at byte 19\noffset hour is out of range\nunexpected text at byte 20\n"
     }
   }
 

@@ -419,10 +419,107 @@ held something more that the caller meant to split off first. `BadShape` and `Tr
 offset for the reason [`sysl.text`](/library/text/)'s `BadDigit` carries one: a message naming where
 is worth writing and cannot be reconstructed afterwards.
 
+## A fixed offset, which is not a zone
+
+```sysl
+import sysl.time.*
+
+var t = Instant(1772548200000000i64)
+
+print(at_offset(t, Offset(-300)))
+print(at_offset(t, Offset(330)))
+print(from_offset(at_offset(t, Offset(-300)), Offset(-300)) == t)
+print(timestamp_text(t, Offset(-300)))
+print(timestamp_text(t, Offset(0)))
+print(timestamp_text(Instant(1772548200500000i64), Offset(-300)))
+```
+
+```output
+2026-03-03 09:30
+2026-03-03 20:00
+true
+2026-03-03T09:30:00-05:00
+2026-03-03T14:30:00Z
+2026-03-03T09:30:00.500000-05:00
+```
+
+**Both directions are total, and that is the whole difference between an offset and a zone.** An
+offset is a number; a zone is a rule with a history. Ask a zone what instant a wall clock reading
+names and the honest answers are *one*, *none* and *two* — the hour a spring-forward deletes has no
+instant in it, and the hour an autumn-back repeats has two. Ask an offset and there is exactly one,
+always, which is why this pair is a pair of plain functions and a zone conversion could never be.
+
+**Most programs that handle timestamps need only this.** A timestamp on a wire, in a log line or in
+a database column already carries the offset that was in force when it was written: the sender
+resolved the zone, and what arrived is the record of that decision. Reading one back needs no table,
+no update cadence and no filesystem — which is exactly what makes it the library's business, where
+the zone is not.
+
+### The renderer is written for machines, and it is the odd one out
+
+`timestamp_text` breaks two of this page's own rules, on purpose. The seconds are present even at
+zero, where [`datetime_text` drops them](#rendering); the date and time are joined by a `T` rather
+than a space; and the offset is flush against the time.
+
+That is **RFC 3339**, the profile of ISO 8601 that JSON APIs, logs and databases actually agree on,
+and it *requires* the seconds. The rule that a renderer should not report what a value does not say
+is the right rule for a person glancing at a meeting time and exactly the wrong one for a parser
+with a grammar — so the two renderers are two renderers. The fraction is still omitted when it is
+zero, because RFC 3339 makes that part optional and `.000000` on every timestamp is six characters
+of noise on the wire.
+
+```sysl
+import sysl.time.*
+
+var t = Instant(1772548200000000i64)
+
+print(parse_timestamp("2026-03-03T09:30:00-05:00").unwrap_or(Instant(0i64)) == t)
+print(parse_timestamp("2026-03-03 09:30-05:00").unwrap_or(Instant(0i64)) == t)
+print(parse_timestamp("2026-03-03T14:30:00Z").unwrap_or(Instant(0i64)) == t)
+print(parse_timestamp("2026-03-03T20:00:00+05:30").unwrap_or(Instant(0i64)) == t)
+```
+
+```output
+true
+true
+true
+true
+```
+
+**The parser reads more shapes than the renderer writes.** It takes the space as well as the `T`,
+and a time with no seconds as well as one with them, because what arrives was written by somebody
+else — while the renderer emits one form, because a wire format with options is a wire format
+everybody implements differently. Liberal in what it accepts, strict in what it sends.
+
+All four of those lines name the same point on the timeline, which is the point: the offset is not
+decoration on the reading, it is what turns the reading into an instant.
+
+### An offset is not optional
+
+```sysl
+import sysl.time.*
+
+print(str(parse_timestamp("2026-03-03T09:30:00").unwrap_err()))
+print(str(parse_timestamp("2026-03-03T09:30:00-25:00").unwrap_err()))
+print(str(parse_timestamp("2026-03-03T09:30:00Z ").unwrap_err()))
+```
+
+```output
+not the expected shape at byte 19
+offset hour is out of range
+unexpected text at byte 20
+```
+
+A date and a time with no offset name a **wall clock reading**, not an instant, and
+`parse_datetime` is what reads one of those. Defaulting the missing offset to UTC would be inventing
+the fact the format exists to carry, and it is the single most common way a timestamp ends up hours
+wrong in a system that never notices.
+
 ## What is not here
 
-**The zone.** A wall clock reading becomes an instant only once somebody says where the wall is, and
-answering that needs the IANA time zone database — a table that changes several times a year, which a
+**The zone**, as distinct from the offset above. A wall clock reading becomes an instant only once
+somebody says where the wall is, and answering that from a *name* — `America/New_York` rather than
+`-05:00` — needs the IANA time zone database — a table that changes several times a year, which a
 standard library either ships and lets go stale or reads from the host and thereby needs a
 filesystem. Both are decisions with costs, and neither belongs in a module whose whole claim is that
 it is arithmetic. The [date and time guide](/guides/datetime/) builds a fixed-offset zone over this

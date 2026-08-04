@@ -86,9 +86,16 @@ us_transitions() -> [10]Instant
 
         // Both rules are written in *local* time — 02:00 on the day — so each one is turned into an
         // instant with the offset that is in force on the way in, standard in spring and daylight
-        // in autumn. That is the same trap `resolve` exists to handle, met here first.
-        ts[i] = Instant(long(nth_weekday(y, 3, Sunday, 2).day) * us_per_day + 7i64 * us_per_hour)
-        ts[i + 1usize] = Instant(long(nth_weekday(y, 11, Sunday, 1).day) * us_per_day + 6i64 * us_per_hour)
+        // in autumn. That is the same trap `resolve` exists to handle, met here first, and it is
+        // `from_offset` that performs it: these used to be the UTC hours 7 and 6 written out as
+        // literals, which is the arithmetic already done and the paragraph above claiming it had
+        // not been.
+        var at_two = time_at(2, 0, 0)
+        var spring = standard_offset(NewYork)
+        var autumn = daylight_offset(NewYork)
+
+        ts[i] = from_offset(LocalDateTime(nth_weekday(y, 3, Sunday, 2), at_two), spring)
+        ts[i + 1usize] = from_offset(LocalDateTime(nth_weekday(y, 11, Sunday, 1), at_two), autumn)
 
     ts
 end us_transitions
@@ -102,8 +109,10 @@ eu_transitions() -> [10]Instant
     for y in first_year..last_year
         var i = usize(y - first_year) * 2usize
 
-        ts[i] = Instant(long(last_weekday(y, 3, Sunday).day) * us_per_day + us_per_hour)
-        ts[i + 1usize] = Instant(long(last_weekday(y, 10, Sunday).day) * us_per_day + us_per_hour)
+        var at_one = time_at(1, 0, 0)
+
+        ts[i] = from_offset(LocalDateTime(last_weekday(y, 3, Sunday), at_one), Offset(0))
+        ts[i + 1usize] = from_offset(LocalDateTime(last_weekday(y, 10, Sunday), at_one), Offset(0))
 
     ts
 end eu_transitions
@@ -146,7 +155,7 @@ end ZonedDateTime
 to_local(t: Instant, z: ZoneId) -> ZonedDateTime
     var off = offset_at(z, t)
 
-    ZonedDateTime(wall_of(t.us + long(off.minutes) * us_per_minute), off, z)
+    ZonedDateTime(at_offset(t, off), off, z)
 end to_local
 
 // What a wall clock reading was a moment of — the direction that does not.
@@ -168,14 +177,16 @@ end Resolution
 // produces is the offset that was guessed — which is the whole algorithm, and the reason it needs
 // no knowledge of where the transitions are.
 resolve(ldt: LocalDateTime, z: ZoneId) -> Resolution
-    var wall = wall_us(ldt)
     var std = standard_offset(z)
     var dst = daylight_offset(z)
 
-    if !moves(z) then return Once(Instant(wall - long(std.minutes) * us_per_minute))
+    // A zone that does not move has one offset and therefore one answer, which is exactly what
+    // `from_offset` is: the fixed-offset conversion the library supplies is the whole of this case,
+    // and everything below is what a zone adds to it.
+    if !moves(z) then return Once(from_offset(ldt, std))
 
-    var as_dst = Instant(wall - long(dst.minutes) * us_per_minute)
-    var as_std = Instant(wall - long(std.minutes) * us_per_minute)
+    var as_dst = from_offset(ldt, dst)
+    var as_std = from_offset(ldt, std)
     var dst_holds = offset_at(z, as_dst) == dst
     var std_holds = offset_at(z, as_std) == std
 

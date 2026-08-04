@@ -86,7 +86,7 @@ class DocsTests extends AnyFreeSpec with DocsSupport with ParallelTestExecution 
     "docs/content/library/io.md"                        -> (4, 3, 2),
     "docs/content/library/fs.md"                        -> (6, 5, 3),
     "docs/content/library/math.md"                      -> (14, 9, 2),
-    "docs/content/library/time.md"                       -> (8, 4, 3),
+    "docs/content/library/time.md"                       -> (11, 4, 3),
     "docs/content/library/sync.md"                       -> (9, 7, 2),
     "docs/content/library/thread.md"                     -> (6, 6, 2),
     "docs/content/library/args.md"                        -> (4, 4, 1),

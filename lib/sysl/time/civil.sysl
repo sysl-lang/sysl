@@ -179,6 +179,20 @@ wall_us(ldt: LocalDateTime) -> long = long(ldt.date.day) * us_per_day + ldt.time
 wall_of(us: long) -> LocalDateTime =
     LocalDateTime(LocalDate(int(floor_div(us, us_per_day))), LocalTime(floor_mod(us, us_per_day)))
 
+// An instant read against a wall set a fixed distance from UTC, and back. **Both directions are
+// total**, which is what separates a fixed offset from a zone: a zone whose clocks move answers the
+// second question with none or two, and this pair never does, because an offset is a number rather
+// than a rule with a history.
+//
+// That is also why they are here and a zone is not. A timestamp on a wire, in a log or in a database
+// column carries the offset that was in force when it was written — the sender resolved the zone
+// already, and what arrived is the record of that decision. Reading one back needs no table, no
+// update cadence and no filesystem, which is the whole of what makes it the library's business.
+at_offset(t: Instant, o: Offset) -> LocalDateTime = wall_of(t.us + long(o.minutes) * us_per_minute)
+
+from_offset(ldt: LocalDateTime, o: Offset) -> Instant =
+    Instant(wall_us(ldt) - long(o.minutes) * us_per_minute)
+
 // Adding days to a wall clock reading is **not** adding a length of time to it. Seven days later is
 // the same clock face seven rows down the calendar, whatever the timeline did in between — and
 // across a change of a zone's clocks the two answers differ by an hour. Both are right; they answer
@@ -274,3 +288,22 @@ instant_text(t: Instant) -> string = f"${datetime_text(wall_of(t.us))}%s Z"
 impl Display for Instant
     display(self, out: *Writer, fmt: FormatSpec) = display_str(instant_text(self), out, fmt)
 end Instant
+
+// A timestamp as a machine reads it: `2026-03-08T09:30:00-05:00`, or `…Z` where the offset is zero.
+//
+// **This one is written for RFC 3339 and the renderers above are written for people**, which is why
+// the shapes differ where it would have been easy to share one. The seconds are always present, even
+// at zero, because RFC 3339 requires them — so `datetime_text`'s rule of dropping what a value does
+// not say is exactly wrong here, where the reader is a parser with a grammar rather than somebody
+// glancing at a meeting time. The date and the time are joined by `T` rather than a space for the
+// same reason, and the offset is written flush against the time rather than after a space.
+//
+// The fraction still appears only when there is one, because RFC 3339 makes it optional and a
+// `.000000` on every timestamp is six characters of noise on the wire.
+timestamp_text(t: Instant, o: Offset) -> string
+    var l = at_offset(t, o)
+    var hms = f"${hour_of(l.time)}%02d:${minute_of(l.time)}%02d:${second_of(l.time)}%02d"
+    var frac = if us_of(l.time) == 0i64 then "" else f".${us_of(l.time)}%06d"
+
+    date_text(l.date) + "T" + hms + frac + offset_text(o)
+end timestamp_text

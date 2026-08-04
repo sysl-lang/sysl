@@ -167,20 +167,49 @@ end parse_datetime
 // `Z`, `+05:30`, `-08:00`. The `Z` is zero, which is the spelling `offset_text` writes it back as.
 parse_offset(s: string) -> Result[Offset, TimeParseError]
     var b = s.bytes
+    var o = offset_from(b, 0usize)?
 
-    if b.len == 1usize && b[0] == 90u8 then return Ok(Offset(0))
-    if b.len != 6usize then return Err(BadShape(0usize))
+    if o.1 != b.len then return Err(Trailing(o.1))
 
-    var sign = if b[0] == 45u8 then -1 else 1
+    Ok(o.0)
+end parse_offset
 
-    if b[0] != 43u8 && b[0] != 45u8 then return Err(BadShape(0usize))
+// The offset, and where reading it stopped — which is what lets a timestamp read one off its tail.
+private offset_from(b: []const u8, at: usize) -> Result[(Offset, usize), TimeParseError]
+    if at >= b.len then return Err(BadShape(at))
+    if b[at] == 90u8 then return Ok((Offset(0), at + 1usize))
+    if b[at] != 43u8 && b[at] != 45u8 then return Err(BadShape(at))
 
-    var h = digits(b, 1usize, 2usize)?
-    expect(b, 3usize, 58u8)?
-    var m = digits(b, 4usize, 2usize)?
+    var sign = if b[at] == 45u8 then -1 else 1
+    var h = digits(b, at + 1usize, 2usize)?
+    expect(b, at + 3usize, 58u8)?
+    var m = digits(b, at + 4usize, 2usize)?
 
     if h > 23 then return Err(OutOfRange("offset hour"))
     if m > 59 then return Err(OutOfRange("offset minute"))
 
-    Ok(Offset(sign * (h * 60 + m)))
-end parse_offset
+    Ok((Offset(sign * (h * 60 + m)), at + 6usize))
+end offset_from
+
+// A whole timestamp, straight to the point on the timeline it names — which is the thing a program
+// reading a log line, a wire format or a database column actually wants, and the one conversion in
+// this direction that needs no zone table.
+//
+// **It reads more shapes than `timestamp_text` writes**, deliberately. The renderer emits one form
+// because a wire format with options is a wire format everybody implements differently; the parser
+// takes the space as well as the `T`, and a time with no seconds as well as one with them, because
+// what arrives was written by somebody else. Liberal in what it accepts, strict in what it sends.
+parse_timestamp(s: string) -> Result[Instant, TimeParseError]
+    var b = s.bytes
+    var d = date_from(b, 0usize)?
+
+    if d.1 >= b.len then return Err(BadShape(d.1))
+    if b[d.1] != 32u8 && b[d.1] != 84u8 then return Err(BadShape(d.1))
+
+    var t = time_from(b, d.1 + 1usize)?
+    var o = offset_from(b, t.1)?
+
+    if o.1 != b.len then return Err(Trailing(o.1))
+
+    Ok(from_offset(LocalDateTime(d.0, t.0), o.0))
+end parse_timestamp
