@@ -104,12 +104,19 @@ class TestAttributeTests extends AnyFreeSpec with CodegenSupport with RunSupport
   }
 
   "an attribute the language does not have is refused by name" - {
-    // The point of naming it: a mechanism with two members should say which two it has, rather
-    // than reporting the grammar's own confusion about a token it could not place.
+    // The point of naming them: a mechanism with a closed set of members should say which ones it
+    // has, rather than reporting the grammar's own confusion about a token it could not place. The
+    // list grows as the set does — `@pure` and `@ghost` joined it with `17` — so what is asserted is
+    // that every member is named, one at a time, rather than one sentence that goes stale each time
+    // an annotation is added.
     "an unknown word after '@' says what the annotations are" in {
-      err("""@packed
-            |t() = 0
-            |""".stripMargin) should include("'@test' and '@tailrec' are the two")
+      val message = err("""@packed
+                          |t() = 0
+                          |""".stripMargin)
+
+      message should include("'packed' is not an annotation sysl knows")
+
+      for known <- List("@test", "@tailrec", "@pure", "@ghost") do message should include(known)
     }
 
     /** `#` where `@` was meant — the sigil someone arriving from Rust or C reaches for, and the one

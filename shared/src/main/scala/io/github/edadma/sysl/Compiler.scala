@@ -79,6 +79,32 @@ object Compiler {
       case errs => Left(errs.mkString("\n"))
   }
 
+  /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
+   *
+   * It stops before pruning and before lowering, and both matter. A function nothing calls is still
+   * one the program declared and still one somebody may want proved; and a `@ghost` declaration is
+   * dropped from the emitted module by design (`17 §8`), so a proof run reading the lowered tree
+   * would have lost exactly the predicates the specification is written in.
+   */
+  def typedWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
+                std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet)
+      : Either[String, (TProgram, Set[String])] = {
+    val parsed = sources.map(SyslParser.parse(_, target))
+
+    parsed.collect { case Left(e) => e } match
+      case Nil =>
+        val own = parsed.collect { case Right(p) => p }
+
+        // **Which modules are the program's own travels back beside the tree**, because nothing in
+        // the tree says. `TProgram.mainModule` names the file that carries the statements, and a
+        // module of pure declarations carries none — so a proof run over a library-shaped file would
+        // have found nothing to translate. The sources given are what the reader meant by "this
+        // module", and they are only known here.
+        Analyzer.analyze(libraries ::: own, std = carried(std, target), target = target,
+                         provides = provides).map((_, own.map(moduleOf).toSet))
+      case errs => Left(errs.mkString("\n"))
+  }
+
   /** The standard module a compilation was handed, or the copy the compiler carries **for the target
    * it is building for**.
    *

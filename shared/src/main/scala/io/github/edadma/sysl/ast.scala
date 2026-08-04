@@ -689,6 +689,31 @@ enum AsmItem {
 case class Require(cond: Expr, msg: Option[String]) extends Stmt
 case class Ensure(cond: Expr, msg: Option[String]) extends Stmt
 
+/** `invariant <bool> [, "message"]` at the head of a loop body — a condition that holds on every
+ * entry to the body (`17 §3`).
+ *
+ * It is a statement rather than a slot in each loop's header so that one rule serves all five loop
+ * forms. Where it may stand is the analyzer's: at the head of a loop's body and nowhere else.
+ */
+case class Invariant(cond: Expr, msg: Option[String]) extends Stmt
+
+/** `variant <int>` — a measure that strictly decreases (`17 §3`, `17 §4`).
+ *
+ * At the head of a loop body it decreases from one iteration to the next. In a function's contract
+ * block it decreases at each direct recursive call, and there it may read only the parameters, which
+ * is what lets the check be made entirely at the call site.
+ */
+case class Variant(expr: Expr) extends Stmt
+
+/** `for all i in 0..<n do P(i)` / `for some i in 0..<n do P(i)` — a quantifier over an integer
+ * range, yielding a `bool` (`17 §2`).
+ *
+ * `universal` tells the two apart. The bound name is visible only inside `pred`, and `iter` is a
+ * range expression — the same `RangeExpr` a counted `for` takes, so the two forms cannot drift
+ * apart over what a range is.
+ */
+case class Quantifier(universal: Boolean, name: String, iter: Expr, pred: Expr) extends Expr
+
 /** A function declaration. The body is a statement list whose trailing expression is the
  * implicit return value; an `= expr` short body is stored as a single-element list. A
  * missing `retType` means the function returns `unit`. `tparams` names the type parameters of
@@ -734,6 +759,10 @@ case class FuncDecl(
     conv: Option[CallConv] = None,
     /** `@tailrec` — see `TFunc.tailrec`. */
     tailrec: Boolean = false,
+    /** `@pure` — see `TFunc.pure`. */
+    pure: Boolean = false,
+    /** `@ghost` — see `TFunc.ghost`. */
+    ghost: Boolean = false,
 ) extends Stmt
 
 /** What `@test` says about the function it is written above (`testing.md`).
@@ -761,6 +790,8 @@ case class TestAttr(display: Option[String], shouldTrap: Boolean, expected: Opti
 enum Attr(val word: String) {
   case Test(attr: TestAttr) extends Attr("test")
   case TailRec              extends Attr("tailrec")
+  case Pure                 extends Attr("pure")
+  case Ghost                extends Attr("ghost")
 }
 
 /** `extern name(params) -> ret` — a function this program does not define but may call, resolved

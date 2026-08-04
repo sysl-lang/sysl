@@ -93,6 +93,10 @@ case class Config(
     filter: Option[String] = None,
     failFast: Boolean = false,
     optimize: String = Toolchain.defaultOptimization,
+    /** `prove --emit-whyml` — print the translation instead of running the prover (`17 §9`). */
+    emitWhyML: Boolean = false,
+    /** `prove --overflow` — whether staying in an integer's range is a proof obligation. */
+    overflow: String = "check",
 )
 
 /** The option grammar, held apart from the entry point so that a test can ask what an argument list
@@ -144,6 +148,19 @@ private[sysl] val parser = {
         .action((_, c) => c.copy(command = "emit-llvm"))
         .text("print the generated LLVM IR")
         .children(arg[String]("<path>").required().action((f, c) => c.copy(file = f))),
+      cmd("prove")
+        .action((_, c) => c.copy(command = "prove"))
+        .text("translate a module to WhyML and discharge its proof obligations with Why3 (17)")
+        .children(
+          arg[String]("<path>").required().action((f, c) => c.copy(file = f)),
+          opt[Unit]("emit-whyml")
+            .action((_, c) => c.copy(emitWhyML = true))
+            .text("print the WhyML instead of proving it"),
+          opt[String]("overflow")
+            .action((o, c) => c.copy(overflow = o))
+            .text("'check' (the default) makes staying in an integer's range a proof obligation; " +
+              "'ignore' drops those obligations, for reasoning about the rest of a function first"),
+        ),
       cmd("targets")
         .action((_, c) => c.copy(command = "targets"))
         .text("list the machines sysl can build for"),
@@ -342,6 +359,12 @@ private[sysl] def execute(cfg: Config): Int = {
   if cfg.command == "test" then
     return TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, std, archives)
 
+  // Proving stops at the typed tree and never lowers, so it branches before the compilation below
+  // (`17 §9`). It reads the tree before pruning and before `@ghost` erasure, because the predicates a
+  // specification is written in are exactly what the lowering drops.
+  if cfg.command == "prove" then
+    return prove(cfg, librarySources ::: sources, libraryTrees, target, std, provides)
+
   // One compilation, whatever the subcommand does with it. The notes come back beside the IR
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled =
@@ -379,6 +402,47 @@ private[sysl] def execute(cfg: Config): Int = {
 
     case other =>
       fail(s"unknown command '$other'")
+}
+
+/** `sysl prove` — the module as WhyML, and what Why3 made of it (`17 §9`).
+ *
+ * **A proof is not a build.** Nothing is emitted and nothing about `sysl build` changes, which is
+ * `17 §1`: a module that fails to prove still compiles and still runs, with every check `16` and `17`
+ * describe. What the prover buys is finding out before the program runs rather than at the trap.
+ *
+ * The exit status is Why3's, so a proof run is usable in a build script that wants to fail on an
+ * undischarged goal.
+ */
+private def prove(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
+                  std: Stdlib, provides: Set[String]): Int = {
+  val (typed, ownModules) = Compiler.typedWith(sources, libraries, target, Some(std), provides) match
+    case Left(err)  => return report(err)
+    case Right(out) => out
+
+  if cfg.overflow != "check" && cfg.overflow != "ignore" then
+    return fail(s"--overflow is 'check' or 'ignore', and '${cfg.overflow}' is neither")
+
+  val mlw = WhyML.generate(typed, moduleName(cfg.file), cfg.overflow == "check", ownModules) match
+    case Left(err)  => return fail(err)
+    case Right(out) => out
+
+  if cfg.emitWhyML then { stdout(mlw); return 0 }
+
+  Toolchain.why3Prove(mlw) match
+    case Left(err) => fail(err)
+    case Right((code, out)) =>
+      stdout(out)
+      if code == 0 then Console.err.println("every goal was discharged")
+      code
+}
+
+/** A WhyML module's name, taken from the file the program was given. It is only a label — Why3 needs
+ * one and sysl's module names hold dots a WhyML identifier may not.
+ */
+private def moduleName(path: String): String = {
+  val base = path.split('/').last.takeWhile(_ != '.')
+
+  if base.isEmpty then "Program" else base.filter(c => c.isLetterOrDigit || c == '_')
 }
 
 /** `sysl build-lib <path> -o <artifact>` — a library compiled once, into the two halves a program

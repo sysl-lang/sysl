@@ -531,6 +531,23 @@ sealed trait TStmt
 case class TVarDecl(name: String, ty: Type, init: TExpr) extends TStmt
 case class TExprStmt(expr: TExpr)                         extends TStmt
 
+/** A loop's `invariant`, at the head of its body (`17 §3`) — a condition that traps on false, which
+ * is what every other clause in `16` already is. It carries no machinery of its own for that reason.
+ */
+case class TInvariant(cond: TExpr, msg: Option[String]) extends TStmt
+
+/** A loop's `variant`, at the head of its body (`17 §3`): the measure is evaluated, compared against
+ * the previous iteration's, and stored.
+ *
+ * `slot` names the pair of allocas the enclosing `TCheckedLoop` set up — `%<slot>.prev` holding the
+ * last value and `%<slot>.armed` saying whether there has been one. The armed flag is what makes the
+ * first iteration pass with nothing to compare against, and it is stored **at loop entry** rather
+ * than in the function's prologue, which is the whole reason this statement cannot stand alone: a
+ * loop inside another loop is entered many times, and a flag armed once per call would compare the
+ * second entry's first measure against the first entry's last.
+ */
+case class TVariantCheck(slot: String, varTy: Type, expr: TExpr) extends TStmt
+
 /** `ref name = place` (`03 § ref`) — a name bound to the storage `place` found, rather than to a
  * copy of what was in it.
  *
@@ -601,6 +618,27 @@ case class TFor(name: String, varTy: Type, lo: TExpr, hi: TExpr, inclusive: Bool
  */
 case class TCFor(init: List[TStmt], cond: Option[TExpr], step: List[TStmt], body: List[TStmt],
                  elseBlock: Option[TBlock], ty: Type) extends TExpr
+
+/** `for all name in lo..hi do pred` / `for some …` — a quantifier over an integer range (`17 §2`),
+ * which is an **expression** yielding a `bool` and not a loop: it carries no `break`, no `else`, and
+ * no label, so its type is settled rather than met.
+ *
+ * The bounds share `TFor`'s shape because they are the same range. What differs is the body: a
+ * single `TExpr` rather than a statement list, since a predicate is a condition and not a block.
+ */
+case class TQuantifier(universal: Boolean, name: String, varTy: Type, lo: TExpr, hi: TExpr,
+                       inclusive: Boolean, pred: TExpr) extends TExpr { def ty: Type = Type.Bool }
+
+/** A loop whose body carries a `variant`, wrapped so the measure's slots are set up **once per
+ * entry** to the loop rather than once per call to the function (`17 §3`).
+ *
+ * It wraps rather than adding a field to each of the seven loop nodes, and what it holds is only
+ * what has to happen outside the body: the two allocas and the store that disarms the comparison.
+ * The check itself is a `TVariantCheck` among the body's statements, where it was written.
+ *
+ * A loop with only `invariant` clauses is not wrapped — those need nothing outside the body.
+ */
+case class TCheckedLoop(slot: String, varTy: Type, loop: TExpr) extends TExpr { def ty: Type = loop.ty }
 
 /** `for name in seq [else …]` over an array or a slice. The loop variable is a *copy* of each
  * element, and the sequence is evaluated once.
@@ -681,6 +719,34 @@ case class TFunc(
      * wherever it applies — so what the flag reaches is `TailCalls.check` and nothing in codegen.
      */
     tailrec: Boolean = false,
+    /** The `variant` its contract block declared: an integer measure over the **parameters** that
+     * must strictly decrease at every direct recursive call (`17 §4`).
+     *
+     * That it reads only parameters is what makes the check local, and it is what this field is
+     * enough for on its own. At a self-call the emitter has both the current parameter values and
+     * the argument values about to replace them, so it evaluates this expression twice — once as it
+     * stands, once with the arguments stored into the parameters' own slots — and needs neither a
+     * substitution pass nor a hidden argument travelling with the call.
+     */
+    variant: Option[TExpr] = None,
+    /** `@pure` was written above it: an assertion that a caller can observe nothing about this call
+     * but its result (`17 §6`).
+     *
+     * It is checked rather than believed, and what it excludes is written out in `Purity`. It is not
+     * inferred: a function is pure because it says so, which is what keeps an edit to a leaf from
+     * breaking a caller three levels up with no annotation anywhere naming the promise it broke.
+     */
+    pure: Boolean = false,
+    /** `@ghost` was written above it: the function exists for the specification and is erased before
+     * codegen (`17 §8`).
+     *
+     * Its body is ordinary code and may read real state freely — that is the whole point of an
+     * `is_sorted` — and what the mark buys is the pair of rules that make erasing it sound: nothing
+     * executable may call it, and a clause that does is a clause that does not run. So a loop
+     * invariant costing O(n) inside an O(n) loop costs nothing at all, without a switch that would
+     * give one program two meanings.
+     */
+    ghost: Boolean = false,
 )
 
 /** A function the linker supplies, which the module declares rather than defines. Only the ones

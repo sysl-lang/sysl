@@ -27,10 +27,83 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
   protected var ensures: List[(TExpr, Option[String])] = Nil
   protected var resultSSA: Option[String]              = None
 
+  /** What the function being emitted is called, what its parameters are, and the `variant` it
+   * declared — the three things a self-call needs to check the measure (`17 §4`).
+   */
+  protected var selfName: String                 = ""
+  protected var selfParams: List[(String, Type)] = Nil
+  protected var selfVariant: Option[TExpr]       = None
+
   override protected def startFunction(): Unit = {
     super.startFunction()
     ensures = Nil
     resultSSA = None
+    selfName = ""
+    selfParams = Nil
+    selfVariant = None
+  }
+
+  /** Whether a call to `name` is the self-call a `variant` is checked at. */
+  protected def checksVariant(name: String): Boolean = selfVariant.isDefined && name == selfName
+
+  /** The measure check at a direct recursive call (`17 §4`).
+   *
+   * **It reads no state and threads nothing through the call**, which is what `17 §4`'s restriction
+   * to the parameters buys. The arguments about to be passed are the values the parameters are about
+   * to hold, so the "next" measure is this same expression evaluated with those values in the
+   * parameters' own slots: take the measure as it stands, put the arguments in, take it again, put
+   * the parameters back, and compare. Nothing is retained or released across the swap — the slots end
+   * holding exactly what they held — so the ownership bookkeeping is untouched.
+   *
+   * `staged` is aligned with `selfParams` and carries what each argument came out as, which is the
+   * shape both call paths already produce: an address for a large value, a register for the rest,
+   * and nothing at all for a zero-sized parameter.
+   */
+  protected def genVariantAtCall(staged: List[Option[(Type, Either[String, String])]]): Unit = {
+    val variant = selfVariant.get
+
+    pushTemps()
+    val cur = genExpr(variant)
+    popTemps()
+
+    // Every save is laid down before any argument lands, since a measure over two parameters must
+    // see both of the call's values and neither of the frame's.
+    val saved =
+      for case ((name, ty), Some((_, arg))) <- selfParams.zip(staged) yield
+        val keep = emitAlloca(freshTemp(), ty.llvm)
+
+        arg match
+          case Left(addr) =>
+            memcpy(keep, s"%$name.addr", ty)
+            memcpy(s"%$name.addr", addr, ty)
+          case Right(v) =>
+            val old = freshTemp()
+
+            emit(s"$old = load ${ty.llvm}, ptr %$name.addr")
+            emit(s"store ${ty.llvm} $old, ptr $keep")
+            emit(s"store ${ty.llvm} $v, ptr %$name.addr")
+        (name, ty, keep)
+
+    pushTemps()
+    val nxt = genExpr(variant)
+    popTemps()
+
+    for (name, ty, keep) <- saved do
+      if Layout.indirect(ty) then memcpy(s"%$name.addr", keep, ty)
+      else
+        val back = freshTemp(); emit(s"$back = load ${ty.llvm}, ptr $keep")
+        emit(s"store ${ty.llvm} $back, ptr %$name.addr")
+
+    val ok = freshTemp()
+
+    emit(s"$ok = icmp ${predicate("<", variant.ty)} ${variant.ty.llvm} $nxt, $cur")
+    trapUnless(ok, "variant")
+  }
+
+  private def memcpy(dst: String, src: String, ty: Type): Unit = {
+    usesMemcpy = true
+    emit(s"call void @llvm.memcpy.p0.p0.i64(ptr align ${Layout.align(ty)} $dst, " +
+      s"ptr align ${Layout.align(ty)} $src, i64 ${Layout.size(ty)}, i1 false)")
   }
 
   /** Emits a contract clause as a trap-on-false check, discarding any temporaries the condition
@@ -49,6 +122,52 @@ trait ContractEmitter extends ArcEmitter with ScalarEmitter {
       resultSSA = result
       for (cond, _) <- ensures do emitContract(cond, "ensure")
       resultSSA = None
+
+  /** Sets up a `variant`'s two slots at the point the loop is entered (`17 §3`), then emits the loop.
+   *
+   * The `armed` flag starts false, which is what lets the first iteration pass with nothing to
+   * compare against. It is stored **here** rather than in the function's prologue because a loop
+   * nested inside another is entered many times: a flag armed once per call would compare the second
+   * entry's first measure against the first entry's last, and trap on a loop that was decreasing
+   * perfectly well.
+   */
+  protected def genCheckedLoop(slot: String, varTy: Type, loop: TExpr): String = {
+    emitAlloca(s"%$slot.prev", varTy.llvm)
+    emitAlloca(s"%$slot.armed", "i1")
+    emit(s"store i1 0, ptr %$slot.armed")
+    genExpr(loop)
+  }
+
+  /** One iteration's `variant` check: measure, compare against the last one where there was a last
+   * one, and store.
+   *
+   * The comparison is **strict** and it is signed or unsigned according to the measure's own type,
+   * which `compareValue` reads off it — a `usize` counting down to zero is as ordinary a measure as
+   * an `int` is, and comparing it as signed would be wrong at exactly the values it spends its time
+   * near.
+   */
+  protected def genVariantCheck(v: TVariantCheck): Unit = {
+    val TVariantCheck(slot, varTy, expr) = v
+    val w = varTy.llvm
+
+    pushTemps()
+    val cur = genExpr(expr)
+    popTemps()
+
+    val armedV = freshTemp(); emit(s"$armedV = load i1, ptr %$slot.armed")
+    val cmpL   = freshLabel("variant.cmp")
+    val setL   = freshLabel("variant.set")
+
+    emitTerm(s"br i1 $armedV, label %$cmpL, label %$setL")
+    emitLabel(cmpL)
+    val prev = freshTemp(); emit(s"$prev = load $w, ptr %$slot.prev")
+    val ok   = freshTemp(); emit(s"$ok = icmp ${predicate("<", varTy)} $w $cur, $prev")
+    trapUnless(ok, "variant")
+    emitTerm(s"br label %$setL")
+    emitLabel(setL)
+    emit(s"store $w $cur, ptr %$slot.prev")
+    emit(s"store i1 1, ptr %$slot.armed")
+  }
 
   /** Emits the `within`-range checks for a value produced into a constrained subtype: a lower- and
    * upper-bound compare, each trapping on violation. Integer and `char` bounds compare at the base
