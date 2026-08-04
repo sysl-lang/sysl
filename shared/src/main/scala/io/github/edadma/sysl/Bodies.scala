@@ -23,8 +23,7 @@ object Bodies {
    */
   def isDeclaration(s: Stmt): Boolean = s match
     case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-        _: ExternVarDecl | _: ImportDecl | _: ConstDecl | _: ValDecl | _: StaticVarDecl |
-        _: TypeDecl =>
+        _: ExternVarDecl | _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl =>
       true
     case _ => false
 
