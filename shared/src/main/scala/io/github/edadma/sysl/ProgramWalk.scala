@@ -469,18 +469,17 @@ trait ProgramWalk
    * mistake rather than an ordering to be guessed at.
    */
   private def entryPoint(files: List[(Program, Scope)]): (Scope, List[Stmt]) = {
-    // An `import` is not one: it binds a name for the file that wrote it and runs nothing, so a
-    // file may import whatever it likes without becoming the file the program starts in.
-    // Neither is a `const` or a `val`: both are declarations, hoisted, and a module that names a
-    // dimension or carries a table must not thereby become the file the program starts in. That is
-    // also what makes every `ValDecl` the statement walk goes on to meet a **local** — the ones
-    // written at the top of a file never reach it.
-    def executable(u: Program) = u.body.filter {
-      case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-          _: ExternVarDecl | _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl =>
-        false
-      case _ => true
-    }
+    // What counts as a declaration is `Bodies.isDeclaration`, and there is one of it on purpose:
+    // the same split decides which statements a body's `main` receives, and two lists that had to
+    // agree would be a way for them to stop agreeing.
+    //
+    // An `import` is not executable: it binds a name for the file that wrote it and runs nothing, so
+    // a file may import whatever it likes without becoming the file the program starts in. Neither
+    // is a `const` or a `val`: both are declarations, hoisted, and a module that names a dimension or
+    // carries a table must not thereby become the file the program starts in. That is also what
+    // makes every `ValDecl` the statement walk goes on to meet a **local** — the ones written at the
+    // top of a file never reach it.
+    def executable(u: Program) = u.body.filterNot(Bodies.isDeclaration)
 
     files.map((u, s) => (u, s, executable(u))).filter(_._3.nonEmpty) match
       case Nil                  => (Scope.root, Nil)
