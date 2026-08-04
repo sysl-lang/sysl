@@ -65,4 +65,24 @@ object Project {
 
     if slash >= 0 then path.substring(slash + 1) else path
   }
+
+  /** The directory an output path sits in, where it names one — the default standard-module path
+   * does, and it is a directory a fresh clone has never had, so writing the artifact has to make it.
+   */
+  def parentOf(path: String): Option[String] = {
+    val slash = math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+
+    Option.when(slash > 0)(path.substring(0, slash))
+  }
+
+  /** Removes a temporary file, whether or not it is there.
+   *
+   * Cleanup runs on the paths that failed, and those are exactly the paths where the file may never
+   * have been created: `createTempFile` reserves a name, and it is the toolchain that writes to it. A
+   * `deleteFile` on a link that failed therefore threw, and the stack trace replaced the linker's own
+   * message — the one thing the user needed to see.
+   */
+  def discard(path: String): Unit =
+    try deleteFile(path)
+    catch case _: Exception => ()
 }

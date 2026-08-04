@@ -1090,15 +1090,25 @@ standard modules be handed to two compilations and compared — but the paramete
 is found rather than named:
 
 ```
-sysl run prog.sysl                 # builds .sysl/std.syslib if it is not there, then finds it
+sysl run prog.sysl                 # builds the artifact if it is not there, then finds it
 sysl build-lib lib --std          # the same artifact, written on demand
 ```
 
-One path at both ends. `build-lib --std` with no `-o` writes to `.sysl/std.syslib`, and a
-compilation with no `--std-lib` looks there; naming the path is for the cases where it is somewhere
-else. Handed one, a compilation does the whole of the above: it declares what the artifact compiled,
-monomorphizes the generics here, and links — rather than re-deriving every signature in the standard
-module before checking its own first line.
+One path at both ends. `build-lib --std` with no `-o` writes to it and a compilation with no
+`--std-lib` looks there; naming the path is for the cases where it is somewhere else. Handed one, a
+compilation does the whole of the above: it declares what the artifact compiled, monomorphizes the
+generics here, and links — rather than re-deriving every signature in the standard module before
+checking its own first line.
+
+**That path is in the user's cache, keyed by the library's fingerprint** — on this author's macOS,
+`~/Library/Caches/sysl/<fingerprint>/std.syslib`. It was once `./.sysl/std.syslib`, and the change is
+what an *installed* compiler forces: a clone has its own `lib/sysl`, so a per-tree artifact was right,
+but a compiler carrying the library inside itself would otherwise rebuild the same 900KB once per
+directory anyone ran it in, and leave a `.sysl/` wherever `sysl run` was typed. Keying on the
+fingerprint rather than a release number is what makes an upgrade need no invalidation: an edited
+`lib/sysl` hashes differently and therefore *is* a different path, so a stale hit cannot occur rather
+than being caught. Where a machine has no cache directory at all — a container with no home — the
+project-local path is still the answer.
 
 **The artifact is not committed.** It is object code for one machine, and building it takes under a
 second, so a clone or a fresh worktree builds its own. That makes drift the thing to guard against

@@ -42,7 +42,9 @@ import scopt.OParser
  * carries, and says so on stderr. The artifact is derived rather than authored: not committed, object
  * code for one machine, and computed entirely from sources the compiler already has, so being absent
  * after a clone or stale after a format change has one answer and it is not a question for whoever
- * ran the command.
+ * ran the command. It sits in the user's cache under a fingerprint of the library it was built from,
+ * so every project on a machine shares one and a compiler carrying a different library gets a path of
+ * its own rather than a stale hit.
  *
  * **Which is not the same as substituting a library.** What a compiler must never do is answer *I
  * could not find the library you meant* by quietly using a different one — and a rebuild uses **this**
@@ -145,6 +147,12 @@ private[sysl] val parser = {
       cmd("targets")
         .action((_, c) => c.copy(command = "targets"))
         .text("list the machines sysl can build for"),
+      // A flag rather than a subcommand, because it is what somebody types before they know there
+      // are subcommands — and it satisfies `checkConfig` below by naming a command of its own, so
+      // `sysl --version` stands alone rather than being an option to something else.
+      opt[Unit]("version")
+        .action((_, c) => c.copy(command = "version"))
+        .text("print which build of sysl this is"),
       opt[Unit]("explain-escapes")
         .action((_, c) => c.copy(explainEscapes = true))
         .text("report every local array promoted to the heap, and the view that forced it"),
@@ -212,6 +220,7 @@ private[sysl] def parseArgs(own: Seq[String]): Option[Config] =
  * none of them is reachable from the compiler's own API.
  */
 private[sysl] def execute(cfg: Config): Int = {
+  if cfg.command == "version" then return printVersion()
   if cfg.command == "targets" then return listTargets()
 
   val sources =
@@ -351,10 +360,10 @@ private[sysl] def execute(cfg: Config): Int = {
       val exe = createTempFile("sysl-", "")
 
       Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links) match
-        case Left(err) => discard(exe); fail(err)
+        case Left(err) => Project.discard(exe); fail(err)
         case Right(_) =>
           val result = exec(exe :: cfg.programArgs)
-          discard(exe)
+          Project.discard(exe)
           stdout(result.stdout)
           if result.stderr.nonEmpty then Console.err.print(result.stderr)
           result.exitCode
@@ -362,17 +371,6 @@ private[sysl] def execute(cfg: Config): Int = {
     case other =>
       fail(s"unknown command '$other'")
 }
-
-/** Removes a temporary file, whether or not it is there.
- *
- * Cleanup runs on the paths that failed, and those are exactly the paths where the file may never
- * have been created: `createTempFile` reserves a name, and it is the toolchain that writes to it. A
- * `deleteFile` on a link that failed therefore threw, and the stack trace replaced the linker's own
- * message — the one thing the user needed to see.
- */
-private def discard(path: String): Unit =
-  try deleteFile(path)
-  catch case _: Exception => ()
 
 /** `sysl build-lib <path> -o <artifact>` — a library compiled once, into the two halves a program
  * links against (`LibraryArtifact`).
@@ -416,7 +414,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
         cfg.output.getOrElse(
           if cfg.std then cfg.stdSearch else defaultOutputName(cfg.file) + LibraryArtifact.extension)
 
-      parentOf(out).foreach(createDirectories)
+      Project.parentOf(out).foreach(createDirectories)
 
       // The members are named rather than left as whatever a temporary file was called, so an
       // artifact holds the same names wherever it was built and `ar t` shows a reader something they
@@ -437,7 +435,7 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
           _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), out, ar)
         yield ()
 
-      (code :: metadata :: objects.map(_._2) ::: List(staging)).foreach(discard)
+      (code :: metadata :: objects.map(_._2) ::: List(staging)).foreach(Project.discard)
 
       outcome match
         case Left(err) => fail(err)
@@ -502,50 +500,13 @@ private def foundStd(path: String, target: Target)
     case Left(why)  =>
       Console.err.println(s"building the standard module at $path ($why)")
 
-      writeCore(path, target) match
+      Stdlib.writeArtifact(path, target) match
         case Right(_) => loadCore(path, target)
         case Left(err) =>
           Left(s"cannot find or build the standard module — build it with " +
             s"'sysl build-lib lib --std', or pass --no-std-lib to compile against the copy built " +
             s"into the compiler ($err)")
 }
-
-/** The standard module compiled to an artifact at `out`, from the library source the compiler
- * carries.
- *
- * The sources are `Std.sources` and not the `lib/` in some tree, which is what makes this usable at
- * all: an installed compiler has no repository beside it, and `Stdlib.read` checks a decoded artifact
- * against `Std.fingerprint` — the fingerprint of exactly these files — so building from them is the
- * one thing guaranteed to produce an artifact this compiler will accept.
- *
- * No C files are gathered, and none can be missed: `15 §7` lets a library carry `.c` beside its
- * modules, and the standard module carries none. It could not — the fingerprint an artifact is held
- * to covers a library's C sources with its sysl ones, while the one the compiler carries covers only
- * what `StdSource` embeds, so a `.c` under `lib/sysl` would make every artifact built from the tree
- * fail the check it is read back through.
- */
-private def writeCore(out: String, target: Target): Either[String, Unit] =
-  for
-    ar    <- Toolchain.findAr(None)
-    built <- LibraryArtifact.build(Std.sources, target, LibraryArtifact.std, Some(Stdlib.embedded(target)))
-    _     <- {
-               val staging  = createTempDirectory("sysl-std-")
-               val code     = s"$staging/${LibraryArtifact.codeMember}"
-               val metadata = s"$staging/${LibraryArtifact.metadataMember}"
-
-               parentOf(out).foreach(createDirectories)
-
-               val outcome =
-                 for
-                   _ <- Toolchain.compileObject(built._1, code, target)
-                   _ <- Toolchain.compileObject(LibraryArtifact.metadataIr(built._2, target), metadata, target)
-                   _ <- Toolchain.archive(List(code, metadata), out, ar)
-                 yield ()
-
-               List(code, metadata, staging).foreach(discard)
-               outcome
-             }
-  yield ()
 
 /** A prebuilt standard module read back: the trees to compile against, the symbols its object half
  * already defines, and the archive to link that half from — which is the file itself, since it is
@@ -608,6 +569,18 @@ private def readPackageConfig(file: String): Either[String, PackageConfig] = {
     catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
 }
 
+/** Which build of sysl this is.
+ *
+ * On stdout rather than stderr, and alone on its line, because the first thing anyone does with a
+ * version is read it out of a script — and a bug report that quotes it is the reason it exists at
+ * all. The number comes from the build (`BuildInfo`), so a binary cannot claim a version it was not
+ * cut at.
+ */
+private def printVersion(): Int = {
+  stdout(s"sysl ${BuildInfo.version}\n")
+  0
+}
+
 /** The registry, as a reader of `sysl targets` sees it: the name to write, the LLVM triple it
  * stands for, and — for one sysl knows and cannot build for — why not.
  */
@@ -625,15 +598,6 @@ private def listTargets(): Int = {
   stdout(s"\nthis machine reports: ${Target.hostMachineShown}\n")
 
   0
-}
-
-/** The directory an output path sits in, where it names one — the default std path does, and it is
- * a directory a fresh clone has never had, so writing the artifact has to make it.
- */
-private def parentOf(path: String): Option[String] = {
-  val slash = math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
-
-  Option.when(slash > 0)(path.substring(0, slash))
 }
 
 private def defaultOutputName(file: String): String = {
