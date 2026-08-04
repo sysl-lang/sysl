@@ -4,10 +4,15 @@ import org.scalatest.freespec.AnyFreeSpec
 
 /** `val` — a binding written once (`07`, `13 §7`).
  *
- * One keyword read at two levels. At the top of a file it is a module member: read-only storage laid
- * into the object file, which is what a table of round constants needs and what a `const` can never
- * be, since a constant is folded into its uses and has no address to index. Inside a block it is the
- * immutable counterpart of `var`.
+ * This suite is about the **module member**: read-only storage laid into the object file, which is
+ * what a table of round constants needs and what a `const` can never be, since a constant is folded
+ * into its uses and has no address to index.
+ *
+ * In a file the program *starts* in — which is what a single-file program is — that is spelled
+ * `static val`, because such a file is a body and a plain `val` written there is one of its locals.
+ * Hence the modifier on nearly every program below. A file with no statements needs none: everything
+ * it declares is the module's already, which is why the two-file programs here are written plain.
+ * `EntryFileTests` is where the other half lives.
  *
  * The two properties worth pinning are that it has an **address** — so it can be indexed, iterated,
  * and reached into — and that the address is not a writable one, at any depth and through `&` as
@@ -17,37 +22,37 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
 
   "the form parses" - {
     "with a type and a value" in {
-      prog("val n: int = 3") shouldBe List(ValDecl("n", Some(NamedType("int", Nil)), i(3)))
+      prog("static val n: int = 3") shouldBe List(StaticDecl(ValDecl("n", Some(NamedType("int", Nil)), i(3))))
     }
 
     "with the type left off" in {
-      prog("val n = 3") shouldBe List(ValDecl("n", None, i(3)))
+      prog("static val n = 3") shouldBe List(StaticDecl(ValDecl("n", None, i(3))))
     }
 
     "and takes a visibility modifier, as every other declaration does" in {
-      prog("private val n: int = 3") shouldBe
-        List(ValDecl("n", Some(NamedType("int", Nil)), i(3), Visibility.File))
+      prog("private static val n: int = 3") shouldBe
+        List(StaticDecl(ValDecl("n", Some(NamedType("int", Nil)), i(3), Visibility.File)))
     }
 
     // The value is what tells a `val` from a `var` to the parser as well as to a reader: a binding
     // written once with nothing to hold is not a declaration of anything.
     "but not without a value" in {
-      progError("val n: int") should not be empty
+      progError("static val n: int") should not be empty
     }
   }
 
   "a module-level 'val'" - {
     "is read by name" in {
-      run("val n: int = 7\nprint(str(n))") shouldBe "7\n"
+      run("static val n: int = 7\nprint(str(n))") shouldBe "7\n"
     }
 
     "holds a table, which is the thing a 'const' cannot be" in {
-      run("val k: [4]u32 = [11, 22, 33, 44]\nprint(str(k[2]))") shouldBe "33\n"
+      run("static val k: [4]u32 = [11, 22, 33, 44]\nprint(str(k[2]))") shouldBe "33\n"
     }
 
     "is indexed at a value only known while running" in {
       run(
-        """val k: [4]int = [11, 22, 33, 44]
+        """static val k: [4]int = [11, 22, 33, 44]
           |var total = 0
           |for i in 0..<4 do total += k[i]
           |print(str(total))""".stripMargin,
@@ -56,7 +61,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
 
     "is iterated" in {
       run(
-        """val k: [3]int = [2, 3, 4]
+        """static val k: [3]int = [2, 3, 4]
           |var p = 1
           |for x in k do p *= x
           |print(str(p))""".stripMargin,
@@ -64,21 +69,21 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
 
     "reports its length" in {
-      run("val k: [5]u8 = [1; 5]\nprint(str(k.len))") shouldBe "5\n"
+      run("static val k: [5]u8 = [1; 5]\nprint(str(k.len))") shouldBe "5\n"
     }
 
     "may be built with a repeat" in {
-      run("val k: [8]int = [3; 8]\nprint(str(k[7]))\nprint(str(k.len))") shouldBe "3\n8\n"
+      run("static val k: [8]int = [3; 8]\nprint(str(k[7]))\nprint(str(k.len))") shouldBe "3\n8\n"
     }
 
     "takes its element type from its declaration, so the elements need no suffix" in {
-      run("val k: [2]u64 = [0xcbf29ce484222325, 2]\nprint(str(k[0]))") shouldBe "14695981039346656037\n"
+      run("static val k: [2]u64 = [0xcbf29ce484222325, 2]\nprint(str(k[0]))") shouldBe "14695981039346656037\n"
     }
 
     "is reached from a function, wherever the function is written" in {
       run(
         """first() -> int = k[0]
-          |val k: [2]int = [9, 8]
+          |static val k: [2]int = [9, 8]
           |print(str(first()))""".stripMargin,
       ) shouldBe "9\n"
     }
@@ -86,27 +91,28 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // Order-freedom is what makes it a declaration rather than a statement: nothing runs to
     // initialize it, so nothing has to run first.
     "may be written in terms of a 'const' declared below it" in {
-      run("val k: [n]int = [4; n]\nconst n: usize = 3\nprint(str(k.len))\nprint(str(k[2]))") shouldBe "3\n4\n"
+      run("static val k: [n]int = [4; n]\nconst n: usize = 3\nprint(str(k.len))\nprint(str(k[2]))") shouldBe "3\n4\n"
     }
 
     // The other half of order-freedom, and the sharp one: where the initializer *does* have to run,
-    // it runs with the module's other initializers and not in the place it was written. So a `val`
-    // sitting between two statements of a script is **not** evaluated between them — it is already
+    // it runs with the module's other initializers and not in the place it was written. So a
+    // `static val` sitting between two statements is **not** evaluated between them — it is already
     // bound by the time the first of them runs.
     //
-    // Written down because the shape it bites is an ordinary one: a script that opens a resource in
-    // a `val`, sets it up with a statement, and binds something derived from it in a second `val`.
-    // The second `val` runs before the setup and fails, with nothing in the source suggesting an
-    // order was involved. A sequence that has to be a sequence belongs in a function.
+    // That surprises a reader exactly once, and the modifier is now what warns them: a declaration
+    // saying it belongs to the module is saying it is not part of the sequence around it. The shape
+    // this used to bite — a script binding a value, setting it up with a statement, and binding
+    // something derived from it — is written with plain `val`s, which run where they stand
+    // (`EntryFileTests`).
     "runs its initializer ahead of the script, wherever it was written" in {
       run(
         """print("script")
           |
-          |val n: int = noisy()
+          |static val n: int = noisy()
           |
           |print(str(n))
           |
-          |noisy() -> int
+          |static noisy() -> int
           |    print("initializer")
           |    7
           |end noisy""".stripMargin,
@@ -128,26 +134,26 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
 
     "nests" in {
-      run("val g: [2][3]int = [[1, 2, 3], [4, 5, 6]]\nprint(str(g[1][0]))") shouldBe "4\n"
+      run("static val g: [2][3]int = [[1, 2, 3], [4, 5, 6]]\nprint(str(g[1][0]))") shouldBe "4\n"
     }
 
     "holds floats" in {
-      run("val w: [2]f64 = [0.5, 0.25]\nprint(str(w[0] + w[1]))") shouldBe "0.75\n"
+      run("static val w: [2]f64 = [0.5, 0.25]\nprint(str(w[0] + w[1]))") shouldBe "0.75\n"
     }
 
     "holds narrow floats" in {
-      run("val w: [2]f32 = [0.5, 0.25]\nprint(str(w[0] + w[1]))") shouldBe "0.75\n"
+      run("static val w: [2]f32 = [0.5, 0.25]\nprint(str(w[0] + w[1]))") shouldBe "0.75\n"
     }
 
     "holds bools" in {
-      run("val b: [3]bool = [true, false, true]\nprint(str(b[0] && b[2]))") shouldBe "true\n"
+      run("static val b: [3]bool = [true, false, true]\nprint(str(b[0] && b[2]))") shouldBe "true\n"
     }
 
     // An array is a value, so binding one to a `var` copies it — which is how a program that wants
     // to work from a table gets writable storage without the table being writable.
     "is copied, not aliased, when it is bound to a 'var'" in {
       run(
-        """val k: [3]int = [1, 2, 3]
+        """static val k: [3]int = [1, 2, 3]
           |var c = k
           |c[0] = 99
           |print(str(c[0]))
@@ -158,7 +164,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "is passed to a function by value" in {
       run(
         """sum(a: [3]int) -> int = a[0] + a[1] + a[2]
-          |val k: [3]int = [1, 2, 3]
+          |static val k: [3]int = [1, 2, 3]
           |print(str(sum(k)))""".stripMargin,
       ) shouldBe "6\n"
     }
@@ -167,13 +173,13 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
   // The point of the whole exercise: storage that costs nothing to reach and nothing to set up.
   "it is laid into the object file" - {
     "as a constant global, with no code to initialize it" in {
-      val out = ir("val k: [3]u32 = [7, 8, 9]\nprint(str(k[0]))")
+      val out = ir("static val k: [3]u32 = [7, 8, 9]\nprint(str(k[0]))")
 
       out should include("private constant [3 x i32] [i32 7, i32 8, i32 9]")
     }
 
     "with a repeat written out, since a global has no loop to run" in {
-      ir("val k: [4]u8 = [2; 4]\nprint(str(k[0]))") should
+      ir("static val k: [4]u8 = [2; 4]\nprint(str(k[0]))") should
         include("private constant [4 x i8] [i8 2, i8 2, i8 2, i8 2]")
     }
 
@@ -181,12 +187,12 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // to run before the program starts — and LLVM refuses a hex constant a `float` cannot hold, so
     // the f64 bits of `0.1` (0x3FB999999999999A) would not merely be imprecise, it would not build.
     "with a narrow float rounded to its own width, not to a double's" in {
-      ir("val w: [1]f32 = [0.1]\nprint(str(w[0]))") should
+      ir("static val w: [1]f32 = [0.1]\nprint(str(w[0]))") should
         include("private constant [1 x float] [float 0x3FB99999A0000000]")
     }
 
     "and reaching an element is a 'getelementptr' from the global itself" in {
-      irMain("val k: [4]int = [1, 2, 3, 4]\nprint(str(k[1]))") should include("ptr @k")
+      irMain("static val k: [4]int = [1, 2, 3, 4]\nprint(str(k[1]))") should include("ptr @k")
     }
 
     // A struct is fields laid side by side, so it is a constant tree exactly when its fields are —
@@ -198,7 +204,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    a: int
           |    b: int
           |end Pair
-          |val p: Pair = Pair(1, 2)
+          |static val p: Pair = Pair(1, 2)
           |print(str(p.a))""".stripMargin,
       )
 
@@ -212,7 +218,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    a: int
           |    b: int
           |end Pair
-          |val ps: [2]Pair = [Pair(1, 2), Pair(3, 4)]
+          |static val ps: [2]Pair = [Pair(1, 2), Pair(3, 4)]
           |print(str(ps[1].a))""".stripMargin,
       ) should include(
         "@ps = private constant [2 x %struct.Pair] " +
@@ -228,8 +234,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    a: int
           |    b: int
           |end Pair
-          |n() -> int = 1
-          |val p: Pair = Pair(n(), 2)
+          |static n() -> int = 1
+          |static val p: Pair = Pair(n(), 2)
           |print(str(p.a))""".stripMargin,
       )
 
@@ -252,11 +258,11 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
    */
   "a module-level 'val' holds a string literal" - {
     "read by name" in {
-      run("val greeting: string = \"hello\"\nprint(greeting)") shouldBe "hello\n"
+      run("static val greeting: string = \"hello\"\nprint(greeting)") shouldBe "hello\n"
     }
 
     "as three words with a null owner, laid straight into the object file" in {
-      val out = ir("val greeting: string = \"hello\"\nprint(greeting)")
+      val out = ir("static val greeting: string = \"hello\"\nprint(greeting)")
 
       out should include("@greeting = private constant { ptr, ptr, i64 } { ptr null, ptr @.str")
       out should not include "@greeting = private global"
@@ -266,7 +272,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // which is the one thing a `const` can never be.
     "a table of them, indexed at a value only known while running" in {
       run(
-        """val names: [3]string = ["alpha", "beta", "gamma"]
+        """static val names: [3]string = ["alpha", "beta", "gamma"]
           |var i = 2
           |print(names[i])""".stripMargin,
       ) shouldBe "gamma\n"
@@ -274,7 +280,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
 
     "which is iterated, since it is storage rather than a folded value" in {
       run(
-        """val names: [3]string = ["a", "bb", "ccc"]
+        """static val names: [3]string = ["a", "bb", "ccc"]
           |var total: usize = 0
           |for s in names do total += s.len
           |print(str(total))""".stripMargin,
@@ -282,7 +288,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     }
 
     "a repeat, written out as a global has no loop to run" in {
-      run("val xs: [3]string = [\"x\"; 3]\nvar i = 1\nprint(xs[i])") shouldBe "x\n"
+      run("static val xs: [3]string = [\"x\"; 3]\nvar i = 1\nprint(xs[i])") shouldBe "x\n"
     }
 
     // A text block is joined by the lexer into one constant (`04 § Text blocks`), so it arrives here
@@ -301,14 +307,14 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    name: string
           |    code: int
           |end Device
-          |val devices: [2]Device = [Device("uart", 16), Device("timer", 32)]
+          |static val devices: [2]Device = [Device("uart", 16), Device("timer", 32)]
           |var i = 1
           |print(devices[i].name, str(devices[i].code))""".stripMargin,
       ) shouldBe "timer 32\n"
     }
 
     "a tuple with one in it, which is a struct with its fields named for their positions" in {
-      run("val t: (int, string) = (1, \"one\")\nprint(str(t.0), t.1)") shouldBe "1 one\n"
+      run("static val t: (int, string) = (1, \"one\")\nprint(str(t.0), t.1)") shouldBe "1 one\n"
     }
 
     // The motivation, stated as a test: a module that has declared it will not allocate may still
@@ -317,7 +323,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       run(
         """@no_alloc
           |
-          |val messages: [3]string = ["out of range", "not permitted", "no such device"]
+          |static val messages: [3]string = ["out of range", "not permitted", "no such device"]
           |
           |var i = 2
           |print(messages[i])
@@ -344,7 +350,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    i: Inner
           |    c: int
           |end Outer
-          |val o: Outer = Outer(Inner(1, 2), 3)
+          |static val o: Outer = Outer(Inner(1, 2), 3)
           |print(str(o.i.b))""".stripMargin,
       )
 
@@ -357,7 +363,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    xs: [2]int
           |    n:  int
           |end S
-          |val s: S = S([4, 5], 6)
+          |static val s: S = S([4, 5], 6)
           |print(str(s.xs[1]))""".stripMargin,
       )
 
@@ -370,7 +376,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    on: bool
           |    w:  f32
           |end S
-          |val s: S = S(true, 0.1)
+          |static val s: S = S(true, 0.1)
           |print(str(s.on))""".stripMargin,
       )
 
@@ -387,7 +393,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    name: string
           |    base: *u32
           |end Device
-          |val uart: Device = Device("uart", ptr_cast(UART))
+          |static val uart: Device = Device("uart", ptr_cast(UART))
           |print(uart.name)""".stripMargin,
       )
 
@@ -397,7 +403,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
 
     "an array of tuples carrying strings" in {
       run(
-        """val rows: [2](int, string) = [(1, "one"), (2, "two")]
+        """static val rows: [2](int, string) = [(1, "one"), (2, "two")]
           |var i = 1
           |print(str(rows[i].0), rows[i].1)""".stripMargin,
       ) shouldBe "2 two\n"
@@ -408,7 +414,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
         """struct Cell[T]
           |    v: T
           |end Cell
-          |val c: Cell[string] = Cell("held")
+          |static val c: Cell[string] = Cell("held")
           |print(c.v)""".stripMargin,
       ) shouldBe "held\n"
     }
@@ -416,17 +422,17 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // The length a literal carries is its bytes, not its characters, and the empty one is a real
     // value rather than an absent pointer — both of which the three-word constant has to say.
     "the empty literal, whose bytes are none of them" in {
-      run("val e: string = \"\"\nprint(e.len, e == \"\")") shouldBe "0 true\n"
+      run("static val e: string = \"\"\nprint(e.len, e == \"\")") shouldBe "0 true\n"
     }
 
     "a literal with an escape and a character outside ASCII" in {
-      run("val s: string = \"a\\tb\\u{e9}\"\nprint(s.len)\nprint(s)") shouldBe "5\na\tbé\n"
+      run("static val s: string = \"a\\tb\\u{e9}\"\nprint(s.len)\nprint(s)") shouldBe "5\na\tbé\n"
     }
 
     // A literal may carry a NUL as an ordinary byte, since a string carries its length — so the
     // constant's length has to come from the bytes rather than from where a terminator falls.
     "a literal with a NUL inside it, which is a byte like any other" in {
-      run("val s: string = \"a\\u{0}b\"\nprint(s.len)") shouldBe "3\n"
+      run("static val s: string = \"a\\u{0}b\"\nprint(s.len)") shouldBe "3\n"
     }
 
     // The bytes of a literal are not interned across uses, so two `val`s written the same way name
@@ -435,8 +441,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // correctness one.
     "the same literal in two 'val's, which are two globals and one value" in {
       run(
-        """val a: string = "same"
-          |val b: string = "same"
+        """static val a: string = "same"
+          |static val b: string = "same"
           |print(a == b, a.len == b.len)""".stripMargin,
       ) shouldBe "true true\n"
     }
@@ -449,7 +455,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
         """struct Box
           |    s: string
           |end Box
-          |val greeting: string = "hello"
+          |static val greeting: string = "hello"
           |hold() -> string
           |    var b: &Box = Box(greeting)
           |    b.s
@@ -476,7 +482,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |struct P
           |    age: Age
           |end P
-          |val p: P = P(40)
+          |static val p: P = P(40)
           |print(p.age)""".stripMargin,
       )
 
@@ -488,7 +494,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |struct P
           |    age: Age
           |end P
-          |val p: P = P(200)
+          |static val p: P = P(200)
           |print(p.age)""".stripMargin,
       )
     }
@@ -497,9 +503,9 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // ordering graph is over the computed ones, and a constant is already there.
     "a computed 'val' may read a constant string one, which is already in place" in {
       run(
-        """val greeting: string = "hello"
-          |val n: usize = twice()
-          |twice() -> usize = greeting.len * 2
+        """static val greeting: string = "hello"
+          |static val n: usize = twice()
+          |static twice() -> usize = greeting.len * 2
           |print(n)""".stripMargin,
       ) shouldBe "10\n"
     }
@@ -512,7 +518,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    a: int
           |    b: int
           |end Pair
-          |val p: Pair = Pair(1, 2)
+          |static val p: Pair = Pair(1, 2)
           |p.a = 3""".stripMargin,
       ) should include("written once")
     }
@@ -521,13 +527,13 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // type being a counted one changes nothing about that.
     "slicing a table of literals yields a view that may be read and not written" in {
       run(
-        """val names: [3]string = ["alpha", "beta", "gamma"]
+        """static val names: [3]string = ["alpha", "beta", "gamma"]
           |var v = names[1..<3]
           |print(v[0], v.len)""".stripMargin,
       ) shouldBe "beta 2\n"
 
       err(
-        """val names: [3]string = ["alpha", "beta", "gamma"]
+        """static val names: [3]string = ["alpha", "beta", "gamma"]
           |var v = names[1..<3]
           |v[0] = "other" """.stripMargin,
       ) should include("views elements it may not write")
@@ -553,7 +559,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    status: u32
           |    data:   u32
           |end Uart
-          |val regs: *Uart = ptr_cast(malloc(16))
+          |static val regs: *Uart = ptr_cast(malloc(16))
           |arm()
           |    regs.status = 7u32
           |end arm
@@ -569,7 +575,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "and the elements it addresses are read and written through it" in {
       run(
         """extern malloc(n: usize) -> *u8
-          |val cells: *int = ptr_cast(malloc(32))
+          |static val cells: *int = ptr_cast(malloc(32))
           |put(v: int)
           |    cells[0] = v
           |end put
@@ -581,7 +587,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "an array of them" in {
       run(
         """extern malloc(n: usize) -> *u8
-          |val ps: [2]*u8 = [ptr_cast(malloc(8)), ptr_cast(malloc(8))]
+          |static val ps: [2]*u8 = [ptr_cast(malloc(8)), ptr_cast(malloc(8))]
           |print(str(usize(ps[0]) != usize(ps[1])))""".stripMargin,
       ) shouldBe "true\n"
     }
@@ -593,8 +599,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    base: *u32
           |    id:   int
           |end Dev
-          |mk() -> Dev = Dev(ptr_cast(malloc(8)), 5)
-          |val d: Dev = mk()
+          |static mk() -> Dev = Dev(ptr_cast(malloc(8)), 5)
+          |static val d: Dev = mk()
           |print(str(d.id))""".stripMargin,
       ) shouldBe "5\n"
     }
@@ -604,8 +610,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // test rather than by being meant, so it is pinned here now that the rule names it.
     "the address of a function, and a call through the one it holds" in {
       run(
-        """g(x: int) -> int = x + 1
-          |val f: *extern(int) -> int = &g
+        """static g(x: int) -> int = x + 1
+          |static val f: *extern(int) -> int = &g
           |print(str(f(3)))""".stripMargin,
       ) shouldBe "4\n"
     }
@@ -618,7 +624,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    v: int
           |end Node
           |extern malloc(n: usize) -> *u8
-          |val p: *&Node = ptr_cast(malloc(8))
+          |static val p: *&Node = ptr_cast(malloc(8))
           |print("ok")""".stripMargin,
       ) should include("@p")
     }
@@ -630,8 +636,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    Empty
           |    At(p: *u8)
           |end Slot
-          |mk() -> Slot = At(malloc(8))
-          |val s: Slot = mk()
+          |static mk() -> Slot = At(malloc(8))
+          |static val s: Slot = mk()
           |s match
           |    At(p) -> print(str(usize(p) != 0))
           |    Empty -> print("empty")""".stripMargin,
@@ -644,8 +650,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |struct Cell[T]
           |    p: *T
           |end Cell
-          |mk() -> Cell[int] = Cell(ptr_cast(malloc(8)))
-          |val c: Cell[int] = mk()
+          |static mk() -> Cell[int] = Cell(ptr_cast(malloc(8)))
+          |static val c: Cell[int] = mk()
           |c.p[0] = 6
           |print(str(c.p[0]))""".stripMargin,
       ) shouldBe "6\n"
@@ -656,8 +662,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "a tuple with one in it, where a tuple with a reference is still refused" in {
       run(
         """extern malloc(n: usize) -> *u8
-          |mk() -> (int, *u8) = (1, malloc(8))
-          |val t: (int, *u8) = mk()
+          |static mk() -> (int, *u8) = (1, malloc(8))
+          |static val t: (int, *u8) = mk()
           |print(str(t.0))""".stripMargin,
       ) shouldBe "1\n"
 
@@ -665,8 +671,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
         """struct Node
           |    v: int
           |end Node
-          |mk() -> (int, &Node) = (1, Node(2))
-          |val t: (int, &Node) = mk()
+          |static mk() -> (int, &Node) = (1, Node(2))
+          |static val t: (int, &Node) = mk()
           |print("ok")""".stripMargin,
       ) should include("a count with nowhere to write the release")
     }
@@ -674,8 +680,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "and one 'val' is filled from another" in {
       run(
         """extern malloc(n: usize) -> *u8
-          |val a: *u8 = malloc(8)
-          |val b: *u8 = a
+          |static val a: *u8 = malloc(8)
+          |static val b: *u8 = a
           |print(str(usize(a) == usize(b)))""".stripMargin,
       ) shouldBe "true\n"
     }
@@ -710,13 +716,13 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "'ptr_cast' of a constant is laid straight in as an 'inttoptr'" in {
       ir(
         """const UART: usize = 0x10000000
-          |val regs: *u32 = ptr_cast(UART)
+          |static val regs: *u32 = ptr_cast(UART)
           |print("ok")""".stripMargin,
       ) should include("@regs = private constant ptr inttoptr (i64 268435456 to ptr)")
     }
 
     "and so is a null one" in {
-      ir("val p: *u32 = null\nprint(\"ok\")") should include("@p = private constant ptr null")
+      ir("static val p: *u32 = null\nprint(\"ok\")") should include("@p = private constant ptr null")
     }
 
     // A pointer to a trait is two words (`03`), so its empty value is not the one-word `null` — the
@@ -726,18 +732,18 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
         """trait Shape
           |    area(self) -> int
           |end Shape
-          |val p: *Shape = null
+          |static val p: *Shape = null
           |print("ok")""".stripMargin,
       ) should include("@p = private constant { ptr, ptr } zeroinitializer")
     }
 
     "and an array of them, element by element" in {
-      ir("val ps: [2]*u8 = [null, null]\nprint(\"ok\")") should
+      ir("static val ps: [2]*u8 = [null, null]\nprint(\"ok\")") should
         include("@ps = private constant [2 x ptr] [ptr null, ptr null]")
     }
 
     "and a repeat of one, written out as a global has no loop to run" in {
-      ir("val ps: [3]*u8 = [null; 3]\nprint(\"ok\")") should
+      ir("static val ps: [3]*u8 = [null; 3]\nprint(\"ok\")") should
         include("@ps = private constant [3 x ptr] [ptr null, ptr null, ptr null]")
     }
 
@@ -746,7 +752,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "and an address read as the address of a function" in {
       ir(
         """const RESET: usize = 0x8000
-          |val entry: *extern() -> unit = ptr_cast(RESET)
+          |static val entry: *extern() -> unit = ptr_cast(RESET)
           |print("ok")""".stripMargin,
       ) should include("@entry = private constant ptr inttoptr (i64 32768 to ptr)")
     }
@@ -759,7 +765,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
       irFor(
         riscv,
         """const UART: usize = 0x10000000
-          |val regs: *u32 = ptr_cast(UART)
+          |static val regs: *u32 = ptr_cast(UART)
           |go() = regs[0] = 1u32
           |go()""".stripMargin,
       ) should include("@regs = private constant ptr inttoptr (i64 268435456 to ptr)")
@@ -770,7 +776,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "while an address a call produces is a computed one, as any other computed value is" in {
       val out = ir(
         """extern malloc(n: usize) -> *u8
-          |val p: *u8 = malloc(8)
+          |static val p: *u8 = malloc(8)
           |print("ok")""".stripMargin,
       )
 
@@ -783,8 +789,8 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // a cycle (`13 §7`, "what order the initializers run in").
     "and a cycle among computed pointer 'val's is still reported" in {
       err(
-        """val a: *u8 = ptr_cast(usize(b))
-          |val b: *u8 = ptr_cast(usize(a))
+        """static val a: *u8 = ptr_cast(usize(b))
+          |static val b: *u8 = ptr_cast(usize(a))
           |print("ok")""".stripMargin,
       ) should include("cannot be initialized")
     }
@@ -796,7 +802,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "the name may not be assigned to" in {
       err(
         """const UART: usize = 0x1000
-          |val regs: *u32 = ptr_cast(UART)
+          |static val regs: *u32 = ptr_cast(UART)
           |regs = ptr_cast(UART)
           |print("ok")""".stripMargin,
       ) should include("written once")
@@ -809,7 +815,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     "while the storage it addresses is writable, which is what the raw tier means" in {
       ir(
         """const UART: usize = 0x1000
-          |val regs: *u32 = ptr_cast(UART)
+          |static val regs: *u32 = ptr_cast(UART)
           |set()
           |    regs[0] = 1u32
           |end set
@@ -821,7 +827,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // `val`'s own elements are reachable as a writable `*T` through a view of it, today, on purpose.
     "because a writable pointer into a 'val' is already reachable through a view of it" in {
       run(
-        """val k: [4]int = [1, 2, 3, 4]
+        """static val k: [4]int = [1, 2, 3, 4]
           |var s = k[1..<3]
           |var p = &s[0]
           |print(str(p[0]))""".stripMargin,
@@ -851,7 +857,7 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // Inside a block it is a local of that block, so the top-level one it shadows is untouched.
     "shadows a module-level one for the rest of its block" in {
       run(
-        """val n: int = 1
+        """static val n: int = 1
           |f() -> int
           |    val n = 50
           |    n
@@ -863,25 +869,25 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
 
   "what it refuses" - {
     "assigning to a module-level 'val'" in {
-      err("val n: int = 1\nn = 2") should include("written once")
+      err("static val n: int = 1\nn = 2") should include("written once")
     }
 
     "assigning to one of its elements" in {
-      err("val k: [2]int = [1, 2]\nk[0] = 9") should include("written once")
+      err("static val k: [2]int = [1, 2]\nk[0] = 9") should include("written once")
     }
 
     "compound assignment, which is an assignment" in {
-      err("val k: [2]int = [1, 2]\nk[1] += 1") should include("written once")
+      err("static val k: [2]int = [1, 2]\nk[1] += 1") should include("written once")
     }
 
     "an increment, for the same reason" in {
-      err("val k: [2]int = [1, 2]\nk[0]++") should include("written once")
+      err("static val k: [2]int = [1, 2]\nk[0]++") should include("written once")
     }
 
     // A `*T` is a licence to write, so handing one out would move the mistake one step from where
     // it could still be reported.
     "taking its address" in {
-      err("val k: [2]int = [1, 2]\nvar p = &k[0]") should include("written once")
+      err("static val k: [2]int = [1, 2]\nvar p = &k[0]") should include("written once")
     }
 
     "assigning to a local 'val'" in {
@@ -905,49 +911,49 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
     // Slicing is no longer among them: a view of a `val` is a `[]const T`, which carries the
     // read-only-ness rather than losing it, so what is refused is the write through the view.
     "writing through a view of one, which is where the refusal moved when slicing became legal" in {
-      run("val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]\nprint(s[0], s[1])") shouldBe "2 3\n"
+      run("static val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]\nprint(s[0], s[1])") shouldBe "2 3\n"
 
-      err("val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]\ns[0] = 9") should
+      err("static val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]\ns[0] = 9") should
         include("views elements it may not write")
     }
 
     "a module-level 'val' with no type, which every module member states" in {
-      err("val k = [1, 2, 3]") should include("states its type")
+      err("static val k = [1, 2, 3]") should include("states its type")
     }
 
     "a value computed from a variable" in {
-      err("var x = 1\nval n: int = x") should include("undefined name")
+      err("var x = 1\nstatic val n: int = x") should include("undefined name")
     }
 
     "an initializer that does not fit its declared type" in {
-      err("val k: [2]u8 = [1, 300]") should include("does not fit")
+      err("static val k: [2]u8 = [1, 300]") should include("does not fit")
     }
 
     "an initializer of the wrong shape" in {
-      err("val k: [3]int = [1, 2]") should include("[3]int")
+      err("static val k: [3]int = [1, 2]") should include("[3]int")
     }
 
     // Storage that outlives every frame is never let go of, so a count taken in one has nowhere to
     // write the release. What decides is the **value**: a string the program builds takes a count,
     // and the literal above does not.
     "a string built while the program runs" in {
-      err("val s: string = str(1)") should include("a count with nowhere to write the release")
+      err("static val s: string = str(1)") should include("a count with nowhere to write the release")
     }
 
     // Two literals joined is the discriminating pair against the section above: it looks constant
     // and is not, because joining them allocates. Folding it is separate work, deliberately not done
     // here — admitting it on the strength of how it reads would be admitting a leak.
     "a string joined from two literals, which allocates however constant it looks" in {
-      err("val s: string = \"a\" + \"b\"") should include("built while the program runs")
+      err("static val s: string = \"a\" + \"b\"") should include("built while the program runs")
     }
 
     "a reference, which is the count itself" in {
-      err("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nval r: &P = mk()") should
+      err("struct P\n    x: int\nend P\nstatic mk() -> &P = P(1)\nstatic val r: &P = mk()") should
         include("a count with nowhere to write the release")
     }
 
     "a view, whose owner word is a count like any other" in {
-      err("val k: [4]int = [1, 2, 3, 4]\nval s: []const int = k[1..<3]") should
+      err("static val k: [4]int = [1, 2, 3, 4]\nstatic val s: []const int = k[1..<3]") should
         include("a count with nowhere to write the release")
     }
 
@@ -961,50 +967,50 @@ class ValTests extends AnyFreeSpec with CodegenSupport with RunSupport with Pars
           |    name: string
           |    invariant name.len > 0
           |end Tag
-          |val t: Tag = Tag("uart")""".stripMargin,
+          |static val t: Tag = Tag("uart")""".stripMargin,
       ) should include("a count with nowhere to write the release")
     }
 
     // The diagnostic names the value rather than the type, because once a literal is legal "its type
     // is string" sends a reader looking for a spelling instead of at what they wrote.
     "and the message says what may be held instead" in {
-      err("val s: string = str(1)") should
+      err("static val s: string = str(1)") should
         include("a string literal owns nothing, and neither does a table of them")
     }
 
     // The line between the two declarations, from the other side: a `const` sizes an array because
     // it is a value, and a `val` cannot because it is storage.
     "naming one as an array's bound" in {
-      err("val n: usize = 4\nvar bad: [n]int") should include("must be a constant")
+      err("static val n: usize = 4\nvar bad: [n]int") should include("must be a constant")
     }
 
     // `13 §7` argues that sysl cannot have Rust's trap where a name in a pattern quietly binds
     // instead of matching. A `val` is the one thing that could have reintroduced it.
     "matching against one, which would bind instead of compare" in {
-      err("val n: int = 1\nvar x = 2\nx match\n    n -> print(1)\n    else print(2)") should
+      err("static val n: int = 1\nvar x = 2\nx match\n    n -> print(1)\n    else print(2)") should
         include("cannot match against it")
     }
   }
 
   "the name it takes" - {
     "clashes with a constant of that name" in {
-      err("const n: int = 1\nval n: int = 2") should include("already used by a constant")
+      err("const n: int = 1\nstatic val n: int = 2") should include("already used by a constant")
     }
 
     "clashes with a function of that name" in {
-      err("val n: int = 1\nn() -> int = 2") should include("already declared as a 'val'")
+      err("static val n: int = 1\nn() -> int = 2") should include("already declared as a 'val'")
     }
 
     "clashes with an enum variant of that name" in {
-      err("enum Colour\n    Red\nend Colour\nval Red: int = 1") should include("already used by enum")
+      err("enum Colour\n    Red\nend Colour\nstatic val Red: int = 1") should include("already used by enum")
     }
 
     "and a second 'val' of that name" in {
-      err("val n: int = 1\nval n: int = 2") should include("already declared")
+      err("static val n: int = 1\nstatic val n: int = 2") should include("already declared")
     }
 
     "while a constant written over one is reported the other way round" in {
-      err("val n: int = 1\nconst n: int = 2") should include("already used by a 'val'")
+      err("static val n: int = 1\nconst n: int = 2") should include("already used by a 'val'")
     }
   }
 }

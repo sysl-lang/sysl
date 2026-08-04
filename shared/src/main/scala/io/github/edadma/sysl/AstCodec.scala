@@ -305,6 +305,12 @@ object AstCodec {
         case VarDecl(n, t, i)             => tok("var"); sref(n); opt(t)(typ); opt(i)(expr)
         case ConstDecl(n, t, v, vs)       => tok("cst"); sref(n); typ(t); expr(v); vis(vs)
         case ValDecl(n, t, v, vs)         => tok("val"); sref(n); opt(t)(typ); expr(v); vis(vs)
+        // No token, and no version bump to give it one: `static` is legal only in the file a program
+        // starts in, a library has no such file, and the analyzer has already said so by the time
+        // anything is encoded. Reaching here would mean that check stopped running.
+        case StaticDecl(_) =>
+          sys.error("a 'static' declaration reached a library artifact, which is a file a program " +
+            "starts in reaching one — the analyzer refuses 'static' everywhere else")
         case RefDecl(n, p)                => tok("ref"); sref(n); expr(p)
         case MultiAssign(op, ts, vs)      => tok("masg"); sref(op); list(ts)(expr); list(vs)(expr)
         case MultiDecl(ns, mut, vs)       => tok("mdcl"); list(ns)(sref); bool(mut); list(vs)(expr)

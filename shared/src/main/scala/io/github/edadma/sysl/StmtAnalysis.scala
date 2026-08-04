@@ -686,6 +686,13 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
         _: ExternVarDecl | _: TypeDecl =>
       err("structs, enums, traits, impls, externs, and types may only be declared at the top level")
 
+    // `static` names the one distinction a *file's* top level draws — module member or body-local —
+    // and an inner block has no such choice to make: everything in one is local to it.
+    case _: StaticDecl =>
+      err("'static' marks a declaration at the top of the file the program starts in, saying it " +
+        "belongs to the module rather than to that file's body. A declaration inside a block is " +
+        "local to that block and there is no module member for it to be instead")
+
     // The leading clauses of a function body are split off before the body is analyzed, so any
     // that reach here sit after another statement or inside an inner block — both disallowed.
     case _: Require | _: Ensure =>

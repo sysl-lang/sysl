@@ -95,6 +95,7 @@ class SyslLexical
     "val",
     "ref",
     "const",
+    "static",
     "if",
     "then",
     "elif",

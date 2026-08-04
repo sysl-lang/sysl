@@ -75,7 +75,38 @@ trait ProgramWalk
     // any other — one of them may import a sibling module of the library, and until there was more
     // than one library module there was nothing for such an import to name.
     val library = std.contributed(building).map(u => u -> scopeOf(u))
-    val body    = (library ::: files).flatMap((u, s) => u.body.map((s, _)))
+
+    // Which file the program starts in is settled **before** anything is hoisted, because it decides
+    // what the hoisting passes are given: that file is a body, so its `val`s and its functions are
+    // local to it and are not the module's to register. Every other file hands over everything it
+    // has.
+    val entry = entryFile(files)
+
+    // `static` is how a declaration in that body opts back into the module, so past this point
+    // nothing else in the compiler has a case for one: the inner declaration is handed to the
+    // hoisting passes exactly as another file's would be.
+    def unstatic(s: Stmt) = s match
+      case StaticDecl(inner) => inner
+      case other             => other
+
+    def contributed(u: Program) =
+      if entry.exists(_._1 eq u) then u.body.filter(Bodies.isModuleMember).map(unstatic)
+      else u.body.map(unstatic)
+
+    // Everywhere else it says nothing, because everywhere else there is no body for a declaration to
+    // belong to instead — so it is refused rather than quietly accepted as a no-op. A file with no
+    // statements is one of those places, which is why this reads "the file the program starts in"
+    // rather than "another file": a program with no entry file at all has nowhere to write one.
+    for (u, _) <- files if !entry.exists(_._1 eq u); s <- u.body do
+      s match
+        case StaticDecl(_) =>
+          currentPos = s.pos
+          recover(())(err("'static' says a declaration belongs to the module rather than to the body " +
+            "of the file the program starts in — and this file has no such body, so everything it " +
+            "declares is the module's already"))
+        case _ =>
+
+    val body = (library ::: files).flatMap((u, s) => contributed(u).map((s, _)))
 
     // Each declaration, each function body, and each statement is a **recovery region**: a
     // failure inside one is recorded and the region abandoned, and the walk resumes at the next.
@@ -240,7 +271,7 @@ trait ProgramWalk
     for f <- ourMembers do
       tfuncs ++= recoverOpt(analyzeFuncBody(f.name, f, Map.empty))
 
-    val (mainScope, mainStmts) = entryPoint(files)
+    val (mainScope, mainStmts) = entryPoint(entry)
 
     resetFunction()
     tsubst = Map.empty
@@ -460,38 +491,48 @@ trait ProgramWalk
           "declare it — its declarations would join the library's rather than sit beside them")
       })
 
-  /** The statements that become the program's entry point, and the module they are read in.
+  /** The file the program starts in, if it has one.
    *
    * A declaration is hoisted and belongs to the module it was written in, but an executable
    * statement runs, and running happens in an order. Files have none — a module's members are one
    * unordered set (`13 §6`) — and neither do modules, which are a graph rather than a sequence. So
    * **one file of the program carries the statements it runs**, and a second that carries any is a
    * mistake rather than an ordering to be guessed at.
+   *
+   * An `import` is not executable: it binds a name for the file that wrote it and runs nothing, so a
+   * file may import whatever it likes without becoming the file the program starts in. Neither is a
+   * `const`, a `val`, or a function — all three are declarations, and a file carrying a table and
+   * the functions that read it must not thereby become the file the program starts in.
+   *
+   * A program with none is a complete program that does nothing, which is what a tree of pure
+   * declarations should compile to: a library is not an error.
    */
-  private def entryPoint(files: List[(Program, Scope)]): (Scope, List[Stmt]) = {
-    // What counts as a declaration is `Bodies.isDeclaration`, and there is one of it on purpose:
-    // the same split decides which statements a body's `main` receives, and two lists that had to
-    // agree would be a way for them to stop agreeing.
-    //
-    // An `import` is not executable: it binds a name for the file that wrote it and runs nothing, so
-    // a file may import whatever it likes without becoming the file the program starts in. Neither
-    // is a `const` or a `val`: both are declarations, hoisted, and a module that names a dimension or
-    // carries a table must not thereby become the file the program starts in. That is also what
-    // makes every `ValDecl` the statement walk goes on to meet a **local** — the ones written at the
-    // top of a file never reach it.
-    def executable(u: Program) = u.body.filterNot(Bodies.isDeclaration)
+  private def entryFile(files: List[(Program, Scope)]): Option[(Program, Scope)] =
+    files.filter((u, _) => u.body.exists(!Bodies.isDeclaration(_))) match
+      case Nil          => None
+      case one :: Nil   => Some(one)
+      case (first, s) :: others =>
+        for (u, _) <- others do
+          val rest = u.body.filterNot(Bodies.isDeclaration)
 
-    files.map((u, s) => (u, s, executable(u))).filter(_._3.nonEmpty) match
-      case Nil                  => (Scope.root, Nil)
-      case (_, s, stmts) :: Nil => (s, stmts)
-      case (first, s, stmts) :: others =>
-        for (u, _, rest) <- others do
           recover(())(at(rest.head.pos) {
             err(s"${first.source.name} already carries the statements this program runs, so " +
               s"${u.source.name} may hold declarations only")
           })
-        (s, stmts)
-  }
+        Some((first, s))
+
+  /** The statements that become the program's entry point, and the module they are read in.
+   *
+   * The entry file is a **body**, so this is everything in it that is not a module member —
+   * its statements, and also the `val`s and functions it declares, which belong to that body rather
+   * than to the module (`Bodies.isModuleMember`). They arrive in **source order**, which is what
+   * makes a `val` there an ordinary local: it is initialized where it is written, rather than before
+   * every statement in the file the way a module member's is.
+   */
+  private def entryPoint(entry: Option[(Program, Scope)]): (Scope, List[Stmt]) =
+    entry match
+      case None         => (Scope.root, Nil)
+      case Some((u, s)) => (s, u.body.filterNot(Bodies.isModuleMember))
 
   // --- module-level `val`s --------------------------------------------------------------
 

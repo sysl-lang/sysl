@@ -121,9 +121,31 @@ class SyslParser(val source: Source) extends DeclParser {
    * rather than threaded through five rules that would each have to remember it. An `impl` is not
    * among them and takes none: it declares no name, so there is nothing for a modifier to restrict.
    */
+  /** `static val`, `static var`, `static f() -> …` — the three declarations of the entry file that
+   * would otherwise be local to its body, asking to be the module's instead (`13 §7`).
+   *
+   * The modifier follows the visibility rather than preceding it, so `private static var ticks: u64`
+   * reads in the order the two questions are asked: how far it reaches, then whose it is.
+   *
+   * Only these three take it. A type, a `const`, an `extern` and an `import` are module members
+   * wherever they are written — a body has nothing to make them local *to* — so `static` on one says
+   * nothing, and the sentence below says that rather than leaving the grammar to complain that a
+   * declaration form was not among the three.
+   */
+  protected lazy val staticDecl: PackratParser[Stmt] =
+    visibility ~ (op("static") ~> (valDecl | varDecl | funcDecl)) ^^ {
+      case Visibility.Public ~ d => StaticDecl(d)
+      case v ~ d                 => StaticDecl(restrict(v, d))
+    } | (visibility <~ op("static")) ~> err(
+      "'static' marks a 'val', a 'var' or a function — the declarations of the file a program starts " +
+        "in that would otherwise belong to its body. A type, a constant, an 'extern' and an 'import' " +
+        "belong to the module wherever they are written, so there is nothing for this to change",
+    )
+
   protected lazy val declaration: PackratParser[Stmt] =
     attributedDecl |
       implVisibility |
+      staticDecl |
       visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
         case Visibility.Public ~ d => d
         case v ~ d                 => restrict(v, d)

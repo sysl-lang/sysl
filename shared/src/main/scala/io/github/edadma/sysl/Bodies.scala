@@ -18,12 +18,40 @@ object Bodies {
   /** Whether a top-level statement is a **declaration** — hoisted, order-free, and not part of what
    * the program runs.
    *
-   * This is the one definition of the split, read by `ProgramWalk` to find a file's statements and by
-   * `wrapBody` to move them. Two lists that had to agree would be a way for them to stop agreeing.
+   * This answers **which file the program starts in**: the one carrying something this is false of.
+   * A file holding only a table of constants and the functions that read it declares a lot and runs
+   * nothing, and must not thereby become the file the program starts in.
+   *
+   * It is also what `wrapBody` moves, for the same reason — the statements a body carries are the
+   * ones a `main` has to be built around.
    */
   def isDeclaration(s: Stmt): Boolean = s match
     case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
-        _: ExternVarDecl | _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl =>
+        _: ExternVarDecl | _: ImportDecl | _: ConstDecl | _: ValDecl | _: TypeDecl | _: StaticDecl =>
+      true
+    case _ => false
+
+  /** Whether a declaration belongs to the **module** even when it is written in the file the program
+   * starts in.
+   *
+   * The file that carries the statements is a **body**, so what it declares is local to that body: a
+   * `val` there is a stack local initialized where it is written, and a function there is a nested
+   * function (`12 §5a`) that captures the locals above it. That is the whole of why a top-level `var`
+   * has never been readable from a function and a top-level `val` has — a distinction nobody could
+   * see a reason for, because there was none.
+   *
+   * What stays behind is everything with **no runtime identity**: a type names a shape, a `const` is
+   * folded into its uses before anything runs, an `extern` names storage somebody else owns, an
+   * `import` binds a name for the file. None of them occupies storage or captures anything, and a
+   * body has nothing to make them local *to* — `StmtAnalysis` refuses every one of them in a block.
+   *
+   * This is narrower than `isDeclaration` on purpose, and the two questions really are different: the
+   * one above asks which file runs, and is asked of every file; this one asks what that file's own
+   * declarations mean, and is asked only of it.
+   */
+  def isModuleMember(s: Stmt): Boolean = s match
+    case _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl | _: ExternVarDecl |
+        _: ImportDecl | _: ConstDecl | _: TypeDecl | _: StaticDecl =>
       true
     case _ => false
 

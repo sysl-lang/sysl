@@ -480,6 +480,25 @@ case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr]) exten
  */
 case class ConstDecl(name: String, typ: TypeRef, value: Expr, vis: Visibility = Visibility.Public) extends Stmt
 
+/** `static val`, `static var`, `static f() -> …` — a declaration in the file the program starts in
+ * that belongs to the **module** rather than to that file's body (`13 §7`).
+ *
+ * The file carrying a program's statements is a body, so what it declares is local to that body: a
+ * `val` is a stack local, a function is a nested function (`12 §5a`). That is what a reader wants
+ * nearly always, and there are three things it cannot be — a nested function may not be generic, has
+ * no address, and is not a value — plus one a local cannot be, which is visible to another file. This
+ * is how a declaration opts out and becomes an ordinary module member.
+ *
+ * It is a **wrapper rather than a flag** because that is the whole of what it does: nothing past the
+ * point where a file's declarations are separated from its statements ever sees one. `ProgramWalk`
+ * unwraps it, hands the inner declaration to the hoisting passes exactly as another file's would be,
+ * and no later pass has a case for it.
+ *
+ * It is meaningful in exactly one file per program, since only the entry file has a body for a
+ * declaration to *not* belong to; anywhere else it says nothing and is refused rather than ignored.
+ */
+case class StaticDecl(inner: Stmt) extends Stmt
+
 /** `val name [: type] = value` — a binding written once and never assigned to.
  *
  * One keyword, read at two levels, because it is one idea at both. Written at the top of a file it
