@@ -1126,6 +1126,17 @@ a fresh worktree and stale after a change to the tree encoding or the container,
 each, the same answer every time, and it takes well under a second to produce. Putting that to
 whoever ran the compiler buys nothing: there is no second option for them to choose.
 
+**A rebuild publishes by rename**, which is what keying the path on the library rather than on the
+directory costs. One key means one file for every compilation of that library on the machine, and
+nothing holds two of them apart: separate worktrees at one commit carry identical sources and so
+hash to identical paths, and so do two runs of the same suite. `ar` truncates its output before it
+writes, so a build that assembled in place would leave every concurrent reader a file that is
+briefly absent and then briefly half an archive — a failure with no diagnostic, since half an
+archive is simply an artifact that will not read. Assembled beside its destination and renamed onto
+it, a reader sees the whole of the previous artifact or the whole of the new one, and a rebuild that
+fails leaves the working artifact it was replacing rather than taking it down on the way to not
+producing one.
+
 **This is not the silent substitution the rule above forbids, and the difference is exact.** What a
 compiler must never do is answer *I could not find the library you meant* by compiling against a
 different one — which is why no C compiler that cannot find libc carries a spare. A rebuild compiles

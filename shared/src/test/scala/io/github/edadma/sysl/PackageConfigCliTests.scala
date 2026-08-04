@@ -15,8 +15,17 @@ import org.scalatest.matchers.should.Matchers
  */
 class PackageConfigCliTests extends AnyFreeSpec with Matchers {
 
-  /** The driver under a name of its own — `Suite` has an `execute` too, and it wins unqualified. */
-  private def cli(cfg: Config): Int = Console.withOut(Discarded)(io.github.edadma.sysl.execute(cfg))
+  /** The driver under a name of its own — `Suite` has an `execute` too, and it wins unqualified.
+   *
+   * Everything here says `--no-std-lib`: *this test is about `package.hocon`, not about which
+   * standard module a compilation gets.* Without it these runs fall through to
+   * `LibraryArtifact.stdDefault` — the **user's own cache** — and a suite that builds an artifact
+   * there is writing outside its own temporary directories and racing every other compilation on the
+   * machine for one file. `LibraryCliSupport` and `TestCliTests` each say the same thing for the
+   * same reason.
+   */
+  private def cli(cfg: Config): Int =
+    Console.withOut(Discarded)(io.github.edadma.sysl.execute(cfg.copy(noStdLib = true)))
 
   /** A project directory holding a program and, where one is given, a config beside it. */
   private def project(program: String, config: Option[String])(check: String => Unit): Unit = {
@@ -48,19 +57,45 @@ class PackageConfigCliTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  "and builds it without going looking for a standard module to link" in {
+    // What a compilation that *did* look for one leaves behind is an artifact at the search path,
+    // because nothing usable is ever there and the driver builds one rather than refusing
+    // (`Main.foundStd`). So an empty directory left empty is the observation — and the reason it
+    // matters is where the search path points when nobody names one: `LibraryArtifact.stdDefault`,
+    // in the user's own cache, which this suite spent a day writing into.
+    val elsewhere = createTempDirectory("sysl-package-std-")
+    val unused    = s"$elsewhere/std${LibraryArtifact.extension}"
+
+    try
+      project("main()\n    print(1)\n", None) { dir =>
+        cli(Config(command = "build", file = dir, output = Some(s"$dir/out"), stdSearch = unused)) shouldBe 0
+      }
+
+      exists(unused) shouldBe false
+    finally
+      for f <- listFiles(elsewhere) do deleteFile(f)
+      deleteFile(elsewhere)
+  }
+
   "the config names the target a build is for" in {
     project(
       "main()\n    print(1)\n",
       Some("targets { default = \"riscv64-linux\" }\n"),
     ) { dir =>
-      // A cross build gets no further than the standard module here — this machine's clang has no
-      // RISC-V target — and that is enough to see the answer. What is asserted is that the driver
-      // took the target from the **file**: with the config unread the build is for this machine, it
-      // succeeds, and nothing is said at all, so naming the configured machine is what discriminates.
+      // A cross build gets no further than clang here — this machine's has no RISC-V target — and
+      // that is enough to see the answer. What is asserted is that the driver took the target from
+      // the **file**: with the config unread the build is for this machine, it succeeds, and nothing
+      // is said at all, so it is *which* machine is named that discriminates. The triple rather than
+      // the name because that is what got as far as the toolchain, and both are read off the target
+      // table rather than written out, so this says "the configured one, not this one" rather than
+      // repeating a spelling.
+      val riscv = Target.named("riscv64-linux").getOrElse(fail("riscv64-linux is not a target"))
+
       val (code, said) = stderrOf(cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))))
 
       code should not be 0
-      said should include("riscv64-linux")
+      said should include(riscv.triple)
+      said shouldNot include(Target.default.triple)
     }
   }
 
