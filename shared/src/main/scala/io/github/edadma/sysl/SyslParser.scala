@@ -54,7 +54,7 @@ class SyslParser(val source: Source) extends DeclParser {
   lazy val statement: PackratParser[Stmt] =
     at(
       misplacedCapability | misplacedLink | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
-        breakStmt | continueStmt | deferStmt | requireStmt | ensureStmt | multiAssign |
+        breakStmt | continueStmt | deferStmt | asmStmt | requireStmt | ensureStmt | multiAssign |
         resultListStmt | exprStmt,
     )
 
@@ -652,6 +652,78 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val deferStmt: PackratParser[Stmt] =
     op("defer") ~> inlineStatement ^^ Defer.apply
+
+  /** `asm` with an architecture arm per line under it (`inline-assembly.md §1`).
+   *
+   * Every word the construct spends is contextual, `asm` included: each is recognized in one
+   * position and is an ordinary identifier everywhere else, so a program may still call a variable
+   * `out` or `clobbers` — and use it as an operand in the same function. What commits this rule is
+   * the indented arm list, which a bare mention of a variable named `asm` does not have, so the
+   * fall-through to an expression statement is exact rather than a matter of ordering.
+   */
+  protected lazy val asmStmt: PackratParser[Stmt] =
+    softWord("asm") ~> newline ~> indent ~> opt(newlines) ~>
+      repsep(asmArm, newlines) <~ opt(newlines) <~ dedent ^^ AsmStmt.apply
+
+  /** `[x86_64, aarch64]` and what answers for them. The architecture names are not checked here —
+   * the grammar has no idea which processors exist, and a name outside the set is a diagnostic
+   * about a target rather than a parse error about a token.
+   */
+  protected lazy val asmArm: Parser[AsmArm] =
+    at((op("[") ~> rep1sep(ident, op(",")) <~ op("]")) ~ asmArmBody ^^ { case archs ~ body =>
+      AsmArm(archs, body)
+    })
+
+  /** The four things an arm may be: no answer, one instruction inline, an indented block, or
+   * nothing at all. Nothing at all is last because it consumes no input and would otherwise take
+   * every arm; it is the architecture on which the operation costs no instruction.
+   */
+  protected lazy val asmArmBody: Parser[AsmBody] =
+    (softWord("unavailable") ~> asmText ^^ AsmUnavailable.apply) |
+      (asmText ^^ (line => AsmCode(List(line), Nil, Nil))) |
+      (newline ~> indent ~> opt(newlines) ~> repsep(asmItem, newlines) <~ opt(newlines) <~ dedent ^^ gatherAsm) |
+      success(AsmCode(Nil, Nil, Nil))
+
+  /** A line inside an arm: an instruction, an operand, or what the arm destroys. They are collected
+   * by kind rather than kept in order, because only the instructions have an order that matters.
+   */
+  protected lazy val asmItem: Parser[AsmItem] =
+    (asmText ^^ AsmItem.Line.apply) |
+      (asmOperand ^^ AsmItem.Operand.apply) |
+      (softWord("clobbers") ~> rep1sep(asmText, op(",")) ^^ AsmItem.Clobber.apply)
+
+  /** `in name : reg` / `out name : "dx"`.
+   *
+   * The class slot is required even though `reg` is the only class there is, so that every operand
+   * line has one shape and a second class arrives as a peer rather than as the exception to an
+   * invisible default. Its `:` is not a type annotation — the operand names a variable that already
+   * has a type — so what follows is a class or a machine register and never a type.
+   */
+  protected lazy val asmOperand: Parser[AsmOperand] =
+    at((asmDir ~ ident <~ op(":")) ~ asmPlace ^^ { case dir ~ name ~ place =>
+      AsmOperand(dir, name, place)
+    })
+
+  /** `in` is a reserved word already, for `for x in xs`, and is reused rather than added to. */
+  protected lazy val asmDir: Parser[AsmDir] =
+    (op("in") ^^^ AsmDir.In) | (softWord("out") ^^^ AsmDir.Out)
+
+  /** A bare word is sysl's and a quoted one is the assembler's, which is the rule everywhere in the
+   * construct: `reg` is a class this language names, and `"dx"` is a register only the assembler
+   * knows about.
+   */
+  protected lazy val asmPlace: Parser[Option[String]] =
+    (softWord("reg") ^^^ None) | (asmText ^^ Some.apply)
+
+  protected lazy val asmText: Parser[String] =
+    accept("string literal", { case t: lexical.StrLit => t.value })
+
+  private def gatherAsm(items: List[AsmItem]): AsmCode =
+    AsmCode(
+      items.collect { case AsmItem.Line(t) => t },
+      items.collect { case AsmItem.Operand(o) => o },
+      items.collect { case AsmItem.Clobber(rs) => rs }.flatten,
+    )
 
   /** A `'name` label reference, as used before a loop and after `break`/`continue`. */
   protected lazy val labelRef: Parser[String] =

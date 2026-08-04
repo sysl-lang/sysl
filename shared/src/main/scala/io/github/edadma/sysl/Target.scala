@@ -74,6 +74,27 @@ enum Cpu(val bits: Int) {
   case X86_64  extends Cpu(64)
   case Riscv64 extends Cpu(64)
   case X86     extends Cpu(32)
+
+  /** How a source file names this processor — in a `#if` condition and in an assembly arm alike.
+   * One spelling for both, so a program that gates on a processor and one that writes instructions
+   * for it are naming the same thing.
+   */
+  def symbol: String = this match
+    case Aarch64 => "aarch64"
+    case X86_64  => "x86_64"
+    case Riscv64 => "riscv64"
+    case X86     => "x86"
+}
+
+object Cpu {
+
+  /** The processors a target can actually be built for, which is what an exhaustive set of assembly
+   * arms has to cover (`inline-assembly.md §2`). `x86` is nameable and not yet lowerable — the same
+   * fact `Target.supported` reads — so requiring an arm for it would be requiring an answer to a
+   * question nobody can ask. When 32-bit arrives it joins this list, and the arms that do not cover
+   * it become errors, which is the work of supporting it.
+   */
+  def buildable: List[Cpu] = values.filter(_.bits == 64).toList
 }
 
 /** The system conventions the processor is used under. `Freestanding` is a target with no operating

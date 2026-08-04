@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 18
+  val Version: Int = 19
 
   private val Magic = "sysl-ast"
 
@@ -167,6 +167,22 @@ object AstCodec {
     // rather than here. What this is for is the codec's own promise: a tree reads back as the tree
     // that was written, and a field left out silently is how that stops being true.
     private def testAttr(a: TestAttr): Unit = { pos(a); opt(a.display)(sref); bool(a.shouldTrap); opt(a.expected)(sref) }
+
+    private def asmArm(a: AsmArm): Unit = {
+      pos(a); list(a.archs)(sref)
+
+      a.body match
+        case AsmUnavailable(r)      => tok("0"); sref(r)
+        case AsmCode(ls, ops, clbs) => tok("1"); list(ls)(sref); list(ops)(asmOperand); list(clbs)(sref)
+    }
+
+    private def asmOperand(o: AsmOperand): Unit = {
+      pos(o)
+      o.dir match
+        case AsmDir.In  => tok("0")
+        case AsmDir.Out => tok("1")
+      sref(o.name); opt(o.reg)(sref)
+    }
 
     private def recv(r: RecvMode): Unit = r match
       case RecvMode.ByValue   => tok("0")
@@ -297,6 +313,7 @@ object AstCodec {
         case Break(l, v)                  => tok("brk"); opt(l)(sref); opt(v)(expr)
         case Continue(l)                  => tok("cnt"); opt(l)(sref)
         case Defer(s)                     => tok("dfr"); stmt(s)
+        case AsmStmt(arms)                => tok("asm"); list(arms)(asmArm)
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
 
@@ -543,6 +560,24 @@ object AstCodec {
 
     private def testAttr(): TestAttr = at(TestAttr(opt(sref()), bool(), opt(sref())))
 
+    private def asmArm(): AsmArm = at {
+      val archs = list(sref())
+
+      AsmArm(archs, tok() match
+        case "0"   => AsmUnavailable(sref())
+        case "1"   => AsmCode(list(sref()), list(asmOperand()), list(sref()))
+        case other => fail(s"'$other' is not an assembly arm"))
+    }
+
+    private def asmOperand(): AsmOperand = at {
+      val dir = tok() match
+        case "0"   => AsmDir.In
+        case "1"   => AsmDir.Out
+        case other => fail(s"'$other' is not an assembly operand direction")
+
+      AsmOperand(dir, sref(), opt(sref()))
+    }
+
     private def recv(): RecvMode = tok() match
       case "0"   => RecvMode.ByValue
       case "1"   => RecvMode.ByPtr
@@ -654,6 +689,7 @@ object AstCodec {
         case "brk"  => Break(opt(sref()), opt(expr()))
         case "cnt"  => Continue(opt(sref()))
         case "dfr"  => Defer(stmt())
+        case "asm"  => AsmStmt(list(asmArm()))
         case "req"  => Require(expr(), opt(sref()))
         case "ens"  => Ensure(expr(), opt(sref()))
         case "fn" =>

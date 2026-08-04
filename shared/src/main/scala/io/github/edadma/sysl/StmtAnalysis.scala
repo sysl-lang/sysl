@@ -10,7 +10,7 @@ package io.github.edadma.sysl
  * The other thread here is that a block is an **expression**: it has a type, taken from its
  * trailing expression, or `never` where it ends in a jump and control does not arrive at all.
  */
-trait StmtAnalysis extends TypeResolution {
+trait StmtAnalysis extends TypeResolution with AsmAnalysis {
 
   /** A block whose trailing expression (if any) is its value — a function body or an if/match
    * branch. Statements share one lexical scope with the result expression.
@@ -606,6 +606,10 @@ trait StmtAnalysis extends TypeResolution {
           "to return to. Check the result and handle the failure in the deferred statement itself")
 
       List(TDefer(body))
+
+    // `asm` (`inline-assembly.md`). The arms are chosen between here, so what reaches the emitter is
+    // one architecture's instructions and no record that there were others.
+    case a: AsmStmt => List(analyzeAsm(a))
 
     // A constant is a declaration that was hoisted and folded into its uses (`13 §7`), so where the
     // walk meets one among the entry point's statements there is nothing left to run.
