@@ -172,7 +172,8 @@ trait HoistImpl extends ImplConformance {
 
     traitImpls((impl.traitName, home.key)) =
       already :+ TraitImpl(impl, written, wkey, home.alt, home.tparams,
-        Option.when(home.tparams.nonEmpty && home.bounds.nonEmpty)((home.tparams, home.bounds)))
+        Option.when(home.tparams.nonEmpty && home.bounds.nonEmpty)((home.tparams, home.bounds)),
+        currentScope)
 
     // What the trait **requires** is asked of the implementing type here, at the block that makes
     // the promise, rather than at each bound that relies on it. Two reasons, and the second decides

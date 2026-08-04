@@ -364,6 +364,20 @@ class ComplexTests extends AnyFreeSpec with RunSupport with CodegenSupport {
       err("var a = Complex(1.0, 2.0)") should include("undefined")
     }
 
+    // **And importing the type is the whole of what a program has to do.** Every operator here is a
+    // conditional conformance whose condition names `Float`, which is the library's own import and
+    // not this program's — so a program that had to import `sysl.math` as well to add two complex
+    // numbers would be leaking the implementation's terms into its caller's.
+    "and importing the type is enough to reach every operator" in {
+      super.run(
+        """import sysl.math.complex.Complex
+          |
+          |var a = Complex(3.0, 4.0)
+          |
+          |print(a + a, a * a, a / a, a * 2.0, -a, a == a)""".stripMargin
+      ) shouldBe "6+8i -7+24i 1+0i 6+8i -3-4i true\n"
+    }
+
     // The bound is written with the short name, under the import — which is the spelling a user
     // writing their own generic over `Complex` will reach for.
     "and a program may write its own generic over it, bounded the same way" in {

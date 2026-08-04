@@ -164,6 +164,63 @@ class ImportedBoundTests extends AnyFreeSpec with CodegenSupport with RunSupport
     }
   }
 
+  // A conditional conformance is a condition the *block* wrote, and whether a type meets it is asked
+  // wherever the trait is used — which may be a module that imported only the type. So the bound has
+  // to be read in the block's own terms, and not in the asking module's.
+  "a conditional 'impl' whose bound names an imported trait" - {
+    "is conformed to from a module that imported neither the trait nor the bound's" in {
+      runIn(
+        ("", "main.sysl",
+         """import wrap.Box
+           |
+           |print((Box(21) + Box(0)).v)
+           |""".stripMargin),
+        ("wrap", "w.sysl",
+         """module wrap
+           |
+           |import num.Scale
+           |
+           |struct Box[T]
+           |    v: T
+           |end Box
+           |
+           |impl[T: Scale] Add for Box[T]
+           |    add(self, rhs: Box[T]) -> Box[T] = Box(self.v.double())
+           |""".stripMargin),
+        num,
+      ) shouldBe "42\n"
+    }
+
+    // And the same block still refuses a type argument that does not meet it — naming the trait the
+    // block wrote, resolved, rather than the bare word the asking module cannot see.
+    "and still refuses an argument that does not meet it, naming the trait it asked for" in {
+      errIn(
+        ("", "main.sysl",
+         """import wrap.Box
+           |
+           |struct Tag
+           |    n: int
+           |end Tag
+           |
+           |print((Box(Tag(1)) + Box(Tag(2))).v.n)
+           |""".stripMargin),
+        ("wrap", "w.sysl",
+         """module wrap
+           |
+           |import num.Scale
+           |
+           |struct Box[T]
+           |    v: T
+           |end Box
+           |
+           |impl[T: Scale] Add for Box[T]
+           |    add(self, rhs: Box[T]) -> Box[T] = Box(self.v.double())
+           |""".stripMargin),
+        num,
+      ) should include("asks 'num.Scale' of Tag")
+    }
+  }
+
   // A chain of requirements is walked from whichever trait a use names, and each link is read in the
   // file that wrote it — so a middle module's `: Scale` is its own import's, not the walk's.
   "a required trait named by a short name in the module that required it" - {

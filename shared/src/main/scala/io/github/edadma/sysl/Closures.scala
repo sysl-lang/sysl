@@ -326,7 +326,7 @@ trait Closures extends CallAnalysis {
     val args = ptypes :+ ret
 
     traitImpls((trName, struct.base)) =
-      List(TraitImpl(impl, args, Type.Bound(trName, args).key, "", Nil, None))
+      List(TraitImpl(impl, args, Type.Bound(trName, args).key, "", Nil, None, currentScope))
 
     // The member is registered as the ordinary method it is, so calling a closure is a method call
     // and needs no path of its own — its parameters are the signature `funcInsts` already holds, so
