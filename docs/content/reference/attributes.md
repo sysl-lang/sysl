@@ -1,6 +1,6 @@
 ---
 title: Attributes, annotations, and compile time
-summary: `::` attributes a type answers, the `@test` and `@tailrec` annotations, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the four annotations, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec` | an **annotation** — a fact about the declaration under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost` | an **annotation** — a fact about the declaration under it | the grammar |
 | `#if` | a **directive** — a gate on lines | a pass before the lexer |
 
 **The last two are told apart by the sigil, and that is the whole rule.** An annotation is `@` and
@@ -23,8 +23,10 @@ A directive is still written at column 1, and for its own reason: it is gone bef
 column, so an indented one would look like it takes part in a block structure it has nothing to do
 with. That is a rule about directives, not the thing that distinguishes them.
 
-There are two annotations, both on functions and both written on their own line above the
-declaration. More than one may be stacked, and writing the same one twice is refused.
+There are four annotations, all on functions and all written on their own line above the
+declaration. More than one may be stacked, and writing the same one twice is refused. `@test` and
+`@tailrec` are below; `@pure` and `@ghost` belong to the specification vocabulary and are on the
+[verification](/reference/verification/) page.
 
 The `@` is also read **inside a pattern**, where it binds a name to what a sub-pattern matched
 ([patterns](/reference/patterns/)). The two never compete: an annotation's `@` is a prefix at the
@@ -522,7 +524,7 @@ because the trees a library ships are now a per-target answer.
 
 | absent | why |
 |---|---|
-| a general annotation mechanism | `@test` and `@tailrec` are the two, and the set is closed. What would make it general — a `packed` struct layout, an alignment annotation — is not designed |
+| a general annotation mechanism | `@test`, `@tailrec`, `@pure` and `@ghost` are the four, and the set is closed. What would make it general — a `packed` struct layout, an alignment annotation — is not designed |
 | `#define`, or any project-supplied symbol | the `#if` vocabulary is derived from the target and closed, which is what makes an unknown symbol an error rather than a false |
 | a `#if` that asks about a capability | a condition asks what the *target* says; what a project permits is a different question, left with the config that would define it |
 | a test framework in the library | a test asserts in the language it is testing, and passes by returning |
