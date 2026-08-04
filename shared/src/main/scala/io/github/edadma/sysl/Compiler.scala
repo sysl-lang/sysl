@@ -74,10 +74,21 @@ object Compiler {
 
     parsed.collect { case Left(e) => e } match
       case Nil =>
-        analyzed(libraries ::: parsed.collect { case Right(p) => p }, target, precompiled,
-          carried(std, target), provides)
+        compiledTrees(parsed.collect { case Right(p) => p }, libraries, target, precompiled, std, provides)
       case errs => Left(errs.mkString("\n"))
   }
+
+  /** The same compilation from the program's own **already-parsed** units.
+   *
+   * `compiledWith` is this with a parse in front of it, and the two are one method split rather than
+   * two paths: a caller that had to change the trees between parsing and compiling — to supply the
+   * `main` a body has no room for (`Bodies`) — would otherwise have had nowhere to stand.
+   */
+  def compiledTrees(units: List[Program], libraries: List[Program] = Nil,
+                    target: Target = Target.default, precompiled: Set[String] = Set.empty,
+                    std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet)
+      : Either[String, Compiled] =
+    analyzed(libraries ::: units, target, precompiled, carried(std, target), provides)
 
   /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
    *

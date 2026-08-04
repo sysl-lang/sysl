@@ -374,8 +374,8 @@ object Toolchain {
    * comes back beside its module and nowhere else (`15 §8`). Taking the IR was enough only while the
    * driver carried one hardcoded library for every build.
    */
-  private def runIr(compiled: Either[String, Compiled], args: List[String],
-                    archives: List[String] = Nil): Either[String, (Int, String)] =
+  private[sysl] def runIr(compiled: Either[String, Compiled], args: List[String],
+                          archives: List[String] = Nil): Either[String, (Int, String)] =
     compiled.flatMap { c =>
       val exe = createTempFile("sysl-", "")
 
