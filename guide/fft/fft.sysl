@@ -10,6 +10,7 @@
 import sysl.math.tau
 import sysl.math.Bits
 import sysl.math.is_power_of_two
+import sysl.math.complex.Complex
 
 enum Fault
     Empty
@@ -54,7 +55,7 @@ end reverse_bits
 // Cooley-Tukey, in place, iterative. `sign` is what separates the two directions: -1 for the
 // forward transform's `e^(-2*pi*i*k/n)` and +1 for the inverse's conjugate kernel, which is the
 // whole of the difference between them apart from the final scaling.
-private transform(xs: []Complex, sign: f64) -> Result[unit, Fault]
+private transform(xs: []Complex[real], sign: f64) -> Result[unit, Fault]
     if xs.len == 0usize then return Err(Empty)
     if !is_power_of_two(xs.len) then return Err(NotPowerOfTwo)
 
@@ -81,7 +82,7 @@ private transform(xs: []Complex, sign: f64) -> Result[unit, Fault]
 
         while start < n
             for k in 0..<half
-                var w = expi(step * f64(k))
+                var w = Complex.expi(step * f64(k))
                 var a = xs[start + k]
                 var b = xs[start + k + half] * w
 
@@ -95,12 +96,13 @@ private transform(xs: []Complex, sign: f64) -> Result[unit, Fault]
     Ok(())
 end transform
 
-fft(xs: []Complex) -> Result[unit, Fault] = transform(xs, -1.0)
+fft(xs: []Complex[real]) -> Result[unit, Fault] = transform(xs, -1.0)
 
 // The inverse is the forward transform with the kernel conjugated and everything divided by n. That
-// division is a `Complex` scaled by a real, which is `Mul[f64]` rather than `Mul` — one trait at the
-// argument list that names the operand it takes.
-ifft(xs: []Complex) -> Result[unit, Fault]
+// division is a `Complex` scaled by a real, which is `Mul[real]` rather than `Mul` — one trait at
+// the argument list that names the operand it takes, and the reason `sysl.math.complex` writes each
+// of the four arithmetic operators twice.
+ifft(xs: []Complex[real]) -> Result[unit, Fault]
     transform(xs, 1.0)?
 
     var k = 1.0 / f64(xs.len)
@@ -111,21 +113,21 @@ ifft(xs: []Complex) -> Result[unit, Fault]
 end ifft
 
 // The definition, summed term by term. Quadratic and slow, and that is what it is for.
-dft(xs: []Complex) -> []Complex
+dft(xs: []Complex[real]) -> []Complex[real]
     var n = xs.len
-    var out: []Complex = [zero(); n]
+    var out: []Complex[real] = [Complex.zero(); n]
 
     for k in 0..<n
-        var acc = zero()
+        var acc: Complex[real] = Complex.zero()
 
-        for t in 0..<n do acc = acc + xs[t] * expi(-tau * f64(k) * f64(t) / f64(n))
+        for t in 0..<n do acc = acc + xs[t] * Complex.expi(-tau * f64(k) * f64(t) / f64(n))
 
         out[k] = acc
 
     out
 end dft
 
-magnitudes(xs: []Complex) -> []f64
+magnitudes(xs: []Complex[real]) -> []f64
     var out: []f64 = [0.0; xs.len]
 
     for i in 0..<xs.len do out[i] = xs[i].abs()
@@ -135,16 +137,16 @@ end magnitudes
 
 // A copy, since every transform here works in place and a caller usually wants to keep what it
 // started with.
-copy_of(xs: []Complex) -> []Complex
-    var out: []Complex = [zero(); xs.len]
+copy_of(xs: []Complex[real]) -> []Complex[real]
+    var out: []Complex[real] = [Complex.zero(); xs.len]
 
     for i in 0..<xs.len do out[i] = xs[i]
 
     out
 end copy_of
 
-real_signal(values: []f64) -> []Complex
-    var out: []Complex = [zero(); values.len]
+real_signal(values: []f64) -> []Complex[real]
+    var out: []Complex[real] = [Complex.zero(); values.len]
 
     for i in 0..<values.len do out[i] = Complex(values[i], 0.0)
 
@@ -154,7 +156,7 @@ end real_signal
 // Circular convolution through the transform: multiply the spectra pointwise and come back. The
 // direct sum below computes the same thing by its definition, and the two agreeing is the
 // convolution theorem holding.
-convolve(a: []Complex, b: []Complex) -> Result[[]Complex, Fault]
+convolve(a: []Complex[real], b: []Complex[real]) -> Result[[]Complex[real], Fault]
     if a.len != b.len then return Err(LengthsDiffer)
 
     var fa = copy_of(a)
@@ -170,14 +172,14 @@ convolve(a: []Complex, b: []Complex) -> Result[[]Complex, Fault]
     Ok(fa)
 end convolve
 
-convolve_directly(a: []Complex, b: []Complex) -> Result[[]Complex, Fault]
+convolve_directly(a: []Complex[real], b: []Complex[real]) -> Result[[]Complex[real], Fault]
     if a.len != b.len then return Err(LengthsDiffer)
 
     var n = a.len
-    var out: []Complex = [zero(); n]
+    var out: []Complex[real] = [Complex.zero(); n]
 
     for i in 0..<n
-        var acc = zero()
+        var acc: Complex[real] = Complex.zero()
 
         for j in 0..<n do acc = acc + a[j] * b[(i + n - j) % n]
 
@@ -214,7 +216,7 @@ private strongest_first[T: Ord](xs: []T)
         xs[j] = v
 end strongest_first
 
-peaks(xs: []Complex) -> []Bin
+peaks(xs: []Complex[real]) -> []Bin
     var bins: []Bin = [Bin(0usize, 0.0); xs.len]
 
     for i in 0..<xs.len do bins[i] = Bin(i, xs[i].abs())
@@ -225,11 +227,12 @@ peaks(xs: []Complex) -> []Bin
 end peaks
 
 // The energy in a signal, which Parseval's theorem says the transform preserves up to the factor
-// n. Summing the squared magnitudes avoids the square roots entirely.
-energy(xs: []Complex) -> f64
+// n. Summing the squared magnitudes avoids the square roots entirely, which is what `norm_sqr` is
+// for — and it is never called `norm`, because C++ and Rust give that word opposite meanings.
+energy(xs: []Complex[real]) -> f64
     var total = 0.0
 
-    for i in 0..<xs.len do total += xs[i].norm()
+    for i in 0..<xs.len do total += xs[i].norm_sqr()
 
     total
 end energy

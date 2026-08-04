@@ -1,6 +1,6 @@
 ---
 title: fft
-summary: Arithmetic on a type the program defined, and the transform kept beside the definition it rearranges.
+summary: A transform kept beside the definition it rearranges, and checked against it.
 weight: 50
 ---
 
@@ -12,10 +12,17 @@ rearrangement is exactly the kind of thing that can be subtly wrong and still pr
 numbers — so the slow one is kept as the thing to compare against. Published values then anchor the
 pair, since two implementations by the same author agreeing proves only that they agree.
 
-**The axis: arithmetic on a type the program defined.** `Complex` is an ordinary struct with
-[operator implementations](/reference/expressions/), so `a * b + c` over it is written the way it is
-written over a number. Nothing in the language knows what a complex number is; the operator traits are
-the whole mechanism, and this is the program that leans on them hardest.
+**The axis: an algorithm checked against its own definition.** Every other program in the set is
+checked against values somebody else wrote down, and this one is too — but it also carries the thing
+it is supposed to be equal to, and runs it. A spot check accepts a plausible number; the definition
+does not.
+
+**The complex arithmetic used to be this program's own, and is now
+[`sysl.math.complex`](/library/complex/).** That is the ordinary end of a guide program's life: it
+was written here because there was nothing to import, the friction it turned up is what moved the
+language, and once the type existed there was no reason for a second copy of it. Nothing in the
+language knows what a complex number is — the [operator traits](/reference/expressions/) are still
+the whole mechanism, and the program still leans on them hardest.
 
 ## What it found
 
@@ -33,6 +40,15 @@ zero. A shift by the full width is the case the instruction does not define, so 
 
 That is the more useful shape of finding: not "the language cannot express this" but "the language
 expresses it and the *machine* has an edge case", which no amount of language design removes.
+
+**A trait written for somebody else's type has to find a name that is still free.** What survived the
+move to the library is `sum` — the generic total that starts at a value the type promised rather than
+at `xs[0]`, which is what keeps an empty sequence from needing an `Option` in the signature. The
+trait behind it wanted a `zero() -> Self`, and could not have one: a trait's members become the
+implementing type's, and `Complex` already declares a `zero`. So the member is called `identity`, for
+what it is rather than for the value it answers. The more ordinary the concept, the likelier that
+collision is — and there is no way to name the member the trait *means* apart from the name it goes
+under.
 
 ---
 

@@ -245,9 +245,17 @@ library's is not.
 
 This is what keeps an `impl` for a built-in from spending names. `sysl.math`'s `Float` declares some
 forty-one members on `real` and `f32`, and a program that never imports the module may still declare
-a trait of its own with any of those names and implement it for either width. `guide/fft` does: its
-`Zero` is implemented for `real` alongside the library's, and the bound on `sum` says which one the
-body means.
+a trait of its own with any of those names and implement it for either width. Where the program does
+import the module, both members are in scope at once and a **bound** is what says which one a body
+means.
+
+**The escape stops exactly where `08` does, and `guide/fft` is where that showed up.** A trait's
+members become the implementing type's, so a name is free only if the type does not already declare
+one — the rule two paragraphs down, seen from the other side. That program wanted a `trait Zero` with
+a `zero() -> Self` and implements it for `real` and for `sysl.math.complex`'s `Complex`; the first is
+fine, and the second is refused, because `Complex` declares a `zero` in its own body. It names the
+member `identity` instead. A trait a program writes for types it did not write has to find a name
+still free on **all** of them, and the more ordinary the concept the likelier that it is not.
 
 **Two traits may therefore give one type a member of one name, and three things tell them apart, in
 this order.** A **bound** answers first, because inside a generic body the signature already said

@@ -759,11 +759,12 @@ exactly (`§5`), one row further down the catalog.
 
 - **One trait at more than one argument list — the half the catalog change did not cover, now
   shipped too.** The parameter on `Mul` did not by itself free the program that motivated it. A
-  transform needs **both** `Complex * Complex`, the butterfly, and `Complex * f64`, the scaling an
-  inverse does to every sample — and those are `Mul[Complex]` and `Mul[f64]`, two argument lists for
-  one trait on one type, which `02`'s coherence rule refused. Both are written in
-  `guide/fft/complex.sysl` now and `scale` is gone; what tells them apart is what was always going
-  to tell them apart, the type of the right operand.
+  transform needs **both** `Complex * Complex`, the butterfly, and `Complex * real`, the scaling an
+  inverse does to every sample — and those are `Mul[Complex]` and `Mul[real]`, two argument lists for
+  one trait on one type, which `02`'s coherence rule refused. Both are in `sysl.math.complex` now,
+  which writes each of its four arithmetic operators twice for exactly that reason, and `scale` is
+  gone; what tells them apart is what was always going to tell them apart, the type of the right
+  operand.
 
   It is **not** general member overloading, and that is the whole reason it was affordable. What is
   chosen among is the implementations of *one* parameterized trait, told apart by the argument list

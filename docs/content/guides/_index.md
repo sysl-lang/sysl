@@ -42,7 +42,7 @@ starts, so each one is written on top of what the last one settled.
 | [hashmap](/guides/hashmap/) | the trait system under load — bounds, what they promise, and ownership at once |
 | [bytecode](/guides/bytecode/) | the module system, and the set's one end-to-end assertion |
 | [png](/guides/png/) | the byte level — endianness, bit streams, checksums, somebody else's format |
-| [fft](/guides/fft/) | arithmetic on a type the program defined, and floating point |
+| [fft](/guides/fft/) | an algorithm checked against its own definition |
 | [sha2](/guides/sha2/) | generic arithmetic — one algorithm at two widths — and static tables |
 | [shapes](/guides/shapes/) | dynamic dispatch — a collection whose element types are forgotten |
 | [scheduler](/guides/scheduler/) | OS shapes — a run queue, blocking and waking, `&T` graphs mutated through references |
