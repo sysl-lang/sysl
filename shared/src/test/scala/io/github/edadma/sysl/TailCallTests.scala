@@ -391,12 +391,16 @@ class TailCallTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   }
 
   "the attribute grammar" - {
+    // What this is about is that the *word written* is named back, which is the half `@tailrec` owns.
+    // Which annotations exist is `TestAttributeTests`' assertion, and it is asserted there one name
+    // at a time — a sentence counting them goes stale every time the set grows, which it did twice
+    // in one afternoon when `17` added `@pure` and `@ghost`.
     "an attribute sysl does not know is named in the refusal" in {
       err(
         """@inline
           |double(n: int) -> int = n * 2
           |print(double(5))""".stripMargin
-      ) should include("'@test', '@tailrec', '@pure' and '@ghost' are the four")
+      ) should include("'inline' is not an annotation sysl knows")
     }
 
     "the same attribute twice is refused" in {
