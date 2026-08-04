@@ -282,17 +282,20 @@ That is contracts at their most useful — on a mutating method, saying the thin
 Contracts are checked in **every** build. There is no release mode that drops them, and adding one
 would make a program's meaning depend on how it was compiled.
 
-## What this is not
+## What this is, and where the rest of it is
 
-It is not verification. Nothing here is proved while compiling: a `require` is a branch and a trap, an
-invariant is a call to a synthesized predicate, a `within` is two comparisons. The compiler will not
-tell you that a call site cannot satisfy a precondition, and it will not eliminate a check it could
-have proved redundant.
+Nothing on this page is proved while compiling: a `require` is a branch and a trap, an invariant is a
+call to a synthesized predicate, a `within` is two comparisons. What the feature buys is that the
+rule is written **once, where the thing is declared**, instead of being re-checked by hand at every
+call — and that when it is broken, the program stops at the write that broke it rather than somewhere
+downstream where the wrong value finally mattered.
 
-That is a scope decision rather than a limitation waiting to be fixed. What the feature buys is that
-the rule is written **once, where the thing is declared**, instead of being re-checked by hand at
-every call — and that when it is broken, the program stops at the write that broke it rather than
-somewhere downstream where the wrong value finally mattered.
+**The proving is a page of its own.** [Verification](/reference/verification/) adds the vocabulary a
+specification needs — quantifiers, loop invariants, termination measures, `@pure` and `@ghost` — and
+`sysl prove`, which discharges the obligations with Why3. The two fit together the way they do
+because **a clause means one thing**: the prover and the running program read the same sentence, and
+a check the prover proves redundant is still compiled. So nothing above changes when you start
+proving, which is the point.
 
 ## Tests live beside the code
 

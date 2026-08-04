@@ -1334,18 +1334,18 @@ that it cannot, so an `impl` with an empty body is a complete one.
 | a `panic` that unwinds | a trap is terminal |
 | a `try` on a constrained type | `T::Valid(x)`, then the ordinary cast |
 | a build flag that strips checks | every check is in every build |
-| static proof of a contract | it is a branch and a trap, checked where the value is produced |
+| a contract discharged instead of checked | it is a branch and a trap wherever the value is produced, whether or not a prover has been over it |
 
-That last row is the scope decision worth stating plainly. **This is not verification.** Nothing here
-is proved while compiling: a `require` is a branch and a trap, an invariant is a call to a synthesised
-predicate, a `within` is two comparisons. The compiler will not tell you that a call site cannot
-satisfy a precondition, and it will not eliminate a check it could have proved redundant.
-
-Static checking of these conditions is a different project with a different shape — it needs a
-specification language, a notion of framing, and an answer for what happens when the prover times
-out. The runtime-checked version is useful on its own terms, and what it buys is that **the failure
+Nothing on this page is proved while compiling: a `require` is a branch and a trap, an invariant is a
+call to a synthesised predicate, a `within` is two comparisons. What that buys is that **the failure
 lands where the mistake is** — plus, for `new` types, a compile-time guarantee that has nothing to do
 with the checking at all.
+
+**Proving is a separate tool and it removes nothing.** [Verification](/reference/verification/) adds
+the specification vocabulary — quantifiers, loop invariants, termination measures, `@pure` and
+`@ghost` — and `sysl prove`, which discharges the obligations with Why3. A clause proved redundant is
+still compiled, because a program whose emitted code depended on whether a prover had been available
+is one nobody could reason about. That is why the row above says *instead of*: the two are additive.
 
 ---
 

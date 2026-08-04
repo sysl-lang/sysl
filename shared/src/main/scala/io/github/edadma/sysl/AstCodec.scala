@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 19
+  val Version: Int = 20
 
   private val Magic = "sysl-ast"
 
@@ -292,6 +292,7 @@ object AstCodec {
         case CFor(l, i, c, s, b, e2) =>
           tok("cfor"); opt(l)(sref); opt(i)(stmt); opt(c)(expr); opt(s)(stmt); list(b)(stmt)
           opt(e2)(x => list(x)(stmt))
+        case Quantifier(u, n, it, p) => tok("qnt"); bool(u); sref(n); expr(it); expr(p)
     }
 
     // ---------------------------------------------------------- statements
@@ -316,11 +317,13 @@ object AstCodec {
         case AsmStmt(arms)                => tok("asm"); list(arms)(asmArm)
         case Require(c, m)                => tok("req"); expr(c); opt(m)(sref)
         case Ensure(c, m)                 => tok("ens"); expr(c); opt(m)(sref)
+        case Invariant(c, m)              => tok("inv"); expr(c); opt(m)(sref)
+        case Variant(e)                   => tok("vnt"); expr(e)
 
-        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv, tr) =>
+        case FuncDecl(n, tps, ps, rt, b, bs, va, vs, tds, t, cv, tr, pu, gh) =>
           tok("fn"); sref(n); list(tps)(sref); list(ps)(param); opt(rt)(typ); list(b)(stmt)
           bounds(bs); bool(va); vis(vs); tdefaults(tds); opt(t)(testAttr)
-          opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) }); bool(tr)
+          opt(cv)(c => { pos(c); sref(c.name); opt(c.arg)(sref) }); bool(tr); bool(pu); bool(gh)
 
         case ExternDecl(n, ps, rt, va, lk, vs) =>
           tok("ext"); sref(n); list(ps)(param); opt(rt)(typ); bool(va); opt(lk)(sref); vis(vs)
@@ -669,6 +672,7 @@ object AstCodec {
         case "lop"  => Loop(opt(sref()), list(stmt()))
         case "for"  => For(opt(sref()), sref(), expr(), list(stmt()), opt(list(stmt())))
         case "cfor" => CFor(opt(sref()), opt(stmt()), opt(expr()), opt(stmt()), list(stmt()), opt(list(stmt())))
+        case "qnt"  => Quantifier(bool(), sref(), expr(), expr())
         case other  => fail(s"'$other' is not an expression tag")
     }
 
@@ -692,10 +696,12 @@ object AstCodec {
         case "asm"  => AsmStmt(list(asmArm()))
         case "req"  => Require(expr(), opt(sref()))
         case "ens"  => Ensure(expr(), opt(sref()))
+        case "inv"  => Invariant(expr(), opt(sref()))
+        case "vnt"  => Variant(expr())
         case "fn" =>
           FuncDecl(sref(), list(sref()), list(param()), opt(typ()), list(stmt()),
             bounds(), bool(), vis(), tdefaults(), opt(testAttr()),
-            opt(at(CallConv(sref(), opt(sref())))), bool())
+            opt(at(CallConv(sref(), opt(sref())))), bool(), bool(), bool())
         case "ext" =>
           ExternDecl(sref(), list(param()), opt(typ()), bool(), opt(sref()), vis())
         case "extv" =>

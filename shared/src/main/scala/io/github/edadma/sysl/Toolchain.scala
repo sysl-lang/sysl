@@ -22,6 +22,71 @@ object Toolchain {
   lazy val clangAvailable: Boolean =
     exec(Seq("clang", "--version")).exitCode == 0
 
+  /** Whether a Why3 is on the PATH, for `sysl prove` (`17 §9`). The proof tests gate on it so they
+   * skip cleanly on a machine without one.
+   *
+   * Looked for by name only. Why3 installs through opam and has no Homebrew formula, so on a machine
+   * that has one it is opam's switch that puts it on the PATH — which is the thing to say in the
+   * diagnostic rather than a directory to go guessing at.
+   */
+  lazy val why3Available: Boolean = runs("why3")
+
+  /** Which provers to try, in order, by the name Why3 files them under. Alt-Ergo first because it is
+   * the one Why3 ships alongside; Z3 next, since Homebrew has a formula for it and opam does not.
+   */
+  private val provers = List("Alt-Ergo", "Z3", "CVC5", "CVC4")
+
+  /** The prover to name on the command line, as `Name,Version` — which is the spelling Why3 wants
+   * when a configuration holds several.
+   *
+   * **A bare name is not enough and the failure says so rather than falling back**: with three
+   * Alt-Ergo entries configured (plain, bitvector, counterexample) `-P Alt-Ergo` is refused as
+   * ambiguous. The alternatives are the parenthesized ones, and they are exactly what is skipped
+   * here — the plain entry is the one that answers an ordinary goal.
+   */
+  private lazy val prover: Option[String] =
+    if !why3Available then None
+    else
+      val listed =
+        exec(Seq("why3", "config", "list-provers")).stdout.linesIterator
+          .map(_.trim)
+          .filter(l => l.nonEmpty && !l.contains('('))
+          .toList
+
+      provers.iterator
+        .flatMap(p => listed.find(_.startsWith(p + " ")).map(_.replaceFirst(" ", ",")))
+        .nextOption()
+
+  /** Whether Why3 has a prover to discharge anything with. A machine may have Why3 and no prover at
+   * all, which is a different failure from having neither and is worth telling apart.
+   */
+  lazy val why3HasProver: Boolean = prover.isDefined
+
+  /** Runs Why3 over a WhyML module, answering what it said (`17 §9`).
+   *
+   * `prove` is the batch subcommand: it splits each verification condition into goals, runs the
+   * configured provers on them, and reports one line per goal. The exit status is what says whether
+   * everything was discharged, and the output is what says which goal was not.
+   */
+  def why3Prove(mlw: String, timeoutSeconds: Int = 5): Either[String, (Int, String)] =
+    if !why3Available then
+      Left("cannot find why3, which proving needs — it installs through opam ('opam install why3') " +
+        "and has no Homebrew formula, so a shell that has not run 'eval $(opam env)' will not see " +
+        "one that is installed. A prover is wanted too: 'opam install alt-ergo', or Homebrew's z3, " +
+        "either of which why3 finds once 'why3 config detect' has run")
+    else
+      val file = createTempFile("sysl-", ".mlw")
+
+      writeFile(file, mlw)
+
+      // A prover has to be named for a time limit to mean anything, and naming one is what makes
+      // this a *discharge* rather than a well-formedness check.
+      val args = prover.toList.flatMap(p => List("--timelimit", timeoutSeconds.toString, "-P", p))
+      val result = exec(List("why3", "prove") ::: args ::: List(file))
+
+      deleteFile(file)
+      Right((result.exitCode, result.stdout + result.stderr))
+
   /** What optimization a build asks for when nothing named one — the level, as clang spells it after
    * the `-O`.
    *

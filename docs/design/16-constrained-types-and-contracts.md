@@ -433,19 +433,24 @@ Like a constraint, a violated contract traps. Contracts are checked in every bui
 "release mode drops them" switch, and adding one would make a program's meaning depend on how it was
 compiled.
 
-## 8. What this is not
+## 8. What this chapter is, and where the rest of it went
 
-It is not verification. Nothing here is proved at compile time: a `require` is a branch and a trap, an
-invariant is a call to a synthesised predicate, a `within` is two comparisons. The compiler will not
-tell you that a call site cannot satisfy a precondition, and it will not eliminate a check it could
-have proved redundant.
+Everything here is checked when the program runs: a `require` is a branch and a trap, an invariant is
+a call to a synthesised predicate, a `within` is two comparisons. Nothing in this chapter is proved,
+and the compiler will not tell you that a call site cannot satisfy a precondition.
 
-That is a scope decision rather than a limitation to be fixed later. Static checking of these
-conditions is a different project with a different shape — it needs a specification language, a
-notion of framing, and an answer for what happens when the prover times out — and a runtime-checked
-version is useful on its own terms and is what the language ships. What the runtime version buys is
-**the failure lands where the mistake is**, and, for `new` types, a compile-time guarantee that has
-nothing to do with the checking at all.
+**That was once the whole story and it is not any more — `17` is the other half.** This section used
+to say that static checking of these conditions was a different project, needing a specification
+language, a notion of framing, and an answer for what happens when the prover times out. All three
+turned out to be right about what it needed, and `17` supplies them: quantifiers and ghost state are
+the specification language, `@reads`/`@writes` are the frame, and a prover that times out changes
+nothing about the emitted program because **the checks are never removed**. That last point is `17
+§1` and it is what keeps the two chapters from pulling against each other — a clause described here
+still traps, still runs in every build, and still has no switch, whether or not anyone has proved it.
+
+What the runtime version buys on its own remains what it always was: **the failure lands where the
+mistake is**, and, for `new` types, a compile-time guarantee that has nothing to do with the checking
+at all. What `17` adds is finding out before the program runs rather than at the trap.
 
 ## Open (not yet decided)
 

@@ -54,8 +54,8 @@ class SyslParser(val source: Source) extends DeclParser {
   lazy val statement: PackratParser[Stmt] =
     at(
       misplacedHeaderAttr | importDecl | implDecl | declaration | varDecl | refDecl | returnStmt |
-        breakStmt | continueStmt | deferStmt | asmStmt | requireStmt | ensureStmt | multiAssign |
-        resultListStmt | exprStmt,
+        breakStmt | continueStmt | deferStmt | asmStmt | requireStmt | ensureStmt | invariantStmt |
+        variantStmt | multiAssign | resultListStmt | exprStmt,
     )
 
   /** A statement written on the same line as the keyword that introduces it.
@@ -92,6 +92,25 @@ class SyslParser(val source: Source) extends DeclParser {
 
   protected lazy val ensureStmt: PackratParser[Stmt] =
     op("ensure") ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Ensure(c, m) }
+
+  /** `invariant <cond> [, "message"]` and `variant <expr>` — the loop clauses of `17 §3`, and, for
+   * `variant`, the recursion measure a function's contract block carries (`17 §4`).
+   *
+   * **Both words are contextual**, matched as soft words exactly as the struct `invariant` of
+   * `16 §6` is — which is also where `invariant` was already being read this way, so this spends no
+   * new word. The cost of that is the cost `is` and `not` already pay: a *bare statement* that calls
+   * a function of the same name, `invariant(x)`, reads as a clause over `(x)`. Anywhere that is not
+   * a bare statement — `val v = invariant(x)`, an argument, a condition — the call is unambiguous,
+   * and a value named `invariant` is untouched. That trade buys the clause its natural spelling in
+   * the position a reader writes it.
+   */
+  protected lazy val invariantStmt: PackratParser[Stmt] =
+    invariantKw ~> expression ~ opt(op(",") ~> contractMsg) ^^ { case c ~ m => Invariant(c, m) }
+
+  protected lazy val variantStmt: PackratParser[Stmt] =
+    variantKw ~> expression ^^ Variant.apply
+
+  protected lazy val variantKw: Parser[Unit] = softWord("variant")
 
   protected lazy val contractMsg: Parser[String] =
     accept("string literal", { case t: lexical.StrLit => t.value })
@@ -146,7 +165,7 @@ class SyslParser(val source: Source) extends DeclParser {
    * itself so that the annotation's own position is the `@`, which is the line a test report names.
    */
   private lazy val attribute: PackratParser[Attr] =
-    testAttr ^^ Attr.Test.apply | tailrecAttr | unknownAttr | hashAttr
+    testAttr ^^ Attr.Test.apply | tailrecAttr | pureAttr | ghostAttr | unknownAttr | hashAttr
 
   /** `@test`, and the three things it may say about the test: the name a report gives it, that it is
    * a run which should not come back, and the text such a run should have printed on its way out.
@@ -162,10 +181,24 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val tailrecAttr: PackratParser[Attr] =
     op("@") ~> attrWord("tailrec") ^^ (_ => Attr.TailRec)
 
+  /** `@pure` — the assertion that a caller can observe nothing about this call but its result
+   * (`17 §6`). Like `@tailrec` it takes no arguments: purity is not a thing to configure, and what
+   * the annotation buys is the refusal when the body does something a caller could observe.
+   */
+  protected lazy val pureAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("pure") ^^ (_ => Attr.Pure)
+
+  /** `@ghost` — the function exists for the specification alone and is erased before codegen
+   * (`17 §8`).
+   */
+  protected lazy val ghostAttr: PackratParser[Attr] =
+    op("@") ~> attrWord("ghost") ^^ (_ => Attr.Ghost)
+
   private lazy val unknownAttr: PackratParser[Attr] =
     op("@") ~> ident >> (n =>
-      err(s"'$n' is not an annotation a declaration takes — '@test' and '@tailrec' are the two. " +
-        "'@no_<capability>', '@requires(...)' and '@link(\"...\")' belong in the file's header"))
+      err(s"'$n' is not an annotation a declaration takes — '@test', '@tailrec', '@pure' and " +
+        "'@ghost' are the four. '@no_<capability>', '@requires(...)' and '@link(\"...\")' belong in " +
+        "the file's header"))
 
   /** `#test` where `@test` was meant — the sigil a reader arriving from Rust or C reaches for first.
    *
@@ -210,6 +243,8 @@ class SyslParser(val source: Source) extends DeclParser {
     as.foldLeft(f) {
       case (d, Attr.Test(t)) => d.copy(test = Some(t))
       case (d, Attr.TailRec) => d.copy(tailrec = true)
+      case (d, Attr.Pure)    => d.copy(pure = true)
+      case (d, Attr.Ghost)   => d.copy(ghost = true)
     }
 
   private lazy val testArgs: Parser[TestAttr] =
@@ -815,6 +850,29 @@ class SyslParser(val source: Source) extends DeclParser {
    */
   protected lazy val loopExpr: PackratParser[Expr] =
     opt(labelRef) ~ (op("loop") ~> body("do")) ~ opt(endMarker("loop")) ^^ { case lbl ~ b ~ _ => Loop(lbl, b) }
+
+  /** `for all i in 0..<n do a[i] > 0`, `for some k in 0..n do a[k] == t` — a quantifier over an
+   * integer range (`17 §2`).
+   *
+   * **`all` and `some` stay ordinary identifiers**, matched here as soft words, so nothing a program
+   * already names is spent on this. Telling the form from a counted loop takes one token: a
+   * quantifier is `for` `all`/`some` `name` `in`, and a loop is `for` `name` `in`, so `for all in
+   * 0..<n do …` is still a loop over a variable called `all`. This rule is tried before `forExpr` in
+   * `expression` and backtracks into it when the name is missing.
+   *
+   * The separator is `do` — the word every loop header already uses to introduce what it does with
+   * each element — rather than Ada's `=>`, which is not in the operator set and would have been
+   * added for this one form. The predicate is a full `expression`, so the body extends as far to the
+   * right as one can: `for all i in r do P(i) && Q(i)` quantifies over the conjunction, which is the
+   * reading a specification wants and the one a reader of the line already expects from `->`.
+   */
+  protected lazy val quantifier: PackratParser[Expr] =
+    (op("for") ~> quantifierKind) ~ ident ~ (op("in") ~> expression) ~ (op("do") ~> expression) ^^ {
+      case univ ~ n ~ it ~ p => Quantifier(univ, n, it, p)
+    }
+
+  private lazy val quantifierKind: Parser[Boolean] =
+    softWord("all") ^^^ true | softWord("some") ^^^ false
 
   protected lazy val forExpr: PackratParser[Expr] = cForExpr | forInExpr
 
