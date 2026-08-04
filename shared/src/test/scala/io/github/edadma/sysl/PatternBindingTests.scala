@@ -620,10 +620,15 @@ class PatternBindingTests extends AnyFreeSpec with RunSupport with CodegenSuppor
       ) should include("named twice")
     }
 
-    // The same rule the comma form meets: the parts have nowhere to carry a type, so a module-level
-    // one would quietly become a local of the entry point.
+    // The same rule the comma form meets: the parts have nowhere to carry a type, so this is a local
+    // form. At the top of a program that needs no saying — a body's declarations are local — and the
+    // refusal is what asking for the module's storage gets.
     "a module-level val, whose parts have nowhere to state a type" in {
-      err("val (a, b) = (1, 2)\n") should include("nowhere to write one")
+      err("static val (a, b) = (1, 2)\n") should include("nowhere to write one")
+    }
+
+    "while the plain form at the top of a program is an ordinary local" in {
+      run("val (a, b) = (1, 2)\nprint(a, b)\n") shouldBe "1 2\n"
     }
   }
 }
