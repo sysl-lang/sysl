@@ -94,10 +94,12 @@ should fire, and passes only if the run does not come back. Every other build dr
 they cost a program nothing.
 
 Every program is compiled against the standard module, and **there is no step to run for it**. The
-artifact at `.sysl/std.syslib` is a derived file — object code for one machine, computed from library
-source the compiler already carries — so a clone, a fresh worktree, or a stale container after the
-encoding moved all have the same answer, and the compiler gives it in well under a second, announced
-on stderr. `sysl build-lib lib --std` writes one explicitly if you want to.
+artifact is a derived file — object code for one machine, computed from library source the compiler
+already carries — so a clone, a fresh worktree, or a stale container after the encoding moved all
+have the same answer, and the compiler gives it in well under a second, announced on stderr. It goes
+in your cache directory, keyed by a fingerprint of the library it was built from, so every project on
+the machine shares one and an upgrade needs no invalidating. `sysl build-lib lib --std` writes one
+explicitly if you want to.
 
 That rebuild is not a silent fallback. What the design refuses is compiling against a *different*
 standard module than the one asked for, so an artifact named with `--std-lib` is never rebuilt and a

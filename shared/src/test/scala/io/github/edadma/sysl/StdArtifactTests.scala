@@ -557,9 +557,9 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       assume(Toolchain.clangAvailable, "clang not available")
       assume(Toolchain.findAr(None).isRight, "llvm-ar not available")
 
-      // The default path is `.sysl/std.syslib` — a directory that is not committed, because the
-      // artifact is derived. Writing there on a tree that has never built one is the ordinary case
-      // rather than an unusual one, so the parent has to be made rather than assumed.
+      // The default path is inside a cache directory that no installer creates, and the artifact is
+      // derived rather than committed. Writing to a directory that has never existed is therefore the
+      // ordinary case rather than an unusual one, so the parent has to be made rather than assumed.
       val dir = s"${createTempDirectory("sysl-write-")}/.sysl"
       val out = s"$dir/std${LibraryArtifact.extension}"
 

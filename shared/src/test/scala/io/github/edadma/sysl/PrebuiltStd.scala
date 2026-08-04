@@ -11,7 +11,7 @@ import io.github.edadma.cross_platform.*
  *
  * It is the same artifact `sysl build-lib lib --std` writes, made by the same call
  * (`Stdlib.writeArtifact`) rather than by a second routine of the suite's own, so a test compiled
- * against this one is compiled against what a user's build would find at `.sysl/std.syslib`. That is
+ * against this one is compiled against what a user's build would find at the default path. That is
  * the property worth having: the suite exercises the path an ordinary compilation takes, rather than
  * a bootstrap path that only exists for its own benefit — and a change to how the artifact is made
  * cannot reach the compiler without reaching the suite.

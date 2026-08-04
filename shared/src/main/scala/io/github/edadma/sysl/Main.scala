@@ -42,7 +42,9 @@ import scopt.OParser
  * carries, and says so on stderr. The artifact is derived rather than authored: not committed, object
  * code for one machine, and computed entirely from sources the compiler already has, so being absent
  * after a clone or stale after a format change has one answer and it is not a question for whoever
- * ran the command.
+ * ran the command. It sits in the user's cache under a fingerprint of the library it was built from,
+ * so every project on a machine shares one and a compiler carrying a different library gets a path of
+ * its own rather than a stale hit.
  *
  * **Which is not the same as substituting a library.** What a compiler must never do is answer *I
  * could not find the library you meant* by quietly using a different one — and a rebuild uses **this**

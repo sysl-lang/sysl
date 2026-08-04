@@ -344,6 +344,35 @@ class LibraryCliTests extends LibraryCliSupport {
         Config().stdSearch shouldBe LibraryArtifact.stdDefault
         LibraryArtifact.stdDefault should endWith(LibraryArtifact.extension)
       }
+
+      /* Where that default *is* moved out of the project and into the user's cache when the compiler
+       * became something installed rather than something cloned. The value belongs to the machine —
+       * a home directory, and a platform convention for where caches go — so what is asserted here is
+       * its shape and the one property a caller depends on, never a path from this author's laptop. */
+
+      "and it is keyed by the library, so a compiler carrying another one cannot collide with it" in {
+        // The claim that makes an upgrade need no cache invalidation: the key is a fingerprint of the
+        // library's contents, so a changed `lib/sysl` *is* a different path rather than a stale hit
+        // at the same one. Version-keying would have relied on remembering to bump the version.
+        assume(cacheDirectory.isDefined, "this machine has no cache directory")
+
+        LibraryArtifact.stdDefault should include(Std.fingerprint)
+      }
+
+      "and it sits under the cache directory rather than in the project" in {
+        assume(cacheDirectory.isDefined, "this machine has no cache directory")
+
+        LibraryArtifact.stdDefault should startWith(s"${cacheDirectory.get}/sysl/")
+        // The specific regression: a compilation must not write into whatever directory it was run
+        // in. `sysl run notes.sysl` in a downloads folder used to leave a `.sysl/` there.
+        LibraryArtifact.stdDefault should not startWith LibraryArtifact.stdLocal
+      }
+
+      "while a machine with no cache directory still has the project-local answer" in {
+        // Not a hypothetical: a build container runs as a user with no home. The compilation then
+        // behaves exactly as it did before this moved, rather than failing over somewhere unwritable.
+        LibraryArtifact.stdLocal shouldBe s".sysl/std${LibraryArtifact.extension}"
+      }
     }
   }
 

@@ -17,8 +17,11 @@ print("area =", width * height)
 Run it:
 
 ```bash
-sbt "syslJVM/run run hello.sysl"
+sysl run hello.sysl
 ```
+
+(From a source checkout instead of an installed binary, that is
+`sbt "syslJVM/run run hello.sysl"`.)
 
 ```output
 Hello, sysl!

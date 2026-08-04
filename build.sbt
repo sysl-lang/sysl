@@ -151,7 +151,7 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       "io.github.edadma"         %%% "indentation"              % "0.0.5",
       // Cross-platform I/O boundary (see docs/design/cross-platform.md).
       "io.github.edadma"         %%% "path"                     % "0.0.7",
-      "io.github.edadma"         %%% "cross_platform"           % "0.1.8",
+      "io.github.edadma"         %%% "cross_platform"           % "0.1.9",
       // The project config's format (see docs/design/packages.md §1).
       "io.github.edadma"         %%% "hocon"                    % "0.1.1",
 //      "com.lihaoyi" %%% "pprint" % "0.9.6" % "test",
