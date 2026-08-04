@@ -388,6 +388,8 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
     }
 
     "a label is renamed per expansion, so two blocks do not define one symbol twice" in {
+      // Two *emitted blocks*, which is what collides — calling one function twice emits its block
+      // once and would prove nothing. Each site has to end up with a label of its own.
       val src =
         s"""spin()
            |    asm
@@ -396,21 +398,65 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
            |            "jmp spot"
            |${others("x86_64")}
            |
+           |wait()
+           |    asm
+           |        [x86_64]
+           |            "spot: nop"
+           |            "jmp spot"
+           |${others("x86_64")}
+           |
            |spin()
-           |spin()
+           |wait()
            |""".stripMargin
 
       val out = irFor(intel, src)
 
       // The definition and its reference move together, and the two sites do not collide.
       out should include("""spot.1: nop\0Ajmp spot.1""")
+      out should include("""spot.2: nop\0Ajmp spot.2""")
       out should not include "\"spot: nop"
+    }
+
+    "an operand named twice in one template is one operand, at one number" in {
+      val src =
+        s"""f(n: int)
+           |    asm
+           |        [x86_64]
+           |            "add {n}, {n}"
+           |            in n : reg
+           |${others("x86_64")}
+           |
+           |f(2)
+           |""".stripMargin
+
+      val out = irFor(intel, src)
+
+      out should include("""asm sideeffect "add $0, $0", "r,~{memory},~{cc}"""")
+      // One load, not two: the operand is passed once however often it is named.
+      out.split("load i32, ptr %n.addr").length shouldBe 2
     }
   }
 
   "where assembly may not go" - {
 
-    "not in a contract, which is a claim the compiler has to be able to read" in {
+    "a contract condition cannot hold assembly, because a condition is an expression" in {
+      // Not a check the analyzer makes — `asm` is a statement and `require` takes an expression, so
+      // there is no way to write one inside the other. Pinned because the chapter says a contract
+      // never contains assembly, and this is *why* it never does.
+      val src =
+        s"""f(n: int) -> int
+           |    require asm
+           |        [x86_64] "nop"
+           |${others("x86_64")}
+           |    n
+           |
+           |print(f(1))
+           |""".stripMargin
+
+      errFor(intel, src) should not be empty
+    }
+
+    "assembly beside a contract is ordinary, and compiles" in {
       val src =
         s"""f(n: int) -> int
            |    require n > 0
@@ -422,8 +468,6 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
            |print(f(1))
            |""".stripMargin
 
-      // The contract itself is fine — what is checked here is that assembly beside one is not an
-      // accident of ordering. It compiles, and the refusal below is about a contract *condition*.
       irFor(intel, src) should include("asm sideeffect")
     }
 
@@ -444,6 +488,36 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
 
       out should include("""asm sideeffect "cli\0A1: hlt\0Ajmp 1b"""")
       out should include("unreachable")
+    }
+
+    "and the promise is real, so a body that plainly returns is still refused" in {
+      // The other half of taking assembly at its word: `-> never` is checked where the compiler can
+      // see the body, and it is only assembly it cannot see into.
+      val src =
+        """stop() -> never
+          |    1
+          |
+          |stop()
+          |""".stripMargin
+
+      errFor(intel, src) should not be empty
+    }
+
+    "a name bound by 'ref' is not an operand, since it has no slot of its own" in {
+      val src =
+        s"""f()
+           |    var n: int = 1
+           |    ref r = n
+           |    asm
+           |        [x86_64]
+           |            "nop {r}"
+           |            in r : reg
+           |${others("x86_64")}
+           |
+           |f()
+           |""".stripMargin
+
+      errFor(intel, src) should include("'r'")
     }
   }
 

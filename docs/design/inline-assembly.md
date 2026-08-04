@@ -148,6 +148,13 @@ whatever the variable's is.
 that somewhere is a variable — so writing one first says the same thing without the construct
 growing a place to put temporaries.
 
+**A name bound by `ref` is not one of them.** A ref names storage somewhere else rather than a
+variable of its own (`03 § ref`), so there is no slot for an input to be loaded from or an output
+stored to. Copying it into a `var` first, and writing that back afterwards, is what the operand
+would have had to mean anyway — and saying so is better than emitting an operand against an address
+that was never allocated, which is a module the assembler rejects for reasons the source does not
+explain.
+
 **An operand's type must fit a general-purpose register**, which is the integers, the pointers, and
 `bool`. A float operand needs a floating class, which does not exist yet; the diagnostic says so in
 those terms, because it is a thing to be added rather than a thing to be refused. It is also a
@@ -224,9 +231,11 @@ the same function.
 
 ## 7. Where assembly may not go
 
-**Not in a `require` or `ensure` condition.** A contract is a claim the compiler reasons about, and
-an assembly block is exactly the thing it cannot reason about. This is the same refusal a contract
-makes of anything else it cannot see through.
+**Not in a `require` or `ensure` condition** — and there is no check that says so, because there is
+no way to write it. A contract's condition is an *expression* and assembly is a *statement*, so the
+grammar has already answered. This is worth stating rather than leaving to be discovered: a contract
+is a claim the compiler reasons about and an assembly block is precisely what it cannot reason
+about, so the two never meeting is a property to rely on rather than a coincidence.
 
 **Nothing about a block's contents is understood, including whether control comes back.** The
 compiler does not read the instructions, so it cannot know that `jmp` to a reset vector never
