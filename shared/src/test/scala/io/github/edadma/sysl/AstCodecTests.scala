@@ -126,6 +126,22 @@ class AstCodecTests extends AnyFreeSpec with Matchers {
     // `defer` in it is how this reaches an artifact, and a codec that dropped the payload would
     // decode to a body that releases nothing and says so nowhere.
     check("a defer carrying a statement", "f()\n    defer print(\"out\")\n    print(\"in\")")
+    // Assembly is the one statement whose payload is neither a statement nor an expression — three
+    // lists of strings, an operand list, and two arm shapes told apart by a tag. An artifact
+    // carrying an inline function with an arch layer in it is how this arrives at a library, and
+    // every part of an arm has to come back or the arm answers for the wrong processor.
+    check(
+      "assembly with every arm shape",
+      "f(n: int)\n" +
+        "    asm\n" +
+        "        [x86_64]\n" +
+        "            \"nop {n}\"\n" +
+        "            in n : reg\n" +
+        "            out n : \"rax\"\n" +
+        "            clobbers \"rdx\"\n" +
+        "        [aarch64]\n" +
+        "        [riscv64] unavailable \"nothing to say here\"\n",
+    )
     check("a variadic extern under a link name", "extern \"snprintf\" fmt(f: *u8, ...) -> int")
     // The two `extern` forms together, since the tag is what tells them apart and a codec that wrote
     // one where the other belonged would still round-trip every field either of them has.

@@ -631,6 +631,56 @@ case class Continue(label: Option[String]) extends Stmt
  */
 case class Defer(stmt: Stmt) extends Stmt
 
+/** `asm` — machine instructions, in an arm per architecture (`inline-assembly.md`).
+ *
+ * Exactly one arm is selected, and every architecture the compiler can build for has to appear in
+ * one, so a processor with no answer is reported while building for a different one. What an arm
+ * holds is deliberately not a statement list: the instructions are text sysl does not read, and the
+ * operands beside them are the whole of what it does.
+ */
+case class AsmStmt(arms: List[AsmArm]) extends Stmt
+
+/** One architecture arm. `archs` names the processors it answers for, spelled as `#if` spells them. */
+case class AsmArm(archs: List[String], body: AsmBody) extends Positioned
+
+sealed trait AsmBody
+
+/** Instructions, the operands they name, and what they destroy besides. All three lists may be
+ * empty, and an arm written with nothing under it is exactly that — an architecture on which the
+ * operation costs no instruction, which is a different claim from having no answer.
+ */
+case class AsmCode(lines: List[String], operands: List[AsmOperand], clobbers: List[String]) extends AsmBody
+
+/** `unavailable "reason"` — there is no answer on these processors, and the reason is what a call
+ * from one of them is told.
+ */
+case class AsmUnavailable(reason: String) extends AsmBody
+
+/** Which way a value crosses the instruction boundary. Reading and writing one variable is not
+ * spelled with both of these — it is a single operand the language does not have yet, and the pair
+ * would compile to two registers rather than one.
+ */
+enum AsmDir {
+  case In, Out
+}
+
+/** One operand: a variable already in scope, a direction, and where it has to live. `reg` is the
+ * machine register named for it, or `None` for the `reg` class — any general-purpose register the
+ * allocator likes.
+ */
+case class AsmOperand(dir: AsmDir, name: String, reg: Option[String]) extends Positioned
+
+/** One line inside an arm, before the lines are sorted into the three lists `AsmCode` holds. It
+ * exists only between the parser reading a block and building the arm from it: the instructions
+ * keep their order and nothing else in the block has one, so a single pass over a mixed list is
+ * simpler than a grammar that insists on which kind comes first.
+ */
+enum AsmItem {
+  case Line(text: String)
+  case Operand(operand: AsmOperand)
+  case Clobber(regs: List[String])
+}
+
 /** A design-by-contract clause at the top of a function body. `require` is a precondition,
  * checked once on entry; `ensure` is a postcondition, checked before every return. The optional
  * `msg` accompanies the runtime trap. Inside an `ensure` condition the identifier `result`

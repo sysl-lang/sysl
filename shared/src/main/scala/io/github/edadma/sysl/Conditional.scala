@@ -170,11 +170,7 @@ object Conditional {
     case Os.Windows      => "windows"
     case Os.Freestanding => "freestanding"
 
-  private def cpuSymbol(cpu: Cpu): String = cpu match
-    case Cpu.Aarch64 => "aarch64"
-    case Cpu.X86_64  => "x86_64"
-    case Cpu.Riscv64 => "riscv64"
-    case Cpu.X86     => "x86"
+  private def cpuSymbol(cpu: Cpu): String = cpu.symbol
 
   /** True on every target that has an operating system under it, which is what code gating on a
    * platform is usually really asking: whether there is a libc there to call at all.

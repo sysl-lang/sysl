@@ -540,6 +540,67 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     case TDefer(stmts) =>
       deferStmts(stmts)
 
+    // `asm` (`inline-assembly.md`). One architecture's instructions arrived here; the arms that
+    // answered for the others were chosen between in the analyzer and are not represented.
+    case TAsm(lines, operands, clobbers) =>
+      if lines.nonEmpty then genAsm(lines, operands, clobbers)
+
+  /** Lowers the selected arm to LLVM's inline assembly.
+   *
+   * Every input is loaded before the call and every output stored after it, which is what makes an
+   * operand a *value* rather than a register the programmer had to find: LLVM is told what has to be
+   * where, and satisfying it is the allocator's problem. The template and the constraint string are
+   * built together from one list, because an operand's position in the second is the number its name
+   * becomes in the first, and the two disagreeing is exactly the failure this construct removes.
+   */
+  private def genAsm(lines: List[String], operands: List[TAsmOperand], clobbers: List[String]): Unit = {
+    val ins  = operands.filter(_.dir == AsmDir.In)
+    val outs = operands.filter(_.dir == AsmDir.Out)
+    val slot = Asm.numbering(operands)
+
+    val loaded = ins.map { o =>
+      val r = freshTemp()
+
+      emit(s"$r = load ${o.ty.llvm}, ptr %${o.slot}.addr")
+      s"${o.ty.llvm} $r"
+    }
+
+    asmSite += 1
+
+    val text = Asm.uniquifyLabels(lines, asmSite).map(Asm.render(_, slot.get)).mkString("\\0A")
+    val cons = Asm.constraints(operands, clobbers)
+    val args = loaded.mkString(", ")
+
+    // `sideeffect` says the block matters even where nothing reads its result, which is true of every
+    // assembly sysl can express: the instructions worth reaching for here are the ones whose whole
+    // purpose is what they do to the machine rather than what they hand back.
+    outs match
+      case Nil =>
+        emit(s"""call void asm sideeffect "$text", "$cons"($args)""")
+
+      case List(o) =>
+        val r = freshTemp()
+
+        emit(s"""$r = call ${o.ty.llvm} asm sideeffect "$text", "$cons"($args)""")
+        emit(s"store ${o.ty.llvm} $r, ptr %${o.slot}.addr")
+
+      // Several outputs come back as one anonymous structure, which is LLVM's shape rather than
+      // anything the language says — so it is taken apart here and never seen above this line.
+      case many =>
+        val r     = freshTemp()
+        val shape = many.map(_.ty.llvm).mkString("{ ", ", ", " }")
+
+        emit(s"""$r = call $shape asm sideeffect "$text", "$cons"($args)""")
+
+        for (o, i) <- many.zipWithIndex do
+          val part = freshTemp()
+
+          emit(s"$part = extractvalue $shape $r, $i")
+          emit(s"store ${o.ty.llvm} $part, ptr %${o.slot}.addr")
+  }
+
+  /** Counts the assembly blocks emitted in this module, so each one's labels can be its own. */
+  private var asmSite = 0
 }
 
 object Codegen {

@@ -636,6 +636,25 @@ case class TContinue(depth: Int)                    extends TStmt
  */
 case class TDefer(stmts: List[TStmt]) extends TStmt
 
+/** The one assembly arm that answered for the processor being built for (`inline-assembly.md`).
+ *
+ * The other arms are gone by the time this exists — an architecture is chosen once, in the
+ * analyzer, so nothing downstream carries a branch that was never going to be taken. The
+ * instructions are text nothing here reads; the operands are the whole of what the compiler knows
+ * about the block, and they are what the constraint string is built from.
+ */
+case class TAsm(lines: List[String], operands: List[TAsmOperand], clobbers: List[String]) extends TStmt
+
+/** An operand bound to the local it names.
+ *
+ * `name` is what the template says, and `slot` is the local's unique name — the storage an `in` is
+ * loaded from and an `out` is stored to. Both are kept because they are two different jobs: the
+ * template is the text a person wrote, and the slot is where the value lives after a scope has
+ * renamed it. `reg` is the machine register the operand must occupy, or `None` for any
+ * general-purpose one.
+ */
+case class TAsmOperand(dir: AsmDir, name: String, slot: String, ty: Type, reg: Option[String])
+
 /** A user function. Parameters carry their unique names (the codegen allocates a slot for
  * each so the body can read and mutate them uniformly). `requires`/`ensures` are the
  * design-by-contract clauses: each precondition is checked on entry, each postcondition before
