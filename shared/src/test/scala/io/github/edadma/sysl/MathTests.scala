@@ -229,6 +229,48 @@ class MathTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |print((t.cosh().square() - t.sinh().square() - 1.0).abs() < 1.0e-12)""".stripMargin
       ) shouldBe "true\n"
     }
+
+    "each inverse undoes its own function" in {
+      run(
+        """var t: real = 1.3
+          |print((t.sinh().asinh() - t).abs() < 1.0e-12,
+          |      (t.cosh().acosh() - t).abs() < 1.0e-12,
+          |      (t.tanh().atanh() - t).abs() < 1.0e-12)""".stripMargin
+      ) shouldBe "true true true\n"
+    }
+
+    // The closed forms, which are what a complex `asinh` would otherwise have to be written from --
+    // and the check that the bindings are the entry points they claim rather than each other.
+    "each inverse agrees with the logarithm it is" in {
+      run(
+        """var x: real = 2.5
+          |var h: real = 0.4
+          |print(((x + (x.square() + 1.0).sqrt()).ln() - x.asinh()).abs() < 1.0e-12,
+          |      ((x + (x.square() - 1.0).sqrt()).ln() - x.acosh()).abs() < 1.0e-12,
+          |      (0.5 * ((1.0 + h) / (1.0 - h)).ln() - h.atanh()).abs() < 1.0e-12)""".stripMargin
+      ) shouldBe "true true true\n"
+    }
+
+    // `asinh` is odd and total; the other two are not, and where they have no answer libm hands back
+    // a NaN rather than trapping -- so a program that can reach outside a domain is told nothing
+    // unless it asks. The boundaries themselves *do* have answers, and both are zero.
+    "the two with domains answer NaN outside them, and zero at the boundary" in {
+      run(
+        """print((-2.5).asinh() + (2.5).asinh(),
+          |      (0.5).acosh().is_nan(), (1.0).acosh(),
+          |      (1.0).atanh().is_infinite(), (1.5).atanh().is_nan(), (0.0).atanh())""".stripMargin
+      ) shouldBe "0 true 0 true true 0\n"
+    }
+
+    "and every one of them is bound at f32 too" in {
+      run(
+        """var t: f32 = 1.3f32
+          |print((t.sinh().asinh() - t).abs() < 1.0e-5f32,
+          |      (t.cosh().acosh() - t).abs() < 1.0e-5f32,
+          |      (t.tanh().atanh() - t).abs() < 1.0e-5f32,
+          |      (0.5f32).acosh().is_nan())""".stripMargin
+      ) shouldBe "true true true true\n"
+    }
   }
 
   "rounding to an integral value" - {

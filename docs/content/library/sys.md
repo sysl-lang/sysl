@@ -146,7 +146,7 @@ this file already names, one indirection later.
 | `sqrt`, `fabs`, `copysign` | `cbrt`, `exp`, `exp2`, `log`, `log2`, `log10` |
 | `floor`, `ceil`, `round`, `trunc` | `pow`, `hypot`, `fmod` |
 | | `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2` |
-| | `sinh`, `cosh`, `tanh` |
+| | `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` |
 
 **What that buys beyond speed is a program that needs no libc.** A freestanding target has no libm
 to link against, so the whole module used to be hosted-only. The operations in the left column now

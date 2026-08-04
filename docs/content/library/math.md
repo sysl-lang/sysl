@@ -93,6 +93,9 @@ trait Float: Eq + Ord + Neg + Add + Sub + Mul + Div
     sinh(self) -> Self
     cosh(self) -> Self
     tanh(self) -> Self
+    asinh(self) -> Self
+    acosh(self) -> Self
+    atanh(self) -> Self
     floor(self) -> Self
     ceil(self) -> Self
     round(self) -> Self
@@ -126,7 +129,7 @@ sites.
 whose result C computes — a range-reduced sine, a correctly rounded root — is required, and each width
 binds it to its own libm entry point. A method that is *arithmetic over the others* is a default,
 written once and inherited by both. So `log` in an arbitrary base exists in exactly one place, and
-adding a third floating-point width would be 31 bindings and no new mathematics.
+adding a third floating-point width would be 38 bindings and no new mathematics.
 
 ```sysl
 import sysl.math.{Float, tau, e}
@@ -222,6 +225,39 @@ notices.
 comparisons, so it does not see a negative zero, and a NaN satisfies neither comparison and leaves by
 the same arm holding itself. `abs` and `copysign` are the other two readings of a sign, and those
 *do* see a negative zero, because they work on the bit.
+
+### Hyperbolics, and where they have no answer
+
+```sysl
+import sysl.math.Float
+
+var one = 1.0
+var two = 2.0
+var half = 0.5
+var below = 0.5
+var outside = 2.0
+var neg = -3.0
+
+print(one.sinh(), one.cosh(), one.tanh())
+print(one.sinh().asinh(), two.cosh().acosh(), half.tanh().atanh())
+print(neg.asinh(), below.acosh().is_nan(), outside.atanh().is_nan())
+```
+
+```output
+1.1752 1.54308 0.761594
+1 2 0.5
+-1.81845 true true
+```
+
+**The three inverses are the ones with domains.** `acosh` wants an argument of at least one, `atanh`
+one strictly between −1 and 1, and `asinh` is defined everywhere — which is why the third line asks
+two of them for an answer they do not have.
+
+**Outside a domain the answer is a NaN, not a trap.** That is the same thing `asin` and `acos` do
+outside theirs: a float has a value meaning *no answer*, and the library hands it back rather than
+stopping the program. It is quiet, so a program that can reach outside a domain should say what it
+does about it — `is_nan` is the test, and a NaN that flows on will keep failing every comparison it
+meets.
 
 ### The type's own values
 
