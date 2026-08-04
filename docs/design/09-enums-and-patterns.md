@@ -285,7 +285,7 @@ variant was the one form with nowhere to put a qualifier, since it is spelled li
 literals; but `Some(x) | none-arm` binding `x` is rejected, because the body cannot know which
 alternative matched and therefore cannot know a binding's origin. This is stricter than Rust
 (which permits `A(x) | B(x)` when every alternative binds the same names at the same types) and
-is worth revisiting once there is a motivating case (§ Open d); for now the rule is simple and
+is worth revisiting once there is a motivating case (§ Open c); for now the rule is simple and
 unambiguous: an arm with `|` binds nothing.
 
 **Literal patterns match any type with equality; range patterns need a contiguous order.** The
@@ -551,8 +551,13 @@ Recorded so they are not lost; each needs a decision before the relevant feature
 - **c. Bindings in `|`-alternatives.** Currently forbidden. Reconsider allowing `A(x) | B(x)`
   when every alternative binds the same names at the same types (the Rust rule), if a real case
   motivates it.
-- **d. `@` bindings.** Binding the whole value while also destructuring it (`p @ Circle(r)`) is
-  not implemented; decide whether it earns its place.
+- ~~**d. `@` bindings.**~~ **Closed: built**, and §6 has the rule. It earned its place on the case
+  the question could not see from here — an arm that destructures has the parts and not the value,
+  so handing the value on meant testing its shape a second time inside the body. What settled the
+  *spelling* was elsewhere: annotations moved to `@` (`attributes.md`), and the two forms turn out
+  not to compete, an annotation's being a prefix above a declaration and this one infix inside a
+  pattern. Building it also found an older bug — a name bound twice in one pattern silently bound
+  the second — which §6 now refuses.
 - **e. Unreachable-arm and redundant-pattern lints.** An arm made unreachable by an earlier
   catch-all, or a literal already covered by an earlier arm, is currently accepted silently; a
   lint would catch dead arms.

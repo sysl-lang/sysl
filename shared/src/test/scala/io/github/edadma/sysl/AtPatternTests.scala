@@ -110,6 +110,90 @@ class AtPatternTests extends AnyFreeSpec with CodegenSupport with RunSupport {
     }
   }
 
+  /** Claims `09 §6` and the reference page make about the form, each run rather than asserted.
+   *
+   * They are the sentences that would be quietly false if the wrapper were not transparent — the
+   * ones saying a binding changes nothing about what a pattern *tests for*.
+   */
+  "what the chapter claims about it" - {
+    // "a named arm covers what its sub-pattern covers, so exhaustiveness sees straight through it".
+    // The witness a diagnostic names has to be the same one, not merely present.
+    "the witness an inexhaustive match reports is unchanged by naming an arm" in {
+      val bare = err(
+        shape +
+          """name(s: Shape) -> string
+            |    s match
+            |        Circle(_) -> "c"
+            |print(name(Circle(1)))""".stripMargin)
+
+      val named = err(
+        shape +
+          """name(s: Shape) -> string
+            |    s match
+            |        c @ Circle(_) -> "c"
+            |print(name(Circle(1)))""".stripMargin)
+
+      named shouldBe bare
+    }
+
+    // "no `else` becomes unreachable" — the other direction, where naming every arm must not make
+    // the match look incomplete.
+    "a fully named match needs no else, exactly as the unnamed one does not" in {
+      run(
+        shape +
+          """name(s: Shape) -> string
+            |    s match
+            |        c @ Circle(_) -> "c"
+            |        r @ Rect(_, _) -> "r"
+            |print(name(Rect(1, 2)))""".stripMargin) shouldBe "r\n"
+    }
+
+    /** "the arm test is the inner test alone" — asserted where a wrong answer is *visible*: a named
+     * arm that should not match must fall through to the next one. A wrapper treated as always-true
+     * would take this arm and print `c`.
+     */
+    "a named arm that does not match falls through" in {
+      run(
+        shape +
+          """name(s: Shape) -> string
+            |    s match
+            |        c @ Circle(_) -> "c"
+            |        r @ Rect(_, _) -> "r"
+            |print(name(Rect(1, 2)), name(Circle(1)))""".stripMargin) shouldBe "r c\n"
+    }
+
+    // …and the same for a *literal* inner pattern, where the test is a comparison rather than a tag.
+    "and so does a named literal arm" in {
+      run(
+        """which(n: int) -> string
+          |    n match
+          |        z @ 0 -> "zero"
+          |        o @ 1 -> "one"
+          |        other -> "many"
+          |print(which(1), which(0), which(7))""".stripMargin) shouldBe "one zero many\n"
+    }
+
+    /** A `&T` bound by the outer name and by an inner one is two shares of one object, which the
+     * emitter's comment claims and nothing else here would catch. The count has to survive the arm:
+     * if either binding released without having retained, this reads freed memory.
+     */
+    "a reference named at two depths keeps its count" in {
+      run(
+        """struct Node
+          |    v: int
+          |enum Holder
+          |    One(n: &Node)
+          |
+          |var h: Holder = One(Node(7))
+          |
+          |h match
+          |    whole @ One(inner) -> print(inner.v)
+          |
+          |h match
+          |    One(again) -> print(again.v)""".stripMargin) shouldBe "7\n7\n"
+    }
+  }
+
   "where else a pattern is read" - {
     /** `is` takes a pattern, so it takes this one — and the binding reaches the branch the test
      * guards, which is what makes the form worth having there rather than only in a `match`.
