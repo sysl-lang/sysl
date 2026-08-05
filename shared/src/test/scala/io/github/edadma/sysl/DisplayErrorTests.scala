@@ -98,13 +98,18 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
 
   "an impl" - {
     // An integer's `Display` is the library's blanket block over `Integer`, so a second one for
-    // `int` is refused — but by **coherence** rather than by the compiler-provides-it guard it used
-    // to hit. The rule that catches it is the deeper one and always was: the trait is the library's
-    // and so is `int`, so a block written anywhere else has no home.
+    // `int` is refused as a **second implementation** rather than by the compiler-provides-it guard
+    // it used to hit. Coherence would refuse it too — the trait is the library's and so is `int` —
+    // but "it already has one, here is the block" is the more useful of the two true answers.
     "may not compete with the library's own rendering" in {
-      err("""impl Display for int
-            |    display(self, out: *Writer, fmt: FormatSpec) = display_str("no", out, fmt)
-            |print(1)""".stripMargin) should include("so this one has no home")
+      val e = err("""impl Display for int
+                    |    display(self, out: *Writer, fmt: FormatSpec) = display_str("no", out, fmt)
+                    |print(1)""".stripMargin)
+
+      e should include("'int' already implements 'sysl.Display'")
+      e should include("every 'sysl.Integer' does")
+      // The subtype clause belongs to the two cases below, and `int` is neither.
+      e should not include "subtype"
     }
 
     // And a program's own type is not a way in either: the family is the compiler's answer, so
@@ -114,6 +119,36 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
             |    n: int
             |impl Integer for P
             |print(1)""".stripMargin) should include("names a family of types the compiler settles")
+    }
+
+    // **The one type that can reach a blanket and still have a home of its own.** A derived subtype
+    // is the program's, so coherence lets an `impl` be written here; `16 §3` gives it the base's
+    // memberships, so the library's blanket covers it as well. Two blocks would then cover one type
+    // and the answer would be whichever key the lookup happened to try first.
+    //
+    // The collision list is keyed by the type, and a blanket is filed under its bound — so this is
+    // asked separately or not at all, which is how it went unnoticed until a subtype test caught it.
+    "may not be written for a derived subtype the blanket already covers" in {
+      val e = err("""type Stamp = new int
+                    |impl Display for Stamp
+                    |    display(self, out: *Writer, fmt: FormatSpec) = display_str("x", out, fmt)
+                    |print(1)""".stripMargin)
+
+      e should include("already implements 'sysl.Display'")
+      e should include("every 'sysl.Integer' does")
+      e should include("a subtype has its base's memberships")
+    }
+
+    // A transparent subtype reaches the same refusal, and the message is the same one: `16 §1` makes
+    // it its base and `16 §3` gives a derived one the base's catalogue, so the blanket covers both.
+    "nor for a transparent one, which is its base" in {
+      val e = err("""type Count = int within 0..100
+                    |impl Display for Count
+                    |    display(self, out: *Writer, fmt: FormatSpec) = display_str("x", out, fmt)
+                    |print(1)""".stripMargin)
+
+      e should include("already implements 'sysl.Display'")
+      e should include("a subtype has its base's memberships")
     }
 
     "must match the trait's signature" in {

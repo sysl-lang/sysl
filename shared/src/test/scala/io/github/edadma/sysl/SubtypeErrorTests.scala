@@ -166,7 +166,10 @@ class SubtypeErrorTests extends AnyFreeSpec with CodegenSupport {
     "and so does any other row of the catalog" in {
       err(Stamp + "impl Display for Stamp\n    display(self, out: *Writer, fmt: FormatSpec)\n" +
         "        display_str(\"x\", out, fmt)\nprint(1)") should
-        include("'Stamp' already implements 'sysl.Display' — the compiler provides it")
+        // `Display` is no longer a membership the compiler hands out, so the refusal is the
+        // library's blanket block rather than a rule — but a derived subtype still cannot replace
+        // what its base has, which is the claim this block is about.
+        include("'Stamp' already implements 'sysl.Display' — every 'sysl.Integer' does")
     }
 
     "even where the base's meaning does not survive the derivation" in {

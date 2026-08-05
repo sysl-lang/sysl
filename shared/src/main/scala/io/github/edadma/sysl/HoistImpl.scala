@@ -85,6 +85,30 @@ trait HoistImpl extends ImplConformance {
     for other <- already.find(ti => suppliedBound(ti, impl.traitName, subject, mine).key == bound.key) do
       err(s"'${outer.label}' already implements '${showBound(bound, subject)}'" + secondImplementation(tr, other))
 
+    // **A blanket block covering the subject is an implementation the subject already has**, and the
+    // list above cannot see it: a blanket is filed under its bound's key rather than under any type's,
+    // which is what lets one block stand for a whole family.
+    //
+    // The case is a derived subtype of a built-in — `type Stamp = new int` is the program's own type,
+    // so coherence gives an `impl` here a home, and `16 §3` gives it its base's memberships, so the
+    // library's blanket covers it too. Two blocks would then cover one type with nothing to pick
+    // between them, and the one that answered would be whichever key the lookup tried first.
+    for
+      (key, targs) <- blanketOwners(ty)
+      _            <- implAt(bound, key, ty, targs)
+    do
+      // The subtype half is said only where there is one, and it says "subtype" rather than
+      // "derived" because both kinds reach here: a transparent one *is* its base (`16 §1`) and a
+      // derived one has the base's catalogue (`16 §3`), so either way the block covering it was
+      // written for a type the reader did not name. On a built-in written out in full there is no
+      // such type, and the clause would be a sentence about something that is not there.
+      val inherited =
+        if Type.underlying(ty) == ty then ""
+        else ", and a subtype has its base's memberships"
+
+      err(s"'${outer.label}' already implements '${showBound(bound, subject)}' — " +
+        s"${everyShape(key)} does, through one block written over the family$inherited")
+
     // **A result is not a selector.** An operator trait's last argument is what the operator gives
     // back (`14 §7`), and `a * b` supplies the operands and nothing else — so two implementations that
     // agree on the operands and differ only in the result leave a use with nothing to choose by.
