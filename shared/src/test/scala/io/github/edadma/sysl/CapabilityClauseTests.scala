@@ -187,6 +187,18 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
       errOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nf(n: int) -> string = s\"n=$n\"\n",
         "main.sysl" -> "print(thing.f(1))") should include("needs an allocator")
     }
+
+    // The one place `Display`'s allocation-free promise does not reach, pinned so that it is a known
+    // edge rather than a surprise. Up to 128 bits the digits are worked out against a frame-local
+    // buffer; past it, covering every width would need a buffer whose size follows the receiver, and
+    // a fixed array's length cannot be written in terms of a type parameter. So the widest values
+    // still render through `str`, and a module without an allocator cannot print one.
+    "an integer past 128 bits, which still renders through a string" in {
+      errOf("thing/a.sysl" ->
+        "module thing\n@no_alloc\n\nf(v: u256, out: *Writer) = v.display(out, FormatSpec(0, -1, false))\n",
+        "main.sysl" -> "print(1)") should
+        include("the string a value renders as needs an allocator")
+    }
   }
 
   "'no alloc' leaves the whole no-alloc subset alone" - {
@@ -281,6 +293,26 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
         "thing/a.sysl" -> "module thing\n@no_alloc\n\nfirst(xs: []int) -> int = xs[0]\n",
         "main.sysl" -> "var xs: []int = [7, 8, 9]\nprint(thing.first(xs))",
       ) shouldBe "7\n"
+    }
+
+    // `Display` promises rendering costs no allocation so that a module without an allocator can
+    // still log, and that promise used to stop at 64 bits: anything wider reached its renderer as
+    // the digits `str` writes, which is a heap string, so a value this module could hold was one it
+    // could not print. The renderers work the digits out against a frame-local buffer instead, and
+    // the slice is safe to hand over because a `Writer` borrows what it is given rather than keeping
+    // it.
+    "rendering an integer wider than 64 bits into a sink" in {
+      irOf(
+        "thing/a.sysl" ->
+          """module thing
+            |@no_alloc
+            |
+            |unsigned(v: u128, out: *Writer) = v.display(out, FormatSpec(0, -1, false))
+            |
+            |signed(v: i128, out: *Writer) = v.display(out, FormatSpec(0, -1, false))
+            |""".stripMargin,
+        "main.sysl" -> "print(1)",
+      ) should include("define")
     }
   }
 

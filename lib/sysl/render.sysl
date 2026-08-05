@@ -86,6 +86,58 @@ display_uint(n: ulong, out: *Writer, fmt: FormatSpec)
     display_digits(buf[0..<usize(k)], out, fmt)
 end display_uint
 
+// The two renderers above stop at 64 bits, because they reach `snprintf` and C has no conversion
+// wider than `%lld`. These carry the same job past it with the digits worked out here instead: a
+// frame-local buffer filled from the least significant end, handed to `display_digits` as a slice.
+//
+// **Doing it this way is what keeps rendering allocation-free**, which is the promise `Display`
+// makes and the reason a `no alloc` module can log at all. Going through a `string` would put the
+// digits on the heap, and a module that declared it makes no storage could then not print a number.
+// The slice is safe to hand over because a `Writer` borrows the bytes it is given rather than
+// keeping them (`02`), which is what lets escape analysis pass a stack-backed slice out of here.
+//
+// 39 digits is the widest an unsigned 128-bit value reaches, and the signed buffer carries one more
+// byte for the sign, which `display_digits` reads back off the front.
+//
+// **Above 128 bits the string path below still runs**, and a value that wide therefore cannot be
+// rendered from a module that declares `@no_alloc`. Covering every width needs a renderer generic
+// in its receiver, which the lowering cannot yet name.
+display_u128(n: u128, out: *Writer, fmt: FormatSpec)
+    var buf: [40]u8
+    var i = 40usize
+    var v = n
+    if v == u128(0) then
+        i -= 1usize
+        buf[i] = 48u8
+    else
+        while v > u128(0)
+            i -= 1usize
+            buf[i] = 48u8 + u8(v % u128(10))
+            v = v / u128(10)
+    display_digits(buf[i..<40usize], out, fmt)
+end display_u128
+
+display_i128(n: i128, out: *Writer, fmt: FormatSpec)
+    var buf: [41]u8
+    var i = 41usize
+    var neg = n < i128(0)
+    // The magnitude is taken in the unsigned domain so that the most negative value survives it:
+    // negating that one in its own type is the one case two's complement has no room for.
+    var v = if neg then u128(0) - u128(n) else u128(n)
+    if v == u128(0) then
+        i -= 1usize
+        buf[i] = 48u8
+    else
+        while v > u128(0)
+            i -= 1usize
+            buf[i] = 48u8 + u8(v % u128(10))
+            v = v / u128(10)
+    if neg then
+        i -= 1usize
+        buf[i] = 45u8
+    display_digits(buf[i..<41usize], out, fmt)
+end display_i128
+
 display_wide(s: string, out: *Writer, fmt: FormatSpec) = display_digits(s.bytes, out, fmt)
 
 display_real(x: real, out: *Writer, fmt: FormatSpec)

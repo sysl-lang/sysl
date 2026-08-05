@@ -23,6 +23,21 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
    * on their own, so a call that reached the wrong renderer shows up as missing text rather than
    * as a plausible wrong number.
    */
+  /** The two widths past what `snprintf` can take, each behind a struct that forwards to it — since
+   * `print` and `str` on a scalar do not go through `Display` at all, and a test driving those
+   * would pass whatever the wide renderers did.
+   */
+  private val wide =
+    """struct W
+      |    n: u128
+      |impl Display for W
+      |    display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+      |struct S
+      |    n: i128
+      |impl Display for S
+      |    display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+      |""".stripMargin
+
   private val point =
     """struct Point
       |    x: int
@@ -423,6 +438,61 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
             |while i < 3
             |    print(T(i))
             |    i++""".stripMargin) shouldBe "0\n1\n2\n"
+    }
+  }
+
+  /** Integers past 64 bits, which reach renderers of their own.
+   *
+   * `snprintf` is what the 64-bit pair goes through and C has no conversion wider than `%lld`, so
+   * these work the digits out against a frame-local buffer instead — which is also what keeps them
+   * inside `Display`'s allocation-free promise, pinned from the other side in `CapabilityClauseTests`.
+   */
+  "an integer wider than 64 bits" - {
+
+    "renders every unsigned digit, to the full width of the type" in {
+      val expected = "0\n7\n10\n340282366920938463463374607431768211455\n"
+
+      run(wide +
+        """print(W(u128(0)))
+          |print(W(u128(7)))
+          |print(W(u128(10)))
+          |print(W(340282366920938463463374607431768211455))""".stripMargin).shouldBe(expected)
+    }
+
+    // The most negative value is the case a magnitude taken in the value's own type gets wrong:
+    // negating it overflows, so the digits are worked out in the unsigned domain instead.
+    "renders a signed one, including the value that cannot be negated" in {
+      val expected =
+        "0\n42\n-42\n170141183460469231731687303715884105727\n-170141183460469231731687303715884105728\n"
+
+      run(wide +
+        """print(S(i128(0)))
+          |print(S(i128(42)))
+          |print(S(i128(-42)))
+          |print(S(170141183460469231731687303715884105727))
+          |print(S(-170141183460469231731687303715884105728))""".stripMargin).shouldBe(expected)
+    }
+
+    // The padding is `display_digits`', not each renderer's, so a wide value fills a field exactly
+    // as a narrow one does — sign inside the width, and justification either way.
+    "fills a field the same way a narrow one does" in {
+      run(wide +
+        """print(f"[${W(u128(42))}%8s]")
+          |print(f"[${S(i128(-42))}%8s]")
+          |print(f"[${W(u128(42))}%-8s]")
+          |print(f"[${W(u128(0))}%4s]")""".stripMargin).shouldBe("[      42]\n[     -42]\n[42      ]\n[   0]\n")
+    }
+
+    // Wider still keeps the path that renders through the digits `str` writes. Nothing here is a
+    // width to widen to, so a buffer sized from the receiver would be what covered it, and a fixed
+    // array's length cannot be written in terms of one.
+    "beyond 128 bits it still renders, through the digits" in {
+      run("""struct H
+            |    n: u256
+            |impl Display for H
+            |    display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+            |print(H(u256(12345)))
+            |print(f"[${H(u256(7))}%4s]")""".stripMargin) shouldBe "12345\n[   7]\n"
     }
   }
 }
