@@ -26,6 +26,11 @@ object Bodies {
    *
    * It is also what `wrapBody` moves, for the same reason — the statements a body carries are the
    * ones a `main` has to be built around.
+   *
+   * **A `var` is deliberately not one of these**, because a binding with an initializer is something
+   * that runs and a file carrying one really may be a body. Whether it is *this* program's body is a
+   * question about the other files too, so it is asked in `ProgramWalk.entryFile` rather than here —
+   * see `isTopLevelBinding` below.
    */
   def isDeclaration(s: Stmt): Boolean = s match
     case _: FuncDecl | _: StructDecl | _: EnumDecl | _: TraitDecl | _: ImplDecl | _: ExternDecl |
@@ -33,14 +38,24 @@ object Bodies {
       true
     case _ => false
 
+  /** Whether a top-level statement is a **binding** — the one kind that may be either a body's local
+   * or its module's storage, depending on what the rest of the program looks like (`13 §7`).
+   *
+   * Everything else settles which file the program starts in on its own: a `print` runs and a
+   * `struct` does not, whatever else the program contains. A `var` is the one form that does not,
+   * because both readings are coherent — a local of the body it was written in, or storage the
+   * module owns — and nothing in the line itself chooses between them. `ProgramWalk.entryFile`
+   * chooses, by asking whether any file carries a statement that is not one of these.
+   */
+  def isTopLevelBinding(s: Stmt): Boolean = s.isInstanceOf[VarDecl]
+
   /** Whether a declaration belongs to the **module** even when it is written in the file the program
    * starts in.
    *
    * The file that carries the statements is a **body**, so what it declares is local to that body: a
-   * `val` there is a stack local initialized where it is written, and a function there is a nested
-   * function (`12 §5a`) that captures the locals above it. That is the whole of why a top-level `var`
-   * has never been readable from a function and a top-level `val` has — a distinction nobody could
-   * see a reason for, because there was none.
+   * `val` there is a stack local initialized where it is written, a `var` there is an ordinary
+   * mutable local, and a function there is a nested function (`12 §5a`) that captures the locals
+   * above it.
    *
    * What stays behind is everything with **no runtime identity**: a type names a shape, a `const` is
    * folded into its uses before anything runs, an `extern` names storage somebody else owns, an

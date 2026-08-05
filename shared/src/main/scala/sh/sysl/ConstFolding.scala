@@ -118,7 +118,7 @@ trait ConstFolding extends ImportResolution {
 
   // --- module-level `val`s ---------------------------------------------------------------
 
-  /** The key a written name for module storage resolves to — a `val` or a `static var`.
+  /** The key a written name for module storage resolves to — a `val` or a `var`.
    *
    * The two are one lookup because they are one namespace and one kind of thing: storage the module
    * owns, reached by name. Which of the two a key names decides only whether the storage may be
@@ -127,7 +127,7 @@ trait ConstFolding extends ImportResolution {
   protected def globalKey(written: String): Option[String] =
     resolveName(written)(k => valDecls.contains(k) || staticVarDecls.contains(k))
 
-  /** Whether a key names storage that may be written — a `static var` rather than a `val`. */
+  /** Whether a key names storage that may be written — a module `var` rather than a `val`. */
   protected def globalWritable(key: String): Boolean = staticVarDecls.contains(key)
 
   /** The type a module-level `val` was declared with.

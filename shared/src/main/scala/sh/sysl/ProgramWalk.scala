@@ -239,7 +239,7 @@ trait ProgramWalk
     for (key, decl) <- externVarDecls do
       currentPos = decl.pos
       recover(())(at(decl.pos)(checkExternVar(key)))
-    // A `static var` is laid down with the `val`s and in the same state, for the same reason: its
+    // A module `var` is laid down with the `val`s and in the same state, for the same reason: its
     // initializer is a module member's expression, so no function's locals may be in scope while it
     // is read. It goes first only so that a `val` initialized from one reads storage already there.
     for (key, decl) <- staticVarDecls do
@@ -559,22 +559,49 @@ trait ProgramWalk
    * `const`, a `val`, or a function — all three are declarations, and a file carrying a table and
    * the functions that read it must not thereby become the file the program starts in.
    *
-   * A program with none is a complete program that does nothing, which is what a tree of pure
-   * declarations should compile to: a library is not an error.
+   * **A top-level `var` is the one form that cannot answer on its own, which is why this is two
+   * passes rather than one filter** (`13 §7`). It is a binding with an initializer, so a file
+   * carrying nothing else really is a body and its `var` really is a local — and it is equally
+   * readable as storage the module owns, which is what it has to be in a file that names a module.
+   * Nothing in the line chooses. What chooses is the rest of the program: **a file carrying a
+   * statement that is not a binding is a beginning, and where one exists every other file's
+   * top-level `var`s are the module's.** So the two readings never compete, and a program that has
+   * no such file falls back to the second pass, where a lone binding is a body after all — which is
+   * what keeps a one-file `var n = 1` meaning what it has always meant.
+   *
+   * A program with none of either is a complete program that does nothing, which is what a tree of
+   * pure declarations should compile to: a library is not an error.
    */
-  private def entryFile(files: List[(Program, Scope)]): Option[(Program, Scope)] =
-    files.filter((u, _) => u.body.exists(!Bodies.isDeclaration(_))) match
-      case Nil          => None
-      case one :: Nil   => Some(one)
-      case (first, s) :: others =>
-        for (u, _) <- others do
-          val rest = u.body.filterNot(Bodies.isDeclaration)
+  private def entryFile(files: List[(Program, Scope)]): Option[(Program, Scope)] = {
+    def carries(u: Program, what: Stmt => Boolean) = u.body.exists(s => !Bodies.isDeclaration(s) && what(s))
 
-          recover(())(at(rest.head.pos) {
-            err(s"${first.source.name} already carries the statements this program runs, so " +
-              s"${u.source.name} may hold declarations only")
-          })
+    // Reported against the first thing in `u` that made it a rival, which is the line the reader has
+    // to move — not the file's first line, and not the winner's.
+    def refuse(first: Program, u: Program, what: Stmt => Boolean): Unit =
+      for s <- u.body.find(s => !Bodies.isDeclaration(s) && what(s)) do
+        recover(())(at(s.pos) {
+          err(s"${first.source.name} already carries the statements this program runs, so " +
+            s"${u.source.name} may hold declarations only")
+        })
+
+    // A statement that is not a binding: one file may carry these, and a second is the mistake this
+    // reports.
+    files.filter((u, _) => carries(u, !Bodies.isTopLevelBinding(_))) match
+      case (first, s) :: others =>
+        for (u, _) <- others do refuse(first, u, !Bodies.isTopLevelBinding(_))
         Some((first, s))
+
+      // Nothing runs, so the bindings decide — and only where one file carries them. Several is
+      // **not** the two-beginnings mistake: a program in which nothing runs has no beginning for a
+      // second one to compete with, so each of those files is holding module storage and the whole
+      // thing is a library that does nothing. Picking a winner among them would be arbitrary, and
+      // would make one file's bindings local and invisible to the rest for no reason a reader could
+      // see.
+      case Nil =>
+        files.filter((u, _) => carries(u, Bodies.isTopLevelBinding)) match
+          case one :: Nil => Some(one)
+          case _          => None
+  }
 
   /** The statements that become the program's entry point, and the module they are read in.
    *
@@ -619,7 +646,8 @@ trait ProgramWalk
     TVal(key, ty, Some(init), !static)
   })
 
-  /** One `static var`: module storage the program may write (`13 §7`).
+  /** One module `var`: module storage the program may write (`13 §7`), written `static var` in the
+   * file the program starts in and plain `var` in any other.
    *
    * Three things separate it from the `val` above, and each is what the word `var` already means.
    *
@@ -630,7 +658,7 @@ trait ProgramWalk
    * **The release rule is asked of the TYPE, where a `val`'s is asked of the value**, and the
    * difference is the whole of why this is a separate check. A `val` is forever the value it was
    * given, so `val greeting: string = "hello"` is admissible: a literal's owner word is null and
-   * nothing was ever built. A `static var` could be given that literal and `str(n)` on the next
+   * nothing was ever built. A `var` could be given that literal and `str(n)` on the next
    * line, so whatever it holds when the program ends has nowhere to write its release — which makes
    * the question one about what the storage may ever hold, not about what it was first given.
    *
@@ -649,10 +677,10 @@ trait ProgramWalk
     }
 
     if Type.zeroSized(ty) then
-      err(s"'${qn(key)}' cannot be a 'static var': ${show(ty)} has no representation, so there is " +
+      err(s"'${qn(key)}' cannot be module storage: ${show(ty)} has no representation, so there is " +
         "nothing for the storage to be")
     else if !uncounted(ty) then
-      err(s"'${qn(key)}' cannot be a 'static var': storage that exists for the whole run is never " +
+      err(s"'${qn(key)}' cannot be module storage: storage that exists for the whole run is never " +
         s"let go of, so a count taken in one is a count with nowhere to write the release — and " +
         s"${show(ty)} is a type that takes one. The question is asked of the type here rather than " +
         "of the value, because a variable may be given a different value tomorrow")

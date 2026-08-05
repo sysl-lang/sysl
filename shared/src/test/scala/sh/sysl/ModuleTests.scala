@@ -228,35 +228,35 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) should include("may hold declarations only")
     }
 
-    // A top-level `var` is a statement — it is a local of the entry point, not a member of the
-    // module — so a second file holding one is the same mistake as a second file holding a `print`.
-    "counting a top-level binding as one of them" in {
-      errOf(
-        "a.sysl" -> "print(1)",
-        "b.sysl" -> "var x = 2",
-      ) should include("may hold declarations only")
+    // But NOT counting a top-level binding as one of them. A `var` beside a file that really does
+    // carry statements is module storage (`13 §7`), so it is not a second beginning and the two
+    // files compile together — which is the whole of the mutable-module-storage rule seen from this
+    // side.
+    "though a binding beside them is module storage rather than a second beginning" in {
+      runIn(
+        ("", "main.sysl", "counter.bump()\ncounter.bump()\nprint(str(counter.count))"),
+        ("counter", "c.sysl", "module counter\n\nvar count: int = 0\n\nbump() = count += 1"),
+      ) shouldBe "2\n"
     }
 
-    // The same answer where the second file names a module, which is the case worth pinning
-    // separately: a `module` header is what makes every other declaration in a file the module's,
-    // so a reader may reasonably expect it to make a `var` module storage. It does not — the `var`
-    // is still a statement, and the file still may not carry one. Mutable module storage is
-    // reachable through `static var` in the entry file and nowhere else, which is a narrower surface
-    // than "a module's variables" suggests.
-    "including where that file names a module, which does not change what a 'var' is" in {
-      errIn(
-        ("", "main.sysl", "print(1)"),
-        ("counter", "c.sysl", "module counter\n\nvar count: int = 0"),
-      ) should include("may hold declarations only")
+    // And the same where the sibling has no header, so nothing but the other file's statements
+    // distinguishes them. This is the discriminating half: it is not the `module` line that makes
+    // the binding storage, it is that the beginning is somewhere else.
+    "with no header on the sibling either, since it is the statements that decide" in {
+      runOf(
+        "a.sysl" -> "bump()\nprint(str(x))",
+        "b.sysl" -> "var x: int = 2\n\nbump() = x += 1",
+      ) shouldBe "3\n"
     }
 
-    // And `static` is not the way in either: it asks for the module instead of the body, and a file
-    // with a header has no body for it to be asking about.
-    "and 'static var' is refused there too, so the module file has no spelling at all" in {
-      errIn(
-        ("", "main.sysl", "print(1)"),
-        ("counter", "c.sysl", "module counter\n\nstatic var count: int = 0"),
-      ) should include("this file has no such body")
+    // Where NOTHING runs there is no beginning for a second to compete with, so several files of
+    // bindings are several files of module storage rather than a mistake. A program that does
+    // nothing is a library, and a library is not an error.
+    "while several files of bindings and nothing else is a library, not a mistake" in {
+      runOf(
+        "a.sysl" -> "var x: int = 1",
+        "b.sysl" -> "var y: int = 2",
+      ) shouldBe ""
     }
 
     "though a file of nothing but declarations is never the one that runs" in {
@@ -273,6 +273,156 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       runIn(
         ("m", "a.sysl", "module m\nf() -> int = 4\nprint(f())"),
       ) shouldBe "4\n"
+    }
+  }
+
+  /** Mutable module storage in a file that is not the entry file (`13 §7`).
+    *
+    * It is the same declaration `static var` is, and the two spellings exist because the entry file
+    * is the one place a top-level `var` has a body to be a local of: there the modifier asks for the
+    * module instead, and everywhere else there is nothing to ask. So the rules below are `static
+    * var`'s rules, tested through the other spelling — a type is mandatory, an initializer is not,
+    * and the type may owe no release.
+    */
+  "a 'var' outside the entry file is the module's storage" - {
+    "so another module reads it by its qualified name" in {
+      runIn(
+        ("", "main.sysl", "print(str(counter.count))"),
+        ("counter", "c.sysl", "module counter\n\nvar count: int = 7"),
+      ) shouldBe "7\n"
+    }
+
+    // Two files of one module share one set of declarations (`13 §1`), so the storage is reachable
+    // from a sibling exactly as a `val` would be — which a local of the entry point never was.
+    "and a sibling file of the same module writes it" in {
+      runIn(
+        ("", "main.sysl", "m.bump()\nm.bump()\nm.bump()\nprint(str(m.n))"),
+        ("m", "a.sysl", "module m\n\nvar n: int = 0"),
+        ("m", "b.sysl", "module m\n\nbump() = n += 1"),
+      ) shouldBe "3\n"
+    }
+
+    // A headerless file that is not the one carrying the statements is the anonymous root module,
+    // which is a module like any other — so this needs no rule of its own.
+    "including a headerless file that is not the one the program starts in" in {
+      runIn(
+        ("", "main.sysl", "bump()\nprint(str(n))"),
+        ("", "other.sysl", "var n: int = 5\n\nbump() = n += 1"),
+      ) shouldBe "6\n"
+    }
+
+    // The cheapest form, and the reason the type is mandatory rather than merely conventional:
+    // there may be no value anywhere for one to be inferred from.
+    "its initializer may be absent, and the type's zero is what it starts at" in {
+      runIn(
+        ("", "main.sysl", "print(str(m.slot))"),
+        ("m", "a.sysl", "module m\n\nvar slot: int"),
+      ) shouldBe "0\n"
+    }
+
+    "so the type is mandatory" in {
+      errIn(
+        ("", "main.sysl", "print(str(m.n))"),
+        ("m", "a.sysl", "module m\n\nvar n = 1"),
+      ) should include("module storage states its type")
+    }
+
+    // The diagnostic must not name `static`, which is refused in this very file — a reader told to
+    // write it would be told something false. This is the discriminating half of the test above.
+    "and the diagnostic does not name a spelling this file refuses" in {
+      errIn(
+        ("", "main.sysl", "print(str(m.n))"),
+        ("m", "a.sysl", "module m\n\nvar n = 1"),
+      ) should not include "static"
+    }
+
+    // Asked of the TYPE, not of the value: storage that lives for the whole run has nowhere to
+    // write a release, and a variable may be given a different value tomorrow.
+    "and it may not hold a value that owes a release" in {
+      errIn(
+        ("", "main.sysl", "print(m.greeting)"),
+        ("m", "a.sysl", "module m\n\nvar greeting: string = \"hello\""),
+      ) should include("cannot be module storage")
+    }
+
+    "while 'private' keeps it inside its own module" in {
+      errIn(
+        ("", "main.sysl", "print(str(m.n))"),
+        ("m", "a.sysl", "module m\n\nprivate var n: int = 1"),
+      ) should not be empty
+    }
+
+    // It reaches the rest of the machinery through the same table `static var` does, so the checks
+    // stated over module storage answer for it without being restated. A `@pure` function reading
+    // one (`17 §6`) is the cheapest proof of that.
+    "and a '@pure' function may not read one, as of any module storage" in {
+      errIn(
+        ("", "main.sysl", "print(str(m.peek()))"),
+        ("m", "a.sysl", "module m\n\nvar seed: int = 1\n\n@pure\npeek() -> int = seed"),
+      ) should not be empty
+    }
+
+    // `static` is still refused here, and this is what keeps the two spellings from being two ways
+    // to say one thing in one place: it asks for the module instead of the *body*, and a file with a
+    // header has no body for it to be asking about.
+    "though 'static' is still refused there, having nothing to ask for" in {
+      errIn(
+        ("", "main.sysl", "print(1)"),
+        ("m", "a.sysl", "module m\n\nstatic var n: int = 0"),
+      ) should include("this file has no such body")
+    }
+
+    // The other half of the rule, and the one that could regress silently: the entry file's own
+    // top-level `var` is STILL a local of its body, so it is not the module's and a sibling file
+    // cannot reach it. Without this, making a `var` a declaration everywhere would look correct.
+    "while the entry file's own 'var' stays a local, invisible to a sibling" in {
+      errIn(
+        ("", "main.sysl", "var n: int = 1\nprint(str(peek()))"),
+        ("", "other.sysl", "peek() -> int = n"),
+      ) should not be empty
+    }
+
+    // `13 §7` gives module storage written with `var` the two things the word already means:
+    // assignment at every depth, and `&`. The second is what a `val` is refused, so it is the
+    // discriminating one.
+    "and its address may be taken, which a module 'val' is refused" in {
+      runIn(
+        ("", "main.sysl", "m.bump()\nprint(str(m.k[0]))"),
+        ("m", "a.sysl", "module m\n\nvar k: [2]int = [1, 2]\n\nbump()\n    var p: *int = &k[0]\n    *p = 9\nend bump"),
+      ) shouldBe "9\n"
+    }
+
+    // It joins the same initializer dependency graph a `val` is in, so a cycle between two of them
+    // is the cycle diagnostic rather than a value read before it was stored.
+    "and a cycle between two of them is reported as one" in {
+      errIn(
+        ("", "main.sysl", "print(str(m.a))"),
+        ("m", "x.sysl", "module m\n\nvar a: int = b + 1\n\nvar b: int = a + 1"),
+      ) should not be empty
+    }
+
+    // The value namespace is shared (`13 §2`), so a `var` and a `val` of one name in one module are
+    // the collision they are — reported at whichever was written second.
+    "and it shares the value namespace with a 'val' of the same name" in {
+      errIn(
+        ("", "main.sysl", "print(str(m.n))"),
+        ("m", "x.sysl", "module m\n\nvar n: int = 1"),
+        ("m", "y.sysl", "module m\n\nval n: int = 2"),
+      ) should include("already")
+    }
+
+    // A third file holding only a binding is not a rival to either of two that really do carry
+    // statements, so the two-beginnings report names those two and says nothing about it. This is
+    // what the first pass being over non-bindings buys, and it would be easy to lose.
+    "while a binding beside two real beginnings is not named as a third" in {
+      val e = errOf(
+        "a.sysl" -> "print(1)",
+        "b.sysl" -> "print(2)",
+        "c.sysl" -> "var x: int = 3",
+      )
+
+      e should include("b.sysl may hold declarations only")
+      e should not include "c.sysl"
     }
   }
 
