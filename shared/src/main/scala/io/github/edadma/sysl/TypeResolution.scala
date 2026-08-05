@@ -400,10 +400,21 @@ trait TypeResolution extends GenericInstantiation with Aliasing {
     case ArrayType(None, elem, ro) =>
       Type.Slice(addressable(underIndirection(resolveQualified(elem, subst)), "a slice"), readOnly = ro)
     // A bound is a compile-time constant, which a `const` is and a call is not (`13 §7`).
+    //
+    // **The substitution reaches the bound as well as the element**, so a length may measure the
+    // block's own type parameter: `[sizeof(T) * 3 + 1]u8` is a buffer sized for whatever `T` turns
+    // out to be, which is what a generic renderer needs and what no fixed number can express.
+    //
+    // A bound over a parameter has no value during the walk that checks the generic body itself,
+    // because there is no `T` yet — and that is not a mistake to report, since the body is analyzed
+    // again for each instantiation with the parameter bound to a real type. The array stands at
+    // length zero for that one walk; every array the program actually gets is built by the later
+    // pass, where the measurement answers.
     case ArrayType(Some(len), elem, _) =>
-      val n = constInt(len) match
+      val n = constInt(len, subst) match
         case Some(v) if v >= 0 && v.isValidInt => v.toInt
         case Some(v)                           => err(s"an array cannot have $v elements")
+        case None if awaitsInstantiation(len, subst) => 0
         case None => err("an array length must be a constant — a literal, or a 'const' naming one")
       Type.Array(n, addressable(resolveQualified(elem, subst), "an array"))
 

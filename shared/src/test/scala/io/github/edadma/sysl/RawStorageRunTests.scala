@@ -173,6 +173,79 @@ class RawStorageRunTests extends AnyFreeSpec with RunSupport with CodegenSupport
     run(src) shouldBe "1 8 8 16\n"
   }
 
+  /** The measurement standing where a **bound** does, which is what a generic wanting a buffer needs
+   * (`07`): `[sizeof(T) * 3 + 1]u8` is the widest decimal a `T` can render as, and no fixed number
+   * expresses it — three digits per byte is the bound at every width.
+   *
+   * A body is analyzed once per instantiation with its parameters bound to real types, so the length
+   * is a constant everywhere code is generated. Where it is *not* is the single walk that checks the
+   * generic body itself, and that is not a mistake to report — the array stands at length zero there
+   * and nothing is compiled from it.
+   */
+  "a bound may measure a type parameter" - {
+
+    "and is sized per instantiation, not once" in {
+      val src =
+        """buflen[T](x: T) -> int
+          |    var buf: [sizeof(T) * 3 + 1]u8
+          |    int(buf.len)
+          |struct P
+          |    x: int
+          |    y: int
+          |var a: u8 = 1
+          |var b: u32 = 1
+          |var c: u128 = 1
+          |var p = P(1, 2)
+          |print(buflen(a), buflen(b), buflen(c), buflen(p))""".stripMargin
+
+      run(src) shouldBe "4 13 49 25\n"
+    }
+
+    // A length is not the whole claim: the storage has to be there to write, at the width the
+    // measurement asked for. Writing to the last element is what proves the array is that long.
+    "and the storage it names is real, to its last element" in {
+      val src =
+        """ends[T](x: T) -> int
+          |    var buf: [sizeof(T) * 3 + 1]u8
+          |    var i = 0usize
+          |    while i < buf.len
+          |        buf[i] = u8(65 + int(i) % 26)
+          |        i += 1usize
+          |    int(buf[0]) + int(buf[buf.len - 1usize])
+          |var a: u8 = 1
+          |var b: u32 = 1
+          |print(ends(a), ends(b))""".stripMargin
+
+      run(src) shouldBe "133 142\n"
+    }
+
+    // `alignof` reaches the same folder by the same route, so it is pinned rather than assumed.
+    "and 'alignof' reaches it by the same route" in {
+      val src =
+        """pad[T](x: T) -> int
+          |    var buf: [alignof(T) * 2]u8
+          |    int(buf.len)
+          |var a: u8 = 1
+          |var b: u64 = 1
+          |print(pad(a), pad(b))""".stripMargin
+
+      run(src) shouldBe "2 16\n"
+    }
+
+    // The error path, and the distinction the tolerance rests on: a length that measures a parameter
+    // does not fold *yet*, while a length over a variable never will. Only the second is a mistake,
+    // and it has to stay one or the tolerance would swallow every bad bound.
+    "while a length that is merely not constant is still refused" in {
+      val e = err("""f[T](x: T, n: usize) -> int
+                    |    var buf: [n]u8
+                    |    int(buf.len)
+                    |var a: u8 = 1
+                    |print(f(a, 4usize))""".stripMargin)
+
+      e should include("an array length must be a constant")
+    }
+  }
+
   "an address is read as a number, and the number back as an address" - {
     "the round trip is the identity" in {
       val src =
