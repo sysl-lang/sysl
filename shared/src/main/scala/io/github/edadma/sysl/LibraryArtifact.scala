@@ -161,12 +161,27 @@ object LibraryArtifact {
    * stored once per directory anyone ever ran `sysl` in, and `sysl run notes.sysl` would leave a
    * `.sysl/` in whatever folder it was typed in.
    *
-   * The key is `Std.fingerprint` rather than a release number, because the fingerprint *is* the
-   * question being asked — it is over the library's file contents and their places in the tree, so
-   * two compilers installed with the same library share one artifact and two with different
-   * libraries cannot collide whatever their versions say. A build with an edited `lib/sysl` gets a different
-   * path rather than a stale hit, which is what makes an upgrade need no cache invalidation at all.
-   * `Stdlib.read`'s fingerprint check still stands behind it; this only means it is not relied on.
+   * **The key names both the library and the compiler, because the artifact is a function of both.**
+   * `Std.fingerprint` is over the library's file contents and their places in the tree, so a build
+   * with an edited `lib/sysl` gets a different path rather than a stale hit. That half alone is not
+   * enough, and the way it is not enough is quiet: an artifact is *compiled* code, so a release that
+   * changes what the library lowers to while touching none of its source produces different bytes at
+   * an identical fingerprint. The upgrade then reads back the artifact its predecessor built and the
+   * change does not take.
+   *
+   * That is not hypothetical — it is what 0.0.6 was about to do. 0.0.5 emitted a definition of
+   * `sysl$stdout` into the object half that a program also emits for itself, which a Mach-O link
+   * accepts and an ELF link refuses; the fix changed the compiler and left `lib/sysl` byte-identical,
+   * so every machine that had already run 0.0.5 would have gone on linking against the broken
+   * artifact and seen nothing change.
+   *
+   * The version is the compiler's own, so two releases never share an entry and a rebuild costs the
+   * second it takes. `Stdlib.read`'s fingerprint check still stands behind the library half; nothing
+   * stands behind the compiler half but this, because an artifact does not record what built it.
+   *
+   * What this does *not* separate is two builds of the same version — a development tree, where the
+   * compiler changes under a constant `BuildInfo.version`. Nothing in the cache can distinguish those
+   * without hashing the compiler itself, and `--no-core-lib` is the answer there.
    *
    * Nothing here is ever evicted. Every distinct library leaves an artifact behind, which is what a
    * cache directory is for and why this belongs in one — the platform's own housekeeping knows to
@@ -178,7 +193,9 @@ object LibraryArtifact {
    * before, rather than failing over somewhere nobody can write.
    */
   lazy val stdDefault: String =
-    cacheDirectory.map(c => s"$c/sysl/${Std.fingerprint}/std$extension").getOrElse(stdLocal)
+    cacheDirectory
+      .map(c => s"$c/sysl/${BuildInfo.version}-${Std.fingerprint}/std$extension")
+      .getOrElse(stdLocal)
 
   /** The project-local artifact path, which is what `stdDefault` was before it moved to the cache and
    * what it falls back to where a machine has no cache directory.
