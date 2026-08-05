@@ -19,8 +19,8 @@ ThisBuild / sonatypeProfileName := "io.github.edadma"
 
 ThisBuild / scmInfo := Some(
   ScmInfo(
-    url("https://github.com/edadma/sysl"),
-    "scm:git@github.com:edadma/sysl.git",
+    url("https://github.com/sysl-lang/sysl"),
+    "scm:git@github.com:sysl-lang/sysl.git",
   ),
 )
 ThisBuild / developers := List(
@@ -32,7 +32,7 @@ ThisBuild / developers := List(
   ),
 )
 
-ThisBuild / homepage := Some(url("https://github.com/edadma/sysl"))
+ThisBuild / homepage := Some(url("https://github.com/sysl-lang/sysl"))
 ThisBuild / description := "A modern, ref-counted, OS-level systems language — easier than Rust."
 
 ThisBuild / publishTo := sonatypePublishToBundle.value
