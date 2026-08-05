@@ -154,11 +154,11 @@ unsaved buffer, a test with an inline program — has no file and no reason to m
 compiler is on Maven Central and takes a string:
 
 ```scala
-libraryDependencies += "io.github.edadma" %% "sysl" % "0.0.4"   // %%% in a cross-project
+libraryDependencies += "sh.sysl" %% "sysl" % "0.0.8"   // %%% in a cross-project
 ```
 
 ```scala
-import io.github.edadma.sysl.api.Sysl
+import sh.sysl.api.Sysl
 
 Sysl.run("main()\n    print(1 + 2)")     // Right(Sysl.Run(0, "3\n"))
 Sysl.runBody("print(1 + 2)")             // the same, with the `main` supplied

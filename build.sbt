@@ -4,9 +4,9 @@ ThisBuild / licenses               := Seq("ISC" -> url("https://opensource.org/l
 ThisBuild / versionScheme          := Some("semver-spec")
 ThisBuild / evictionErrorLevel     := Level.Warn
 ThisBuild / scalaVersion           := "3.8.4"
-ThisBuild / organization           := "io.github.edadma"
-ThisBuild / organizationName       := "edadma"
-ThisBuild / organizationHomepage   := Some(url("https://github.com/edadma"))
+ThisBuild / organization           := "sh.sysl"
+ThisBuild / organizationName       := "sysl-lang"
+ThisBuild / organizationHomepage   := Some(url("https://github.com/sysl-lang"))
 ThisBuild / version                := "0.0.7"
 ThisBuild / sonatypeCredentialHost := sonatypeCentralHost
 
@@ -15,7 +15,7 @@ ThisBuild / resolvers += Resolver.mavenLocal
 ThisBuild / resolvers += Resolver.sonatypeCentralSnapshots
 ThisBuild / resolvers += Resolver.sonatypeCentralRepo("releases")
 
-ThisBuild / sonatypeProfileName := "io.github.edadma"
+ThisBuild / sonatypeProfileName := "sh.sysl"
 
 ThisBuild / scmInfo := Some(
   ScmInfo(
@@ -45,9 +45,9 @@ ThisBuild / publishTo := sonatypePublishToBundle.value
 // which build somebody has when they report something.
 lazy val embedVersion = Def.task {
   val utf8 = java.nio.charset.StandardCharsets.UTF_8
-  val out  = (Compile / sourceManaged).value / "io" / "github" / "edadma" / "sysl" / "BuildInfo.scala"
+  val out  = (Compile / sourceManaged).value / "sh" / "sysl" / "BuildInfo.scala"
   val text =
-    s"""package io.github.edadma.sysl
+    s"""package sh.sysl
        |
        |/** Generated from `version` by `build.sbt` -- do not edit. */
        |private[sysl] object BuildInfo {

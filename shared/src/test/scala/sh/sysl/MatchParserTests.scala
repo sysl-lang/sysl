@@ -1,0 +1,159 @@
+package sh.sysl
+
+import org.scalatest.freespec.AnyFreeSpec
+
+/** Parsing of `match` expressions: literal, `|`-alternative, range, wildcard, and `else`
+ * arms, plus guards. `match` is an expression, so in statement position it is an `ExprStmt`.
+ */
+class MatchParserTests extends AnyFreeSpec with ParseSupport {
+
+  private def matchExpr(src: String): MatchExpr =
+    prog(src) match
+      case List(ExprStmt(m: MatchExpr)) => m
+      case other                        => fail(s"expected a single match statement, got $other")
+
+  "a literal, alternative, range, and else arm" in {
+    val src =
+      """n match
+        |    0 -> print(1)
+        |    1 | 2 -> print(2)
+        |    3..5 -> print(3)
+        |    else print(4)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("n"),
+      List(
+        MatchArm(List(LitPattern(i(0))), None, List(printStmt(i(1)))),
+        MatchArm(List(LitPattern(i(1)), LitPattern(i(2))), None, List(printStmt(i(2)))),
+        MatchArm(List(RangePattern(i(3), i(5), inclusive = true)), None, List(printStmt(i(3)))),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(4)))),
+      ),
+    )
+  }
+
+  // The `->` separates a pattern from its body, and `else` is not a pattern — it is the fallback,
+  // and takes its body the way an `if`'s `else` takes one. An arrow after it is named rather than
+  // left to fail as a body, since what it fails as reports the position of the `match` above.
+  "the 'else' arm takes an indented body as readily as an inline one" in {
+    val src =
+      """n match
+        |    0 -> print(1)
+        |    else
+        |        print(2)
+        |        print(3)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("n"),
+      List(
+        MatchArm(List(LitPattern(i(0))), None, List(printStmt(i(1)))),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(2)), printStmt(i(3)))),
+      ),
+    )
+  }
+
+  "and an arrow after it is refused by name" in {
+    val src =
+      """n match
+        |    0 -> print(1)
+        |    else -> print(2)""".stripMargin
+
+    progError(src) should include("takes its body directly, with no '->'")
+  }
+
+  // `match` is postfix and binds looser than any operator, so the scrutinee is the whole expression
+  // written before it — which is what lets one be written where the value is, rather than around it.
+  "the scrutinee is everything to the left of the keyword" in {
+    val src =
+      """a < b match
+        |    true -> print(1)
+        |    false -> print(2)""".stripMargin
+
+    matchExpr(src).scrutinee shouldBe Compare(List(Ident("a"), Ident("b")), List("<"))
+  }
+
+  // Being postfix is what makes a match feed another: each arms block chooses on whatever the chain
+  // has produced so far, so they read left to right in the order the values flow.
+  "and a second match takes the first one's value" in {
+    val src =
+      """n match
+        |    0 -> "zero"
+        |    else "other"
+        |match
+        |    "zero" -> print(1)
+        |    else print(2)""".stripMargin
+
+    matchExpr(src).scrutinee shouldBe MatchExpr(
+      Ident("n"),
+      List(
+        MatchArm(List(LitPattern(i(0))), None, List(ExprStmt(StrLit("zero")))),
+        MatchArm(List(WildcardPattern), None, List(ExprStmt(StrLit("other")))),
+      ),
+    )
+  }
+
+  "a guarded wildcard arm" in {
+    val src =
+      """x match
+        |    _ if x > 0 -> print(1)
+        |    else print(2)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("x"),
+      List(
+        MatchArm(List(WildcardPattern), Some(Compare(List(Ident("x"), i(0)), List(">"))), List(printStmt(i(1)))),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(2)))),
+      ),
+    )
+  }
+
+  "a positional struct pattern parses like a variant" in {
+    val src =
+      """p match
+        |    Point(0, y) -> print(y)
+        |    else print(0)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("p"),
+      List(
+        MatchArm(List(VariantPattern("Point", List(LitPattern(i(0)), IdentPattern("y")))), None, List(printStmt(Ident("y")))),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(0)))),
+      ),
+    )
+  }
+
+  "a named struct pattern carries field-name/sub-pattern pairs" in {
+    val src =
+      """p match
+        |    Point{x: 0, y} -> print(y)
+        |    else print(0)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("p"),
+      List(
+        MatchArm(
+          List(StructPattern("Point", List(("x", LitPattern(i(0))), ("y", IdentPattern("y"))))),
+          None,
+          List(printStmt(Ident("y"))),
+        ),
+        MatchArm(List(WildcardPattern), None, List(printStmt(i(0)))),
+      ),
+    )
+  }
+
+  "a named-field shorthand binds each field to its own name" in {
+    val src =
+      """p match
+        |    Point{x, y} -> print(x)""".stripMargin
+
+    matchExpr(src) shouldBe MatchExpr(
+      Ident("p"),
+      List(
+        MatchArm(
+          List(StructPattern("Point", List(("x", IdentPattern("x")), ("y", IdentPattern("y"))))),
+          None,
+          List(printStmt(Ident("x"))),
+        ),
+      ),
+    )
+  }
+}
