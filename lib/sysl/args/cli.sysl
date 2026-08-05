@@ -1,0 +1,426 @@
+module sysl.args
+
+import sysl.buf.{Buf, buf}
+import sysl.text.*
+
+// A described command line: what the options are, what they mean, and the `--help` that says so.
+//
+// This is the upper of the module's two layers, and everything it does it does through `Scan`. What
+// it adds is a *description* -- a table of options carrying the text that explains each one -- and
+// what the description buys is the two things a hand-written `match` cannot generate for itself: a
+// usage text that cannot drift from the options it documents, and one wording for every failure.
+//
+// **A program still reaches for the scanner when it wants to.** The layers are not a beginner's and
+// an expert's; they answer different shapes. A table is worth writing when the options are many
+// enough that their help text is the point, and a `match` is better when there are three of them and
+// no `--help` at all. Nothing here is required to use `Scan`, and `Scan` knows nothing about this.
+//
+// **An option is named by the value that declares it, not by a string or an index.** A program binds
+// each `Opt` to a name and asks about it with that:
+//
+//     main(args: []string)
+//         var verbose = flag('v', "verbose", "print more about what is happening")
+//         var output  = option('o', "output", "path", "write the result here")
+//
+//         var spec = cli("count", [verbose, output], about = "Count what is in a file.",
+//                        version = "0.1.0", operands = "[file...]")
+//
+//         var opts = parse_or_exit(spec, args)
+//
+//         if opts.given(verbose) then …
+//
+// The alternative spellings were both worse. A string -- `opts.value("output")` -- makes a typo a
+// `None` at runtime that reads exactly like an option nobody passed. An index into the table makes
+// it worse still: a wrong number is a *different option's* value, silently, and it asks a program to
+// keep two lists in step by hand. A binding is a name, so a typo is `undefined name` and neither
+// mistake is reachable.
+//
+// **The table is built inside a body rather than at the top level**, which is a rule rather than a
+// preference: an `Opt` holds strings, and `13 §7` refuses a module-level `val` whose value is built
+// while the program runs, since storage that lives for the whole run has nowhere to write the
+// release its count would need. A program that wants its description at the top level writes a
+// function returning one -- `spec() -> Cli = …` -- and keeps the option bindings inside it.
+//
+// **Help and version are supplied, and only where a program has not claimed them.** `--help` is
+// always offered and `--version` whenever a version was given; `-h` and `-V` come too, unless the
+// table already spells that letter for something else -- a program whose `-V` means verbose keeps
+// it. What they do is *reported* rather than done, so that `parse` neither prints nor exits and a
+// test can drive it; `parse_or_exit` is the one that acts, and its name says so.
+
+// A column the description text starts at, and the widest label that may push it out.
+//
+// A label longer than this takes its description on the next line instead of moving every other
+// description to the right, which is what one `--with-a-very-long-name <PLACEHOLDER>` would
+// otherwise do to a table of short ones.
+const widest_label: usize = 22usize
+
+// One option a program accepts.
+//
+// Built through the six constructors below rather than by writing the fields, because what varies
+// between them is which parts are absent -- and a call that says `flag('v', "verbose", …)` reads as
+// what it is, where `Opt(Some('v'), Some("verbose"), None, …)` reads as bookkeeping.
+struct Opt
+    // The one-letter spelling, the whole-word spelling: at least one, and usually both.
+    short: Option[char]
+    long: Option[string]
+
+    // The placeholder for the value this option takes, or `None` where it takes none. It is the word
+    // that appears between angle brackets in the help text, so it names what the value *is* --
+    // `path`, `when`, `count` -- rather than repeating the option's own name.
+    arg: Option[string]
+
+    // One line, shown against the option in the help text. It is not wrapped, so it should fit.
+    help: string
+end Opt
+
+// An option written both ways that takes no value.
+flag(short: char, long: string, help: string) -> Opt = Opt(Some(short), Some(long), None, help)
+
+// An option written both ways that takes one.
+option(short: char, long: string, arg: string, help: string) -> Opt =
+    Opt(Some(short), Some(long), Some(arg), help)
+
+// The same two, for an option with no one-letter spelling. A word that is rarely typed, or one
+// dangerous enough to be worth spelling out (`--force`, `--no-backup`), is better without one.
+long_flag(long: string, help: string) -> Opt = Opt(None, Some(long), None, help)
+
+long_option(long: string, arg: string, help: string) -> Opt = Opt(None, Some(long), Some(arg), help)
+
+// And for an option with no whole-word spelling, which is mostly what a program keeps for
+// compatibility with something older.
+short_flag(short: char, help: string) -> Opt = Opt(Some(short), None, None, help)
+
+short_option(short: char, arg: string, help: string) -> Opt = Opt(Some(short), None, Some(arg), help)
+
+// Whether two descriptions name the same option.
+//
+// A table has one entry per option, so agreeing on either spelling is agreeing entirely; this is
+// what lets a program hold its `Opt` values in `val`s and ask about them by name.
+private same(a: Opt, b: Opt) -> bool
+    if a.long.is_some() && b.long.is_some() then return a.long.unwrap() == b.long.unwrap()
+
+    if a.short.is_some() && b.short.is_some() then return a.short.unwrap() == b.short.unwrap()
+
+    false
+end same
+
+// A whole command line described: the program, what it is for, and what it takes.
+struct Cli
+    // The program's own name, as its usage text should say it -- not `args[0]`, which is a path and
+    // is whatever the shell happened to invoke.
+    name: string
+
+    // The options, in the order the help text should list them. Declaration order is kept rather
+    // than sorted, because the order is a grouping the author chose.
+    opts: []Opt
+
+    // One line under the usage, saying what the program does.
+    about: string
+
+    // The version `--version` reports. Empty means the program offers no `--version` at all.
+    version: string
+
+    // The tail of the usage line, describing what stands after the options -- `"[file...]"`,
+    // `"<source> <dest>"`. It is text rather than a structure because nothing here *checks* how many
+    // operands arrived: a program counts `positionals` itself, which is one `if`.
+    operands: string
+
+    // Where an option is in the table, or `None` for one the program does not declare.
+    find_long(self, name: string) -> Option[usize]
+        for i in 0usize..<self.opts.len
+            var l = self.opts[i].long
+
+            if l.is_some() && l.unwrap() == name then return Some(i)
+
+        None
+    end find_long
+
+    find_short(self, c: char) -> Option[usize]
+        for i in 0usize..<self.opts.len
+            var s = self.opts[i].short
+
+            if s.is_some() && s.unwrap() == c then return Some(i)
+
+        None
+    end find_short
+end Cli
+
+// A description, with everything but the options and the name optional.
+//
+// The defaults are what makes this readable at the call: a program with no version and no operands
+// writes neither, and one with both names them (`version = …`, `operands = …`) rather than counting
+// commas. `12 §2a` is what allows it, and the suffix rule is why `opts` comes second.
+cli(name: string, opts: []Opt, about: string = "", version: string = "", operands: string = "") -> Cli =
+    Cli(name, opts, about, version, operands)
+
+// What a command line turned out to ask for.
+//
+// `--help` and `--version` are reported rather than acted on, which is what keeps `parse` a function
+// of its arguments: nothing here prints, and nothing here stops the program. A caller wanting the
+// conventional behaviour calls `parse_or_exit`, which is the one that decides.
+enum Outcome
+    Ready(opts: Parsed)
+    HelpRequested
+    VersionRequested
+end Outcome
+
+// What a command line held, asked about by the `Opt` values that described it.
+struct Parsed
+    // The table this was parsed against, so an option can be looked up by its description.
+    opts: []Opt
+
+    // How many times each option was given, and the last value each took -- both indexed as `opts`
+    // is. Counting rather than recording a `bool` is what lets `-vvv` mean what it means everywhere.
+    counts: []int
+    values: []string
+
+    // Everything that was not an option, in the order it was written.
+    positionals: []string
+
+    // Where an option sits in the table.
+    //
+    // Asking about an option the description never declared is a mistake in the *program* rather
+    // than in what a user typed -- there is no command line that could make it right -- so it stops
+    // the program the way `unwrap` does.
+    private slot(self, o: Opt) -> usize
+        for i in 0usize..<self.opts.len
+            if same(self.opts[i], o) then return i
+
+        print("panic: asked about an option the description does not declare")
+        exit(1)
+    end slot
+
+    // Whether the option was given at all.
+    given(self, o: Opt) -> bool = self.count(o) > 0
+
+    // How many times it was given, which is what `-vvv` is for.
+    count(self, o: Opt) -> int = self.counts[self.slot(o)]
+
+    // The value it was given, or `None` where it was not given at all. An option that takes no value
+    // is always `None` here, however often it was written.
+    value(self, o: Opt) -> Option[string]
+        var i = self.slot(o)
+
+        if self.counts[i] == 0 || self.opts[i].arg.is_none() then return None
+
+        Some(self.values[i])
+    end value
+
+    // The same with the program's own default standing in, which is what most callers want.
+    value_or(self, o: Opt, default: string) -> string = self.value(o).unwrap_or(default)
+end Parsed
+
+// The options a help text lists: the program's, and then whichever of `--help` and `--version` it
+// did not spell for itself.
+//
+// A short letter is offered only where the table has not already used it, so the addition can never
+// take a spelling away from the program that declared one.
+private shown(spec: Cli) -> []Opt
+    var out: Buf[Opt] = buf()
+
+    for o in spec.opts
+        out.push(o)
+
+    if spec.find_long("help").is_none()
+        if spec.find_short('h').is_none() then
+            out.push(flag('h', "help", "show this help and exit"))
+        else
+            out.push(long_flag("help", "show this help and exit"))
+
+    if spec.version.len > 0usize && spec.find_long("version").is_none()
+        if spec.find_short('V').is_none() then
+            out.push(flag('V', "version", "show the version and exit"))
+        else
+            out.push(long_flag("version", "show the version and exit"))
+
+    out.view()
+end shown
+
+// An option as the help text spells it: `-v, --verbose`, `    --dry-run`, `-o <path>`.
+//
+// An option with no short spelling is indented by the width of one, so that every `--` in the column
+// lines up whether or not its neighbours have a letter.
+private label_of(o: Opt) -> string
+    var b = str_builder()
+
+    if o.short.is_some()
+        b.push("-")
+        b.push_char(o.short.unwrap())
+
+        if o.long.is_some() then b.push(", ")
+    elif o.long.is_some()
+        b.push("    ")
+
+    if o.long.is_some()
+        b.push("--")
+        b.push(o.long.unwrap())
+
+    if o.arg.is_some()
+        b.push(" <")
+        b.push(o.arg.unwrap())
+        b.push(">")
+
+    b.finish()
+end label_of
+
+private spaces(n: usize) -> string
+    var b = str_builder()
+
+    for i in 0usize..<n
+        b.push(" ")
+
+    b.finish()
+end spaces
+
+// The one line a usage error is reported with.
+//
+// It is separate from `help` deliberately, and the separation is the point: this goes to standard
+// error when a command line could not be read, and the full help goes to standard output when
+// `--help` asked for it. Answering a mistyped flag with forty lines of help buries the sentence
+// saying what was mistyped.
+usage_line(spec: Cli) -> string
+    var b = str_builder()
+
+    b.push("usage: ")
+    b.push(spec.name)
+    b.push(" [options]")
+
+    if spec.operands.len > 0usize
+        b.push(" ")
+        b.push(spec.operands)
+
+    b.finish()
+end usage_line
+
+// The whole help text, as `--help` should print it.
+//
+// The description column is set by the longest label that fits, so a table of short options stays
+// narrow and one long option does not push every description to the right; a label past
+// `widest_label` takes the next line instead.
+//
+// Nothing here is wrapped to a terminal width, which is a deliberate limit rather than an omission:
+// asking how wide the terminal is means asking the platform, and this is otherwise pure string work
+// that a program with no `os` capability can still call. Help text is written to fit.
+help(spec: Cli) -> string
+    var b = str_builder()
+
+    b.push(usage_line(spec))
+    b.push("\n")
+
+    if spec.about.len > 0usize
+        b.push("\n")
+        b.push(spec.about)
+        b.push("\n")
+
+    var all = shown(spec)
+
+    if all.len > 0usize
+        b.push("\noptions:\n")
+
+        var column = 0usize
+
+        for o in all
+            var n = label_of(o).len
+
+            if n > column && n <= widest_label then column = n
+
+        for o in all
+            var lab = label_of(o)
+
+            b.push("  ")
+            b.push(lab)
+
+            if lab.len > column
+                b.push("\n  ")
+                b.push(spaces(column))
+            else
+                b.push(spaces(column - lab.len))
+
+            b.push("  ")
+            b.push(o.help)
+            b.push("\n")
+
+    b.finish()
+end help
+
+// A command line read against a description.
+//
+// It neither prints nor stops the program, whatever it finds -- a failure comes back as an `Err` and
+// a `--help` comes back as an `Outcome`, so this is the entry point a test drives and the one a
+// program with something of its own to say about a bad option calls.
+parse(spec: Cli, argv: []string) -> Result[Outcome, ArgError]
+    var counts: []int    = [0; spec.opts.len]
+    var values: []string = [""; spec.opts.len]
+    var rest: Buf[string] = buf()
+    var a = scan(argv)
+
+    loop
+        a.next() match
+            Ok(None) -> break
+
+            Ok(Some(Positional(p))) -> rest.push(p)
+
+            Ok(Some(Long(n))) ->
+                spec.find_long(n) match
+                    Some(i) ->
+                        counts[i] += 1
+
+                        if spec.opts[i].arg.is_some() then values[i] = a.value()?
+                    None ->
+                        // The program's own table has already had its say, so these are reached only
+                        // where it declared no such option.
+                        if n == "help"
+                            return Ok(HelpRequested)
+
+                        if n == "version" && spec.version.len > 0usize
+                            return Ok(VersionRequested)
+
+                        return Err(UnknownOption("--" + n))
+
+            Ok(Some(Short(c))) ->
+                spec.find_short(c) match
+                    Some(i) ->
+                        counts[i] += 1
+
+                        if spec.opts[i].arg.is_some() then values[i] = a.value()?
+                    None ->
+                        if c == 'h'
+                            return Ok(HelpRequested)
+
+                        if c == 'V' && spec.version.len > 0usize
+                            return Ok(VersionRequested)
+
+                        return Err(UnknownOption("-" + string(c)))
+
+            Err(e) -> return Err(e)
+
+    Ok(Ready(Parsed(spec.opts, counts, values, rest.view())))
+end parse
+
+// The same, doing the conventional thing with what it finds.
+//
+// `--help` and `--version` are answered on standard output and the program stops successfully,
+// because printing them *was* what it was asked to do. A command line that could not be read goes to
+// standard error with the usage line and a pointer at `--help`, and the status is **2** -- the code
+// getopt, argp and every parser after them reserve for "you invoked me wrongly", as against 1 for
+// "I ran and it did not work out".
+//
+// It exits, and the name is what says so: a caller who would rather decide for itself calls `parse`.
+parse_or_exit(spec: Cli, argv: []string) -> Parsed
+    parse(spec, argv) match
+        Ok(Ready(p)) -> p
+
+        Ok(HelpRequested) ->
+            prints(help(spec))
+            exit(0)
+
+        Ok(VersionRequested) ->
+            prints(spec.name + " " + spec.version + "\n")
+            exit(0)
+
+        Err(e) ->
+            eprints(spec.name + ": error: " + e.message() + "\n")
+            eprints(usage_line(spec) + "\n")
+            eprints("try '" + spec.name + " --help' for more information.\n")
+            exit(2)
+end parse_or_exit

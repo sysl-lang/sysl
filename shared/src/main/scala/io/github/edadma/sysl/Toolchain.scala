@@ -366,6 +366,12 @@ object Toolchain {
       : Either[String, (Int, String)] =
     runIr(Compiler.compiledWith(sources, libraries, Target.default, precompiled, std), args, archives)
 
+  /** The same, with the program's two output streams kept apart. */
+  def compileAndRunFully(sources: List[Source], libraries: List[Program], args: List[String],
+                         std: Option[Stdlib], precompiled: Set[String], archives: List[String])
+      : Either[String, (Int, String, String)] =
+    runIrFully(Compiler.compiledWith(sources, libraries, Target.default, precompiled, std), args, archives)
+
   /** `args` are the words the program is started with, which reach it exactly as they would from a
    * shell: the executable's own path arrives ahead of them as the zeroth, since that is what the
    * platform passes and not something this could withhold.
@@ -376,13 +382,25 @@ object Toolchain {
    */
   private[sysl] def runIr(compiled: Either[String, Compiled], args: List[String],
                           archives: List[String] = Nil): Either[String, (Int, String)] =
+    runIrFully(compiled, args, archives).map { case (code, out, _) => (code, out) }
+
+  /** The same, keeping the two streams apart.
+   *
+   * Almost everything that runs a program wants its output and does not care which descriptor it
+   * came out of, which is what `runIr` above is for. What needs the distinction is anything
+   * asserting about a *diagnostic*: `sysl.args` puts a usage error on standard error and its
+   * `--help` on standard output precisely so the two can be redirected apart, and a test that
+   * concatenated them could not tell whether that had happened.
+   */
+  private[sysl] def runIrFully(compiled: Either[String, Compiled], args: List[String],
+                               archives: List[String] = Nil): Either[String, (Int, String, String)] =
     compiled.flatMap { c =>
       val exe = createTempFile("sysl-", "")
 
       build(c.ir, exe, Target.default, archives, defaultOptimization, c.links).map { _ =>
         val result = exec(exe :: args)
         deleteFile(exe)
-        (result.exitCode, result.stdout)
+        (result.exitCode, result.stdout, result.stderr)
       }
     }
 }

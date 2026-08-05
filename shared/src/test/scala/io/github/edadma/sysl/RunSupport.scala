@@ -70,6 +70,33 @@ trait RunSupport extends Matchers { this: Assertions =>
     finally deleteFile(path)
   }
 
+  /** A program's whole outcome — its status, its standard output and its standard error, kept
+   * apart — for the runs where which stream something came out of is the thing being asserted.
+   *
+   * `run` and `runWith` above fail a program that did not exit cleanly, which is right for almost
+   * everything and wrong for a command-line parser: stopping with a status and a diagnostic is
+   * behaviour it is *for*, and a helper that treated it as a failure could not test it. Nothing is
+   * asserted here; the caller reads the three parts and says what it expects of each.
+   */
+  protected case class Outcome(status: Int, out: String, err: String)
+
+  protected def outcomeOf(src: String, args: String*): Outcome = {
+    assume(Toolchain.clangAvailable, "clang not available")
+
+    val sources = List(Source("<input>", src))
+    val result = PrebuiltStd.forHost match {
+      case Some((std, precompiled, archive)) =>
+        Toolchain.compileAndRunFully(sources, Nil, args.toList, Some(std), precompiled, List(archive))
+      case None =>
+        Toolchain.compileAndRunFully(sources, Nil, args.toList, None, Set.empty, Nil)
+    }
+
+    result match {
+      case Right((status, out, err)) => Outcome(status, out, err)
+      case Left(e)                   => fail(e)
+    }
+  }
+
   /** The same, for a program written as several files. */
   protected def runOf(fs: (String, String)*): String =
     ran(fs.toList.map { case (name, text) => Source(name, text) })
