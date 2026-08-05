@@ -101,8 +101,9 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
     // Hands ScalaTest a thread pool, which is what a suite mixing in `ParallelTestExecution`
     // needs before it can run its tests at the same time. Without it the mixin is not an error
     // and not a warning — it simply has nowhere to distribute to and runs everything in order,
-    // which is how `DocsTests` came to spend six minutes doing four hundred compilations on one
-    // core while seventeen sat idle.
+    // which is how the documentation suite came to spend six minutes doing four hundred
+    // compilations on one core while seventeen sat idle. That suite has moved to the site's own
+    // repository and this setting stays, because the suites left here mix in the same thing.
     //
     // JVM-only on purpose: the JS and Native runners are single-threaded, so the two suites that
     // ask for parallelism there get the sequential behaviour they had before rather than an
