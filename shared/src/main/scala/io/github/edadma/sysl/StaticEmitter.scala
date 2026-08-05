@@ -23,8 +23,11 @@ trait StaticEmitter extends StringEmitter {
    */
   protected def genVals(vals: List[TVal]): String =
     vals.map { v =>
-      if v.computed then s"@${v.symbol} = private global ${v.ty.llvm} zeroinitializer\n"
-      else s"@${v.symbol} = private constant ${v.ty.llvm} ${constantValue(v.init)}\n"
+      val kind = if v.computed || v.writable then "global" else "constant"
+
+      v.init match
+        case Some(init) if !v.computed => s"@${v.symbol} = private $kind ${v.ty.llvm} ${constantValue(init)}\n"
+        case _                         => s"@${v.symbol} = private $kind ${v.ty.llvm} zeroinitializer\n"
     }.mkString
 
   /** A `val`'s initializer as a **constant expression** — text laid straight into the object file,

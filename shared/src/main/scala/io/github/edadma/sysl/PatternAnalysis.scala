@@ -118,7 +118,7 @@ trait PatternAnalysis extends TypeResolution {
             // and letting the name bind instead is precisely the trap the paragraph above says
             // cannot arise. It is refused rather than quietly shadowed, which leaves the reader the
             // choice of a different name or an equality test.
-            case None if valKey(written).isDefined =>
+            case None if globalKey(written).isDefined =>
               err(s"'$written' is a 'val', which is read while the program runs, so a pattern cannot " +
                 s"match against it — compare it in a guard, or bind a different name")
             // An `extern` variable is storage too, and storage the linker fills — so there is even

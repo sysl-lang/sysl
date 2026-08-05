@@ -671,15 +671,29 @@ no-op. A function never takes it either: settled by what it reads, the modifier 
 one that reads nothing and impossible on one that reads a binding, since a frame is the one thing a
 module member cannot have.
 
-**Module storage that may be *written* — `static var` — is not built.** Its questions are its own and
-are not this section's: whether it may hold a value that owes a release, what `&` of it means, and
-what a `@pure` function may do with it. `guide/slab` is the customer waiting on it — a static arena
-is one region at one address for the life of the program, which is what a file-scope array is in C,
-and until there is one the region is declared where the program starts and threaded as a `*u8`
-through every function that touches it. That is tolerable in a program of seven sections and does not
-stay tolerable: an allocator is what every other part of a no-heap program asks for storage, so "pass
-the arena in" ends up a parameter on every function that might ever allocate — the argument a
-capability system makes for itself, arrived at from the wrong direction.
+**`static var` is the same storage, written.** It takes from the `val` everything about being a
+module member — visibility, the shared value namespace, the initializer dependency graph and its
+cycle diagnostic, hoisting — and adds the two things the word `var` already means: assignment at
+every depth, and `&`. `&k[0]` on a `val` is refused because a `val` promises its storage is written
+once and that is where the promise is kept; a `static var` promises nothing.
+
+It is stricter in exactly one place, and it is the subtle one. **It may not hold a value that owes a
+release, and the question is asked of the TYPE where a `val`'s is asked of the VALUE.** A `val` is
+forever the value it was given, so `static val greeting: string = "hello"` is admissible — a
+literal's owner word is null and nothing was ever built. A `static var` could be given that literal
+and `str(n)` on the next line, and whatever it holds when the program ends has nowhere to write its
+release, so the question is about what the storage may *ever* hold.
+
+Its **initializer may be absent**, which a `val`'s may not: a variable with no value is still a
+complete declaration of storage, and the type's zero is what it starts at. That is the cheapest form
+— `zeroinitializer` and no store at all — and the one an arena wants. Its **type is mandatory** for
+the same reason a `val`'s is (`§2`), and it bites harder here, since there may be no initializer for
+one to be inferred from.
+
+`guide/slab` was the customer and is now the demonstration: two regions, one address each for the
+life of the program, declared where they are carved rather than threaded as a `*u8` through six
+sections. What it still cannot say is what address a region should *start* at — module storage has no
+way to state an alignment, so the allocator rounds up and pays for it out of the region.
 
 A program in which no file carries a statement is a complete program that does nothing: the entry
 point exists, runs nothing, and succeeds. That is what a tree of pure declarations compiles to,

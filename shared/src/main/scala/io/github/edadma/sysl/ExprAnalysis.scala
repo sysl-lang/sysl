@@ -393,8 +393,8 @@ trait ExprAnalysis
                 // A `val` is the other half of that: nothing is folded, because it is storage. The
                 // name reaches the storage itself, which is why it can be indexed and iterated.
                 case None =>
-                  valKey(name) match
-                    case Some(key) => TGlobal(key, valType(key))
+                  globalKey(name) match
+                    case Some(key) => TGlobal(key, globalType(key), globalWritable(key))
                     // An `extern` variable is storage too, so it becomes the same node — under the
                     // **symbol** rather than the key, since what it names is what the linker
                     // supplies, and writable, since the storage is not this program's to promise

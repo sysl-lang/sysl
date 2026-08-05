@@ -117,8 +117,17 @@ trait ConstFolding extends ImportResolution {
 
   // --- module-level `val`s ---------------------------------------------------------------
 
-  /** The key a written module-level **`val`** name resolves to. */
-  protected def valKey(written: String): Option[String] = resolveName(written)(valDecls.contains)
+  /** The key a written name for module storage resolves to — a `val` or a `static var`.
+   *
+   * The two are one lookup because they are one namespace and one kind of thing: storage the module
+   * owns, reached by name. Which of the two a key names decides only whether the storage may be
+   * *written*, and that is asked separately, where it matters.
+   */
+  protected def globalKey(written: String): Option[String] =
+    resolveName(written)(k => valDecls.contains(k) || staticVarDecls.contains(k))
+
+  /** Whether a key names storage that may be written — a `static var` rather than a `val`. */
+  protected def globalWritable(key: String): Boolean = staticVarDecls.contains(key)
 
   /** The type a module-level `val` was declared with.
    *
@@ -126,10 +135,11 @@ trait ConstFolding extends ImportResolution {
    * the initializer — so one `val` may be read from another's neighbourhood with no ordering
    * between them, exactly as two functions may call each other.
    */
-  protected def valType(key: String): Type = valTypes.getOrElseUpdate(key, {
-    val decl = valDecls(key)
-
-    inDecl(key)(decl.typ.map(resolveType(_, Map.empty)).getOrElse(Type.Unknown))
+  protected def globalType(key: String): Type = valTypes.getOrElseUpdate(key, {
+    inDecl(key)(staticVarDecls.get(key).orElse(valDecls.get(key)) match
+      case Some(v: VarDecl) => v.typ.map(resolveType(_, Map.empty)).getOrElse(Type.Unknown)
+      case Some(v: ValDecl) => v.typ.map(resolveType(_, Map.empty)).getOrElse(Type.Unknown)
+      case _                => Type.Unknown)
   })
 
   // --- `extern` variables -----------------------------------------------------------------

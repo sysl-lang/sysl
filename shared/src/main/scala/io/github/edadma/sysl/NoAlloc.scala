@@ -62,11 +62,11 @@ trait NoAlloc extends AnalyzerBase {
 
       scan(f.body, why)
       allocator.blame(f.body, why)
-    for v <- vals if noAlloc(Modules.moduleOf(v.symbol)) do
+    for v <- vals if noAlloc(Modules.moduleOf(v.symbol)); init <- v.init do
       val why = because(Modules.moduleOf(v.symbol))
 
-      scan(v.init, why)
-      allocator.blame(v.init, why)
+      scan(init, why)
+      allocator.blame(init, why)
     if noAlloc(mainModule) then
       scan(main, because(mainModule))
       allocator.blame(main, because(mainModule))

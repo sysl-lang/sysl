@@ -791,7 +791,13 @@ case class TVSlot(target: String, recv: RecvMode, params: List[Type], retTy: Typ
  * object file and nothing runs; anything else is code, evaluated once before the program's own
  * statements and stored, in an order the initializers' dependencies settle (`13 §7`).
  */
-case class TVal(symbol: String, ty: Type, init: TExpr, computed: Boolean)
+case class TVal(
+    symbol: String,
+    ty: Type,
+    init: Option[TExpr],
+    computed: Boolean,
+    writable: Boolean = false,
+)
 
 /** The `main` a program declared, which runs after its top-level statements (`13 §7`).
  *

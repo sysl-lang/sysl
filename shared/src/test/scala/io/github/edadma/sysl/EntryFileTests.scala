@@ -227,21 +227,72 @@ class EntryFileTests extends AnyFreeSpec with CodegenSupport with RunSupport wit
     }
   }
 
-  /** Module storage that may be **written** is a different thing from a `static val`, and not built:
-    * whether it may hold a value that owes a release, what `&` of it means, and what a `@pure`
-    * function may do with it are its questions and not this one's.
+  /** `static var` — module storage the program may **write**, which is what `static val` is not.
     *
-    * It is refused at the spelling rather than left to fail as an unbound name, which is what it did
-    * while the parser took the word and nothing registered the storage.
+    * Three things separate it from the `val`, and each is what the word `var` already means: it may
+    * be assigned at every depth, its initializer may be absent, and the release rule is asked of its
+    * **type** rather than of its value, since a variable may be given a different value tomorrow.
     */
-  "a 'static var' says what is not built, rather than failing as an unknown name" in {
-    err(
-      """static var ticks: int = 0
-        |tick()
-        |    ticks += 1
-        |tick()
-        |print(str(ticks))""".stripMargin,
-    ) should include("module storage that may be *written* is not built yet")
+  "a 'static var' is module storage that may be written" - {
+    "so a helper reads and writes it, with nothing passed in" in {
+      run(
+        """static var ticks: int = 0
+          |
+          |tick() = ticks += 1
+          |
+          |tick()
+          |tick()
+          |tick()
+          |print(str(ticks))""".stripMargin,
+      ) shouldBe "3\n"
+    }
+
+    "and another file writes it too, which a local could never allow" in {
+      runIn(
+        ("", "main.sysl", "static var hits: int = 0\nbump()\nbump()\nprint(str(hits))"),
+        ("", "other.sysl", "bump() = hits += 1"),
+      ) shouldBe "2\n"
+    }
+
+    // The cheapest form, and the one an arena wants: `zeroinitializer` and no store at all.
+    "its initializer may be absent, which a 'val' may not" in {
+      run("static var slot: int\nslot = 7\nprint(str(slot))") shouldBe "7\n"
+    }
+
+    "and it is a 'global' rather than a 'constant', since the program writes it" in {
+      ir("static var n: int = 5\nn = 6\nprint(str(n))") should include("private global")
+    }
+
+    "while a 'static val' of the same shape stays a constant" in {
+      ir("static val n: int = 5\nprint(str(n))") should include("private constant")
+    }
+
+    // Asked of the TYPE, where a `val`'s is asked of the value — a `static val` may hold a string
+    // *literal*, because a literal's owner word is null and nothing was built. A variable could be
+    // given `str(n)` on the next line, so the question is what the storage may ever hold.
+    "but it may not hold a type that owes a release, even given a literal" in {
+      err("static var greeting: string = \"hello\"\nprint(greeting)") should
+        include("question is asked of the type here")
+    }
+
+    "where a 'static val' given that same literal is admitted" in {
+      run("static val greeting: string = \"hello\"\nprint(greeting)") shouldBe "hello\n"
+    }
+
+    "it states its type, having no value to infer one from" in {
+      err("static var n = 1\nprint(str(n))") should include("states its type")
+    }
+
+    "and a '@pure' function may not read one" in {
+      err(
+        """static var seed: int = 1
+          |
+          |@pure
+          |peek() -> int = seed
+          |
+          |print(str(peek()))""".stripMargin,
+      ) should not be empty
+    }
   }
 
   "'static' says nothing anywhere else, and is refused rather than ignored" - {

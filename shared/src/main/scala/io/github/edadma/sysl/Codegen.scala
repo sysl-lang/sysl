@@ -207,9 +207,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     pushTemps()
     pushOwned()
 
-    for v <- vals if v.computed do
+    for v <- vals if v.computed; init <- v.init do
       pushTemps()
-      emit(s"store ${v.ty.llvm} ${genExpr(v.init)}, ptr @${v.symbol}")
+      emit(s"store ${v.ty.llvm} ${genExpr(init)}, ptr @${v.symbol}")
       popTemps()
 
     stmts.foreach(genStmt)
@@ -258,9 +258,9 @@ class Codegen private (protected val program: TProgram, promotions: Escape.Promo
     pushTemps()
     pushOwned()
 
-    for v <- vals if v.computed do
+    for v <- vals if v.computed; init <- v.init do
       pushTemps()
-      emit(s"store ${v.ty.llvm} ${genExpr(v.init)}, ptr @${v.symbol}")
+      emit(s"store ${v.ty.llvm} ${genExpr(init)}, ptr @${v.symbol}")
       popTemps()
 
     val named   = freshLabel("test.named")
