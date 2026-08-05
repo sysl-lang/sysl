@@ -213,10 +213,15 @@ object CoreTraits {
     // number this language lets a program compute with, which is where the matter rests.
     case "Hash" => t.isInstanceOf[Type.Integer] || t == Type.Char || t == Type.Bool || t == Type.Str
 
-    // Everything with one textual form worth printing. A pointer is deliberately left out: an
-    // address renders differently on every run, so a program that wants one in its output asks for
-    // it rather than getting it from `print(p)`.
-    case "Display" => Type.isNumeric(t) || t == Type.Str || t == Type.Char || t == Type.Bool
+    // **The integers only, because they are the one family here that is open.** `bool`, `char`,
+    // `string` and the two floats have ordinary `impl` blocks in `lib/sysl/display.sysl`, which is
+    // what a closed family gets — and what lets a value of one be erased to a `*Display`, since a
+    // method table needs a function that exists and a membership provided here has none.
+    //
+    // A pointer is deliberately left out of both halves: an address renders differently on every
+    // run, so a program that wants one in its output asks for it rather than getting it from
+    // `print(p)`.
+    case "Display" => t.isInstanceOf[Type.Integer]
 
     case _ => false
     }
@@ -276,9 +281,8 @@ object CoreTraits {
 
     case i: Type.Integer if i.signed => Some(("display_int", Type.Integer(64, signed = true)))
     case _: Type.Integer             => Some(("display_uint", Type.Integer(64, signed = false)))
-    case _: Type.Floating            => Some(("display_real", Type.Real))
-    case Type.Bool                   => Some(("display_bool", Type.Bool))
-    case Type.Char                   => Some(("display_char", Type.Char))
-    case Type.Str                    => Some(("display_str", Type.Str))
-    case _                           => None
+
+    // The closed families are not here: `bool`, `char`, `string` and the two floats reach their
+    // rendering through an ordinary `impl` in `lib/sysl/display.sysl`, the way any other type does.
+    case _ => None
 }
