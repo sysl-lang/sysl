@@ -199,6 +199,45 @@ class ArgsScanTests extends AnyFreeSpec with RunSupport {
     runWith(src, "-v", "a", "-x") shouldBe "first v\n [a] [-x]\n"
   }
 
+  /** The corners nothing on the page is about, which is why they are the ones that break: a word
+   * that is only a separator, a value that contains the character the value was found by, and the
+   * empty string, which is a word a shell can pass and nothing about a dash describes.
+   */
+  "the corners" - {
+    // Only the first `=` splits, so a value may contain as many more as it likes. Without this,
+    // `--define=NAME=value` — the shape every compiler's `-D` has — would lose half of itself.
+    "a value keeps every '=' after the one that split it" in {
+      scanned("--output=a=b=c") shouldBe " =a=b=c\n"
+    }
+
+    // `--=x` has no name at all. It is reported as a long option whose name is empty rather than
+    // being mistaken for the `--` separator, which is a different word — and the value it carries
+    // is then one nobody asked for, so the scan stops there rather than reading `after` as though
+    // the line had made sense.
+    "a long option with an empty name is an option, not a separator" in {
+      scanned("--=x", "after") shouldBe " -- !-- takes no value\n"
+    }
+
+    // A word of no characters is not a dash and not a separator, so it is an operand — and it has
+    // to survive as one, since a shell can pass it and a program may mean it.
+    "the empty string is an operand" in {
+      scanned("", "a") shouldBe " [] [a]\n"
+    }
+
+    // The value takes the next word whatever it is, and `--` is a word. This follows from the rule
+    // rather than being a case of its own, which is exactly why it is worth pinning: the separator
+    // has no special standing once an option has asked for a value.
+    "a value may be the separator itself" in {
+      scanned("-o", "--", "x") shouldBe " =-- [x]\n"
+    }
+
+    // A dash inside a bundle is a short option named '-'. Nothing sensible declares one, but the
+    // scanner has no table to consult and must report what was written rather than guess.
+    "a dash inside a bundle is a short option like any other" in {
+      scanned("-a-b") shouldBe " a - b\n"
+    }
+  }
+
   /** A cursor is a value, so copying one copies where it is. This is the property that makes
    * looking ahead possible without a `peek` of its own — and the one that makes `for arg in a`
    * wrong, which is why `Scan` implements no `Iterate`.

@@ -382,6 +382,132 @@ class ArgsCliTests extends AnyFreeSpec with RunSupport {
     panics(src, "asked about an option the description does not declare")
   }
 
+  /** The corners the design says nothing about, which is why they are the ones that break: a table
+   * with nothing in it, a program that declares no short spellings at all, and a description whose
+   * every optional part was left out.
+   */
+  "the corners" - {
+    // A table of no options is a real thing — a program that takes only operands and still wants
+    // `--help`. The parallel arrays a `Parsed` holds are sized from the table, so this is the case
+    // where they are empty, and the supplied `--help` still has to be found without them.
+    "a description with no options of its own still offers help" in {
+      val src =
+        """import sysl.args.*
+          |
+          |main(args: []string)
+          |    var empty: []Opt = []
+          |
+          |    parse(cli("thing", empty, operands = "<file>"), args) match
+          |        Ok(Ready(p))         -> print("ready with", p.positionals.len)
+          |        Ok(HelpRequested)    -> print("help")
+          |        Ok(VersionRequested) -> print("version")
+          |        Err(e)               -> print("err:", e.message())
+          |""".stripMargin
+
+      runWith(src, "a", "b") shouldBe "ready with 2\n"
+      runWith(src, "--help") shouldBe "help\n"
+      runWith(src, "-x") shouldBe "err: unknown option -x\n"
+    }
+
+    "and its help text is the usage line and the one row" in {
+      val src =
+        """import sysl.args.*
+          |
+          |var empty: []Opt = []
+          |
+          |prints(help(cli("thing", empty, operands = "<file>")))
+          |""".stripMargin
+
+      run(src) shouldBe
+        """|usage: thing [options] <file>
+           |
+           |options:
+           |  -h, --help  show this help and exit
+           |""".stripMargin
+    }
+
+    // Every optional part of a description left out: no about, no version, no operands. The usage
+    // line is then the program's name and `[options]`, and nothing above the table.
+    "a description with only a name and a table" in {
+      val src =
+        """import sysl.args.*
+          |
+          |var q = flag('q', "quiet", "say less")
+          |
+          |prints(help(cli("thing", [q])))
+          |""".stripMargin
+
+      run(src) shouldBe
+        """|usage: thing [options]
+           |
+           |options:
+           |  -q, --quiet  say less
+           |  -h, --help   show this help and exit
+           |""".stripMargin
+    }
+
+    // A table of nothing but long options: every label is indented past where a letter would go, so
+    // the `--`s line up with those of options that have one.
+    "a table with no short spellings lines its long ones up anyway" in {
+      val src =
+        """import sysl.args.*
+          |
+          |var a = long_flag("alpha", "the first")
+          |var b = long_option("beta", "n", "the second")
+          |
+          |prints(help(cli("thing", [a, b])))
+          |""".stripMargin
+
+      run(src) shouldBe
+        """|usage: thing [options]
+           |
+           |options:
+           |      --alpha     the first
+           |      --beta <n>  the second
+           |  -h, --help      show this help and exit
+           |""".stripMargin
+    }
+
+    // A short-only option has no `--` to line up with and takes the column on its own.
+    "a short-only option is listed with no word" in {
+      val src =
+        """import sysl.args.*
+          |
+          |var old = short_flag('x', "kept for something older")
+          |var num = short_option('n', "count", "how many")
+          |
+          |prints(help(cli("thing", [old, num])))
+          |""".stripMargin
+
+      run(src) shouldBe
+        """|usage: thing [options]
+           |
+           |options:
+           |  -x          kept for something older
+           |  -n <count>  how many
+           |  -h, --help  show this help and exit
+           |""".stripMargin
+    }
+
+    // And it parses by its letter, with no long spelling to reach it by.
+    "a short-only option is read by its letter" in {
+      val src =
+        """import sysl.args.*
+          |
+          |main(args: []string)
+          |    var num = short_option('n', "count", "how many")
+          |
+          |    parse(cli("thing", [num]), args) match
+          |        Ok(Ready(p)) -> print("n=" + p.value_or(num, "-"))
+          |        Err(e)       -> print("err:", e.message())
+          |        else print("other")
+          |""".stripMargin
+
+      runWith(src, "-n", "3") shouldBe "n=3\n"
+      runWith(src, "--count", "3") shouldBe "err: unknown option --count\n"
+    }
+  }
+
   /** `value` answers `None` for an option that was never given, and for one that takes no value
    * however often it was. Both halves matter: the first is what `value_or`'s default is for, and
    * the second stops a flag from ever looking as though it carried something.
