@@ -473,9 +473,18 @@ class LibraryMoveTests extends LibrarySeamSupport {
       // The case that found it: reaching libc's real stream, which every program does by declaring
       // it. `run` is what makes this a check rather than a spelling — a program whose `stdout`
       // resolved to the library's function does not compile at all.
+      //
+      // The symbol behind C's `stdout` is a **platform** fact, not a C fact: `__stdoutp` on Darwin
+      // and `stdout` on glibc, because the macro expands differently. Written with one spelling this
+      // linked on the author's machine and nowhere else — which is what it did until the suite was
+      // first run on Linux.
       "an 'extern' variable, which is how a program reaches libc's own stream" in {
         run(
-          """extern "__stdoutp" stdout: *u8
+          """#if macos
+            |extern "__stdoutp" stdout: *u8
+            |#else
+            |extern stdout: *u8
+            |#endif
             |extern fputs(s: *u8, stream: *u8) -> i32
             |print("one")
             |fputs(c"two\n", stdout)

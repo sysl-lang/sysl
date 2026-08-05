@@ -295,8 +295,17 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
         include("@environ = external global ptr")
     }
 
+    // `errno` is a macro on both platforms and the symbol behind it differs — `__error` on Darwin,
+    // `__errno_location` on glibc — so the declaration is gated the same way `sysl.fs`'s own is.
+    // One spelling links on one machine, which is not what this test is about.
     "while a global C also exposes as a function is reachable that way too" in {
-      run("extern \"__error\" errno_at() -> *i32\nprint(*errno_at() == 0)") shouldBe "true\n"
+      run(
+        """#if macos
+          |extern "__error" errno_at() -> *i32
+          |#else
+          |extern "__errno_location" errno_at() -> *i32
+          |#endif
+          |print(*errno_at() == 0)""".stripMargin) shouldBe "true\n"
     }
 
     /** A callable's *sysl* type is a trait object — two words, a method table beside the value — and
