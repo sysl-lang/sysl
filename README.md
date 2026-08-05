@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/static/sysl-wordmark.svg" alt="sysl" width="360">
+  <img src="https://sysl.sh/sysl-wordmark.svg" alt="sysl" width="360">
 </p>
 
 <p align="center">
@@ -31,13 +31,19 @@ a local binding that gives a second name to storage something else already owns.
 
 - **[The tour](https://sysl.sh/tour/)** — the language and its standard library in one
   pass, from `print` to a program that reads its input. Every program on those pages is compiled and
-  run by the test suite, so a page that has drifted from the compiler fails the build.
+  run by a test suite, so a page that has drifted from the compiler fails.
 - **[`design/`](design/)** — the numbered specification. The language is designed in
   writing before it is implemented, and each chapter carries the argument for its rules along with
   the alternatives that were rejected.
 - **[`guide/`](guide/)** — complete working programs at the size where the choices start to matter.
 
-The site source is `docs/`, built with [juicer](https://juicer.build/) and deployed from `dev`.
+The site lives in **[sysl-lang/sysl.sh](https://github.com/sysl-lang/sysl.sh)**, which drives this
+compiler as a published dependency. That is deliberate rather than incidental: a website documents
+the *released* language, so its pages are checked against whatever version is on Central, and a page
+demonstrating something only `dev` can do would be wrong for the person reading it.
+
+What stays here is the specification, which belongs in the same commit as the code implementing it,
+and `guide/` + `examples/`, which are checked against `dev` on every run.
 
 ## Building
 
