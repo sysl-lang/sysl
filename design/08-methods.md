@@ -364,12 +364,8 @@ and they coexist the way Swift's body methods and protocol conformances do. Name
 - An **inherent** member of the receiver's type is found first.
 - Failing that, a member from a **trait the type conforms to** (`impl Trait for Type`) is found.
 
-An inherent member and a trait requirement of the same name is the case where the type is
-choosing to satisfy the trait with its own method; the analyzer treats the inherent member as
-the implementation rather than reporting a clash.
-
-**Where the trait member has a default body, that is an override and must say so** (`02 §`
-`override`). The two cases part company on whether anything is being replaced:
+**An inherent member and a trait member of the same name are a collision, and the type is told so.**
+The implementation of a trait is written in the `impl` block that keeps the promise, and only there:
 
 ```
 trait Fallible
@@ -377,19 +373,28 @@ trait Fallible
 
 struct File
     err: int
-    override failed(self) -> bool = self.err != 0
+    failed(self) -> bool = self.err != 0     // refused
 ```
 
-A bare **requirement** is satisfied by the inherent member and nothing is replaced, so the keyword
-does not apply and is refused. A **default body** is replaced, which is the same act as replacing it
-inside the `impl` block — and a rule that asked for the keyword there and not here would be asking
-about where the member was written rather than about what it does.
+Which refusal it takes says which half of the rule caught it, and both are worth reading. With a
+**default body**, as above, the block inherits `failed` for `File` and the inherent one is a second
+member of that name: *type 'File' already has a member named 'failed'*. With a bare **requirement**
+the block supplies nothing, so what is reported is the promise it fails to keep: *'File' does not
+implement 'Fallible': method 'failed' is missing*. Either way the fix is the same line moved one
+place — into the block, and marked `override` where it replaces a default (`02 § override`).
 
-The silence is the reason this is worth a keyword at all. A member that quietly becomes some trait's
-implementation is a coupling nothing in the source shows: add a method whose name a trait you
-implement happens to use, and its default stops running, at a distance, with no diagnostic. The operator traits of `00` §9 (`+`, `[]`, the
-comparisons) are trait members by this rule — overloading an operator is implementing its trait,
-declared as `impl Trait for Type`, never an inherent method with an operator name.
+An earlier draft of this section said the opposite: that an inherent member of a trait member's name
+was the type choosing to satisfy the trait with its own method, and that the analyzer took it as the
+implementation rather than reporting a clash. **That was never true of the compiler**, in either
+case, and it is worth recording as a claim rather than quietly deleting, because it is the reading
+somebody arriving from Swift will bring. What sysl has instead is the stricter rule, and the reason
+to keep it is the silence the Swift reading buys: a member that quietly becomes some trait's
+implementation is a coupling nothing in the source shows — add a method whose name a trait you
+implement happens to use, and its default stops running, at a distance, with no diagnostic.
+
+The operator traits of `00` §9 (`+`, `[]`, the comparisons) are trait members by this rule —
+overloading an operator is implementing its trait, declared as `impl Trait for Type`, never an
+inherent method with an operator name.
 
 ### One name, one member — and what a second implementation does to that
 

@@ -136,8 +136,23 @@ trait Greet
     greet(self) -> string = "hello, " + self.name()
 ```
 
-`impl Greet for Cat` then writes `name` and gets `greet` free, or writes both and overrides it. A
-trait whose every method has a default leaves nothing to write at all, so the block is optional —
+`impl Greet for Cat` then writes `name` and gets `greet` free, or writes both — and the second one
+says **`override`**, because replacing a body the trait supplied is the same act as replacing an
+implementation (`02 § override`):
+
+```
+impl Greet for Dog
+    name(self) -> string = self.n
+    override greet(self) -> string = "woof from " + self.n
+```
+
+The keyword is required there and refused on `name`, which answers a requirement rather than
+replacing anything. What it buys is that an `impl` block says which of its members are doing which,
+a question that otherwise means opening the trait to find out. It costs almost nothing, because an
+implementation happy with a default writes no member at all — across `lib/`, `guide/` and
+`examples/` exactly two members replace one.
+
+A trait whose every method has a default leaves nothing to write at all, so the block is optional —
 `impl Zero for E` on its own line is a complete implementation, and the opt-in is the point of
 writing it.
 
@@ -358,9 +373,6 @@ nothing about it. `"hi".bytes` is a `[]u8` and is covered.
 
 ### One implementation per type, unless the second one says `override`
 
-**Designed, not yet built.** What follows is the decided rule; the compiler still refuses every
-overlap, which is the first half of it.
-
 `impl Display for []int` and `impl[T] Display for []T` would both say how a `[]int` renders. By
 default **whichever is written second is refused**, and the diagnostic names the one already there.
 That is the rule this section used to end at, and it stays the default for a reason worth keeping:
@@ -409,30 +421,49 @@ and which are supplying what the trait required, and that is the same question i
 costs almost nothing to say so, because an implementation that is happy with a default writes no
 member at all; across `lib/`, `guide/` and `examples/` exactly two members replace one.
 
-**And it reaches the same act written somewhere else.** A type's own **inherent** member may carry a
-trait member's name, and `08 §` gives it precedence — silently, which is the whole problem. Where
-the trait member is a bare requirement the inherent one merely satisfies it and the keyword is
-refused; where the trait member has a **default body**, the inherent member replaces it and must say
-`override`, exactly as it would inside the block. The test is what the member *does*, never where it
-was written.
+**And there is nowhere else the word may be written.** A trait's own member is where a default is
+*written* rather than replaced, so it may not say `override`. Neither may a member of a type's own
+body: an inherent member implements no trait, and a name a trait also declares is a collision on the
+type rather than an implementation of it (`08 § Interaction with traits`) — so there is nothing there
+for the keyword to mark.
+
+#### The overriding side is always a type written out in full
+
+`override` is refused on a block written for a **shape** or for a **generic type**, because neither
+has anything below it to be more specific than. A shape is one key and so is a generic type's name,
+and the two blocks that would sit under them are already refused outright: `impl[T] Show for [][]T`
+matches a shape's argument by *its* shape, which one key cannot express, and `impl Show for Box[int]`
+fixes one instantiation of a block that covers every instantiation at once. So there is no ordering
+*within* the shapes or *within* the generic types, and the more specific of an overlapping pair is
+always the type spelled out in full.
+
+That is worth saying at the block rather than leaving the ordering to find nothing, because the
+mistake it catches is the readable one: somebody marks the general block, having read the rule as
+"the block that knows about the overlap says so".
 
 #### Which of two implementations is more specific
 
 `override` says a replacement was meant. It does not say *what* is being replaced, so the language
-still needs an ordering, and it is deliberately a small one. For two implementations of one trait
-whose heads both match some type:
+still needs an ordering — and the ordering it needs turns out to be one rule, because the section
+above has already thrown out every case the other rules would have decided.
 
-1. **Structure first.** A written-out type beats a parameter at the position they differ:
-   `[]Point` over `[]T`, `[][]T` over `[]U`.
-2. **Then bound strength.** For two shapes of the same structure, the larger set of bounds under
-   supertrait closure wins — `impl[T: Ord]` over `impl[T: Display]` where `Ord` requires `Display`.
-3. **Otherwise they are incomparable**, and the overlap is refused even with `override`, because
-   there is nothing for the keyword to choose between. `impl[T: Ord] Display for []T` against
-   `impl[T: Hash] Display for []T` is the case: neither is a stronger statement than the other, and
-   a rule that picked one would be picking by declaration order, which is not a reason.
+**Structure decides, and structure is all there is.** A type written out in full beats a parameter at
+the position they differ: `[]Point` over `[]T`, `Stamp` over a blanket's bare `T`. That is the whole
+ordering, and what makes it enough is that no two blocks can be *equally* structured and still
+overlap — two blocks for one shape are two blocks for one key, and so are two for one generic type,
+and both were refused long before `override` existed.
 
-The third case is why `override` is a statement of intent rather than a tiebreak. It cannot paper
-over an ambiguity; it can only resolve one the ordering already resolved.
+It is also exactly what the lookup already did. A member is sought under the type's own key, then
+under its shape's, then under a blanket's, and each of those steps is one rung of the ordering read
+as a search. So the more specific block wins by being the first place looked, and nothing had to be
+taught to compare two implementations.
+
+What the ordering does **not** try to do is rank two conditions. `impl[T: Ord] Display for []T` and
+`impl[T: Hash] Display for []T` are two blocks for the one `[]` key and are refused as such — the
+question of whether `Ord` is a stronger statement than `Hash` never arises, and a language that
+answered it would be picking by declaration order, which is not a reason. `override` is therefore a
+statement of intent rather than a tiebreak: it cannot paper over an ambiguity, only take an overlap
+the structure has already resolved.
 
 #### What keeps this sound, and it is not the keyword
 
@@ -934,14 +965,17 @@ type-argument entry already records.
   trait unusable as a trait object, since no vtable slot can hold a function that does not exist
   until a call names its types. Refusing at the declaration is what keeps that from being discovered
   at the `*Trait` instead.
-- ~~**Specialization.**~~ **Decided, and designed above.** This entry said that letting a written-out
-  type beat a shape was the one relaxation here that would be genuinely useful, and that it was not
-  done because such a rule is easy to add and impossible to remove. It is now done, on the terms the
-  section states: the overlap is still refused by default, the second implementation must say
-  `override`, and the ordering is small enough to be written in three lines. What made it affordable
-  was not a change of mind about reversibility — it was noticing that coherence already confines a
-  cross-module override to a type of the overriding module's own, which is what rules out the two
-  tables and the stale instantiation that make specialization hard elsewhere.
+- ~~**Specialization.**~~ **Built.** This entry said that letting a written-out type beat a shape was
+  the one relaxation here that would be genuinely useful, and that it was not done because such a
+  rule is easy to add and impossible to remove. It is done, on the terms the section states: the
+  overlap is still refused by default, the second implementation must say `override`, and the
+  ordering came to one rule rather than the three the design first wrote — the other two had no cases
+  left once the overriding side turned out to be always a type written out in full. What made it
+  affordable was not a change of mind about reversibility. It was noticing that coherence already
+  confines a cross-module override to a type of the overriding module's own, which rules out the two
+  tables and the stale instantiation that make specialization hard elsewhere, and that the member
+  lookup was already searching the type's key before its shape's — so the resolution half cost
+  nothing at all, and what had to be built was the permission.
 - ~~**A property's body must be an expression.**~~ **Built** — a property takes the `funcBody` a
   method takes, so `= expr`, an `=` opening a block, and a bare block are all spellings of it, in a
   trait's default and in a type's own body alike. It was additive exactly as this item predicted, and
