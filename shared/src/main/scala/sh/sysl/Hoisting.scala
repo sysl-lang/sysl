@@ -556,6 +556,31 @@ trait Hoisting extends HoistMembers {
     superChecks.clear()
   }
 
+  /** Holds every `override` to there being something for it to override (`02 § override`), once every
+   * `impl` is registered and the question can be answered.
+   *
+   * This is the check in the other direction from the one the keyword lifts, and it is the one that
+   * earns its keep later: a library drops or narrows the implementation a program was overriding, and
+   * without this the override silently becomes the only one while still claiming to replace
+   * something. The type's **own** key is deliberately not consulted — that is where this very block
+   * is filed, so asking it would find the override overriding itself.
+   */
+  protected def checkOverrides(): Unit = {
+    for (label, bound, ty, pos, scope) <- overrideChecks.toList do
+      currentPos = pos
+      recover(()) {
+        val covering =
+          shapeOwner(ty).flatMap((k, ta) => implAt(bound, k, ty, ta))
+            .orElse(blanketOwners(ty).view.flatMap((k, ta) => implAt(bound, k, ty, ta)).headOption)
+
+        if covering.isEmpty then
+          inScope(scope)(err(s"'$label' says 'override', but nothing else implements " +
+            s"'${showBound(bound, ty)}' for it — an override replaces an implementation that covers " +
+            s"the type more generally, and there is none to replace"))
+      }
+    overrideChecks.clear()
+  }
+
 
   /** Structs, enums, and the built-in scalars share one type namespace, so a name may name at
    * most one of them. `never` is in it too: it names a type, so nothing else may.

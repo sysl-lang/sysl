@@ -202,6 +202,15 @@ trait TraitLookup extends MemberVisibility {
    */
   protected val superChecks = mutable.ListBuffer.empty[(String, String, Type.Bound, Type, Option[Pos])]
 
+  /** Every block marked `override`, with the type it is for and the promise it makes, waiting to be
+   * asked whether anything more general actually covers that type (`02 § override`).
+   *
+   * Held for the reason `superChecks` is held: the block being replaced may be written below this one
+   * or in a module hoisted after it, and an answer that depended on which would make the keyword mean
+   * different things in two files that differ only in their order.
+   */
+  protected val overrideChecks = mutable.ListBuffer.empty[(String, Type.Bound, Type, Option[Pos], Scope)]
+
   /** Checks the arguments a *type* was applied to against what it asks of its parameters, now if
    * that can be answered and after hoisting if it cannot.
    */
@@ -315,9 +324,12 @@ trait TraitLookup extends MemberVisibility {
   /** Where a member of that name is filed for a type: under the type's own key, or — when only a
    * shape-matched block supplies it — under the shape's, with the arguments this type matched at.
    *
-   * The type's own key is asked first, and nothing is ever reached both ways: a block covering a
-   * shape and a written implementation may not give one name to one type (`hoistMemberList`), so the
-   * order settles which table holds the member rather than which of two answers wins.
+   * **The type's own key is asked first, and that order is what makes an override work** (`02 §
+   * override`). Two blocks may give one name to one type only where the written-out one says
+   * `override` (`hoistMemberList`), and then asking the type's key before the shape's is exactly the
+   * "written-out beats a parameter" half of the ordering — the more specific block answers because it
+   * is the first place looked. Everywhere else nothing is reached both ways, and the order merely
+   * settles which table holds the member.
    */
   protected def memberKey(t: Type, mname: String): (String, List[Type]) = {
     val own = memberOwner(t)
@@ -586,11 +598,12 @@ trait TraitLookup extends MemberVisibility {
   /** Which implementation of a trait **at these arguments** a type is covered by, if any: the one
    * written for the type, or the one written for its shape, with the arguments it matched at.
    *
-   * The argument list is what selects, and it selects exactly one. A type may implement a trait more
-   * than once, but never twice at one argument list; and a shape and a type written out in full may
-   * both implement a trait only where each says which one it implements (`hoistImpl`). So this stays
-   * a lookup rather than a choice between implementations, and sysl still needs no rule saying which
-   * of two would be the more specific.
+   * The argument list is what selects, and it selects exactly one *per key*. A type may implement a
+   * trait more than once, but never twice at one argument list; and a shape and a type written out in
+   * full may both implement a trait only where the written-out block says `override` (`hoistImpl`).
+   * That is the one case where two answers exist, and the order below is the ordering `02 §` states:
+   * the type's own key before the shape's before a blanket's, which is "written-out beats a
+   * parameter" read as a sequence of lookups.
    */
   protected def implKey(tr: Type.Bound, t: Type): Option[(List[Type], TraitImpl)] = {
     def at(k: (String, List[Type])) = implAt(tr, k._1, t, k._2).map((k._2, _))

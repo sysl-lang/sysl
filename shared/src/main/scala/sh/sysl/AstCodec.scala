@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 21
+  val Version: Int = 22
 
   private val Magic = "sysl-ast"
 
@@ -202,6 +202,7 @@ object AstCodec {
       tdefaults(m.tdefaults)
       vis(m.vis)
       bool(m.variadic)
+      bool(m.overrides)
     }
 
     private def variant(v: EnumVariantDecl): Unit = {
@@ -352,9 +353,9 @@ object AstCodec {
           tok("trt"); sref(n); list(tps)(sref); list(ms)(method); bounds(bs); list(sups)(bound)
           vis(vs); tdefaults(tds)
 
-        case ImplDecl(tn, ft, ms, tps, bs, targs, tds) =>
+        case ImplDecl(tn, ft, ms, tps, bs, targs, tds, ov) =>
           tok("impl"); sref(tn); typ(ft); list(ms)(method); list(tps)(sref); bounds(bs)
-          list(targs)(typ); tdefaults(tds)
+          list(targs)(typ); tdefaults(tds); bool(ov)
     }
   }
 
@@ -595,7 +596,7 @@ object AstCodec {
 
     private def method(): MethodDecl =
       at(MethodDecl(sref(), opt(recv()), bool(), list(sref()), list(param()), opt(typ()),
-        list(stmt()), bounds(), tdefaults(), vis(), bool()))
+        list(stmt()), bounds(), tdefaults(), vis(), bool(), bool()))
 
     private def variant(): EnumVariantDecl =
       at(EnumVariantDecl(sref(), opt(expr()), list(param())))
@@ -723,7 +724,7 @@ object AstCodec {
         case "trt" =>
           TraitDecl(sref(), list(sref()), list(method()), bounds(), list(bound()), vis(), tdefaults())
         case "impl" =>
-          ImplDecl(sref(), typ(), list(method()), list(sref()), bounds(), list(typ()), tdefaults())
+          ImplDecl(sref(), typ(), list(method()), list(sref()), bounds(), list(typ()), tdefaults(), bool())
         case other => fail(s"'$other' is not a statement tag")
     }
   }

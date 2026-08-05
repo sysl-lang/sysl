@@ -156,7 +156,7 @@ class TraitPropertyRunTests extends AnyFreeSpec with RunSupport {
           |    n: int
           |impl Tagged for A
           |impl Tagged for B
-          |    tag -> string = "bee"
+          |    override tag -> string = "bee"
           |name[T: Tagged](x: T) -> string = x.tag
           |print(name(A(1)))
           |print(name(B(1)))""".stripMargin
@@ -174,7 +174,7 @@ class TraitPropertyRunTests extends AnyFreeSpec with RunSupport {
           |    n: int
           |impl Tagged for A
           |impl Tagged for B
-          |    tag -> string = "bee"
+          |    override tag -> string = "bee"
           |print(A(1).tag)
           |print(B(1).tag)""".stripMargin
 

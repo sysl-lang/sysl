@@ -372,6 +372,11 @@ enum RecvMode:
  * `vis` is how far the member may be named from (`08 § Visibility`). The unmarked default means
  * *its type's* reach rather than public, so `Public` here is "said nothing" and not "said public" —
  * which is why a trait's member and an `impl`'s, neither of which may say anything, carry it too.
+ *
+ * `overrides` is the `override` keyword written in front of the member (`02 § override`), which says
+ * it replaces a body the trait already supplied rather than answering a requirement the trait left
+ * open. It is required where that is what the member does and refused where it is not, so a reader of
+ * an `impl` block can tell the two apart without going to the trait to find out.
  */
 case class MethodDecl(
     name: String,
@@ -385,6 +390,7 @@ case class MethodDecl(
     tdefaults: Map[String, TypeRef] = Map.empty,
     vis: Visibility = Visibility.Public,
     variadic: Boolean = false,
+    overrides: Boolean = false,
 ) extends Positioned {
 
   /** The mode this member takes its receiver in, or `None` for an associated function — which is the
@@ -985,6 +991,12 @@ case class TraitDecl(
  * `traitArgs` are the arguments the **trait** is applied to, for a trait that takes any:
  * `impl From[int] for Celsius`. They are what makes one type able to implement a trait more than
  * once, so they are part of what an implementation is filed under.
+ *
+ * `overrides` is the `override` keyword written in front of the block (`02 § override`), which says
+ * it deliberately replaces a more general implementation that already covers the same type —
+ * `override impl Display for []Point` against the library's `impl[T: Display] Display for []T`.
+ * Without it the second implementation is refused, so the accidental duplicate the rule exists to
+ * catch is still caught.
  */
 case class ImplDecl(
     traitName: String,
@@ -994,6 +1006,7 @@ case class ImplDecl(
     bounds: Map[String, List[BoundRef]] = Map.empty,
     traitArgs: List[TypeRef] = Nil,
     tdefaults: Map[String, TypeRef] = Map.empty,
+    overrides: Boolean = false,
 ) extends Stmt
 
 /** The `module a.b.c` header a file carries, naming the module the file contributes to. The name is

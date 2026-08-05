@@ -239,8 +239,13 @@ trait DeclTables extends Reporting {
    * time.
    *
    * `impl Display for []int` and `impl[T] Display for []T` are two implementations of `Display` for
-   * a `[]int`, and sysl has no rule that picks between two — so whichever is written second is
-   * refused, and this is how the one written first is found however the file ordered them.
+   * a `[]int`, and by default whichever is written second is refused — this is how the one written
+   * first is found however the file ordered them.
+   *
+   * The flag is whether the written-out block said **`override`** (`02 § override`), which is what
+   * makes the pair deliberate rather than a mistake. It has to be recorded rather than asked at the
+   * shape's own declaration, because the shape may be hoisted either before or after the type it
+   * covers and the answer must not depend on which.
    *
    * The trait's arguments are deliberately **not** in the key, though they are what lets one type
    * keep several implementations elsewhere. A shape's members and a written-out type's are filed
@@ -249,7 +254,7 @@ trait DeclTables extends Reporting {
    * unreachable by name whatever their arguments were. What makes several implementations work at
    * all is that they share a namespace to be told apart in, and here they do not.
    */
-  protected val writtenShapes = mutable.LinkedHashMap.empty[(String, String), String]
+  protected val writtenShapes = mutable.LinkedHashMap.empty[(String, String), (String, Boolean)]
 
   /** The members a composed type written out in full was given, keyed by (its shape, the member's
    * name) and holding the type that was written. A shape-matched block may not give a member of the

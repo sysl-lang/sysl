@@ -709,7 +709,7 @@ class FsTests extends AnyFreeSpec with RunSupport with CodegenSupport {
           |end Both
           |
           |impl Fallible for Both
-          |    failed(*self) -> bool = self.over
+          |    override failed(*self) -> bool = self.over
           |
           |impl Reader for Both
           |    read(*self, into: []u8) -> []const u8 = into[0..<0usize]

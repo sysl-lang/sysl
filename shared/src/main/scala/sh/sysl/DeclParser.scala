@@ -200,7 +200,7 @@ trait DeclParser extends ExprParser {
 
   /** A member of a type's own body, which is the one kind that may say how far it is visible. */
   protected lazy val restrictedMember: PackratParser[MethodDecl] =
-    visibility ~ member ^^ { case v ~ m => m.copy(vis = v).setPos(m.pos) }
+    visibility ~ (noOverride ~> member) ^^ { case v ~ m => m.copy(vis = v).setPos(m.pos) }
 
   /** The refusal a trait's member and an `impl`'s share (`08 § Visibility`). Both are reached at the
    * reach the *trait* has — one asks for the member and the other supplies what was asked — so
@@ -210,6 +210,20 @@ trait DeclParser extends ExprParser {
   protected lazy val noVisibility: Parser[Unit] =
     op("private") ~> err("a trait's members and an 'impl' block's carry no visibility of their own — a " +
       "trait's member is as visible as the trait, and an implementation supplies what the trait asked for") |
+      success(())
+
+  /** The refusal a **trait's** member and a **type's own** member share: neither can be replacing
+   * anything, so neither may say `override` (`02 § override`).
+   *
+   * A trait's member is where a default body is *written*, not where one is replaced. A member of a
+   * type's own body implements no trait — a name a trait also declares is a collision there and is
+   * reported as one — so an implementation replaces a default inside the `impl` block that keeps the
+   * promise, which is the one place the keyword belongs.
+   */
+  protected lazy val noOverride: Parser[Unit] =
+    op("override") ~> err("'override' says a member replaces a body its trait supplied, and it is " +
+      "written on that member inside the 'impl' block — a trait's own member is where a default is " +
+      "written rather than replaced, and a member of a type's body implements no trait") |
       success(())
 
   /** `invariant <bool>` among a struct's fields: a condition every value of the struct must satisfy,
@@ -388,7 +402,8 @@ trait DeclParser extends ExprParser {
    * to `methodSig` and a bare property signature to `propertySig`. A signature of either kind asks
    * an implementation for that member; one written with a body supplies a default instead.
    */
-  protected lazy val traitMember: PackratParser[MethodDecl] = noVisibility ~> (member | methodSig | propertySig)
+  protected lazy val traitMember: PackratParser[MethodDecl] =
+    noVisibility ~> noOverride ~> (member | methodSig | propertySig)
 
   /** A trait method signature: a header with no `= body`. The receiver and parameters parse
    * exactly as a real method's do, so a signature and its implementation are compared shape for
@@ -426,16 +441,25 @@ trait DeclParser extends ExprParser {
    * The body itself is optional, because a trait whose every method has a default leaves a
    * conforming type nothing to write: `impl Zero for E` on its own line is the whole of that
    * implementation, and the opt-in it states is the point of writing it.
+   *
+   * The block may be marked **`override`** (`02 § override`), which says it deliberately replaces a
+   * more general implementation already covering the same type. The keyword goes in front of `impl`
+   * rather than anywhere inside, because what it qualifies is the block as a whole.
    */
   protected lazy val implDecl: PackratParser[Stmt] =
-    op("impl") ~> opt(boundedTypeParams) ~ implTrait ~ (op("for") ~> typeRef) >> {
-      case tps ~ ((tname, targs)) ~ forType =>
+    overrideMod ~ (op("impl") ~> opt(boundedTypeParams) ~ implTrait ~ (op("for") ~> typeRef)) >> {
+      case ov ~ (tps ~ ((tname, targs)) ~ forType) =>
         val tp = tps.getOrElse(TypeParams.none)
 
         (implBody | success(Nil)) <~ endTypeRef(forType) ^^ { methods =>
-          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs, tp.defaults)
+          ImplDecl(tname, forType, methods, tp.names, tp.bounds, targs, tp.defaults, overrides = ov)
         }
     }
+
+  /** The `override` keyword in front of a declaration, or nothing — which is the ordinary case and
+   * writes nothing, exactly as public visibility does.
+   */
+  protected lazy val overrideMod: Parser[Boolean] = opt(op("override")) ^^ (_.isDefined)
 
   /** The trait an `impl` is of: a name and its arguments, or a callable written as one (`12 §6`).
    *
@@ -450,7 +474,13 @@ trait DeclParser extends ExprParser {
       qualifiedName ~ opt(typeArgs) ^^ { case n ~ args => (n, args.getOrElse(Nil)) }
 
   protected lazy val implBody: PackratParser[List[MethodDecl]] =
-    newline ~> indent ~> opt(newlines) ~> repsep(noVisibility ~> member, newlines) <~ opt(newlines) <~ dedent
+    newline ~> indent ~> opt(newlines) ~> repsep(implMember, newlines) <~ opt(newlines) <~ dedent
+
+  /** A member of an `impl` block, which is the one place a member may say `override` — the trait it
+   * implements is the only thing a member of a type can be replacing a body from.
+   */
+  protected lazy val implMember: PackratParser[MethodDecl] =
+    noVisibility ~> overrideMod ~ member ^^ { case ov ~ m => m.copy(overrides = ov).setPos(m.pos) }
 
   /** An optional `end Name` marker closing a declaration block, Scala-style. `end` is a soft
    * keyword; the trailing name must equal the declaration's own name, or it is a parse error.

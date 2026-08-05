@@ -9,10 +9,11 @@ import org.scalatest.freespec.AnyFreeSpec
  * already covers.
  *
  * The rule with the most consequence is the one about a shape and a type of that shape written out
- * in full: they are two implementations for one type, and sysl has no rule that picks between two.
- * Neither is more specific than the other, because being more specific is not something the language
- * knows how to be. So whichever is written second is refused, and the diagnostic says which is
- * already there.
+ * in full: they are two implementations for one type, so whichever is written second is refused and
+ * the diagnostic says which is already there. That is the **default** rather than the whole rule —
+ * the written-out block may say `override` and then it wins, which is `ImplOverrideTests`. What is
+ * tested here is the refusal, which is what an unmarked pair still gets, because two overlapping
+ * blocks are usually a mistake and this is how that gets found.
  */
 class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
 
@@ -109,7 +110,8 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
   "a type's members are one namespace, and the shape's are in it" - {
 
     // Two traits declaring a member of one name were always refused for a single type. A shape
-    // reaches types that may already have one, so the same rule reaches across the two.
+    // reaches types that may already have one, so the same rule reaches across the two. `override`
+    // does not relax it: these are two *different* traits, so the shape's block replaces nothing.
     "so a shape may not give a name a written implementation already used" in {
       err(
         s"""$show${other}impl Other for []int

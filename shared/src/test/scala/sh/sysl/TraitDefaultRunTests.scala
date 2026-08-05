@@ -64,7 +64,7 @@ class TraitDefaultRunTests extends AnyFreeSpec with RunSupport {
           |    name(self) -> string = self.n
           |impl Greet for Dog
           |    name(self) -> string = self.n
-          |    greet(self) -> string = "woof from " + self.n
+          |    override greet(self) -> string = "woof from " + self.n
           |var c = Cat("mog")
           |var d = Dog("rex")
           |print(c.greet())
@@ -207,7 +207,7 @@ class TraitDefaultRunTests extends AnyFreeSpec with RunSupport {
           |    name(self) -> string = self.n
           |impl Greet for Dog
           |    name(self) -> string = self.n
-          |    greet(self) -> string = "yo " + self.n
+          |    override greet(self) -> string = "yo " + self.n
           |announce[T: Greet](x: T) -> string = x.greet()
           |print(announce(Cat("mog")))
           |print(announce(Dog("rex")))""".stripMargin
@@ -228,7 +228,7 @@ class TraitDefaultRunTests extends AnyFreeSpec with RunSupport {
           |    name(self) -> string = self.n
           |impl Greet for Dog
           |    name(self) -> string = self.n
-          |    greet(self) -> string = "yo " + self.n
+          |    override greet(self) -> string = "yo " + self.n
           |say(g: *Greet) = print(g.greet())
           |var c = Cat("mog")
           |var d = Dog("rex")

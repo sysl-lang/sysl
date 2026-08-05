@@ -113,6 +113,7 @@ class SyslLexical
     "enum",
     "trait",
     "impl",
+    "override",
     "extern",
     "module",
     "import",

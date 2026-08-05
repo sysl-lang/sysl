@@ -67,6 +67,11 @@ trait MemberLowering extends TypeResolution {
    *   - `fromTrait` is the trait an `impl` block is keeping, and `None` for a type's own body. It is
    *     what a use site's scope is asked about, since a trait's member is reachable only where the
    *     trait can be named.
+   *   - `overrides` is whether the block said `override` (`02 § override`). What it turns off is the
+   *     one-name-per-shape rule below: an override gives a written-out type a member the shape it
+   *     belongs to also has, and that is what an override *is* rather than a collision — the two are
+   *     the same trait's member, and `memberKey` asks the type's own key before the shape's, so one
+   *     name still reaches one member.
    */
   protected case class MemberHome(
       key: String,
@@ -82,6 +87,7 @@ trait MemberLowering extends TypeResolution {
       outer: Map[String, Type] = Map.empty,
       alt: String = "",
       fromTrait: Option[String] = None,
+      overrides: Boolean = false,
   ) {
 
     /** Everything a member's signature resolves against that a call does not supply: the trait's
@@ -217,7 +223,13 @@ trait MemberLowering extends TypeResolution {
       // member however the type came by it. Both directions are asked, since a file may write the
       // shape before the types it covers or after them. A second implementation's members are left
       // out: the name they are filed under is one no other block can have written.
-      for h <- home.head if home.alt.isEmpty do
+      //
+      // An **override** is left out too, and it is the one case where sharing the name is the point:
+      // it supplies the same trait's members for one type of the shape, so a `display` here and a
+      // `display` on every slice are one member seen at two levels of generality rather than two a
+      // call would have to choose between. `memberKey` asks the type's own key first, which is what
+      // makes the more specific one the answer.
+      for h <- home.head if home.alt.isEmpty && !home.overrides do
         if home.shaped then
           for written <- composedMembers.get((h, m.name)) do
             err(s"'$written' already has a member named '${m.name}', and this 'impl' would give " +

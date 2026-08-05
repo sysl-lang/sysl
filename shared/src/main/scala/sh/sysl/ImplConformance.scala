@@ -39,7 +39,9 @@ trait ImplConformance extends MemberLowering {
 
     for tm <- tr.methods do
       impl.methods.find(_.name == tm.name) match
-        case Some(im) => checkSignature(home.label, shown, tm, im, sig, scopeFor(tr.name))
+        case Some(im) =>
+          checkSignature(home.label, shown, tm, im, sig, scopeFor(tr.name))
+          checkOverrideMarking(shown, tm, im)
         case None if tm.body.nonEmpty => inherited += tm
         case None =>
           err(s"'${home.label}' does not implement '$shown': ${kind(tm)} '${tm.name}' is missing")
@@ -50,6 +52,32 @@ trait ImplConformance extends MemberLowering {
 
     inherited.toList
   }
+
+  /** Whether a member the block wrote says `override` exactly when it is one (`02 § override`).
+   *
+   * The trait's side is the whole of the test, and it is one question: does the member the block
+   * wrote **replace a body**, or does it **answer a requirement**? A trait member with a body is a
+   * default the block is replacing, and one without is a promise the block is keeping — so the
+   * keyword is required for the first and refused for the second.
+   *
+   * The point is what an `impl` block reads like from the outside. Without the keyword a member that
+   * replaces a default and one that supplies a requirement are written identically, and telling them
+   * apart means opening the trait; with it, the block says which each of its members is doing. It
+   * costs almost nothing, because an implementation content with a default writes no member at all.
+   */
+  protected def checkOverrideMarking(traitName: String, tm: MethodDecl, im: MethodDecl): Unit =
+    // Reported at the member rather than at the block, which is where the word is missing or spare —
+    // an `impl` of a trait with several defaults would otherwise put every one of these on its
+    // opening line and leave the reader to work out which member was meant.
+    at(im.pos) {
+    if tm.body.nonEmpty && !im.overrides then
+      err(s"trait '$traitName' supplies a body for ${kind(tm)} '${tm.name}', so writing one here " +
+        s"replaces it — say 'override ${tm.name}', or leave the member out to keep the trait's")
+    else if tm.body.isEmpty && im.overrides then
+      err(s"trait '$traitName' declares ${kind(tm)} '${tm.name}' without a body, so this member " +
+        "supplies what the trait asked for rather than replacing anything — 'override' says a body " +
+        "was replaced")
+    }
 
   /** What a diagnostic calls one member of a trait. The three kinds are told apart by shape rather
    * than by a keyword, so a message that names the wrong one sends the reader looking for the wrong

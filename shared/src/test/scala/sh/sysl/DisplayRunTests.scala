@@ -217,7 +217,7 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
             |    n: usize
             |    over: bool
             |impl Fallible for Cap
-            |    failed(*self) -> bool = self.over
+            |    override failed(*self) -> bool = self.over
             |
             |impl Writer for Cap
             |    write(*self, bytes: []const u8)

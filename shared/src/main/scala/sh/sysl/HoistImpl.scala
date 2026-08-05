@@ -58,6 +58,18 @@ trait HoistImpl extends ImplConformance {
       err(s"'${qn(impl.traitName)}' names a family of types the compiler settles, so nothing " +
         s"implements it — a type is one of them or it is not, and '${outer.label}' is not")
 
+    // **The overriding side is always a type written out in full**, which is what makes `override` a
+    // rule about two blocks rather than a rule about every pair of keys. A shape is one key and so is
+    // a generic type: `impl[T] Show for [][]T` and `impl Show for Box[int]` are both refused outright
+    // (`shapeArgs`, `implArgs`), so neither a shape nor a generic type has anything below it to be
+    // more specific *than*. That leaves the written-out type as the only block that can be the more
+    // specific of a pair, and saying so here is worth more than letting the ordering find nothing.
+    if impl.overrides && (outer.shaped || outer.tparams.nonEmpty) then
+      err(s"'override' says this block replaces a more general one, and '${outer.label}' is the " +
+        s"general kind — an implementation for a shape or for a generic type covers every type it " +
+        s"matches at once, so there is nothing below it. The override is written on the block for " +
+        s"one type spelled out in full")
+
     // What this block's own promise is read against: the type where it has one, and the type applied
     // to the block's own parameters where it is generic — the same subject `superChecks` uses, and
     // the one every comparison below has to be made under for the two sides to mean the same thing.
@@ -96,6 +108,7 @@ trait HoistImpl extends ImplConformance {
     for
       (key, targs) <- blanketOwners(ty)
       _            <- implAt(bound, key, ty, targs)
+      if !impl.overrides
     do
       // The subtype half is said only where there is one, and it says "subtype" rather than
       // "derived" because both kinds reach here: a transparent one *is* its base (`16 §1`) and a
@@ -144,27 +157,34 @@ trait HoistImpl extends ImplConformance {
           "defaulted one would promise the same thing")
 
     // A shape and a type of that shape written out in full would both implement the trait for that
-    // type, and sysl has no rule that picks between two implementations — the more specific one does
-    // not win, because nothing here is more specific than anything else. So the second one written is
-    // refused, in whichever order the file put them.
+    // type. By default the second one written is refused, in whichever order the file put them,
+    // because two overlapping blocks are usually a mistake — a duplicate, or one put in the wrong
+    // module — and refusing them is how that gets found.
     //
     // The arguments do not rescue this one, though they are what lets a type keep several
     // implementations of a trait elsewhere. Several work because they share a namespace to be told
     // apart in; a shape's members and a written-out type's are filed under two different owner keys
     // and a lookup takes one or the other, so a second implementation across that boundary would be
     // one a program could not name however it was written.
+    //
+    // **What lifts the refusal is `override` on the written-out side** (`02 § override`), which says
+    // the overlap is deliberate: `[]Point` beats `[]T` at the position they differ, so the ordering
+    // has an answer and the keyword says an answer was wanted. It is asked of the *written-out*
+    // block whichever order the two were hoisted in, which is why the flag travels in
+    // `writtenShapes` rather than being read off whichever block reaches here second.
     val wkey = if written.isEmpty then "" else Type.Bound(impl.traitName, written).key
 
     for h <- outer.head do
       if outer.shaped then
-        for one <- writtenShapes.get((impl.traitName, h)) do
+        for (one, overridden) <- writtenShapes.get((impl.traitName, h)) if !overridden do
           err(s"'$one' already implements '${qn(impl.traitName)}', and this 'impl' would implement " +
             s"it for ${everyShape(h)} — including that one")
       else
-        if implsOf(impl.traitName, h).nonEmpty then
+        if implsOf(impl.traitName, h).nonEmpty && !impl.overrides then
           err(s"${everyShape(h)} already implements '${qn(impl.traitName)}', so '${outer.label}' has " +
-            "an implementation and cannot be given a second one")
-        writtenShapes((impl.traitName, h)) = outer.label
+            "an implementation and cannot be given a second one — write 'override impl' to say that " +
+            "replacing it for this one type is what was meant")
+        writtenShapes((impl.traitName, h)) = (outer.label, impl.overrides)
 
     // Last of the checks about the block as a whole, because every one above it is more specific:
     // a block with no home is often also one the library has already written, and being told which
@@ -201,7 +221,15 @@ trait HoistImpl extends ImplConformance {
 
     val nth = LazyList.from(floor).find(i => !heldByAnother(if i == 1 then "" else s".$i")).get
     val home =
-      outer.copy(alt = if nth == 1 then "" else s".$nth", fromTrait = Option.unless(callTrait)(impl.traitName))
+      outer.copy(alt = if nth == 1 then "" else s".$nth", fromTrait = Option.unless(callTrait)(impl.traitName),
+        overrides = impl.overrides)
+
+    // **An `override` that overrides nothing is refused**, and the question is held for the same
+    // reason a required trait's is: the block being replaced may be written below this one, or in a
+    // module hoisted after it. Held rather than answered here, so the answer never depends on the
+    // order the files happened to arrive in.
+    if impl.overrides && ty != Type.Unknown then
+      overrideChecks += ((outer.label, bound, ty, impl.pos, currentScope))
 
     traitImpls((impl.traitName, home.key)) =
       already :+ TraitImpl(impl, written, wkey, home.alt, home.tparams,
@@ -332,10 +360,12 @@ trait HoistImpl extends ImplConformance {
    * subject settles, and the open case those checks refuse (`impl[V, T] From[T] for Wrapper[V]`,
    * where nothing would ever fix `T`) never reaches this far.
    *
-   * What makes it safe beyond that is that sysl has no specialization: an `impl` for a generic type
-   * covers every instantiation, and `impl Index[usize, int] for Buf[int]` is refused outright
-   * (`implTarget`). So one block per (trait-at-arguments, generic type) still holds, and a parameter
-   * the subject settles is a key that matches one thing per subject rather than many.
+   * What makes it safe beyond that is that a **generic type** admits no more specific block: an
+   * `impl` for one covers every instantiation, and `impl Index[usize, int] for Buf[int]` is refused
+   * outright (`implTarget`). So one block per (trait-at-arguments, generic type) still holds, and a
+   * parameter the subject settles is a key that matches one thing per subject rather than many.
+   * `override` (`02 §`) does not reach this: what it relaxes is a *shape* overlapping a type written
+   * out in full, which is a second key rather than a second block under this one.
    */
   protected def implBound(impl: ImplDecl, tr: TraitDecl): (Type.Bound, List[Type]) = {
     checkTraitArity(qn(impl.traitName), tr.tparams, tr.tdefaults, impl.traitArgs.map(_ => Type.Unknown))

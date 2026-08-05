@@ -153,6 +153,7 @@ class SyslParser(val source: Source) extends DeclParser {
   protected lazy val declaration: PackratParser[Stmt] =
     attributedDecl |
       implVisibility |
+      misplacedOverride |
       staticDecl |
       visibility ~ (structDecl | enumDecl | typeDecl | traitDecl | externDecl | constDecl | valDecl | funcDecl) ^^ {
         case Visibility.Public ~ d => d
@@ -298,6 +299,19 @@ class SyslParser(val source: Source) extends DeclParser {
     op("private") ~ opt(op("[") ~> ident <~ op("]")) ~ guard(op("impl")) ~> err(
       "an 'impl' block carries no visibility of its own — it declares no name for one to restrict, " +
         "and what it supplies is reached at the reach of the trait that asked for it",
+    )
+
+  /** `override` in front of a top-level declaration, refused where it stands and for the reason
+   * `implVisibility` is refused: the word has a place, and a reader who writes it elsewhere is better
+   * served by being told which place than by the grammar's complaint about the word after it.
+   *
+   * It is reached only after `implDecl` has declined the line, so `override impl` never arrives here.
+   */
+  protected lazy val misplacedOverride: Parser[Nothing] =
+    op("override") ~> err(
+      "'override' marks something that replaces an implementation already covering the same type, so " +
+        "it goes in front of an 'impl' block or of a member inside one — a declaration of its own " +
+        "replaces nothing",
     )
 
   /** `private`, `private[M]`, or nothing at all — which is public (`13 §2`). There is no `pub`

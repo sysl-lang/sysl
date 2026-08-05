@@ -219,6 +219,10 @@ trait ProgramWalk
     // question about the same table and so waits for the same moment.
     checkImplSupers()
 
+    // And whether each block marked `override` has something to override, which waits for the same
+    // moment and for the same reason: the block being replaced may be hoisted after it.
+    checkOverrides()
+
     // Every generic body is checked once here, against its bounds alone, before any instantiation
     // is looked at. That is what makes `sum[T](a: T, b: T) = a.plus(b)` fail on its own line
     // instead of at whichever call site first supplied a type without a `plus`.
