@@ -589,6 +589,42 @@ It is then hoisted, laid into the object file, visible to every file of the modu
 before any statement runs — which is also why its initializer may not call a helper that reads the
 body: at that moment there is no body yet.
 
+A **`static var`** is the same storage, written — assignment at every depth and `&`, which is what the
+word `var` already means, and which a `val` refuses because a `val` promises its storage is written
+once:
+
+```sysl
+static var ticks: int = 0
+
+tick() = ticks += 1
+
+tick()
+tick()
+print(ticks)
+```
+
+```output
+2
+```
+
+Its initializer may be **absent**, which a `val`'s may not — the type's zero is what it starts at, and
+that is the cheapest form and the one an arena wants. It is stricter in one place, and the question is
+asked of the **type** where a `val`'s is asked of the value:
+
+```sysl
+static var greeting: string = "hello"
+
+print(greeting)
+```
+
+```error
+cannot be a 'static var': storage that exists for the whole run is never let go of
+```
+
+A `static val` given that same literal is admitted, because a literal's owner word is null and nothing
+was built. A variable could be given `str(n)` on the next line, so what is asked is what the storage
+may *ever* hold.
+
 **`static` is meaningful only in the entry file**, since only that file has a body for a declaration
 to *not* belong to. In a file with a `module` header, or a headerless file carrying no statements,
 everything is the module's already and the modifier is refused rather than ignored. A function never

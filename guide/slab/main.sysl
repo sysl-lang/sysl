@@ -21,26 +21,30 @@ struct Node
 struct Cell
     bits: i64
 
-// **The regions are threaded from the entry point rather than declared beside the code that uses
-// them, and that is a finding — now half of one.** A static arena wants module scope: one region,
-// one address, for the life of the program, which is what a file-scope array is in C.
+// **This program used to thread its regions from the entry point through every section that touched
+// one, and that was a finding. It is answered.** A static arena wants module scope — one region, one
+// address, for the life of the program, which is what a file-scope array is in C — and there was no
+// way to declare one: a module-level `val` is written once, so `&` of one is refused outright and
+// nothing can be carved out of it, and a `var` was a local nothing could see.
 //
-// Half of what made that impossible is gone. A binding at the top of the file a program starts in is
-// a local of that file's body, and a function written below it reads and writes it with nothing
-// passed in — so a *single-file* program can now declare its arena above the code that uses it and
-// drop the parameter. What that costs is the rest of what a nested function cannot be: no address,
-// not a value, not generic.
+// `static var` is that storage, and the two regions below are declared in it. Six sections lost the
+// `*u8` parameter they were handed, and the entry point at the bottom lost the six arguments it was
+// handing them.
 //
-// What is still missing is the module's own storage, which is what an allocator actually wants,
-// because an allocator is a thing other files call. A module-level `val` is written once, so `&` of
-// one is refused outright and nothing can be carved out of it; `static var` is the spelling for the
-// mutable half and the storage behind it is not built. So the region is still declared where the
-// program starts and passed as a `*u8` to everything that touches it.
+// The threading was harmless here and would not have stayed harmless, which is why it was worth
+// recording rather than living with. An allocator is the thing every other part of a no-heap program
+// asks for storage, so "pass the arena in" ends up a parameter on every function that might ever
+// allocate — which is the argument a capability system makes for itself, arrived at from the wrong
+// direction.
 //
-// The threading is harmless here and would not stay harmless. An allocator is the thing every other
-// part of a no-heap program asks for storage, so "pass the arena in" becomes a parameter on every
-// function that might ever allocate — which is the argument a capability system makes for itself,
-// arrived at from the wrong direction.
+// Note what the regions do **not** say: what address they should start at. Module storage has an
+// address for the whole run and still no way to say what it should be a multiple of, so the allocator
+// rounds up and pays for it out of the region. That part of the finding stands.
+
+// The two regions, which is what this whole program is about having: one address each, for the life
+// of the program, reachable by name from every section rather than threaded through them.
+static var region_a: [256]u8
+static var region_b: [256]u8
 
 section_what_a_block_costs()
     print("-- what a block costs")
@@ -55,11 +59,11 @@ section_what_a_block_costs()
     check("and one is twice the other", str(sizeof(Node) / sizeof(Cell)), "2")
 end section_what_a_block_costs
 
-section_carving_a_region(one: *u8, two: *u8)
+section_carving_a_region()
     print("-- carving a region into blocks")
 
-    var nodes: Slab[Node] = slab_over(one, 256usize)
-    var cells: Slab[Cell] = slab_over(two, 256usize)
+    var nodes: Slab[Node] = slab_over(&region_a[0], 256usize)
+    var cells: Slab[Cell] = slab_over(&region_b[0], 256usize)
 
     // Whatever the rounding costs, it costs less than one alignment, so the counts are the region
     // over the block size give or take a block.
@@ -71,12 +75,12 @@ section_carving_a_region(one: *u8, two: *u8)
     check("every cell block starts free", str(free_count(&cells)), str(cells.made))
 end section_carving_a_region
 
-section_the_intrusive_list(region: *u8)
+section_the_intrusive_list()
     print("-- the free list lives in the free blocks themselves")
 
     // A `Cell` is exactly one address wide, so writing one writes exactly the bytes the link
     // occupies. That is what makes the claim below an equality rather than an "it changed".
-    var s: Slab[Cell] = slab_over(region, 256usize)
+    var s: Slab[Cell] = slab_over(&region_a[0], 256usize)
 
     // The list is threaded back to front, so the head is block zero and each link points at the
     // block above it. Walking by address and walking by link have to agree.
@@ -98,7 +102,7 @@ section_the_intrusive_list(region: *u8)
 
     // And the converse, which is the rule a caller has to keep: a block that is *out* of the list
     // may be written freely, because the list no longer runs through it.
-    var fresh: Slab[Cell] = slab_over(region, 256usize)
+    var fresh: Slab[Cell] = slab_over(&region_a[0], 256usize)
     var taken = alloc(&fresh)
     var counted = free_count(&fresh)
 
@@ -108,10 +112,10 @@ section_the_intrusive_list(region: *u8)
     check("and writing it left the list alone", str(free_count(&fresh)), str(fresh.made - 1usize))
 end section_the_intrusive_list
 
-section_allocating_and_releasing(region: *u8)
+section_allocating_and_releasing()
     print("-- allocating and releasing")
 
-    var s: Slab[Node] = slab_over(region, 256usize)
+    var s: Slab[Node] = slab_over(&region_a[0], 256usize)
     var before = free_count(&s)
 
     var a = alloc(&s)
@@ -137,10 +141,10 @@ section_allocating_and_releasing(region: *u8)
     check("and the other", str(free_count(&s)), str(before))
 end section_allocating_and_releasing
 
-section_reuse(region: *u8)
+section_reuse()
     print("-- a released block is the one handed out next")
 
-    var s: Slab[Node] = slab_over(region, 256usize)
+    var s: Slab[Node] = slab_over(&region_a[0], 256usize)
 
     var a = alloc(&s)
     var b = alloc(&s)
@@ -170,10 +174,10 @@ section_reuse(region: *u8)
     check("last released, first out", str(again == b && d == c), "true")
 end section_reuse
 
-section_exhaustion(region: *u8)
+section_exhaustion()
     print("-- exhaustion answers rather than trapping")
 
-    var s: Slab[Cell] = slab_over(region, 256usize)
+    var s: Slab[Cell] = slab_over(&region_b[0], 256usize)
     var made = s.made
     var taken = 0usize
     var last: *Cell = null
@@ -197,14 +201,14 @@ section_exhaustion(region: *u8)
     check("releasing one makes it answer again", str(alloc(&s) == last), "true")
 end section_exhaustion
 
-section_alignment(region: *u8)
+section_alignment()
     print("-- the alignment the language cannot ask for")
 
     // A `[N]u8` is aligned to one, because that is what a byte needs. So the region's own start is
     // not aligned for anything carved out of it, and the allocator has to round up. This is the
     // finding: the rounding is correct for an allocator and unnecessary here.
-    var s: Slab[Node] = slab_over(region, 256usize)
-    var start = usize(region)
+    var s: Slab[Node] = slab_over(&region_a[0], 256usize)
+    var start = usize(&region_a[0])
     var base = usize(s.first)
 
     check("the blocks start aligned for what they hold", str(base % alignof(Node)), "0")
@@ -224,13 +228,10 @@ section_alignment(region: *u8)
     check("aligning to one is the identity", str(aligned_up(17usize, 1usize)), "17")
 end section_alignment
 
-var region_a: [256]u8 = [0u8; 256]
-var region_b: [256]u8 = [0u8; 256]
-
 section_what_a_block_costs()
-section_carving_a_region(&region_a[0], &region_b[0])
-section_the_intrusive_list(&region_a[0])
-section_allocating_and_releasing(&region_a[0])
-section_reuse(&region_a[0])
-section_exhaustion(&region_b[0])
-section_alignment(&region_a[0])
+section_carving_a_region()
+section_the_intrusive_list()
+section_allocating_and_releasing()
+section_reuse()
+section_exhaustion()
+section_alignment()

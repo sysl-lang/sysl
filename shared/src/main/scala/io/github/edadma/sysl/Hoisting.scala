@@ -28,6 +28,7 @@ trait Hoisting extends HoistMembers {
   protected def valueNameHolder(key: String): Option[String] =
     if constDecls.contains(key) then Some("a constant")
     else if valDecls.contains(key) then Some("a 'val'")
+    else if staticVarDecls.contains(key) then Some("a 'static var'")
     else if externVarDecls.contains(key) then Some("an 'extern' variable")
     else if variantOwner.contains(key) then Some(s"enum '${qn(variantOwner(key))}'")
     else None
@@ -160,6 +161,24 @@ trait Hoisting extends HoistMembers {
       declScope(key) = currentScope
       recordAccess(key, v.vis)
 
+    // A `static var` is registered beside the `val`s because it is the same kind of thing: storage
+    // the module owns, under a name that reaches it. A plain `var` never arrives here — only the top
+    // level of a file the program starts in can carry one that is not a statement, and `ProgramWalk`
+    // has already unwrapped the `static` off it (`13 §7`).
+    case v: VarDecl =>
+      val key = Modules.qualify(currentModule, v.name)
+
+      if staticVarDecls.contains(key) then duplicate(key, s"'${v.name}' is already declared")
+      else for what <- valueNameHolder(key) do duplicate(key, s"'${v.name}' is already used by $what")
+      // The same rule a `val` meets, and for the same reason (`13 §2`): a module member may be
+      // visible outside its file, and what is has to say what it is. It bites harder here, because a
+      // `static var` may have no initializer at all for a type to be inferred from.
+      if v.typ.isEmpty then
+        err(s"a 'static var' states its type, so '${v.name}' needs one — 'static var ${v.name}: T = …'")
+      staticVarDecls(key) = v.copy(name = key).setPos(v.pos)
+      declScope(key) = currentScope
+      recordAccess(key, v.vis)
+
     // An `extern` variable is registered here rather than with the functions, because what it
     // declares is a *value* a bare name reaches — the same namespace a `const` and a `val` are in,
     // and the reason a clash with either is reported at whichever was written second. Its **symbol**
@@ -239,6 +258,8 @@ trait Hoisting extends HoistMembers {
       if funcDecls.contains(key) then duplicate(key, s"function '${f.name}' is already declared")
       else if constDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a constant")
       else if valDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a 'val'")
+      else if staticVarDecls.contains(key) then
+        duplicate(key, s"'${f.name}' is already declared as a 'static var'")
       else if externVarDecls.contains(key) then
         duplicate(key, s"'${f.name}' is already declared as an 'extern' variable")
       funcDecls(key) = f.copy(name = key).setPos(f.pos)

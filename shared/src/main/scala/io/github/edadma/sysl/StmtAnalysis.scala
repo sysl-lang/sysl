@@ -44,7 +44,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
     // here made every such use report that it was "declared below" — from above it and from below it
     // alike, since the name was never bound at all.
     blockDeclares = savedDeclares ++ stmts.collect {
-      case VarDecl(n, _, _)     => List(n)
+      case VarDecl(n, _, _, _)  => List(n)
       case ValDecl(n, _, _, _)  => List(n)
       case RefDecl(n, _)        => List(n)
       case MultiDecl(ns, _, _)  => ns
@@ -237,7 +237,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
    * the name into an "undefined name" of its own, and the real mistake is lost among them.
    */
   private def bindFailed(stmt: Stmt): Unit = stmt match
-    case VarDecl(name, _, _)    => declare(name, Type.Unknown)
+    case VarDecl(name, _, _, _) => declare(name, Type.Unknown)
     case ValDecl(name, _, _, _) => declareReadOnly(name, Type.Unknown)
     // A ref whose place did not analyze binds the name at `Type.Unknown` like the other two, and
     // records no place: there is nothing to walk outward through, and a guard built from a poisoned
@@ -551,7 +551,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
       importInBlock(i)
       List(TExprStmt(TUnitLit()))
 
-    case VarDecl(name, typOpt, Some(init)) =>
+    case VarDecl(name, typOpt, Some(init), _) =>
       val declared = typOpt.map(rt)
       val ti       = analyzeExpr(init, declared)
       // A binding needs a value to hold, and an initializer that does not finish never produces
@@ -591,7 +591,7 @@ trait StmtAnalysis extends TypeResolution with AsmAnalysis {
 
       List(TRefDecl(declareRef(name, tp, refHazards(tp)), tp.ty, tp))
 
-    case VarDecl(name, typOpt, None) =>
+    case VarDecl(name, typOpt, None, _) =>
       val ty = typOpt.map(rt).getOrElse(err(s"'$name' needs either a type or an initial value"))
       if !hasZero(ty) then err(s"${show(ty)} has no zero value, so '$name' needs an initial value")
       List(TVarDecl(declare(name, ty), ty, TZero(ty)))

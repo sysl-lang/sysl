@@ -55,7 +55,7 @@ object AstCodec {
    * reason — the value has to be later than every version any compiler has ever stamped, not merely
    * later than the one this branch started from.
    */
-  val Version: Int = 20
+  val Version: Int = 21
 
   private val Magic = "sysl-ast"
 
@@ -302,7 +302,7 @@ object AstCodec {
       s match
         case ImportDecl(path, sels, wild, alias) =>
           tok("imp"); list(path)(sref); list(sels)(selector); bool(wild); opt(alias)(sref)
-        case VarDecl(n, t, i)             => tok("var"); sref(n); opt(t)(typ); opt(i)(expr)
+        case VarDecl(n, t, i, vs)         => tok("var"); sref(n); opt(t)(typ); opt(i)(expr); vis(vs)
         case ConstDecl(n, t, v, vs)       => tok("cst"); sref(n); typ(t); expr(v); vis(vs)
         case ValDecl(n, t, v, vs)         => tok("val"); sref(n); opt(t)(typ); expr(v); vis(vs)
         // No token, and no version bump to give it one: `static` is legal only in the file a program
@@ -687,7 +687,7 @@ object AstCodec {
     private def stmt(): Stmt = at {
       tok() match
         case "imp"  => ImportDecl(list(sref()), list(selector()), bool(), opt(sref()))
-        case "var"  => VarDecl(sref(), opt(typ()), opt(expr()))
+        case "var"  => VarDecl(sref(), opt(typ()), opt(expr()), vis())
         case "cst"  => ConstDecl(sref(), typ(), expr(), vis())
         case "val"  => ValDecl(sref(), opt(typ()), expr(), vis())
         case "ref"  => RefDecl(sref(), expr())

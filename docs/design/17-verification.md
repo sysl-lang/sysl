@@ -160,14 +160,13 @@ it survives the jump intact and a `@tailrec` function may carry one.
 
 ## 5. Module invariants
 
-**This section and `§7` are specified and not built, and they wait on the same thing: sysl has no
-mutable module state for either of them to be about.** `13 §7` settles the spelling — `static var` —
-and records that the storage behind it is not built: whether it may hold a value that owes a release,
-what `&` of it means, and what a `@pure` function may do with it are open, and `guide/slab`'s arena is
-the named customer. An invariant over a module's variables and a frame naming which of them a function
-touches are both predicates over a set that is empty today, so building either would be building a
-check with no subject. They are written out here so that the design lands with the decision rather
-than after it — when the storage arrives, this is what attaches to it. `§ Open f`
+**This section and `§7` waited on mutable module state to be about, and it has arrived: `13 §7`'s
+`static var` is built.** `§7` (`@reads`/`@writes`) is now a build with no decision in front of it, and
+is the more useful of the two, since a frame is what makes a call something other than an eraser to a
+prover. **This section has one open question and it is not a technical one:** the check below runs on
+return from every public function of the module, which is complete exactly when the module's own
+functions are the only writers — and a public `static var` is writable by anyone, from another module
+or from a program's own statements, with no check anywhere. `§ Open f`
 carries the dependency.
 
 An `invariant` written at the top level of a file is a predicate over the module's own state:

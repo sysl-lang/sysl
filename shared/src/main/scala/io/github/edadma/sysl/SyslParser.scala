@@ -139,16 +139,10 @@ class SyslParser(val source: Source) extends DeclParser {
    * the grammar to complain that a declaration form was not among the two.
    */
   protected lazy val staticDecl: PackratParser[Stmt] =
-    visibility ~ (op("static") ~> valDecl) ^^ {
+    visibility ~ (op("static") ~> (valDecl | varDecl)) ^^ {
       case Visibility.Public ~ d => StaticDecl(d)
       case v ~ d                 => StaticDecl(restrict(v, d))
-    } | (visibility ~ op("static") ~ guard(op("var"))) ~> err(
-      "module storage that may be *written* is not built yet — 'static' takes a 'val' today. What " +
-        "is missing is not the spelling but the storage: whether it may hold a value that owes a " +
-        "release, what taking its address means, and what a '@pure' function may do with it. A " +
-        "program that needs a mutable value shared between its functions passes it as a parameter " +
-        "until then",
-    ) | (visibility <~ op("static")) ~> err(
+    } | (visibility <~ op("static")) ~> err(
       "'static' marks a 'val' or a 'var' in the file a program starts in, saying it belongs to the " +
         "module rather than to that file's body. Everything else there is the module's already: a " +
         "type, a constant, an 'extern' and an 'import' are wherever they are written, and a function " +
@@ -323,6 +317,7 @@ class SyslParser(val source: Source) extends DeclParser {
     case e: ExternVarDecl => e.copy(vis = v).setPos(e.pos)
     case c: ConstDecl     => c.copy(vis = v).setPos(c.pos)
     case l: ValDecl       => l.copy(vis = v).setPos(l.pos)
+    case r: VarDecl       => r.copy(vis = v).setPos(r.pos)
     case f: FuncDecl      => f.copy(vis = v).setPos(f.pos)
     case t: TypeDecl      => t.copy(vis = v).setPos(t.pos)
     case other            => other

@@ -39,7 +39,7 @@ trait InitOrder extends AnalyzerBase {
     else
       val ordered = computed.map(_.symbol).toSet
       val deps = computed
-        .map(v => v.symbol -> Reachability.reachedFrom(List(v.init), funcs, vtables).vals.intersect(ordered))
+        .map(v => v.symbol -> Reachability.reachedFrom(v.init.toList, funcs, vtables).vals.intersect(ordered))
         .toMap
 
       constant ::: sorted(computed, deps)

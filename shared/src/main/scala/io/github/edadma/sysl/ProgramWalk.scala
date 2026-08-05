@@ -239,6 +239,12 @@ trait ProgramWalk
     for (key, decl) <- externVarDecls do
       currentPos = decl.pos
       recover(())(at(decl.pos)(checkExternVar(key)))
+    // A `static var` is laid down with the `val`s and in the same state, for the same reason: its
+    // initializer is a module member's expression, so no function's locals may be in scope while it
+    // is read. It goes first only so that a `val` initialized from one reads storage already there.
+    for (key, decl) <- staticVarDecls do
+      currentPos = decl.pos
+      tvals ++= recoverOpt(analyzeStaticVar(key))
     for (key, decl) <- valDecls do
       currentPos = decl.pos
       tvals ++= recoverOpt(analyzeVal(key))
@@ -295,7 +301,7 @@ trait ProgramWalk
     // The `main` the program runs after those statements, if it declared one. Read here rather than
     // during hoisting because the conversion it may want is a library function, and marking one as
     // reached has to happen before the loop below decides which of them are worth analyzing.
-    val tentry = recover(Option.empty[TEntry])(declaredEntry(entry))
+    val tentry = recover(Option.empty[TEntry])(declaredEntry())
 
     // Draining the queue may itself discover further instantiations, so it runs to a fixpoint. An
     // instantiation of a member the definition-time pass already reported is dropped rather than
@@ -429,7 +435,7 @@ trait ProgramWalk
         "two the program means, the other belongs inside it. The statements this program starts " +
         s"with are in ${u.source.name}"))
 
-  private def declaredEntry(entry: Option[(Program, Scope)]): Option[TEntry] = {
+  private def declaredEntry(): Option[TEntry] = {
     val declared = funcDecls.keys.filter(k => Modules.bare(k) == "main" && !externDecls.contains(k)).toList
 
     declared match
@@ -589,7 +595,7 @@ trait ProgramWalk
    */
   private def analyzeVal(key: String): TVal = inDecl(key)(at(valDecls(key).pos) {
     val decl = valDecls(key)
-    val ty   = valType(key)
+    val ty   = globalType(key)
     val init = analyzeExpr(decl.value, Some(ty))
 
     if disagree(init.ty, ty) then
@@ -598,7 +604,48 @@ trait ProgramWalk
     val static = isStatic(init)
 
     checkVal(ty, static, key)
-    TVal(key, ty, init, !static)
+    TVal(key, ty, Some(init), !static)
+  })
+
+  /** One `static var`: module storage the program may write (`13 §7`).
+   *
+   * Three things separate it from the `val` above, and each is what the word `var` already means.
+   *
+   * **Its initializer may be absent**, which a `val`'s may not: a variable with no value is still a
+   * complete declaration of storage, and the type's zero is what it starts at. That is the cheapest
+   * form and the one an arena wants — `zeroinitializer` and no store at all.
+   *
+   * **The release rule is asked of the TYPE, where a `val`'s is asked of the value**, and the
+   * difference is the whole of why this is a separate check. A `val` is forever the value it was
+   * given, so `val greeting: string = "hello"` is admissible: a literal's owner word is null and
+   * nothing was ever built. A `static var` could be given that literal and `str(n)` on the next
+   * line, so whatever it holds when the program ends has nowhere to write its release — which makes
+   * the question one about what the storage may ever hold, not about what it was first given.
+   *
+   * **It is `writable`**, which is what `TGlobal` carries to every read of the name so that an
+   * assignment through it is allowed and a `@pure` function reading it is not (`17 §6`).
+   */
+  private def analyzeStaticVar(key: String): TVal = inDecl(key)(at(staticVarDecls(key).pos) {
+    val decl = staticVarDecls(key)
+    val ty   = globalType(key)
+    val init = decl.init.map { e =>
+      val t = analyzeExpr(e, Some(ty))
+
+      if disagree(t.ty, ty) then
+        err(s"cannot initialize '${qn(key)}': declared ${show(ty)} but the value is ${show(t.ty)}")
+      t
+    }
+
+    if Type.zeroSized(ty) then
+      err(s"'${qn(key)}' cannot be a 'static var': ${show(ty)} has no representation, so there is " +
+        "nothing for the storage to be")
+    else if !uncounted(ty) then
+      err(s"'${qn(key)}' cannot be a 'static var': storage that exists for the whole run is never " +
+        s"let go of, so a count taken in one is a count with nowhere to write the release — and " +
+        s"${show(ty)} is a type that takes one. The question is asked of the type here rather than " +
+        "of the value, because a variable may be given a different value tomorrow")
+
+    TVal(key, ty, init, computed = init.exists(!isStatic(_)), writable = true)
   })
 
   /** Holds a module-level `val` to a value that **owes no release** (`13 §7`).

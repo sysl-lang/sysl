@@ -464,7 +464,8 @@ case class ImportDecl(
  * type's zero value, which is how a scratch buffer is written; a type that has no zero value
  * (one containing a `&T`, which always points at a live object) must be initialized.
  */
-case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr]) extends Stmt
+case class VarDecl(name: String, typ: Option[TypeRef], init: Option[Expr],
+                   vis: Visibility = Visibility.Public) extends Stmt
 
 /** `const name: type = value` — a **module member** (`13 §7`). It is what a top-level `var` is not:
  * hoisted, order-free, and visible beyond its file under the ordinary rules, where a `var` at the
