@@ -61,6 +61,10 @@ stderr so that stdout stays whatever the build was for.
 dropped — `src/tools/fmt.sysl` becomes `fmt` in the current directory — and `a.out` if that leaves
 nothing.
 
+**A project whose `package.hocon` names dependencies gets them fetched here**, if this machine has
+not got them already — see [packages](/reference/packages/). `run` and `test` do the same; there is
+no separate step to remember, and a project with no dependencies does none of it.
+
 ### `build-lib`
 
 ```bash

@@ -31,6 +31,11 @@ what an expression is, then the declarations that bind them, then the systems bu
 memory, traits, generics, modules, errors, the foreign interface, and the forms that reach into the
 compilation itself.
 
+**One page is about the project rather than the language.** [Packages](/reference/packages/) is
+what `package.hocon` says and what it means to depend on somebody else's code — a build-time
+concern rather than a rule the compiler enforces on an expression, but one that decides which
+modules a program even has.
+
 **What ships beside the language is a section of its own.** The
 [standard library](/library/) is ordinary sysl — no type in it is a language feature and a program
 could have written any of it — so it is documented apart from the rules the compiler enforces.
