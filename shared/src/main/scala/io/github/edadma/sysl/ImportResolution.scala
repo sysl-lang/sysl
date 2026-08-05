@@ -62,17 +62,22 @@ trait ImportResolution extends TraitLookup {
   // --- one import ------------------------------------------------------------------------
 
   private def bind(decl: ImportDecl, acc: Imports): Imports = {
-    val path = decl.show
+    // What was written is what a diagnostic quotes; what it *names* is that read through the package
+    // layer, so a file of a fetched package writes its own short names and a consumer writes the
+    // name the manifest gave the package (`packages.md § 9`). For a project with no dependencies the
+    // two are the same string.
+    val written = decl.show
+    val path    = inPackage(written)
 
     // A wildcard is over a module's members, so there has to be a module to have them. A selector
     // list may instead reach a sub-module of a directory that holds no source of its own, which is
     // a module's parent without being one — so it asks only that the path lead somewhere.
     if decl.wildcard then
-      if !moduleNames(path) then err(s"no module is called '$path'")
+      if !moduleNames(path) then err(s"no module is called '$written'")
       dependsOn(path)
       acc.copy(wildcards = acc.wildcards :+ path)
     else if decl.selectors.nonEmpty then
-      if !namesModule(path) then err(s"no module is called '$path'")
+      if !namesModule(path) then err(s"no module is called '$written'")
       decl.selectors.foldLeft(acc)((a, s) => at(s.pos.orElse(decl.pos))(recover(a)(select(path, s, a))))
     else
       // The longest prefix that names a module wins, exactly as a qualified reference is read by
@@ -81,10 +86,10 @@ trait ImportResolution extends TraitLookup {
       if moduleNames(path) then
         bindModule(decl.bound, path, acc)
       else
-        val module = decl.path.init.mkString(".")
+        val module = inPackage(decl.path.init.mkString("."))
 
         if decl.path.length == 1 || !moduleNames(module) then
-          err(s"no module is called '$path', and nothing declares it")
+          err(s"no module is called '$written', and nothing declares it")
 
         bindName(decl.bound, module, decl.path.last, acc)
   }

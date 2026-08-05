@@ -1,17 +1,25 @@
 # Packages
 
-**Status:** §1–2 are **built**; §3–11 are decided in outline and unbuilt. This is the project-config
-half of the doc `capabilities.md` promised and `13 § Open a` tracks — what `package.hocon` says, and
-what it means to depend on somebody else's code. `targets.md` already settled the other half, what a
-machine is.
+**Status:** §1–6 and §9 are **built**; §7 is a property of the design rather than code; §10–11 are
+decided in outline and unbuilt. This is the project-config half of the doc `capabilities.md` promised
+and `13 § Open a` tracks — what `package.hocon` says, and what it means to depend on somebody else's
+code. `targets.md` already settled the other half, what a machine is.
 
 **What exists today:** the file is found beside the sources, parsed (`PackageConfig`), and read for
-identity, the active target and per-target capability sets. That last one is the thing it was needed
-for: `capabilities.md`'s *target provides* level had no way to be stated before, so every target
-offered everything. A target that provides no allocator now makes every module of the program
-allocator-free with no clause written anywhere, and a module's `requires` is answered against the
-machine — which is the "one clean error if built for a no-alloc target" that chapter promises.
-**Dependencies are not read at all**, and nothing below §3 is implemented.
+identity, the active target, per-target capability sets and **dependencies**. A `sysl build` over a
+project with a `dependencies` block fetches what it names, selects versions by MVS, checks what
+arrived against `sysl.sum`, and compiles the result as more modules — which is what a `--lib` source
+tree already was, so nothing downstream of resolution is new.
+
+The capability half was the first thing the file was needed for: `capabilities.md`'s *target
+provides* level had no way to be stated before, so every target offered everything. A target that
+provides no allocator now makes every module of the program allocator-free with no clause written
+anywhere, and a module's `requires` is answered against the machine.
+
+**What is not built:** `sysl vendor` (§10) and the commands of §11 — there is no `sysl add`, `fetch`,
+`vendor` or `deps` subcommand, and a dependency is added by editing `package.hocon`. §8's *report it
+at add time* half waits on `sysl add` existing; the compiler's own enforcement of a package's
+`requires` is there.
 
 **Written ahead of need, deliberately, and that is worth knowing when reading it.**
 `capabilities.md` advises designing only the minimum that unblocks the work at hand and letting real
@@ -70,7 +78,7 @@ targets {
 requires { os = true }
 
 dependencies {
-  json  { git = "github.com/edadma/sysl-json", version = "2.1.0" }
+  json  { git = "github.com/edadma/sysl-json", version = "1.4.0" }
   regex { git = "github.com/edadma/sysl-regex", version = "0.4.0", mount = "re" }
   local { path = "../experiment" }
 }
@@ -99,12 +107,17 @@ A dependency is **a git repository and a version**. There is no registry, no acc
 no name to reserve.
 
 ```hocon
-json { git = "github.com/edadma/sysl-json", version = "2.1.0" }
+json { git = "github.com/edadma/sysl-json", version = "1.4.0" }
 ```
 
 The coordinate resolves the way Go's does: `github.com/edadma/sysl-json` is cloned over HTTPS and
-the tag `v2.1.0` is what gets read. A `path` dependency names a directory instead, for a package
+the tag `v1.4.0` is what gets read. A `path` dependency names a directory instead, for a package
 being developed alongside its consumer.
+
+**A coordinate is identity, not a URL, and the difference is checked.** `https://` on the front is
+refused rather than stripped: the coordinate is what `§ 9` mangles module names out of, so two
+spellings of one package would link as two incompatible copies of it, and the error would arrive at
+the linker rather than at the line that caused it.
 
 **Why no registry: a registry is a service, and a service is a thing that must not go down.** It
 needs hosting, uptime, moderation, a name-squatting policy, an abuse contact and a story for what
@@ -179,6 +192,26 @@ trade Go made, and the same complaint Go gets.
 `sysl.sum` sits beside `package.hocon`, is committed, and records a content hash per resolved
 package and version. A fetch whose content does not match is refused.
 
+**The hash is SHA-256 over a canonical listing** — one `<digest>  <relative path>` line per file,
+sorted by path — which is the shape Go's `h1:` takes and is chosen for the same reason: it is a total
+order over content that no filesystem detail can perturb. `.git` is excluded anywhere in the tree,
+since two clones of one commit differ there and a hash including it would depend on how a package was
+fetched rather than on what was fetched. The digest itself is computed by the platform's own utility
+(`shasum`, `sha256sum`), which is the arrangement the compiler already has with `clang` and
+`llvm-ar` — but the *definition* is independent of it, so replacing the shell-out with an
+implementation in Scala changes nothing that has been committed.
+
+**The cache is shared by every project on the machine**, and that is what makes the check more than
+a formality: the hash computed when a package was written is recorded in a **sibling** of its
+directory, so a project whose `sysl.sum` covers a package that some *other* project fetched first is
+still checked, and is checked without walking the tree again. A sibling rather than a file inside,
+because anything inside would be part of what the tree hash covers and a hash cannot cover itself.
+A cached directory with nothing recording what it hashed to is refused rather than trusted — it is
+an interrupted fetch or something a person put there, and it is not evidence about anything.
+
+**A `path` dependency has no entry and wants none.** A directory beside the consumer is expected to
+change; that is what it is for.
+
 **It is not a lockfile and it is worth being clear about the difference.** MVS has already made the
 *version* selection deterministic, so nothing needs to record which versions were chosen. What
 `sysl.sum` pins is *content* — the case where a tag is moved, a repository is rewritten, or a mirror
@@ -248,6 +281,23 @@ Two ways out, and sysl takes the second:
 **The mount is optional.** A dependency states a preferred root name; a consumer writes `mount` only
 when it collides. Mandatory mounting was rejected because it would make every project's import lines
 differ from the library's own documentation — a permanent tax paid for an occasional problem.
+
+**What a package offers is its own top-level module names, and that is settled by the paragraph
+above.** A package's top-level directories are its modules (`13 §1`), so those are the names a
+consumer writes: a package holding `sqlite/` is reached as `sqlite.open`, which is what its
+documentation shows. Prefixing them by something — the package's name, the coordinate — would be
+mandatory mounting under another name, and would fail the test this section already set. The
+collision example below says the same thing from the other side, since the `json` a project's own
+`json/` directory collides with is a *directory* name.
+
+**`package.name` is deliberately not what a consumer writes.** It names the package, which is a unit
+of distribution; an import line names a module, which is a unit of code. sqlite3 is the case that
+makes the difference concrete — the package is `sqlite3` and the module is `sqlite` — and a consumer
+reaching for the second should not have to say the first.
+
+**A mount hangs the whole package under one segment.** Mounted as `ejson`, a package's `json` is
+reached as `ejson.json`, which leaves the consumer's own `json` alone. That is the escape hatch, and
+it is per-consumer: two projects mounting one package differently still link one copy of it.
 
 **What makes "optional" safe is the rule that a collision is an error, never a silent winner.** Two
 dependencies resolving to one root name refuse to compile, and the diagnostic says which one to
@@ -329,10 +379,14 @@ code reaches.
 
 ## Open (not yet decided)
 
-- **a. Where a preferred root name comes from when there is no manifest.** A `path` dependency into
-  a plain directory, or a git tree that predates `package.hocon`, has nothing to state a preference.
-  The lean is to **require** an explicit `mount` there rather than defaulting to the directory name,
-  since a silent default is the kind of magic that is pleasant once and surprising afterwards.
+- **~~a. Where a preferred root name comes from when there is no manifest.~~ CLOSED by §9's own
+  rule.** The worry was that a package with no manifest has nothing to state a preference with, and
+  that defaulting to a directory name would be magic — but the names a package offers are its
+  **top-level module** directories rather than the directory it was checked out into, and those are
+  decisions its author made and `13 §1` already makes load-bearing. So a manifest is not what names
+  a package's modules, and a `path` dependency into a plain tree needs no `mount`. What *is* refused
+  is a package with no top-level directories at all: it offers nothing, and a dependency on it can
+  only be a mistake.
 - **b. Whether module names ever become globally qualified.** §9 chose local names, but the
   alternative is a real design and not a strawman.
 - **c. Whether a package's `link` directives are reported at add time.** The information is already

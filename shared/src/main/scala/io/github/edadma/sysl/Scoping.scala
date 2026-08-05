@@ -320,7 +320,46 @@ trait Scoping extends DeclTables {
     val head = written.takeWhile(_ != '.')
 
     if namesModule(head) then written
-    else importedModule(head).map(_ + written.drop(head.length)).getOrElse(written)
+    else importedModule(head).map(_ + written.drop(head.length)).getOrElse(inPackage(written))
+  }
+
+  /** A written module path read through the **package** layer alone, leaving a file's own imports
+   * out of it.
+   *
+   * `import` paths take this rather than `modulePath`, because an import is what *makes* a shorter
+   * spelling and reading one through the spellings already in scope would let an import be written
+   * in terms of another — a rename of a rename, which no language here offers and which would make
+   * the order of a file's import lines change what they mean.
+   */
+  protected def inPackage(written: String): String = {
+    val head = written.takeWhile(_ != '.')
+
+    if namesModule(head) then written
+    else packagePath(head).map(_ + written.drop(head.length)).getOrElse(written)
+  }
+
+  /** The same question one layer out: what a written path's leading segment means in the **package**
+   * the file belongs to (`packages.md § 9`).
+   *
+   * Two things answer to it, and they are the two halves of that section. A package's own modules
+   * sit under its canonical prefix, so a file of `github.com/e/json` writing `json.Parser` means
+   * that package's `json` and nothing else — which is what makes a package's source read the same
+   * whoever depends on it. And a **dependency** of that package answers to whatever the manifest
+   * calls it: its own preferred name, or the `mount` a consumer wrote when two packages wanted one
+   * word.
+   *
+   * Its own modules are asked first. A package cannot be made to mean something other than itself by
+   * a dependency that happens to prefer one of its names — and the collision that would be is
+   * already refused when the graph is resolved, so this order is what that refusal is worth.
+   *
+   * The project being built has an empty prefix and no table, so both lookups miss and a path is
+   * read exactly as it was before any of this existed.
+   */
+  private def packagePath(head: String): Option[String] = {
+    val prefix = currentFile.map(packages.prefixOf).getOrElse("")
+
+    Option.when(prefix.nonEmpty)(Packages.qualify(prefix, head)).filter(namesModule)
+      .orElse(packages.mounted(prefix, head))
   }
 
   /** The module a name was imported as, searching the open blocks before the file. */

@@ -68,13 +68,15 @@ object Compiler {
    */
   def compiledWith(sources: List[Source], libraries: List[Program], target: Target = Target.default,
                    precompiled: Set[String] = Set.empty, std: Option[Stdlib] = None,
-                   provides: Set[String] = Capability.core.toSet)
+                   provides: Set[String] = Capability.core.toSet,
+                   packages: Packages = Packages.none)
       : Either[String, Compiled] = {
     val parsed = sources.map(SyslParser.parse(_, target))
 
     parsed.collect { case Left(e) => e } match
       case Nil =>
-        compiledTrees(parsed.collect { case Right(p) => p }, libraries, target, precompiled, std, provides)
+        compiledTrees(parsed.collect { case Right(p) => p }, libraries, target, precompiled, std,
+          provides, packages)
       case errs => Left(errs.mkString("\n"))
   }
 
@@ -86,9 +88,10 @@ object Compiler {
    */
   def compiledTrees(units: List[Program], libraries: List[Program] = Nil,
                     target: Target = Target.default, precompiled: Set[String] = Set.empty,
-                    std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet)
+                    std: Option[Stdlib] = None, provides: Set[String] = Capability.core.toSet,
+                    packages: Packages = Packages.none)
       : Either[String, Compiled] =
-    analyzed(libraries ::: units, target, precompiled, carried(std, target), provides)
+    analyzed(libraries ::: units, target, precompiled, carried(std, target), provides, packages)
 
   /** The same compilation stopped at the **typed tree**, which is what `sysl prove` reads (`17 §9`).
    *
@@ -251,10 +254,12 @@ object Compiler {
    * the only thing between the checks and the lowering.
    */
   private def analyzed(units: List[Program], target: Target, precompiled: Set[String],
-                       std: Stdlib, provides: Set[String] = Capability.core.toSet)
+                       std: Stdlib, provides: Set[String] = Capability.core.toSet,
+                       packages: Packages = Packages.none)
       : Either[String, Compiled] =
     for
-      typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides)
+      typed    <- Analyzer.analyze(units, std = std, target = target, provides = provides,
+                    packages = packages)
       promoted <- Escape.check(typed)
       _        <- TailCalls.check(typed)
     yield

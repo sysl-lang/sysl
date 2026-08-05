@@ -51,13 +51,17 @@ trait ExprSupport extends SpecialForms with PatternAnalysis with StmtAnalysis {
    * **longest** module prefix wins, so a module `a.b` is reached as one rather than as `a`'s `b`.
    *
    * A head that names no module is read as an import of one, which is what makes the `fs` of
-   * `import std.fs` a prefix everywhere a written path is.
+   * `import std.fs` a prefix everywhere a written path is — and failing that, as a name the
+   * **package** binds, which is what makes `sqlite.open` reach a dependency's module without an
+   * import and without the coordinate it is really named under (`packages.md § 9`).
    */
   protected def throughModule(e: Expr): Option[Expr] =
     for
       written <- chain(e) if written.length > 1 && lookupOpt(written.head).isEmpty
       path = if namesModule(written.head) then written
-             else importedModule(written.head).fold(written)(_.split('.').toList ::: written.tail)
+             else importedModule(written.head)
+               .orElse(Option(inPackage(written.head)).filter(_ != written.head))
+               .fold(written)(_.split('.').toList ::: written.tail)
       k <- (path.length - 1).to(1, -1).find(n => moduleNames(path.take(n).mkString(".")))
     yield
       val module = path.take(k).mkString(".")
