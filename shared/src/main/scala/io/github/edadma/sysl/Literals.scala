@@ -169,14 +169,19 @@ trait Literals extends TypeResolution {
 
   /** The same, for the value a `Display` renderer is handed.
    *
-   * One kind of value does not *widen* into its renderer: an integer past 64 bits has no width to
-   * widen to that would still hold it, so it arrives as the digits `str` writes and the library is
-   * left with the padding. Rendering it any other way would truncate silently, which is the one
-   * outcome a renderer must not have — the number would simply print as its low half.
+   * One kind of value does not *widen* into its renderer: an integer too wide for any renderer to
+   * take as a number arrives as the digits `str` writes instead, and the library is left with the
+   * padding. Rendering it any other way would truncate silently, which is the one outcome a
+   * renderer must not have — the number would simply print as its low half.
+   *
+   * **Which integers those are is `CoreTraits.display`'s to say, and this reads its answer rather
+   * than repeating the width test.** The two used to carry a copy of the rule each, and they
+   * disagreed the moment one of them moved: a renderer taking a number was handed a `string`, which
+   * is a fat pointer read as an integer and a crash rather than a diagnostic. So the widening target
+   * being `string` for a value that is not one *is* the signal, and there is one width test.
    */
-  protected def rendered(t: TExpr, to: Type): TExpr = Type.underlying(t.ty) match
-    case i: Type.Integer if i.bits > 64 => TStr(t)
-    case _                              => widen(t, to)
+  protected def rendered(t: TExpr, to: Type): TExpr =
+    if to == Type.Str && Type.underlying(t.ty) != Type.Str then TStr(t) else widen(t, to)
 
   /** The result type of an arithmetic or bitwise binary operator. Operands must already have
    * the same type — there is no implicit promotion, so a mixed-width expression is an error

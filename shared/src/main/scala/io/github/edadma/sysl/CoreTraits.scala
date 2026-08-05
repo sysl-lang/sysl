@@ -261,9 +261,19 @@ object CoreTraits {
    * before it can name one.
    */
   def display(t: Type): Option[(String, Type)] = t match
-    // Past 64 bits the renderer takes the digits rather than the number, because the library's own
-    // two go through `snprintf` and C has no conversion that wide. The padding is still the same.
-    case i: Type.Integer if i.bits > 64 => Some(("display_wide", Type.Str))
+    // Past 128 bits the renderer takes the digits rather than the number, because working them out
+    // needs a buffer whose size follows the width, and a fixed array's length cannot be written in
+    // terms of the receiver. Rendering that wide therefore costs an allocation, which is the one
+    // place `Display`'s allocation-free promise does not reach.
+    case i: Type.Integer if i.bits > 128 => Some(("display_wide", Type.Str))
+
+    // Between 64 and 128 the digits are worked out in the library against a frame-local buffer.
+    // `snprintf` is what the two below reach and C has no conversion wider than `%lld`, so these
+    // exist rather than widening into them — and going through a `string` instead would put the
+    // digits on the heap and stop a `no alloc` module printing a number.
+    case i: Type.Integer if i.bits > 64 && i.signed => Some(("display_i128", Type.Integer(128, signed = true)))
+    case i: Type.Integer if i.bits > 64             => Some(("display_u128", Type.Integer(128, signed = false)))
+
     case i: Type.Integer if i.signed => Some(("display_int", Type.Integer(64, signed = true)))
     case _: Type.Integer             => Some(("display_uint", Type.Integer(64, signed = false)))
     case _: Type.Floating            => Some(("display_real", Type.Real))
