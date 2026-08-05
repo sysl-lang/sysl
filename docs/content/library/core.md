@@ -261,21 +261,30 @@ Every rendering the language does ends up in this family, one function per shape
 | function | renders |
 |---|---|
 | `display_str` | a `string`; precision **truncates** |
-| `display_int`, `display_uint` | an integer up to **64 bits**; precision is a **minimum digit count**, zero-filled |
-| `display_i128`, `display_u128` | an integer of **65 to 128 bits**, whose digits `snprintf` cannot produce |
-| `display_wide` | an integer **above 128 bits**, rendered from the digits `str` writes |
+| `display_int`, `display_uint` | an integer a caller already holds at **64 bits**; precision is a **minimum digit count**, zero-filled |
 | `display_real` | a float; precision is **significant digits**, defaulting to 6 and capped at 40 |
 | `display_bool`, `display_char` | `true`/`false`, and a code point encoded to UTF-8 |
-| `display_pad` | **where they all end up** — puts finished bytes in the field the spec asked for |
+| `display_digits` | **where a number ends up** — reads a sign off the front, zero-fills to the precision, then pads |
+| `display_pad` | **where the rest end up** — puts finished bytes in the field the spec asked for |
 | `display_fill` | writes one byte *n* times, in 16-byte runs off a stack buffer |
 
-**How a built-in reaches its own splits by whether its family is closed.** `bool`, `char`, `string`,
-`real` and `f32` are five types, so each has an ordinary `impl Display` in the library forwarding to
-the function above — they are `Display` exactly the way your own struct is, and a `*Display` can
-carry one. The `iN`/`uN` families are open (`i5` and `u24` are types you may write), so no finite
-list of blocks reaches them and the compiler routes their `display` to the family directly. The cost
-of that is real and worth knowing: **an integer cannot be erased to a `*Display`**, because a method
-table holds functions and a routing rule supplies none.
+**Every built-in reaches its own through an `impl`, and the two halves get there differently.**
+`bool`, `char`, `string`, `real` and `f32` are five types, so each has an ordinary `impl Display` in
+the library forwarding to the function above. The `iN`/`uN` families are open — `i5` and `u24` are
+types you may write — so no finite list of blocks reaches them; what reaches them is a single
+**blanket** block, `impl[T: Integer] Display for T`, whose buffer is measured from the width it is
+instantiated at.
+
+Either way they are `Display` exactly the way your own struct is, and **a `*Display` can carry any
+of them**. That is what the blanket bought: a `[]*Display` holding an `int`, a `u8`, a `string` and
+a float is ordinary code, where an integer used to be the one thing a method table could not hold.
+
+`Integer` is a trait you can write a bound over — `f[T: Integer](x: T)` accepts every width and
+nothing else — but not one you can implement. It names which types the compiler settles a family as,
+so there is nothing for a block to supply.
+
+`display_int` and `display_uint` remain for a caller who already has a `long` in hand. Nothing in
+the library routes through them any more.
 
 A scalar reaches its own through a method call, so a `Display` written for a struct can render its
 fields without leaving the allocation-free path:
@@ -301,13 +310,15 @@ prints("\n")
 the family — and padding on the left. The neutral spec, which is what a plain `print` passes, is
 `FormatSpec(0, -1, false)`.
 
-**The allocation-free path reaches 128 bits and stops there.** Every renderer up to that width works
-its digits out against a frame-local buffer and hands the sink a slice of it, which is safe because a
-`Writer` borrows the bytes it is given rather than keeping them — so a module declaring `@no_alloc`
-can render any of them. Wider values go through `display_wide`, which takes the digits `str` writes,
-and a string is heap storage: a `u256` therefore cannot be rendered from a module without an
-allocator. Covering every width would need a buffer whose size follows the receiver, and a fixed
-array's length cannot be written in terms of a type parameter.
+**The allocation-free path reaches every width.** A rendering works its digits out against a
+frame-local buffer and hands the sink a slice of it, which is safe because a `Writer` borrows the
+bytes it is given rather than keeping them — so a module declaring `@no_alloc` can render anything,
+a `u256` included.
+
+It did not always. The buffer has to be sized for the width, and until an array's length could be
+written in terms of a type parameter — `[sizeof(T) * 3 + 2]u8`, three decimal digits per byte being
+the bound at every width — the widest values fell back through `str`, which is heap storage. So the
+values needing the most care were the ones a module without an allocator could not print.
 
 ### One padder, and why
 

@@ -509,8 +509,10 @@ The built-in scalar and primitive types have no source body to write an `impl` i
 memberships are **provided by the compiler**, exactly as their members already are (`08 §"Built-in
 members"`). The mapping is the existing operator semantics of `01`, restated as trait membership:
 
-- Every numeric type (integers and floats) is `Add`, `Sub`, `Mul`, `Div`, `Eq`, `Ord`, and
-  `Display`. The signed integers and the floats are additionally `Neg`. Every **integer** is also
+- Every numeric type (integers and floats) is `Add`, `Sub`, `Mul`, `Div`, `Eq`, and `Ord`. Every
+  integer is additionally `Integer`, which is the family the blanket `impl` of `Display` is written
+  over and promises nothing else. The signed integers and the floats are additionally `Neg`. Every
+  **integer** is also
   `Hash`; a **float** deliberately is not, for the reason Rust leaves it out — `NaN != NaN` breaks
   the reflexivity a table lookup assumes, and `-0.0 == 0.0` holds between two different bit
   patterns, so a hash over the bits would contradict the equality unless it normalized first. A
@@ -527,9 +529,9 @@ members"`). The mapping is the existing operator semantics of `01`, restated as 
   (`01` — `char` has equality and ordering only).
 - `bool` is `Eq` and `Hash`, and is **not** `Ord` (`01` — `bool` has equality, no ordering).
 - `string` is `Add` (concatenation, the one string operator — `04`), `Eq`, `Ord`, and `Hash`.
-- **`Display` is not in this list for any of them, and that is the point of the next paragraph:**
-  `bool`, `char`, `string` and the two floats reach it through written `impl` blocks instead. The
-  integers are the only types whose `Display` is a rule.
+- **`Display` is not in this list for any of them, and that is the point of the next section:**
+  every built-in reaches it through an `impl` — the closed families through blocks written per type,
+  the integers through one blanket block over `Integer`. No type has `Display` by rule.
 - The pointer modes `*T`/`&T` are `Eq` only (address equality; no ordering — `01`), and
   deliberately **not `Display`**: an address renders differently on every run, so a program that
   wants one in its output asks for it explicitly rather than getting it from `print(p)`. This is a
@@ -551,9 +553,51 @@ bool` in the library or nowhere.
 So the closed families are **written out**. `bool`, `char`, `string`, `real` and `f32` are five
 types, and `lib/sysl/display.sysl` gives each an ordinary one-line `impl` forwarding to the same
 `display_*` function the rule used to name. They are now `Display` the way any program's struct is,
-and a `*Display` carries one. The `iN`/`uN` families stay a rule because `i5` and `u24` are types a
-program may name and no finite list of blocks reaches them — the same test `sysl.math` applies when
-it writes `Float` as two `impl`s and leaves `Bits` to the compiler.
+and a `*Display` carries one.
+
+### A blanket `impl` over a closed bound
+
+The open families cannot be written out and are not left to a rule either. What covers them is one
+block written over a **bound** rather than over a type:
+
+```sysl
+trait Integer: Div + Rem + Ord + Eq + Sub
+
+impl[T: Integer] Display for T
+    display(self, out: *Writer, fmt: FormatSpec)
+        var buf: [sizeof(T) * 3 + 2]u8
+        …
+```
+
+`Integer` names the family and declares no member of its own — a type is one of the integers or it
+is not. What it carries is the operators the body needs, exactly as `sysl.math`'s `Float` carries
+the ones its two widths share. **A trait may leave its members out only where it requires another**;
+one with neither says nothing at all, and a body indented wrongly would silently become one.
+
+The buffer is what makes a single block possible, and it could not have been written before an
+array's length could be worked out from a type parameter: three decimal digits per byte is the bound
+at every width, so `[sizeof(T) * 3 + 2]u8` is right at `u8` and at `i256` and wasteful at neither.
+The two extra bytes are the sign and the rounding.
+
+**The bound must be one nothing outside the compiler can join, and that single requirement is what
+makes the relaxation sound.** A blanket stands for every type meeting its bound, so coherence needs
+that set fixed: a program able to join the family later would acquire an implementation written for
+something else, with no block naming either. `Integer` is therefore **closed** — an `impl` of it is
+refused, there being nothing for one to supply. The same fact is what stops the lookup circling,
+since membership is asked of the compiler directly rather than through the conformance question that
+reached it. Widening this past a closed bound needs both arguments made again.
+
+`Bits` and `Signed` are **not** closed and stay ordinary traits whose members the compiler provides
+for the built-ins: a program's own type declaring `count_ones` and joining is meaningful, where a
+claim to *be* an integer is not. And `Integer` is not `Bits` renamed — `Bits` is named for what it
+provides, `Integer` for what it ranges over, and a future bitset or lane mask would want the first
+without being the second.
+
+**What this buys** is that every built-in erases. A heterogeneous `[]*Display` holding an `int`, a
+`u8`, a `u256`, a `string` and a float is ordinary code — the shape `12 § Open i`'s safe variadic
+wanted and could not have — and rendering costs no allocation at any width, where the values above
+128 bits used to fall back through a `string` and so were exactly the ones a `@no_alloc` module
+could not print.
 
 **A compiler-provided membership is not always an operator, and `sysl.math`'s integer half is the
 case that shows why the mechanism is needed rather than convenient.** `Signed`'s `abs` and `signum`,

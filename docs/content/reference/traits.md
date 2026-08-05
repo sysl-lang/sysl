@@ -835,7 +835,13 @@ for bounds.
 
 **A trait that requires an unerasable one is unerasable itself**, and the diagnostic names the trait
 the offending member came from. A **built-in** that satisfies a requirement by the compiler's rule
-cannot be erased at all — a table holds function pointers, and a scalar's `add` is an instruction.
+cannot be erased through it either — a table holds function pointers, and a scalar's `add` is an
+instruction.
+
+`Hash` is the only trait where that bites, since every other compiler-provided membership is an
+operator and already excluded above. **`Display` is not one of them**: every built-in reaches it
+through an `impl`, so a `*Display` carries an `int`, a `u256`, a `string` or a float alike, and a
+heterogeneous array of them is ordinary code.
 
 ### Forming and using one
 

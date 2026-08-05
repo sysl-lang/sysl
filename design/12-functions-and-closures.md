@@ -1307,10 +1307,16 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
   tail already follows, and the receiver is what the tail anchors on. A trait may declare one; what
   it cannot then be is a trait object, for the reason object safety gives.
 - **i. A *safe* variadic beside the C-faithful one.** A homogeneous `...T` collected into a slice
-  (Go's, Swift's) or a heterogeneous `...&Show` over trait objects would be checked, which §9's
-  cannot be. It is additive and wanted, and nothing blocks it any longer — the trait objects its
-  heterogeneous half wanted are built (`02`), so what remains is a spelling and a decision to take
-  it.
+  (Go's, Swift's) or a heterogeneous `...&Display` over trait objects would be checked, which §9's
+  cannot be. It is additive and wanted, and **nothing blocks it any longer** — what remains is a
+  spelling and a decision to take it.
+
+  That sentence was written once before and was not true when it was. The trait objects were built,
+  but a built-in joined `Display` by the compiler's rule rather than through a block, and a rule
+  supplies no function for a method table to point at — so a `...&Display` would have been a safe
+  `printf` that refused to print a number, which is no replacement at all. `14 §5` closes that: the
+  integers reach `Display` through a blanket `impl` over `Integer`, the closed families through
+  written blocks, and every built-in erases. The heterogeneous half now has something to hold.
 - **h. Capability gating for externs.** An `extern` reaching into libc is exactly the kind of thing
   `capabilities.md` exists to gate, and a freestanding `no alloc` target's externs are a different
   set from a hosted one's. Which capability an extern requires — and whether that is a property of
