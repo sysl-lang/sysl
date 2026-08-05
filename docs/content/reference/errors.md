@@ -611,8 +611,14 @@ impl Display for Span
 ```
 
 ```error
-'Span' already implements 'sysl.Display' — the compiler provides it
+'Span' already implements 'sysl.Display' — every 'sysl.Integer' does, through one block written over the family, and a subtype has its base's memberships
 ```
+
+The two refusals arrive by different routes, which the messages say. `Add` is a membership the
+**compiler** provides, so a member of that name would hide something with no block behind it.
+`Display` is an ordinary `impl` the **library** writes — one blanket block covering every integer —
+and a derivation has its base's memberships, so the block covers `Span` too. Either way a derivation
+may not replace what it inherited.
 
 Both halves are deliberate. **Inheriting is right** because a derivation does not change what the
 values *are*: a `Slot` is some of the `u8`s, not a different set of things that happens to be stored

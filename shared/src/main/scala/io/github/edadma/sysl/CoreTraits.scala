@@ -213,19 +213,43 @@ object CoreTraits {
     // number this language lets a program compute with, which is where the matter rests.
     case "Hash" => t.isInstanceOf[Type.Integer] || t == Type.Char || t == Type.Bool || t == Type.Str
 
-    // **The integers only, because they are the one family here that is open.** `bool`, `char`,
-    // `string` and the two floats have ordinary `impl` blocks in `lib/sysl/display.sysl`, which is
-    // what a closed family gets — and what lets a value of one be erased to a `*Display`, since a
-    // method table needs a function that exists and a membership provided here has none.
+    // **Every integer type, and nothing else — the family named by what it ranges over.**
     //
-    // A pointer is deliberately left out of both halves: an address renders differently on every
-    // run, so a program that wants one in its output asks for it rather than getting it from
-    // `print(p)`.
-    case "Display" => t.isInstanceOf[Type.Integer]
+    // This is the membership a *blanket* `impl` is written over, which is the whole reason it
+    // exists: `impl[T: Integer] Display for T` says once, in source, what no finite list of blocks
+    // could say about an open family. So unlike every other row here it promises no operation of its
+    // own; what it promises is that `T` is one of the integers, and the operations come from the
+    // traits it requires.
+    //
+    // It is deliberately **not** `Bits` under another name (`14 §5`). `Bits` is named for what it
+    // provides — a population count, a rotation — and `Integer` for what it ranges over; they extend
+    // alike today and would part company the moment a bitset or a lane mask wanted the first without
+    // being the second. `Float` is the counterpart on the closed side, and it is a trait with two
+    // written `impl`s for exactly the reason this one cannot be.
+    case "Integer" => t.isInstanceOf[Type.Integer]
 
     case _ => false
     }
   }
+
+  /** The traits a program may never write an `impl` for, because their membership is a **family**
+   * rather than a promise: they say which types something *is one of*, and that is the compiler's
+   * answer alone.
+   *
+   * This is what makes a blanket `impl` over one of them sound, and the two facts are the same fact.
+   * A blanket covers every type meeting its bound, so coherence needs the set of such types to be
+   * one nothing outside the compiler can add to — otherwise a program joins a family after the fact
+   * and acquires an implementation written for something else entirely, with no block naming either.
+   * Closing the trait is what fixes the set, and fixing the set is what lets one block stand for all
+   * of it.
+   *
+   * `Bits` and `Signed` are **not** here, and the difference is worth being exact about: they are
+   * ordinary traits whose members happen to be compiler-provided for the built-ins, so a program's
+   * own type declaring `count_ones` and joining is meaningful. `Integer` has no members to supply,
+   * so an `impl` of it could only be a claim to be an integer, which is not a claim a program is in
+   * a position to make.
+   */
+  val closed: Set[String] = Set("Integer")
 
   /** The library function a built-in's `Hash` goes through, and the type its receiver widens to.
    *
@@ -253,36 +277,4 @@ object CoreTraits {
     case Type.Bool => Some(("hash_bool", Type.Bool))
     case Type.Str  => Some(("hash_str", Type.Str))
     case _         => None
-
-  /** The library function a built-in's `Display` renders through (`14 §5`), which is the sink
-   * counterpart of the one `print` reaches for the same type.
-   *
-   * A built-in has no `impl` block and so no lowered `int.display` to call, exactly as it has no
-   * `int.add`; what it has is a rendering the library already writes, and naming it here is what
-   * lets a `Display` written for a struct render the struct's own fields.
-   *
-   * These are **spellings**, as everything in this table is. The family is in the standard module,
-   * so `display_int` is filed under `sysl$display_int` and a caller goes through `Library.key`
-   * before it can name one.
-   */
-  def display(t: Type): Option[(String, Type)] = t match
-    // Past 128 bits the renderer takes the digits rather than the number, because working them out
-    // needs a buffer whose size follows the width, and a fixed array's length cannot be written in
-    // terms of the receiver. Rendering that wide therefore costs an allocation, which is the one
-    // place `Display`'s allocation-free promise does not reach.
-    case i: Type.Integer if i.bits > 128 => Some(("display_wide", Type.Str))
-
-    // Between 64 and 128 the digits are worked out in the library against a frame-local buffer.
-    // `snprintf` is what the two below reach and C has no conversion wider than `%lld`, so these
-    // exist rather than widening into them — and going through a `string` instead would put the
-    // digits on the heap and stop a `no alloc` module printing a number.
-    case i: Type.Integer if i.bits > 64 && i.signed => Some(("display_i128", Type.Integer(128, signed = true)))
-    case i: Type.Integer if i.bits > 64             => Some(("display_u128", Type.Integer(128, signed = false)))
-
-    case i: Type.Integer if i.signed => Some(("display_int", Type.Integer(64, signed = true)))
-    case _: Type.Integer             => Some(("display_uint", Type.Integer(64, signed = false)))
-
-    // The closed families are not here: `bool`, `char`, `string` and the two floats reach their
-    // rendering through an ordinary `impl` in `lib/sysl/display.sysl`, the way any other type does.
-    case _ => None
 }

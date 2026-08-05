@@ -164,32 +164,45 @@ class LibraryTests extends LibrarySeamSupport {
       CoreTraits.required.keySet -- Library.declared shouldBe Set.empty
     }
 
-    "the renderer each built-in reaches, which is chosen per type rather than written down" in {
-      // The integers, and only the integers: the closed families reach `Display` through ordinary
-      // `impl` blocks in `lib/sysl/display.sysl`, so the routing table has no row for them.
+    // There is no renderer table left to assert about: every type reaches `Display` through an
+    // `impl`, the closed families each through one of their own and the integers through the
+    // blanket block over `Integer`. What is asserted instead is that no built-in gets `Display` by
+    // rule any longer, since a membership provided that way is exactly what cannot fill a table
+    // slot — and filling one is the whole point of having moved it.
+    "no built-in has 'Display' by the compiler's rule, at any width or in any closed family" in {
       val builtins = List(
+        Type.Integer(4, signed = false),
         Type.Integer(8, signed = true),
         Type.Integer(64, signed = true),
         Type.Integer(64, signed = false),
         Type.Integer(128, signed = false),
         Type.Integer(256, signed = false),
+        Type.Real,
+        Type.Bool,
+        Type.Char,
+        Type.Str,
       )
 
-      // Each has a renderer, and no two widths share one by accident — the five rows are four
-      // distinct functions, which is what the widening is for.
-      val renderers = builtins.flatMap(t => CoreTraits.display(t).map(_._1))
-
-      renderers.length shouldBe builtins.length
-      renderers.toSet.diff(Library.declared) shouldBe Set.empty
+      for t <- builtins do CoreTraits.builtin("Display", t).shouldBe(false)
     }
 
-    // The other half of the split, asserted where the table is: a type whose family is closed has
-    // no row here at all, because a written `impl` is what it reaches instead. This is also what
-    // makes those types erasable to a `*Display`, since a table slot needs a function that exists.
-    "and no renderer for a type whose family is closed, which has an impl instead" in {
-      for t <- List(Type.Real, Type.Bool, Type.Char, Type.Str) do
-        CoreTraits.display(t) shouldBe None
-        CoreTraits.builtin("Display", t) shouldBe false
+    // The membership that replaced it, which is a *family* rather than a rendering: it says which
+    // types the blanket covers and promises no operation, so there is no function name to hold
+    // against the library the way the renderer rows were held.
+    "'Integer' is every integer width and nothing else" in {
+      for t <- List(Type.Integer(1, signed = false), Type.Integer(4, signed = false),
+                    Type.Integer(32, signed = true), Type.Integer(256, signed = false)) do
+        CoreTraits.builtin("Integer", t).shouldBe(true)
+
+      for t <- List(Type.Real, Type.Floating(32), Type.Bool, Type.Char, Type.Str) do
+        CoreTraits.builtin("Integer", t).shouldBe(false)
+    }
+
+    // A closed trait is one nothing may implement, and that is what makes the blanket sound — so
+    // the set is held to being declared exactly as every other compiler-known name is.
+    "and the family it names is a trait the library declares" in {
+      CoreTraits.closed.diff(Library.declared).shouldBe(Set.empty)
+      CoreTraits.closed.shouldBe(Set("Integer"))
     }
 
     "and the mixer, for the types whose `Hash` the compiler provides" in {
@@ -206,16 +219,16 @@ class LibraryTests extends LibrarySeamSupport {
       mixers.toSet.diff(Library.declared) shouldBe Set.empty
     }
 
-    // A float is in neither table, for two unrelated reasons worth keeping apart: `Hash` withholds
-    // the membership deliberately (`NaN != NaN` breaks what a table lookup assumes), while
-    // `Display` has no row because there are two float widths and a closed family gets written
-    // `impl` blocks rather than a rule.
-    "a float is in neither table, and the two reasons are different" in {
-      CoreTraits.hash(Type.Real) shouldBe None
-      CoreTraits.builtin("Hash", Type.Real) shouldBe false
+    // A float has neither membership, for two unrelated reasons worth keeping apart: `Hash`
+    // withholds it deliberately (`NaN != NaN` breaks what a table lookup assumes), while `Display`
+    // withholds it from every built-in now — a float renders through the `impl` written for its
+    // width, exactly as an integer renders through the blanket.
+    "a float has neither membership, and the two reasons are different" in {
+      CoreTraits.hash(Type.Real).shouldBe(None)
+      CoreTraits.builtin("Hash", Type.Real).shouldBe(false)
 
-      CoreTraits.display(Type.Real) shouldBe None
-      CoreTraits.builtin("Display", Type.Real) shouldBe false
+      CoreTraits.builtin("Display", Type.Real).shouldBe(false)
+      CoreTraits.builtin("Integer", Type.Real).shouldBe(false)
     }
   }
 

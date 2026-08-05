@@ -305,7 +305,7 @@ private[sysl] def execute(cfg: Config): Int = {
 
   // Which standard module this compilation is compiled against — an error if there is none, the same
   // as any other missing library.
-  val (std, coreSymbols, coreArchive) = chooseCore(cfg, target) match
+  val Stdlib.Resolved(std, coreSymbols, coreArchive) = Stdlib.resolve(stdChoice(cfg), target) match
     case Left(err) => return fail(err)
     case Right(c)  => c
 
@@ -509,7 +509,8 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
       // is named after the root it was built from, there being nowhere in particular it belongs.
       val out =
         cfg.output.getOrElse(
-          if cfg.std then stdSearchOf(cfg) else defaultOutputName(cfg.file) + LibraryArtifact.extension)
+          if cfg.std then cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault)
+          else defaultOutputName(cfg.file) + LibraryArtifact.extension)
 
       Project.parentOf(out).foreach(createDirectories)
 
@@ -546,7 +547,8 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
  * rather than a different standard module built underneath them. That is the rule `Toolchain.findAr`
  * applies to a named archiver, and for the same reason.
  *
- * **The one at the default path is a cache, and is rebuilt when it is not usable.** See `foundStd`.
+ * **The one at the default path is a cache, and is rebuilt when it is not usable.** See
+ * `Stdlib.resolve`.
  *
  * `--no-std-lib` is the one way to the library **as source**, with no artifact in between. It is
  * what bootstrap needs — there is no released sysl to build the first artifact with — and what the
@@ -558,85 +560,23 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
  * **`build-lib --std` is exempt, and has to be.** It is the command that produces the artifact, so
  * consulting one would be a deadlock with nothing to break it.
  */
-/** Where this compilation looks for a prebuilt standard module: wherever the config points, or the
- * path both ends agree on.
+/** Which standard module this command line asks for.
  *
- * Resolved here rather than in `Config`, because the default is keyed by a fingerprint of the
- * library and so cannot be computed until the library has been found. Every caller is downstream of
- * `chooseCore`'s check, so by the time this runs there is a library to fingerprint.
+ * The whole of what the driver contributes: the finding, the rebuilding and the checking are
+ * `Stdlib.resolve`'s, because they are not properties of a command line — a test suite and a
+ * documentation harness need the same answer to the same question, and this is the only place that
+ * knows about `Config`.
+ *
+ * `build-lib --std` takes the source, and has to: it is the command that *produces* the artifact, so
+ * consulting one would be a deadlock with nothing to break it.
  */
-private def stdSearchOf(cfg: Config): String = cfg.stdSearch.getOrElse(LibraryArtifact.stdDefault)
+private def stdChoice(cfg: Config): Stdlib.Choice =
+  if cfg.noStdLib || cfg.std then Stdlib.Choice.FromSource
+  else
+    cfg.stdLib match
+      case Some(named) => Stdlib.Choice.Artifact(named)
+      case None        => Stdlib.Choice.Default(cfg.stdSearch)
 
-private def chooseCore(cfg: Config, target: Target): Either[String, (Stdlib, Set[String], Option[String])] =
-  // Every branch below reads the library's source: two of them compile it, and the third checks a
-  // prebuilt artifact against a fingerprint of it. So a compiler that cannot find its library fails
-  // here, once, with the diagnostic that names where it looked — rather than at whichever of the
-  // three happened to touch `Std.sources` first, where it would arrive as an exception.
-  Std.root.flatMap: _ =>
-    if cfg.noStdLib || cfg.std then Right((Stdlib.fromSource(target), Set.empty, None))
-    else
-      cfg.stdLib match
-        case Some(named) => loadCore(named, target)
-        case None        => foundStd(stdSearchOf(cfg), target)
-
-/** The standard module at the path both ends agree on, **built there when what is there is not one.**
- *
- * The artifact is a *derived* file: it is object code for one machine, it is not committed, and every
- * byte of it is computed from the library source the compiler already carries. So the states it can
- * be found in — absent after a clone or a fresh worktree, and stale after any change to the tree
- * encoding or the container — are not questions to put to whoever ran the compiler. They have one
- * answer, the compiler can produce it in well under a second, and it is the same answer every time.
- *
- * **This is not the silent fallback the design refuses**, and the distinction is the whole of why it
- * is allowed. What is refused is compiling against a *different* standard module than the one asked
- * for — answering "I could not find your library" by quietly using another. A rebuild answers with
- * **this** library: the sources are the ones the compiler carries, `Stdlib.read` holds the result to
- * `Std.fingerprint` on the way back in, and a program compiled after it is compiled against exactly
- * what it would have been compiled against had the artifact been there. Nothing is substituted, so
- * there is nothing for a reader to be misled about.
- *
- * It says so on stderr rather than doing it invisibly. The work is a second of someone's time and the
- * line is what makes a slow first build explicable instead of mysterious.
- *
- * **A rebuild that cannot happen reports the original problem, not its own.** Without a toolchain
- * there is no artifact to make, and what the reader needs then is the sentence naming the command and
- * the flag — the same one they would have got before — with the reason the compiler could not do it
- * for them appended.
- */
-private def foundStd(path: String, target: Target)
-    : Either[String, (Stdlib, Set[String], Option[String])] = {
-  val found = if isFile(path) then loadCore(path, target) else Left(s"$path does not exist")
-
-  found match
-    case Right(got) => Right(got)
-    case Left(why)  =>
-      Console.err.println(s"building the standard module at $path ($why)")
-
-      Stdlib.writeArtifact(path, target) match
-        case Right(_) => loadCore(path, target)
-        case Left(err) =>
-          Left(s"cannot find or build the standard module — build it with " +
-            s"'sysl build-lib lib --std', or pass --no-std-lib to compile against the copy built " +
-            s"into the compiler ($err)")
-}
-
-/** A prebuilt standard module read back: the trees to compile against, the symbols its object half
- * already defines, and the archive to link that half from — which is the file itself, since it is
- * already the archive the linker wants.
- *
- * Every way this can go wrong — a file that is not ours, one built by another sysl, one built from
- * other sources than the compiler carries, a tree that will not decode — is a failure of the same
- * kind as not finding it at all, and is reported rather than worked around. A standard module that
- * cannot be read is not a standard module.
- */
-private def loadCore(path: String, target: Target): Either[String, (Stdlib, Set[String], Option[String])] = {
-  val bytes =
-    try readBytes(path)
-    catch case e: Exception => return Left(s"cannot read $path: ${e.getMessage}")
-
-  LibraryArtifact.metadataOf(path, bytes).flatMap(meta =>
-    Stdlib.read(path, meta, target).map((std, symbols) => (std, symbols, Some(path))))
-}
 
 /** Which machine this invocation is for: the one it names, the one the project config names, or this
  * one. A machine sysl has no entry for is reported rather than guessed at — the guess would be a

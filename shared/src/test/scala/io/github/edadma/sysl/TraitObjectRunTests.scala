@@ -473,33 +473,57 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
           |""".stripMargin) shouldBe "7 6 2 20 3 36\n"
   }
 
-  /** `02`, *Object safety*: a built-in that belongs to a trait **by the compiler's rule** cannot be
-    * erased, because a table holds function pointers and what the compiler provides is an
-    * instruction or a rendering.
+  /** `02`, *Object safety*: a table holds function pointers, so a type can be erased to a trait only
+    * where the trait's members are functions that exist — which is what a source `impl` supplies and
+    * a compiler-provided membership does not.
     *
-    * **Which built-ins those are is now the open families only.** `bool`, `char`, `string` and the
-    * two floats are finite, so `lib/sysl/display.sysl` writes them ordinary `impl` blocks and they
-    * erase like anything else. The `iN`/`uN` families admit `i5` and `u24`, so no finite list of
-    * blocks covers them and their membership stays the compiler's — which is what this block is
-    * about. The membership is real either way, which is why the refusal is pinned beside the
-    * questions the same type still answers: a plain "wrong type" would deny a conformance the
-    * reader has, and send them after one they already hold.
+    * **Every built-in now clears that bar for `Display`, and the open families were the last to.**
+    * `bool`, `char`, `string` and the two floats are finite, so `lib/sysl/display.sysl` writes them
+    * ordinary blocks. The `iN`/`uN` families admit `i5` and `u24`, so no finite list of blocks covers
+    * them — what covers them is the single blanket block over `Integer`, whose buffer is measured
+    * from the type it is instantiated at. An integer's `display` is therefore an ordinary lowered
+    * function, and a slot can point at it.
     *
-    * `Display` is what makes this reachable at all: it is the one compiler-provided trait that is
-    * also object-safe, so every other one is stopped a step earlier by object safety.
+    * This block used to assert the refusal. It asserts the erasure now, and that is the change:
+    * a heterogeneous `[]*Display` was the shape every use of this wanted and could not have.
     */
-  "an integer belongs to a trait by rule, and a rule is not a table" - {
-    "so erasing one is refused, and the refusal names the rule" in {
-      for src <- List(
-          """var d: &Display = 5""",
-          """var xs: [3]&Display = [1, 2, 3]""",
-        )
-      do
-        val e = err(src)
+  "an integer's Display is written out too, so it erases like anything else" - {
+    "as a counted object and as a raw one" in {
+      run("""var n = 5
+            |var d: &Display = 5
+            |var p: *Display = &n
+            |print(d)
+            |print(p)
+            |""".stripMargin) shouldBe "5\n5\n"
+    }
 
-        e should include("by the compiler's rule rather than through an 'impl'")
-        e should include("table")
-        e should not include "but the value is"
+    "in an array of them" in {
+      run("""var xs: [3]&Display = [1, 2, 3]
+            |for x in xs do print(x)
+            |""".stripMargin) shouldBe "1\n2\n3\n"
+    }
+
+    // The shape the whole change is for: one array, four types, two of them integers of different
+    // widths — which no list of written blocks could have covered and no rule could have erased.
+    "and in a heterogeneous one, which is what an open family made impossible" in {
+      run("""var n = 42
+            |var w = 7u8
+            |var big = 340282366920938463463374607431768211455u128
+            |var s = "hi"
+            |var f = 2.5
+            |var five: [5]*Display = [&n, &w, &big, &s, &f]
+            |for d in five do print(d)
+            |""".stripMargin) shouldBe "42\n7\n340282366920938463463374607431768211455\nhi\n2.5\n"
+    }
+
+    // A width no C conversion reaches, erased and dispatched — the range that used to need a
+    // `string` to render at all, so it is the one where "the slot points at a real function" is
+    // saying the most.
+    "at a width the machine has no instruction for" in {
+      run("""var v = u256(1) << u256(200)
+            |var d: *Display = &v
+            |print(d)
+            |""".stripMargin) shouldBe "1606938044258990275541962092341162602522202993782792835301376\n"
     }
 
     "though a bound over that same trait is met, and print finds the same rendering" in {

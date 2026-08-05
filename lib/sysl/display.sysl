@@ -49,3 +49,57 @@ impl Display for real
 // renderer per kind rather than one per type, and `%g` is written against a `double`.
 impl Display for f32
     display(self, out: *Writer, fmt: FormatSpec) = display_real(real(self), out, fmt)
+
+// The integers, which are the family that is **open**: `i5` and `u24` are types a program may
+// name, so there is no finite list of widths to write the blocks above for.
+//
+// What stands in for the list is one block written over the whole family at once, and `Integer` is
+// what names the family. It declares no member of its own -- a type is one of the integers or it is
+// not, which is the compiler's answer and not something a program can join -- so what it carries is
+// the operators the block below needs, exactly as `sysl.math`'s `Float` carries the ones its two
+// widths share.
+trait Integer: Div + Rem + Ord + Eq + Sub
+
+// How every integer renders, at every width, from one body.
+//
+// **The buffer is measured from the type**, which is what makes one block possible: three decimal
+// digits per byte is the bound at every width, and the two extra bytes are the sign and the room
+// that rounding the bound up costs. A fixed length would be wrong at `u256` or wasteful at `u8`,
+// and there is no third choice -- which is why this could not be written until an array's length
+// could be worked out from a type parameter.
+//
+// **The number is never negated**, and that is what lets one body serve both signednesses. Taking a
+// magnitude gets the most negative value of a width wrong, since its magnitude is one larger than
+// the width holds -- `-128i8` negated is `-128i8` again. So a negative value walks toward zero
+// exactly as a positive one does, and each digit is taken out of it with the sign still on: `%`
+// truncates toward zero (`01`), so the remainder is itself negative and `zero - (n % ten)` is one
+// digit, always in 0..9 and so never near an edge.
+//
+// Rendering therefore costs no allocation at any width, which is the promise the trait's own prose
+// makes and the reason a `no alloc` module can log.
+impl[T: Integer] Display for T
+    display(self, out: *Writer, fmt: FormatSpec)
+        var buf: [sizeof(T) * 3 + 2]u8
+        val zero: T = 0
+        val ten: T = 10
+        var i = buf.len
+        var n = self
+
+        if n == zero then
+            i -= 1usize
+            buf[i] = 48u8
+        else if n < zero then
+            while n != zero
+                i -= 1usize
+                buf[i] = 48u8 + u8(zero - (n % ten))
+                n = n / ten
+
+            i -= 1usize
+            buf[i] = 45u8
+        else
+            while n > zero
+                i -= 1usize
+                buf[i] = 48u8 + u8(n % ten)
+                n = n / ten
+
+        display_digits(buf[i..<buf.len], out, fmt)

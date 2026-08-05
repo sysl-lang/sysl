@@ -780,14 +780,21 @@ type-argument entry already records.
 
 ## Details still to settle
 
-- **Whether a built-in should be erasable into a `&Display`.** *Object safety* refuses every
-  compiler-provided membership on the grounds that what the compiler provides is an instruction, and
-  for the operator catalog that is exactly right. `Display` is the one place the reason does not
-  reach: a built-in's rendering is a **library function** (`display_int`, `display_str`, …), which is
-  precisely the thing a table slot can hold, so the refusal there is the blanket rule rather than the
-  argument behind it. Whether to synthesize those slots — which is what a heterogeneous
-  `[3]&Display` of `1`, `"hi"`, `true` would need — is a question about what the language should
-  offer, not about whether the code is right. Refused today, and the diagnostic names the rule.
+- ~~**Whether a built-in should be erasable into a `&Display`.**~~ **Settled: yes, and it needed no
+  synthesis.** The heading asked whether the compiler should manufacture table slots for a
+  membership it provides by rule. The answer was to stop providing it by rule. `bool`, `char`,
+  `string` and the two floats are a finite list, so the library writes them ordinary blocks; the
+  `iN`/`uN` families are open, so one **blanket** block covers them — `impl[T: Integer] Display for
+  T`, sized from `sizeof(T)`. A heterogeneous `[3]&Display` of `1`, `"hi"`, `true` is ordinary code,
+  and *Object safety*'s rule is untouched: a slot still holds a function some block wrote.
+
+  What made this the harder question it looked was that the integers have no finite list of types
+  to write blocks for, so the choice appeared to be between a rule and nothing. A block written over
+  a **bound** is the third option, and what it costs is that the bound must be one nothing outside
+  the compiler can join — see `14 §5`.
+
+  `Hash` is the one membership still provided by rule *and* object-safe, so it is the case the
+  refusal now speaks about, and the last one.
 - **Laws / invariants on traits.** The old `trait` could assert invariants ("`Ord` is a total
   order"). Whether the unified trait carries such contracts (via `require` / `ensure`-style
   annotations) is deferred to the contracts spec.

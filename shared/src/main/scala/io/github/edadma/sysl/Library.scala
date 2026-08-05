@@ -180,6 +180,8 @@ object Library {
       "FormatSpec",
       // The traits whose members a built-in has by rule rather than by an `impl` (`14 §5`).
       "Display", "Hash",
+      // The family every integer belongs to, which the blanket `impl` of `Display` is written over.
+      "Integer",
       // The same, for the members that are not operators and whose trait is in a submodule.
       "Signed", "Bits",
       // The orderings the atomic forms require written at the call, whose variant names become

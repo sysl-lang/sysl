@@ -504,26 +504,29 @@ class WideIntegerTests extends AnyFreeSpec with CodegenSupport with RunSupport {
             |show(a)""".stripMargin) shouldBe "340282366920938463463374607431768211455\n"
     }
 
+    // The field forwards to the width's **own** `display`, which is the blanket instantiated at
+    // `u128` — so a wide field is written exactly the way a narrow one is, with no renderer named
+    // and no `str` in the middle. That the two used to differ is what `display_wide` was.
     "a struct's own `Display` renders a wide field through the sink" in {
       run("""struct Id
             |    v: u128
             |
             |impl Display for Id
-            |    display(self, out: *Writer, fmt: FormatSpec) = display_wide(str(self.v), out, fmt)
+            |    display(self, out: *Writer, fmt: FormatSpec) = self.v.display(out, fmt)
             |
             |print(Id(340282366920938463463374607431768211455))""".stripMargin) shouldBe
         "340282366920938463463374607431768211455\n"
     }
 
-    // The specifier reaches `display_wide` the way it reaches any renderer that forwards it: through
-    // a type that renders itself, since a built-in keeps the strict conversion check. The digits are
-    // the language's and the field is the library's, which is the split every other width has.
+    // The specifier reaches the blanket the way it reaches any renderer that forwards it: through a
+    // type that renders itself, since a number keeps the strict conversion check. The digits are the
+    // language's and the field is the library's, which is the split every other width has.
     "and the specifier it is handed pads the digits like any other number's" in {
       run("""struct Id
             |    v: u128
             |
             |impl Display for Id
-            |    display(self, out: *Writer, fmt: FormatSpec) = display_wide(str(self.v), out, fmt)
+            |    display(self, out: *Writer, fmt: FormatSpec) = self.v.display(out, fmt)
             |
             |var a: u128 = 18446744073709551616
             |print(f"[${Id(a)}%25s]")

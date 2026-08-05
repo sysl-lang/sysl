@@ -839,14 +839,32 @@ class SupertraitTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     // A table holds function pointers and a compiler-provided membership has no function — the
     // sentence `02` already carried, now reachable through a required trait rather than only
     // through the operator catalog.
+    //
+    // **`Hash` is the case, and it is the last one.** It is the only trait left that a built-in
+    // joins by rule and that is object-safe as well; every other compiler-provided trait takes
+    // `Self` away from the receiver and is stopped a step earlier by object safety. `Display` was
+    // the other, until its membership became a blanket `impl` and a slot had something to point at.
     "a built-in that satisfies a required trait by rule cannot be erased" in {
       err(
-        """trait Tagged: Display
+        """trait Tagged: Hash
           |    tag(self) -> int
           |impl Tagged for i32
           |    tag(self) -> int = 7
           |var o: &Tagged = 1i32""".stripMargin,
-      ) should include("implements 'sysl.Display' by the compiler's own rule rather than through an 'impl'")
+      ) should include("implements 'sysl.Hash' by the compiler's own rule rather than through an 'impl'")
+    }
+
+    // The counterpart, and the reason the rule above is now about `Hash` alone: the same shape over
+    // `Display` used to be refused in exactly these words and is ordinary code.
+    "while one that satisfies it through an impl erases and dispatches" in {
+      run(
+        """trait Tagged: Display
+          |    tag(self) -> int
+          |impl Tagged for i32
+          |    tag(self) -> int = 7
+          |var o: &Tagged = 1i32
+          |print(o, o.tag())""".stripMargin,
+      ) shouldBe "1 7\n"
     }
 
     // The object-safety diagnostic has two names to get right and they are different names: the

@@ -3,7 +3,7 @@ package io.github.edadma.sysl
 import scala.util.parsing.input.Position
 
 /** The sysl parser: a packrat combinator grammar over the materialized token list from
- * `SyslLexical` (see docs/design/front-end.md).
+ * `SyslLexical` (see design/front-end.md).
  *
  * The precedence structure mirrors `01-scalar-types-and-operators.md`: assignment (loosest)
  * → `||` → `&&` → chained comparison → range → `|` → `^` → `&` → `+ -` →
@@ -33,7 +33,7 @@ object TypeParams {
 }
 
 /** The sysl parser: a packrat combinator grammar over the materialized token list from
- * `SyslLexical` (see docs/design/front-end.md).
+ * `SyslLexical` (see design/front-end.md).
  *
  * The grammar is split across `SyslParserBase` (the token reader, position stamping, terminals, and
  * the crossings between areas), `ExprParser` (the precedence ladder and the literals), `DeclParser`

@@ -74,6 +74,43 @@ trait TraitLookup extends MemberVisibility {
   protected def implsOf(traitName: String, key: String): List[TraitImpl] =
     traitImpls.getOrElse((traitName, key), Nil)
 
+  /** The synthetic owner key a **blanket** `impl` is filed under: one key per closed bound, standing
+   * for every type that meets it.
+   *
+   * A blanket is not a new kind of storage and deliberately does not get one. A block matching every
+   * slice is already filed under `[]` with its members instantiated per receiver (`shapeOwner`), and
+   * a block matching every integer is the same arrangement with a different key — so the whole of
+   * this is a name that no type's own key can collide with.
+   */
+  protected def blanketKey(boundTrait: String): String = s"@bound:$boundTrait"
+
+  /** Which closed bound each registered blanket `impl` was written over, by the key it is filed
+   * under. Small, and usually empty outside the library.
+   */
+  protected val blanketBounds = mutable.LinkedHashMap.empty[String, String]
+
+  /** The blanket keys a type is covered by, each paired with the type itself — the `(key, targs)`
+   * pair `shapeOwner` gives for a shape, since a blanket's one type argument is the receiver.
+   *
+   * **The membership is asked of `CoreTraits` directly and never through `satisfies`, and that is
+   * load-bearing twice over.** It is what terminates: `satisfies` reaches `conforms`, which reaches
+   * `implKey`, which reaches here — so a question asked back through `satisfies` would be the same
+   * question one turn later. And it is what keeps the relaxation sound, since a bound the compiler
+   * answers about is one nothing outside the compiler can join (`CoreTraits.closed`). The two are
+   * one argument, so widening the relaxation past a closed bound needs both re-derived.
+   *
+   * What this does **not** carry is the block's own condition — `conforms` re-checks that through
+   * `ti.bounds`, exactly as it does for `impl[T: Show] Show for []T`. The filter here is what tells
+   * *which* blanket, and it is needed for that alone: `implAt` selects on the trait's argument list,
+   * and a trait taking no arguments would hand the first blanket to every type asking.
+   */
+  protected def blanketOwners(t: Type): List[(String, List[Type])] =
+    if blanketBounds.isEmpty then Nil
+    else
+      blanketBounds.toList.collect {
+        case (key, bound) if Library.spelling(bound).exists(CoreTraits.builtin(_, t)) => (key, List(t))
+      }
+
   /** The promise one implementation makes **about this subject**: what the block wrote, with the
    * subject's own type arguments put in for the block's parameters and the trait's own defaults
    * supplying the rest under a `Self` of the type being asked about.
@@ -120,7 +157,9 @@ trait TraitLookup extends MemberVisibility {
     else
       val (key, targs) = memberOwner(subject)
 
-      matching(key, targs).orElse(shapeOwner(subject).flatMap((k, ta) => matching(k, ta)))
+      matching(key, targs)
+        .orElse(shapeOwner(subject).flatMap((k, ta) => matching(k, ta)))
+        .orElse(blanketOwners(subject).view.flatMap((k, ta) => matching(k, ta)).headOption)
   }
 
   /** Whether the `impl` blocks have all been registered, which is what makes a bound answerable.
@@ -287,6 +326,11 @@ trait TraitLookup extends MemberVisibility {
     else
       widened(t).filter(w => memberDecls.contains((w._1, mname)))
         .orElse(shapeOwner(t).filter(s => memberDecls.contains((s._1, mname))))
+        // A blanket's members are filed under its key exactly as a shape's are under `[]`, and this
+        // is what a *call* finds them by. Without it a blanket would conform and have nothing
+        // callable: `memberFuncName` reads the pair this returns and instantiates from it, so a
+        // receiver whose member lives here would be looked up under its own key and found missing.
+        .orElse(blanketOwners(t).find(b => memberDecls.contains((b._1, mname))))
         .getOrElse(own)
   }
 
@@ -551,7 +595,7 @@ trait TraitLookup extends MemberVisibility {
   protected def implKey(tr: Type.Bound, t: Type): Option[(List[Type], TraitImpl)] = {
     def at(k: (String, List[Type])) = implAt(tr, k._1, t, k._2).map((k._2, _))
 
-    at(memberOwner(t)).orElse(shapeOwner(t).flatMap(at))
+    at(memberOwner(t)).orElse(shapeOwner(t).flatMap(at)).orElse(blanketOwners(t).view.flatMap(at).headOption)
   }
 
   /** The suffix the members of a type's implementation of one particular trait-at-arguments carry,
@@ -587,7 +631,7 @@ trait TraitLookup extends MemberVisibility {
     // `impl`, at the arguments the bound asked for, beside the ones already there.
     val wrongArgs =
       for
-        (key, targs) <- List(memberOwner(t)) ::: shapeOwner(t).toList
+        (key, targs) <- List(memberOwner(t)) ::: shapeOwner(t).toList ::: blanketOwners(t)
         impls = implsOf(tr.name, key)
         if impls.nonEmpty && implAt(tr, key, t, targs).isEmpty
       yield s"it implements ${conjoin(impls.map(ti => s"'${showBound(suppliedBound(ti, tr.name, t, targs), t)}'"))}"

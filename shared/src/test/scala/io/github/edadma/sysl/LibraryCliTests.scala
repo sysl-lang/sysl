@@ -346,8 +346,10 @@ class LibraryCliTests extends LibraryCliSupport {
         // built. That is not a detail: the path holds a fingerprint of the library, so computing it
         // up front read the library's source during argument parsing — where a compiler that could
         // not find its library had no way to report it but an exception.
+        // A config naming nothing asks for the default *without saying what it is*, which is what
+        // defers the path to the moment it is used.
         Config().stdSearch shouldBe None
-        stdSearchOf(Config()) shouldBe LibraryArtifact.stdDefault
+        stdChoice(Config()) shouldBe Stdlib.Choice.Default(None)
         LibraryArtifact.stdDefault should endWith(LibraryArtifact.extension)
       }
 

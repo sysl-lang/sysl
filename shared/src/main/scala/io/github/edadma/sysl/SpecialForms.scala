@@ -149,9 +149,14 @@ trait SpecialForms extends Closures {
    *
    * A type that renders itself has no printf conversion, so `%s` is what reaches it — and the
    * specifier is handed on rather than applied, since only the implementation knows what a width
-   * means for the text it is about to write. A **built-in** keeps the strict check: `%s` on an
-   * integer stays the mistake it was, rather than becoming a rendering that silently drops the
-   * width the programmer asked for.
+   * means for the text it is about to write. A **number** keeps the strict check: `%s` on an
+   * integer stays the mistake it was, since `%d` and `%g` are what it is for and writing `%s`
+   * instead is a confusion about which value is in the hole rather than a rendering choice.
+   *
+   * The line is drawn at *numbers* rather than at built-ins, and it has to be: every built-in now
+   * renders through an `impl`, so conforming no longer tells a scalar from a program's struct. What
+   * it tells apart is a type with a conversion of its own from one without — `bool` and `char` have
+   * none, so `%s` is the only way to write them and refusing it would leave them unwritable.
    */
   protected def formatCall(argExpr: Expr, spec: String): TExpr = {
     val t = analyzeExpr(argExpr)
@@ -173,7 +178,7 @@ trait SpecialForms extends Closures {
       else t.ty == Type.Str
 
     if ok then TFormat(t, spec)
-    else if FormatSpec.isStr(c) && rendersItself(t.ty) then
+    else if FormatSpec.isStr(c) && rendersItself(t.ty) && !numericBuiltin(t.ty) then
       val (method, value, slot)   = renderer(t, "format")
       val (width, prec, left)     = FormatSpec.parts(spec)
 
@@ -209,55 +214,50 @@ trait SpecialForms extends Closures {
     case Type.Ptr(o: Type.Trait) => objectRenderer(t, o, op)
     case Type.Ref(o: Type.Trait, _) => objectRenderer(t, o, op)
 
+    // Every other type renders through an `impl`, the built-ins included: the closed families have
+    // one written per type and the integers are covered by the blanket block over `Integer`. There
+    // is no compiler-picked renderer left to try first, which is what makes this one path.
     case ty =>
-      CoreTraits.display(ty) match
-        case Some((name, want)) =>
-          val key = Library.key(name)
+      if !conforms(displayTrait, ty) then
+        // Naming the `impl` to write is only advice where one could be written at all: a memory
+        // mode is the shape `02` refuses, so it is told what is true of it rather than pointed
+        // at a block that would not compile. A generic type is written for as a whole, so the
+        // advice names the block's own parameters rather than the arguments this value has. And
+        // a type an implementation already covers is told what that implementation asked of it,
+        // since writing a second one is exactly what it may not do.
+        //
+        // The trait is named by the **key**, never spelled: advice is the one place where being
+        // shown a name that means something else is worse than being shown a long one. A program
+        // with a `Display` of its own reaches the library's only by path, and telling it to write
+        // `impl Display` would have it implement its own trait and be refused again for the same
+        // reason.
+        val tr  = qn(displayTrait)
+        val fix = unmetBound(displayTrait, ty).getOrElse(ty match
+          case n: Type.Named if n.targs.nonEmpty =>
+            val tps = nominalTparams(n.base).mkString(", ")
+            s"write an 'impl[$tps] $tr for ${qn(n.base)}[$tps]' to say how it renders"
+          case n: Type.Named => s"write an 'impl $tr for ${show(n)}' to say how it renders"
 
-          funcsUsed += key
-          (key, rendered(t, want), None)
+          // A composed type is the module's when anything named in it is (`02 § Coherence`), so
+          // the advice holds for a `[]Point` and is impossible for a `[]int`: `Display` is the
+          // library's and nothing in `[]int` is this module's, so the block named here is one
+          // `checkCoherence` refuses. Both diagnostics used to arrive in the same run — the
+          // rule saying the `impl` has no home, and this line telling the reader to write it.
+          case _: Type.Array | _: Type.Slice if implementableHere(ty) =>
+            s"write an 'impl $tr for ${show(ty)}' to say how it renders"
 
-        case None =>
-          if !conforms(displayTrait, ty) then
-            // Naming the `impl` to write is only advice where one could be written at all: a memory
-            // mode is the shape `02` refuses, so it is told what is true of it rather than pointed
-            // at a block that would not compile. A generic type is written for as a whole, so the
-            // advice names the block's own parameters rather than the arguments this value has. And
-            // a type an implementation already covers is told what that implementation asked of it,
-            // since writing a second one is exactly what it may not do.
-            //
-            // The trait is named by the **key**, never spelled: advice is the one place where being
-            // shown a name that means something else is worse than being shown a long one. A program
-            // with a `Display` of its own reaches the library's only by path, and telling it to write
-            // `impl Display` would have it implement its own trait and be refused again for the same
-            // reason.
-            val tr  = qn(displayTrait)
-            val fix = unmetBound(displayTrait, ty).getOrElse(ty match
-              case n: Type.Named if n.targs.nonEmpty =>
-                val tps = nominalTparams(n.base).mkString(", ")
-                s"write an 'impl[$tps] $tr for ${qn(n.base)}[$tps]' to say how it renders"
-              case n: Type.Named => s"write an 'impl $tr for ${show(n)}' to say how it renders"
+          case _: Type.Array | _: Type.Slice =>
+            s"nothing renders a ${show(ty)}, and an 'impl $tr' for it has no home outside " +
+              "the library — print the elements, or give them a type of your own to be held in"
 
-              // A composed type is the module's when anything named in it is (`02 § Coherence`), so
-              // the advice holds for a `[]Point` and is impossible for a `[]int`: `Display` is the
-              // library's and nothing in `[]int` is this module's, so the block named here is one
-              // `checkCoherence` refuses. Both diagnostics used to arrive in the same run — the
-              // rule saying the `impl` has no home, and this line telling the reader to write it.
-              case _: Type.Array | _: Type.Slice if implementableHere(ty) =>
-                s"write an 'impl $tr for ${show(ty)}' to say how it renders"
+          case _ => s"it does not implement '$tr'")
+        val asked = if op == "print" then "cannot print" else "cannot make a string of"
+        err(s"$asked a ${show(ty)} value — $fix")
 
-              case _: Type.Array | _: Type.Slice =>
-                s"nothing renders a ${show(ty)}, and an 'impl $tr' for it has no home outside " +
-                  "the library — print the elements, or give them a type of your own to be held in"
+      val fname = memberFuncName(ty, "display")
 
-              case _ => s"it does not implement '$tr'")
-            val asked = if op == "print" then "cannot print" else "cannot make a string of"
-            err(s"$asked a ${show(ty)} value — $fix")
-
-          val fname = memberFuncName(ty, "display")
-
-          funcsUsed += fname
-          (fname, t, None)
+      funcsUsed += fname
+      (fname, t, None)
 
   /** Whether an `impl` for this type could be written **here** — the coherence question
    * (`02 § Coherence`), asked of a resolved type rather than of a written subject.
@@ -308,6 +308,12 @@ trait SpecialForms extends Closures {
   /** Whether a type renders through an `impl` rather than through a printf conversion — which is
    * the case `format` hands its specifier on for instead of applying it.
    */
+  /** Whether the value is a number the language has a printf conversion for, which is what keeps
+   * `%s` on one the mistake it is. A constrained subtype is asked at its base, since `16` gives it
+   * the base's whole catalog and `%d` reaches it exactly as it reaches an `int`.
+   */
+  private def numericBuiltin(ty: Type): Boolean = Type.isNumeric(Type.underlying(ty))
+
   private def rendersItself(ty: Type): Boolean = ty match
     case a: Type.Abstract           => satisfies(displayTrait, a)
     case Type.Ptr(o: Type.Trait)    => displaySlot(o).isDefined
