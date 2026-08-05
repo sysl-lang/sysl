@@ -611,7 +611,7 @@ impl Display for Span
 ```
 
 ```error
-'Span' already implements 'sysl.Display' — every 'sysl.Integer' does, through one block written over the family, and a derived subtype has its base's memberships
+'Span' already implements 'sysl.Display' — every 'sysl.Integer' does, through one block written over the family, and a subtype has its base's memberships
 ```
 
 The two refusals arrive by different routes, which the messages say. `Add` is a membership the
