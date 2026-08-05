@@ -358,16 +358,29 @@ trait DeclParser extends ExprParser {
    * `trait Name: Super + Other` names the traits this one **requires**, spelled exactly as a bound
    * on a type parameter is — the same `:` and the same `+` — because it asks the same thing of the
    * implementing type. A generic trait writes both: `trait Word[T]: Add`, the parameters first.
+   *
+   * **The members may be left out entirely, and only where the trait requires another.** Such a
+   * trait declares no behaviour of its own; what it says is that its implementors have the ones it
+   * names, which makes it a name for a family rather than for a capability — `Integer` is the case
+   * this exists for, and a blanket `impl` written over it is what reads the name.
+   *
+   * Requiring the supertraits is what keeps the omission from being a hole. A trait with neither
+   * members nor requirements says nothing at all, and a body indented by the wrong amount would
+   * become one silently — so the form that means something is allowed and the form that cannot is
+   * still the missing block it was.
    */
   protected lazy val traitDecl: PackratParser[Stmt] =
     op("trait") ~> ident ~ opt(boundedTypeParams) ~ opt(op(":") ~> rep1sep(boundRef, op("+"))) >> {
       case name ~ tps ~ supers =>
         val tp = tps.getOrElse(TypeParams.none)
+        val body =
+          (newline ~> indent ~> opt(newlines) ~> repsep(traitMember, newlines) <~ opt(newlines) <~ dedent) <~
+            endName(name)
 
-        (newline ~> indent ~> opt(newlines) ~> repsep(traitMember, newlines) <~ opt(newlines) <~ dedent) <~
-          endName(name) ^^ { methods =>
-            TraitDecl(name, tp.names, methods, tp.bounds, supers.getOrElse(Nil), tdefaults = tp.defaults)
-          }
+        def decl(methods: List[MethodDecl]) =
+          TraitDecl(name, tp.names, methods, tp.bounds, supers.getOrElse(Nil), tdefaults = tp.defaults)
+
+        if supers.isEmpty then body ^^ decl else opt(body) ^^ (m => decl(m.getOrElse(Nil)))
     }
 
   /** A line inside a trait body. A **definition** is tried first, since it is a signature with more

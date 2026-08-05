@@ -78,7 +78,11 @@ trait MethodCalls extends FuncAddress {
             // A closure's `call` is not a method a program wrote, so a complaint about one names
             // the callable and the argument's position rather than the member behind it (`12 §6`).
             val callable = mname == "call" && callableOf(rty).isDefined
-            val shown    = if callable then "this callable" else s"method '$fname'"
+            // Named by the **receiver**, not by the symbol the member is emitted under. The two
+            // agree for a type with a name of its own and part company for everything reached
+            // through a shape or a blanket — `bound.Integer.display.int` is a fine symbol and an
+            // answer to a question nobody asked, where `int.display` is what the call site wrote.
+            val shown = if callable then "this callable" else s"method '${show(rty)}.$chosen'"
             // The receiver is not among the parameters a call writes arguments for, so it is not
             // among the ones a name may reach either — `m.params` starts where the arguments do.
             val bound = bindArgs(shown, Some(base), m.params, args, m.variadic)
@@ -102,7 +106,6 @@ trait MethodCalls extends FuncAddress {
           case None =>
             builtinMethod(rty, mname, tr, args)
               .orElse(builtinNumeric(rty, mname, tr, args))
-              .orElse(builtinDisplay(rty, mname, tr, args))
               .orElse(builtinHash(rty, mname, tr, args))
               .orElse(callableField(rty, mname, tr, args, expected))
               .getOrElse {
@@ -354,40 +357,9 @@ trait MethodCalls extends FuncAddress {
       TCall(name, checkArgs(shown, params, passed, Some(recvArg :: provisional)) ::: tail.map(variadicArg(_)), rtype))
   }
 
-  /** `5.display(out, fmt)` — the rendering a built-in's `Display` membership provides (`14 §5`).
-   *
-   * It is `5.add(3)`'s sibling and exists for the same reason: a built-in has no `impl` block, so
-   * there is no lowered `int.display` to call. What it has is a renderer the library already writes,
-   * declared in the argument order `Display` does, so naming it here is the whole lowering — and it
-   * is what lets a `Display` written for a struct render the struct's own fields without leaving
-   * the allocation-free path the sink exists for.
-   */
-  private def builtinDisplay(rty: Type, mname: String, recv: TExpr, args: List[Expr]): Option[TExpr] =
-    for
-      m           <- Option.when(mname == "display")(traitDecls.get(Library.key("Display"))).flatten
-      sig         <- m.methods.find(_.name == "display")
-      (fname, to) <- CoreTraits.display(rty)
-    yield {
-      // Read in the **trait's** terms, not the caller's: `Display.display` names the specifier
-      // struct, and a program that declares a type of that name means its own by the word
-      // everywhere except here.
-      val params = inDecl(m.name)(sig.params.map(p => (p.name, rt(p.typ))))
-      val key    = Library.key(fname)
-      val bound  = bindArgs("method 'Display.display'", Some(m.name), sig.params, args)
-
-      if bound.length != params.length then
-        err(s"method 'Display.display' takes ${quantity(params.length, "argument")}, " +
-          s"but ${supplied(bound.length, "argument")}")
-
-      val self = rendered(buildReceiver(RecvMode.ByValue, recv), to)
-
-      funcsUsed += key
-      TCall(key, self :: checkArgs("Display.display", params, bound, None), Type.Unit)
-    }
-
   /** `k.hash()` — the mixing a built-in's `Hash` membership provides (`14 §5`).
    *
-   * `builtinDisplay`'s sibling, and built the same way for the same reason: a built-in has no
+   * `5.add(3)`'s sibling, and built the same way for the same reason: a built-in has no
    * `impl` block, so the lowering is a library function named here. Where `Display` writes into a
    * sink this returns a number, so what the widening is for is the law rather than the signature —
    * every integer, `char`, and `bool` reaches one mixer at 64 bits, so two values that compare

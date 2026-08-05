@@ -250,7 +250,7 @@ class StdLibraryTests extends AnyFreeSpec with Matchers {
     val declared = Std.parsed(Target.default).map(p => place(p.source) -> p.body).toMap
 
     declared("sysl/write.sysl").collect { case t: TraitDecl => t.name } shouldBe List("Writer")
-    declared("sysl/display.sysl").collect { case t: TraitDecl => t.name } shouldBe List("Display")
+    declared("sysl/display.sysl").collect { case t: TraitDecl => t.name } shouldBe List("Display", "Integer")
 
     // Which is the claim, rather than "the library imports nothing": a file may well have a sibling
     // module of the library to import, and none of them has itself. The two import forms spell the

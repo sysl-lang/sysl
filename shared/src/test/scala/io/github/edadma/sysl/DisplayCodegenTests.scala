@@ -134,22 +134,46 @@ class DisplayCodegenTests extends AnyFreeSpec with CodegenSupport {
 
   "the renderer a built-in's Display reaches" - {
 
-    // The one thing an IR test has to say about this family, and nothing was saying it: which
-    // function `self.x.display(out, fmt)` lowers to is chosen by the *compiler* from `CoreTraits`,
-    // not resolved from source, so the emitted symbol is a name the compiler spells. That is the
+    // The one thing an IR test has to say about this family, and nothing was saying it: the symbol
+    // an integer's `display` lowers to is one the *compiler* spells rather than one resolved from
+    // source, so it has to carry the library's key like every other emitted name. That is the
     // `putbytes`-in-emitted-IR defect class — a link failure rather than a diagnostic, and one no
     // behavioural test can see, since the program runs identically either way until the linker
     // refuses it.
+    //
+    // The blanket makes this sharper than it was. Its members are emitted **per receiver**, so the
+    // name is built rather than written down anywhere, and a bare `bound.Integer.display.int` would
+    // be a symbol a program could collide with by declaring a trait of that name.
     "is emitted under the library's key, wherever the family lives" in {
       val out = ir(point + "print(Point(1, 2))")
 
-      out should include(s"call void @${Library.key("display_int")}(")
-      out should not include "call void @display_int("
+      out should include(s"call void @bound.${Library.key("Integer")}.display.int(")
+      out should not include "call void @bound.Integer.display.int("
     }
 
-    "and a rendering of each built-in reaches its own" in {
-      // One per branch of `CoreTraits.display`, because the table is what chooses and a wrong entry
-      // would be a call to a function that is not there rather than one that renders oddly.
+    // The width is part of the name, which is what makes one blanket serve an open family: each
+    // instantiation is its own function, sized for the type it was made at.
+    "and each width instantiates a renderer of its own" in {
+      val out = ir(
+        """struct B
+          |    a: u8
+          |    b: u128
+          |impl Display for B
+          |    display(self, out: *Writer, fmt: FormatSpec)
+          |        self.a.display(out, fmt)
+          |        self.b.display(out, fmt)
+          |print(B(1u8, 2u128))
+          |""".stripMargin)
+
+      // `u8` mangles as `byte`, which is the name it has everywhere else an emitted symbol carries
+      // a type — so the instantiation is named by the mangling and not by the spelling written.
+      out should include(s"define void @bound.${Library.key("Integer")}.display.byte(")
+      out should include(s"define void @bound.${Library.key("Integer")}.display.u128(")
+    }
+
+    "and a closed family still reaches the renderer its own impl names" in {
+      // `bool` has a written `impl` rather than a share of the blanket, so it forwards to the
+      // library function by name and the symbol is the one that function was declared under.
       val out = ir(
         """struct B
           |    v: bool

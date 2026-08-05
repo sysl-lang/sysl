@@ -188,17 +188,6 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
         "main.sysl" -> "print(thing.f(1))") should include("needs an allocator")
     }
 
-    // The one place `Display`'s allocation-free promise does not reach, pinned so that it is a known
-    // edge rather than a surprise. Up to 128 bits the digits are worked out against a frame-local
-    // buffer; past it, covering every width would need a buffer whose size follows the receiver, and
-    // a fixed array's length cannot be written in terms of a type parameter. So the widest values
-    // still render through `str`, and a module without an allocator cannot print one.
-    "an integer past 128 bits, which still renders through a string" in {
-      errOf("thing/a.sysl" ->
-        "module thing\n@no_alloc\n\nf(v: u256, out: *Writer) = v.display(out, FormatSpec(0, -1, false))\n",
-        "main.sysl" -> "print(1)") should
-        include("the string a value renders as needs an allocator")
-    }
   }
 
   "'no alloc' leaves the whole no-alloc subset alone" - {
@@ -248,6 +237,23 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
     "and a string literal, which is static rather than made" in {
       runOf("thing/a.sysl" -> "module thing\n@no_alloc\n\nname() -> string = \"kernel\"\n",
         "main.sysl" -> "print(thing.name())") shouldBe "kernel\n"
+    }
+
+    // **Rendering an integer, at every width there is** — which is `Display`'s own promise and was
+    // not true of the widest values until the blanket `impl` replaced the routing that chose between
+    // three renderers. Above 128 bits the compiler used to fall back through `str`, so a module
+    // declaring it makes no storage could print a `u32` and not a `u256`: the values needing the
+    // most care were the ones it could not have. Pinned at four widths spanning both signednesses
+    // and all three of the old ranges.
+    "an integer of any width, which is what the blanket buys a module with no allocator" in {
+      for width <- List("u8", "i64", "u128", "i256") do
+        // Called from `main`, so the instantiation is live: an uncalled generic emits nothing, and
+        // the assertion would then be about a module the compiler had thrown away.
+        irOf(
+          "thing/a.sysl" ->
+            s"module thing\n@no_alloc\n\nf(v: $width, out: *Writer) = v.display(out, FormatSpec(0, -1, false))\n",
+          "main.sysl" -> s"thing.f(7$width, stdout())\n",
+        ) should include(s"call void @bound.${Library.key("Integer")}.display.")
     }
 
     // `capabilities.md` lists this among the no-alloc subset by name: the allocator's own building

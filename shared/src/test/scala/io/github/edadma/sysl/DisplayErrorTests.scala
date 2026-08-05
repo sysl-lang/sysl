@@ -97,12 +97,23 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
   }
 
   "an impl" - {
-    // The scalars' memberships are the compiler's (`14 §5`), so there is no second answer to be
-    // had — the same guard that refuses `impl Add for int`.
-    "may not compete with a built-in's own rendering" in {
+    // An integer's `Display` is the library's blanket block over `Integer`, so a second one for
+    // `int` is refused — but by **coherence** rather than by the compiler-provides-it guard it used
+    // to hit. The rule that catches it is the deeper one and always was: the trait is the library's
+    // and so is `int`, so a block written anywhere else has no home.
+    "may not compete with the library's own rendering" in {
       err("""impl Display for int
             |    display(self, out: *Writer, fmt: FormatSpec) = display_str("no", out, fmt)
-            |print(1)""".stripMargin) should include("'int' already implements 'sysl.Display'")
+            |print(1)""".stripMargin) should include("so this one has no home")
+    }
+
+    // And a program's own type is not a way in either: the family is the compiler's answer, so
+    // there is nothing an `impl` of `Integer` could be supplying.
+    "may not join the family the blanket is written over" in {
+      err("""struct P
+            |    n: int
+            |impl Integer for P
+            |print(1)""".stripMargin) should include("names a family of types the compiler settles")
     }
 
     "must match the trait's signature" in {
@@ -118,7 +129,7 @@ class DisplayErrorTests extends AnyFreeSpec with CodegenSupport {
             |    n: int
             |impl Display for P
             |    display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out)
-            |print(P(1))""".stripMargin) should include("method 'Display.display' takes 2 arguments")
+            |print(P(1))""".stripMargin) should include("method 'int.display' takes 2 arguments")
     }
   }
 

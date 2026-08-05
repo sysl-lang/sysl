@@ -49,6 +49,15 @@ trait HoistImpl extends ImplConformance {
     if written.isEmpty && Library.spelling(impl.traitName).exists(CoreTraits.builtin(_, ty)) then
       err(s"'${outer.label}' already implements '${qn(impl.traitName)}' — the compiler provides it")
 
+    // A **closed** trait names a family rather than a promise, so there is nothing for a block to
+    // supply: it declares no member, and an `impl` of it could only be a claim to belong to the
+    // family. Which types belong is the compiler's answer, and it has to stay that way — a blanket
+    // `impl` written over the bound covers exactly the types in it, so a program able to join would
+    // acquire an implementation written for something else with no block naming either.
+    if Library.spelling(impl.traitName).exists(CoreTraits.closed) then
+      err(s"'${qn(impl.traitName)}' names a family of types the compiler settles, so nothing " +
+        s"implements it — a type is one of them or it is not, and '${outer.label}' is not")
+
     // What this block's own promise is read against: the type where it has one, and the type applied
     // to the block's own parameters where it is generic — the same subject `superChecks` uses, and
     // the one every comparison below has to be made under for the two sides to mean the same thing.
@@ -430,14 +439,28 @@ trait HoistImpl extends ImplConformance {
               s"its own — and nothing goes through one but 'get()', so a member written here could " +
               s"never be called. Write the 'impl' for ${show(inner)}, which 'get()' hands back")
           case Type.VaList => err("a va_list is an ABI primitive, not something to implement a trait for")
-          // The subject is the block's own parameter, which stands for any type at all — so the block
-          // would be saying how every type behaves, which is what a trait's own defaults are for.
+          // A **blanket** block, whose subject is the block's own parameter: it covers every type
+          // that meets the parameter's bound. Allowed only where that bound is one the compiler
+          // closes (`CoreTraits.closed`), which is what keeps the set of covered types fixed — and
+          // so what lets one block stand for all of it without any type being able to join later.
+          case a: Type.Abstract if closedBound(a).isDefined => ()
+          // Any other parameter stands for any type at all, so the block would be saying how every
+          // type behaves, which is what a trait's own defaults are for.
           case a: Type.Abstract =>
             err(s"'${a.name}' is a type parameter of this 'impl', so it stands for every type at " +
-              "once — an 'impl' says how one kind of type behaves")
+              s"once — an 'impl' says how one kind of type behaves. A bound the compiler closes is " +
+              s"the exception, since it names a family rather than every type")
           case _ =>
 
-        val head = shapeOwner(ty).map(_._1)
+        val blanket = ty match
+          case a: Type.Abstract => closedBound(a)
+          case _                => None
+
+        val head = blanket.map(blanketKey).orElse(shapeOwner(ty).map(_._1))
+
+        // Recorded where it is decided, since this is the only place that knows the block was a
+        // blanket: the key alone cannot be read back out of the table it is filed in.
+        for b <- blanket do blanketBounds(blanketKey(b)) = b
 
         if impl.tparams.isEmpty then
           (ty,
@@ -445,15 +468,64 @@ trait HoistImpl extends ImplConformance {
              selfBinding(ty)))
         else
           val shape = head.getOrElse(notGeneric(ref))
-          val order = shapeArgs(impl, ty, shape)
+          val order = blanket.fold(shapeArgs(impl, ty, shape))(_ => blanketArgs(impl, ty))
 
           // Like a generic type's, the members are made real per receiver — so there is no one
           // instantiation to be, and the shape rather than any type of it is what they are filed
           // under. The symbol drops the arguments the same way: `slice.show` instantiated at `int`
           // is `slice.show.int`, which the written `[]int`'s `slice.int.show` cannot collide with.
           (Type.Unknown,
-           MemberHome(shape, ref.show, shapeSymbol(ty), head, ref, order, impl.bounds, Set.empty, "field",
-             Map.empty))
+           MemberHome(shape, ref.show, blanket.fold(shapeSymbol(ty))(blanketSymbol), head, ref, order, impl.bounds,
+             Set.empty, "field", Map.empty))
+  }
+
+  /** The **closed** bound a type parameter carries, where it carries one — which is what makes a
+   * block written for the bare parameter a blanket rather than the refusal above.
+   *
+   * A parameter may be bounded by more than one trait, and only the closed one names the family the
+   * block covers; the rest are what its body may assume, exactly as on any other generic. So this
+   * finds rather than requires, and a parameter with two closed bounds is refused where the second
+   * would have widened what the block stands for.
+   */
+  protected def closedBound(a: Type.Abstract): Option[String] = {
+    val closed = a.bounds.map(_.name).filter(n => Library.spelling(n).exists(CoreTraits.closed))
+
+    if closed.length > 1 then
+      err(s"'${a.name}' is bounded by ${conjoin(closed.map(n => s"'${qn(n)}'"))}, and each of those " +
+        s"names a family — so it is not one family this 'impl' covers, and there is no type that is " +
+        s"in both")
+
+    closed.headOption
+  }
+
+  /** The symbol a blanket's members are emitted under, which the instantiation's own arguments are
+   * appended to — `bound.sysl$Integer.display.int`, arrived at the way `slice.int` is.
+   *
+   * It has to be spelled out rather than left to `shapeSymbol`, whose fallback mangles the subject:
+   * a type parameter mangles as **its own name**, so two blankets would both be emitted under `T`
+   * and collide with each other for no reason a reader could see.
+   *
+   * The bound is named by its **key** rather than its spelling, which is what every other emitted
+   * name does and is load-bearing for the same reason: nothing about the symbol should change if
+   * the trait moves between the library's files, and nothing a program declares should be able to
+   * land on it.
+   */
+  protected def blanketSymbol(boundTrait: String): String = s"bound.$boundTrait"
+
+  /** A blanket's one type parameter, which is the subject itself.
+   *
+   * `shapeArgs`' rule and `implArgs`' rule, at the one place where the type applies exactly one
+   * argument: every parameter the block declares must be fixed by the subject, and a blanket's
+   * subject is a single parameter — so a block declaring a second has one nothing would ever fix.
+   */
+  protected def blanketArgs(impl: ImplDecl, ty: Type): List[String] = {
+    val name = ty.asInstanceOf[Type.Abstract].name
+
+    if impl.tparams != List(name) then
+      err(s"'${(impl.tparams.toSet - name).mkString("', '")}' is declared by this 'impl' but does " +
+        s"not appear in '${impl.forType.show}', so nothing would ever fix it")
+
+    impl.tparams
   }
 
   /** Where an `impl` may be written (`02 § Coherence`): **the module that declares the trait, or one
@@ -533,6 +605,9 @@ trait HoistImpl extends ImplConformance {
   /** What a diagnostic calls every type of a shape at once. */
   protected def everyShape(head: String): String =
     if head == "[]" then "every slice"
+    // A blanket covers a family the compiler names, and the family's own name is what a reader
+    // knows it by — there is no shape to describe, so the bound is the description.
+    else if head.startsWith("@bound:") then s"every '${qn(head.drop("@bound:".length))}'"
     else if head.startsWith("(") then s"every tuple of ${head.count(_ == ',') + 1} parts"
     else s"every array of ${head.drop(1).dropRight(1)}"
 
