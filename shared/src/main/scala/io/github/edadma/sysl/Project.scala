@@ -33,17 +33,21 @@ object Project {
    */
   private val sysl: List[String] = List(".sysl", Literate.Extension)
 
-  /** The C files of a library, which a `.sysl` file reaches by `extern` and the build compiles
+  /** The C files of a source tree, which a `.sysl` file reaches by `extern` and the build compiles
    * alongside it (`15 §7`).
    *
    * The same walk as `collect` and deliberately so: a C file belongs to the directory it was found
    * in exactly as a sysl file does, which is what lets its object be named after a path that is
-   * unique across the library. It is a *separate* call rather than a second list out of one walk
-   * because every caller wants one or the other — a compilation wants the sysl and never the C, and
-   * only `build-lib` wants both.
+   * unique across the tree.
    *
-   * Naming a single file is not offered. A library is reached by naming its module (`13 §3`), so it
-   * is a directory before it is anything else, and a lone C file is not a library.
+   * It is a *separate* call rather than a second list out of one walk because the two answers are
+   * wanted at different moments: the sysl decides whether there is anything to compile at all, and
+   * the C is not looked at until a compilation that got that far is about to link. Which trees are
+   * asked is `NativeSources`' — every tree the compilation walked, not only a library's.
+   *
+   * Naming a single file is not offered, and gets `Nil` rather than an error. Naming a file compiles
+   * that file alone (`13 §1`), so there is no tree for C to have travelled with — and a lone C file
+   * is not a program.
    */
   def cSources(path: String): List[Source] =
     if isDirectory(path) then walk(path, Nil, List(".c")) else Nil

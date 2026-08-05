@@ -40,9 +40,15 @@ object TestRunner {
    * A test build is **for this machine**, for the same reason `run` is — the binary is executed and
    * only this machine can execute it. A cross target is refused here rather than built and then found
    * to be unrunnable.
+   *
+   * `objects` is the C the walked trees carried, already compiled (`NativeSources`). A test build
+   * gets it on the same footing as a `build` does, and has to: a package's tests are exactly what
+   * exercises the shims it ships, so a test run that dropped them would fail at the link on the one
+   * tree most likely to hold C.
    */
   def run(cfg: Config, sources: List[Source], libraries: List[Program], target: Target,
-          precompiled: Set[String], std: Stdlib, archives: List[String]): Int = {
+          precompiled: Set[String], std: Stdlib, archives: List[String],
+          objects: List[String] = Nil): Int = {
     if !Target.host.contains(target) then
       return fail(s"'test' runs what it builds, and '${target.name}' is not this machine")
 
@@ -66,7 +72,7 @@ object TestRunner {
 
     val exe = createTempFile("sysl-test-", "")
 
-    Toolchain.build(built.ir, exe, target, archives, cfg.optimize, built.links) match
+    Toolchain.build(built.ir, exe, target, archives, cfg.optimize, built.links, objects) match
       case Left(err) => Project.discard(exe); fail(err)
       case Right(_) =>
         val outcomes = execute(exe, selected, opts)

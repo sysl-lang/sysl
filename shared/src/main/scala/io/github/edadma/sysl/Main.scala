@@ -358,11 +358,12 @@ private[sysl] def execute(cfg: Config): Int = {
   // What this project depends on, fetched and version-selected (`packages.md § 3`, `§ 5`). A project
   // with no `dependencies` resolves to itself and this costs nothing, which is what keeps
   // `sysl run hello.sysl` free of ceremony.
-  val (dependencySources, packages) = dependencies(cfg, project) match
+  val fetched = dependencies(cfg, project) match
     case Left(err) => return fail(err)
     case Right(d)  => d
 
-  val librarySources = collected.flatMap(_._2) ::: dependencySources
+  val librarySources = collected.flatMap(_._2) ::: fetched.sources
+  val packages       = fetched.packages
   val read           = decoded.collect { case Right(r) => r }
   val libraryTrees   = read.flatMap(_._1)
 
@@ -376,12 +377,31 @@ private[sysl] def execute(cfg: Config): Int = {
   // the link line as it stands and the linker takes only the members that resolve something.
   val archives = artifacts ::: coreArchive.toList
 
+  // The C beside the sysl, of every tree this compilation walked — the project's own, each `--lib`
+  // source root's, and each package's (`15 §7`, `NativeSources`). An artifact is not among them: a
+  // `.syslib` carries its C already compiled, as archive members.
+  //
+  // Compiled only where something is about to be linked. `emit-llvm` prints IR and `prove` stops at
+  // the typed tree, and neither has a use for an object file — running clang for one would be work
+  // whose result is thrown away.
+  val native =
+    if links(cfg.command) then
+      NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots), target, cfg.optimize) match
+        case Left(err)    => return fail(err)
+        case Right(built) => built
+    else NativeSources.none
+
   // A test build is its own compilation and branches before the one below, rather than sharing it:
   // it keeps the `@test` functions every other build drops, and it lowers a different entry point
   // (`Tests`). Everything up to here — the libraries, the standard module, the target — is the same,
   // which is why the branch is here and not at the top.
   if cfg.command == "test" then
-    return TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, std, archives)
+    val status =
+      TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, std, archives,
+        native.objects)
+
+    native.scratch.foreach(Project.discard)
+    return status
 
   // Proving stops at the typed tree and never lowers, so it branches before the compilation below
   // (`17 §9`). It reads the tree before pruning and before `@ghost` erasure, because the predicates a
@@ -401,21 +421,21 @@ private[sysl] def execute(cfg: Config): Int = {
         else result.notes.foreach(Console.err.println)
       result
 
-  cfg.command match
+  val status = cfg.command match
     case "emit-llvm" =>
       stdout(compiled.ir); 0
 
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
 
-      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links) match
+      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects) match
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
       val exe = createTempFile("sysl-", "")
 
-      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links) match
+      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects) match
         case Left(err) => Project.discard(exe); fail(err)
         case Right(_) =>
           val result = exec(exe :: cfg.programArgs)
@@ -426,7 +446,18 @@ private[sysl] def execute(cfg: Config): Int = {
 
     case other =>
       fail(s"unknown command '$other'")
+
+  // The objects were a temporary of this build, whichever way it went — a link that failed leaves
+  // them as surely as one that worked.
+  native.scratch.foreach(Project.discard)
+  status
 }
+
+/** Whether a subcommand ends at the linker, which is what decides whether a tree's C is worth
+ * compiling. `emit-llvm` and `prove` do not, and `build-lib` never reaches here — it archives its
+ * own C rather than linking it.
+ */
+private def links(command: String): Boolean = command == "build" || command == "run" || command == "test"
 
 /** `sysl prove` — the module as WhyML, and what Why3 made of it (`17 §9`).
  *
@@ -608,19 +639,18 @@ private def chooseTarget(named: Option[String], configured: Option[String]): Eit
 /** The project's dependencies, brought onto this machine and turned into what a compilation needs
  * from them (`packages.md § 3`, `§ 5`, `§ 9`).
  *
- * A dependency reaches a compilation the way a `--lib` source tree does — as **more modules** — and
- * that is the whole of the wiring. What is new beside it is the `Packages` table: each fetched
- * package's files are filed under a canonical prefix taken from its coordinate, and the names its
- * import lines write are read back through the manifest that named it.
+ * A dependency reaches a compilation the way a `--lib` source tree does — as **more modules**, and
+ * as a tree whose C is compiled beside the program's (`15 §7`). What is new beside those is the
+ * `Packages` table: each fetched package's files are filed under a canonical prefix taken from its
+ * coordinate, and the names its import lines write are read back through the manifest that named it.
  *
  * `sysl.sum` is written back where a package was fetched that no line covered, so the first build
  * after adding a dependency records what it got and every build after that is checked against it.
  * Writing it is not fatal if it fails: a read-only checkout should still build, and the alternative
  * is refusing to compile over a file that exists to be compared against next time.
  */
-private def dependencies(cfg: Config, project: PackageConfig)
-    : Either[String, (List[Source], Packages)] =
-  if project.dependencies.isEmpty then Right((Nil, Packages.none))
+private def dependencies(cfg: Config, project: PackageConfig): Either[String, PackageSources] =
+  if project.dependencies.isEmpty then Right(PackageSources.none)
   else
     val root = projectRoot(cfg.file)
 
@@ -634,9 +664,9 @@ private def dependencies(cfg: Config, project: PackageConfig)
       files
 
 /** Each fetched package's source, filed under the canonical prefix that keeps its module names
- * apart from every other package's.
+ * apart from every other package's — and each one's directory, which is a tree the C walk visits.
  */
-private def collectPackages(graph: Resolve.Graph): Either[String, (List[Source], Packages)] = {
+private def collectPackages(graph: Resolve.Graph): Either[String, PackageSources] = {
   val fetched = graph.packages.filterNot(_.isRoot)
 
   try
@@ -647,9 +677,10 @@ private def collectPackages(graph: Resolve.Graph): Either[String, (List[Source],
       case None =>
         val owned = each.flatMap((p, sources) => sources.map(_ -> p.canonical)).toMap
 
-        Right((
+        Right(PackageSources(
           each.flatMap(_._2),
           Packages(owned, graph.packages.map(p => p.canonical -> p.imports).toMap),
+          fetched.map(_.root),
         ))
   catch case e: Exception => Left(s"cannot read a package: ${e.getMessage}")
 }

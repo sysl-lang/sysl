@@ -45,6 +45,26 @@ case class Packages(of: Map[Source, String] = Map.empty, imports: Map[String, Ma
   def isEmpty: Boolean = of.isEmpty && imports.isEmpty
 }
 
+/** What a project's `dependencies` block brings to one compilation.
+ *
+ * Three things and not one, because a package reaches a build by more than one road. Its `.sysl` is
+ * **more modules** and joins the compilation's own; the table keeps its module names apart from
+ * every other package's; and its directory is a tree whose C is compiled and linked beside the
+ * program's (`15 §7`, `NativeSources`).
+ *
+ * The third is here because it was once missing. A package's sysl compiled and its C was dropped
+ * with no warning, so a build against any package carrying a shim ended at the linker naming symbols
+ * that package's own C defines — which `packages.md § 7` had already promised would not happen, on
+ * the grounds that sysl compiles a package's C declaratively and needs no build script to do it.
+ */
+case class PackageSources(sources: List[Source], packages: Packages, roots: List[String])
+
+object PackageSources {
+
+  /** A project with no dependencies, which is the ordinary case and costs nothing. */
+  val none: PackageSources = PackageSources(Nil, Packages.none, Nil)
+}
+
 object Packages {
 
   /** No packages: one project, its own modules, nothing fetched. */

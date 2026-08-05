@@ -69,17 +69,26 @@ reads — the same convention `sysl run <path> -- <args>` follows.
 That needs a `clang` on the PATH: sysl emits textual LLVM IR and links it with clang.
 
 `bindings/` holds bindings to real C libraries. Each is a library rather than a single file — its
-sysl and the `.c` shims that read whatever only a header knows — so it takes two commands, because a
-program compiles against the built artifact rather than against the tree:
+sysl and the `.c` shims that read whatever only a header knows — and `--lib` takes the tree itself:
+
+```bash
+sbt "syslJVM/run run bindings/regex/match.sysl --lib bindings/regex/lib"
+```
+
+Building it into an artifact first is the other road, and gives a program that compiles without the
+library's source anywhere near it:
 
 ```bash
 sbt "syslJVM/run build-lib bindings/regex/lib -o /tmp/rx.syslib"
 sbt "syslJVM/run run bindings/regex/match.sysl --lib /tmp/rx.syslib"
 ```
 
+Both carry the shims: a `.c` anywhere in a tree is compiled with it (`design/15 §7`), whether the
+tree is a library, a package a `dependencies` block brought in, or the project itself.
+
 `bindings/regex` binds POSIX regular expressions and needs nothing installed, since they are part of
 libc. A program built against it says nothing about linking, because `link "regex"` is written once
-in the binding and travels in the artifact.
+in the binding and travels with it.
 
 **The SQLite binding used to live here and now has a repository of its own** —
 [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package outside this tree

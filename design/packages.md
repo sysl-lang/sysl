@@ -224,10 +224,18 @@ describe.
 
 This is the single most valuable property in the chapter and it is available almost for free,
 because the reason other ecosystems need build scripts mostly does not apply. Cargo's `build.rs`
-exists in large part to compile vendored C, and **sysl already compiles a library's C
-declaratively**: `15 § 7` establishes that a library may carry C source inside its module tree, and
+exists in large part to compile vendored C, and **sysl already compiles a package's C
+declaratively**: `15 § 7` establishes that any source tree may carry C inside its module tree, and
 `bindings/regex` and the SQLite package both do exactly that. The linker inputs a package needs are
 `link` directives in the source (`13 §`), not a program that computes them.
+
+**A dependency is consumed as source, so this is a claim about the source path and not only about
+`build-lib`.** A fetched package's `.c` is compiled for the build's target and its object goes on
+that build's link line, exactly as its `.sysl` becomes more of that build's modules; a `@link`
+directive in its header reaches the same command line, which is what lets a consumer link against
+SQLite without ever writing `-lsqlite3`. Neither is optional to the argument above — a package
+system that dropped a package's C would need build scripts again the first time somebody bound a
+real library.
 
 What that buys is most of the supply-chain story: **a package that cannot execute during
 installation cannot exfiltrate anything during installation.** `sysl add` reads and writes files and

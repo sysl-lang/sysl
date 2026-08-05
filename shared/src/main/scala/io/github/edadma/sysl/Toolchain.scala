@@ -188,11 +188,11 @@ object Toolchain {
    */
   def build(ir: String, exe: String, target: Target = Target.default,
             archives: List[String] = Nil, level: String = defaultOptimization,
-            links: List[String] = Nil): Either[String, Unit] = {
+            links: List[String] = Nil, objects: List[String] = Nil): Either[String, Unit] = {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    val result = exec(linkCommand(ll, archives, exe, target, level, links))
+    val result = exec(linkCommand(ll, archives, exe, target, level, links, objects))
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())
@@ -207,12 +207,17 @@ object Toolchain {
    * undefined — an archive listed first would be scanned before anything needed it and contribute
    * nothing. The system libraries go after both for exactly the same reason, since the library's own
    * object is one of the things that calls them.
+   *
+   * `objects` is the C a source tree carried (`NativeSources`), and it sits between the two for the
+   * same reason again: an object is linked whether or not anything needed it, so its own calls are
+   * undefined symbols by the time the archives and the `-l`s are scanned. A shim placed after them
+   * would have nothing left to resolve `sqlite3_open` against.
    */
   private[sysl] def linkCommand(ll: String, archives: List[String], exe: String, target: Target,
                                 level: String = defaultOptimization,
-                                links: List[String] = Nil): List[String] =
+                                links: List[String] = Nil, objects: List[String] = Nil): List[String] =
     List("clang", s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: deadStrip(target) :::
-      List(ll) ::: archives ::: libraryFlags(links, target) ::: List("-o", exe)
+      List(ll) ::: objects ::: archives ::: libraryFlags(links, target) ::: List("-o", exe)
 
   /** What a build's link directives (`15 §8`) become on **this** target's command line.
    *
