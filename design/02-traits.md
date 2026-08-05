@@ -409,6 +409,13 @@ and which are supplying what the trait required, and that is the same question i
 costs almost nothing to say so, because an implementation that is happy with a default writes no
 member at all; across `lib/`, `guide/` and `examples/` exactly two members replace one.
 
+**And it reaches the same act written somewhere else.** A type's own **inherent** member may carry a
+trait member's name, and `08 §` gives it precedence — silently, which is the whole problem. Where
+the trait member is a bare requirement the inherent one merely satisfies it and the keyword is
+refused; where the trait member has a **default body**, the inherent member replaces it and must say
+`override`, exactly as it would inside the block. The test is what the member *does*, never where it
+was written.
+
 #### Which of two implementations is more specific
 
 `override` says a replacement was meant. It does not say *what* is being replaced, so the language

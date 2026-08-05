@@ -366,7 +366,28 @@ and they coexist the way Swift's body methods and protocol conformances do. Name
 
 An inherent member and a trait requirement of the same name is the case where the type is
 choosing to satisfy the trait with its own method; the analyzer treats the inherent member as
-the implementation rather than reporting a clash. The operator traits of `00` §9 (`+`, `[]`, the
+the implementation rather than reporting a clash.
+
+**Where the trait member has a default body, that is an override and must say so** (`02 §`
+`override`). The two cases part company on whether anything is being replaced:
+
+```
+trait Fallible
+    failed(*self) -> bool = false
+
+struct File
+    err: int
+    override failed(self) -> bool = self.err != 0
+```
+
+A bare **requirement** is satisfied by the inherent member and nothing is replaced, so the keyword
+does not apply and is refused. A **default body** is replaced, which is the same act as replacing it
+inside the `impl` block — and a rule that asked for the keyword there and not here would be asking
+about where the member was written rather than about what it does.
+
+The silence is the reason this is worth a keyword at all. A member that quietly becomes some trait's
+implementation is a coupling nothing in the source shows: add a method whose name a trait you
+implement happens to use, and its default stops running, at a distance, with no diagnostic. The operator traits of `00` §9 (`+`, `[]`, the
 comparisons) are trait members by this rule — overloading an operator is implementing its trait,
 declared as `impl Trait for Type`, never an inherent method with an operator name.
 
