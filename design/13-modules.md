@@ -683,7 +683,40 @@ module member cannot have.
 module member — visibility, the shared value namespace, the initializer dependency graph and its
 cycle diagnostic, hoisting — and adds the two things the word `var` already means: assignment at
 every depth, and `&`. `&k[0]` on a `val` is refused because a `val` promises its storage is written
-once and that is where the promise is kept; a `static var` promises nothing.
+once and that is where the promise is kept; a module `var` promises nothing.
+
+**That list was a claim rather than a description in one place, and the probe pass caught it.** The
+cycle diagnostic looked a name up among the `val`s alone, so a cycle running through a `var` threw
+where it should have explained — the compiler dying on the program it was meant to be reporting on.
+It had stood since `static var` landed, because every cycle anyone had written was between two
+`val`s. Fixed and pinned at both spellings and at one of each.
+
+**Everywhere else it is spelled `var`, with no modifier, and it is the same declaration.** The two
+spellings follow from the paragraph above rather than adding anything to it: `static` asks for the
+module *instead of the body*, so it is needed exactly where there is a body to be asking about, and
+that is one file per program. In any other file — a `module` header, or a headerless file that is
+not the one carrying the statements — a top-level `var` is the module's storage because there is
+nothing else it could be.
+
+```
+// counter/c.sysl
+module counter
+
+var count: int = 0
+
+bump() = count += 1
+```
+
+**A `var` therefore does not decide which file the program starts in.** That question is answered by
+what a file *runs*, and a declaration of storage runs nothing — a file holding a counter is no more
+the program's beginning than one holding a table (`§7`, *the entry file is a body*). The entry file's
+own top-level `var` is untouched by this and is still a local of its body, which is the distinction
+the modifier exists to cross.
+
+This was unwritable until 2026-08-05, and the gap was found by `17 §5` — its module-invariant example
+was written against exactly this spelling and did not compile, because a `var` outside the entry file
+was read as a statement and refused as a second beginning. The rule stated here is what the chapter
+had assumed all along.
 
 It is stricter in exactly one place, and it is the subtle one. **It may not hold a value that owes a
 release, and the question is asked of the TYPE where a `val`'s is asked of the VALUE.** A `val` is

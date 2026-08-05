@@ -2,9 +2,13 @@ package sh.sysl
 
 import scala.collection.mutable
 
-/** The order a program's computed `val` initializers run in (`13 §7`).
+/** The order a program's computed module-storage initializers run in (`13 §7`).
  *
- * A `val` whose initializer is a constant tree is laid straight into the object file and has no
+ * **"`val`" below means either declaration**, since `13 §7` makes a `val` and a module `var` one
+ * kind of thing and an initializer is a place where they are indistinguishable — a cycle may run
+ * through both, and a diagnostic that knew about only one of them threw instead of explaining.
+ *
+ * Storage whose initializer is a constant tree is laid straight into the object file and has no
  * order to have. One whose initializer is *code* runs before the program's own statements, and as
  * soon as two of them exist the question is which goes first — which is the question that kept
  * computed initializers out of `val`'s first cut.
@@ -75,16 +79,29 @@ trait InitOrder extends AnalyzerBase {
       val head = cycle.min
 
       if blamed.add(head) then
-        currentPos = valDecls(head).pos
+        // Both tables, because module storage is one thing under two declarations (`13 §7`) and a
+        // cycle may run through either. Asking only the `val`s threw where a `var` was on the loop —
+        // a crash rather than a diagnostic, and one that stood from the day `static var` landed
+        // because nothing had written a cycle through one.
+        currentPos = declPos(head)
 
         val chain = (cycle.dropWhile(_ != head) ::: cycle.takeWhile(_ != head)).tail :+ head
 
         recover(())(err(s"'${qn(head)}' cannot be initialized: its value needs " +
           chain.map(n => s"'${qn(n)}'").mkString(", whose value needs ") +
-          " — a computed 'val' runs once before anything else does, so what it needs has to be " +
-          "settled first"))
+          " — computed module storage runs once before anything else does, so what it needs has to " +
+          "be settled first"))
 
     computed.map(_.symbol).foreach(walk)
     out.toList
   }
+
+  /** Where a piece of module storage was declared, whichever of the two declarations wrote it.
+   *
+   * `13 §7` makes a `val` and a `var` one kind of thing under two spellings, and everything
+   * downstream of hoisting treats them that way — so a lookup that consults one table is a lookup
+   * that is right about half its inputs and throws on the rest.
+   */
+  private def declPos(key: String): Option[Pos] =
+    valDecls.get(key).flatMap(_.pos).orElse(staticVarDecls.get(key).flatMap(_.pos))
 }

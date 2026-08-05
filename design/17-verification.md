@@ -161,36 +161,37 @@ it survives the jump intact and a `@tailrec` function may carry one.
 ## 5. Module invariants
 
 **This section and `§7` waited on mutable module state to be about, and it has arrived: `13 §7`'s
-`static var` is built.** `§7` (`@reads`/`@writes`) is now a build with no decision in front of it, and
+module `var` is built.** `§7` (`@reads`/`@writes`) is now a build with no decision in front of it, and
 is the more useful of the two, since a frame is what makes a call something other than an eraser to a
 prover. **This section has one open question and it is not a technical one:** the check below runs on
 return from every public function of the module, which is complete exactly when the module's own
-functions are the only writers — and a public `static var` is writable by anyone, from another module
+functions are the only writers — and a public module `var` is writable by anyone, from another module
 or from a program's own statements, with no check anywhere. `§ Open f`
 carries the dependency.
 
 An `invariant` written at the top level of a file is a predicate over the module's own state:
 
 ```
-static var count: int = 0
-static var limit: int = 100
+module counter
+
+var count: int = 0
+var limit: int = 100
 
 invariant count >= 0 && count <= limit
 ```
 
-**This example used to be written under a `module counter` header with two plain `var`s, and neither
-line compiles that way** — which is worth recording rather than quietly correcting, because it is the
-gap the section rests on. A `var` at the top level of *any* file is a statement, so a file that names
-a module may not carry one at all; and `static` is refused there too, since it asks for the module
-instead of the *body* and a module file has no body to be asking about. **So mutable module storage
-is reachable in the entry file and nowhere else.** `13 §7` is consistent about this and never claimed
-otherwise; the example here was written to what the section wanted rather than to what §7 gives.
+**This example did not compile until 2026-08-05, and finding that out is what made `13 §7` say what
+it now says.** A `var` outside the file the program starts in was read as a *statement*, so a file
+that named a module was refused for carrying one — as a second beginning, with a diagnostic about
+which file the program starts in, which is not a subject this example is about. `static` was refused
+there too, correctly and for its own reason, so mutable module storage had no spelling at all in a
+module file and this section's whole subject was unreachable.
 
-That narrows this section's reach considerably and does not change its design. **Whether a module
-file should be able to declare mutable storage is a language question and an open one** — it is the
-same question `13 § Open c` and `§ Open f` circle from the visibility side, and the answer decides
-whether a module invariant is a general facility or an entry-file one. Both spellings are pinned in
-`ModuleTests` so that whichever way it goes, the change is visible.
+It was a gap rather than a decision, and `13 §7` closed it the way that section's own framing
+required: in a module file everything is the module's already, which is exactly why `static` is
+refused there — so a `var` is the module's storage because there is nothing else it could be. The
+entry file's own `var` is untouched and is still a local of its body. Both halves are pinned in
+`ModuleTests`.
 
 No new word: this is the word `16 §6` already gives a struct, meaning the same thing one level out. A
 struct invariant is a property of a struct's fields that every operation on the struct preserves; a
@@ -537,21 +538,23 @@ function a name and recursion, which is exactly what this clause is for, and wha
 environment argument to be skipped when the measure's parameters are matched to the call's arguments.
 Both are refused today with one message that names both.
 
-**f. ~~`§5` and `§7` wait on `13`'s module-state spelling.~~ The spelling arrived — `static var` —
-and what is left is narrower and sharper than the dependency it replaces.** This item used to be the
-biggest in the chapter, on the grounds that both sections were predicates over a set the language
-could not name. It can name one now, and the argument recorded here held: the chapter never needed a
-*particular* spelling, only that one exist, and an invariant reads the names and a frame lists them
-whichever form was taken. The second customer this offered beside `guide/slab` is also discharged —
-an allocator wanted module state, a verifier wanted to say what a function does to it, and the
-declaration serves both.
+**f. ~~`§5` and `§7` wait on `13`'s module-state spelling.~~ CLOSED — the spelling is `13 §7`'s
+module `var`, and it reaches every module rather than one file.** This item used to be the biggest in
+the chapter, on the grounds that both sections were predicates over a set the language could not
+name. The argument recorded here held all the way through: the chapter never needed a *particular*
+spelling, only that one exist, and an invariant reads the names and a frame lists them whichever form
+was taken. The second customer this offered beside `guide/slab` is discharged too — an allocator
+wanted module state, a verifier wanted to say what a function does to it, and one declaration serves
+both.
 
-**What replaces it is two questions, and only the first is a decision.** A `static var` may be
-written in the entry file and nowhere else (`§5`), so module state is real but confined, and whether
-a module file should be able to declare mutable storage is the language question this chapter now
-waits on rather than the spelling one. And a **public** `static var` is writable from outside the
-module with no check anywhere, which is `§5`'s own open question — the invariant is checked on return
-from the module's public functions, and that is complete exactly when they are the only writers.
+It closed in two steps and the second was found by this chapter. `static var` came first and was
+confined to the file the program starts in, which would have made a module invariant an entry-file
+facility rather than a general one; `§5`'s example is what showed that, by not compiling. A plain
+`var` in any other file is the same storage, and the confinement is gone.
+
+**What is left is one question, and it is `§5`'s rather than this item's.** A **public** module `var`
+is writable from outside the module with no check anywhere, so the invariant checked on return from
+the module's public functions is complete exactly when those functions are the only writers.
 Narrowing the visibility answers it; so would checking at the write; neither is chosen here.
 
 **e. A quantifier over something other than an integer range.** `for all x in a do P(x)` over a `[]T`

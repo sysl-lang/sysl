@@ -183,10 +183,11 @@ trait DeclTables extends Reporting {
    */
   protected val valDecls = mutable.LinkedHashMap.empty[String, ValDecl]
 
-  /** Declared `static var`s by key (`13 §7`) — the mutable half of module storage.
+  /** Declared module `var`s by key (`13 §7`) — the mutable half of module storage, written
+   * `static var` in the file the program starts in and plain `var` in any other.
    *
    * A separate table from the `val`s only because the two declarations have different shapes: a
-   * `static var` may omit its value where a `val` may not, and it must state its type where a `val`
+   * `var` may omit its value where a `val` may not, and it must state its type where a `val`
    * may infer one. Everything downstream treats them as one kind of thing, which is what `globalKey`
    * and `globalType` are for, and what makes a name declared by one clash with a name declared by
    * the other.

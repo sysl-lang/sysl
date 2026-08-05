@@ -28,7 +28,7 @@ trait Hoisting extends HoistMembers {
   protected def valueNameHolder(key: String): Option[String] =
     if constDecls.contains(key) then Some("a constant")
     else if valDecls.contains(key) then Some("a 'val'")
-    else if staticVarDecls.contains(key) then Some("a 'static var'")
+    else if staticVarDecls.contains(key) then Some("a module 'var'")
     else if externVarDecls.contains(key) then Some("an 'extern' variable")
     else if variantOwner.contains(key) then Some(s"enum '${qn(variantOwner(key))}'")
     else None
@@ -161,20 +161,28 @@ trait Hoisting extends HoistMembers {
       declScope(key) = currentScope
       recordAccess(key, v.vis)
 
-    // A `static var` is registered beside the `val`s because it is the same kind of thing: storage
-    // the module owns, under a name that reaches it. A plain `var` never arrives here — only the top
-    // level of a file the program starts in can carry one that is not a statement, and `ProgramWalk`
-    // has already unwrapped the `static` off it (`13 §7`).
+    // A module `var` is registered beside the `val`s because it is the same kind of thing: storage
+    // the module owns, under a name that reaches it. It arrives here by two spellings and they mean
+    // one declaration (`13 §7`): `static var` at the top of the file the program starts in, which
+    // `ProgramWalk` has already unwrapped, and a plain `var` at the top of any other file, where
+    // there is no body for it to be a local of and `static` would say nothing.
+    //
+    // Only a *local* `var` never reaches this, and that is the entry file's own — which is why the
+    // diagnostics below say "module storage" rather than naming either spelling. A reader told to
+    // write `static` in a file that refuses the word, or told to drop it in the one file that needs
+    // it, would be told something false.
     case v: VarDecl =>
       val key = Modules.qualify(currentModule, v.name)
 
       if staticVarDecls.contains(key) then duplicate(key, s"'${v.name}' is already declared")
       else for what <- valueNameHolder(key) do duplicate(key, s"'${v.name}' is already used by $what")
       // The same rule a `val` meets, and for the same reason (`13 §2`): a module member may be
-      // visible outside its file, and what is has to say what it is. It bites harder here, because a
-      // `static var` may have no initializer at all for a type to be inferred from.
+      // visible outside its file, and what is has to say what it is. It bites harder here, because
+      // module storage written with `var` may have no initializer at all for a type to be inferred
+      // from.
       if v.typ.isEmpty then
-        err(s"a 'static var' states its type, so '${v.name}' needs one — 'static var ${v.name}: T = …'")
+        err(s"'${v.name}' is module storage, and module storage states its type (`13 §2`) — write " +
+          s"'${v.name}: T'")
       staticVarDecls(key) = v.copy(name = key).setPos(v.pos)
       declScope(key) = currentScope
       recordAccess(key, v.vis)
@@ -259,7 +267,7 @@ trait Hoisting extends HoistMembers {
       else if constDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a constant")
       else if valDecls.contains(key) then duplicate(key, s"'${f.name}' is already declared as a 'val'")
       else if staticVarDecls.contains(key) then
-        duplicate(key, s"'${f.name}' is already declared as a 'static var'")
+        duplicate(key, s"'${f.name}' is already declared as a module 'var'")
       else if externVarDecls.contains(key) then
         duplicate(key, s"'${f.name}' is already declared as an 'extern' variable")
       funcDecls(key) = f.copy(name = key).setPos(f.pos)

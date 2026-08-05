@@ -107,6 +107,35 @@ class ComputedValTests extends AnyFreeSpec with CodegenSupport with RunSupport {
       err("me() -> int = n\nstatic val n: int = me()") should include("cannot be initialized")
     }
 
+    // The same cycle through the WRITABLE half of module storage, which every test above spells
+    // `val`. It used to throw rather than report: the diagnostic looked its name up in the `val`
+    // table alone, and a `var` is in the other one — so the compiler died on a program it was
+    // supposed to be explaining. `13 §7` makes the two one kind of thing, and this is what holds the
+    // reporting to that.
+    "including a cycle through a 'var', which is the same storage" in {
+      val e = err(
+        """from_b() -> int = b + 1
+          |from_a() -> int = a + 1
+          |static var a: int = from_b()
+          |static var b: int = from_a()""".stripMargin
+      )
+
+      e should include("cannot be initialized")
+      e should include("'a'")
+      e should include("'b'")
+    }
+
+    // And a cycle with one of each, which is the case that proves the lookup consults both tables
+    // rather than having been swapped from one to the other.
+    "and one that runs through a 'val' and a 'var' together" in {
+      err(
+        """from_b() -> int = b + 1
+          |from_a() -> int = a + 1
+          |static val a: int = from_b()
+          |static var b: int = from_a()""".stripMargin
+      ) should include("cannot be initialized")
+    }
+
     // A **computed** `val` counts nothing, which is where the rule bites now that a constant one may
     // hold a literal string: the two forms are told apart by the initializer, and the release a
     // computed value owes is exactly the one there is no line to write.
