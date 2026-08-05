@@ -1,0 +1,211 @@
+import sysl.buf.byte_sink
+import sysl.text.from_utf8
+
+// The checks. Every line of output begins `ok`, so the whole of stdout is the assertion.
+
+check(name: string, got: string, want: string)
+    if got == want then print(s"ok    $name = $got")
+    else print(s"FAIL  $name = $got, wanted $want")
+end check
+
+// A rendered line as text.
+//
+// A table writes only what it was handed and the padding between it, so the bytes are valid wherever
+// the cells were — which is why this unwraps rather than reporting. `from_utf8` validates, and the
+// cost of that is one pass the program would otherwise not make; what it buys is that every check
+// below is an ordinary string comparison, the same one every other program in the set writes.
+text_of(bytes: []const u8) -> string = from_utf8(bytes).unwrap()
+
+// Line `n` of some rendered text, without its newline.
+line(text: []const u8, n: usize) -> []const u8
+    var start = 0usize
+    var seen = 0usize
+    var i = 0usize
+
+    while i < text.len
+        if text[i] == 10u8 then
+            if seen == n then return text[start..<i]
+
+            seen += 1usize
+            start = i + 1usize
+
+        i += 1usize
+
+    text[start..<text.len]
+end line
+
+// Whether every line of some rendered text is the same width **on screen**, which is the whole of
+// what it means for a table to line up — and the assertion a byte count fails. It counts characters
+// rather than bytes for the same reason the renderer does, so a program that measured wrongly would
+// pass this and produce a table nobody could read.
+even(text: []const u8) -> bool
+    val want = columns(line(text, 0usize))
+    var i = 1usize
+
+    while i < usize(lines(text))
+        if columns(line(text, i)) != want then return false
+
+        i += 1usize
+
+    true
+end even
+
+lines(text: []const u8) -> int
+    var n = 0
+
+    for b in text do if b == 10u8 then n += 1
+
+    n
+end lines
+
+section_a_column_is_as_wide_as_its_widest_cell()
+    print("-- a column is as wide as its widest cell")
+
+    var t = table([Left, Left])
+
+    t.add(["name", "city"])
+    t.add(["Alice", "New York"])
+    t.add(["Bob", "London"])
+
+    check("the first column takes 'Alice'", str(t.width(0usize)), "5")
+    check("the second takes 'New York'", str(t.width(1usize)), "8")
+    check("three rows went in", str(t.rows()), "3")
+
+    var sink = byte_sink()
+    var out: *Writer = &sink
+
+    t.render(out)
+
+    val text = sink.text()
+
+    check("the rule spans both fields", text_of(line(text, 0usize)), "+-------+----------+")
+    check("the header", text_of(line(text, 1usize)), "| name  | city     |")
+    check("a rule under the header", text_of(line(text, 2usize)), "+-------+----------+")
+    check("the first row", text_of(line(text, 3usize)), "| Alice | New York |")
+    check("the second", text_of(line(text, 4usize)), "| Bob   | London   |")
+    check("and a rule under the last", text_of(line(text, 5usize)), "+-------+----------+")
+    check("which is every line", str(lines(text)), "6")
+end section_a_column_is_as_wide_as_its_widest_cell
+
+section_a_row_holds_types_that_differ()
+    print("-- a row holds types that differ")
+
+    // The shape the whole program is written to exercise: one row, four types, none of them the
+    // program's own. Two are integers of different widths, which is what a rule rather than an
+    // `impl` could not have carried into a method table.
+    var t = table([Left, Right, Right, Left])
+
+    t.add(["what", "count", "wide", "flag"])
+    t.add(["totals", 7, 340282366920938463463374607431768211455u128, true])
+    t.add(["signed", -128i8, 2u8, false])
+
+    var sink = byte_sink()
+    var out: *Writer = &sink
+
+    t.render(out)
+
+    val text = sink.text()
+
+    check("the header, with the numeric columns right", text_of(line(text, 1usize)),
+        "| what   | count |                                    wide | flag  |")
+    check("a u128 laid out beside a string and a bool", text_of(line(text, 3usize)),
+        "| totals |     7 | 340282366920938463463374607431768211455 | true  |")
+    check("and the most negative i8, which renders in full", text_of(line(text, 4usize)),
+        "| signed |  -128 |                                       2 | false |")
+    check("every line is the same width", str(even(text)), "true")
+end section_a_row_holds_types_that_differ
+
+section_alignment_puts_the_slack_where_it_was_asked()
+    print("-- alignment puts the slack where it was asked")
+
+    var t = table([Left, Right, Center])
+
+    t.add(["left", "right", "center"])
+    t.add(["a", "a", "a"])
+    t.add(["xxxxxx", "xxxxxx", "xxxxxx"])
+
+    var sink = byte_sink()
+    var out: *Writer = &sink
+
+    t.render(out)
+
+    val text = sink.text()
+
+    check("the header sits by its column's rule", text_of(line(text, 1usize)), "| left   |  right | center |")
+    check("one character, three ways", text_of(line(text, 3usize)), "| a      |      a |   a    |")
+    check("and the widest cell fills every field", text_of(line(text, 4usize)), "| xxxxxx | xxxxxx | xxxxxx |")
+end section_alignment_puts_the_slack_where_it_was_asked
+
+// **The section this program exists for.** Every cell here is text a byte count gets wrong, and a
+// table is where being wrong by one is a border that does not line up.
+section_a_column_is_measured_in_characters()
+    print("-- a column is measured in characters, not bytes")
+
+    check("'cafe' is four of each", str(columns("cafe".bytes)), "4")
+    check("but 'café' is five bytes", str("café".bytes.len), "5")
+    check("and four characters", str(columns("café".bytes)), "4")
+    check("'naïve' is six bytes", str("naïve".bytes.len), "6")
+    check("and five characters", str(columns("naïve".bytes)), "5")
+    check("'naïveté' is nine bytes", str("naïveté".bytes.len), "9")
+    check("and seven characters", str(columns("naïveté".bytes)), "7")
+    check("'日本' is six bytes", str("日本".bytes.len), "6")
+    check("and two characters", str(columns("日本".bytes)), "2")
+
+    var t = table([Left, Right])
+
+    t.add(["city", "n"])
+    t.add(["café", 1])
+    t.add(["naïve", 22])
+    t.add(["Zürich", 333])
+
+    check("the column takes the widest in characters", str(t.width(0usize)), "6")
+
+    var sink = byte_sink()
+    var out: *Writer = &sink
+
+    t.render(out)
+
+    val text = sink.text()
+
+    // Every one of these lines is the same length **on screen** and three different lengths in
+    // bytes, which is the whole of what the finding costs.
+    check("the rule", text_of(line(text, 0usize)), "+--------+-----+")
+    check("an accented cell still ends at the border", text_of(line(text, 3usize)), "| café   |   1 |")
+    check("a longer one", text_of(line(text, 4usize)), "| naïve  |  22 |")
+    check("an initial that is two bytes", text_of(line(text, 5usize)), "| Zürich | 333 |")
+
+    // The claim the section is for, made without counting anything by hand: the borders line up.
+    // Measured in bytes this is false, and false by a different amount on each of the three rows.
+    check("every line is the same width on screen", str(even(text)), "true")
+
+    // And the lines are not ASCII, which is what makes the line above a claim rather than a
+    // tautology: each is longer in bytes than it is on screen, so a layout that had counted bytes
+    // would have padded these fields to different widths.
+    check("while each is longer in bytes than on screen",
+        str(line(text, 3usize).len > columns(line(text, 3usize))), "true")
+end section_a_column_is_measured_in_characters
+
+// What the same table looks like if width is taken from `bytes.len`, which is what `FormatSpec`
+// would have given it. The borders move, and they move by a different amount per row.
+section_what_a_byte_count_would_have_done()
+    print("-- what a byte count would have done")
+
+    check("'café' is over by one", str("café".bytes.len - columns("café".bytes)), "1")
+    check("'naïve' by one", str("naïve".bytes.len - columns("naïve".bytes)), "1")
+    check("'naïveté' by two", str("naïveté".bytes.len - columns("naïveté".bytes)), "2")
+    check("'Zürich' by one", str("Zürich".bytes.len - columns("Zürich".bytes)), "1")
+    check("'日本' by four", str("日本".bytes.len - columns("日本".bytes)), "4")
+
+    // And the error is not a constant, which is why a column cannot be corrected after the fact by
+    // subtracting something: it is one per accented character, so two cells in one column are over
+    // by different amounts and a field padded by bytes is ragged rather than merely narrow.
+    check("so the error differs between two cells of one column",
+        str(("naïveté".bytes.len - columns("naïveté".bytes)) !=
+            ("café".bytes.len - columns("café".bytes))), "true")
+end section_what_a_byte_count_would_have_done
+
+section_a_column_is_as_wide_as_its_widest_cell()
+section_a_row_holds_types_that_differ()
+section_alignment_puts_the_slack_where_it_was_asked()
+section_a_column_is_measured_in_characters()
+section_what_a_byte_count_would_have_done()

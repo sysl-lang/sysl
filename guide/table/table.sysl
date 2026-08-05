@@ -1,0 +1,213 @@
+// A text table: cells of any type that renders, laid out in columns that line up.
+//
+// The axis this owns is **text measured for display**. Every other program in the set treats a
+// string as bytes to be copied or compared; this one has to know how wide one *looks*, because a
+// column is a promise about where the next border falls. Nothing else in the set asks.
+//
+// Deliberately not modelled: multiple border styles, Markdown and TSV output, row spanning, and
+// wrapping a cell that is wider than its column. Each is more of the same layout; none of them asks
+// the language anything the box below does not.
+//
+//
+// What writing it found
+// ---------------------
+//
+// **A `FormatSpec`'s width is a byte count, so it cannot lay out a column.** `14 §2` says width and
+// precision count bytes "as C's do", and `display_pad` pads to that. A table is the program that
+// minds: `café` is five bytes and four columns, so a field padded to a byte count is short by one —
+// and it is short by **one per non-ASCII character**, so two cells of one column are wrong by
+// different amounts and the column comes out ragged rather than merely narrow. There is no
+// correction to apply afterwards.
+//
+// So this program ignores the specifier's width entirely, hands every cell the neutral spec, and
+// does its own padding over a count it works out itself (`columns`). That is the right division —
+// only the caller knows what a column is — but it means the one field in `FormatSpec` a table would
+// have used is the one it cannot use, and a program that trusted it would produce a table that is
+// wrong only for text that is not ASCII, which is the worst way to be wrong.
+//
+// **A correction rather than a finding, and it is the same one `png` recorded: ask the library
+// before reporting an absence.** This program was most of the way to writing up "a rendered value
+// cannot become a `string`" — `ByteSink.text()` answers a `[]u8`, and two earlier programs had
+// wanted `from_utf8` and not had it. It is there now, in `sysl.text`, and it takes the rendered
+// bytes exactly as the chapter says. What that would have cost was not just a false note: the
+// checks were written twice, once comparing bytes by hand and printing them back through
+// `putbytes`, before the conversion was looked for. `04` had specified it all along.
+//
+// **A character is not a column, and this program is right only because its text is Latin.**
+// `columns` counts characters, which is correct for `café` and `Zürich` and wrong for `日本` — two
+// characters occupying four terminal columns. Getting that right needs the East Asian Width table
+// from UAX #11, which is data rather than language, and `13 §7`'s missing module-level constants is
+// where that lands. Recorded as a boundary rather than solved: the program asserts alignment over
+// text where character and column agree, and says so.
+//
+// **A `require` cannot carry its message onto the next line.** Continuation covers an operator that
+// cannot finish an expression, and brackets already join — but `require cond, "message"` has no
+// brackets, so its comma cannot carry the line and a long message has nowhere to go. Every other
+// multi-line call in this directory continues inside brackets and is fine.
+//
+// **The payoff, and it is the whole reason this program is writable at all: a heterogeneous row is
+// ordinary code.** `t.add(["totals", 7, 340282366920938463463374607431768211455u128, true])` is an
+// array literal of four unrelated types coercing to `[]const &Display`, each boxed and erased at
+// the element. Until every built-in reached `Display` through an `impl` (`14 §5`), an integer could
+// not be erased at all — so a table of numbers, which is what a table is usually for, could not be
+// spelled. This program was the thing that asked for that, and it is now the thing that shows it.
+//
+// A smaller positive beside it: a fixed array does **not** decay to a slice at a call, so a row
+// built as a binding is passed `row[..]` — but an array literal written *at* the argument coerces
+// directly, which is why the rows above read the way they do.
+
+import sysl.buf.{Buf, buf, byte_sink}
+
+// How a cell's text sits in the field its column gives it.
+enum Align
+    Left
+    Right
+    Center
+end Align
+
+// **How wide some UTF-8 text is, counted in characters rather than in bytes.**
+//
+// A continuation byte is `10xxxxxx`, and every other byte starts a character -- so the count is the
+// bytes that are not continuations, which needs no decoding and no table.
+//
+// This function is the program's answer to the finding in the header, and the reason it is here
+// rather than in the library: `FormatSpec`'s width is a **byte** count, so nothing the sink family
+// supplies can lay out a column of text that is not ASCII.
+columns(bytes: []const u8) -> usize
+    var n = 0usize
+
+    for b in bytes do if b & 192u8 != 128u8 then n += 1
+
+    n
+end columns
+
+// One rendered cell: what the value came to, and how wide that is on screen.
+//
+// Both are kept because both are wanted and the rendering is what produces them. A table cannot lay
+// out a column until it knows the widest cell in it, so it has to see every cell before it writes
+// the first -- and rendering each value a second time at that point would mean holding the values
+// instead, which is the same storage with a dispatch on the end of it.
+struct Cell
+    text: &Buf[u8]
+    width: usize
+end Cell
+
+// Render a value once, keeping the bytes and measuring them.
+//
+// The parameter is a `&Display` rather than a `T: Display`, and that is what lets a row hold a
+// `string` beside an `int`: a bound is a promise about **one** type and a row is a sequence of
+// different ones. Every built-in reaches the trait through an `impl`, so an integer erases here
+// exactly as a program's own struct does (`14 §5`).
+cell_of(v: &Display) -> Cell
+    var sink = byte_sink()
+    var out: *Writer = &sink
+
+    v.display(out, FormatSpec(0, -1, false))
+
+    Cell(sink.bytes, columns(sink.text()))
+end cell_of
+
+// A table of rendered cells, in row-major order.
+//
+// The cells are **one flat buffer** rather than a buffer of rows: a row is `ncols` consecutive
+// entries, so a column is a walk with a stride and neither shape needs a nested container. The first
+// row is the header.
+struct Table
+    ncols: usize
+    aligns: &Buf[Align]
+    cells: &Buf[Cell]
+
+    rows(self) -> usize = self.cells.len() / self.ncols
+
+    // Add a row. The cells are rendered here rather than at layout, so a value handed to a table
+    // needs to outlive the call and nothing longer.
+    add(*self, values: []const &Display)
+        require values.len == self.ncols, "a row has to have one cell per column"
+
+        for v in values do self.cells.push(cell_of(v))
+    end add
+
+    // The width of a column: its widest cell, the header included.
+    width(self, col: usize) -> usize
+        var w = 0usize
+        var i = col
+
+        while i < self.cells.len()
+            val c = self.cells.at(i)
+
+            if c.width > w then w = c.width
+
+            i += self.ncols
+
+        w
+    end width
+
+    // `+---+---+`, which is what makes a column that is laid out wrongly visible rather than merely
+    // wrong.
+    rule(self, out: *Writer)
+        var c = 0usize
+
+        while c < self.ncols
+            out.write("+".bytes)
+            fill(out, 45u8, self.width(c) + 2usize)
+            c += 1usize
+
+        out.write("+\n".bytes)
+    end rule
+
+    line(self, r: usize, out: *Writer)
+        var c = 0usize
+
+        while c < self.ncols
+            val cell = self.cells.at(r * self.ncols + c)
+            val slack = self.width(c) - cell.width
+            val left = self.aligns.at(c) match
+                Left   -> 0usize
+                Right  -> slack
+                Center -> slack / 2usize
+
+            out.write("| ".bytes)
+            fill(out, 32u8, left)
+            out.write(cell.text.view())
+            fill(out, 32u8, slack - left)
+            out.write(" ".bytes)
+
+            c += 1usize
+
+        out.write("|\n".bytes)
+    end line
+
+    render(self, out: *Writer)
+        var r = 0usize
+
+        self.rule(out)
+
+        while r < self.rows()
+            self.line(r, out)
+
+            // Under the header, and nowhere else: one rule between the names and the data is what
+            // says which row the names are.
+            if r == 0usize then self.rule(out)
+
+            r += 1usize
+
+        self.rule(out)
+    end render
+end Table
+
+table(aligns: []const Align) -> Table
+    var a: &Buf[Align] = buf()
+
+    a.extend(aligns)
+
+    Table(aligns.len, a, buf())
+end table
+
+// One byte, `n` times.
+fill(out: *Writer, b: u8, n: usize)
+    var i = 0usize
+
+    while i < n
+        out.write([b][..])
+        i += 1usize
+end fill
