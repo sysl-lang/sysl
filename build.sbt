@@ -87,10 +87,10 @@ lazy val sysl = crossProject(JSPlatform, JVMPlatform, NativePlatform)
       // Off-side-rule lexer base (see design/front-end.md).
       "io.github.edadma"         %%% "indentation"              % "0.0.5",
       // Cross-platform I/O boundary (see design/cross-platform.md).
-      "io.github.edadma"         %%% "path"                     % "0.0.7",
+      "io.github.edadma"         %%% "path"                     % "0.0.8",
       "io.github.edadma"         %%% "cross_platform"           % "0.1.9",
       // The project config's format (see design/packages.md §1).
-      "io.github.edadma"         %%% "hocon"                    % "0.1.1",
+      "io.github.edadma"         %%% "hocon"                    % "0.1.2",
 //      "com.lihaoyi" %%% "pprint" % "0.9.6" % "test",
     ),
     publishMavenStyle      := true,
