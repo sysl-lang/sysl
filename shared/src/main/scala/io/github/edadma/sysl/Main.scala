@@ -102,6 +102,13 @@ case class Config(
       */
     stdSearch: Option[String] = None,
     ar: Option[String] = None,
+    /** `--link-path` and `--include-path` — where on this machine to look for a library a `@link`
+      * named, and for a header a carried `.c` includes (`SearchPaths`). Lists rather than single
+      * values because a build that needs one prefix usually needs the two it came with, and the
+      * order given is the order searched.
+      */
+    linkPaths: List[String] = Nil,
+    includePaths: List[String] = Nil,
     programArgs: List[String] = Nil,
     filter: Option[String] = None,
     failFast: Boolean = false,
@@ -217,6 +224,16 @@ private[sysl] val parser = {
       opt[String]("ar")
         .action((a, c) => c.copy(ar = Some(a)))
         .text("the llvm-ar to build a library with; defaults to searching for one"),
+      opt[String]("link-path")
+        .unbounded()
+        .action((d, c) => c.copy(linkPaths = c.linkPaths :+ d))
+        .text("a directory to look in for a library a 'link' directive named — for one a package " +
+          "manager installed outside the toolchain's own prefix; may be given more than once"),
+      opt[String]("include-path")
+        .unbounded()
+        .action((d, c) => c.copy(includePaths = c.includePaths :+ d))
+        .text("a directory to look in for a header the C beside a module includes; the other half " +
+          "of --link-path, and needed by the same bindings; may be given more than once"),
       opt[String]('O', "optimize")
         .action((o, c) => c.copy(optimize = o))
         .text(s"the optimization level to hand clang, as it spells one after the '-O': " +
@@ -384,9 +401,16 @@ private[sysl] def execute(cfg: Config): Int = {
   // Compiled only where something is about to be linked. `emit-llvm` prints IR and `prove` stops at
   // the typed tree, and neither has a use for an object file — running clang for one would be work
   // whose result is thrown away.
+  // Where this machine keeps what the toolchain was not told the location of (`SearchPaths`). One
+  // value rather than two lists threaded separately, because the two halves are one setting: a
+  // binding to a library outside the default prefix needs its headers to compile and its archive to
+  // link, and a build given only one of them fails at whichever step comes first.
+  val paths = SearchPaths(cfg.linkPaths, cfg.includePaths)
+
   val native =
     if links(cfg.command) then
-      NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots), target, cfg.optimize) match
+      NativeSources.build(NativeSources.of(cfg.file :: roots ::: fetched.roots), target, cfg.optimize,
+        paths) match
         case Left(err)    => return fail(err)
         case Right(built) => built
     else NativeSources.none
@@ -398,7 +422,7 @@ private[sysl] def execute(cfg: Config): Int = {
   if cfg.command == "test" then
     val status =
       TestRunner.run(cfg, librarySources ::: sources, libraryTrees, target, precompiled, std, archives,
-        native.objects)
+        native.objects, paths)
 
     native.scratch.foreach(Project.discard)
     return status
@@ -428,14 +452,16 @@ private[sysl] def execute(cfg: Config): Int = {
     case "build" =>
       val exe = cfg.output.getOrElse(defaultOutputName(cfg.file))
 
-      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects) match
+      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
+        paths) match
         case Left(err) => fail(err)
         case Right(_)  => Console.err.println(s"wrote $exe"); 0
 
     case "run" =>
       val exe = createTempFile("sysl-", "")
 
-      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects) match
+      Toolchain.build(compiled.ir, exe, target, archives, cfg.optimize, compiled.links, native.objects,
+        paths) match
         case Left(err) => Project.discard(exe); fail(err)
         case Right(_) =>
           val result = exec(exe :: cfg.programArgs)
@@ -560,7 +586,8 @@ private def buildLibrary(cfg: Config, sources: List[Source], target: Target, std
           // Each C file becomes its own member, so the linker pulls in a shim the same way it pulls
           // in anything else: because something left its symbol undefined.
           _ <- objects.foldLeft[Either[String, Unit]](Right(()))((so_far, entry) =>
-                 so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize)))
+                 so_far.flatMap(_ => Toolchain.compileC(entry._1.name, entry._2, target, cfg.optimize,
+                   SearchPaths(cfg.linkPaths, cfg.includePaths))))
           _ <- Toolchain.archive(code :: metadata :: objects.map(_._2), out, ar)
         yield ()
 

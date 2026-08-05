@@ -14,6 +14,64 @@ import io.github.edadma.cross_platform.*
  * writes an archive with the member **missing**. A cross-built library would be silently empty.
  * `llvm-ar` indexes every format, so one archiver covers every target.
  */
+/** Where on **this machine** the toolchain should look for things it was not told the location of:
+ * libraries a `@link` directive named, and headers a carried `.c` includes.
+ *
+ * ==This is the host's question, and `15 §8` answered the target's==
+ *
+ * `15 §8` is emphatic that a directive names a library and never a flag, because *what a name becomes
+ * on a command line* is a property of the machine being built **for** — `-lm` is right on ELF and
+ * wrong on Darwin. That decision stands and nothing here touches it. What it never addressed is
+ * *where the library sits on the machine being built* **on**, which is a different question with a
+ * different owner: the target decides the name-to-flag mapping, the host decides the search path.
+ *
+ * So this belongs to the driver and must not become an attribute. A path written into a module's
+ * header would be one machine's directory layout hard-coded into portable source, which is the exact
+ * failure `15 §8` refuses `-l` spellings to avoid.
+ *
+ * ==Why it is a flag when clang already reads the environment==
+ *
+ * `LIBRARY_PATH` and `CPATH` work already and always did: sysl execs clang, clang inherits the
+ * environment, and a developer who exports them gets a build that links. Measured, not assumed —
+ * without them `ld: library 'probe' not found`, with them the program runs.
+ *
+ * That is not a reason to leave this out; it is the reason to put it in. **A build that works only
+ * because of one developer's shell is a build nobody else can reproduce**, and it fails for the next
+ * person with a diagnostic that names a library rather than the setting they are missing. The flag is
+ * where that fact gets written down, in the project or the command, alongside every other thing a
+ * build needs. The environment keeps working and is the right tool for *this machine, always*; the
+ * flag is the right one for *this build, wherever it runs*.
+ *
+ * ==Both halves, because half is unusable==
+ *
+ * A binding to a library outside the default path needs its headers to compile and its archive to
+ * link, and neither is reachable without a flag — verified both ways on this machine. Shipping only
+ * `link` would leave every such binding exactly as unbuildable as before, failing one step earlier.
+ *
+ * Nothing is guessed at. `/opt/homebrew/lib` is the obvious candidate to add by default and is not
+ * added, for `Toolchain.provided`'s reason: a compiler that ruled on where a platform keeps its
+ * libraries would be wrong about a machine nobody here has, and the cost of being wrong is a link
+ * that fails somewhere the author cannot reach.
+ */
+case class SearchPaths(link: List[String] = Nil, include: List[String] = Nil) {
+
+  /** What the linker is told, as clang spells it. Joined rather than passed as two arguments, which
+   * is how `-L` has been written since cc and what a reader comparing this line against a hand-run
+   * clang expects to see.
+   */
+  def linkFlags: List[String] = link.map(d => s"-L$d")
+
+  def includeFlags: List[String] = include.map(d => s"-I$d")
+}
+
+object SearchPaths {
+
+  /** Nothing but the toolchain's own defaults — every build that binds only what the platform ships,
+   * which is every one in this repository.
+   */
+  val none: SearchPaths = SearchPaths()
+}
+
 object Toolchain {
 
   /** Whether a `clang` capable of consuming textual LLVM IR is on the PATH. Tests that link
@@ -188,11 +246,12 @@ object Toolchain {
    */
   def build(ir: String, exe: String, target: Target = Target.default,
             archives: List[String] = Nil, level: String = defaultOptimization,
-            links: List[String] = Nil, objects: List[String] = Nil): Either[String, Unit] = {
+            links: List[String] = Nil, objects: List[String] = Nil,
+            paths: SearchPaths = SearchPaths.none): Either[String, Unit] = {
     val ll = createTempFile("sysl-", ".ll")
     writeFile(ll, ir)
 
-    val result = exec(linkCommand(ll, archives, exe, target, level, links, objects))
+    val result = exec(linkCommand(ll, archives, exe, target, level, links, objects, paths))
     deleteFile(ll)
 
     if result.exitCode == 0 then Right(())
@@ -212,12 +271,19 @@ object Toolchain {
    * same reason again: an object is linked whether or not anything needed it, so its own calls are
    * undefined symbols by the time the archives and the `-l`s are scanned. A shim placed after them
    * would have nothing left to resolve `sqlite3_open` against.
+   *
+   * The `-L`s go **before** everything they could affect (`SearchPaths`). A search path is not an
+   * input being scanned in turn — it is where the scan looks — so putting it first is what makes the
+   * line read the way a hand-run clang would be written, and leaves no question about whether a
+   * directory named late reaches a library named early.
    */
   private[sysl] def linkCommand(ll: String, archives: List[String], exe: String, target: Target,
                                 level: String = defaultOptimization,
-                                links: List[String] = Nil, objects: List[String] = Nil): List[String] =
+                                links: List[String] = Nil, objects: List[String] = Nil,
+                                paths: SearchPaths = SearchPaths.none): List[String] =
     List("clang", s"--target=${target.triple}", "-Wno-override-module", flag(level)) ::: deadStrip(target) :::
-      List(ll) ::: objects ::: archives ::: libraryFlags(links, target) ::: List("-o", exe)
+      paths.linkFlags ::: List(ll) ::: objects ::: archives ::: libraryFlags(links, target) :::
+      List("-o", exe)
 
   /** What a build's link directives (`15 §8`) become on **this** target's command line.
    *
@@ -328,11 +394,17 @@ object Toolchain {
    * `-Wno-override-module` is *not* passed. It exists for a `.ll` that states a target family the
    * driver then refines, and a `.c` has no module statement to override — passing it here would be
    * suppressing a warning that cannot arise.
+   *
+   * `paths.include` is where a header the shim `#include`s is looked for beyond the toolchain's own
+   * directories (`SearchPaths`). This is the half of that setting the *link* flag cannot stand in
+   * for: a binding to a library outside the default prefix fails here, at the `#include`, one step
+   * before anything gets as far as a `-l`.
    */
   def compileC(source: String, obj: String, target: Target = Target.default,
-               level: String = defaultOptimization): Either[String, Unit] = {
-    val result = exec(Seq("clang", s"--target=${target.triple}", flag(level),
-      "-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj))
+               level: String = defaultOptimization,
+               paths: SearchPaths = SearchPaths.none): Either[String, Unit] = {
+    val result = exec(Seq("clang", s"--target=${target.triple}", flag(level)) ++ paths.includeFlags ++
+      Seq("-ffunction-sections", "-fdata-sections", "-c", source, "-o", obj))
 
     if result.exitCode == 0 then Right(())
     else Left(s"$source did not compile (exit ${result.exitCode}):\n${result.stderr.trim}")

@@ -327,6 +327,40 @@ through rather than guessed about. Being wrong in that direction produces a link
 library; being wrong in the other produces a link error naming a *function*, on a platform the
 author does not have.
 
+### Where the library sits is the host's question, and belongs to the driver
+
+Everything above decides what a *name* becomes. It says nothing about **where that name is looked
+for**, and the two are different questions with different owners: the target decides the name-to-flag
+mapping, the machine being built **on** decides the search path. This section answered the first and
+left the second unasked, and while it was unasked `@link` could reach only libraries already on the
+toolchain's own path — every OS-shipped library and nothing else. `-lpng` failed with `library 'png'
+not found` on a machine where `/opt/homebrew/lib/libpng.dylib` was sitting the whole time.
+
+**`--link-path <dir>` and `--include-path <dir>` are the answer, and they are the driver's.** Both are
+repeatable and searched in the order given. They ship as a pair because half of the capability is
+none of it: a binding to a library outside the default prefix has to compile its shim against that
+library's header before there is anything to link, so `--link-path` alone gets a build one step
+further and no closer.
+
+**It must not be an attribute, for this section's own reason.** `@link("png")` is portable because it
+names a library rather than a flag; `@link_path("/opt/homebrew/lib")` would be one machine's
+directory layout compiled into source meant to build anywhere — the same mistake as writing `-lm`,
+one level up. For the same reason it is not a field in `package.hocon`: that file is committed and
+describes the *package*, and where a prefix lives on somebody's laptop is not a property of the
+package.
+
+**The environment already worked, and that is why the flags exist rather than why they don't.**
+`LIBRARY_PATH` and `CPATH` are read by clang, which sysl execs, so a developer who exports them has
+always had a build that links. But a build that works only because of one person's shell is one
+nobody else can reproduce, and it fails for the next person with a message naming a library rather
+than the setting they are missing. The environment stays the right tool for *this machine, always*;
+the flag is the right one for *this build, wherever it runs*.
+
+**Nothing is guessed at.** Adding `/opt/homebrew/lib` by default is the obvious convenience and is
+refused for the reason the table above refuses to guess a library's placement: a compiler that ruled
+on where a platform keeps its libraries would be wrong about a machine nobody here has, and the cost
+of being wrong is a link that fails somewhere the author cannot reach.
+
 **The requirement travels in the artifact.** The clauses are part of the tree a `.syslib` carries, so
 a program depending on a prebuilt library learns to pass `-lz` without reading that library's source.
 Leaving them out would mean a binding that works from source and stops working the moment it ships —

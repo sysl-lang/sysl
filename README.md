@@ -90,6 +90,20 @@ tree is a library, a package a `dependencies` block brought in, or the project i
 libc. A program built against it says nothing about linking, because `link "regex"` is written once
 in the binding and travels with it.
 
+**Binding a library your package manager installed takes two flags**, because a toolchain searches
+its own directories and nothing else — on a Mac that means `/opt/homebrew` is invisible to it:
+
+```bash
+sysl run prog.sysl --include-path /opt/homebrew/include --link-path /opt/homebrew/lib
+```
+
+`--include-path` is where a header the shim `#include`s is looked for and `--link-path` is where a
+library a `link` directive named is; both are repeatable and searched in order. A binding needs both,
+since it has to compile against the headers before there is anything to link. Neither is guessed at
+for you, and neither belongs in a source file — where a prefix lives is a fact about your machine,
+not about the code (`design/15 §8`). `LIBRARY_PATH` and `CPATH` work too, since clang reads them, and
+are the better answer for a machine where the setting is always the same.
+
 **The SQLite binding used to live here and now has a repository of its own** —
 [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package outside this tree
 (`design/packages.md`). It moved because a binding to a library nobody is obliged to have
