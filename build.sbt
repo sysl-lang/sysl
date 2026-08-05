@@ -35,7 +35,38 @@ ThisBuild / developers := List(
 ThisBuild / homepage := Some(url("https://github.com/sysl-lang/sysl"))
 ThisBuild / description := "A modern, ref-counted, OS-level systems language — easier than Rust."
 
-ThisBuild / publishTo := sonatypePublishToBundle.value
+// Where a publish goes, and there are two answers because Central is slow.
+//
+// Central is the real one: it is what anybody depending on sysl resolves from, and a release is not
+// a release until it is there. But it can take hours to propagate, and `~/dev/sysl.sh` — which
+// compiles every fenced block on every page against a *released* compiler — cannot write a line of
+// documentation for a release until it can resolve one. GitHub Packages answers in minutes, so the
+// same artifacts go there too and the site can be written while Central catches up.
+//
+// Gated on an environment variable rather than a separate task, matching `SYSL_RELEASE`: one
+// `publishTo`, switched, so there is no second configuration to drift.
+//
+//     sbt publishSigned                      # Central, the release
+//     SYSL_PUBLISH_GITHUB=1 sbt publish      # GitHub Packages, the head start
+//
+// **This does not shorten the release and must never be allowed to stand in for it.** A GitHub
+// Packages copy makes a downstream build succeed whether or not the Central upload worked, which is
+// the same masking that rules out `publishLocal` — so the Central check against `maven-metadata.xml`
+// stays exactly as mandatory as it was.
+ThisBuild / publishTo := {
+  if (sys.env.contains("SYSL_PUBLISH_GITHUB"))
+    Some("GitHub Packages" at "https://maven.pkg.github.com/sysl-lang/sysl")
+  else
+    sonatypePublishToBundle.value
+}
+
+// GitHub Packages authenticates every request, including reads of a public package, so both halves
+// of this need a token. Kept out of the build for the obvious reason.
+ThisBuild / credentials ++= {
+  val f = Path.userHome / ".sbt" / "github-credentials"
+
+  if (f.exists) Seq(Credentials(f)) else Nil
+}
 
 // The version, carried into the compiler so that `sysl --version` can answer with it.
 //
