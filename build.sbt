@@ -62,10 +62,30 @@ ThisBuild / publishTo := {
 
 // GitHub Packages authenticates every request, including reads of a public package, so both halves
 // of this need a token. Kept out of the build for the obvious reason.
-ThisBuild / credentials ++= {
+//
+// Two places to find one, because the two machines that run this keep it differently. A workstation
+// has a file; **CI has `GITHUB_TOKEN` and cannot have a file**, which is the case that matters —
+// the whole point of publishing here is the window where Central has not propagated, and that is
+// exactly when a build with no credentials would fail to resolve.
+ThisBuild / credentials ++= githubCredentials
+
+// The file wins where it exists, so a workstation that has set one up behaves as it did before this
+// was added, and `GITHUB_TOKEN` cannot quietly take over from a token somebody chose on purpose.
+lazy val githubCredentials: Seq[Credentials] = {
   val f = Path.userHome / ".sbt" / "github-credentials"
 
-  if (f.exists) Seq(Credentials(f)) else Nil
+  if (f.exists)
+    Seq(Credentials(f))
+  else
+    sys.env.get("GITHUB_TOKEN").toSeq.map { token =>
+      // Any username authenticates against a valid token; CI's own actor is the honest one to send.
+      Credentials(
+        "GitHub Package Registry",
+        "maven.pkg.github.com",
+        sys.env.getOrElse("GITHUB_ACTOR", "edadma"),
+        token,
+      )
+    }
 }
 
 // The version, carried into the compiler so that `sysl --version` can answer with it.
