@@ -270,6 +270,31 @@ rendered by `snprintf` or by a `Display`; the one refinement is that truncation 
 character boundary rather than handing a sink half a codepoint. A sink is a byte sink, and there is
 no recovering from an invalid sequence once it has been written.
 
+**Open: the unit is bytes, and that makes the width unusable for laying anything out.**
+`guide/table` is the customer, and it is the first program in the set to measure text for *display*
+rather than to copy or compare it. `café` is five bytes and four columns, so a field padded to a
+byte count is short by one — and short by **one per non-ASCII character**, so two cells of one
+column are wrong by different amounts and the column comes out ragged rather than merely narrow.
+There is no correction to apply afterwards, because the error is not a constant.
+
+So the program hands every cell the neutral specifier, ignores the width entirely, and does its own
+padding over a character count it works out itself. The division of labour is right — only the
+caller knows where the next border falls — but the one field of `FormatSpec` a table would have
+used is precisely the one it cannot, and a program that trusted it would produce output that is
+wrong *only* for text that is not ASCII, which is the worst way to be wrong.
+
+The argument for bytes is the equivalence stated above: a `string` occupies the same field whichever
+renderer produced it. That is worth something, and it is worth less than it looks, because the thing
+it agrees with is C's `%-10s` — which is itself wrong for UTF-8 and is worked around in every
+program that formats text for a terminal.
+
+Three ways out, none taken: count **characters** and give up the equivalence with `snprintf`; keep
+bytes and add a second pair of fields; or leave it and say plainly that the specifier is for
+`printf`-shaped output and not for layout, which is what the guide program does in practice. **A
+fourth is what a table actually needs and none of the three supplies** — the East Asian Width
+property from UAX #11, since `日本` is two characters and four columns, and that is a *table* rather
+than a rule, so it waits on module-level constant data (`13 §7`) whichever unit is chosen.
+
 ### The `Writer` surface, as built (`§8 d`)
 
 | Trait | Methods |

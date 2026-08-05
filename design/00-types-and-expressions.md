@@ -534,7 +534,21 @@ match-anything pattern. The right answer changed neither: **`.*` is one token.**
 only ever followed by a name, so nothing else can produce that pair, and a line then never ends in a
 bare `*` that was really the end of a statement.
 | `.` | would work, but the chaining style worth having puts the dot at the *start* of the next line, which is the opposite mechanism and is not decided here |
-| `,`, `:`, `;` | separators; the one with a real customer (`,`) already continues, since an argument list is bracketed |
+| `,`, `:`, `;` | separators; the one with a real customer (`,`) continues wherever it is bracketed, which is almost everywhere — see below for the one place it is not |
+
+**The comma's exemption is "because it is bracketed", and there is one construct where it is not.**
+`require cond, "message"` and its siblings (`assert`, `ensures`) take two operands with no brackets
+round them, so a comma ending that line ends the statement — and a `require` whose message is long
+is exactly where the break would be wanted. `guide/table` is the customer, having written one and
+had to put it back on a single line; every other multi-line call in that directory continues inside
+brackets and is fine.
+
+Left as it is, and the reason is the rule rather than the effort. Continuation is "an operator that
+cannot finish an expression", and a comma **can** finish one — the statement is complete after
+`require cond` alone, since the message is optional. So continuing there would need the rule to
+consult which construct it is inside, which is what the whole design avoids. What would fix it
+without touching the rule is bracketing the operands, and that is a change to how a contract is
+spelled rather than to how a line ends.
 
 A bracketed list may also **end in a comma**. That is what makes the multi-line layout worth using:
 with one element to a line the last line stops being different from the others, so an element can be

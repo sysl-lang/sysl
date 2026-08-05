@@ -55,6 +55,7 @@ contract.
 | `ring` | the constrained-subtype surface — range types, their `::` attributes, contracts, struct invariants, and a loop's termination measure |
 | `slab` | raw storage — reinterpreting bytes as a typed pointer, `sizeof`/`alignof`, and a free list threaded through the free blocks themselves |
 | `lisp` | the reference cycle — the one shape a count cannot reclaim, `weak T` as both the cure and the instrument that measures it |
+| `table` | text measured for **display** — a column is as many characters wide as its widest cell, and a byte count is the wrong unit |
 
 The rest of the set, and the coverage map that justifies each entry, is recorded outside the repo
 with the rest of the project's decisions. A candidate that does not own an axis already unclaimed is

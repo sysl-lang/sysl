@@ -376,4 +376,27 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   "lisp — what the interpreter refuses, which its own run cannot assert" in {
     guideTests("lisp") should have length 17
   }
+
+  // The one program in the set that measures text for **display** rather than copying or comparing
+  // it. Its last two sections are the finding: a column is characters wide and a `FormatSpec` is
+  // bytes wide, and the difference is not a constant that could be corrected for afterwards.
+  "table — text measured for display, where a byte count is the wrong unit" in {
+    val out = guide("table")
+
+    out should not include "FAIL"
+    checks(out) shouldBe 39
+    sections(out) shouldBe List(
+      "-- a column is as wide as its widest cell",
+      "-- a row holds types that differ",
+      "-- alignment puts the slack where it was asked",
+      "-- a column is measured in characters, not bytes",
+      "-- what a byte count would have done",
+    )
+  }
+
+  // A row is refused for having the wrong number of cells, which traps — so the pair of it and the
+  // row that is taken lives here, where a trap is an observation rather than the end of the run.
+  "table — a row that does not fit its columns" in {
+    guideTests("table") should have length 5
+  }
 }
