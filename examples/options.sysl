@@ -1,0 +1,63 @@
+// Reading options off a command line with `sysl.args`'s scanner, which is the lower of its two
+// layers and the one a small program wants.
+//
+//     ./run-example.sh examples/options.sysl -- -v -o out.txt one two
+//     ./run-example.sh examples/options.sysl -- -vo out.txt -- -not-an-option
+//
+// The scanner knows the *shape* of a command line and nothing about which options this program has:
+// that `--name=value` carries its value, that `-abc` is three options in one word, that `--` ends
+// the options and everything after it is an operand. Deciding what each one means is the `match`
+// below, and that is the reason to write it this way rather than with a table — an option nobody
+// handled is a missing arm, which the compiler refuses, where a table would answer at run time that
+// the option simply was not given.
+//
+// `wc.sysl` is the other layer: a table, and a `--help` generated from it. The two are for different
+// shapes rather than for different levels of skill. Reach for the table when the options are many
+// enough that their help text is the point; reach for this when there are three of them.
+//
+// A value is asked for rather than reported, because whether the next word belongs to the option or
+// stands on its own is not something the shape can tell — `-o x` is an option and its value, `-v x`
+// is an option and an operand. So `value()` is a call the program makes on the options that take
+// one, and all four spellings a user might write reach it: `-ox`, `-o x`, `--output=x`, `--output x`.
+
+import sysl.args.*
+import sysl.buf.{Buf, buf}
+
+main(args: []string)
+    var verbose = false
+    var output  = "-"
+    var files: Buf[string] = buf()
+
+    var a = scan(args)
+
+    loop
+        a.next() match
+            Ok(Some(Short('v'))) | Ok(Some(Long("verbose"))) -> verbose = true
+
+            Ok(Some(Short('o'))) | Ok(Some(Long("output"))) ->
+                a.value() match
+                    Ok(v) -> output = v
+                    Err(e) ->
+                        eprints(f"options: ${e.message()}%s\n")
+                        exit(2)
+
+            Ok(Some(Positional(p))) -> files.push(p)
+
+            Ok(None) -> break
+
+            // Everything the arms above did not name. `a.option` is the option as the user wrote it,
+            // so the complaint says `-z` or `--nope` rather than the parser's idea of a name.
+            Ok(Some(_)) ->
+                eprints(f"options: unknown option ${a.option}%s\n")
+                exit(2)
+
+            Err(e) ->
+                eprints(f"options: ${e.message()}%s\n")
+                exit(2)
+
+    print("verbose:", verbose)
+    print("output :", output)
+    print("files  :", files.len())
+
+    for f in files.view()
+        print("  ", f)

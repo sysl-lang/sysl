@@ -459,4 +459,5 @@ having a borrow checker.
 
 ---
 
-Next: [`sysl.args`](/library/args/) — how `argc` and `argv` become a `[]string`.
+Next: [`sysl.args`](/library/args/) — how `argc` and `argv` become a `[]string`, and the two layers
+that read options out of them.

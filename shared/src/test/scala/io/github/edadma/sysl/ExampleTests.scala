@@ -90,28 +90,84 @@ class ExampleTests extends AnyFreeSpec with Matchers {
     example("args.sysl") should endWith("0 argument(s) given\n")
   }
 
+  /** The scanner, driven by hand. Every kind of piece a command line can hold is on this one line —
+   * a bundle whose last option takes the rest of its word, a long option, an operand, and a `--`
+   * after which something that looks like an option is not one.
+   */
+  "options — reading a command line with the scanner" in {
+    example("options.sysl", "-vo", "out.txt", "one", "--", "-two") shouldBe
+      """verbose: true
+        |output : out.txt
+        |files  : 2
+        |   one
+        |   -two
+        |""".stripMargin
+  }
+
+  "options — and with nothing given, the program's own defaults stand" in {
+    example("options.sysl") shouldBe
+      """verbose: false
+        |output : -
+        |files  : 0
+        |""".stripMargin
+  }
+
   /** `wc` has to be given something to count, and a temporary file is the only input an assertion can
    * be sure of — counting a file of the repository would pin this test to whatever that file happens
    * to say today, which is the kind of expectation that gets deleted rather than fixed.
    *
-   * Only the counting is asserted. Both of the ways this example stops early exit non-zero, and
-   * `example` fails on that before there is any output to read, so what it says about a file it
-   * cannot open belongs to `FsTests` — where the same failure is reached through the library rather
-   * than through a program.
+   * Only the counting is asserted. Every way this example stops early exits non-zero, and `example`
+   * fails on that before there is any output to read, so what it says about a file it cannot open
+   * belongs to `FsTests` — where the same failure is reached through the library rather than through
+   * a program — and what it says about a bad option belongs to `ArgsCliTests`.
    */
   "wc — counting the lines, words and bytes of a file" in {
     val path = createTempFile("sysl-wc-", ".txt")
 
     writeFile(path, "one two three\nfour five\n\nsix\n")
 
-    try example("wc.sysl", path) shouldBe f"${4}%8d ${6}%8d ${29}%8d $path%s\n"
+    try example("wc.sysl", path) shouldBe f"${4}%8d${6}%8d${29}%8d $path%s\n"
     finally deleteFile(path)
+  }
+
+  // A flag narrows what is printed to the one count it names, which is the whole point of the table
+  // this example grew. Each of the three is asked for separately, so a flag reaching the wrong
+  // counter shows up as the wrong number rather than as a missing column.
+  "wc — a flag prints only the count it names" in {
+    val path = createTempFile("sysl-wc-", ".txt")
+
+    writeFile(path, "one two three\nfour five\n\nsix\n")
+
+    try {
+      example("wc.sysl", "-l", path) shouldBe f"${4}%8d $path%s\n"
+      example("wc.sysl", "-w", path) shouldBe f"${6}%8d $path%s\n"
+      example("wc.sysl", "-c", path) shouldBe f"${29}%8d $path%s\n"
+      example("wc.sysl", "-lw", path) shouldBe f"${4}%8d${6}%8d $path%s\n"
+      example("wc.sysl", "--words", "--lines", path) shouldBe f"${4}%8d${6}%8d $path%s\n"
+    } finally deleteFile(path)
+  }
+
+  // The help text is generated from the same table the flags above are read against, so this is the
+  // assertion that catches the two drifting apart.
+  "wc — and its help text is the table it reads" in {
+    example("wc.sysl", "--help") shouldBe
+      """usage: wc [options] <file>
+        |
+        |Count lines, words and bytes in a file.
+        |
+        |options:
+        |  -l, --lines    print the line count
+        |  -w, --words    print the word count
+        |  -c, --bytes    print the byte count
+        |  -h, --help     show this help and exit
+        |  -V, --version  show the version and exit
+        |""".stripMargin
   }
 
   "every example in the tree has an expectation above" in {
     assume(isDirectory(dir), s"$dir is not reachable from the working directory")
 
     listFiles(dir).filter(_.endsWith(".sysl")).map(Project.basename).toList.sorted shouldBe
-      List("args.sysl", "hello.sysl", "wc.sysl")
+      List("args.sysl", "hello.sysl", "options.sysl", "wc.sysl")
   }
 }

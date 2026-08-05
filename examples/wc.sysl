@@ -1,4 +1,4 @@
-// Counting what is in a file, which is `wc` with the flags left out.
+// Counting what is in a file, which is `wc`.
 //
 // It is the shortest program that needs both halves of `sysl.fs`. The *handle* half, because
 // counting lines means reading them one at a time rather than holding the file in memory — and the
@@ -7,24 +7,55 @@
 // that is not there should say which file and why, rather than counting zero of everything.
 //
 //     ./run-example.sh examples/wc.sysl -- README.md
+//     ./run-example.sh examples/wc.sysl -- -l README.md
+//     ./run-example.sh examples/wc.sysl -- --help
+//
+// The flags are `sysl.args`'s described layer: three options in a table, and the `--help` text is
+// generated from that same table rather than written out beside it, so the two cannot come to
+// disagree. What the program itself decides is the one rule a table cannot express — that naming
+// none of the three counts means all three, which is what `wc` has always done.
 //
 // The close is deferred rather than written at the end. sysl has no destructor, so nothing releases
 // a handle that the scope did not say to release — and a `defer` says it once, for the failing paths
 // as well as the one that reaches the bottom.
 
+import sysl.args.*
 import sysl.fs.open
 import sysl.io.lines
 
 main(args: []string)
-    if args.len < 2usize
-        print("usage: wc <file>")
-        exit(1)
+    var want_lines = flag('l', "lines", "print the line count")
+    var want_words = flag('w', "words", "print the word count")
+    var want_bytes = flag('c', "bytes", "print the byte count")
 
-    var path  = args[1]
+    var spec = cli("wc", [want_lines, want_words, want_bytes],
+                   about = "Count lines, words and bytes in a file.",
+                   version = "0.1.0",
+                   operands = "<file>")
+
+    var opts = parse_or_exit(spec, args)
+
+    // How many operands there are is the program's to check: the table describes options, and
+    // `operands` above is the text the usage line shows rather than a rule anything enforces.
+    if opts.positionals.len != 1usize
+        eprints("wc: exactly one file is wanted\n")
+        eprints(usage_line(spec) + "\n")
+        exit(2)
+
+    var show_lines = opts.given(want_lines)
+    var show_words = opts.given(want_words)
+    var show_bytes = opts.given(want_bytes)
+
+    if !show_lines && !show_words && !show_bytes
+        show_lines = true
+        show_words = true
+        show_bytes = true
+
+    var path  = opts.positionals[0usize]
     var asked = open(path)
 
     if asked.is_err()
-        print(f"wc: $path%s: ${asked.unwrap_err()}%s")
+        eprints(f"wc: $path%s: ${asked.unwrap_err()}%s\n")
         exit(1)
 
     var f = asked.unwrap()
@@ -50,7 +81,13 @@ main(args: []string)
                 words += 1
 
     if f.failed()
-        print(f"wc: $path%s: reading stopped early")
+        eprints(f"wc: $path%s: reading stopped early\n")
         exit(1)
 
-    print(f"$lines_seen%8d $words%8d $bytes%8d $path%s")
+    var out = ""
+
+    if show_lines then out += f"$lines_seen%8d"
+    if show_words then out += f"$words%8d"
+    if show_bytes then out += f"$bytes%8d"
+
+    print(f"$out%s $path%s")

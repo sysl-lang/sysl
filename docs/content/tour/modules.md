@@ -277,7 +277,7 @@ import anything to call `print`. Everything else is a submodule you ask for by n
 | `sysl.regex` | POSIX Extended Regular Expressions — `regex`, `Regex`, `Match` |
 | `sysl.sync` | `Atomic[T]`, `SpinLock`, and the five memory orderings — requires nothing |
 | `sysl.thread` | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` |
-| `sysl.args` | `args_of`, for reading a raw `argv` |
+| `sysl.args` | command-line options — `Scan`, `Cli`, and `args_of` for a raw `argv` |
 | `sysl.sys` | the platform seam — what a freestanding target replaces |
 
 The split is one rule: **what a program cannot avoid needing arrives free, and what it has to ask for

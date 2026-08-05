@@ -32,6 +32,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | absence and failure | `Option`, `Result`, `Fallible` | [errors and contracts](/reference/errors/) |
 | stopping | `panic`, `assert`, `exit` | below, and [attributes](/reference/attributes/) for `@test` |
 | rendering to standard output | `print`-family: `prints`, `printi`, `printu`, `printr`, `printb`, `printc`, `putbytes`; the sink itself, `Stdout` and `stdout` | below |
+| rendering to standard error | `eprints`, `eputbytes`; the sink itself, `Stderr` and `stderr` | below |
 | rendering to a sink | `Display`, `FormatSpec`, `Writer`, the `display_*` family | below |
 | hashing | `Hash`, `hash_u64`, `hash_u128`, `hash_bool`, `hash_str` | below |
 | operators | `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Neg`, `Not`, `Eq`, `Ord` | [expressions](/reference/expressions/) |
@@ -183,6 +184,32 @@ end putbytes
 **`putbytes` is one of exactly two functions a freestanding target has to replace.** Swap its body
 for a `write` syscall and [`FdReader.read`](/library/io/)'s for a `read` one, and the entire surface
 above both is unchanged — every renderer, every `Display`, every `f"…"` in the program.
+
+### The other stream
+
+A program's *answer* and its *complaints* go to different places, so that a run whose output is being
+captured does not have the complaint land in the middle of the answer, and a redirect that keeps the
+answer still lets a person see what went wrong. `eprints` writes a string to standard error, and
+`stderr()` is the same destination as a `Writer`, for a value rendering itself through its own
+`Display`:
+
+```sysl
+prints("the answer\n")
+eprints("something to say about it\n")
+```
+
+```output
+the answer
+```
+
+The page shows only the first line because only the first line went to standard output — which is the
+whole point of the distinction, and is what [`sysl.args`](/library/args/) relies on when it puts a
+usage error on one stream and its `--help` on the other.
+
+This half goes through `write` directly rather than a byte at a time, because there is no buffer
+between it and the descriptor: a diagnostic written just before a program stops has to have left
+before it does, which is the same reason C leaves standard error unbuffered. A short write is looped
+over, since a signal may cut one anywhere.
 
 ## Rendering to a sink
 
