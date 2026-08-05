@@ -1,0 +1,234 @@
+module sysl.args
+
+import sysl.buf.{Buf, buf}
+import sysl.text.*
+
+// Reading a command line one piece at a time, with the program deciding what each option means.
+//
+// This is the lower of the module's two layers. It knows the *shape* of a command line -- that
+// `--name=value` carries its value with it, that `-abc` is three options and not one, that `--` ends
+// the options and everything after it is an operand -- and it knows nothing whatever about which
+// options a program has. Deciding that is the caller's, and `cli.sysl` above is one way of doing it.
+//
+// **The split is what makes both halves small.** A parser that knew the option set would have to be
+// told it, which means a table, which means a way to describe every kind of option before any of
+// them can be read. Separating the two means the shape is settled once and the table is optional: a
+// program with four flags writes a `match` and never builds one.
+//
+// **The `match` is the reason to prefer this to a query API.** An option the program forgot to
+// handle is a missing arm, and `09 §8` makes that a diagnostic -- where a `parsed.value("output")`
+// spelling would hand back a `None` at runtime and look like an absent flag. `09 §6` allows the arm
+// that reads best here, since alternatives may not bind and neither of these binds:
+//
+//     Short('o') | Long("output") -> out = a.value()?
+//
+// **A value is asked for rather than reported**, because whether the next word belongs to the option
+// or stands on its own is not something the shape can tell: `-o x` is two words and one option with
+// a value, and `-v x` is an option and an operand. Only the program knows which, so `value` is a
+// call it makes on the options that take one, and the four spellings a user might write -- `-ox`,
+// `-o x`, `--out=x`, `--out x` -- are one call and need no thought at the call site.
+//
+// **What `value` will take is the next word, whatever it looks like.** `-o --verbose` sets the
+// output to the text `--verbose`, which is what getopt has always done and what every program that
+// has ever had to write out a file called `-` depends on. A user who means an operand writes
+// `--out=--verbose` or moves the word.
+//
+// **There is deliberately no `Iterate`, so `for arg in a` does not compile.** A `for` walks a *copy*
+// of its cursor (`sysl.iter`), so the `value` call inside the loop would advance a cursor the loop
+// is not reading and every option's value would arrive at the wrong place -- or not at all. The loop
+// is written by hand with `next`, which is three lines longer and cannot go wrong that way.
+
+// What one step of a command line turned out to be.
+//
+// A short option's name is a `char` rather than a byte because that is what a user typed; `-é` is a
+// legal thing to want and costs nothing to allow. `Positional` covers a bare `-`, which by long
+// convention names standard input and is an operand rather than an option with an empty name.
+enum Arg
+    Short(name: char)
+    Long(name: string)
+    Positional(value: string)
+end Arg
+
+// Why a command line could not be read.
+//
+// The first two are the scanner's own and are about *shape*: a value that was asked for and is not
+// there, and one that is there and was never asked for. The last two belong to the layer above,
+// which is the only one that knows what the options are -- they live here so that a program handling
+// failure has one type to match on rather than one per layer.
+enum ArgError
+    MissingValue(option: string)
+    UnexpectedValue(option: string)
+    UnknownOption(option: string)
+    BadValue(option: string, value: string, want: string)
+
+    // A sentence, in the terms the user wrote rather than in the parser's.
+    //
+    // Each names the option **as it was written** -- `-o` when that is what was typed and `--output`
+    // when that was -- because a message naming the other spelling reads as being about a different
+    // option than the one the user is looking at.
+    message(self) -> string = self match
+        MissingValue(o)    -> f"$o%s requires a value"
+        UnexpectedValue(o) -> f"$o%s takes no value"
+        UnknownOption(o)   -> f"unknown option $o%s"
+        BadValue(o, v, w)  -> f"$o%s: '$v%s' is not $w%s"
+end ArgError
+
+// So that `print(e)` and `f"$e%s"` say the sentence rather than the shape of the value.
+impl Display for ArgError
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+end ArgError
+
+// A cursor over a program's arguments.
+//
+// It is a value like every other struct, so a copy of one is a second cursor over the same words --
+// which is occasionally what a program wants (looking ahead without committing) and is the reason
+// the fields below are what they are rather than a pointer into something shared.
+struct Scan
+    // The words, and the index of the next one not yet read.
+    argv: []string
+    at: usize
+
+    // The unread tail of a short bundle. `-abc` reports `a` and leaves `bc` here; a `value` call at
+    // that point takes `bc` entire, which is what `-ofile` means.
+    bundle: string
+
+    // The text after the `=` of a long option, held until the program either asks for it or reports
+    // the next argument -- at which point it was a value nobody wanted and becomes an error.
+    attached: Option[string]
+
+    // The option most recently reported, spelled as the user wrote it, so that an error message can
+    // name it that way.
+    last: string
+
+    // Whether a `--` has gone past, after which every word is an operand however it starts.
+    rest_are_positional: bool
+
+    // The option most recently reported, as it was written -- `-o` or `--output`. Empty before the
+    // first one. A program building an error of its own wants this: the layer above uses it for
+    // every message it writes, and a hand-written `match` wants the same spelling for its `else`.
+    option -> string = self.last
+
+    // The next option or operand, or `None` at the end of the line.
+    //
+    // **The `Result` is here for one case**, and it is the case a scanner without one gets wrong: a
+    // user who writes `--verbose=yes` at a program whose `--verbose` is a flag. The value is read as
+    // part of the word, so it cannot be reported as an operand and it cannot be left where it is;
+    // silently dropping it would turn a mistake about a flag's meaning into a run that looked
+    // successful. It is caught here rather than at `value` because it is *not* asking for a value
+    // that reveals it -- what reveals it is the program going on to the next argument instead.
+    next(*self) -> Result[Option[Arg], ArgError]
+        if self.attached.is_some()
+            var unwanted = self.last
+
+            self.attached = None
+            return Err(UnexpectedValue(unwanted))
+
+        if self.bundle.len > 0usize then return Ok(Some(self.take_short()))
+
+        loop
+            if self.at >= self.argv.len then return Ok(None)
+
+            var w = self.argv[self.at]
+
+            self.at += 1usize
+
+            if self.rest_are_positional then return Ok(Some(Positional(w)))
+
+            if w == "--"
+                self.rest_are_positional = true
+                continue
+
+            if w.starts_with("--")
+                var body = w[2usize..]
+
+                body.index_of("=") match
+                    Some(i) ->
+                        var name = body[0usize..<i]
+
+                        self.attached = Some(body[i + 1usize..])
+                        self.last = "--" + name
+                        return Ok(Some(Long(name)))
+                    None ->
+                        self.last = w
+                        return Ok(Some(Long(body)))
+
+            // A lone `-` falls past this, which is the convention that makes it standard input.
+            if w.len > 1usize && w.starts_with("-")
+                self.bundle = w[1usize..]
+                return Ok(Some(self.take_short()))
+
+            return Ok(Some(Positional(w)))
+    end next
+
+    // The value belonging to the option just reported, from wherever the user put it.
+    //
+    // Three places, in the order a command line can carry one: attached to a long option after its
+    // `=`, attached to a short one as the rest of its bundle, or standing as the next word. The
+    // fourth possibility is that there is nothing left, which is the error.
+    value(*self) -> Result[string, ArgError]
+        if self.attached.is_some()
+            var v = self.attached.unwrap()
+
+            self.attached = None
+            return Ok(v)
+
+        if self.bundle.len > 0usize
+            var v = self.bundle
+
+            self.bundle = ""
+            return Ok(v)
+
+        if self.at < self.argv.len
+            var v = self.argv[self.at]
+
+            self.at += 1usize
+            return Ok(v)
+
+        Err(MissingValue(self.last))
+    end value
+
+    // Every word that is left, read as operands whatever they look like.
+    //
+    // This is what a program calls once its options are done and it wants the files: it is `--`
+    // applied from here on, so a name that begins with a dash still arrives as itself. A program
+    // that would rather keep reading options to the end of the line simply does not call it.
+    rest(*self) -> []string
+        var out: Buf[string] = buf()
+
+        loop
+            self.next() match
+                Ok(Some(Positional(v))) -> out.push(v)
+                Ok(Some(Short(c)))      -> out.push("-" + string(c))
+                Ok(Some(Long(n)))       -> out.push("--" + n)
+                Ok(None)                -> break
+                Err(_)                  -> break
+
+        out.view()
+    end rest
+
+    // One character off the front of a short bundle. Only called with a non-empty one, which is why
+    // the `unwrap` cannot fire: `Chars` yields a character for every byte run a `string` can hold.
+    private take_short(*self) -> Arg
+        var cur = self.bundle.chars
+        var c = cur.next().unwrap()
+
+        self.bundle = self.bundle[cur.offset..]
+        self.last = "-" + string(c)
+        Short(c)
+    end take_short
+end Scan
+
+// A cursor over the words a program was started with, with the zeroth left out.
+//
+// **It skips `args[0]` itself**, because that word is the program's own path and is never an
+// argument -- and forgetting to skip it is the mistake this would otherwise invite, reported as a
+// mysterious operand that is always there. A program wanting to read a vector that is not its own,
+// or wanting the zeroth as well, uses `scan_all`.
+scan(args: []string) -> Scan =
+    scan_all(if args.len > 0usize then args[1usize..] else args)
+
+// The same over every word given, reading nothing as a program name.
+//
+// This is what a program driving a sub-command's arguments wants, or a test, or anything handed a
+// vector that did not come from the platform.
+scan_all(args: []string) -> Scan = Scan(args, 0usize, "", None, "", false)

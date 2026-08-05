@@ -1,6 +1,6 @@
 module sysl
 
-import sysl.sys.{sysl_putchar, sysl_snprintf}
+import sysl.sys.{sysl_putchar, sysl_snprintf, sysl_write}
 
 // The printing surface, which lives in the library rather than in the compiler. `print(a, b, c)` is
 // a desugaring onto these one-value functions, chosen by each argument's static type, so the
@@ -44,6 +44,50 @@ val sink: *Stdout = ptr_cast(0usize)
 stdout() -> *Writer = sink
 
 prints(s: string) = putbytes(s.bytes)
+
+// The other stream, which is where a program's diagnostics belong.
+//
+// **The distinction is not decoration.** A program whose output is being read by another program --
+// piped, redirected, captured in a variable -- writes its answer to one stream and its complaints to
+// the other, so that a complaint never lands in the middle of the answer and a redirect that keeps
+// the answer still lets a person see what went wrong. `sysl.args` puts a usage error here and its
+// `--help` text on standard output for exactly that reason: the help *was* what was asked for.
+//
+// It goes through `write` rather than through `putchar`'s neighbour `fputc`, and directly rather
+// than a byte at a time, because there is no buffer between this and the descriptor: a diagnostic
+// written just before the program stops has to have left, and C's standard error is unbuffered for
+// the same reason. That also makes it the one printing path whose output cannot be lost to a trap,
+// which is worth knowing when a program is being debugged.
+//
+// A short write is looped over rather than ignored, since a signal may cut one anywhere; a write
+// that reports failure ends the loop, because there is nowhere left to report *that* to.
+eputbytes(b: []const u8)
+    var at = 0usize
+
+    while at < b.len
+        var k = sysl_write(2, &b[at], b.len - at)
+
+        if k <= 0isize then return
+
+        at += usize(k)
+end eputbytes
+
+eprints(s: string) = eputbytes(s.bytes)
+
+// Standard error as a `Writer`, so a value renders itself onto the diagnostic stream through the
+// same `Display` it uses for standard output. It carries no state for the reason `Stdout` does not.
+struct Stderr
+end Stderr
+
+impl Fallible for Stderr
+
+impl Writer for Stderr
+    write(*self, bytes: []const u8) = eputbytes(bytes)
+end Stderr
+
+val esink: *Stderr = ptr_cast(0usize)
+
+stderr() -> *Writer = esink
 
 // The integer and float renderings lean on `snprintf`, which is formatting rather than I/O. Doing
 // them in sysl is a small job for the integers and a large one for the floats (correct shortest
