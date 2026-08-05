@@ -240,7 +240,9 @@ before they appear and may be mutually recursive).
   the trait for every `Box` at once; its members are monomorphized per receiver exactly as a generic
   type's own are, and are *named* as those are (`Box.show.int`), which is what a vtable slot has to
   use as well. The subject must be the type applied to the block's parameters — one key per generic
-  type, so no overlapping implementations and no specialization rule to need. The bounds decide
+  type, so an implementation for *some* instantiations has nowhere to be filed and the question of
+  choosing between two never arises here. (`02`'s `override` orders implementations by subject and
+  reaches the composed shapes below, not this keying rule.) The bounds decide
   **which instantiations conform**, asked one step in so the answer composes, and they make the
   members checkable at their **definition**: a body using what no bound licenses is reported on its
   own line with nothing instantiated.

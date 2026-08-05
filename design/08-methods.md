@@ -395,8 +395,9 @@ three steps rather than the only one: a **bound** narrows first where the use is
 then **scope**, and the arguments settle whatever is left. Exactly one candidate accepting the
 arguments is the answer; none and more than one are both reported. In particular a
 literal has no type of its own to be matched by, so `c.mul(2)` against candidates taking a `Complex`
-and a `real` is refused rather than rounded to the nearest — choosing there would be a specialization
-rule, which `02` deliberately does not have. A **property** takes no arguments and so cannot be
+and a `real` is refused rather than rounded to the nearest — choosing there would be a ranking over
+**argument lists**, which `02`'s ordering deliberately does not do: it orders implementations by
+their subject, and `override` says nothing about which arguments a call meant. A **property** takes no arguments and so cannot be
 resolved this way at all: two implementations both supplying one make it unreadable, which is
 reported where it is read.
 

@@ -284,10 +284,11 @@ parameter, each parameter used once, all of them spoken for. `impl Show for Box[
 and so is `impl[T] Show for Pair[T, int]`, because **a generic type has one key for all of its
 instantiations**: a type's members are filed under the name it was declared with, so an
 implementation for *some* instantiations would be a second implementation for a key that holds one.
-Overlapping implementations, and the specialization rule that would be needed to pick between them,
-are deliberately not in the language. The parameters are matched to the arguments **by position in
-the subject**, not by the order they were declared in, so `impl[X, Y] Show for Pair[Y, X]` reads as
-it looks.
+This is a **keying** rule and not an overlap rule, which is why `override` does not reach it: there
+is no second key for an implementation of *some* instantiations to be filed under, so the refusal is
+about what can be represented rather than about which of two candidates wins. The parameters are
+matched to the arguments **by position in the subject**, not by the order they were declared in, so
+`impl[X, Y] Show for Pair[Y, X]` reads as it looks.
 
 ### Conditional conformance
 
@@ -355,13 +356,107 @@ A `string` is **not** covered by `[]T`. It is a view of bytes that are valid UTF
 invariant is the whole difference between it and a `[]u8` — a block written for every slice has said
 nothing about it. `"hi".bytes` is a `[]u8` and is covered.
 
-### One implementation per type, so a shape and a written type may not overlap
+### One implementation per type, unless the second one says `override`
 
-`impl Display for []int` and `impl[T] Display for []T` would both say how a `[]int` renders. Neither
-is more specific than the other — being more specific is not something sysl knows how to be, since
-there is no specialization rule and deliberately no place to add one — so **whichever is written
-second is refused**, and the diagnostic names the one already there. The choice is between saying
-how every slice behaves and saying it slice type by slice type; not both.
+**Designed, not yet built.** What follows is the decided rule; the compiler still refuses every
+overlap, which is the first half of it.
+
+`impl Display for []int` and `impl[T] Display for []T` would both say how a `[]int` renders. By
+default **whichever is written second is refused**, and the diagnostic names the one already there.
+That is the rule this section used to end at, and it stays the default for a reason worth keeping:
+two impls that overlap are usually a mistake — a duplicate written by accident, or one put in the
+wrong module — and refusing them is how that gets found.
+
+What the rule now admits is the case where the overlap is deliberate. An implementation may be
+marked **`override`**, and then it wins:
+
+```
+impl[T: Display] Display for []T          // the library, saying how every slice renders
+override impl Display for []Point         // a program, saying how its own renders
+```
+
+**The keyword goes on the overriding side, not the overridden one.** That is the whole of the
+design and it is the opposite of C#'s `virtual`/`override` pair and of Rust's unstable `default`
+(#31844), both of which make the general implementation grant permission in advance. Requiring
+permission means a program can override only where a library author thought to allow it, and a
+library author cannot know which of their implementations somebody will need to replace. Intent is
+something the writer of the override has and the writer of the original does not.
+
+What the keyword buys, given it grants no permission, is the diagnostic: an unmarked second
+implementation is still refused exactly as before, so the accidental duplicate is still caught. The
+only thing `override` changes is that somebody can say they meant it.
+
+**An `override` that overrides nothing is refused**, which is the check in the other direction and
+the one that earns its keep later: a library drops or narrows the implementation a program was
+overriding, and without this the override silently becomes the only one while still claiming to
+replace something.
+
+**`override` is required wherever something really is an override**, which includes a member that
+replaces a trait's default body:
+
+```
+trait Fallible
+    failed(*self) -> bool = false
+
+impl Fallible for File
+    override failed(*self) -> bool = self.err != 0
+```
+
+A default body is arguably an invitation — the trait author wrote it knowing implementations would
+replace it — and the earlier draft of this section used that to exempt it. The exemption is not
+worth its inconsistency: the reader of an `impl` wants to know which members are replacing something
+and which are supplying what the trait required, and that is the same question in both places. It
+costs almost nothing to say so, because an implementation that is happy with a default writes no
+member at all; across `lib/`, `guide/` and `examples/` exactly two members replace one.
+
+#### Which of two implementations is more specific
+
+`override` says a replacement was meant. It does not say *what* is being replaced, so the language
+still needs an ordering, and it is deliberately a small one. For two implementations of one trait
+whose heads both match some type:
+
+1. **Structure first.** A written-out type beats a parameter at the position they differ:
+   `[]Point` over `[]T`, `[][]T` over `[]U`.
+2. **Then bound strength.** For two shapes of the same structure, the larger set of bounds under
+   supertrait closure wins — `impl[T: Ord]` over `impl[T: Display]` where `Ord` requires `Display`.
+3. **Otherwise they are incomparable**, and the overlap is refused even with `override`, because
+   there is nothing for the keyword to choose between. `impl[T: Ord] Display for []T` against
+   `impl[T: Hash] Display for []T` is the case: neither is a stronger statement than the other, and
+   a rule that picked one would be picking by declaration order, which is not a reason.
+
+The third case is why `override` is a statement of intent rather than a tiebreak. It cannot paper
+over an ambiguity; it can only resolve one the ordering already resolved.
+
+#### What keeps this sound, and it is not the keyword
+
+The hazard a specialization rule usually brings is two method tables for one type — a `[]Point`
+erased to a `*Display` at one site picking a different implementation than at another, which is
+exactly the failure the member-name rule below is about. Here the **coherence rule closes it before
+`override` is reached**. An `impl Trait for Type` may live only in the module declaring `Trait` or
+one declaring a type named in `Type`, so:
+
+- A program cannot write `impl[T: MyTrait] Display for []T` at all — `[]T` names no type of its own,
+  making it an ordinary orphan. **The only override anybody can write across a module boundary is
+  one that names their own type.**
+- Therefore exactly one override can exist for a given type: it must live with that type.
+- And any site that can write `[]Point` down already depends on the module declaring `Point`, so no
+  site can erase a `[]Point` without seeing the override. One type, one table.
+
+It also means an override can never apply to a type the library might already have instantiated
+generically — `[]int` and `[]u8` belong to the library, and a program may not touch them — so a
+pre-compiled library artifact (`15`) cannot disagree with an override that arrives later.
+
+The two things that have kept this unstable in Rust for a decade are lifetime erasure, where an
+implementation selected on a lifetime bound may not be the one codegen sees, and associated types,
+where a more specific implementation can change a projection out from under code checked against the
+general one. sysl has neither: ownership is escape analysis and reference counting (`03`, `05`), and
+a trait takes parameters rather than declaring associated types.
+
+**The cost that remains, stated plainly:** a library can no longer rely on its own implementations.
+If `sysl.args` rendered through `Display for []T`, a program's override would change what its help
+text does, from a module the library has never heard of. That is the price of the flexibility and it
+is not bought off by anything above — what `override` buys is that every such site is greppable
+rather than invisible.
 
 The same rule reaches member *names*, and the reason is the boundary rather than the namespace. A
 shape may not give a member a name that some slice written out in full already has, and vice versa —
@@ -370,16 +465,24 @@ and a trait object's slot would be filled from the wrong one. **Two traits decla
 different case and are allowed**, because a use of one of them says which by naming the trait
 (`13 §2`); what has no such answer is two *tables* that a lookup picks between without being told.
 
+An `override` is not this case and does not relax it. An override supplies the **same trait's**
+members and replaces the implementation rather than adding a second one beside it, so the type still
+has one table and one meaning per name — which is why the ordering above has to settle the question
+before any table is built, rather than a lookup choosing as it goes.
+
 This is also the boundary a **second implementation of one trait** does not cross. A type may
 implement a parameterized trait at more than one argument list (below), and what makes that work is
 that the implementations share a namespace to be told apart in. A shape and a written-out type have
 two, and a lookup takes one or the other — so a second implementation split across the boundary
 would be one no call could reach, whatever arguments the two blocks wrote.
 
-Refusing the overlap is the conservative choice and can be relaxed; shipping a rule that picks
-between two implementations cannot be walked back. If a case turns up that genuinely wants
-`[]byte` to render differently from every other slice, the language would be adding specialization
-with its eyes open, rather than discovering it had one.
+This section used to close by saying that refusing the overlap was the conservative choice, that a
+rule picking between two implementations could not be walked back, and that the language would take
+that step only with its eyes open when a case turned up. The case turned up: `guide/table` wanted a
+slice of anything printable to render, which is one blanket implementation in the library, and the
+blanket implementation shuts the door on every program's `impl Display for []TheirType` — a
+documented capability with no workaround, since `[]int` names nothing of a program's and the advice
+the diagnostic gave could not be taken. The step above is that step, taken deliberately.
 
 ## A trait may take type parameters of its own
 
@@ -446,9 +549,11 @@ The resolution is **determined, not preferred**. Nothing ranks two candidates: a
 the one implementation whose parameters are the types the arguments have, and a call that answers to
 none of them or to more than one is reported rather than resolved. So `c.mul(2)` where the
 candidates take a `Complex` and a `real` is refused — an integer literal is neither, and picking the
-nearest would be the specialization rule this chapter does not have. This is why it is not general
-member overloading: what is being chosen among is the implementations of **one** trait, told apart by
-the very thing that declares them to be different.
+nearest would be a ranking over **argument lists**, which the ordering above deliberately does not
+do: it orders implementations by their *subject*, and says nothing about a type implementing one
+trait at several argument lists. This is why it is not general member overloading: what is being
+chosen among is the implementations of **one** trait, told apart by the very thing that declares them
+to be different.
 
 Two limits fall out of "several implementations are told apart inside one namespace":
 
@@ -476,8 +581,10 @@ the type it is written for — each appearing in the subject, and each appearing
 argument can name is therefore one the subject settles, and what settles it is the same thing that
 settles a defaulted `Self`. This is what lets a container carry the type of what it holds in the
 trait it implements without an associated type to derive it from (`14 §7`), and it is safe for the
-reason the rest of this section is: there is no specialization here, so `impl Index[usize, int] for
-Buf[int]` beside it is refused outright and the two never have to be chosen between.
+reason the rest of this section is: nothing ranks argument lists, so `impl Index[usize, int] for
+Buf[int]` beside it is refused outright and the two never have to be chosen between. The subject
+ordering that `override` introduces does not apply — these two have the same subject and differ only
+in what they supply the trait.
 
 What has not changed is what a bound means. `Mul` is `Mul[Self]` by `10 §3`'s default, so a bare
 bound still names the homogeneous implementation rather than "whichever there is", and every bound
@@ -820,11 +927,14 @@ type-argument entry already records.
   trait unusable as a trait object, since no vtable slot can hold a function that does not exist
   until a call names its types. Refusing at the declaration is what keeps that from being discovered
   at the `*Trait` instead.
-- **Specialization.** A shape and a type of that shape written out in full are refused as the two
-  implementations for one type they are, as above. Allowing both and letting the written one win is
-  the one thing here that would be genuinely useful (`[]byte` rendering differently from every other
-  slice) and is deliberately not done: a rule for choosing between two implementations is easy to
-  add later and impossible to remove.
+- ~~**Specialization.**~~ **Decided, and designed above.** This entry said that letting a written-out
+  type beat a shape was the one relaxation here that would be genuinely useful, and that it was not
+  done because such a rule is easy to add and impossible to remove. It is now done, on the terms the
+  section states: the overlap is still refused by default, the second implementation must say
+  `override`, and the ordering is small enough to be written in three lines. What made it affordable
+  was not a change of mind about reversibility — it was noticing that coherence already confines a
+  cross-module override to a type of the overriding module's own, which is what rules out the two
+  tables and the stale instantiation that make specialization hard elsewhere.
 - ~~**A property's body must be an expression.**~~ **Built** — a property takes the `funcBody` a
   method takes, so `= expr`, an `=` opening a block, and a bare block are all spellings of it, in a
   trait's default and in a type's own body alike. It was additive exactly as this item predicted, and
