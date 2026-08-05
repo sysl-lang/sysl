@@ -29,8 +29,15 @@ class ExternCodegenTests extends AnyFreeSpec with CodegenSupport {
     // A view is three words, which is more than any of the four conventions puts in registers, so
     // the C boundary is the one place it does *not* lower as it does everywhere else: it is passed
     // by address, exactly as C passes a struct of that size (`CAbi`).
+    //
+    // **Compiled for a named target rather than for this machine**, because how an aggregate is
+    // passed is the one thing that is genuinely a property of the ABI: AAPCS64 and SysV x86-64
+    // classify the same struct differently and spell it differently in the IR. Left at the default
+    // this asserted whichever answer the author's laptop gave, which is a test that checks one
+    // convention on one machine and nothing at all anywhere else. Naming the target is what makes it
+    // a claim about AAPCS64 that holds wherever the suite runs.
     "a pointer lowers as it does everywhere else, and a view as the ABI passes an aggregate" in {
-      ir("extern f(p: *u8, s: string) -> *int\nvar b: u8 = 0\nprint(f(&b, \"hi\") == null)") should
+      irFor(Target.aarch64MacOS, "extern f(p: *u8, s: string) -> *int\nvar b: u8 = 0\nprint(f(&b, \"hi\") == null)") should
         include("declare ptr @f(ptr, ptr)")
     }
 

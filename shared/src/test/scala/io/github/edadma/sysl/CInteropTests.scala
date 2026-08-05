@@ -16,6 +16,11 @@ import org.scalatest.freespec.AnyFreeSpec
  */
 class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
+  /** Whether the hand-transcribed `<regex.h>` layouts further down describe this machine's libc.
+    * See the block comment above the two tests that ask.
+    */
+  private def transcribedForThisLibc: Boolean = Target.host.map(_.os).contains(Os.MacOS)
+
   /** Every one of these must compile. They are grouped by header so a failure names the area. */
   private def spellable(ds: String*): Unit =
     for d <- ds do
@@ -145,18 +150,26 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
     // The same thing read off the declaration rather than off the answer, which is where it lives.
     // Both of these are what clang emits for the same two headers.
+    //
+    // **Named target, because "the way C classifies it" is a different answer per convention.**
+    // AAPCS64 returns a 8-byte struct in one register and a 16-byte one in two; SysV x86-64 splits
+    // by eightbyte class and spells the result differently again. Compiled for whatever machine ran
+    // the suite, this asserted one convention's spelling and could only ever pass on that machine --
+    // which is exactly what it did until the suite met a Linux runner.
     "a struct-returning extern is declared the way C classifies it" in {
-      ir("""struct div_t
-           |    quot: i32
-           |    rem: i32
-           |extern div(a: i32, b: i32) -> div_t
-           |print(div(7, 2).quot)""".stripMargin) should include("declare i64 @div(i32, i32)")
+      irFor(Target.aarch64MacOS,
+            """struct div_t
+              |    quot: i32
+              |    rem: i32
+              |extern div(a: i32, b: i32) -> div_t
+              |print(div(7, 2).quot)""".stripMargin) should include("declare i64 @div(i32, i32)")
 
-      ir("""struct ldiv_t
-           |    quot: i64
-           |    rem: i64
-           |extern ldiv(a: i64, b: i64) -> ldiv_t
-           |print(ldiv(7i64, 2i64).quot)""".stripMargin) should include("declare [2 x i64] @ldiv(i64, i64)")
+      irFor(Target.aarch64MacOS,
+            """struct ldiv_t
+              |    quot: i64
+              |    rem: i64
+              |extern ldiv(a: i64, b: i64) -> ldiv_t
+              |print(ldiv(7i64, 2i64).quot)""".stripMargin) should include("declare [2 x i64] @ldiv(i64, i64)")
     }
 
     "a struct the callee fills is read back out" in {
@@ -199,9 +212,20 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
      * binding is missing is never "sysl cannot call this". What both spellings really hold is the
      * numbers 32 and 8 and the value of `REG_EXTENDED`, transcribed by hand, correct on this machine
      * and different under glibc, with nothing checking either. That is the argument for a shim
-     * (`15 §7`), and these two are what it is an argument against. */
+     * (`15 §7`), and these two are what it is an argument against.
+     *
+     * **That paragraph turned out to be literally true, and these two are held to macOS because of
+     * it.** Run on glibc they fail, and not by a little: `regex_t` is a different size, and
+     * `regoff_t` is `int` there rather than `long`, so `so`/`eo` declared `i64` read the wrong
+     * halves of the wrong words. A second transcription could be written for glibc, but it would be
+     * another set of hand-copied numbers that nothing checks — the exact thing being warned about
+     * — so what is asserted instead is the transcription that was actually verified, on the
+     * platform it was verified against. Elsewhere they are *cancelled*, which reads differently from
+     * passing and is the honest answer. */
 
     "a caller-allocated C struct, transcribed field by field" in {
+      assume(transcribedForThisLibc, "the struct layouts here are macOS's <regex.h>, not glibc's")
+
       // macOS <regex.h>: int re_magic; size_t re_nsub; const char *re_endp; struct re_guts *re_g.
       run("""struct regex_t
             |    magic: i32
@@ -223,6 +247,8 @@ class CInteropTests extends AnyFreeSpec with RunSupport with CodegenSupport {
     }
 
     "and the same one as nothing but sized, aligned storage" in {
+      assume(transcribedForThisLibc, "four words is macOS's regex_t; glibc's is larger")
+
       // The fields are never read here, so the whole declaration is the two numbers: four words, at
       // the alignment `u64` carries. It is the smaller lie of the two and exactly as unchecked.
       run("""struct regex_t

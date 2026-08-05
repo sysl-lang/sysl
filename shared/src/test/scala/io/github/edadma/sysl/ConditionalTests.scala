@@ -281,7 +281,12 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
     }
 
     "a diagnostic inside a kept group points at the line it was written on" in {
-      val out = err("""#if macos
+      // `posix` rather than `macos`, because this one really compiles for the machine it is running
+      // on and the claim is about a group that is **kept**. Named `macos` it was a test about the
+      // author's laptop: on Linux the group is dropped, the erroneous line goes with it, and what
+      // comes back is a clean compilation rather than the diagnostic being asserted. `posix` is true
+      // of every target sysl hosts, so the group is kept wherever this runs.
+      val out = err("""#if posix
                       |var x: int = "no"
                       |#endif
                       |""".stripMargin)
@@ -663,7 +668,10 @@ class ConditionalTests extends AnyFreeSpec with Matchers with CodegenSupport wit
     "a file's directory is carried through the gate, so its module still checks out" in {
       // A gated `Source` is a new object, and losing `dir` would make every module header in a
       // project stop agreeing with the directory it sits in — a whole class of wrong diagnostics.
-      irIn(("demo", "a.sysl", "module demo\n\n#if macos\ntwo() -> int = 2\n#endif\n"),
+      //
+      // `posix` rather than `macos`: this compiles for the host, so a condition true only on the
+      // author's machine takes `two` out of the module everywhere else and the call goes undefined.
+      irIn(("demo", "a.sysl", "module demo\n\n#if posix\ntwo() -> int = 2\n#endif\n"),
            ("", "main.sysl", "print(demo.two())\n")) should include("2")
     }
 

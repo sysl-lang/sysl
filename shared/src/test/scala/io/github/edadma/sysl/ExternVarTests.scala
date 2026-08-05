@@ -439,8 +439,15 @@ class ExternVarTests
   /** The point of the whole feature: a real C global, really resolved, really read. */
   "reaching a C global that is actually there" - {
     /** `stdout` is the one that mattered, and it is also the case the link name was made for: in C
-      * it is a *macro*, and what the linker actually has on this platform is `__stdoutp`. A program
+      * it is a *macro*, and what the linker has under it is the platform's business. A program
       * transcribing the header's spelling reaches nothing, and the declaration is what says so.
+      *
+      * **The two platforms disagree, which is the point rather than an inconvenience.** macOS
+      * exports `__stdoutp`; glibc exports `stdout` itself. Writing either one unconditionally makes
+      * the test a claim about a machine instead of about the feature, and this suite ran on macOS
+      * alone for long enough that the Darwin spelling read as *the* spelling. `#if` is exactly the
+      * construct a program uses for this, so the fixture uses it — which also means the fixture
+      * demonstrates the feature it depends on.
       *
       * The stream only interleaves with `print` in the order written if it really is libc's own —
       * the library renders through `putchar`, which writes to that same stream, so a stand-in opened
@@ -448,7 +455,11 @@ class ExternVarTests
       */
     "stdout is libc's own stream, in the order print writes to it" in {
       val src =
-        """extern "__stdoutp" stdout: *u8
+        """#if macos
+          |extern "__stdoutp" stdout: *u8
+          |#else
+          |extern stdout: *u8
+          |#endif
           |extern fputs(s: *u8, stream: *u8) -> i32
           |print("one")
           |fputs(c"two\n", stdout)
@@ -459,7 +470,11 @@ class ExternVarTests
 
     "and stderr is a different stream, so what goes there is not what came back" in {
       val src =
-        """extern "__stderrp" stderr: *u8
+        """#if macos
+          |extern "__stderrp" stderr: *u8
+          |#else
+          |extern stderr: *u8
+          |#endif
           |extern fputs(s: *u8, stream: *u8) -> i32
           |fputs(c"to stderr\n", stderr)
           |print("to stdout")""".stripMargin

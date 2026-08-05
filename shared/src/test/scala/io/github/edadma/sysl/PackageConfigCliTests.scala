@@ -77,37 +77,54 @@ class PackageConfigCliTests extends AnyFreeSpec with Matchers {
       deleteFile(elsewhere)
   }
 
+  /** Two hosted targets that are not the machine this suite is running on, whichever that is.
+    *
+    * **Written out rather than named because a fixed pair cannot be cross everywhere.** These tests
+    * used `riscv64-linux` and `x86_64-linux`, which are both cross from the author's Mac and one of
+    * which is the *host* on an x86-64 Linux runner — where the driver then builds happily, says
+    * nothing, and the assertion that it complained fails. The claim being made is "a target other
+    * than this machine's", so that is what the fixture computes.
+    */
+  private def elsewhere: (Target, Target) =
+    List(Target.aarch64MacOS, Target.x86_64MacOS, Target.aarch64Linux, Target.x86_64Linux, Target.riscv64Linux)
+      .filterNot(Target.host.contains) match
+      case a :: b :: _ => (a, b)
+      case _           => fail("no two targets are foreign to this machine")
+
   "the config names the target a build is for" in {
+    val (configured, _) = elsewhere
+
     project(
       "main()\n    print(1)\n",
-      Some("targets { default = \"riscv64-linux\" }\n"),
+      Some(s"""targets { default = "${configured.name}" }\n"""),
     ) { dir =>
-      // A cross build gets no further than clang here — this machine's has no RISC-V target — and
-      // that is enough to see the answer. What is asserted is that the driver took the target from
-      // the **file**: with the config unread the build is for this machine, it succeeds, and nothing
-      // is said at all, so it is *which* machine is named that discriminates. The triple rather than
-      // the name because that is what got as far as the toolchain, and both are read off the target
-      // table rather than written out, so this says "the configured one, not this one" rather than
-      // repeating a spelling.
-      val riscv = Target.named("riscv64-linux").getOrElse(fail("riscv64-linux is not a target"))
-
-      val (code, said) = stderrOf(cli(Config(command = "build", file = dir, output = Some(s"$dir/out"))))
+      // `run` rather than `build`, because it is the **driver** that refuses to run what it cannot
+      // execute, before any of this reaches clang. That matters for what the assertion can say: a
+      // failed cross *link* is worded by whatever linker the machine has -- macOS names the triple,
+      // GNU ld says `unrecognised emulation mode: elf64lriscv` and names nothing -- so asserting on
+      // it made the test a claim about a toolchain. The driver's own refusal names the target.
+      //
+      // What discriminates is *which* machine is named: with the config unread the build is for this
+      // one and nothing is said at all.
+      val (code, said) = stderrOf(cli(Config(command = "run", file = dir)))
 
       code should not be 0
-      said should include(riscv.triple)
-      said shouldNot include(Target.default.triple)
+      said should include(configured.name)
+      said shouldNot include(Target.default.name)
     }
   }
 
   "and --target beats the config, so a project with a default is still cross-buildable" in {
+    val (configured, overridden) = elsewhere
+
     project(
       "main()\n    print(1)\n",
-      Some("targets { default = \"riscv64-linux\" }\n"),
+      Some(s"""targets { default = "${configured.name}" }\n"""),
     ) { dir =>
-      val (_, said) = stderrOf(cli(Config(command = "run", file = dir, target = Some("x86_64-linux"))))
+      val (_, said) = stderrOf(cli(Config(command = "run", file = dir, target = Some(overridden.name))))
 
-      said should include("x86_64-linux")
-      said shouldNot include("riscv64-linux")
+      said should include(overridden.name)
+      said shouldNot include(configured.name)
     }
   }
 

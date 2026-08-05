@@ -308,13 +308,17 @@ class EscapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSupport {
   // The pointer has to be the route to *this* array. A local array beside a pointer to something
   // else is still a local array, and an element of a local array of arrays still belongs here.
   "a heap-backed view may still be handed to an extern" in {
-    ir("""extern take(s: []u8)
-         |use()
-         |    var buf: &[4]u8 = [1, 2, 3, 4]
-         |    take(buf[0..<2])
-         |end use
-         |use()
-         |""".stripMargin) should include("declare void @take(ptr)")
+    // The claim is about escape analysis, not about a convention -- but it is *read* off the extern's
+    // declaration, and how a view is passed is spelled differently by AAPCS64 and SysV x86-64. So the
+    // target is named, which keeps the assertion about the thing the test is called after.
+    irFor(Target.aarch64MacOS,
+          """extern take(s: []u8)
+            |use()
+            |    var buf: &[4]u8 = [1, 2, 3, 4]
+            |    take(buf[0..<2])
+            |end use
+            |use()
+            |""".stripMargin) should include("declare void @take(ptr)")
   }
 
   "a recursive function converges rather than assuming the worst" in {

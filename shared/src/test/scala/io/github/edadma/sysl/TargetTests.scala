@@ -171,9 +171,22 @@ class TargetTests extends AnyFreeSpec with CodegenSupport {
     "a cross build is refused by the toolchain rather than quietly made for this machine" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
+      // The target is computed rather than named, because a written-out one stops being cross on the
+      // machine it names. This said `x86_64Linux`, which is foreign from the author's Mac and is the
+      // *host* on an x86-64 Linux runner -- where the build then succeeds and the claim inverts.
+      //
+      // **A different OS, not merely a different target.** Picking the first target that is not the
+      // host chooses `x86_64-macos` on an Apple Silicon machine, and clang builds that quite happily
+      // -- one toolchain, two architectures, no missing linker. What makes a link actually fail is
+      // the platform: there is no Linux linker on a Mac and no Mach-O one on Linux.
+      val foreign =
+        List(Target.aarch64MacOS, Target.x86_64MacOS, Target.aarch64Linux, Target.x86_64Linux)
+          .find(t => !Target.host.map(_.os).contains(t.os))
+          .getOrElse(fail("no target has an OS foreign to this machine"))
+
       val exe = "/tmp/sysl-cross-target-test"
 
-      Toolchain.build(irFor(Target.x86_64Linux, "print(1)"), exe, Target.x86_64Linux).isLeft shouldBe true
+      Toolchain.build(irFor(foreign, "print(1)"), exe, foreign).isLeft shouldBe true
     }
 
     // The other half of the same claim: with the triples agreeing, this machine's build still works

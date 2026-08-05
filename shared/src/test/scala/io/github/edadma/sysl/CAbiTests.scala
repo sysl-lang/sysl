@@ -622,15 +622,21 @@ class CAbiTests extends AnyFreeSpec with RunSupport with CodegenSupport {
   "a counted field changes the ownership not at all" - {
 
     "a struct holding a string is passed by address and released once, at its own scope" in {
-      val out = ir("""struct Named
-                     |    tag: i32
-                     |    name: string
-                     |extern take(v: Named)
-                     |use()
-                     |    var n = Named(7, "hi")
-                     |    take(n)
-                     |end use
-                     |use()""".stripMargin)
+      // Named target: both conventions pass this aggregate in memory, but they *spell* it
+      // differently in the IR -- AAPCS64 as a bare `ptr`, SysV x86-64 with `byval` -- so an
+      // assertion on the declaration is an assertion about one of them. The ownership half below is
+      // ABI-independent and would hold either way; it is the `declare` line that has to name a
+      // convention to mean anything.
+      val out = irFor(Target.aarch64MacOS,
+                      """struct Named
+                        |    tag: i32
+                        |    name: string
+                        |extern take(v: Named)
+                        |use()
+                        |    var n = Named(7, "hi")
+                        |    take(n)
+                        |end use
+                        |use()""".stripMargin)
 
       out should include("declare void @take(ptr)")
 
