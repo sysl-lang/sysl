@@ -8,10 +8,12 @@ package io.github.edadma.sysl
  * arrive stores nothing, so a diverging arm needs no special handling: its block is already closed
  * and `emit` drops what would follow.
  *
- * A pattern is split in two on purpose. `patternTest` is a pure value read that answers whether an
- * arm matches, with no side effects and no bindings, so it can run before the arm is chosen;
- * `patternBind` establishes the bindings afterwards, once the arm is known to be taken. Splitting
- * them is what keeps a failed match from retaining anything it then has to release.
+ * A pattern is split in two on purpose. `patternTest` answers whether an arm matches, with no side
+ * effects and no bindings, so it can run before the arm is chosen; `patternBind` establishes the
+ * bindings afterwards, once the arm is known to be taken. Splitting them is what keeps a failed
+ * match from retaining anything it then has to release. The test is free of side effects but not
+ * of control flow: a variant's payload may only be read once its tag has been checked, so that
+ * check is a branch.
  */
 trait ControlFlowEmitter extends PlaceEmitter {
 
@@ -235,9 +237,13 @@ trait ControlFlowEmitter extends PlaceEmitter {
   }
 
   /** The i1 result of testing a pattern against a value. Every pattern node carries the type it
-   * tests at, so the value's type does not have to be passed alongside it. Pattern tests are pure
-   * value reads (`extractvalue`, comparisons), so nested variant fields are extracted and
-   * tested unconditionally — a failed outer tag simply ANDs a `false` through.
+   * tests at, so the value's type does not have to be passed alongside it.
+   *
+   * A variant's payload is tested **behind** its tag rather than beside it. The payload is only
+   * this variant's while the tag says so, so reading it out of a value that turned out to be
+   * another variant reinterprets whatever that other variant stored — and a test over the result
+   * is not merely wrong but unsafe, since comparing a `string` is a call to `sysl.str.cmp` that
+   * dereferences the pointer it is handed. Everything else here is a pure value read.
    */
   private def patternTest(p: TPattern, value: String): String = p match
     case _: TWildPattern | _: TBindPattern => "true"
@@ -254,12 +260,32 @@ trait ControlFlowEmitter extends PlaceEmitter {
         if en.simple then value
         else { val t = freshTemp(); emit(s"$t = extractvalue ${en.llvm} $value, 0"); t }
       val tagOk = freshTemp(); emit(s"$tagOk = icmp eq ${en.tagLlvm} $tagVal, ${variant.tag}")
-      if args.isEmpty then tagOk
+
+      // Nothing in the payload to ask about — a variant with no fields, or one destructured only
+      // into bindings, which `patternBind` establishes later and after the arm has been taken.
+      if !args.exists(refutable) then tagOk
       else
+        // The tag decides whether the payload may be read at all, so its test is a branch and not
+        // an operand of an `and`: the block below runs only for a value of this variant.
+        val answer = emitAlloca(freshTemp(), "i1")
+        val testL  = freshLabel("pat.payload")
+        val doneL  = freshLabel("pat.done")
+
+        emit(s"store i1 false, ptr $answer")
+        emitTerm(s"br i1 $tagOk, label %$testL, label %$doneL")
+        emitLabel(testL)
+
         val payload = enumPayload(en, variant, value)
-        args.zipWithIndex.foldLeft(tagOk) { case (acc, (arg, i)) =>
-          andI1(acc, patternTest(arg, payloadField(en, variant, payload, i)))
+        val inner = args.zipWithIndex.foldLeft("true") { case (acc, (arg, i)) =>
+          if !refutable(arg) then acc
+          else andI1(acc, patternTest(arg, payloadField(en, variant, payload, i)))
         }
+
+        emit(s"store i1 $inner, ptr $answer")
+        emitTerm(s"br label %$doneL")
+        emitLabel(doneL)
+
+        val r = freshTemp(); emit(s"$r = load i1, ptr $answer"); r
 
     // A struct has no tag, so the test is just its refutable fields' tests ANDed together; an
     // irrefutable field needs none, so nothing is emitted for the parts a named pattern omitted.

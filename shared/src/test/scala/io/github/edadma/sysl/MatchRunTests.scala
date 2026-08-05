@@ -249,6 +249,77 @@ class MatchRunTests extends AnyFreeSpec with RunSupport {
     run(src) shouldBe "42 -1 -2\n"
   }
 
+  /** A variant's payload may be read only once its tag says the payload is that variant's.
+   *
+   * These three ran the same wrong way: the payload's test was emitted beside the tag's and ANDed
+   * to it, so it *executed* for a value of some other variant, over whatever that variant had
+   * stored in the shared payload. For an integer or a `char` that reads a nonsense number and
+   * quietly answers `false`; for a `string` it hands `sysl.str.cmp` a pointer that was never one,
+   * and the program dies where no `match` arm says anything about dying.
+   *
+   * The alternation is the case that made it certain rather than lucky, because an `|` has to
+   * evaluate every alternative's test to OR them: `Short('o') | Long("output")` tests a `char`
+   * payload and a `string` payload of the same value, and one of the two is always the wrong
+   * reading. That is what took down a `sysl.args` scanner written against `09 §6`'s own example.
+   */
+  "a variant's payload is tested only when its tag matched" - {
+    // The one that crashed. Every call is answered, and the two alternatives are reached through
+    // *different* payload types, so a test that read the wrong one cannot pass by coincidence.
+    "across an alternation whose variants carry different types" in {
+      val src =
+        """enum Arg
+          |    Short(name: char)
+          |    Long(name: string)
+          |    Positional(value: string)
+          |one(a: Arg) -> string
+          |    a match
+          |        Short('o') | Long("output") -> "matched"
+          |        Short(_) -> "other short"
+          |        Long(_) -> "other long"
+          |        Positional(_) -> "pos"
+          |print(one(Short('o')), one(Long("output")), one(Short('v')), one(Long("x")))""".stripMargin
+
+      run(src) shouldBe "matched matched other short other long\n"
+    }
+
+    // The same unsoundness with no alternation in sight: the first arm compares a `string` payload,
+    // and `Short('o')` reaches it carrying a `char`. This survived only while the bytes beside the
+    // char happened to read as an empty string.
+    "in a plain arm whose literal is a string" in {
+      val src =
+        """enum Arg
+          |    Short(name: char)
+          |    Long(name: string)
+          |pick(a: Arg) -> string
+          |    a match
+          |        Long("output") -> "the output option"
+          |        Short(_) -> "short"
+          |        Long(_) -> "other long"
+          |print(pick(Long("output")), pick(Short('o')), pick(Long("x")))""".stripMargin
+
+      run(src) shouldBe "the output option short other long\n"
+    }
+
+    // And through a layer, where the inner test reads a payload the outer tag has already ruled
+    // out. `Bare` carries a `string` where `Wrap` carries an `Inner`.
+    "through a nested variant, where the outer tag rules the inner payload out" in {
+      val src =
+        """enum Inner
+          |    Val(s: string)
+          |enum Outer
+          |    Wrap(i: Inner)
+          |    Bare(s: string)
+          |peek(o: Outer) -> string
+          |    o match
+          |        Wrap(Val("hit")) -> "wrapped hit"
+          |        Wrap(_) -> "wrapped"
+          |        Bare(_) -> "bare"
+          |print(peek(Wrap(Val("hit"))), peek(Wrap(Val("no"))), peek(Bare("hit")))""".stripMargin
+
+      run(src) shouldBe "wrapped hit wrapped bare\n"
+    }
+  }
+
   // `09 §6` — a variant may be written with a qualifier, which the scrutinee's type makes
   // redundant rather than wrong. It reads the same on a nullary variant, which is spelled like a
   // name and so had nowhere to put one: `Wrap(i)` took a qualifier and `Bare` did not.
