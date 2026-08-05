@@ -111,3 +111,52 @@ impl[A: Display, B: Display] Display for (A, B)
 impl[A: Display, B: Display, C: Display] Display for (A, B, C)
     display(self, out: *Writer, fmt: FormatSpec) =
         display_pad(("(" + str(self.0) + ", " + str(self.1) + ", " + str(self.2) + ")").bytes, out, fmt)
+
+// A sink that keeps the length of what it was given and drops the bytes, which is how a slice
+// honours a width without gathering: the elements are rendered twice and stored nowhere, rather
+// than once into a buffer that has to be allocated. `sysl` cannot reach `sysl.buf` -- that module
+// is built on this one -- so a growable buffer is not available here even if one were wanted.
+private struct Counting
+    n: usize
+
+impl Fallible for Counting
+
+impl Writer for Counting
+    write(*self, bytes: []const u8)
+        self.n = self.n + bytes.len
+end Counting
+
+// The elements between brackets, written straight through to wherever they are going. Each element
+// gets a plain specifier, because `14 §2`'s field is the whole slice and not its parts.
+private render_slice[T: Display](xs: []T, out: *Writer)
+    out.write("[".bytes)
+
+    for i in 0..<xs.len
+        if i > 0usize then out.write(", ".bytes)
+
+        xs[i].display(out, FormatSpec(0, -1, false))
+
+    out.write("]".bytes)
+end render_slice
+
+impl[T: Display] Display for []T
+    display(self, out: *Writer, fmt: FormatSpec)
+        var pad = 0
+
+        // Measured only when a width was asked for, so the ordinary print costs one pass.
+        if fmt.width > 0
+            var count = Counting(0usize)
+            var sink: *Writer = &count
+
+            render_slice(self, sink)
+            pad = fmt.width - int(count.n)
+
+            if pad < 0 then pad = 0
+
+        if !fmt.left then display_fill(out, 32u8, pad)
+
+        render_slice(self, out)
+
+        if fmt.left then display_fill(out, 32u8, pad)
+    end display
+end []T

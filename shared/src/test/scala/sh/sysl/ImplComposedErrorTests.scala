@@ -211,15 +211,26 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
       ) should include("type '[]int' has no method 'show'")
     }
 
-    // A slice may carry an `impl`, so the advice names the one to write — but only where the
-    // coherence rule would let it be written (`02 § Coherence`). `Display` is the library's, so it
-    // is the *element* that gives the block a home: a `[]P` may have one and a `[]int` may not.
-    "printing a slice points at the impl to write, where one could be written" in {
+    // A **slice** no longer reaches this advice at all, because the library implements `Display` for
+    // every slice: what a `[]P` fails is that block's condition, so the diagnostic names the element
+    // that does not render rather than telling the reader to write a block. An **array** is where
+    // the advice still lives, since one `impl` cannot cover every length and nothing covers arrays.
+    "printing a composed type points at the impl to write, where one could be written" in {
+      err("""struct P
+            |    v: int
+            |var a = [P(1), P(2)]
+            |print(a)""".stripMargin) should
+        include(s"write an 'impl ${lib("Display")} for [2]P' to say how it renders")
+    }
+
+    // The slice half of the same question, which is now a condition rather than a missing block —
+    // and the better answer, since the element is the part a reader can act on.
+    "while a slice names the element its covering block asks about" in {
       err("""struct P
             |    v: int
             |var a = [P(1), P(2)]
             |print(a[0..])""".stripMargin) should
-        include(s"write an 'impl ${lib("Display")} for []P' to say how it renders")
+        include(s"the 'impl' that covers it asks '${lib("Display")}' of P, which does not implement it")
     }
 
     "and an array of them the same way, through however many shapes it takes" in {
@@ -231,12 +242,13 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
       e should include(s"write an 'impl ${lib("Display")} for [2][1]P' to say how it renders")
     }
 
+    // A `[]int` prints, so the case is an **array** of a built-in: nothing covers arrays and nothing
+    // in `[2]int` is the program's, which leaves the reader with a block they could not write.
     "but where nothing in the subject is this module's, it says there is no home for one" in {
-      for src <- List("var a = [1, 2]\nprint(a[0..])", "var a = [1, 2]\nprint(a)") do
-        val e = err(src)
+      val e = err("var a = [1, 2]\nprint(a)")
 
-        e should include("no home outside the library")
-        e should not include s"write an 'impl ${lib("Display")} for"
+      e should include("no home outside the library")
+      e should not include s"write an 'impl ${lib("Display")} for"
     }
 
     /** The defect the pair above exists for. Both diagnostics used to arrive in the same run — the
@@ -244,12 +256,12 @@ class ImplComposedErrorTests extends AnyFreeSpec with CodegenSupport with RunSup
       * write that very block. Advice naming something the compiler refuses is worse than none.
       */
     "so a program that tries the advice is not told to try it again" in {
-      val e = err("""impl Display for []int
+      val e = err("""impl Display for [2]int
                     |    display(self, out: *Writer, fmt: FormatSpec)
                     |        display_str("ints", out, fmt)
                     |
                     |var a = [1, 2]
-                    |print(a[0..])""".stripMargin)
+                    |print(a)""".stripMargin)
 
       e should include("has no home")
       e should not include s"write an 'impl ${lib("Display")} for"

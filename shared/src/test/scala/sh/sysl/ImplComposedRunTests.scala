@@ -61,7 +61,7 @@ class ImplComposedRunTests extends AnyFreeSpec with RunSupport {
           |    v: int
           |impl Display for N
           |    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.v), out, fmt)
-          |impl Display for []N
+          |override impl Display for []N
           |    display(self, out: *Writer, fmt: FormatSpec)
           |        out.write("[".bytes)
           |        for i in 0..<self.len do
@@ -281,7 +281,7 @@ class ImplComposedRunTests extends AnyFreeSpec with RunSupport {
       run(
         """struct N
           |    v: int
-          |impl Display for []N
+          |override impl Display for []N
           |    display(self, out: *Writer, fmt: FormatSpec)
           |        display_int(i64(self.len), out, fmt)
           |var a = [N(1), N(2), N(3)]

@@ -102,13 +102,17 @@ writing `impl Eq for (int, string)` is the ordinary orphan case — both halves 
 `impl MyTrait for (int, string)` is permitted, because the trait is local. No exception is needed;
 the rule needed a sentence saying where a nameless type lives.
 
-**A composed type is the module's when anything named in it is.** `impl Display for []Point` is
-licensed by `Point` — the block is written where `Point` is, and nowhere else could have written it
-— while `impl Display for []int` names nothing outside the library and has no home. This is the half
+**A composed type is the module's when anything named in it is.** `override impl Display for []Point`
+is licensed by `Point` — the block is written where `Point` is, and nowhere else could have written
+it — while a block for `[]int` names nothing outside the library and has no home. This is the half
 the paragraphs above left to be settled, and it is settled this way because the strict reading takes
-something the language cannot do without: with it, a module could not so much as print a slice of
-its own struct, and the compiler's own advice — *write an `impl Display for []Point`* — would name a
-block the rule then refused. Rust reaches the same answer by its covered-type rule.
+something the language cannot do without: with it, a module could not say how a slice of its own
+struct renders. Rust reaches the same answer by its covered-type rule.
+
+The example says `override` because the library now implements `Display` for every slice, and that
+is the pairing to keep in view: **coherence says where a block may be written, and `override` says
+which of two blocks that both have a home answers.** They are separate rules that a slice of a
+program's own struct happens to need both of.
 
 The reach of that is smaller than it looks, because a **generic named type has one implementation
 covering every instantiation** (below): there is no `impl Eq for Option[Point]` to be licensed, only
@@ -245,8 +249,8 @@ whatever the bounds say, because a field is layout and no promise about behaviou
 that have no name of their own carry an implementation exactly as the named ones do:
 
 ```
-impl Display for []int
-    display(self, out: *Writer, fmt: FormatSpec)
+impl Total for []int
+    total(self) -> int
         …
 
 impl Total for [3]int

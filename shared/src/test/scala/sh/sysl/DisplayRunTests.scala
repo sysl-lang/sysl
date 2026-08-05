@@ -9,7 +9,7 @@ import org.scalatest.freespec.AnyFreeSpec
  * `str` is only which sink the text lands in. So most cases here drive the same value through both,
  * and expect the two to agree to the byte.
  */
-class DisplayRunTests extends AnyFreeSpec with RunSupport {
+class DisplayRunTests extends AnyFreeSpec with RunSupport with CodegenSupport {
 
   /** `Display`, `Writer` and the renderers are the standard module's, since `print` desugars onto
    * them. The one sink the library supplies is `sysl.buf`'s, being ordinary sysl over the growable
@@ -391,6 +391,110 @@ class DisplayRunTests extends AnyFreeSpec with RunSupport {
             |    print(x)
             |once[T: Display](x: T) = twice(x)
             |once(5)""".stripMargin) shouldBe "5\n5\n"
+    }
+  }
+
+  /** A slice of anything printable, which is one `impl[T: Display] Display for []T` rather than a
+   * case per element type.
+   *
+   * **What it is written to avoid is a buffer.** Gathering the elements and padding the result would
+   * be the obvious shape and it is the one thing this cannot do: `sysl` is the module `sysl.buf` is
+   * built on, so a growable buffer is not reachable from where `Display` lives, and printing a slice
+   * would start allocating in a language whose printing does not. So the elements go straight to the
+   * writer as they are met, and a width — the one thing that needs a length before any byte is
+   * written — is answered by rendering once into a sink that counts and keeps nothing.
+   */
+  "a slice renders its elements" - {
+    "of a built-in" in {
+      run("var a = [1, 2, 3]\nprint(a[..])") shouldBe "[1, 2, 3]\n"
+    }
+
+    "of strings, which are not scalars" in {
+      run("var a = [\"a\", \"b\"]\nprint(a[..])") shouldBe "[a, b]\n"
+    }
+
+    // The bound is doing the work: `Rect` renders by its own `impl` and nothing about slices knows
+    // that, so an element type the library never heard of goes through the same one block.
+    "of a user type, through that type's own impl" in {
+      run("""struct Rect
+            |    w: int
+            |    h: int
+            |impl Display for Rect
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_str("a rect", out, fmt)
+            |var r = [Rect(3, 4), Rect(1, 2)]
+            |print(r[..])""".stripMargin) shouldBe "[a rect, a rect]\n"
+    }
+
+    // The impl satisfies its own bound, so a slice is an element type like any other.
+    "of slices, which is the impl reaching itself" in {
+      run("var n = [[1, 2][..], [3, 4][..]]\nprint(n[..])") shouldBe "[[1, 2], [3, 4]]\n"
+    }
+
+    "with no elements at all" in {
+      run("var e: [0]int = []\nprint(e[..])") shouldBe "[]\n"
+    }
+
+    "and reached through an ordinary bound, not only through print" in {
+      run("show[T: Display](x: T) = print(x)\nvar a = [1, 2, 3]\nshow(a[..])") shouldBe "[1, 2, 3]\n"
+    }
+
+    "and through str, which is the other sink" in {
+      run("var a = [1, 2, 3]\nprint(str(a[..]) + \"!\")") shouldBe "[1, 2, 3]!\n"
+    }
+
+    /** `14 §2`'s rule — a specifier describes the field the **whole** value occupies — which for a
+     * slice is the part that cannot be done in one pass. The width is 14 and the rendering is 9
+     * bytes, so five spaces land on whichever side the justification says; getting the count wrong
+     * in either direction moves them.
+     */
+    "padded as one field, on the right" in {
+      run("var a = [1, 2, 3]\nprint(f\"[${a[..]}%14s]\")") shouldBe "[     [1, 2, 3]]\n"
+    }
+
+    "and on the left" in {
+      run("var a = [1, 2, 3]\nprint(f\"[${a[..]}%-14s]\")") shouldBe "[[1, 2, 3]     ]\n"
+    }
+
+    // The counting pass measures what the second pass writes, so an element whose rendering is not
+    // its own length — a user type whose text is nothing like its fields — still pads correctly.
+    "including where an element's text is unrelated to its value" in {
+      run("""struct Rect
+            |    w: int
+            |    h: int
+            |impl Display for Rect
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_str("a rect", out, fmt)
+            |var r = [Rect(3, 4)]
+            |print(f"[${r[..]}%12s]")""".stripMargin) shouldBe "[    [a rect]]\n"
+    }
+
+    // A fixed array is not a slice, and the diagnostic says which block covers what and why this
+    // value fails it rather than telling the reader to write an `impl` that would be refused.
+    "while a fixed-size array is not one, and is told so" in {
+      err("var a = [1, 2, 3]\nprint(a)") should include("nothing renders a [3]int")
+    }
+
+    // The element type is where the bound bites, and the message names the element rather than the
+    // slice — which is the part a reader can act on.
+    "and a slice of something unprintable names the element" in {
+      err("""struct P
+            |    v: int
+            |var p = [P(1)]
+            |print(p[..])""".stripMargin) should
+        include(s"the 'impl' that covers it asks '${lib("Display")}' of P, which does not implement it")
+    }
+
+    /** The block that made this land: a program's own `override` beats the library's block for one
+     * element type, which is the case `02 § override` was written for and the reason this feature
+     * waited on it. Every `impl Display for []N` in the tree became an `override impl` the day the
+     * library grew one for every slice.
+     */
+    "and a program may override it for a slice of its own type" in {
+      run("""struct P
+            |    v: int
+            |override impl Display for []P
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_str("points", out, fmt)
+            |var p = [P(1), P(2)]
+            |print(p[..])""".stripMargin) shouldBe "points\n"
     }
   }
 

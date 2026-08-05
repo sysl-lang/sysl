@@ -192,6 +192,32 @@ class CapabilityClauseTests extends AnyFreeSpec with RunSupport with CodegenSupp
 
   "'no alloc' leaves the whole no-alloc subset alone" - {
 
+    /** Printing a slice, which is the reason its `Display` writes elements straight through rather
+     * than gathering them. Gathering would have been the shorter block, and it would have put an
+     * allocation on the one path an embedded target actually takes — where the point of printing
+     * here is that it needs none.
+     *
+     * **Only the unpadded form is reachable under the clause**, and not because of anything slices
+     * do: a width can only be written in an interpolation, and an interpolation joins strings, which
+     * is refused here on its own account. So the width path is pinned in `DisplayRunTests` instead.
+     * That does not make the counting sink idle — it is what keeps the width working *without*
+     * putting a buffer in the impl, which would have cost this test its subject.
+     */
+    "printing a slice" in {
+      runOf(
+        "thing/a.sysl" ->
+          """module thing
+            |@no_alloc
+            |
+            |show(xs: []int) = print(xs)
+            |""".stripMargin,
+        "main.sysl" ->
+          """var a: [3]int = [4, 5, 6]
+            |thing.show(a[0..<3])
+            |""".stripMargin,
+      ) shouldBe "[4, 5, 6]\n"
+    }
+
     "raw pointers, fixed arrays, and views of them" in {
       runOf(
         "thing/a.sysl" ->

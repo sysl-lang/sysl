@@ -225,19 +225,23 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
             |""".stripMargin) should include("so this one has no home")
     }
 
+    // The trait is `Hash` rather than `Display`, which this used to be written with: the library now
+    // implements `Display` for every slice, so a block naming it is stopped by the overlap one check
+    // earlier and never reaches coherence. `Hash` is a library trait with no block for slices, which
+    // is what leaves coherence the thing being tested.
     "and so is a slice, whose element settles nothing when it is a built-in too" in {
-      err("""impl Display for []int
-            |    display(self, out: *Writer, fmt: FormatSpec) = out.write("x".bytes)
+      err("""impl Hash for []int
+            |    hash(self) -> u64 = 1u64
             |print(1)
             |""".stripMargin) should include("nothing in '[]int' is declared outside the library")
     }
 
     // A shape's parameter stands for no declaration, so a block over every slice at once names
-    // nothing local however its bound is written — which is what puts `Display` for every slice out
-    // of a program's reach and leaves it the library's.
+    // nothing local however its bound is written — which is what puts a library trait for every
+    // slice out of a program's reach and leaves it the library's.
     "a shape over the library's own trait has no home either" in {
-      err("""impl[T: Display] Display for []T
-            |    display(self, out: *Writer, fmt: FormatSpec) = out.write("x".bytes)
+      err("""impl[T: Hash] Hash for []T
+            |    hash(self) -> u64 = 1u64
             |print(1)
             |""".stripMargin) should include("nothing in '[]T' is declared outside the library")
     }
@@ -267,10 +271,14 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     // The half `02` left to the implementation to settle: a composed type is the module's when
     // anything named in it is. Without it a module could not print a slice of its own struct, and
     // the compiler's own advice would name a block the rule then refused.
+    //
+    // It says `override` because the library covers every slice now — coherence is still what is
+    // being tested, and what the keyword shows is that the two rules are separate: coherence gives
+    // the block a home, and `override` settles which of two blocks with a home answers.
     "and a type of the program's own inside the subject is enough" in {
       run("""struct P
             |    v: int
-            |impl Display for []P
+            |override impl Display for []P
             |    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.len), out, fmt)
             |var a = [P(1), P(2)]
             |print(a[0..])
@@ -280,7 +288,7 @@ class ImplShapeErrorTests extends AnyFreeSpec with CodegenSupport with RunSuppor
     "however deeply it is buried" in {
       ir("""struct P
            |    v: int
-           |impl Display for [][]P
+           |override impl Display for [][]P
            |    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.len), out, fmt)
            |print(1)
            |""".stripMargin) should include("@main")
