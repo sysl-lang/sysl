@@ -92,10 +92,10 @@ trait RunSupport extends Matchers { this: Assertions =>
     assume(Toolchain.clangAvailable, "clang not available")
 
     val sources = List(Source("<input>", src))
-    val result = PrebuiltStd.forHost match {
-      case Some((std, precompiled, archive)) =>
+    val result = prebuiltStd match {
+      case Some(Stdlib.Resolved(std, precompiled, Some(archive))) =>
         Toolchain.compileAndRunFully(sources, Nil, args.toList, Some(std), precompiled, List(archive))
-      case None =>
+      case _ =>
         Toolchain.compileAndRunFully(sources, Nil, args.toList, None, Set.empty, Nil)
     }
 
