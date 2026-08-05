@@ -314,6 +314,37 @@ jar order, quietly, and the program that results is one somebody has to bisect t
 **Collisions include the consumer's own modules**, which is in fact the common case: a project with a
 `json/` directory at its root and a dependency preferring `json` is not an exotic scenario.
 
+### A package may namespace itself, and the published ones do
+
+Everything above is about what the **tool** may impose, and the answer there is nothing: a mandatory
+prefix would make every import line differ from the library's own documentation, which is the tax
+this section refuses to levy. It says nothing about what a package may choose for **itself**.
+
+A package's top-level directories are its modules, so a package that wants a namespaced name simply
+has namespaced directories. The packages published under `sysl-lang` do exactly that, by convention
+rather than by rule:
+
+```
+sh/sysl/monocypher/         →  module sh.sysl.monocypher
+    monocypher.sysl
+```
+
+`sh.sysl.` is the reverse-DNS of `sysl.sh`, the same device Java and Scala use and for the same
+reason. A dotted module name is a directory path (`13 §1`), so the prefix costs three directories and
+nothing else — no new mechanism, and no change to anything in this chapter.
+
+**What it changes is how often `mount` is needed, which is close to never.** The escape hatch stays,
+because a convention only binds those who follow it and a dependency may still be a package that
+picked a bare name — but a consumer whose dependencies are all namespaced will not meet a collision,
+and will not meet the consumer's-own-module case either, since a project is unlikely to have an `sh/`
+directory of its own. The optional mount was the right call precisely because the common case can be
+arranged not to need it; this is a package author arranging that.
+
+**A convention, deliberately, and not a rule.** Enforcing it would be mandatory mounting wearing a
+different hat, and would refuse a perfectly good single-purpose package that wants a short name in a
+project that will never collide. What the chapter guarantees is that a collision is loud; what the
+convention does is make one unlikely.
+
 ### Identity is two-layered, and the mount is not the identity
 
 **The mount name cannot be what the symbol mangler uses.** Mounts are per-consumer, so if one
