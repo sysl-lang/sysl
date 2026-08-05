@@ -32,7 +32,7 @@ a local binding that gives a second name to storage something else already owns.
 - **[The tour](https://sysl.sh/tour/)** — the language and its standard library in one
   pass, from `print` to a program that reads its input. Every program on those pages is compiled and
   run by the test suite, so a page that has drifted from the compiler fails the build.
-- **[`docs/design/`](docs/design/)** — the numbered specification. The language is designed in
+- **[`design/`](design/)** — the numbered specification. The language is designed in
   writing before it is implemented, and each chapter carries the argument for its rules along with
   the alternatives that were rejected.
 - **[`guide/`](guide/)** — complete working programs at the size where the choices start to matter.
@@ -77,12 +77,12 @@ in the binding and travels in the artifact.
 
 **The SQLite binding used to live here and now has a repository of its own** —
 [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3), the first sysl package outside this tree
-(`docs/design/packages.md`). It moved because a binding to a library nobody is obliged to have
+(`design/packages.md`). It moved because a binding to a library nobody is obliged to have
 installed is a *package*, not an example, and keeping it here made the compiler's own suite depend on
 SQLite being present.
 
 A program's own unit tests are `@test` functions written beside what they test, and `sysl test` is
-what runs them (`docs/design/testing.md`):
+what runs them (`design/testing.md`):
 
 ```bash
 sbt "syslJVM/run test guide/ring"                  # every @test under a directory

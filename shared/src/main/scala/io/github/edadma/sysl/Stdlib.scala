@@ -77,6 +77,135 @@ final class Stdlib(val units: List[Program]) {
 
 object Stdlib {
 
+  /** Which standard module a compilation is to be given.
+   *
+   * The three ways are not variations on a setting — they are three different sources, and which one
+   * a compilation used decides what its diagnostics can say and whether anything is linked. They are
+   * a type rather than a set of flags so that a caller cannot ask for two at once: naming an
+   * artifact *and* refusing all of them is a command line with no reading, and it is refused by the
+   * driver today with a message saying exactly that.
+   */
+  enum Choice {
+
+    /** Compile the library's source into the program. What `--no-std-lib` asks for, and what
+     * `build-lib --std` has to use, since it is the command that produces the artifact.
+     */
+    case FromSource
+
+    /** A prebuilt artifact somebody named. Never rebuilt and never fallen back from — someone who
+     * wrote down which artifact to use is owed the truth about that one.
+     */
+    case Artifact(path: String)
+
+    /** The path both ends agree on, built there when what is there is not one. `search` overrides
+     * where that is; `None` means the default, which is keyed by a fingerprint of the library and so
+     * cannot be computed until the library has been found.
+     */
+    case Default(search: Option[String] = None)
+  }
+
+  /** A standard module a compilation can be given: the trees to compile against, the symbols its
+   * object half already defines, and the archive to link them from.
+   *
+   * The archive is `None` where there is nothing to link — the library was compiled in rather than
+   * linked, so its bodies are in the program's own IR.
+   */
+  case class Resolved(std: Stdlib, precompiled: Set[String], archive: Option[String])
+
+  /** The standard module for a target, however the caller wants it found.
+   *
+   * **This is the entry point anything embedding the compiler wants**, and it is here rather than in
+   * the driver because it is not a property of a command line: a test suite, a documentation
+   * harness and `sysl build` all need the same answer to the same question, and answering it three
+   * ways is how the three drift.
+   *
+   * Every branch reads the library's source — two compile it and the third checks a prebuilt
+   * artifact against a fingerprint of it — so a compiler that cannot find its library fails here,
+   * once, with the diagnostic naming where it looked, rather than at whichever branch happened to
+   * touch `Std.sources` first, where it would arrive as an exception.
+   */
+  def resolve(choice: Choice, target: Target): Either[String, Resolved] =
+    Std.root.flatMap: _ =>
+      choice match
+        case Choice.FromSource      => Right(Resolved(fromSource(target), Set.empty, None))
+        case Choice.Artifact(named) => load(named, target)
+        case Choice.Default(search) =>
+          val path = search.getOrElse(LibraryArtifact.stdDefault)
+
+          resolved.synchronized(resolved.getOrElseUpdate((path, target), found(path, target)))
+
+  /** The default path's answer, kept — for the reason `fromSource`'s copy is kept, and with the same
+   * lock: a caller that resolves repeatedly would otherwise decode an unchanged artifact each time,
+   * and a suite that compiles hundreds of programs is exactly such a caller.
+   *
+   * **Only the default path is memoized, and the key is what makes that safe.** The path is
+   * `<cache>/sysl/<fingerprint>/std.syslib`, so a change to the library changes the *path* rather
+   * than the file — a stale answer under one key is not reachable. A **named** artifact is
+   * deliberately not kept: someone who wrote down which artifact to use may be rebuilding it, and
+   * answering from memory would hand them the one they replaced.
+   */
+  private val resolved = collection.mutable.Map.empty[(String, Target), Either[String, Resolved]]
+
+  /** The standard module at the path both ends agree on, **built there when what is there is not
+   * one.**
+   *
+   * The artifact is a *derived* file: it is object code for one machine, it is not committed, and
+   * every byte of it is computed from the library source the compiler already carries. So the states
+   * it can be found in — absent after a clone or a fresh worktree, and stale after any change to the
+   * tree encoding or the container — are not questions to put to whoever ran the compiler. They have
+   * one answer, the compiler can produce it in well under a second, and it is the same answer every
+   * time.
+   *
+   * **This is not the silent fallback the design refuses**, and the distinction is the whole of why
+   * it is allowed. What is refused is compiling against a *different* standard module than the one
+   * asked for — answering "I could not find your library" by quietly using another. A rebuild
+   * answers with **this** library: the sources are the ones the compiler carries, `read` holds the
+   * result to `Std.fingerprint` on the way back in, and a program compiled after it is compiled
+   * against exactly what it would have been compiled against had the artifact been there. Nothing is
+   * substituted, so there is nothing for a reader to be misled about.
+   *
+   * It says so on stderr rather than doing it invisibly. The work is a second of someone's time and
+   * the line is what makes a slow first build explicable instead of mysterious.
+   *
+   * **A rebuild that cannot happen reports the original problem, not its own.** Without a toolchain
+   * there is no artifact to make, and what the reader needs then is the sentence naming the command
+   * and the flag — the same one they would have got before — with the reason the compiler could not
+   * do it for them appended.
+   */
+  private def found(path: String, target: Target): Either[String, Resolved] = {
+    val already = if isFile(path) then load(path, target) else Left(s"$path does not exist")
+
+    already match
+      case Right(got) => Right(got)
+      case Left(why) =>
+        Console.err.println(s"building the standard module at $path ($why)")
+
+        writeArtifact(path, target) match
+          case Right(_) => load(path, target)
+          case Left(err) =>
+            Left(s"cannot find or build the standard module — build it with " +
+              s"'sysl build-lib lib --std', or pass --no-std-lib to compile against the copy built " +
+              s"into the compiler ($err)")
+  }
+
+  /** A prebuilt standard module read back: the trees to compile against, the symbols its object half
+   * already defines, and the archive to link that half from — which is the file itself, since it is
+   * already the archive the linker wants.
+   *
+   * Every way this can go wrong — a file that is not ours, one built by another sysl, one built from
+   * other sources than the compiler carries, a tree that will not decode — is a failure of the same
+   * kind as not finding it at all, and is reported rather than worked around. A standard module that
+   * cannot be read is not a standard module.
+   */
+  private def load(path: String, target: Target): Either[String, Resolved] = {
+    val bytes =
+      try readBytes(path)
+      catch case e: Exception => return Left(s"cannot read $path: ${e.getMessage}")
+
+    LibraryArtifact.metadataOf(path, bytes).flatMap(meta =>
+      read(path, meta, target).map((std, symbols) => Resolved(std, symbols, Some(path))))
+  }
+
   /** The library **parsed from its source**, as a given target sees it — the standard module the
    * long way round, and what an unusable artifact at the default path is rebuilt *from* rather than
    * replaced by (`Main.foundStd`). Reached directly only by `--no-std-lib`.

@@ -165,7 +165,7 @@ You have seen the whole language. What is left is depth:
   `for`, what `?` does to a `&T` payload, which slice forms exist.
 - **The [library](/library/)** documents each module the table in
   [modules](/tour/modules/) named, one page each, down to what a `no alloc` program may reach.
-- **The design chapters** in `docs/design/` are the specification — every rule in this tour is stated
+- **The design chapters** in the compiler's `design/` are the specification — every rule in this tour is stated
   there with the argument for it, including the alternatives that were rejected and why.
 - **The [guide programs](/guides/)** are fourteen complete programs at the size where the choices
   start to matter — a JSON parser, a scheduler, SHA-2, a slab allocator, a ring buffer, a datetime

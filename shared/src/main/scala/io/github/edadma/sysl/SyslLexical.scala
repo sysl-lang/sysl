@@ -219,7 +219,7 @@ class SyslLexical
     case _              => false
 
   /** Materializes the token stream with each token's source position, so the parser can
-   * memoize over a fixed `List` (not the stateful scanner — see docs/design/front-end.md)
+   * memoize over a fixed `List` (not the stateful scanner — see design/front-end.md)
    * yet still report where a parse error occurred.
    */
   def scanPositioned(s: String): List[(Token, Position)] = {

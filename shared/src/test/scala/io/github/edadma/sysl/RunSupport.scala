@@ -11,19 +11,27 @@ import org.scalatest.matchers.should.Matchers
  */
 trait RunSupport extends Matchers { this: Assertions =>
 
-  /** Every run-tier compilation, in one place, against the **prebuilt** standard module
-   * (`PrebuiltStd`) where the toolchain can build one.
+  /** Every run-tier compilation, in one place, against the **prebuilt** standard module where the
+   * toolchain can build one.
    *
    * That is the compilation an ordinary `sysl build` performs: the library's determined half is
    * linked from the artifact rather than emitted into this program and handed to clang again. Absent
    * a toolchain there is no artifact and this is the compilation the suite has always done — which is
    * the case the `assume` above each helper has already cancelled for.
+   *
+   * It goes through `Stdlib.resolve`, which is the call the driver itself makes, rather than through
+   * a routine of the suite's own — so a test is compiled against the artifact an ordinary build
+   * would find, at the path an ordinary build would find it, and a change to how one is made cannot
+   * reach the compiler without reaching the suite.
    */
+  protected def prebuiltStd: Option[Stdlib.Resolved] =
+    Stdlib.resolve(Stdlib.Choice.Default(), Target.default).toOption
+
   private def compiled(sources: List[Source], args: List[String]): Either[String, (Int, String)] =
-    PrebuiltStd.forHost match {
-      case Some((std, precompiled, archive)) =>
+    prebuiltStd match {
+      case Some(Stdlib.Resolved(std, precompiled, Some(archive))) =>
         Toolchain.compileAndRun(sources, Nil, args, Some(std), precompiled, List(archive))
-      case None =>
+      case _ =>
         Toolchain.compileAndRun(sources, Nil, args, None, Set.empty, Nil)
     }
 
