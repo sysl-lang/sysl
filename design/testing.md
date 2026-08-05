@@ -55,17 +55,23 @@ a_broken_promise() = …
 an_index_past_the_end() = …
 ```
 
-`#` is the language's first attribute and for now its only one; a word after it that is not
-`test` is answered by name rather than as grammar. It is deliberately *not* a general
-mechanism yet — the two that will make it one are `packed` (`15 §1`) and the alignment
-attribute `00 § Open` wants, and neither is designed. The attribute goes on its own line above
-an ordinary function declaration, which may still be `private`.
+`@test` was the language's first attribute and is no longer its only one — `@tailrec`, `@pure` and
+`@ghost` are the other three a declaration takes, and `@no_<capability>`, `@requires(...)` and
+`@link("...")` are the file-header three (`13 §4`). A word after `@` that is none of them is answered
+by name rather than as grammar, and the message says which of the two lists it was looking in. The
+attribute goes on its own line above an ordinary function declaration, which may still be `private`.
 
-**A conditional-compilation directive also starts with `#`** (`targets.md § Conditional
+What stays true is that this is *not* a general extension mechanism: the set is closed and each
+member was added deliberately. The two that would make it general are `packed` (`15 §1`) and the
+alignment attribute `00 § Open` wants, and neither is designed.
+
+**A conditional-compilation directive starts with `#` instead** (`targets.md § Conditional
 compilation`), and the two never meet: a directive sits at the margin and is gone before the lexer
 runs, while an attribute is indented with the declaration it is on and reaches the grammar as one.
-The words tell them apart in any case — `test` is not one of `if` / `elif` / `else` / `endif`. A
-`@test` inside a gated-out branch is simply not there, so a test build has the tests its target has.
+**`#test` is refused by name**, because `#` is the sigil a reader arriving from Rust or C reaches for
+first, and being told the annotation is written `@test` is more use than being told a directive word
+is unknown. A `@test` inside a gated-out branch is simply not there, so a test build has the tests its
+target has.
 
 **A test is an ordinary function with a caller nothing else has.** No parameters, no result,
 not generic — all three are the same requirement from different sides, since the runner calls

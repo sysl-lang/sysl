@@ -172,13 +172,25 @@ carries the dependency.
 An `invariant` written at the top level of a file is a predicate over the module's own state:
 
 ```
-module counter
-
-var count: int = 0
-var limit: int = 100
+static var count: int = 0
+static var limit: int = 100
 
 invariant count >= 0 && count <= limit
 ```
+
+**This example used to be written under a `module counter` header with two plain `var`s, and neither
+line compiles that way** — which is worth recording rather than quietly correcting, because it is the
+gap the section rests on. A `var` at the top level of *any* file is a statement, so a file that names
+a module may not carry one at all; and `static` is refused there too, since it asks for the module
+instead of the *body* and a module file has no body to be asking about. **So mutable module storage
+is reachable in the entry file and nowhere else.** `13 §7` is consistent about this and never claimed
+otherwise; the example here was written to what the section wanted rather than to what §7 gives.
+
+That narrows this section's reach considerably and does not change its design. **Whether a module
+file should be able to declare mutable storage is a language question and an open one** — it is the
+same question `13 § Open c` and `§ Open f` circle from the visibility side, and the answer decides
+whether a module invariant is a general facility or an entry-file one. Both spellings are pinned in
+`ModuleTests` so that whichever way it goes, the change is visible.
 
 No new word: this is the word `16 §6` already gives a struct, meaning the same thing one level out. A
 struct invariant is a property of a struct's fields that every operation on the struct preserves; a
@@ -263,12 +275,18 @@ that less mechanical than it looks.
 
 ## 7. `@reads` and `@writes`
 
-**Specified and not built, for `§5`'s reason and by the same dependency** — a frame names module-level
-mutable variables and sysl has none. The one thing that comes close is an `extern` variable (`12 §1`),
-which really is module-level storage a function can reach; a frame over `errno` and `optind` alone
-would be a real feature and a very small one, and it would not be the feature this section describes,
-because what a prover needs a frame *for* is reasoning about the module's own state across a call.
-So this waits with `§5`.
+**Specified and not built — and it is no longer waiting on anything.** This section used to say sysl
+had no module-level mutable variables for a frame to name. It has them: `13 §7`'s `static var` is
+built, and `§5` above says so. What is left is the work, and there is no decision in front of it,
+which makes this the most build-ready item in the chapter.
+
+Two things bound what it would cover, and both come from `§5`'s finding rather than from this
+section. The storage a frame could name is the **entry file's**, since that is where a `static var`
+may be written — so a frame is as general as module state is, and today that is less general than
+this section's prose assumes. And an `extern` variable (`12 §1`) is module-level storage a function
+can reach without being module state in the sense a prover wants: a frame over `errno` and `optind`
+would be a real feature and a very small one, and it is not the feature described here, because what
+a prover needs a frame *for* is reasoning about the module's own state across a call.
 
 The looser sibling: a function that is not pure, but that says which module-level variables it
 touches.
@@ -499,8 +517,8 @@ annotation — `@ghost` sits above a declaration exactly as `@test` does — and
 the spelling, the erasure is wider: a declaration to drop, every assignment into it to drop, and a
 read from executable code to refuse. What it buys is a specification that can talk about *history* —
 how many times something happened, what the input looked like before the loop started — which no
-predicate over the current state can say. A module-level ghost variable additionally waits on
-`§ Open f` like everything else module-scoped.
+predicate over the current state can say. A module-level ghost variable reaches as far as module
+state does, which `§ Open f` now says is the entry file rather than any module.
 
 **h. Annotating the library, and what a generic function's purity even means.** `pow[T: Mul]` is pure
 at `int`, where `Mul` is an instruction, and its purity at some other `T` is a question about that
@@ -519,13 +537,22 @@ function a name and recursion, which is exactly what this clause is for, and wha
 environment argument to be skipped when the measure's parameters are matched to the call's arguments.
 Both are refused today with one message that names both.
 
-**f. `§5` and `§7` wait on `13`'s module-state spelling, and that is the biggest single dependency in
-this chapter.** Both are predicates over a set the language cannot yet name. It is worth saying which
-way the dependency runs: this chapter does not need a *particular* spelling, only that one exists —
-whichever of `13`'s three candidates is taken, an invariant reads the names and a frame lists them.
-So nothing here should be used as an argument for one form over another. What this chapter does add
-to `13`'s case is a second customer beside `guide/slab`: an allocator wants module state, and a
-verifier wants to say what a function does to it.
+**f. ~~`§5` and `§7` wait on `13`'s module-state spelling.~~ The spelling arrived — `static var` —
+and what is left is narrower and sharper than the dependency it replaces.** This item used to be the
+biggest in the chapter, on the grounds that both sections were predicates over a set the language
+could not name. It can name one now, and the argument recorded here held: the chapter never needed a
+*particular* spelling, only that one exist, and an invariant reads the names and a frame lists them
+whichever form was taken. The second customer this offered beside `guide/slab` is also discharged —
+an allocator wanted module state, a verifier wanted to say what a function does to it, and the
+declaration serves both.
+
+**What replaces it is two questions, and only the first is a decision.** A `static var` may be
+written in the entry file and nowhere else (`§5`), so module state is real but confined, and whether
+a module file should be able to declare mutable storage is the language question this chapter now
+waits on rather than the spelling one. And a **public** `static var` is writable from outside the
+module with no check anywhere, which is `§5`'s own open question — the invariant is checked on return
+from the module's public functions, and that is complete exactly when they are the only writers.
+Narrowing the visibility answers it; so would checking at the write; neither is chosen here.
 
 **e. A quantifier over something other than an integer range.** `for all x in a do P(x)` over a `[]T`
 is the form most specifications want, and it is not offered — the range form is, and an index has to

@@ -286,9 +286,13 @@ the trees a library ships are now a per-target answer. `13 §8` has the rest.
 
 ## Open
 
-- **The project config — now designed in `packages.md`, and unbuilt.** `package.hocon` carries
-  per-target capability sets (`capabilities.md`'s `alloc` / `os` / `posix` / `threads`); filename-axis
-  platform selection is the part still unwritten. The registry here is the fixed table that config
+- **The project config — designed in `packages.md`, and built.** `package.hocon` carries
+  per-target capability sets (`capabilities.md`'s `alloc` / `os` / `posix` / `threads`), and they are
+  parsed and enforced: a target that provides no allocator makes every module of the program
+  allocator-free with no clause written anywhere. **What is left open is filename-axis platform
+  selection**, and that alone — this item said "unbuilt" of the whole thing, five lines below a
+  header on this same page saying the capability sets were built, which is the ordinary way a status
+  claim written twice goes stale in one of its two places. The registry here is the fixed table that config
   extends, and deliberately does not try to be one: a target's *capabilities* are exactly the part
   a project has an opinion about. `packages.md § 2` states the boundary the other way round —
   **a config may add capabilities to a registry target, and may not overrule a measured ABI fact** —

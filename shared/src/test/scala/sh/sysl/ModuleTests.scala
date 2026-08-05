@@ -237,6 +237,28 @@ class ModuleTests extends AnyFreeSpec with ParseSupport with CodegenSupport with
       ) should include("may hold declarations only")
     }
 
+    // The same answer where the second file names a module, which is the case worth pinning
+    // separately: a `module` header is what makes every other declaration in a file the module's,
+    // so a reader may reasonably expect it to make a `var` module storage. It does not — the `var`
+    // is still a statement, and the file still may not carry one. Mutable module storage is
+    // reachable through `static var` in the entry file and nowhere else, which is a narrower surface
+    // than "a module's variables" suggests.
+    "including where that file names a module, which does not change what a 'var' is" in {
+      errIn(
+        ("", "main.sysl", "print(1)"),
+        ("counter", "c.sysl", "module counter\n\nvar count: int = 0"),
+      ) should include("may hold declarations only")
+    }
+
+    // And `static` is not the way in either: it asks for the module instead of the body, and a file
+    // with a header has no body for it to be asking about.
+    "and 'static var' is refused there too, so the module file has no spelling at all" in {
+      errIn(
+        ("", "main.sysl", "print(1)"),
+        ("counter", "c.sysl", "module counter\n\nstatic var count: int = 0"),
+      ) should include("this file has no such body")
+    }
+
     "though a file of nothing but declarations is never the one that runs" in {
       runOf(
         "a.sysl" -> "f() -> int = 1",

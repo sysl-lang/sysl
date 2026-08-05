@@ -288,14 +288,18 @@ Most of this the existing syntax already enforces, and nothing changes:
   inference: the signature is complete as written either way, and a reader never has to consult a
   body to learn what a function returns.
 
-So the rule **binds nowhere today**, and that is worth saying plainly rather than leaving as an
-apparent gap. The one declaration whose type could be inferred is a top-level `var`, and §7 settles
-what one of those is: a local of the program's entry point, scoped to it and initialized in its
-order, not a member of the module its file contributes to. It is therefore not visible outside its
-file to begin with, carries no visibility modifier, and has nothing for this rule to hold it to. The
-rule binds the moment a **module-level binding** exists — a `var` that is a member of its module,
-which is a different declaration from the one written today — and it is stated here so that the
-question is already settled when that arrives.
+**So the rule binds in exactly two places, and both are §7's module storage.** A module-level `val`
+and a `static var` are the declarations whose types could have been inferred from their initializers
+and are not: each is refused without one, by name. This paragraph used to say the rule bound
+*nowhere* — that a top-level `var` was only ever a local of the entry point, so nothing was left for
+the rule to hold — and it was written before `static` existed. The moment a binding could be a
+member of its module, the rule it was stated in advance for started binding, which is what stating it
+in advance was for.
+
+**It bites harder on the `var`**, and that is the case worth having written the rule down for: a
+`static var`'s initializer **may be absent** (§7), so there is not merely a value the rule declines
+to read, there is often no value at all. `static var slot: int` is a complete declaration of storage
+and the type is the only thing that says what storage.
 
 **Why: it makes interface extraction parse-only.** A file's exported surface can then be read off
 its syntax tree — without resolving a name, checking a body, or having compiled anything the file

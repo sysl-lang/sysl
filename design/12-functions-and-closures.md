@@ -1321,6 +1321,8 @@ it is reaching. This is object safety in the shape `02` already gives it, alongs
   `capabilities.md` exists to gate, and a freestanding `no alloc` target's externs are a different
   set from a hosted one's. Which capability an extern requires — and whether that is a property of
   the declaration or of the module — is still open, but **no longer for want of the mechanism**: the
-  clause is built, and `no alloc` is checked over the module graph. What is left is the decision, and
-  behind it the target half — a build cannot yet refuse a program for the machine it is for, which is
-  what would give the gate teeth.
+  clause is built, and `no alloc` is checked over the module graph. **The target half is built too**,
+  which this item used to name as the missing teeth: `package.hocon` carries per-target capability
+  sets, and a target that provides no allocator makes every module of the program allocator-free with
+  no clause written anywhere (`packages.md §2`). So a build already refuses a program for the machine
+  it is for. What is left is the decision alone.
