@@ -359,12 +359,35 @@ class LibraryCliTests extends LibraryCliSupport {
        * its shape and the one property a caller depends on, never a path from this author's laptop. */
 
       "and it is keyed by the library, so a compiler carrying another one cannot collide with it" in {
-        // The claim that makes an upgrade need no cache invalidation: the key is a fingerprint of the
-        // library's contents, so a changed `lib/sysl` *is* a different path rather than a stale hit
-        // at the same one. Version-keying would have relied on remembering to bump the version.
+        // The key is a fingerprint of the library's contents, so a changed `lib/sysl` *is* a
+        // different path rather than a stale hit at the same one.
         assume(cacheDirectory.isDefined, "this machine has no cache directory")
 
         LibraryArtifact.stdDefault should include(Std.fingerprint)
+      }
+
+      "and by the compiler too, so an upgrade cannot read back what its predecessor built" in {
+        // The half the fingerprint cannot cover. An artifact is compiled code, so a release that
+        // changes what the library lowers to while editing none of its source produces different
+        // bytes at an identical fingerprint -- and the upgrade silently keeps the old ones.
+        //
+        // The regression is 0.0.5 -> 0.0.6: the fix stopped the object half defining `sysl$stdout`
+        // and touched no `lib/sysl` file, so every machine that had run 0.0.5 would have gone on
+        // linking against an artifact that still defined it. Keyed on the library alone, that is a
+        // release which changes nothing for the people it is for.
+        assume(cacheDirectory.isDefined, "this machine has no cache directory")
+
+        LibraryArtifact.stdDefault should include(BuildInfo.version)
+      }
+
+      "and names them in one path, both halves, in that order" in {
+        // Pinned whole rather than by two `include`s, because what matters is that the two are one
+        // directory: a layout putting them in separate segments would satisfy both assertions above
+        // and give each release its own tree of every library it ever saw.
+        assume(cacheDirectory.isDefined, "this machine has no cache directory")
+
+        LibraryArtifact.stdDefault shouldBe
+          s"${cacheDirectory.get}/sysl/${BuildInfo.version}-${Std.fingerprint}/std${LibraryArtifact.extension}"
       }
 
       "and it sits under the cache directory rather than in the project" in {

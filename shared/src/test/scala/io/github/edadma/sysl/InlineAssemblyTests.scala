@@ -417,6 +417,42 @@ class InlineAssemblyTests extends AnyFreeSpec with Matchers with CodegenSupport 
       out should not include "\"spot: nop"
     }
 
+    "a label that only looks like another is left alone" in {
+      // The boundary rule, at the level of the function rather than through a compilation, because
+      // what is being pinned is which occurrences count as whole ones -- and a program cannot easily
+      // be made to contain every neighbouring case at once.
+      //
+      // This is where the renaming stopped being a regex. The natural spelling uses lookbehind and
+      // lookahead, which Scala Native's RE2-derived engine rejects outright, so the compiler that
+      // ships threw `PatternSyntaxException` on any assembly carrying a label while the JVM build
+      // this suite normally runs on was perfectly happy. These cases hold the replacement to the
+      // same semantics now that it is a scan.
+      Asm.uniquifyLabels(List("spot: nop", "jmp spot"), 7) shouldBe
+        List("spot.7: nop", "jmp spot.7")
+
+      // A longer name merely starting with the label, and one merely ending with it.
+      Asm.uniquifyLabels(List("spot: nop", "jmp spotless", "jmp respot"), 7) shouldBe
+        List("spot.7: nop", "jmp spotless", "jmp respot")
+
+      // The characters that continue a name are `[A-Za-z0-9_.$]`, so each of them guards an
+      // occurrence -- including the dot and the dollar, which begin ordinary label names.
+      Asm.uniquifyLabels(List("spot: nop", "jmp spot.other", "jmp x$spot", "jmp spot_2"), 7) shouldBe
+        List("spot.7: nop", "jmp spot.other", "jmp x$spot", "jmp spot_2")
+
+      // And a separator that is not one of them does not guard it: two references on one line both
+      // move, which is the case a scan that forgot to keep going after a match would get wrong.
+      Asm.uniquifyLabels(List("spot: nop", "jmp spot, spot"), 7) shouldBe
+        List("spot.7: nop", "jmp spot.7, spot.7")
+    }
+
+    "two labels sharing a prefix are renamed apart" in {
+      // Renaming is a fold over the defined names, so each pass runs over what the previous one
+      // produced. `spot` is a prefix of `spot2`, and the rename of `spot` inserts a dot -- which is
+      // a name character. Getting this wrong turns `spot2` into `spot.7 2` or renames it twice.
+      Asm.uniquifyLabels(List("spot: nop", "spot2: nop", "jmp spot", "jmp spot2"), 7) shouldBe
+        List("spot.7: nop", "spot2.7: nop", "jmp spot.7", "jmp spot2.7")
+    }
+
     "an operand named twice in one template is one operand, at one number" in {
       val src =
         s"""f(n: int)

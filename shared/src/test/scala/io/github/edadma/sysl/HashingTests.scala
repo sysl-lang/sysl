@@ -133,6 +133,26 @@ class HashingTests extends AnyFreeSpec with Matchers {
       hashOf(cloned) shouldBe hashOf(bare)
     }
 
+    // The hash covers what the package *is*, not the part of it a compiler happens to parse. A
+    // package's C is compiled and linked into whoever depends on it (`15 §7`), so a listing that
+    // took only `.sysl` would let a shim be swapped under a `sysl.sum` that still verified — and
+    // that is the one file in a package that can reach a system call without a line of sysl saying
+    // so. `packages.md § 6` is only worth what it covers.
+    "a C file beside the sysl, which is as much of the package as the sysl is" in {
+      val one = treeOf("a.sysl" -> "one\n", "shim.c" -> "int f(void) { return 1; }\n")
+      val two = treeOf("a.sysl" -> "one\n", "shim.c" -> "int f(void) { return 2; }\n")
+
+      hashOf(one) should not be hashOf(two)
+    }
+
+    // Nor is it a list of extensions that C was added to. Anything under the root is in, which is
+    // what makes the answer a property of the tree rather than of what a reader thought to name.
+    "and a file of no kind the compiler knows at all" in {
+      val bare = treeOf("a.sysl" -> "one\n")
+
+      hashOf(treeOf("a.sysl" -> "one\n", "NOTICE" -> "x\n")) should not be hashOf(bare)
+    }
+
     "a `.git` further down, which is a submodule's and is not this package's either" in {
       val bare   = treeOf("a.sysl" -> "one\n", "sub/b.sysl" -> "two\n")
       val nested = treeOf("a.sysl" -> "one\n", "sub/b.sysl" -> "two\n", "sub/.git/HEAD" -> "x\n")

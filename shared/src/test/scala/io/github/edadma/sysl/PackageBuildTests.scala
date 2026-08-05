@@ -16,13 +16,21 @@ import io.github.edadma.cross_platform.*
  */
 class PackageBuildTests extends PackageCacheSupport {
 
-  /** A package on disk: a manifest, and one module in a directory of its own. */
-  private def packageOf(name: String, module: String, text: String, deps: String = ""): String = {
+  /** A package on disk: a manifest, one module in a directory of its own, and whatever else it
+   * carries — which for the suite below is C, written at a path relative to the package root.
+   */
+  private def packageOf(name: String, module: String, text: String, deps: String = "",
+                        files: (String, String)*): String = {
     val root = createTempDirectory("sysl-pkg-")
 
     writeFile(s"$root/${PackageConfig.FileName}", manifest(name, "1.0.0", deps))
     createDirectories(s"$root/$module")
     writeFile(s"$root/$module/$module.sysl", s"module $module\n\n$text\n")
+
+    for (path, body) <- files do
+      Project.parentOf(s"$root/$path").foreach(createDirectories)
+      writeFile(s"$root/$path", body)
+
     root
   }
 
@@ -190,6 +198,109 @@ class PackageBuildTests extends PackageCacheSupport {
     val geom = packageOf("geom-lib", "geom", "double(n: int) -> int = n * 2")
 
     refused(app("""print(geom.triple(21))""", s"""g { path = "$geom" }""")) should include("triple")
+  }
+
+  /** `15 §7` from the consuming side: a package carries C, and a build against it compiles that C
+   * and links it.
+   *
+   * **This is the seam a whole release shipped without.** A package's `.sysl` compiled, its `.c` was
+   * dropped with nothing said, and the build ended at the linker naming symbols the package's own C
+   * defines — which made every package with a shim unusable as a dependency, and a shim is what a
+   * binding to a real library *is*. `packages.md § 7` had already promised the opposite in as many
+   * words, refusing build scripts on the grounds that sysl compiles a package's C declaratively.
+   *
+   * Nothing else in the suite could have caught it: every package above is pure sysl, so the walk
+   * that never looked for C was never asked a question it could get wrong.
+   */
+  "a package's C" - {
+
+    // The discriminating shape: seven is a number only the C knows, and the multiplication is only
+    // the sysl's. A build that dropped the C cannot print this, and neither can one that linked the
+    // C and lost the sysl.
+    val shim = "int geom_seven(void) { return 7; }\n"
+
+    val calling =
+      """extern "geom_seven" c_seven() -> int
+        |
+        |seven_times(n: int) -> int = c_seven() * n""".stripMargin
+
+    "is compiled and linked beside its sysl" in {
+      val geom = packageOf("geom-lib", "geom", calling, "", "geom/shim.c" -> shim)
+
+      run(app("""print(geom.seven_times(6))""", s"""g { path = "$geom" }""")) shouldBe "42\n"
+    }
+
+    // `15 §7` says *anywhere* in the tree, and the package root is the one place that declares no
+    // module — so a walk gathering C only where it found sysl would skip it.
+    "is found at the package root as well as beside a module" in {
+      val geom = packageOf("geom-lib", "geom", calling, "", "shim.c" -> shim)
+
+      run(app("""print(geom.seven_times(6))""", s"""g { path = "$geom" }""")) shouldBe "42\n"
+    }
+
+    // The trap the fix had to answer. Each package is staged into a directory of its own, so two
+    // files at one relative path stay two objects — where one shared staging area would have the
+    // second overwrite the first and the program lose whatever only the first defined.
+    "does not collide with another package's at the same relative path" in {
+      val one = packageOf("one", "left", """extern "one_util" c() -> int
+                                           |
+                                           |value() -> int = c()""".stripMargin,
+        "", "left/util.c" -> "int one_util(void) { return 40; }\n")
+
+      val two = packageOf("two", "left", """extern "two_util" c() -> int
+                                           |
+                                           |value() -> int = c()""".stripMargin,
+        "", "left/util.c" -> "int two_util(void) { return 2; }\n")
+
+      run(app("""print(left.value() + other.left.value())""",
+        s"""a { path = "$one" }, b { path = "$two", mount = "other" }""")) shouldBe "42\n"
+    }
+
+    // Every package the resolver selected is a tree, not only the ones the project named — so a
+    // binding two levels down is compiled on the same footing as one the manifest mentions. The
+    // consumer here never writes the word `bottom`.
+    "is compiled for a package the project never named itself" in {
+      val cache = emptyCache()
+      val at    = published(cache, "github.com/e/bottom", Version(1, 0, 0), manifest("bottom", "1.0.0"))
+
+      createDirectories(s"$at/bottom")
+      writeFile(s"$at/bottom/bottom.sysl",
+        "module bottom\n\nextern \"bottom_seven\" c() -> int\n\nseven() -> int = c()\n")
+      writeFile(s"$at/bottom/shim.c", "int bottom_seven(void) { return 7; }\n")
+
+      val middle = createTempDirectory("sysl-pkg-mid3-")
+
+      writeFile(s"$middle/${PackageConfig.FileName}",
+        manifest("middle", "1.0.0", """b { git = "github.com/e/bottom", version = "1.0.0" }"""))
+      createDirectories(s"$middle/middle")
+      writeFile(s"$middle/middle/middle.sysl",
+        "module middle\n\nsix_sevens() -> int = bottom.seven() * 6\n")
+
+      withCache(cache)(run(app("""print(middle.six_sevens())""", s"""m { path = "$middle" }"""))) shouldBe
+        "42\n"
+    }
+
+    // The other half of a binding: the C reaches its own library through a `@link` directive, and
+    // the directive is written in the package's header where nothing but the package could know it.
+    // Named after a library no machine has, so the observation is the same on every platform — the
+    // name reached a command line, which is all `15 §8` claims.
+    "carries its module's link directive to the command line" in {
+      val geom = packageOf("geom-lib", "geom",
+        "@link(\"sysl-no-such-library\")\n\nvalue() -> int = 42")
+
+      refused(app("""print(geom.value())""", s"""g { path = "$geom" }""")) should
+        include("sysl-no-such-library")
+    }
+
+    // The error path. A shim that will not compile is the package author's mistake and the consumer
+    // is the one who meets it, so the message has to name the file rather than report that a link
+    // went wrong somewhere.
+    "that will not compile stops the build, naming the file" in {
+      val geom = packageOf("geom-lib", "geom", calling, "", "geom/shim.c" -> "int geom_seven(void) { return\n")
+
+      refused(app("""print(geom.seven_times(6))""", s"""g { path = "$geom" }""")) should
+        include("shim.c")
+    }
   }
 
   "a project with no dependencies block is untouched by any of this" in {

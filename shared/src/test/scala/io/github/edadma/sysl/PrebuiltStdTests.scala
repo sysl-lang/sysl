@@ -37,7 +37,14 @@ class PrebuiltStdTests extends AnyFreeSpec with Matchers {
     "is built wherever a toolchain can build one" in {
       assume(Toolchain.clangAvailable, "clang not available")
 
-      Stdlib.resolve(Stdlib.Choice.Default(), Target.default) shouldBe Symbol("right")
+      // Matched rather than asserted with `shouldBe Symbol("right")`, which is what this was. That
+      // matcher reaches `isRight` by runtime reflection, and Scala Native has none -- so on the
+      // platform the compiler actually ships as, it compared an `Either` against a `Symbol` and
+      // failed however well resolution had worked. Matching also gets the reason into the failure,
+      // which a boolean assertion throws away.
+      Stdlib.resolve(Stdlib.Choice.Default(), Target.default) match
+        case Right(_) => succeed
+        case Left(e)  => fail(e)
     }
 
     "arrives with the archive to link it from" in {

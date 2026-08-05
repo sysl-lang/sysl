@@ -125,12 +125,51 @@ object Asm {
   def uniquifyLabels(lines: List[String], id: Int): List[String] = {
     val defined = lines.flatMap(l => LabelDef.findFirstMatchIn(l).map(_.group(1))).distinct
 
-    defined.foldLeft(lines) { (acc, name) =>
-      val bounded = s"(?<![A-Za-z0-9_.$$])${java.util.regex.Pattern.quote(name)}(?![A-Za-z0-9_.$$])".r
-
-      acc.map(l => bounded.replaceAllIn(l, java.util.regex.Matcher.quoteReplacement(s"$name.$id")))
-    }
+    defined.foldLeft(lines)((acc, name) => acc.map(rename(_, name, s"$name.$id")))
   }
+
+  /** Whether a character carries on a label name, and so means an occurrence of one is really part of
+   * something longer. Exactly `[A-Za-z0-9_.$]`, spelled out rather than deferred to `isLetterOrDigit`
+   * because that is Unicode-aware and an assembler label is not.
+   */
+  private def continues(c: Char): Boolean =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+      c == '_' || c == '.' || c == '$'
+
+  /** Replaces whole occurrences of `name`, leaving alone any that is part of a longer name.
+   *
+   * **Written as a scan rather than as a regex, and it has to be.** The natural spelling is a pair of
+   * lookarounds, `(?<![A-Za-z0-9_.$])name(?![A-Za-z0-9_.$])`, and that is what this was. Scala
+   * Native's regex engine is a port of RE2, which supports neither lookbehind nor lookahead — it
+   * reads `(?<` as the start of a named group and throws `PatternSyntaxException: capturing group
+   * name does not start with a Latin letter`. The JVM's engine accepts it, so the failure appears
+   * only in the binary that ships and never in the build the tests are normally run against.
+   *
+   * That is the general shape to watch for here: sysl cross-compiles to three platforms whose regex
+   * engines are not the same one, and the compiled binary is the least-exercised of them.
+   */
+  private def rename(line: String, name: String, replacement: String): String =
+    if name.isEmpty then line
+    else {
+      val out = new StringBuilder
+      var i   = 0
+
+      while i < line.length do
+        val ends = i + name.length
+        val whole =
+          line.startsWith(name, i) &&
+            (i == 0 || !continues(line.charAt(i - 1))) &&
+            (ends >= line.length || !continues(line.charAt(ends)))
+
+        if whole then
+          out ++= replacement
+          i = ends
+        else
+          out += line.charAt(i)
+          i += 1
+
+      out.toString
+    }
 
   /** The operand numbers a template's names stand for, outputs first, matching `constraints`. */
   def numbering(operands: List[TAsmOperand]): Map[String, Int] = {

@@ -151,6 +151,50 @@ class LinkCommandTests extends AnyFreeSpec with Matchers {
     }
   }
 
+  /** Where this machine keeps a library, which is the host's question and not the target's
+   * (`SearchPaths`). The target decides what a directive's name becomes; the search path decides
+   * where that name is looked for, and `15 §8` only ever answered the first.
+   */
+  "a search path given to the driver" - {
+
+    def withPaths(dirs: String*): List[String] =
+      Toolchain.linkCommand("prog.ll", List("std.syslib"), "prog", Target.x86_64Linux,
+        Toolchain.defaultOptimization, List("m"), Nil, SearchPaths(link = dirs.toList))
+
+    // Joined, as `-L` has been written since cc, so the line reads as a hand-run clang would.
+    "reaches the command line as clang spells one" in {
+      withPaths("/opt/homebrew/lib") should contain("-L/opt/homebrew/lib")
+    }
+
+    // A search path is not an input being scanned in turn — it is where the scan looks — so a
+    // directory named after the library that needs it would be a line nobody could reason about.
+    "comes before everything it could affect" in {
+      val cmd = withPaths("/opt/homebrew/lib")
+
+      cmd.indexOf("-L/opt/homebrew/lib") should be < cmd.indexOf("prog.ll")
+      cmd.indexOf("-L/opt/homebrew/lib") should be < cmd.indexOf("-lm")
+    }
+
+    "keeps the order it was given in, since that is the order searched" in {
+      withPaths("/first", "/second").filter(_.startsWith("-L")) shouldBe List("-L/first", "-L/second")
+    }
+
+    // The whole of what a build with no such flag pays: nothing. Every build in this repository is
+    // one of those, because the standard module reaches libc by symbol alone.
+    "is absent altogether when none was given" in {
+      commandFor(Target.x86_64Linux).filter(_.startsWith("-L")) shouldBe empty
+    }
+
+    // Guessing `/opt/homebrew/lib` is the obvious convenience and would be wrong for the reason
+    // `libraryFlags` refuses to guess a library's placement: a machine nobody here has.
+    "is never guessed at for the host" in {
+      for t <- Target.all do
+        withClue(t.name) {
+          Toolchain.linkCommand("prog.ll", Nil, "prog", t).filter(_.startsWith("-L")) shouldBe empty
+        }
+    }
+  }
+
   // A program with no library to link against still gets what it asked for: a directive resolves
   // what the *program's own* externs name, not only what the standard module's do.
   "a link with no archives still asks for the mathematics on Linux" in {

@@ -209,13 +209,38 @@ appending a field cannot move an existing field's offset.
 
 ---
 
-## 7. A library may carry C
+## 7. A source tree may carry C
 
-**A `.c` file dropped anywhere in a library's tree is compiled with it and archived beside it.**
-Nothing declares it and nothing lists it: the walk of §5 step 1 already visits every directory, and a
-C file found there is compiled for the same target and becomes one more member of the `.syslib`.
-The sysl side reaches it through the `extern` that was already the way to name a symbol the linker
-has (`12` §1) — so the language gains nothing, and the whole of the feature is in the build.
+**A `.c` file dropped anywhere in a tree is compiled with it.** Nothing declares it and nothing lists
+it: the walk of §5 step 1 already visits every directory, and a C file found there is compiled for
+the same target as the sysl beside it. The sysl side reaches it through the `extern` that was already
+the way to name a symbol the linker has (`12` §1) — so the language gains nothing, and the whole of
+the feature is in the build.
+
+**Which tree it is decides nothing about whether the C is compiled, and only where the object goes.**
+Four trees reach a build and all four carry their C:
+
+| the tree | what its objects become |
+|---|---|
+| a `build-lib`'s library | members of the `.syslib`, named as below |
+| the project being built | objects on the link line |
+| a source root named with `--lib` | objects on the link line |
+| a package a `dependencies` block brought in | objects on the link line |
+
+The first is the only one that has to name anything, because an artifact is one file. A compilation
+has no such constraint, so its C goes on the command line as objects — which is also more correct
+than archiving would be: an archive member is pulled in only to resolve a symbol already undefined,
+and a shim reached through a table nothing has mentioned yet would not be pulled in at all.
+
+**A tree brought in as source and the same tree built into an artifact must behave alike**, which is
+what makes `--lib` able to take either without a second flag. It is also why the packages chapter can
+refuse build scripts (`packages.md § 7`): its argument is that sysl compiles a package's C
+declaratively, and that is a claim about a package consumed *as source*, since that is how a
+`dependencies` block consumes one.
+
+A run that names a single **file** rather than a directory gets no C, and that follows from `13 §1`
+rather than being a rule of its own: naming a file compiles that file alone, so there is no tree for
+C to have travelled with.
 
 **It exists because a binding to a real C library cannot be written without it.** Three things are
 reachable from C and from nothing else, and each of them blocks an ordinary POSIX interface:
@@ -236,11 +261,17 @@ Nothing checks it — sysl's own `sizeof` would report what sysl laid out, not w
 comparison is a tautology. Getting it wrong writes past the end of the caller's storage. The number
 has to come from the headers, and C is what reads headers.
 
-**A member is named after the path it was found at**, directories included — `demo/util.c` becomes
+**An object is named after the path it was found at**, directories included — `demo/util.c` becomes
 `demo.util.o`. A basename alone would not do: `ar r` replaces by name, so two modules each holding a
 `util.c` would have the second evict the first, and the library would ship missing whatever only the
 first defined. The one collision that survives this is a directory called `sysl` holding a `code.c`,
 which would take the name the library's own compiled half uses; it is refused rather than archived.
+
+**Across trees even that is not unique**, since two packages may each hold a `net/util.c`, and the
+consumer never chose either name. So a compilation stages each tree's objects into a directory of its
+own and the names inside stay the readable ones. There is nothing to check, because the shape makes a
+collision impossible — which is the right answer for a clash between two files neither of whose
+authors could have known about the other.
 
 **The C files are fingerprinted with the sysl ones.** A library's shims are as much its source as its
 modules are, and an artifact that did not change when one was edited is a stale artifact nothing
@@ -295,6 +326,40 @@ the two whose placement actually differs across the four. An unrecognized name i
 through rather than guessed about. Being wrong in that direction produces a link error naming the
 library; being wrong in the other produces a link error naming a *function*, on a platform the
 author does not have.
+
+### Where the library sits is the host's question, and belongs to the driver
+
+Everything above decides what a *name* becomes. It says nothing about **where that name is looked
+for**, and the two are different questions with different owners: the target decides the name-to-flag
+mapping, the machine being built **on** decides the search path. This section answered the first and
+left the second unasked, and while it was unasked `@link` could reach only libraries already on the
+toolchain's own path — every OS-shipped library and nothing else. `-lpng` failed with `library 'png'
+not found` on a machine where `/opt/homebrew/lib/libpng.dylib` was sitting the whole time.
+
+**`--link-path <dir>` and `--include-path <dir>` are the answer, and they are the driver's.** Both are
+repeatable and searched in the order given. They ship as a pair because half of the capability is
+none of it: a binding to a library outside the default prefix has to compile its shim against that
+library's header before there is anything to link, so `--link-path` alone gets a build one step
+further and no closer.
+
+**It must not be an attribute, for this section's own reason.** `@link("png")` is portable because it
+names a library rather than a flag; `@link_path("/opt/homebrew/lib")` would be one machine's
+directory layout compiled into source meant to build anywhere — the same mistake as writing `-lm`,
+one level up. For the same reason it is not a field in `package.hocon`: that file is committed and
+describes the *package*, and where a prefix lives on somebody's laptop is not a property of the
+package.
+
+**The environment already worked, and that is why the flags exist rather than why they don't.**
+`LIBRARY_PATH` and `CPATH` are read by clang, which sysl execs, so a developer who exports them has
+always had a build that links. But a build that works only because of one person's shell is one
+nobody else can reproduce, and it fails for the next person with a message naming a library rather
+than the setting they are missing. The environment stays the right tool for *this machine, always*;
+the flag is the right one for *this build, wherever it runs*.
+
+**Nothing is guessed at.** Adding `/opt/homebrew/lib` by default is the obvious convenience and is
+refused for the reason the table above refuses to guess a library's placement: a compiler that ruled
+on where a platform keeps its libraries would be wrong about a machine nobody here has, and the cost
+of being wrong is a link that fails somewhere the author cannot reach.
 
 **The requirement travels in the artifact.** The clauses are part of the tree a `.syslib` carries, so
 a program depending on a prebuilt library learns to pass `-lz` without reading that library's source.
