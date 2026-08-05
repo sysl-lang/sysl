@@ -77,6 +77,44 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
       case Left(err)        => fail(s"the altered std did not build: $err")
   }
 
+  /** What a program and the artifact it links would both define **at a name the linker can see** —
+   * empty, or a link that fails wherever a duplicate is refused.
+   *
+   * `private` and `internal` definitions are excluded and have to be: those are exactly the symbols
+   * a program is *meant* to carry its own copy of, since the name does not leave the object file and
+   * two copies can never be one symbol. Comparing them would report the arc helpers on every
+   * program, which is not a collision and never was.
+   */
+  private def bothDefine(program: String): Set[String] =
+    external(artifact._1) intersect external(linked(program))
+
+  /** The program that found this: `display` takes an `out: *Writer`, which reaches `sysl.stdout` —
+   * the one library function a program compiles for itself, because it reads a module-level `val`
+   * and a library has no entry point to initialize one.
+   */
+  private val displaying =
+    """struct Point
+      |    x: int
+      |    y: int
+      |
+      |impl Display for Point
+      |    display(self, out: *Writer, fmt: FormatSpec) =
+      |        display_pad(("(" + str(self.x) + ", " + str(self.y) + ")").bytes, out, fmt)
+      |
+      |var p = Point(3, 4)
+      |
+      |print(p)
+      |""".stripMargin
+
+  private def external(ir: String): Set[String] =
+    ir.linesIterator
+      .filter(l => l.startsWith("define ") && !l.startsWith("define private") && !l.startsWith("define internal"))
+      .flatMap { line =>
+        val at = line.indexOf('@')
+
+        Option.when(at >= 0)(line.drop(at + 1).takeWhile(c => c != '(' && c != ' ').stripPrefix("\"").stripSuffix("\""))
+      }.toSet
+
   /** The symbols a module defines, and the ones it leaves to the linker. */
   private def defines(ir: String): Set[String] = symbols(ir, "define")
   private def declares(ir: String): Set[String] = symbols(ir, "declare")
@@ -620,6 +658,46 @@ class StdArtifactTests extends AnyFreeSpec with Matchers {
 
       deleteFile(out)
       deleteFile(dir)
+    }
+  }
+
+  /** The invariant a linker enforces, asserted where a linker is not needed to see it.
+   *
+   * A program and the artifact it links must not both **define** a symbol. Everything else in this
+   * file asks whether the right things are declared; this asks the other half of the same question,
+   * and it is the half that was wrong.
+   *
+   * **It is asserted on the IR rather than by linking, because linking does not reliably fail.**
+   * `ld64` takes the first of two definitions and says nothing, so a run-tier test on macOS passes
+   * with the bug present; GNU `ld` reports `multiple definition` and stops. A suite that ran only
+   * where the linker is forgiving would go on being green — which is exactly what happened, for as
+   * long as the pages that trigger it were only ever compiled on one platform.
+   */
+  "nothing is defined twice" - {
+
+    "not for a program that reaches the library at all" in {
+      bothDefine("""print("x")""") shouldBe empty
+    }
+
+    // The case that found this. `display` takes an `out: *Writer`, which reaches `sysl.stdout` —
+    // the one library function a program compiles for itself, because it reads a module-level
+    // `val` and a library has no entry point to initialize one. Being compiled for itself is
+    // correct; being compiled into the artifact *as well* is what made two definitions.
+    "not for a program that implements Display, which reaches a writer" in {
+      bothDefine(displaying) shouldBe empty
+    }
+
+    // Stated from the other end, so a change that stopped emitting something the program needs is
+    // caught too: a program that reaches `sysl.stdout` still has to have it from somewhere, and
+    // here it is its own. A program that does not reach it has neither copy, which is the pruning
+    // working rather than a hole.
+    "and what the program compiles for itself, it really does compile" in {
+      external(linked(displaying)) should contain(Library.key("stdout"))
+    }
+
+    "which the artifact leaves to it" in {
+      defines(artifact._1) should not contain Library.key("stdout")
+      precompiled should not contain Library.key("stdout")
     }
   }
 }

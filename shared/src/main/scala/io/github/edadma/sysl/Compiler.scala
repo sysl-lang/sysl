@@ -222,9 +222,6 @@ object Compiler {
     yield
       val mine            = units.map(moduleOf).toSet
       val (own, supplied) = typed.funcs.partition(f => mine(Modules.moduleOf(f.name)))
-      val ir =
-        Codegen.generate(
-          typed.copy(entryPoint = false, precompiled = supplied.map(_.name).toSet), promoted, target)
 
       // A function that reads a module-level `val` is left out of the precompiled half, and this is
       // the honest boundary of what separate compilation reaches today: the storage for a `val` is
@@ -232,14 +229,35 @@ object Compiler {
       // program instead, where the initialization it depends on actually happens. Everything else —
       // which is most of a library — is compiled once, here.
       //
+      // **It has to be left out of what is EMITTED and not only out of what is advertised**, and
+      // getting that wrong is a duplicate definition rather than a missing one. The program compiles
+      // its own copy because nothing advertised it; if this object file defined it too, both
+      // definitions reach the linker. `sysl.stdout` is the case that found this — it returns a trait
+      // object built from a module-level `val`, so it is the one library function a program emits for
+      // itself, and it was being emitted here as well.
+      //
+      // **A Mach-O link accepts that and an ELF link refuses it**, which is why it survived a suite
+      // that runs on one of the two: `ld64` takes the first definition, `ld` reports `multiple
+      // definition of 'sysl$stdout'` and stops. Nothing about the bug was macOS-specific — only the
+      // consequence was.
+      val (deferred, here) =
+        own.partition(f => Reachability.reachedFrom(List(f), typed.funcs, typed.vtables).vals.nonEmpty)
+
+      val ir =
+        Codegen.generate(
+          typed.copy(entryPoint = false, precompiled = (supplied ::: deferred).map(_.name).toSet),
+          promoted, target)
+
       // **What is advertised is what the linker can reach**, so a file-private declaration is left
       // out however ordinary it looks here. Its symbol is emitted `internal` (`13 §2`), which is a
       // promise that every caller is in this module — and a program told the artifact holds it would
       // declare it, call it, and find nothing at the link. Left out, the program compiles a copy of
       // its own from the tree the artifact carries, which is what it does with a generic.
-      val determined =
-        own.filter(f => !f.internal)
-          .filter(f => Reachability.reachedFrom(List(f), typed.funcs, typed.vtables).vals.isEmpty)
+      //
+      // An `internal` function is still *emitted* above, unlike a deferred one: internal linkage is
+      // what keeps the program's copy and this one from being one symbol, so there is no collision
+      // for them to have.
+      val determined = here.filter(f => !f.internal)
 
       (ir, determined.map(_.name).toSet)
 
