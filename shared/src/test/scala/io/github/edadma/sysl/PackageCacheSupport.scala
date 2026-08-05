@@ -40,6 +40,18 @@ trait PackageCacheSupport extends AnyFreeSpec with Matchers {
     dir
   }
 
+  /** The usual case: a package in the cache holding one module, in a directory of its own.
+   *
+   * A package's top-level directories are its modules (`13 §1`) and are therefore the names it
+   * offers a consumer, so a package with none offers nothing — which makes this, rather than
+   * `published`, what almost every test wants.
+   */
+  protected def publishedModule(cache: String, coordinate: String, version: Version, module: String,
+                                name: String = "", deps: String = ""): String =
+    published(cache, coordinate, version,
+      manifest(if name.isEmpty then module else name, version.toString, deps),
+      s"$module/$module.sysl" -> s"module $module\n")
+
   /** The hash a fetch would have recorded beside a cached package, computed from what is there. */
   protected def record(cache: String, coordinate: String, version: Version): String = {
     val dir  = Fetch.directory(cache, coordinate, version)

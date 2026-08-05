@@ -485,9 +485,16 @@ trait ProgramWalk
   // --- the files of a module -----------------------------------------------------------
 
   /** The module a file contributes to: what its header says, or the **anonymous root module** when
-   * it declares none (`13 §1`).
+   * it declares none (`13 §1`) — under the canonical prefix of the package it came from
+   * (`packages.md § 9`).
+   *
+   * The prefix is what keeps a dependency's `json` and this project's `json` apart, and it is added
+   * *here* rather than being written in the file so that a package's source is the same source
+   * whoever depends on it. A compilation with no dependencies has no prefixes, so this is the
+   * header's own name and nothing has changed.
    */
-  private def moduleOf(u: Program): String = u.module.map(_.show).getOrElse(Modules.root)
+  private def moduleOf(u: Program): String =
+    Packages.qualify(packages.prefixOf(u.source), u.module.map(_.show).getOrElse(Modules.root))
 
   /** A module is a directory, and its name is that directory's path relative to the project root
    * (`13 §1`), so a file's header has to agree with where the file sits.
@@ -504,8 +511,13 @@ trait ProgramWalk
    */
   private def checkLocations(): Unit =
     for u <- units; dir <- u.source.dir do
+      // Both sides are read **relative to the package's own root**, which is what lets a fetched
+      // package be checked by the rule it was written under: its files say `module json` and sit in
+      // `json/`, and the canonical prefix that keeps it apart from this project's `json` is added
+      // above both of them rather than to one. `13 §1` is a rule about a package, not about a
+      // machine's directory layout, and a dependency would fail it for the wrong reason otherwise.
       val expected = dir.mkString(".")
-      val declared = moduleOf(u)
+      val declared = u.module.map(_.show).getOrElse(Modules.root)
 
       if declared != expected then
         val theirs = if declared.isEmpty then "declares no module" else s"declares '$declared'"

@@ -52,6 +52,13 @@ trait DeclTables extends Reporting {
    */
   protected def target: Target
 
+  /** Which package each file came from, and what its import lines mean (`packages.md § 9`).
+   *
+   * Empty for a compilation with no dependencies, which is every compilation that does not go
+   * through the package system — so nothing about a one-project build is changed by this being here.
+   */
+  protected def packages: Packages
+
   /** What the target **provides**, which the project config says and the registry does not
    * (`packages.md § 2`, `capabilities.md § Two levels: target provides, module narrows`).
    *

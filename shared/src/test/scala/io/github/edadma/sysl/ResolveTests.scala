@@ -20,12 +20,12 @@ class ResolveTests extends PackageCacheSupport {
     "a floor raised from further down the graph" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/buf", Version(1, 2, 0), manifest("buf", "1.2.0"))
-      published(cache, "github.com/e/buf", Version(1, 4, 0), manifest("buf", "1.4.0"))
-      published(cache, "github.com/e/a", Version(1, 0, 0),
-        manifest("a", "1.0.0", dep("buf", "github.com/e/buf", "1.2.0")))
-      published(cache, "github.com/e/b", Version(1, 0, 0),
-        manifest("b", "1.0.0", dep("buf", "github.com/e/buf", "1.4.0")))
+      publishedModule(cache, "github.com/e/buf", Version(1, 2, 0), "buf")
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "buf")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("buf", "github.com/e/buf", "1.2.0"))
+      publishedModule(cache, "github.com/e/b", Version(1, 0, 0), "b",
+        deps = dep("buf", "github.com/e/buf", "1.4.0"))
 
       val root = project(manifest("app", "0.1.0",
         s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("b", "github.com/e/b", "1.0.0")}"))
@@ -41,10 +41,10 @@ class ResolveTests extends PackageCacheSupport {
     "versions are compared as numbers" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/buf", Version(1, 9, 0), manifest("buf", "1.9.0"))
-      published(cache, "github.com/e/buf", Version(1, 10, 0), manifest("buf", "1.10.0"))
-      published(cache, "github.com/e/a", Version(1, 0, 0),
-        manifest("a", "1.0.0", dep("buf", "github.com/e/buf", "1.10.0")))
+      publishedModule(cache, "github.com/e/buf", Version(1, 9, 0), "buf")
+      publishedModule(cache, "github.com/e/buf", Version(1, 10, 0), "buf")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("buf", "github.com/e/buf", "1.10.0"))
 
       val root = project(manifest("app", "0.1.0",
         s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("buf", "github.com/e/buf", "1.9.0")}"))
@@ -56,10 +56,10 @@ class ResolveTests extends PackageCacheSupport {
     "a dependency that asks for less does not lower a floor" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/buf", Version(1, 2, 0), manifest("buf", "1.2.0"))
-      published(cache, "github.com/e/buf", Version(1, 4, 0), manifest("buf", "1.4.0"))
-      published(cache, "github.com/e/a", Version(1, 0, 0),
-        manifest("a", "1.0.0", dep("buf", "github.com/e/buf", "1.2.0")))
+      publishedModule(cache, "github.com/e/buf", Version(1, 2, 0), "buf")
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "buf")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("buf", "github.com/e/buf", "1.2.0"))
 
       val root = project(manifest("app", "0.1.0",
         s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("buf", "github.com/e/buf", "1.4.0")}"))
@@ -68,14 +68,14 @@ class ResolveTests extends PackageCacheSupport {
     }
 
     // The lower version's manifest was read on the way to raising the floor; it must not survive
-    // into what gets built, and its name must not be what the import table uses.
+    // into what gets built, and its modules must not be what the import table names.
     "the version that was passed over is not in the graph" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/buf", Version(1, 2, 0), manifest("early", "1.2.0"))
-      published(cache, "github.com/e/buf", Version(1, 4, 0), manifest("later", "1.4.0"))
-      published(cache, "github.com/e/a", Version(1, 0, 0),
-        manifest("a", "1.0.0", dep("buf", "github.com/e/buf", "1.2.0")))
+      publishedModule(cache, "github.com/e/buf", Version(1, 2, 0), "early")
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "later")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("buf", "github.com/e/buf", "1.2.0"))
 
       val root = project(manifest("app", "0.1.0",
         s"${dep("a", "github.com/e/a", "1.0.0")}, ${dep("buf", "github.com/e/buf", "1.4.0")}"))
@@ -84,30 +84,46 @@ class ResolveTests extends PackageCacheSupport {
 
       graph.packages.count(_.canonical == "github.com.e.buf") shouldBe 1
 
-      // `a` asked for 1.2.0 and gets the selected 1.4.0, so the name in its import table is the
-      // name the built version calls itself.
+      // `a` asked for 1.2.0 and gets the selected 1.4.0, so what its import lines may name is what
+      // the built version holds rather than what the version it asked for held.
       val a = graph.packages.find(_.canonical == "github.com.e.a").get
 
-      a.imports shouldBe Map("later" -> "github.com.e.buf")
+      a.imports shouldBe Map("later" -> "github.com.e.buf.later")
     }
   }
 
   "what a name at the head of an import line means" - {
 
-    "the package's own name, where nothing overrides it" in {
+    // The library's own documentation says `json.parse`, and `§ 9` rejected mandatory mounting so
+    // that a consumer could write exactly that.
+    "a package's own modules, under their own names" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/sysl-json", Version(1, 4, 0), manifest("json", "1.4.0"))
+      publishedModule(cache, "github.com/e/sysl-json", Version(1, 4, 0), "json", name = "json-lib")
 
       val root = project(manifest("app", "0.1.0", dep("j", "github.com/e/sysl-json", "1.4.0")))
 
-      resolve(root, cache).packages.head.imports shouldBe Map("json" -> "github.com.e.sysl-json")
+      resolve(root, cache).packages.head.imports shouldBe
+        Map("json" -> "github.com.e.sysl-json.json")
     }
 
-    "a mount, which is what a consumer writes when two packages want one word" in {
+    // The package is the unit of distribution and the module is the unit of code: sqlite3's package
+    // is `sqlite3` and its module is `sqlite`, and a consumer reaching the second should not have to
+    // say the first.
+    "and not the name the package calls itself" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/sysl-json", Version(1, 4, 0), manifest("json", "1.4.0"))
+      publishedModule(cache, "github.com/e/sqlite3", Version(1, 0, 0), "sqlite", name = "sqlite3")
+
+      val root = project(manifest("app", "0.1.0", dep("s", "github.com/e/sqlite3", "1.0.0")))
+
+      resolve(root, cache).packages.head.imports.keys should contain only "sqlite"
+    }
+
+    "a mount hangs the whole package under one segment" in {
+      val cache = emptyCache()
+
+      publishedModule(cache, "github.com/e/sysl-json", Version(1, 4, 0), "json")
 
       val root = project(manifest("app", "0.1.0",
         dep("j", "github.com/e/sysl-json", "1.4.0", mount = "ejson")))
@@ -115,14 +131,28 @@ class ResolveTests extends PackageCacheSupport {
       resolve(root, cache).packages.head.imports shouldBe Map("ejson" -> "github.com.e.sysl-json")
     }
 
+    "every module a package has, where there is more than one" in {
+      val cache = emptyCache()
+
+      published(cache, "github.com/e/two", Version(1, 0, 0), manifest("two", "1.0.0"),
+        "alpha/alpha.sysl" -> "module alpha\n", "beta/beta.sysl" -> "module beta\n")
+
+      val root = project(manifest("app", "0.1.0", dep("t", "github.com/e/two", "1.0.0")))
+
+      resolve(root, cache).packages.head.imports shouldBe Map(
+        "alpha" -> "github.com.e.two.alpha",
+        "beta" -> "github.com.e.two.beta",
+      )
+    }
+
     // Per-consumer, which is the whole of the two-layer identity: two projects may write different
     // words and still link one copy of the package.
     "is per-package, so a dependency's own table is its own" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/buf", Version(1, 0, 0), manifest("buf", "1.0.0"))
-      published(cache, "github.com/e/a", Version(1, 0, 0),
-        manifest("a", "1.0.0", dep("b", "github.com/e/buf", "1.0.0")))
+      publishedModule(cache, "github.com/e/buf", Version(1, 0, 0), "buf")
+      publishedModule(cache, "github.com/e/a", Version(1, 0, 0), "a",
+        deps = dep("b", "github.com/e/buf", "1.0.0"))
 
       val root = project(manifest("app", "0.1.0",
         s"${dep("a", "github.com/e/a", "1.0.0")}, " +
@@ -131,30 +161,29 @@ class ResolveTests extends PackageCacheSupport {
       val graph = resolve(root, cache)
 
       graph.packages.head.imports shouldBe
-        Map("a" -> "github.com.e.a", "bytes" -> "github.com.e.buf")
+        Map("a" -> "github.com.e.a.a", "bytes" -> "github.com.e.buf")
       graph.packages.find(_.canonical == "github.com.e.a").get.imports shouldBe
-        Map("buf" -> "github.com.e.buf")
+        Map("buf" -> "github.com.e.buf.buf")
     }
 
-    // A directory name is where a checkout happened to land rather than a decision anybody made.
-    "a package that names itself nothing, and is given no mount" in {
+    "a package with no modules at all offers nothing to import" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/j", Version(1, 0, 0), "")
+      published(cache, "github.com/e/j", Version(1, 0, 0), manifest("j", "1.0.0"))
 
       val root = project(manifest("app", "0.1.0", dep("j", "github.com/e/j", "1.0.0")))
 
-      resolveRefused(root, cache) should include("there is nothing to call it here")
+      resolveRefused(root, cache) should include("has no modules")
     }
   }
 
   "a collision is an error and never a silent winner" - {
 
-    "two dependencies preferring one root name" in {
+    "two dependencies whose modules want one name" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/one", Version(1, 0, 0), manifest("json", "1.0.0"))
-      published(cache, "github.com/e/two", Version(1, 0, 0), manifest("json", "1.0.0"))
+      publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
+      publishedModule(cache, "github.com/e/two", Version(1, 0, 0), "json", name = "two")
 
       val root = project(manifest("app", "0.1.0",
         s"${dep("a", "github.com/e/one", "1.0.0")}, ${dep("b", "github.com/e/two", "1.0.0")}"))
@@ -168,15 +197,15 @@ class ResolveTests extends PackageCacheSupport {
     "and a mount settles it" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/one", Version(1, 0, 0), manifest("json", "1.0.0"))
-      published(cache, "github.com/e/two", Version(1, 0, 0), manifest("json", "1.0.0"))
+      publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
+      publishedModule(cache, "github.com/e/two", Version(1, 0, 0), "json", name = "two")
 
       val root = project(manifest("app", "0.1.0",
         s"${dep("a", "github.com/e/one", "1.0.0")}, " +
           s"${dep("b", "github.com/e/two", "1.0.0", mount = "json2")}"))
 
       resolve(root, cache).packages.head.imports shouldBe
-        Map("json" -> "github.com.e.one", "json2" -> "github.com.e.two")
+        Map("json" -> "github.com.e.one.json", "json2" -> "github.com.e.two")
     }
 
     // The common case rather than an exotic one, and the reason the check cannot be only about
@@ -184,7 +213,7 @@ class ResolveTests extends PackageCacheSupport {
     "a dependency taking a name the project already uses for a module of its own" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/one", Version(1, 0, 0), manifest("json", "1.0.0"))
+      publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
 
       val root = project(manifest("app", "0.1.0", dep("a", "github.com/e/one", "1.0.0")), "json")
 
@@ -194,11 +223,11 @@ class ResolveTests extends PackageCacheSupport {
     "and a directory that is not a module does not collide with anything" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/one", Version(1, 0, 0), manifest("json", "1.0.0"))
+      publishedModule(cache, "github.com/e/one", Version(1, 0, 0), "json", name = "one")
 
       val root = project(manifest("app", "0.1.0", dep("a", "github.com/e/one", "1.0.0")), ".git")
 
-      resolve(root, cache).packages.head.imports shouldBe Map("json" -> "github.com.e.one")
+      resolve(root, cache).packages.head.imports shouldBe Map("json" -> "github.com.e.one.json")
     }
   }
 
@@ -206,24 +235,24 @@ class ResolveTests extends PackageCacheSupport {
 
     "is read and named like any other" in {
       val cache = emptyCache()
-      val other = project(manifest("helper", "0.1.0"))
+      val other = project(manifest("helper", "0.1.0"), "helper")
       val root  = project(s"""package { name = "app", version = "0.1.0" }
                              |dependencies { h { path = "$other" } }
                              |""".stripMargin)
 
       val graph = resolve(root, cache)
 
-      graph.packages.head.imports shouldBe Map("helper" -> "h")
+      graph.packages.head.imports shouldBe Map("helper" -> "h.helper")
       graph.packages.find(_.canonical == "h").map(_.root) shouldBe Some(other)
     }
 
     // A relative path in a fetched package is relative to a checkout that exists on one machine.
     "may not itself have one, because a relative path is only meaningful where it was written" in {
       val cache  = emptyCache()
-      val bottom = project(manifest("bottom", "0.1.0"))
+      val bottom = project(manifest("bottom", "0.1.0"), "bottom")
       val middle = project(s"""package { name = "middle", version = "0.1.0" }
                               |dependencies { b { path = "$bottom" } }
-                              |""".stripMargin)
+                              |""".stripMargin, "middle")
       val root   = project(s"""package { name = "app", version = "0.1.0" }
                               |dependencies { m { path = "$middle" } }
                               |""".stripMargin)
@@ -235,9 +264,9 @@ class ResolveTests extends PackageCacheSupport {
     "raises the floors its own manifest asks for" in {
       val cache = emptyCache()
 
-      published(cache, "github.com/e/buf", Version(1, 4, 0), manifest("buf", "1.4.0"))
+      publishedModule(cache, "github.com/e/buf", Version(1, 4, 0), "buf")
 
-      val other = project(manifest("helper", "0.1.0", dep("buf", "github.com/e/buf", "1.4.0")))
+      val other = project(manifest("helper", "0.1.0", dep("buf", "github.com/e/buf", "1.4.0")), "helper")
       val root  = project(s"""package { name = "app", version = "0.1.0" }
                              |dependencies { h { path = "$other" } }
                              |""".stripMargin)

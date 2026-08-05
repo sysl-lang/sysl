@@ -33,9 +33,27 @@ object Fetch {
    * reasoning, and the same root, as the standard module's prebuilt artifact.
    */
   def cacheRoot: Either[String, String] =
-    cacheDirectory.map(c => s"$c/sysl/pkg").toRight(
-      "cannot find a cache directory to fetch packages into — set XDG_CACHE_HOME, or vendor the " +
-        "dependencies so that nothing has to be fetched")
+    override_.map(Right(_)).getOrElse(
+      cacheDirectory.map(c => s"$c/sysl/pkg").toRight(
+        "cannot find a cache directory to fetch packages into — set XDG_CACHE_HOME, or vendor the " +
+          "dependencies so that nothing has to be fetched"))
+
+  private var override_ : Option[String] = None
+
+  /** Runs `body` against a cache somewhere else — **for tests only**.
+   *
+   * A suite that drives the whole driver has no other way to keep its packages out of the machine's
+   * own cache, and putting them there would make a test's answer depend on what had been built
+   * before it. The same shape and the same caveat as `AutoImport.including`: it is process-global,
+   * so only one suite may use it, and that suite's tests must not run in parallel with each other.
+   */
+  private[sysl] def usingCache[T](path: String)(body: => T): T = {
+    val saved = override_
+
+    override_ = Some(path)
+    try body
+    finally override_ = saved
+  }
 
   /** Where this coordinate at this version sits, fetched or not. */
   def directory(cache: String, coordinate: String, version: Version): String =
@@ -44,9 +62,11 @@ object Fetch {
   /** The package's source on disk, cloning it if this machine has not got it, and checked against
    * `sums` either way.
    *
-   * Returns the hash **only when it had to be computed**, which is what tells the caller there is a
-   * new line to write into `sysl.sum`. A package the file already covers has been verified and has
-   * nothing to record.
+   * Returns **the hash however it was arrived at** — computed from the clone, or read from what was
+   * recorded beside a package already here. Returning it only for a fresh clone would have meant
+   * that a project depending on a package some other project had already fetched wrote no
+   * `sysl.sum` line at all, and so was never checked afterwards. Whether the line is *new* is the
+   * caller's question, and it can only be answered against the sums it holds.
    */
   def ensure(dep: Dependency, sums: Sums, cache: String): Either[String, Fetched] = dep.origin match
     case Origin.Local(dir) =>
@@ -58,7 +78,7 @@ object Fetch {
     case Origin.Git(coordinate, version) =>
       val dir = directory(cache, coordinate, version)
 
-      if isDirectory(dir) then verify(dep, coordinate, version, dir, sums).map(_ => Fetched(dep, dir, None))
+      if isDirectory(dir) then verify(dep, coordinate, version, dir, sums).map(Fetched(dep, dir, _))
       else clone(dep, coordinate, version, dir, sums).map(hash => Fetched(dep, dir, Some(hash)))
 
   /** A cache entry checked against `sysl.sum`, by way of the hash recorded when it was written.
@@ -69,11 +89,11 @@ object Fetch {
    * edited would simply hash to whatever it now holds.
    */
   private def verify(dep: Dependency, coordinate: String, version: Version, dir: String,
-                     sums: Sums): Either[String, Unit] =
+                     sums: Sums): Either[String, Option[String]] =
     (sums.hashOf(coordinate, version), recorded(dir)) match
-      case (None, _) => Right(())
+      case (None, got) => Right(got)
 
-      case (Some(want), Some(got)) if want == got => Right(())
+      case (Some(want), Some(got)) if want == got => Right(Some(got))
 
       case (Some(want), Some(got)) =>
         Left(mismatch(dep, coordinate, version, want, got))

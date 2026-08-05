@@ -355,7 +355,14 @@ private[sysl] def execute(cfg: Config): Int = {
     case Some((root, _)) => return fail(s"$root holds no sysl source files")
     case None            => ()
 
-  val librarySources = collected.flatMap(_._2)
+  // What this project depends on, fetched and version-selected (`packages.md § 3`, `§ 5`). A project
+  // with no `dependencies` resolves to itself and this costs nothing, which is what keeps
+  // `sysl run hello.sysl` free of ceremony.
+  val (dependencySources, packages) = dependencies(cfg, project) match
+    case Left(err) => return fail(err)
+    case Right(d)  => d
+
+  val librarySources = collected.flatMap(_._2) ::: dependencySources
   val read           = decoded.collect { case Right(r) => r }
   val libraryTrees   = read.flatMap(_._1)
 
@@ -386,7 +393,7 @@ private[sysl] def execute(cfg: Config): Int = {
   // rather than being printed from inside the compiler, which has no business writing to a console.
   val compiled =
     Compiler.compiledWith(librarySources ::: sources, libraryTrees, target, precompiled, Some(std),
-      provides) match
+      provides, packages) match
     case Left(err) => return report(err)
     case Right(result) =>
       if cfg.explainEscapes then
@@ -658,15 +665,84 @@ private def chooseTarget(named: Option[String], configured: Option[String]): Eit
  * that the driver is *given* a root rather than discovering one, and a search that walked upward
  * would make a build depend on directories above the one named.
  */
+/** The project's dependencies, brought onto this machine and turned into what a compilation needs
+ * from them (`packages.md § 3`, `§ 5`, `§ 9`).
+ *
+ * A dependency reaches a compilation the way a `--lib` source tree does — as **more modules** — and
+ * that is the whole of the wiring. What is new beside it is the `Packages` table: each fetched
+ * package's files are filed under a canonical prefix taken from its coordinate, and the names its
+ * import lines write are read back through the manifest that named it.
+ *
+ * `sysl.sum` is written back where a package was fetched that no line covered, so the first build
+ * after adding a dependency records what it got and every build after that is checked against it.
+ * Writing it is not fatal if it fails: a read-only checkout should still build, and the alternative
+ * is refusing to compile over a file that exists to be compared against next time.
+ */
+private def dependencies(cfg: Config, project: PackageConfig)
+    : Either[String, (List[Source], Packages)] =
+  if project.dependencies.isEmpty then Right((Nil, Packages.none))
+  else
+    val root = projectRoot(cfg.file)
+
+    for
+      cache <- Fetch.cacheRoot
+      sums  <- readSums(root)
+      graph <- Resolve.graph(root, project, sums, cache)
+      files <- collectPackages(graph)
+    yield
+      if graph.sumsChanged then writeSums(root, graph.sums)
+      files
+
+/** Each fetched package's source, filed under the canonical prefix that keeps its module names
+ * apart from every other package's.
+ */
+private def collectPackages(graph: Resolve.Graph): Either[String, (List[Source], Packages)] = {
+  val fetched = graph.packages.filterNot(_.isRoot)
+
+  try
+    val each = fetched.map(p => p -> Project.collect(p.root))
+
+    each.find(_._2.isEmpty) match
+      case Some((p, _)) => Left(s"'${p.canonical}' holds no sysl source files")
+      case None =>
+        val owned = each.flatMap((p, sources) => sources.map(_ -> p.canonical)).toMap
+
+        Right((
+          each.flatMap(_._2),
+          Packages(owned, graph.packages.map(p => p.canonical -> p.imports).toMap),
+        ))
+  catch case e: Exception => Left(s"cannot read a package: ${e.getMessage}")
+}
+
+private def readSums(root: String): Either[String, Sums] = {
+  val path = s"$root/${Sums.FileName}"
+
+  if !isFile(path) then Right(Sums.empty)
+  else
+    try Sums.read(readFile(path))
+    catch case e: Exception => Left(s"cannot read $path: ${e.getMessage}")
+}
+
+private def writeSums(root: String, sums: Sums): Unit =
+  try writeFile(s"$root/${Sums.FileName}", sums.render)
+  catch
+    case e: Exception =>
+      Console.err.println(s"warning: cannot write ${Sums.FileName}: ${e.getMessage}")
+
+/** The project root: the directory the driver was given, or the one holding the file it was given.
+ *
+ * `13 § Open a` settles that the driver is *given* a root rather than discovering one, so this never
+ * searches upward — a build that walked up would depend on directories above the one named.
+ */
+private def projectRoot(file: String): String =
+  if isDirectory(file) then file
+  else
+    val slash = math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))
+
+    if slash >= 0 then file.substring(0, slash) else "."
+
 private def readPackageConfig(file: String): Either[String, PackageConfig] = {
-  val root =
-    if isDirectory(file) then file
-    else
-      val slash = math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))
-
-      if slash >= 0 then file.substring(0, slash) else "."
-
-  val path = s"$root/${PackageConfig.FileName}"
+  val path = s"${projectRoot(file)}/${PackageConfig.FileName}"
 
   if !isFile(path) then Right(PackageConfig.empty)
   else

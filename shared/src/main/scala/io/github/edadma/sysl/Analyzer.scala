@@ -36,6 +36,7 @@ class Analyzer private (
     protected val std: Stdlib,
     protected val target: Target,
     protected val provides: Set[String],
+    protected val packages: Packages,
 ) extends ProgramWalk with ExprAnalysis {
 
   /** Every error the walk found, rendered and in source order. */
@@ -66,9 +67,9 @@ object Analyzer {
    */
   def analyze(units: List[Program], building: Set[String] = Set.empty,
               std: Stdlib = Stdlib.fromSource(Target.default), target: Target = Target.default,
-              provides: Set[String] = Capability.core.toSet)
+              provides: Set[String] = Capability.core.toSet, packages: Packages = Packages.none)
       : Either[String, TProgram] = {
-    val analyzer = new Analyzer(units, building, std, target, provides)
+    val analyzer = new Analyzer(units, building, std, target, provides, packages)
 
     val outcome =
       try Right(analyzer.analyze())

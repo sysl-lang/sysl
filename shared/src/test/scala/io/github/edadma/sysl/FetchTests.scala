@@ -47,7 +47,19 @@ class FetchTests extends PackageCacheSupport {
       val hash  = record(cache, coordinate, version)
 
       ensure(cache, Sums.empty.recording(coordinate, version, hash)) shouldBe
-        Right(Fetch.Fetched(dep(), dir, None))
+        Right(Fetch.Fetched(dep(), dir, Some(hash)))
+    }
+
+    // Otherwise a project depending on something another project had already fetched would write no
+    // sysl.sum line at all, and so would never be checked afterwards.
+    "answers with what was recorded, so a project that did not fetch it can still record it" in {
+      val cache = emptyCache()
+
+      published(cache, coordinate, version, manifest("json", "1.4.0"))
+
+      val hash = record(cache, coordinate, version)
+
+      ensure(cache).map(_.hash) shouldBe Right(Some(hash))
     }
 
     "and refused when the two disagree" in {

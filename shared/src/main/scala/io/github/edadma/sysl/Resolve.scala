@@ -70,9 +70,16 @@ object Resolve {
         case (s, _) => s
       }
 
+    /** A package's hash written into the sums where no line covered it yet.
+     *
+     * Asked against what is held rather than against how the package arrived, so that a project
+     * depending on something another project already fetched still records what it got. A line that
+     * is already there and already agrees is not a change, which is what keeps a build from
+     * rewriting the file every time.
+     */
     def withFetch(dep: Dependency, got: Fetch.Fetched): State =
       (got.hash, dep.origin) match
-        case (Some(hash), Origin.Git(coordinate, version)) =>
+        case (Some(hash), Origin.Git(coordinate, version)) if !sums.hashOf(coordinate, version).contains(hash) =>
           copy(sums = sums.recording(coordinate, version, hash), changed = true)
         case _ => this
   }
@@ -176,25 +183,55 @@ object Resolve {
       : Either[String, Map[String, String]] =
     deps.foldLeft(Right(Map.empty[String, String]): Either[String, Map[String, String]]) { (acc, dep) =>
       for
-        table  <- acc
-        theirs <- theirConfig(dep, state)
-        local  <- rootName(dep, theirs).left.map(e => s"$owner: $e")
-        _      <- noCollision(owner, ownerRoot, table, local, dep)
-      yield table + (local -> dep.canonical)
+        table <- acc
+        dir   <- theirRoot(dep, state)
+        added <- bindings(dep, dir).left.map(e => s"$owner: $e")
+        _     <- collect(added.keys.toList.sorted)(local => noCollision(owner, ownerRoot, table, local, dep))
+      yield table ++ added
     }
 
-  /** The manifest of the version of `dep` that is being built, which for a git dependency is the one
-   * selection settled on rather than the one this edge asked for.
+  /** What a dependency binds in the manifest that named it (`§ 9`).
+   *
+   * **With no mount, a package's top-level modules come in under their own names.** That is what
+   * makes the mount optional in the sense the section argues for: mandatory mounting was rejected
+   * because it "would make every project's import lines differ from the library's own
+   * documentation", and an import line only matches the documentation if `sqlite.open` is what a
+   * consumer writes — which it is not if every name is silently prefixed by something. The section's
+   * own collision example says the same thing from the other side: it is a project with a `json/`
+   * directory meeting "a dependency preferring `json`", and `json` there is a *directory* name.
+   *
+   * **A mount hangs the whole package under one segment**, which is the escape hatch for exactly the
+   * case that example describes: mount it as `ejson` and its `json` is reached as `ejson.json`,
+   * leaving the project's own `json` alone.
+   *
+   * `package.name` is deliberately not consulted. It names the *package*, which is a unit of
+   * distribution, and what an import line writes is a *module*, which is a unit of code — sqlite3's
+   * package is called `sqlite3` and its module is `sqlite`, and a consumer reaching for the second
+   * should not have to say the first.
    */
-  private def theirConfig(dep: Dependency, state: State): Either[String, PackageConfig] =
+  private def bindings(dep: Dependency, dir: String): Either[String, Map[String, String]] =
+    dep.mount match
+      case Some(mount) => Right(Map(mount -> dep.canonical))
+      case None =>
+        val modules = topLevel(dir)
+
+        if modules.isEmpty then
+          Left(s"'${dep.label}' has no modules — a package is a tree of directories, each of them a " +
+            "module, and there is nothing here to import")
+        else Right(modules.map(m => m -> Packages.qualify(dep.canonical, m)).toMap)
+
+  /** Where the version of `dep` that is being built has its source, which for a git dependency is the
+   * version selection settled on rather than the one this edge asked for.
+   */
+  private def theirRoot(dep: Dependency, state: State): Either[String, String] =
     dep.origin match
       case Origin.Local(_) =>
-        state.locals.get(dep.canonical).map(_._2).toRight(s"'${dep.label}' was never read")
+        state.locals.get(dep.canonical).map(_._1).toRight(s"'${dep.label}' was never read")
       case Origin.Git(coordinate, _) =>
         for
           version <- state.selected.get(coordinate).toRight(s"'$coordinate' was never selected")
           entry   <- state.manifests.get((coordinate, version)).toRight(s"'$coordinate' was never read")
-        yield entry._2
+        yield entry._1
 
   /** The two ways one root name can be claimed twice, both refused rather than resolved by order.
    *
@@ -216,22 +253,6 @@ object Resolve {
         Either.cond(!topLevel(ownerRoot).contains(local), (),
           s"$owner: '$local' is both a directory in this project and the root name of " +
             s"${dep.canonical} — give the dependency a 'mount' to say what it is called here")
-
-  /** The root name a dependency takes in the manifest that named it (`§ 9`).
-   *
-   * The package's own `package.name` is the preferred one, and a `mount` overrides it. That order is
-   * what makes the mount **optional**: a consumer's import lines match the library's own
-   * documentation until two libraries want one word, and only then does anyone write a rename.
-   *
-   * A package that states no name and is given no mount is refused rather than named after its
-   * directory. `§ Open a` leans this way, and the reason is that a directory name is not a decision
-   * anybody made — it is where a checkout happened to land, and a silent default drawn from it is
-   * pleasant exactly once.
-   */
-  private def rootName(dep: Dependency, config: PackageConfig): Either[String, String] =
-    dep.mount.orElse(config.name).toRight(
-      s"'${dep.label}' says no name in its own ${PackageConfig.FileName} and is given no 'mount', " +
-        "so there is nothing to call it here — add a 'mount' saying what its modules are named under")
 
   /** A package's manifest, where it has one. A package with no file is a package that said nothing,
    * exactly as `§ 1` has it for a project.
