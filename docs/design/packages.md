@@ -70,7 +70,7 @@ targets {
 requires { os = true }
 
 dependencies {
-  json  { git = "github.com/edadma/sysl-json", version = "2.1.0" }
+  json  { git = "github.com/edadma/sysl-json", version = "1.4.0" }
   regex { git = "github.com/edadma/sysl-regex", version = "0.4.0", mount = "re" }
   local { path = "../experiment" }
 }
@@ -99,12 +99,17 @@ A dependency is **a git repository and a version**. There is no registry, no acc
 no name to reserve.
 
 ```hocon
-json { git = "github.com/edadma/sysl-json", version = "2.1.0" }
+json { git = "github.com/edadma/sysl-json", version = "1.4.0" }
 ```
 
 The coordinate resolves the way Go's does: `github.com/edadma/sysl-json` is cloned over HTTPS and
-the tag `v2.1.0` is what gets read. A `path` dependency names a directory instead, for a package
+the tag `v1.4.0` is what gets read. A `path` dependency names a directory instead, for a package
 being developed alongside its consumer.
+
+**A coordinate is identity, not a URL, and the difference is checked.** `https://` on the front is
+refused rather than stripped: the coordinate is what `§ 9` mangles module names out of, so two
+spellings of one package would link as two incompatible copies of it, and the error would arrive at
+the linker rather than at the line that caused it.
 
 **Why no registry: a registry is a service, and a service is a thing that must not go down.** It
 needs hosting, uptime, moderation, a name-squatting policy, an abuse contact and a story for what
