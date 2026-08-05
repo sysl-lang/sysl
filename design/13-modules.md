@@ -7,12 +7,16 @@ ordering and no forward declaration, a member of one module reached from another
 full, the `import` statement in all five of its forms shortening that path for the file or the block
 that writes it, `private` / `private[M]` deciding which of those spellings a given file is allowed
 to write at all, no declaration allowed to name in its signature a type that does not reach as far
-as it does, and the graph those references make held to being acyclic. The capability clause (§4) is
-**not yet implemented**: the propagation it needs is the sweep §6 now makes available, and the
-clause does not currently parse at all. What it is *not* waiting for any more is the target — that
-used to be the stated blocker, and it is stale: `Target` is a real value with a registry of ten
-targets, a `--target` flag and a `targets` command. What is genuinely missing from open item (a) is
-the `package.hocon` schema and platform-file selection, neither of which a `no alloc` check needs. Two written docs already lean on modules: `capabilities.md` attaches
+as it does, and the graph those references make held to being acyclic. **§4 is built too** — the
+header attributes `@no_alloc`, `@requires(...)` and `@link("...")` parse, a module whose files
+disagree about a narrowing is rejected, the requirement propagates over the import graph as the
+single reverse-topological sweep §6 makes available, and the finer-than-declaration `alloc` check
+this section ends on reports the *call* rather than the import. Two claims this paragraph used to
+make are gone with it: the clause did not parse, and the target was the blocker. Both were stale, and
+`Target` had been a real value with a registry of ten targets, a `--target` flag and a `targets`
+command for some time before either sentence was removed. What is genuinely left of open item (a) is
+the platform-file suffix grammar and resolution (§5) — the `package.hocon` schema is written and
+built, as `packages.md` says. Two written docs already lean on modules: `capabilities.md` attaches
 capability narrowing (`no alloc`, `requires`) and its transitive propagation to *modules*, and
 `cross-platform.md` fixes that "module names follow the directory tree relative to the project
 root." This chapter defines what a module **is** so those have something to name, and consolidates
@@ -1294,8 +1298,10 @@ would diagnose it unable to run — so the source path stays, and stays reachabl
   takes one, as the path it is given — `sysl run <dir>` makes that directory the root and compiles
   the tree beneath it, and a config file only ever *names* a root the driver would otherwise be told.
   **What is left of this item is the platform-file suffix grammar and resolution (§5)**, which
-  `packages.md` does not attempt. Of `packages.md` itself, the file and its capability sets are
-  built; the dependency model is not.
+  `packages.md` does not attempt. Of `packages.md` itself, the file, its capability sets **and the
+  dependency model** are built — a `dependencies` block is fetched, resolved by MVS and checked
+  against `sysl.sum`. What is unbuilt there is the *commands* (`sysl add`, `vendor`), which is a
+  question about the driver rather than about modules.
 - **b. Re-export / facade modules.** Whether a module can re-export another's names (a `pub
   import`-style forwarding, so `std` can surface `std.fs.read`) is a real ergonomic want for
   building a curated public surface over sub-modules, and is left until the standard library's
