@@ -263,8 +263,9 @@ this family, one function per shape, which the compiler routes a scalar's `displ
 | function | renders |
 |---|---|
 | `display_str` | a `string`; precision **truncates** |
-| `display_int`, `display_uint` | an integer; precision is a **minimum digit count**, zero-filled |
-| `display_wide` | an integer **above 64 bits**, whose digits `snprintf` cannot produce |
+| `display_int`, `display_uint` | an integer up to **64 bits**; precision is a **minimum digit count**, zero-filled |
+| `display_i128`, `display_u128` | an integer of **65 to 128 bits**, whose digits `snprintf` cannot produce |
+| `display_wide` | an integer **above 128 bits**, rendered from the digits `str` writes |
 | `display_real` | a float; precision is **significant digits**, defaulting to 6 and capped at 40 |
 | `display_bool`, `display_char` | `true`/`false`, and a code point encoded to UTF-8 |
 | `display_pad` | **where they all end up** — puts finished bytes in the field the spec asked for |
@@ -293,6 +294,14 @@ prints("\n")
 `FormatSpec(6, -1, false)` is a width of six, **no precision** — which is what `-1` means throughout
 the family — and padding on the left. The neutral spec, which is what a plain `print` passes, is
 `FormatSpec(0, -1, false)`.
+
+**The allocation-free path reaches 128 bits and stops there.** Every renderer up to that width works
+its digits out against a frame-local buffer and hands the sink a slice of it, which is safe because a
+`Writer` borrows the bytes it is given rather than keeping them — so a module declaring `@no_alloc`
+can render any of them. Wider values go through `display_wide`, which takes the digits `str` writes,
+and a string is heap storage: a `u256` therefore cannot be rendered from a module without an
+allocator. Covering every width would need a buffer whose size follows the receiver, and a fixed
+array's length cannot be written in terms of a type parameter.
 
 ### One padder, and why
 
