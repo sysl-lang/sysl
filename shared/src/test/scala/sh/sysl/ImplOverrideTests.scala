@@ -177,6 +177,54 @@ class ImplOverrideTests extends AnyFreeSpec with CodegenSupport with RunSupport 
     }
   }
 
+  /** `02 § What keeps this sound` argues from coherence rather than from the keyword, and these are
+   * the two halves of that argument as the compiler actually enforces them.
+   */
+  "coherence is untouched, which is what keeps one type to one table" - {
+
+    // The claim the soundness argument rests on: the only override anybody can write across a module
+    // boundary is one naming their own type. `[]int` names nothing outside the library, so a program
+    // cannot override the library's block for it however the block is marked — and the refusal is
+    // coherence's, arriving after `override` has lifted the overlap.
+    "so a program cannot override the library's block for a slice of a built-in" in {
+      err("""override impl Display for []int
+            |    display(self, out: *Writer, fmt: FormatSpec) = display_str("ints", out, fmt)
+            |print(1)
+            |""".stripMargin) should include("nothing in '[]int' is declared outside the library")
+    }
+
+    // And exactly one override per type, which is the other half: two blocks for one key are two
+    // blocks for one key whatever they say, since neither is more specific than the other.
+    "and one type takes one override, not a stack of them" in {
+      err(s"""${show}impl[T] Show for []T
+             |    show(self) -> string = "any"
+             |struct P
+             |    v: int
+             |override impl Show for []P
+             |    show(self) -> string = "points"
+             |override impl Show for []P
+             |    show(self) -> string = "again"
+             |""".stripMargin) should include("'[]P' already implements 'Show'")
+    }
+  }
+
+  /** A tuple is a shape like a slice — its arity is the key — so the same pairing works there, and
+   * it is worth pinning because the library's tuple blocks are the ones an override meets first.
+   */
+  "a tuple of the program's own types overrides the library's block for its arity" in {
+    run("""struct P
+          |    v: int
+          |impl Display for P
+          |    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.v), out, fmt)
+          |override impl Display for (P, int)
+          |    display(self, out: *Writer, fmt: FormatSpec) = display_str("a pair", out, fmt)
+          |var t = (P(1), 2)
+          |var u = (1, 2)
+          |print(t)
+          |print(u)
+          |""".stripMargin) shouldBe "a pair\n(1, 2)\n"
+  }
+
   "a member that replaces a trait's default body says so" - {
 
     "the keyword is required where a body is replaced" in {
