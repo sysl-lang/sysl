@@ -270,15 +270,16 @@ rendered by `snprintf` or by a `Display`; the one refinement is that truncation 
 character boundary rather than handing a sink half a codepoint. A sink is a byte sink, and there is
 no recovering from an invalid sequence once it has been written.
 
-**Open: the unit is bytes, and that makes the width unusable for laying anything out.**
-`guide/table` is the customer, and it is the first program in the set to measure text for *display*
-rather than to copy or compare it. `café` is five bytes and four columns, so a field padded to a
+**The unit is bytes, and that makes the width unusable for laying anything out — decided, and the
+answer was a second measurement rather than a change to this one.** `guide/table` is the customer,
+and it is the first program in the set to measure text for *display* rather than to copy or compare
+it. `café` is five bytes and four columns, so a field padded to a
 byte count is short by one — and short by **one per non-ASCII character**, so two cells of one
 column are wrong by different amounts and the column comes out ragged rather than merely narrow.
 There is no correction to apply afterwards, because the error is not a constant.
 
 So the program hands every cell the neutral specifier, ignores the width entirely, and does its own
-padding over a character count it works out itself. The division of labour is right — only the
+padding over a column count it asks `sysl.text` for. The division of labour is right — only the
 caller knows where the next border falls — but the one field of `FormatSpec` a table would have
 used is precisely the one it cannot, and a program that trusted it would produce output that is
 wrong *only* for text that is not ASCII, which is the worst way to be wrong.
@@ -288,12 +289,37 @@ renderer produced it. That is worth something, and it is worth less than it look
 it agrees with is C's `%-10s` — which is itself wrong for UTF-8 and is worked around in every
 program that formats text for a terminal.
 
-Three ways out, none taken: count **characters** and give up the equivalence with `snprintf`; keep
-bytes and add a second pair of fields; or leave it and say plainly that the specifier is for
-`printf`-shaped output and not for layout, which is what the guide program does in practice. **A
-fourth is what a table actually needs and none of the three supplies** — the East Asian Width
-property from UAX #11, since `日本` is two characters and four columns, and that is a *table* rather
-than a rule, so it waits on module-level constant data (`13 §7`) whichever unit is chosen.
+Four ways out were on the table: count **characters** and give up the equivalence with `snprintf`;
+keep bytes and add a second pair of fields; leave the specifier alone and say plainly that it is for
+`printf`-shaped output and not for layout; or supply the measurement a table actually needs, which
+is neither bytes nor characters — the East Asian Width property from UAX #11, since `日本` is two
+characters and four columns.
+
+**Settled: the third and the fourth, which turn out to be the same answer.** `FormatSpec` keeps
+counting bytes and keeps its equivalence with `snprintf`, because a specifier is for `printf`-shaped
+output; and the measurement layout needs lives in `sysl.text` as `char_columns` and `columns`,
+where a program asks for it by name. The division is the one `guide/table` had already arrived at in
+practice — only the caller knows where the next border falls, so the library owes it a *number*, not
+a padded field.
+
+What that leaves is a specifier whose width field is unusable for the one job its name suggests, and
+that is a documentation obligation rather than an open question: `§8`'s prose says which one to
+reach for.
+
+**The fourth way out was recorded as waiting on module-level constant data (`13 §7`), and it was
+never waiting.** Both `const` and module-level `val` had landed the day before `guide/table` was
+written, and four other guide programs were already using them — `guide/datetime` carries a
+transition table built by a function at module level, which is the shape a width table needs. The
+blocker was a habit rather than a fact, and it is worth naming because the cost was invisible: not
+a wrong decision, but a paragraph explaining why something could not be done that could.
+
+**Nor do the tables cost a program that does not measure anything.** `04 § Granularity` gives
+"tables that must not be in a kernel" as its reason for the byte-and-scalar granularity, which reads
+as an argument against a library carrying Unicode data at all. It is not, because a `val` whose
+initializer is a literal aggregate has no initializer at run time — it lowers to a `private
+constant` and is dropped when nothing reaches it (`15 § What is emitted at all`). The roots rule
+there is about *computed* `val`s. A program that imports `sysl.text` and never calls `columns` links
+neither table.
 
 ### The `Writer` surface, as built (`§8 d`)
 

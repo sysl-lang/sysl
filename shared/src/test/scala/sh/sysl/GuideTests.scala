@@ -378,18 +378,20 @@ class GuideTests extends AnyFreeSpec with GuideSupport with ParallelTestExecutio
   }
 
   // The one program in the set that measures text for **display** rather than copying or comparing
-  // it. Its last two sections are the finding: a column is characters wide and a `FormatSpec` is
-  // bytes wide, and the difference is not a constant that could be corrected for afterwards.
+  // it. Its last three sections are the finding: a column is neither bytes nor characters wide, and
+  // the difference is not a constant that could be corrected for afterwards. The measurement itself
+  // is `sysl.text`'s — the finding is what put it there, and `WidthTests` is where it is pinned.
   "table — text measured for display, where a byte count is the wrong unit" in {
     val out = guide("table")
 
     out should not include "FAIL"
-    checks(out) shouldBe 39
+    checks(out) shouldBe 46
     sections(out) shouldBe List(
       "-- a column is as wide as its widest cell",
       "-- a row holds types that differ",
       "-- alignment puts the slack where it was asked",
-      "-- a column is measured in characters, not bytes",
+      "-- a column is measured in columns, not bytes and not characters",
+      "-- a cell that is wider than its characters",
       "-- what a byte count would have done",
     )
   }

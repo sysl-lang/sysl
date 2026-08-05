@@ -1,5 +1,5 @@
 import sysl.buf.byte_sink
-import sysl.text.from_utf8
+import sysl.text.{columns, from_utf8}
 
 // The checks. Every line of output begins `ok`, so the whole of stdout is the assertion.
 
@@ -35,7 +35,7 @@ line(text: []const u8, n: usize) -> []const u8
 end line
 
 // Whether every line of some rendered text is the same width **on screen**, which is the whole of
-// what it means for a table to line up — and the assertion a byte count fails. It counts characters
+// what it means for a table to line up — and the assertion a byte count fails. It measures columns
 // rather than bytes for the same reason the renderer does, so a program that measured wrongly would
 // pass this and produce a table nobody could read.
 even(text: []const u8) -> bool
@@ -138,18 +138,27 @@ end section_alignment_puts_the_slack_where_it_was_asked
 
 // **The section this program exists for.** Every cell here is text a byte count gets wrong, and a
 // table is where being wrong by one is a border that does not line up.
-section_a_column_is_measured_in_characters()
-    print("-- a column is measured in characters, not bytes")
+section_a_column_is_measured_in_columns()
+    print("-- a column is measured in columns, not bytes and not characters")
 
-    check("'cafe' is four of each", str(columns("cafe".bytes)), "4")
+    check("'cafe' is four of everything", str(columns("cafe".bytes)), "4")
     check("but 'café' is five bytes", str("café".bytes.len), "5")
-    check("and four characters", str(columns("café".bytes)), "4")
-    check("'naïve' is six bytes", str("naïve".bytes.len), "6")
-    check("and five characters", str(columns("naïve".bytes)), "5")
+    check("and four columns", str(columns("café".bytes)), "4")
     check("'naïveté' is nine bytes", str("naïveté".bytes.len), "9")
-    check("and seven characters", str(columns("naïveté".bytes)), "7")
+    check("and seven columns", str(columns("naïveté".bytes)), "7")
+
+    // The two measurements err in **opposite directions**, which is why neither is a correction of
+    // the other: `日本` is six bytes and two characters, and it is four columns.
     check("'日本' is six bytes", str("日本".bytes.len), "6")
-    check("and two characters", str(columns("日本".bytes)), "2")
+    check("and two characters", str("日本".chars.count()), "2")
+    check("and four columns, which is neither", str(columns("日本".bytes)), "4")
+
+    // A decomposed vowel is the case that makes a *character* count wrong in Latin text, which is
+    // the script a program is likeliest to have assumed safe.
+    val nfd = "cafe" + str(char(0x0301u32))
+
+    check("a decomposed 'café' is five characters", str(nfd.chars.count()), "5")
+    check("and four columns, the same as the precomposed one", str(columns(nfd.bytes)), "4")
 
     var t = table([Left, Right])
 
@@ -158,7 +167,7 @@ section_a_column_is_measured_in_characters()
     t.add(["naïve", 22])
     t.add(["Zürich", 333])
 
-    check("the column takes the widest in characters", str(t.width(0usize)), "6")
+    check("the column takes the widest in columns", str(t.width(0usize)), "6")
 
     var sink = byte_sink()
     var out: *Writer = &sink
@@ -183,7 +192,38 @@ section_a_column_is_measured_in_characters()
     // would have padded these fields to different widths.
     check("while each is longer in bytes than on screen",
         str(line(text, 3usize).len > columns(line(text, 3usize))), "true")
-end section_a_column_is_measured_in_characters
+end section_a_column_is_measured_in_columns
+
+// **The section the first version of this program could not write**, and the reason the measurement
+// moved into the library: a cell whose characters are not one column each.
+section_a_wide_cell_lines_up_too()
+    print("-- a cell that is wider than its characters")
+
+    var t = table([Left, Right])
+
+    t.add(["city", "n"])
+    t.add(["東京", 1])
+    t.add(["Zürich", 22])
+    t.add(["a", 333])
+
+    // Six columns: `東京` is two characters and four columns, and `Zürich` is seven bytes and six.
+    // A character count makes this column four wide and a byte count makes it seven; both draw a
+    // table whose right-hand border moves from row to row.
+    check("the column is as wide as the widest cell on screen", str(t.width(0usize)), "6")
+
+    var sink = byte_sink()
+    var out: *Writer = &sink
+
+    t.render(out)
+
+    val text = sink.text()
+
+    check("the rule", text_of(line(text, 0usize)), "+--------+-----+")
+    check("a two-character cell that fills four columns", text_of(line(text, 3usize)), "| 東京   |   1 |")
+    check("beside a six-column one that is seven bytes", text_of(line(text, 4usize)), "| Zürich |  22 |")
+    check("and a cell that is one of everything", text_of(line(text, 5usize)), "| a      | 333 |")
+    check("every line is the same width on screen", str(even(text)), "true")
+end section_a_wide_cell_lines_up_too
 
 // What the same table looks like if width is taken from `bytes.len`, which is what `FormatSpec`
 // would have given it. The borders move, and they move by a different amount per row.
@@ -194,7 +234,7 @@ section_what_a_byte_count_would_have_done()
     check("'naïve' by one", str("naïve".bytes.len - columns("naïve".bytes)), "1")
     check("'naïveté' by two", str("naïveté".bytes.len - columns("naïveté".bytes)), "2")
     check("'Zürich' by one", str("Zürich".bytes.len - columns("Zürich".bytes)), "1")
-    check("'日本' by four", str("日本".bytes.len - columns("日本".bytes)), "4")
+    check("'日本' by two", str("日本".bytes.len - columns("日本".bytes)), "2")
 
     // And the error is not a constant, which is why a column cannot be corrected after the fact by
     // subtracting something: it is one per accented character, so two cells in one column are over
@@ -207,5 +247,6 @@ end section_what_a_byte_count_would_have_done
 section_a_column_is_as_wide_as_its_widest_cell()
 section_a_row_holds_types_that_differ()
 section_alignment_puts_the_slack_where_it_was_asked()
-section_a_column_is_measured_in_characters()
+section_a_column_is_measured_in_columns()
+section_a_wide_cell_lines_up_too()
 section_what_a_byte_count_would_have_done()

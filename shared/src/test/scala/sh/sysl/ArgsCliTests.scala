@@ -256,6 +256,36 @@ class ArgsCliTests extends AnyFreeSpec with RunSupport {
            |""".stripMargin
     }
 
+    /* A label is built out of text the *program* supplied — its long names and its placeholder —
+     * so it is not necessarily ASCII, and the column it sets has to be measured in what a terminal
+     * draws rather than in bytes. `<préfé>` is five characters and seven bytes, which makes the
+     * label twenty columns and twenty-two bytes: measured wrongly, the two rows under it are pushed
+     * two positions right of the row that set the column, and every row disagrees with every other
+     * by however many accented characters happen to be above it.
+     *
+     * This is `guide/table`'s finding reaching the library that had the same bug (`14 §2`).
+     */
+    "and the column is screen columns, so a placeholder that is not ASCII still lines up" in {
+      val src =
+        """import sysl.args.*
+          |
+          |var out  = option('o', "output", "préfé", "where to write it")
+          |var all  = flag('a', "all", "do every one")
+          |var spec = cli("thing", [out, all])
+          |
+          |prints(help(spec))
+          |""".stripMargin
+
+      run(src) shouldBe
+        """|usage: thing [options]
+           |
+           |options:
+           |  -o, --output <préfé>  where to write it
+           |  -a, --all             do every one
+           |  -h, --help            show this help and exit
+           |""".stripMargin
+    }
+
     // No version, no `--version` row — the help text lists what the program actually accepts.
     "leaves out the version row where no version was given" in {
       val src =

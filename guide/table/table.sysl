@@ -20,10 +20,10 @@
 // correction to apply afterwards.
 //
 // So this program ignores the specifier's width entirely, hands every cell the neutral spec, and
-// does its own padding over a count it works out itself (`columns`). That is the right division —
-// only the caller knows what a column is — but it means the one field in `FormatSpec` a table would
-// have used is the one it cannot use, and a program that trusted it would produce a table that is
-// wrong only for text that is not ASCII, which is the worst way to be wrong.
+// does its own padding over a count it asks `sysl.text` for (`columns`). That is the right division
+// — only the caller knows what a column is — but it means the one field in `FormatSpec` a table
+// would have used is the one it cannot use, and a program that trusted it would produce a table
+// that is wrong only for text that is not ASCII, which is the worst way to be wrong.
 //
 // **A correction rather than a finding, and it is the same one `png` recorded: ask the library
 // before reporting an absence.** This program was most of the way to writing up "a rendered value
@@ -33,12 +33,22 @@
 // checks were written twice, once comparing bytes by hand and printing them back through
 // `putbytes`, before the conversion was looked for. `04` had specified it all along.
 //
-// **A character is not a column, and this program is right only because its text is Latin.**
-// `columns` counts characters, which is correct for `café` and `Zürich` and wrong for `日本` — two
-// characters occupying four terminal columns. Getting that right needs the East Asian Width table
-// from UAX #11, which is data rather than language, and `13 §7`'s missing module-level constants is
-// where that lands. Recorded as a boundary rather than solved: the program asserts alignment over
-// text where character and column agree, and says so.
+// **A character is not a column either — found here, and now fixed in the library.** The first
+// version of this program counted characters, which is right for `café` and `Zürich` and wrong for
+// `日本`: two characters occupying four terminal columns. It was recorded as a boundary rather than
+// solved, on the grounds that the East Asian Width table from UAX #11 is data rather than language
+// and had nowhere to live.
+//
+// **That reason was already false when it was written**, which is the more useful half of the
+// finding. Module-level `const` and `val` had landed the day before (`13 §7`), and four other
+// programs in this set were already using them — `guide/datetime` carries a transition table built
+// by a function at module level, which is the exact shape a width table needs. An absence is worth
+// checking against the language as it is *today* rather than as it was when the habit formed; this
+// one cost a paragraph explaining why something could not be done that could.
+//
+// So `columns` is now `sysl.text`'s, backed by the Unicode Character Database, and this program
+// measures `日本` and a decomposed `café` as correctly as it measures ASCII. What the program keeps
+// is the *call*, not the table: only the caller knows where the next border falls.
 //
 // **A `require` cannot carry its message onto the next line.** Continuation covers an operator that
 // cannot finish an expression, and brackets already join — but `require cond, "message"` has no
@@ -57,6 +67,7 @@
 // directly, which is why the rows above read the way they do.
 
 import sysl.buf.{Buf, buf, byte_sink}
+import sysl.text.columns
 
 // How a cell's text sits in the field its column gives it.
 enum Align
@@ -64,22 +75,6 @@ enum Align
     Right
     Center
 end Align
-
-// **How wide some UTF-8 text is, counted in characters rather than in bytes.**
-//
-// A continuation byte is `10xxxxxx`, and every other byte starts a character -- so the count is the
-// bytes that are not continuations, which needs no decoding and no table.
-//
-// This function is the program's answer to the finding in the header, and the reason it is here
-// rather than in the library: `FormatSpec`'s width is a **byte** count, so nothing the sink family
-// supplies can lay out a column of text that is not ASCII.
-columns(bytes: []const u8) -> usize
-    var n = 0usize
-
-    for b in bytes do if b & 192u8 != 128u8 then n += 1
-
-    n
-end columns
 
 // One rendered cell: what the value came to, and how wide that is on screen.
 //

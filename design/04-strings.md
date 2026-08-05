@@ -187,6 +187,17 @@ kernel, and making the default element type the one that requires them would put
 O(n) and force an opaque index type on every program that just wants a byte offset. Go's
 choice is right for a systems language; Swift's is right for an application language.
 
+**That argument is about the *default*, not about the library**, and the distinction matters because
+it has been misread as a reason `sysl.text` may not carry Unicode data at all. It may. `columns` —
+how much room text takes on a terminal, the third measurement a string has after bytes and scalar
+values — is 499 ranges of the Unicode Character Database sitting in this module, and a program that
+imports `sysl.text` and never calls it links none of them: a `val` whose initializer is a literal
+aggregate has no initializer at run time, lowering to a `private constant` that is dropped when
+nothing reaches it (`15 § What is emitted at all`). What the granularity choice rules out is making
+every program pay for tables by making the *element type* need them, which is a different thing from
+a function that asks for them by name. A kernel that does not lay text out in columns does not
+import `columns`.
+
 | Operation | Spelling | Cost |
 |---|---|---|
 | byte length | `s.len` | O(1) |
@@ -194,6 +205,7 @@ choice is right for a systems language; Swift's is right for an application lang
 | substring | `s[a..b] -> string` | O(1), shares; bounds-checked **and** boundary-checked |
 | bytes | `s.bytes -> []const u8` | O(1) view |
 | scalar values | `s.chars` | O(1) per step, total — no replacement characters |
+| terminal columns | `columns(s.bytes)` | O(n), a binary search per character; `sysl.text` |
 | copy out | `s.copy() -> string` | O(n), allocates; releases the parent |
 | concatenation | `a + b` | O(n), allocates |
 | repeated append | `str_builder()` | amortized |
