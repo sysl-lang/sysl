@@ -475,18 +475,23 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
 
   /** `02`, *Object safety*: a built-in that belongs to a trait **by the compiler's rule** cannot be
     * erased, because a table holds function pointers and what the compiler provides is an
-    * instruction or a rendering. The membership itself is real, which is why the refusal is pinned
-    * here beside the questions the same type still answers — a plain "wrong type" would deny the
-    * conformance instead of naming the rule, and send the reader after one they already have.
+    * instruction or a rendering.
+    *
+    * **Which built-ins those are is now the open families only.** `bool`, `char`, `string` and the
+    * two floats are finite, so `lib/sysl/display.sysl` writes them ordinary `impl` blocks and they
+    * erase like anything else. The `iN`/`uN` families admit `i5` and `u24`, so no finite list of
+    * blocks covers them and their membership stays the compiler's — which is what this block is
+    * about. The membership is real either way, which is why the refusal is pinned beside the
+    * questions the same type still answers: a plain "wrong type" would deny a conformance the
+    * reader has, and send them after one they already hold.
     *
     * `Display` is what makes this reachable at all: it is the one compiler-provided trait that is
     * also object-safe, so every other one is stopped a step earlier by object safety.
     */
-  "a built-in belongs to a trait by rule, and a rule is not a table" - {
+  "an integer belongs to a trait by rule, and a rule is not a table" - {
     "so erasing one is refused, and the refusal names the rule" in {
       for src <- List(
           """var d: &Display = 5""",
-          """var d: &Display = "hi"""",
           """var xs: [3]&Display = [1, 2, 3]""",
         )
       do
@@ -504,6 +509,23 @@ class TraitObjectRunTests extends AnyFreeSpec with RunSupport with CodegenSuppor
             |show(5)
             |show("hi")
             |""".stripMargin) shouldBe "5\nhi\n"
+    }
+
+    // The other side of the split, and the reason it is worth having: a closed family's membership
+    // is written out, so a slot in the table is a function that exists and the value erases.
+    "while a closed family's, being written out, erases and dispatches" in {
+      run("""var spec = FormatSpec(0, -1, false)
+            |var text = "hi"
+            |var flag = true
+            |var ch = 'x'
+            |var num = 3.5
+            |var s: *Display = &text
+            |var b: *Display = &flag
+            |var c: *Display = &ch
+            |var r: *Display = &num
+            |for d in [s, b, c, r] do d.display(stdout(), spec)
+            |print("")
+            |""".stripMargin) shouldBe "hitruex3.5\n"
     }
 
     // The contrast that shows the rule is about *how* a type joined the trait and not about what it

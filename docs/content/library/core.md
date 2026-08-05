@@ -256,9 +256,7 @@ contracts](/reference/errors/), with the reason a stream **latches** instead of 
 
 ### The `display_*` family
 
-The built-in types have no `impl` block anywhere — there is no `int.display` to call, because the
-`iN`/`uN` families are open and no finite list of impls could cover them. What they have instead is
-this family, one function per shape, which the compiler routes a scalar's `display` to:
+Every rendering the language does ends up in this family, one function per shape:
 
 | function | renders |
 |---|---|
@@ -270,6 +268,14 @@ this family, one function per shape, which the compiler routes a scalar's `displ
 | `display_bool`, `display_char` | `true`/`false`, and a code point encoded to UTF-8 |
 | `display_pad` | **where they all end up** — puts finished bytes in the field the spec asked for |
 | `display_fill` | writes one byte *n* times, in 16-byte runs off a stack buffer |
+
+**How a built-in reaches its own splits by whether its family is closed.** `bool`, `char`, `string`,
+`real` and `f32` are five types, so each has an ordinary `impl Display` in the library forwarding to
+the function above — they are `Display` exactly the way your own struct is, and a `*Display` can
+carry one. The `iN`/`uN` families are open (`i5` and `u24` are types you may write), so no finite
+list of blocks reaches them and the compiler routes their `display` to the family directly. The cost
+of that is real and worth knowing: **an integer cannot be erased to a `*Display`**, because a method
+table holds functions and a routing rule supplies none.
 
 A scalar reaches its own through a method call, so a `Display` written for a struct can render its
 fields without leaving the allocation-free path:

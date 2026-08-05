@@ -523,12 +523,13 @@ members"`). The mapping is the existing operator semantics of `01`, restated as 
   rather than with the numeric types because `%` is integer-only in `01`'s operator table: there is
   no float remainder to lower, and a membership wider than the table would promise a bounded generic
   an operation that fails at the instantiation the bound was supposed to have proven.
-- `char` is `Eq`, `Ord`, `Hash`, and `Display`, and has **no** arithmetic or bitwise membership
+- `char` is `Eq`, `Ord`, and `Hash`, and has **no** arithmetic or bitwise membership
   (`01` — `char` has equality and ordering only).
-- `bool` is `Eq`, `Hash`, and `Display`, and is **not** `Ord` (`01` — `bool` has equality, no
-  ordering).
-- `string` is `Add` (concatenation, the one string operator — `04`), `Eq`, `Ord`, `Hash`, and
-  `Display`.
+- `bool` is `Eq` and `Hash`, and is **not** `Ord` (`01` — `bool` has equality, no ordering).
+- `string` is `Add` (concatenation, the one string operator — `04`), `Eq`, `Ord`, and `Hash`.
+- **`Display` is not in this list for any of them, and that is the point of the next paragraph:**
+  `bool`, `char`, `string` and the two floats reach it through written `impl` blocks instead. The
+  integers are the only types whose `Display` is a rule.
 - The pointer modes `*T`/`&T` are `Eq` only (address equality; no ordering — `01`), and
   deliberately **not `Display`**: an address renders differently on every run, so a program that
   wants one in its output asks for it explicitly rather than getting it from `print(p)`. This is a
@@ -538,6 +539,21 @@ members"`). The mapping is the existing operator semantics of `01`, restated as 
 These memberships change no codegen: a scalar operator still lowers to its native instruction
 (`§3`). Their sole job is to make the type system agree that a scalar satisfies the bound a
 generic asks for, so `sum(3, 4)` and `sum(3.0, 4.0)` both instantiate `sum[T: Add]`.
+
+**A membership is a rule only where the family is open, and `Display` is where that line is worth
+drawing.** A rule cannot fill a slot in a method table — a table holds function pointers, and what a
+rule provides is an instruction or a rendering spliced in — so a type belonging to a trait by rule
+cannot be erased to an object over it (`02`, *Object safety*). For the operator catalog that costs
+nothing, since `add(self, rhs: Self) -> Self` is not object-safe anyway. For `Display` it costs the
+most useful erasure in the language, and there is no workaround: coherence puts `impl Display for
+bool` in the library or nowhere.
+
+So the closed families are **written out**. `bool`, `char`, `string`, `real` and `f32` are five
+types, and `lib/sysl/display.sysl` gives each an ordinary one-line `impl` forwarding to the same
+`display_*` function the rule used to name. They are now `Display` the way any program's struct is,
+and a `*Display` carries one. The `iN`/`uN` families stay a rule because `i5` and `u24` are types a
+program may name and no finite list of blocks reaches them — the same test `sysl.math` applies when
+it writes `Float` as two `impl`s and leaves `Bits` to the compiler.
 
 **A compiler-provided membership is not always an operator, and `sysl.math`'s integer half is the
 case that shows why the mechanism is needed rather than convenient.** `Signed`'s `abs` and `signum`,

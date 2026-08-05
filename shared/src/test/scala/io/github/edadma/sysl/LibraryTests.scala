@@ -165,23 +165,31 @@ class LibraryTests extends LibrarySeamSupport {
     }
 
     "the renderer each built-in reaches, which is chosen per type rather than written down" in {
+      // The integers, and only the integers: the closed families reach `Display` through ordinary
+      // `impl` blocks in `lib/sysl/display.sysl`, so the routing table has no row for them.
       val builtins = List(
         Type.Integer(8, signed = true),
         Type.Integer(64, signed = true),
         Type.Integer(64, signed = false),
         Type.Integer(128, signed = false),
-        Type.Real,
-        Type.Bool,
-        Type.Char,
-        Type.Str,
+        Type.Integer(256, signed = false),
       )
 
-      // Each of the eight has a renderer, and no two kinds share one by accident — the four
-      // integer rows below are three distinct functions, which is what the widening is for.
+      // Each has a renderer, and no two widths share one by accident — the five rows are four
+      // distinct functions, which is what the widening is for.
       val renderers = builtins.flatMap(t => CoreTraits.display(t).map(_._1))
 
       renderers.length shouldBe builtins.length
       renderers.toSet.diff(Library.declared) shouldBe Set.empty
+    }
+
+    // The other half of the split, asserted where the table is: a type whose family is closed has
+    // no row here at all, because a written `impl` is what it reaches instead. This is also what
+    // makes those types erasable to a `*Display`, since a table slot needs a function that exists.
+    "and no renderer for a type whose family is closed, which has an impl instead" in {
+      for t <- List(Type.Real, Type.Bool, Type.Char, Type.Str) do
+        CoreTraits.display(t) shouldBe None
+        CoreTraits.builtin("Display", t) shouldBe false
     }
 
     "and the mixer, for the types whose `Hash` the compiler provides" in {
@@ -198,9 +206,16 @@ class LibraryTests extends LibrarySeamSupport {
       mixers.toSet.diff(Library.declared) shouldBe Set.empty
     }
 
-    "a float has neither, which is the membership `Hash` deliberately withholds" in {
+    // A float is in neither table, for two unrelated reasons worth keeping apart: `Hash` withholds
+    // the membership deliberately (`NaN != NaN` breaks what a table lookup assumes), while
+    // `Display` has no row because there are two float widths and a closed family gets written
+    // `impl` blocks rather than a rule.
+    "a float is in neither table, and the two reasons are different" in {
       CoreTraits.hash(Type.Real) shouldBe None
-      CoreTraits.display(Type.Real).map(_._1) shouldBe Some("display_real")
+      CoreTraits.builtin("Hash", Type.Real) shouldBe false
+
+      CoreTraits.display(Type.Real) shouldBe None
+      CoreTraits.builtin("Display", Type.Real) shouldBe false
     }
   }
 
