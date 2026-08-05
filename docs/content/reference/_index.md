@@ -35,6 +35,6 @@ compilation itself.
 [standard library](/library/) is ordinary sysl — no type in it is a language feature and a program
 could have written any of it — so it is documented apart from the rules the compiler enforces.
 
-Cross-references point at the [design chapters](https://github.com/edadma/sysl/tree/dev/docs/design)
+Cross-references point at the [design chapters](https://github.com/edadma/sysl/tree/dev/design)
 where a rule was argued out. Those are the specification and carry the alternatives that were
 rejected; this section is what the language *is*, without the deliberation.

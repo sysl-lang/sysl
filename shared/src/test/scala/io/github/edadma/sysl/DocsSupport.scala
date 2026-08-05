@@ -184,10 +184,10 @@ trait DocsSupport extends Matchers { this: Assertions =>
    * toolchain can build one, which is what an ordinary `sysl run` does.
    */
   private def compileAndRun(src: String): Either[String, (Int, String)] =
-    PrebuiltStd.forHost match {
-      case Some((std, precompiled, archive)) =>
+    Stdlib.resolve(Stdlib.Choice.Default(), Target.default) match {
+      case Right(Stdlib.Resolved(std, precompiled, Some(archive))) =>
         Toolchain.compileAndRun(List(Source("<page>", src)), Nil, Nil, Some(std), precompiled, List(archive))
-      case None =>
+      case _ =>
         Toolchain.compileAndRun(List(Source("<page>", src)), Nil, Nil, None, Set.empty, Nil)
     }
 

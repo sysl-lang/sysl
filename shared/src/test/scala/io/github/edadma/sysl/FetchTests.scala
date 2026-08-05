@@ -20,7 +20,7 @@ class FetchTests extends PackageCacheSupport {
   private def ensure(cache: String, sums: Sums = Sums.empty, d: Dependency = dep()) =
     Fetch.ensure(d, sums, cache)
 
-  private def refused(cache: String, sums: Sums = Sums.empty, d: Dependency = dep()): String =
+  private def refused(cache: String, sums: Sums, d: Dependency = dep()): String =
     ensure(cache, sums, d) match
       case Left(e)  => e
       case Right(f) => fail(s"expected a refusal, got: $f")

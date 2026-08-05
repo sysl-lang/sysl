@@ -49,6 +49,6 @@ a slab allocator, SHA-2, a Lisp — each written to force a language decision, w
 written down.
 Most of the features documented above exist because one of them could not be written without.
 
-The [specification](https://github.com/edadma/sysl/tree/dev/docs/design) is the other kind of
+The [specification](https://github.com/edadma/sysl/tree/dev/design) is the other kind of
 document — numbered chapters that say what the language *is* and why, written for someone deciding
 the design rather than someone learning it.
