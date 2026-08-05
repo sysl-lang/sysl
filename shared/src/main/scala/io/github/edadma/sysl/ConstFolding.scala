@@ -113,7 +113,8 @@ trait ConstFolding extends ImportResolution {
   /** A compile-time integer, for the two positions where a literal was previously the only thing
    * accepted: an array bound and an enum discriminant (`13 §7`).
    */
-  protected def constInt(e: Expr): Option[BigInt] = fold(e).collect { case IntLit(v, _) => v }
+  protected def constInt(e: Expr, subst: Map[String, Type] = Map.empty): Option[BigInt] =
+    fold(e, subst).collect { case IntLit(v, _) => v }
 
   // --- module-level `val`s ---------------------------------------------------------------
 
@@ -165,7 +166,7 @@ trait ConstFolding extends ImportResolution {
    * folds only from a literal, since `+` on strings allocates and a compile-time concatenation
    * would be a different operation wearing the same spelling.
    */
-  protected def fold(e: Expr): Option[Expr] = e match
+  protected def fold(e: Expr, subst: Map[String, Type] = Map.empty): Option[Expr] = e match
     case l: IntLit   => Some(l.copy(suffix = None))
     case l: FloatLit => Some(l.copy(suffix = None))
     case l: BoolLit  => Some(l)
@@ -175,12 +176,12 @@ trait ConstFolding extends ImportResolution {
     case Ident(n) => constKey(n).map(k => constLiteral(k))
 
     case Unary("-", operand) =>
-      fold(operand).collect {
+      fold(operand, subst).collect {
         case IntLit(v, _)   => IntLit(-v, None)
         case FloatLit(t, _) => FloatLit((-t.toDouble).toString, None)
       }
-    case Unary("!", operand) => fold(operand).collect { case BoolLit(b) => BoolLit(!b) }
-    case Unary("~", operand) => fold(operand).collect { case IntLit(v, _) => IntLit(~v, None) }
+    case Unary("!", operand) => fold(operand, subst).collect { case BoolLit(b) => BoolLit(!b) }
+    case Unary("~", operand) => fold(operand, subst).collect { case IntLit(v, _) => IntLit(~v, None) }
 
     // A conversion is written, so what it does at compile time is what it does at run time: a
     // narrowing wraps and a float-to-integer truncates toward zero (`01`). Silently doing something
@@ -189,18 +190,25 @@ trait ConstFolding extends ImportResolution {
     case Call(Ident(name), List(arg)) =>
       for
         target <- scalarType(name)
-        value  <- fold(arg)
+        value  <- fold(arg, subst)
         out    <- convert(value, target)
       yield out
 
-    case Binary(op, l, r)   => for (a <- fold(l); b <- fold(r); v <- binary(op, a, b)) yield v
-    case Compare(List(l, r), List(op)) => for (a <- fold(l); b <- fold(r); v <- binary(op, a, b)) yield v
+    case Binary(op, l, r) => for (a <- fold(l, subst); b <- fold(r, subst); v <- binary(op, a, b)) yield v
+    case Compare(List(l, r), List(op)) =>
+      for (a <- fold(l, subst); b <- fold(r, subst); v <- binary(op, a, b)) yield v
 
     // `sizeof(T)` and `alignof(T)` are compile-time constants (`03 § Reinterpreting storage`), so
     // they fold exactly as a literal does. That is what makes them usable in the two positions this
     // folder serves — an array bound and an enum discriminant — as well as in a `const`, which is
     // where a program names the block size a slab is laid out in.
-    case LayoutOf(what, tr) => layoutBytes(what, resolveType(tr, Map.empty)).map(n => IntLit(n, None))
+    //
+    // **The substitution is what lets the measured type be the caller's own parameter.** A generic
+    // body is analyzed once per instantiation with its parameters bound to the concrete arguments
+    // (`instantiateFunc`), so `sizeof(T)` inside one has a width at every point it is compiled —
+    // and resolving it against an empty map instead would report the parameter as an unknown type,
+    // which is a name the reader can see is declared right there.
+    case LayoutOf(what, tr) => layoutBytes(what, resolveType(tr, subst)).map(n => IntLit(n, None))
 
     case _ => None
 
@@ -215,6 +223,29 @@ trait ConstFolding extends ImportResolution {
   protected def layoutBytes(what: String, ty: Type): Option[Int] = Type.underlying(ty) match
     case _: Type.Abstract | Type.Unknown => None
     case t                               => Some(if what == "sizeof" then Layout.size(t) else Layout.align(t))
+
+  /** Whether a constant expression does not fold **yet** rather than not folding at all: it measures
+   * a type that is still a parameter, and every instantiation will supply one that is not.
+   *
+   * The distinction is the whole of what separates a deferred bound from a mistake. `[sizeof(T)]u8`
+   * inside a generic is a well-formed array whose length nobody can name until the body is compiled
+   * for a particular `T`; `[n]u8` over a variable is a length that will never be a constant however
+   * many times it is instantiated. Both fail to fold, and only the second is worth a diagnostic.
+   *
+   * It walks the same shapes `fold` does, since a bound may measure a type inside arithmetic —
+   * `[sizeof(T) * 3 + 1]u8` is the shape a decimal-digit buffer wants, and none of its parts folds
+   * on its own either.
+   */
+  protected def awaitsInstantiation(e: Expr, subst: Map[String, Type]): Boolean = e match
+    case LayoutOf(_, tr) =>
+      Type.underlying(resolveType(tr, subst)) match
+        case _: Type.Abstract => true
+        case _                => false
+    case Unary(_, operand)             => awaitsInstantiation(operand, subst)
+    case Binary(_, l, r)               => awaitsInstantiation(l, subst) || awaitsInstantiation(r, subst)
+    case Compare(List(l, r), _)        => awaitsInstantiation(l, subst) || awaitsInstantiation(r, subst)
+    case Call(Ident(_), List(arg))     => awaitsInstantiation(arg, subst)
+    case _                             => false
 
   private def convert(value: Expr, target: Type): Option[Expr] = (value, target) match
     case (IntLit(v, _), i: Type.Integer) => Some(IntLit(Type.wrap(v, i), None))
