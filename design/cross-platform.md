@@ -37,12 +37,12 @@ default an invocation that names no target gets.
 
 Two of the author's own cross-published libraries cover the edge, and both are on Central:
 
-- **`path`** (`io.github.edadma:path:0.0.6`) — a fluent `Path` type: `/` composition, `readText`,
+- **`path`** (`io.github.edadma:path`) — a fluent `Path` type: `/` composition, `readText`,
   `exists`, `parent`, `filename`, `extension`, `relativeTo`, `normalize`, `toAbsolutePath`,
   `listDirectory` with globs. This is what **module resolution** wants: module names follow the
   directory tree relative to the project root, and `relativeTo` / `normalize` / `startsWith` are
   exactly those operations.
-- **`cross_platform`** (`io.github.edadma:cross_platform:0.1.8`) — process-level operations
+- **`cross_platform`** (`io.github.edadma:cross_platform`) — process-level operations
   `path` doesn't cover: `processArgs`, `stdout`, `processExit`, `nameSeparator`, the temp-file
   operations the toolchain glue writes its `.ll` through, and `exec` — running an external command
   to completion and capturing what it printed.
@@ -88,7 +88,9 @@ the library and publish it — never work around it in sysl.**
 
 Current state of that policy:
 
-- `path` 0.0.6, `cross_platform` 0.1.8 and `indentation` 0.0.5 — all three on Central, used as-is.
+- `path`, `cross_platform` and `indentation` — all three on Central, used as-is. `build.sbt` holds
+  the versions; naming them here only guarantees this chapter goes stale behind it, which is what
+  had happened by the time anyone checked.
 - **`indentation` is the policy's worked example.** It sat at 0.0.2 while the commits for 0.0.3
   (`blockTriggerToken`) and 0.0.4 (`isLineContinuationToken`) were written and never released, and
   trailing-operator line continuation waited on that release rather than on a workaround here. The
