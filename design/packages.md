@@ -457,6 +457,11 @@ code reaches.
 [sysl-lang/sqlite3](https://github.com/sysl-lang/sqlite3) is the first sysl package outside this
 repository, and it exists to keep this chapter honest: it has a real `package.hocon`, a module under
 the package root, C compiled as part of the library, and a `link` directive that travels in the
-artifact so nothing on the consuming side names `-lsqlite3`. It is consumed today the way any library
-is — `build-lib` then `--lib` — because §3–§6 are unbuilt and there is nothing yet that could fetch
-it. It is what `sysl add` should be pointed at first.
+artifact so nothing on the consuming side names `-lsqlite3`. **It is fetched today** — naming it in a
+`dependencies` block is enough, and §3–§6 do the rest — which is what this paragraph used to deny,
+back when it said those sections were unbuilt and nothing could fetch anything. The header at the top
+of this chapter had already been corrected; this sentence had not, which is the ordinary way a status
+claim written twice goes stale in one of its two places.
+
+What is still done by hand is **naming** it: there is no `sysl add`, so the coordinate and the version
+are typed into `package.hocon`. That is the command this package should be pointed at first.

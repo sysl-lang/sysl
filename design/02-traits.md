@@ -830,8 +830,16 @@ type-argument entry already records.
   trait's default and in a type's own body alike. It was additive exactly as this item predicted, and
   it was never a decision about traits or about properties: it was one parser alternative narrower
   than the member beside it. See `08 § Properties`.
-- **`&Trait` is not yet gated on `alloc`.** `capabilities.md` puts a counted trait object behind the
-  allocator capability, alongside `&T` itself. Neither is gated — this is the same gap `&T` already
-  has rather than a new one. **The stated reason is now stale**: it said the capability system was
-  waiting on the project config and the module system, and `13` is written and the config is
-  designed in `packages.md`. What the gate waits on is an implementation, not a decision.
+- ~~**`&Trait` is not yet gated on `alloc`.**~~ **Built, and it needed no rule of its own.**
+  `capabilities.md` puts a counted trait object behind the allocator capability alongside `&T`
+  itself, and this item said neither was gated. Both are: an erasure sits on top of the box the `&T`
+  already is, so the one gate on `&T` answers for the trait object one step earlier and there is
+  nothing about `&Trait` for the capability pass to know. Pinned by `CapabilityClauseTests`' *"a
+  boxed trait object, which is a reference underneath"*, which is written as a trait object
+  precisely so that the shared gate cannot be removed without a trait-object test failing.
+
+  **The item's own reasoning is worth keeping, because it was right about the shape and wrong about
+  the state.** It said the gate waited on an implementation rather than a decision, and the
+  implementation it waited on turned out to be the `&T` one — which is what "the same gap `&T`
+  already has rather than a new one" had already said, one step short of the conclusion that closing
+  the one closes the other.

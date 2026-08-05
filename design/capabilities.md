@@ -30,8 +30,10 @@ modes). **The target registry is now its own doc and is built — `targets.md`**
 target *is* and how one is named are settled, and the project-config half around it is now
 `packages.md`: the `package.hocon` schema, per-target capability sets, and the dependency model
 that lets a *package* carry a capability requirement the way a module does. `packages.md` is
-**built for exactly the capability half** — the file is parsed and its per-target sets are what
-the two-level rule below is now measured against — and unbuilt for everything about dependencies.
+**built for the capability half and for the dependency model both** — the file is parsed, its
+per-target sets are what the two-level rule below is now measured against, and a `dependencies`
+block is fetched, resolved and checked against `sysl.sum`. What is unbuilt there is the commands
+that would edit the file for you (`sysl add`, `vendor`), which changes nothing about this doc.
 This one is the capability model.
 
 ## Two kinds of capability
